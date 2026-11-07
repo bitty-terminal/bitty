@@ -50,7 +50,7 @@
             "result": {
               "wire_version": 1,
               "service_api_version.major": 1,
-              "service_api_version.minor": 3,
+              "service_api_version.minor": 4,
               "service_api_version.min_client_minor": 0,
               "daemon_state": "running",
               "capabilities.worker_sessions": "@worker_sessions",
@@ -157,7 +157,7 @@
           "params": {
             "client_version": {
               "major": 1,
-              "minor": 4
+              "minor": 5
             }
           },
           "expect": {
@@ -9236,7 +9236,7 @@
           "expect": {
             "ok": true,
             "result": {
-              "service_api_version.minor": 3
+              "service_api_version.minor": 4
             }
           }
         },
@@ -10631,6 +10631,985 @@
       ],
       "fake_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it",
       "real_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it"
+    },
+    {
+      "id": "V-51",
+      "title": "A created session serves its origin and timestamps and omits worker-only fields",
+      "area": "session-record",
+      "decisions": [
+        "D-03",
+        "D-09",
+        "D-11"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "capture": {
+            "creator_client_id": "client_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "client_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v51-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.created_by_kind",
+              "session.state_changed_at_ms",
+              "session.owner_client_id",
+              "session.attached_leases"
+            ],
+            "result": {
+              "session.created_by_kind": "consumer",
+              "session.owner_client_id": "@creator_client_id",
+              "session.state": "created"
+            },
+            "array": {
+              "session.attached_leases": []
+            },
+            "hex_len": {
+              "session.owner_client_id": 32
+            },
+            "absent": [
+              "session.requested_by",
+              "session.last_worker_seen_at_ms",
+              "session.worker_handle",
+              "session.exit_code",
+              "session.signal"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id",
+            "control_token": "@create_token"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.created_by_kind",
+              "session.state_changed_at_ms"
+            ],
+            "result": {
+              "session.created_by_kind": "consumer"
+            },
+            "absent": [
+              "session.owner_client_id",
+              "session.requested_by",
+              "session.attached_leases",
+              "session.worker_handle"
+            ]
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 1
+            },
+            "present": [
+              "sessions.0.created_by_kind",
+              "sessions.0.state_changed_at_ms",
+              "sessions.0.owner_client_id",
+              "sessions.0.attached_leases"
+            ],
+            "result": {
+              "sessions.0.created_by_kind": "consumer"
+            },
+            "array": {
+              "sessions.0.attached_leases": []
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.created_by_kind": "consumer"
+            },
+            "present": [
+              "session.owner_client_id",
+              "session.state_changed_at_ms"
+            ],
+            "absent": [
+              "session.requested_by",
+              "session.worker_handle",
+              "session.exit_code",
+              "session.signal"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "no worker handle or worker liveness timestamp before a worker binds",
+        "no exit code or signal on a session that never exited",
+        "no owner client id, requester, or attach list in an ordinary view",
+        "no null placeholder for a field that does not apply"
+      ]
+    },
+    {
+      "id": "V-52",
+      "title": "A bound session serves its worker handle and live attach identity",
+      "area": "session-record",
+      "decisions": [
+        "D-03",
+        "D-09",
+        "D-11"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "capture": {
+            "creator_client_id": "client_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "client_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v52-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v52-claim"
+          },
+          "capture": {
+            "attach_id": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.worker_handle",
+              "session.last_worker_seen_at_ms",
+              "session.attached_leases",
+              "session.owner_client_id",
+              "session.state_changed_at_ms"
+            ],
+            "result": {
+              "session.state": "running",
+              "session.generation": 1,
+              "session.created_by_kind": "consumer",
+              "session.attached_leases.0.attach_id": "@attach_id",
+              "session.attached_leases.0.client_id": "@creator_client_id",
+              "session.attached_leases.0.role": "controller",
+              "session.owner_client_id": "@creator_client_id"
+            },
+            "hex_len": {
+              "session.worker_handle": 32
+            },
+            "array_len": {
+              "session.attached_leases": 1
+            },
+            "absent": [
+              "session.exit_code",
+              "session.signal",
+              "session.requested_by"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.worker_handle",
+              "session.last_worker_seen_at_ms"
+            ],
+            "absent": [
+              "session.attached_leases",
+              "session.owner_client_id",
+              "session.requested_by"
+            ]
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.worker_handle",
+              "session.last_worker_seen_at_ms"
+            ],
+            "array_len": {
+              "session.attached_leases": 1
+            },
+            "absent": [
+              "session.exit_code",
+              "session.signal"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "no pid, descriptor, or command line in place of the opaque worker handle",
+        "no attach list or client identity in an ordinary view",
+        "no exit code or signal while the worker is running"
+      ]
+    },
+    {
+      "id": "V-53",
+      "title": "A stopped session records the consumer requester and serves no exit status",
+      "area": "session-record",
+      "decisions": [
+        "D-04",
+        "D-09",
+        "D-11"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "capture": {
+            "creator_client_id": "client_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "client_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v53-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v53-claim"
+          },
+          "capture": {
+            "attach_id": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "reason_class": "cancel"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "consumer_cancel",
+              "session.cleanup": "not_started"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.requested_by",
+              "session.state_changed_at_ms"
+            ],
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "consumer_cancel",
+              "session.requested_by.kind": "consumer",
+              "session.requested_by.client_id": "@creator_client_id",
+              "session.cleanup": "not_started",
+              "session.created_by_kind": "consumer",
+              "session.owner_client_id": "@creator_client_id"
+            },
+            "hex_len": {
+              "session.requested_by.client_id": 32
+            },
+            "absent": [
+              "session.exit_code",
+              "session.signal",
+              "session.worker_handle",
+              "session.last_worker_seen_at_ms"
+            ],
+            "array": {
+              "session.attached_leases": []
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 1
+            },
+            "result": {
+              "sessions.0.state": "terminated",
+              "sessions.0.requested_by.kind": "consumer",
+              "sessions.0.requested_by.client_id": "@creator_client_id"
+            },
+            "absent": [
+              "sessions.0.exit_code",
+              "sessions.0.signal",
+              "sessions.0.worker_handle"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "no exit code or signal for a reason that has no wait status",
+        "no worker handle on a session that never bound a worker",
+        "no requester identity in an ordinary view"
+      ]
+    },
+    {
+      "id": "V-54",
+      "title": "A force-killed session records the operator requester",
+      "area": "session-record",
+      "decisions": [
+        "D-04",
+        "D-05",
+        "D-09"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "capture": {
+            "operator_client_id": "client_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "client_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "client_id": 32
+            }
+          },
+          "capture": {
+            "creator_client_id": "client_id"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v54-create"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.kill",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.requested_by"
+            ],
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "operator_abort",
+              "session.requested_by.kind": "operator",
+              "session.requested_by.client_id": "@operator_client_id",
+              "session.cleanup": "not_started"
+            },
+            "absent": [
+              "session.exit_code",
+              "session.signal",
+              "session.worker_handle"
+            ]
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.requested_by",
+              "session.state_changed_at_ms"
+            ],
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "operator_abort",
+              "session.requested_by.kind": "operator",
+              "session.requested_by.client_id": "@operator_client_id",
+              "session.created_by_kind": "consumer",
+              "session.owner_client_id": "@creator_client_id"
+            },
+            "absent": [
+              "session.exit_code",
+              "session.signal",
+              "session.worker_handle"
+            ],
+            "array": {
+              "session.attached_leases": []
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 1
+            },
+            "result": {
+              "sessions.0.state": "terminated",
+              "sessions.0.requested_by.kind": "operator",
+              "sessions.0.requested_by.client_id": "@operator_client_id"
+            },
+            "absent": [
+              "sessions.0.exit_code",
+              "sessions.0.signal",
+              "sessions.0.worker_handle"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "an operator kill never names a consumer or the daemon as the requester",
+        "no exit code or signal for a stop reason that has no wait status",
+        "no worker handle on a session that never bound a worker"
+      ]
+    },
+    {
+      "id": "V-55",
+      "title": "A natural worker exit serves its exit code and omits the signal",
+      "area": "session-record",
+      "decisions": [
+        "D-04",
+        "D-11"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v55-create",
+            "argv": [
+              "/bin/sh",
+              "-c",
+              "sleep 0.2; exit 7"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "retry_ms": 5000,
+            "ok": true,
+            "present": [
+              "session.exit_code",
+              "session.worker_handle"
+            ],
+            "result": {
+              "session.state": "exited",
+              "session.terminal_reason": "worker_exit",
+              "session.exit_code": 7
+            },
+            "absent": [
+              "session.signal",
+              "session.requested_by"
+            ]
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "exited",
+              "session.exit_code": 7
+            },
+            "absent": [
+              "session.signal"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "a wait-status exit never reports a signal",
+        "a natural exit never names a client or operator requester",
+        "no terminal text or child pid in the record"
+      ]
+    },
+    {
+      "id": "V-56",
+      "title": "A signal death serves the signal and omits the exit code",
+      "area": "session-record",
+      "decisions": [
+        "D-04",
+        "D-11"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v56-create",
+            "argv": [
+              "/bin/sh",
+              "-c",
+              "sleep 0.2; kill -KILL $$"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "retry_ms": 5000,
+            "ok": true,
+            "present": [
+              "session.signal",
+              "session.worker_handle"
+            ],
+            "result": {
+              "session.state": "failed",
+              "session.terminal_reason": "worker_signal",
+              "session.signal": 9
+            },
+            "absent": [
+              "session.exit_code",
+              "session.requested_by"
+            ]
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "failed",
+              "session.signal": 9
+            },
+            "absent": [
+              "session.exit_code"
+            ]
+          }
+        }
+      ],
+      "forbidden": [
+        "a signal death never reports a wait-status exit code",
+        "a natural signal never names a client or operator requester",
+        "no terminal text or child pid in the record"
+      ]
     }
   ]
 }

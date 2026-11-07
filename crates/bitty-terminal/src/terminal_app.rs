@@ -930,6 +930,9 @@ pub(crate) struct TerminalApp {
     /// query is exercised against a real rejection in `bitty-runtime`.
     #[cfg(test)]
     pub(crate) test_present_owed: Option<bool>,
+    /// Test-only override for the compositor-confirmation wake (bitty#2989).
+    #[cfg(test)]
+    pub(crate) test_present_confirm_deadline: Option<std::time::Instant>,
     /// Test-only clock for the plugin timer pump (bitty#2899).
     ///
     /// Production pumps at `Instant::now()`; the idle-wake regression drives
@@ -1175,6 +1178,8 @@ impl TerminalApp {
             #[cfg(test)]
             test_present_owed: None,
             #[cfg(test)]
+            test_present_confirm_deadline: None,
+            #[cfg(test)]
             test_now: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
@@ -1238,6 +1243,8 @@ impl TerminalApp {
             test_surface_retry_deadline: None,
             #[cfg(test)]
             test_present_owed: None,
+            #[cfg(test)]
+            test_present_confirm_deadline: None,
             #[cfg(test)]
             test_now: None,
             hidden_repair_probe_at: None,
@@ -1521,6 +1528,15 @@ impl TerminalApp {
             return owed;
         }
         self.runtime.present_owed()
+    }
+
+    /// Compositor-confirmation wake, with a test override (bitty#2989).
+    fn present_confirm_wake(&self) -> Option<std::time::Instant> {
+        #[cfg(test)]
+        if let Some(deadline) = self.test_present_confirm_deadline {
+            return Some(deadline);
+        }
+        self.runtime.present_confirm_deadline()
     }
 
     fn watchdog_idle(&self) {
@@ -5238,6 +5254,12 @@ impl TerminalApp {
                         }
                     }
                     WindowEventKind::RedrawRequested => {
+                        // bitty#2989: a served redraw request is the
+                        // compositor's frame callback. It proves the surface is
+                        // being sampled, so the last committed frame reached
+                        // the screen; without this the runtime would force a
+                        // corrective repaint it does not need.
+                        self.runtime.note_present_confirmed();
                         // bitty#2830 hypothesis 2: while the gate is closed a
                         // repair probe asked for this frame. The compositor
                         // serving it proves the surface is mapped again even
@@ -5254,7 +5276,17 @@ impl TerminalApp {
                         // Frame-on-demand: no damage → no present, no redraw
                         // loop. Keep Wait mode (default `ControlFlow::Wait`)
                         // so idle burns ≤ 1 % CPU (PB-7 budget).
-                        let _ = self.drive_tick();
+                        //
+                        // bitty#2989: a present on this tick owes the
+                        // compositor-confirmation round trip, so ask for the
+                        // next redraw here exactly like the other present
+                        // arms. A tick that presents nothing requests nothing,
+                        // so the idle loop still parks.
+                        if self.drive_tick().is_some() {
+                            if let Some(win) = self.window.handle.as_ref() {
+                                win.request_redraw();
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -5380,6 +5412,13 @@ impl TerminalApp {
                 // first; if the worker is wedged in the compositor, this wake
                 // is what notices and recovers instead of parking forever.
                 let present_recovery = self.runtime.present_recovery_deadline();
+                // bitty#2989: a committed frame the compositor has not
+                // confirmed within the bound is the only state that leaves
+                // nothing owed and no retry armed. Without this wake the loop
+                // parks with the older frame on screen and nothing ever
+                // re-presents; a healthy window clears it in the same frame
+                // callback that ends the redraw request.
+                let present_confirm = self.present_confirm_wake();
                 let wake = [
                     hover,
                     animation,
@@ -5394,6 +5433,7 @@ impl TerminalApp {
                     surface_retry,
                     hidden_repair,
                     present_recovery,
+                    present_confirm,
                 ]
                 .into_iter()
                 .flatten()

@@ -331,6 +331,11 @@ pub(crate) struct LoadFailure {
     /// `E_CONFIG_MODULE_*`. Carried so `config check`, `doctor`, and reload
     /// each report the contract's typed record instead of only flattened text.
     module: Option<Box<bitty_config::ConfigModuleDiagnostic>>,
+    /// Dotted field path when the failure is field-scoped (validation,
+    /// undeclared key, merge conflict, policy override). Carried so the reload
+    /// result can name the rejected path structurally (bitty#2927) instead of
+    /// only inside the rendered message.
+    field: Option<String>,
 }
 
 impl LoadFailure {
@@ -340,6 +345,7 @@ impl LoadFailure {
             message,
             fallback_allowed: true,
             module: None,
+            field: None,
         }
     }
 
@@ -349,11 +355,12 @@ impl LoadFailure {
             message,
             fallback_allowed: false,
             module: None,
+            field: None,
         }
     }
 
     /// A classified configuration error, carrying its typed module refusal
-    /// (if any) alongside the rendered message.
+    /// (if any) and field path alongside the rendered message.
     fn config_error(
         message: String,
         error: &bitty_config::ConfigError,
@@ -363,12 +370,18 @@ impl LoadFailure {
             message,
             fallback_allowed,
             module: error.module_diagnostic().cloned().map(Box::new),
+            field: error.field().map(str::to_string),
         }
     }
 
     /// The typed module loader refusal behind this failure, if any.
     pub(crate) fn module_diagnostic(&self) -> Option<&bitty_config::ConfigModuleDiagnostic> {
         self.module.as_deref()
+    }
+
+    /// The dotted field path when the failure is field-scoped.
+    pub(crate) fn field(&self) -> Option<&str> {
+        self.field.as_deref()
     }
 
     /// Split into the rendered message and the typed module record, for the

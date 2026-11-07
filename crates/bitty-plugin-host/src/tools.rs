@@ -2564,7 +2564,7 @@ mod tests {
         );
         assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
         assert!(
-            refusal.path().ends_with("outside/.git"),
+            Path::new(refusal.path()).ends_with(Path::new("outside").join(".git")),
             "the refused path names the gitfile target: {}",
             refusal.path()
         );

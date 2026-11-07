@@ -22,7 +22,7 @@ use crate::orphan::identity::ProcessGroupId;
 use crate::platform::PlatformCell;
 use crate::registry::CleanupClass;
 
-use super::posix::{drain_group, group_has_members, signal_group};
+use super::posix::{GroupIdentity, drain_group, group_has_members, probe_leader, signal_group};
 use super::{
     CleanupOutcome, ContainmentError, ContainmentKind, ContainmentLimits, ContainmentRecord,
     ContainmentRefusal, ContainmentReport, SessionMode, classify_spawn_error, wait_bounded,
@@ -85,7 +85,7 @@ pub fn spawn_with(
     Ok(ContainedChild {
         child,
         group,
-        reaped: false,
+        identity: GroupIdentity::fresh(),
     })
 }
 
@@ -101,12 +101,12 @@ fn observed_group(pid: u32) -> Option<ProcessGroupId> {
 pub struct ContainedChild {
     child: Child,
     group: ProcessGroupId,
-    /// Whether this handle already reaped the leader.
+    /// Whether this handle confirmed that it reaped the leader.
     ///
     /// A reap frees the leader's pid, and with it the group id minted from
-    /// that pid, so a later signal could reach an unrelated group. Every stop
-    /// below refuses to signal once this is set.
-    reaped: bool,
+    /// that pid, so a later signal could reach an unrelated group. Every
+    /// signal, probe, and drain below refuses once this is set.
+    identity: GroupIdentity,
 }
 
 impl ContainedChild {
@@ -135,7 +135,7 @@ impl ContainedChild {
     /// Propagates a wait failure.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         let status = self.child.wait()?;
-        self.reaped = true;
+        self.identity.note_reap();
         Ok(status)
     }
 
@@ -162,21 +162,36 @@ impl ContainedChild {
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
-            self.reaped = true;
+            self.identity.note_reap();
         }
         Ok(status)
     }
 
     /// Nothing to drain beyond the recorded group.
+    ///
+    /// A no-op until this handle confirmed the leader reap: [`drain_group`]
+    /// waits on the whole recorded group, the leader included, so draining
+    /// first would reap the leader behind this handle's back and free the
+    /// group id while the handle still reports it unreaped.
     pub fn drain_recorded(&self) {
+        if !self.identity.reaped() {
+            return;
+        }
         drain_group(self.group.get());
     }
 
     /// Send a signal to the recorded process group.
     ///
     /// Returns `1` when the kernel accepted the signal, `0` otherwise. A group
-    /// that no longer exists is not an error and delivers nothing.
+    /// that no longer exists is not an error and delivers nothing; a group id
+    /// this handle already freed through a confirmed reap is never signalled.
     pub fn signal(&self, signal: Signal) -> usize {
+        if !self
+            .identity
+            .may_signal(self.group.get(), probe_leader(self.child.id()))
+        {
+            return 0;
+        }
         usize::from(signal_group(self.group.get(), Some(signal)))
     }
 
@@ -233,17 +248,19 @@ impl ContainedChild {
         // The kill is already on its way to the recorded group; reap the
         // leader inside the bounded window so the group can be observed
         // empty. Nothing is signalled after this point.
-        let mut reaped = self.reaped;
+        let mut reaped = self.identity.reaped();
         let _ = wait_bounded(limits.kill_wait(), limits, || {
             if !reaped {
                 reaped = matches!(self.child.try_wait(), Ok(Some(_)));
             }
             !group_has_members(self.group.get())
         });
-        self.reaped |= reaped;
+        if reaped {
+            self.identity.note_reap();
+        }
         let gone = !group_has_members(self.group.get());
         CleanupOutcome {
-            class: if gone && reaped && signalled > 0 {
+            class: if signalled > 0 && self.identity.settled(gone) {
                 CleanupClass::GroupSignalled
             } else {
                 CleanupClass::Unverified
@@ -254,25 +271,14 @@ impl ContainedChild {
 
     /// Whether the recorded leader may still be signalled exactly.
     ///
-    /// A leader this handle has already reaped frees its pid, and the group id
-    /// minted from it, so nothing about the recorded group is provable
-    /// afterwards. An unreaped leader usually answers with the recorded group;
-    /// one that already exited answers `ESRCH`, and while its zombie still
-    /// reserves the id the recorded group cannot have been reused.
+    /// The group id is minted from the leader's pid, so it stays exact only
+    /// while the kernel reserves that pid: a live leader and an unreaped
+    /// zombie both do. A leader this handle already reaped fails closed, and
+    /// so does `ESRCH` — a pid that is gone entirely was reaped somewhere, so
+    /// the recorded group id is free and may already name another group.
     fn group_is_ours(&self) -> bool {
-        if self.reaped {
-            return false;
-        }
-        let Ok(raw) = i32::try_from(self.child.id()) else {
-            return false;
-        };
-        match getpgid(Some(Pid::from_raw(raw))) {
-            Ok(pgid) => u32::try_from(pgid.as_raw()).ok() == Some(self.group.get()),
-            // The leader exited but is not reaped; while it is a zombie the
-            // recorded group id cannot be reused.
-            Err(nix::errno::Errno::ESRCH) => true,
-            Err(_) => false,
-        }
+        self.identity
+            .may_signal(self.group.get(), probe_leader(self.child.id()))
     }
 }
 

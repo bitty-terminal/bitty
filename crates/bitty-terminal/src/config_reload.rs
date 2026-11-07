@@ -1197,6 +1197,16 @@ fn adopted_live(class: bitty_config::ReloadClass, field: &str, adopts: fn(&str) 
     class == bitty_config::ReloadClass::Live && adopts(field)
 }
 
+/// Whether the running app adopts one configuration field live.
+///
+/// Shared policy for both restart-pending classifications and the
+/// `config.manage` write reply (bitty#2972): a scalar write the app cannot
+/// adopt live must report `restart`, never a live adoption that will not
+/// happen.
+pub(crate) fn field_adopted_live(field: &str) -> bool {
+    adopted_live(bitty_config::classify_field(field), field, runtime_adopts)
+}
+
 /// Fields that differ and that the running runtime would not adopt live: the
 /// restart-pending set.
 ///

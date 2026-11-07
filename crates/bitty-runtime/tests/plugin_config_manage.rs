@@ -187,8 +187,8 @@ impl ConfigWriteBackend for RecordingBackend {
         }
         match self.failure {
             Some(failure) => Err(failure),
-            // `config.set` has no restart marker on its reply; the scalar
-            // writer cannot classify the change, so it stays conservative.
+            // A backend that cannot classify the change reports
+            // `pending_restart`, so the reply is `restart` (bitty#2972).
             None => Ok(ConfigApplyOutcome::Applied {
                 pending_restart: true,
             }),
@@ -545,7 +545,11 @@ fn preview_and_apply_carry_the_exact_rendered_change() {
         "the preview renders the candidate and lists the changed keys"
     );
     assert!(backend.calls.borrow().is_empty(), "preview never writes");
-    assert_eq!(run(&mut rt, "apply"), "true|auto");
+    assert_eq!(
+        run(&mut rt, "apply"),
+        "true|restart",
+        "an unclassified backend never claims a live adoption"
+    );
     let calls = backend.calls.borrow();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key(), "appearance.theme");
@@ -588,7 +592,7 @@ fn approval_tokens_are_generation_bound() {
     );
 
     // The reloaded generation mints and applies its own token normally.
-    assert_eq!(run(&mut rt, "apply"), "true|auto");
+    assert_eq!(run(&mut rt, "apply"), "true|restart");
     assert_eq!(backend.calls.borrow().len(), 1);
 }
 
@@ -687,4 +691,359 @@ fn ungranted_generation_denies_every_new_verb() {
 ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+/// bitty#2972: a committed `config.manage` write is host I/O the plugin neither
+/// performs nor controls, so its latency is credited against the calling
+/// callback's RC-1 wall limit (see `CONFIG_COMMIT_CREDIT_MAX_MS`).
+///
+/// Before the credit, a write slower than the per-tick budget plus any
+/// post-apply Lua work suspended the generation at the next slice boundary.
+/// The next cold timer drive then terminally failed it (`fail_runtime` →
+/// `rollback`), which clears its UI blocks and releases its overlay capture:
+/// the panel that made the write vanished and the confirmation row was never
+/// shown. These tests pin the credit, the restart classification, and the
+/// refusal path against a real overlay-holding generation.
+mod overlay_write_credit {
+    use super::*;
+    use bitty_runtime::plugin_runtime::{
+        ConfigReadFailure, ConfigSourceLabel, ConfigValueRow, LifecycleState,
+    };
+
+    /// Write backend whose durable replace is slow enough to exceed the RC-1
+    /// per-tick wall budget, like an fsync on a busy disk.
+    struct SlowWriteBackend {
+        delay_ms: u64,
+        pending_restart: bool,
+        stale: bool,
+        calls: RefCell<Vec<ConfigChange>>,
+    }
+
+    impl SlowWriteBackend {
+        fn new(delay_ms: u64, pending_restart: bool, stale: bool) -> Self {
+            Self {
+                delay_ms,
+                pending_restart,
+                stale,
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ConfigWriteBackend for SlowWriteBackend {
+        fn config_get(
+            &self,
+            _plugin_id: &str,
+            key: &str,
+        ) -> Result<ConfigValueRow, ConfigReadFailure> {
+            Ok(ConfigValueRow {
+                key: key.to_string(),
+                value: ConfigReadValue::Text(String::from("catppuccin")),
+                source: ConfigSourceLabel::User,
+                redacted: false,
+            })
+        }
+
+        fn preview(
+            &self,
+            _plugin_id: &str,
+            change: &ConfigChange,
+        ) -> Result<ConfigPreviewRendering, ConfigWriteFailure> {
+            Ok(ConfigPreviewRendering {
+                changed_keys: vec![change.key()],
+                rendered: change.rendered().to_string(),
+                candidate_digest: candidate_digest(change.rendered().as_bytes()),
+            })
+        }
+
+        fn apply(
+            &self,
+            _plugin_id: &str,
+            change: &ConfigChange,
+            expected_candidate_digest: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            self.calls.borrow_mut().push(change.clone());
+            if self.stale {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            if candidate_digest(change.rendered().as_bytes()) != expected_candidate_digest {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            Ok(ConfigApplyOutcome::Applied {
+                pending_restart: self.pending_restart,
+            })
+        }
+
+        fn preview_plugin_enabled(
+            &self,
+            _plugin_id: &str,
+            id: &str,
+            enabled: bool,
+        ) -> Result<PluginEnabledRendering, ConfigWriteFailure> {
+            let rendered = format!("plugins.{id}.enabled = {enabled}");
+            Ok(PluginEnabledRendering {
+                changed_keys: vec![format!("plugins.{id}.enabled")],
+                candidate_digest: candidate_digest(rendered.as_bytes()),
+                rendered,
+            })
+        }
+
+        fn apply_plugin_enabled(
+            &self,
+            _plugin_id: &str,
+            id: &str,
+            enabled: bool,
+            expected_candidate_digest: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            let rendered = format!("plugins.{id}.enabled = {enabled}");
+            if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            Ok(ConfigApplyOutcome::Applied {
+                pending_restart: true,
+            })
+        }
+    }
+
+    const OVERLAY_ID: &str = "xuepoo.overlaywriter";
+
+    /// Dashboard-shaped probe: hold a focusable overlay, apply a change from
+    /// the capture-input handler, then do post-apply Lua work and keep a
+    /// one-shot timer armed (the next cold timer drive is what turns a
+    /// suspended VM into a failed generation).
+    const OVERLAY_PROBE: &str = r##"
+    local handle = nil
+    local open_ok = pcall(function()
+      handle = bitty.ui.overlay.acquire({ title = "Settings", placeholder = "Type" })
+    end)
+    bitty.store.set("open_ok", open_ok)
+    bitty.store.set("handle", handle or -1)
+
+    local function apply()
+      local ok, p = pcall(bitty.config.preview, "appearance.theme", "catppuccin")
+      if not ok then return "ERR:" .. p.code end
+      local applied, out = pcall(bitty.config.set, "appearance.theme", "catppuccin", p.digest)
+      if not applied then return "ERR:" .. out.code end
+      return tostring(out.applied) .. "|" .. out.reload
+    end
+
+    bitty.commands.register({ id = "apply", title = "Apply", run = apply })
+    bitty.commands.register({ id = "enable", title = "Enable", run = function()
+      local ok, p = pcall(bitty.config.preview_enabled, "owner.plugin", true)
+      if not ok then return "ERR:" .. p.code end
+      local applied, out = pcall(bitty.config.set_enabled, "owner.plugin", true, p.digest)
+      if not applied then return "ERR:" .. out.code end
+      return tostring(out.changed) .. "|" .. out.reload
+    end })
+    bitty.commands.register({ id = "replay", title = "Replay", run = function()
+      local ok, p = pcall(bitty.config.preview, "appearance.theme", "catppuccin")
+      if not ok then return "ERR:" .. p.code end
+      local first, out = pcall(bitty.config.set, "appearance.theme", "catppuccin", p.digest)
+      if not first then return "ERR:" .. out.code end
+      local again_ok, again = pcall(bitty.config.set, "appearance.theme", "catppuccin", p.digest)
+      if again_ok then return "REPLAYED" end
+      return again.code
+    end })
+
+    bitty.events.subscribe("overlay.input.available", function(_event)
+      bitty.store.set("event_result", apply())
+      -- Post-apply work the dashboard also does (rebuild rows, render, paint):
+      -- this is what reaches a slice boundary after the write.
+      local total = 0
+      for i = 1, 20000 do
+        total = total + i
+      end
+      bitty.store.set("post_work", total)
+    end)
+
+    bitty.timers.create(10, function()
+      bitty.store.set("timer_fired", true)
+    end)
+    return {}
+    "##;
+
+    const OVERLAY_COMMANDS: &[&str] = &["apply", "enable", "replay"];
+
+    fn write_overlay_package(store: &Path, id: &str) -> PluginRecord {
+        let version = "0.1.0";
+        let relative = format!("packages/{id}/{version}");
+        let package_root = store.join(&relative);
+        write_package_at(
+            &package_root,
+            id,
+            &["config.manage", "ui.overlay.focus"],
+            OVERLAY_COMMANDS,
+            OVERLAY_PROBE,
+        );
+        // The probe subscribes to the capture nudge during activation.
+        let manifest_path = package_root.join("bitty-plugin.toml");
+        let manifest = std::fs::read_to_string(&manifest_path).expect("manifest");
+        std::fs::write(
+            &manifest_path,
+            format!("{manifest}events = [\"overlay.input.available\"]\n"),
+        )
+        .expect("manifest events");
+        let manifest_bytes = std::fs::read(&manifest_path).expect("manifest bytes");
+        let manifest = manifest_toml::parse_manifest(&manifest_bytes).expect("manifest parses");
+        PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: version.to_string(),
+            root: relative,
+            manifest_hash: manifest.manifest_hash(),
+            content_digest: content_digest(&package_root).expect("content digest"),
+            enabled: true,
+            granted: vec![
+                String::from("config.manage"),
+                String::from("ui.overlay.focus"),
+            ],
+        }
+    }
+
+    /// Production RC-1 budgets: the regression is about the real per-tick
+    /// wall limit, so the harness seams (which widen it to the callback
+    /// ceiling) must not be installed.
+    fn overlay_runtime(backend: Rc<SlowWriteBackend>) -> (PluginRuntime, PluginId) {
+        let store = temp_dir("overlay-credit-store");
+        let record = write_overlay_package(&store, OVERLAY_ID);
+        write_index(&store, &[record]).expect("store index");
+        let mut rt = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(temp_dir("overlay-credit-state")),
+            store_root: Some(store),
+            bundled_roots: Vec::new(),
+            third_party_roots: Vec::new(),
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(NoSnapshot),
+        });
+        rt.set_config_write_backend(Some(backend));
+        common::install_stub_backend(&mut rt);
+        rt.discover();
+        for (id, result) in rt.activate_discovered() {
+            result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+        }
+        let id = pid(OVERLAY_ID);
+        assert_eq!(
+            rt.state(&id),
+            Some(&LifecycleState::Active),
+            "the probe must activate"
+        );
+        (rt, id)
+    }
+
+    fn store_string(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<String> {
+        rt.services(id)
+            .and_then(|services| services.with_store(|store| store.get(key)))
+            .and_then(|value| match value {
+                LuaValue::String(text) => Some(text),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn a_slow_value_write_from_an_overlay_keeps_the_overlay_and_the_generation() {
+        // The durable write takes 60 ms, past the 50 ms per-tick budget, and
+        // the handler then does dashboard-shaped post-work. Before the
+        // config-write credit this suspended the VM; the timer pump below
+        // then terminally failed the generation and released the capture.
+        let backend = Rc::new(SlowWriteBackend::new(60, false, false));
+        let (mut rt, id) = overlay_runtime(Rc::clone(&backend));
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "init.lua holds the capture"
+        );
+
+        let delivered = rt.deliver_event(
+            "overlay.input.available",
+            &LuaValue::table([("owner", LuaValue::String(OVERLAY_ID.to_string()))]),
+        );
+        assert_eq!(delivered, 1, "the capture handler ran");
+        assert_eq!(
+            store_string(&rt, &id, "event_result").as_deref(),
+            Some("true|auto"),
+            "a live-adoptable value reports the automatic reload"
+        );
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "the write must not release the overlay capture"
+        );
+        assert_eq!(
+            rt.state(&id),
+            Some(&LifecycleState::Active),
+            "the committed write must not suspend the generation"
+        );
+
+        // The dashboard keeps a re-arm timer; its next cold drive is the
+        // place a suspended VM would be terminally failed.
+        let fired =
+            rt.pump_due_timers_at(std::time::Instant::now() + std::time::Duration::from_millis(50));
+        assert_eq!(fired, 1, "the keep-alive timer fired");
+        assert_eq!(
+            rt.state(&id),
+            Some(&LifecycleState::Active),
+            "the generation survives the timer drive"
+        );
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "the overlay still owns the capture after the reload tick"
+        );
+        assert_eq!(backend.calls.borrow().len(), 1, "exactly one write landed");
+    }
+
+    #[test]
+    fn a_value_the_running_plan_cannot_adopt_reports_restart() {
+        // bitty#2972: a persisted value with no live adopter must not be
+        // reported as an `auto` adoption.
+        let backend = Rc::new(SlowWriteBackend::new(0, true, false));
+        let (mut rt, id) = overlay_runtime(Rc::clone(&backend));
+        let out = common::settle_dispatch(&mut rt, &id, "apply", &[]).expect_string("apply");
+        assert_eq!(out, "true|restart");
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "a restart-required write still leaves the panel open"
+        );
+        assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    }
+
+    #[test]
+    fn a_plugin_set_write_reports_restart_and_keeps_the_overlay() {
+        let backend = Rc::new(SlowWriteBackend::new(0, false, false));
+        let (mut rt, id) = overlay_runtime(Rc::clone(&backend));
+        let out = common::settle_dispatch(&mut rt, &id, "enable", &[]).expect_string("enable");
+        assert_eq!(
+            out, "true|restart",
+            "the ledger is read at activation, so an applied toggle needs a restart"
+        );
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "the panel survives a plugin-set write"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_and_a_replayed_digest_keep_the_overlay_open() {
+        // A stale candidate refuses with the typed error and no write.
+        let backend = Rc::new(SlowWriteBackend::new(0, false, true));
+        let (mut rt, id) = overlay_runtime(Rc::clone(&backend));
+        let out = common::settle_dispatch(&mut rt, &id, "apply", &[]).expect_string("apply");
+        assert_eq!(out, "ERR:E_CONFIG_STALE");
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "a refused write must leave the overlay open with the typed error"
+        );
+        assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+
+        // A replayed one-shot digest refuses with the approval error.
+        let backend = Rc::new(SlowWriteBackend::new(0, false, false));
+        let (mut rt, id) = overlay_runtime(Rc::clone(&backend));
+        let out = common::settle_dispatch(&mut rt, &id, "replay", &[]).expect_string("replay");
+        assert_eq!(out, "E_CONFIG_APPROVAL_REQUIRED");
+        assert!(
+            rt.overlay_capture().borrow().is_active(),
+            "a replayed digest must leave the overlay open"
+        );
+        assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    }
 }

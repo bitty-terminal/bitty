@@ -310,8 +310,21 @@ impl ConfigWriteBackend for AppConfigManage {
         change: &ConfigChange,
         expected_candidate_digest: &str,
     ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
-        self.writer()
-            .apply(plugin_id, change, expected_candidate_digest)
+        match self
+            .writer()
+            .apply(plugin_id, change, expected_candidate_digest)?
+        {
+            // bitty#2972: report what the running process will actually do
+            // with the written value. The scalar writer has no reload context
+            // of its own, so the classification comes from the same shared
+            // policy the reload engine uses (field class + adopter list): a
+            // value the running plan cannot adopt live stays restart-pending
+            // instead of being reported as an `auto` adoption.
+            ConfigApplyOutcome::Applied { .. } => Ok(ConfigApplyOutcome::Applied {
+                pending_restart: !crate::config_reload::field_adopted_live(change.key()),
+            }),
+            ConfigApplyOutcome::Unchanged => Ok(ConfigApplyOutcome::Unchanged),
+        }
     }
 
     fn config_get(&self, _plugin_id: &str, key: &str) -> Result<ConfigValueRow, ConfigReadFailure> {
@@ -1158,6 +1171,52 @@ mod tests {
             opacity.value,
             ConfigReadValue::Number(0.9),
             "reads never follow a switch the runtime did not adopt"
+        );
+        crate::config_reload::clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scalar_write_reports_whether_the_running_plan_adopts_it_live() {
+        // bitty#2972: the `config.set` reply must describe what the running
+        // process will actually do. A live-class value reports no pending
+        // restart; a restart-class value stays pending instead of being
+        // reported as an automatic live adoption.
+        let dir = scratch("scalar-class");
+        std::fs::write(dir.join("init.lua"), "return {}\n").expect("layer");
+        crate::config_reload::clear();
+        let backend = backend(&dir, None);
+
+        let theme = ConfigChange::new(
+            writable_setting("appearance.theme").expect("allowlisted"),
+            bitty_runtime::plugin_runtime::ConfigSettingValue::text("dracula").expect("text"),
+        );
+        let preview = backend.preview("p", &theme).expect("theme preview");
+        assert_eq!(
+            backend
+                .apply("p", &theme, &preview.candidate_digest)
+                .expect("theme apply"),
+            ConfigApplyOutcome::Applied {
+                pending_restart: false
+            },
+            "appearance.theme is adopted live by the running plan"
+        );
+
+        let scrollback = ConfigChange::new(
+            writable_setting("terminal.scrollback").expect("allowlisted"),
+            bitty_runtime::plugin_runtime::ConfigSettingValue::integer(20_000).expect("integer"),
+        );
+        let preview = backend
+            .preview("p", &scrollback)
+            .expect("scrollback preview");
+        assert_eq!(
+            backend
+                .apply("p", &scrollback, &preview.candidate_digest)
+                .expect("scrollback apply"),
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "terminal.scrollback is persisted but needs a restart"
         );
         crate::config_reload::clear();
         let _ = std::fs::remove_dir_all(dir);

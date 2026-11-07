@@ -16,6 +16,7 @@
 //! | `limit`                  | `1..=256` | [`KeymapQuery::new`] |
 //! | `chord`                  | 1..=64 bytes | [`KeymapRow::new`] |
 //! | `action`                 | 1..=320 bytes | [`KeymapRow::new`] |
+//! | `action` carrying args   | 1..=[`KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES`] bytes | [`KeymapRow::new`] |
 //! | `title`                  | 0..=128 characters | [`KeymapRow::new`] |
 //! | `command`                | 1..=257 bytes | [`KeymapRow::new`] |
 //! | calls per generation     | 16 / s | host call budget |
@@ -31,8 +32,11 @@
 //! malformed row is dropped instead of echoed. `chord`, `action`, and
 //! `command` are canonical single-line spellings; a control character, an
 //! embedded newline, or an over-bound value drops the whole row (truncating
-//! one would advertise a different binding). `title` is display-only: it is
-//! stripped to one bounded line and never drops the binding.
+//! one would advertise a different binding). The one exception is the JSON
+//! args document inside a `command:` action, which is data and may contain
+//! spaces; it must still be single-line and inside its own bound, and the
+//! action's pre-separator half must match `command`. `title` is display-only:
+//! it is stripped to one bounded line and never drops the binding.
 
 use crate::host::{BridgeError, LuaValue};
 
@@ -60,6 +64,11 @@ pub const KEYMAP_LIST_MAX_BYTES: usize = 64 * 1024;
 pub const KEYMAP_LIST_CHORD_MAX_BYTES: usize = 64;
 
 /// Maximum bytes of one canonical action.
+///
+/// Every closed-catalog spelling stays inside this bound; a `command:` action
+/// that carries a JSON args document is bounded by
+/// [`KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES`] instead (the document is data, not
+/// a token).
 pub const KEYMAP_LIST_ACTION_MAX_BYTES: usize = 320;
 
 /// Maximum characters of one static action title.
@@ -67,6 +76,28 @@ pub const KEYMAP_LIST_TITLE_MAX_CHARS: usize = 128;
 
 /// Maximum bytes of one qualified command target.
 pub const KEYMAP_LIST_COMMAND_MAX_BYTES: usize = 257;
+
+/// Separator between a `command:` target and the JSON args document it
+/// carries (`command:<owner:command> -- '{"a":1}'`).
+///
+/// Mirrors `bitty_config::keymap::INVOKE_ARGS_SEPARATOR`; this crate has no
+/// dependency on `bitty-config`, so the value is repeated and pinned by a test.
+pub const KEYMAP_LIST_COMMAND_ARGS_SEPARATOR: &str = " -- ";
+
+/// Maximum bytes of one JSON args document carried by a `command:` row.
+///
+/// Mirrors `bitty_config::keymap::MAX_INVOKE_ARGS_BYTES` (the binding surface
+/// bound, which is itself a strict subset of the CLI's bulk bound).
+pub const KEYMAP_LIST_ARGS_MAX_BYTES: usize = 4096;
+
+/// Maximum bytes of one canonical `command:` action that carries an args
+/// document: `command:` + target + separator + blob.
+///
+/// Mirrors `bitty_config::keymap::MAX_COMMAND_ACTION_LEN`.
+pub const KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES: usize = "command:".len()
+    + KEYMAP_LIST_COMMAND_MAX_BYTES
+    + KEYMAP_LIST_COMMAND_ARGS_SEPARATOR.len()
+    + KEYMAP_LIST_ARGS_MAX_BYTES;
 
 /// Maximum accepted calls per second per plugin generation.
 pub const KEYMAP_LIST_CALLS_PER_SECOND: u32 = 16;
@@ -148,7 +179,8 @@ impl KeymapQuery {
 pub struct KeymapRow {
     /// Canonical chord spelling (`alt+h`, `ctrl+shift+v`, ...).
     pub chord: String,
-    /// Canonical action spelling (`goto_split:left`, `command:owner:cmd`).
+    /// Canonical action spelling (`goto_split:left`,
+    /// `command:owner:cmd`, `command:owner:cmd -- {"a":1}`).
     pub action: String,
     /// `"default"` or `"user"`.
     pub source: String,
@@ -164,13 +196,16 @@ impl KeymapRow {
     /// Validate and build one row.
     ///
     /// Returns `None` — the row is dropped, never echoed — when the canonical
-    /// `chord`, `action`, or `command` is empty, over its byte bound, or
-    /// carries a control character or whitespace, when `source`/`context` is
-    /// outside the closed set, or when the `title`/`command` shape does not
-    /// match the action. `title` is display-only and optional: an over-long or
-    /// multi-line value is stripped and truncated to one bounded line instead
-    /// of dropping the binding. The checks are defensive: the host builds rows
-    /// from its validated chord, action, and context types.
+    /// `chord` is empty, over its byte bound, or carries a control character
+    /// or whitespace; when a closed-catalog `action` is not one such token;
+    /// when a `command:` action is over its bound, carries a control character
+    /// in its args text, or does not name the row's `command` in its
+    /// pre-separator half; when `source`/`context` is outside the closed set;
+    /// or when the `title`/`command` shape does not match the action. `title`
+    /// is display-only and optional: an over-long or multi-line value is
+    /// stripped and truncated to one bounded line instead of dropping the
+    /// binding. The checks are defensive: the host builds rows from its
+    /// validated chord, action, and context types.
     #[must_use]
     pub fn new(
         chord: impl Into<String>,
@@ -187,8 +222,32 @@ impl KeymapRow {
         if !valid_token(&chord, KEYMAP_LIST_CHORD_MAX_BYTES) {
             return None;
         }
-        if !valid_token(&action, KEYMAP_LIST_ACTION_MAX_BYTES) {
-            return None;
+        // The action shape decides which rule applies. A closed-catalog
+        // spelling is one whitespace-free token; a `command:` action may carry
+        // a JSON args document (`command:<target> -- '{"a":1}'`), whose text
+        // legitimately contains spaces (issue #2965). Every `command:` row must
+        // still name its target in `command`, and that target must match the
+        // pre-separator half exactly.
+        match action.strip_prefix("command:") {
+            Some(tail) => {
+                let Some(target) = command.as_deref() else {
+                    // `command:` without a target: drop the row.
+                    return None;
+                };
+                if !valid_token(target, KEYMAP_LIST_COMMAND_MAX_BYTES) {
+                    return None;
+                }
+                if !valid_command_action(&action, tail, target) {
+                    return None;
+                }
+            }
+            None => {
+                // A `command` field on a Core action, or a Core action that is
+                // not a single token, drops the row.
+                if command.is_some() || !valid_token(&action, KEYMAP_LIST_ACTION_MAX_BYTES) {
+                    return None;
+                }
+            }
         }
         if source != KEYMAP_SOURCE_DEFAULT && source != KEYMAP_SOURCE_USER {
             return None;
@@ -201,18 +260,6 @@ impl KeymapRow {
         // dropping a real binding. Chord, action, and command stay strict:
         // truncating any of those would advertise a different binding.
         let title = title.as_deref().and_then(sanitize_title);
-        match (action.strip_prefix("command:"), command.as_deref()) {
-            (Some(target), Some(command)) if target == command => {
-                if !valid_token(command, KEYMAP_LIST_COMMAND_MAX_BYTES) {
-                    return None;
-                }
-            }
-            (None, None) => {}
-            // `command:` without a target, a target without `command:`, a
-            // mismatched target, or a command field on a Core action all fail
-            // closed: the row is dropped.
-            _ => return None,
-        }
         Some(Self {
             chord,
             action,
@@ -408,6 +455,29 @@ fn valid_token(value: &str, max: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+}
+
+/// Validate the half of a `command:` action after `command:`.
+///
+/// `tail` is either the bare target (`owner:command`, must equal `target`) or
+/// `<target><separator><json>` (the pre-separator half must equal `target`).
+/// The args text is data, so spaces are allowed inside it; it still has to be
+/// non-empty, single-line (no control character), inside
+/// [`KEYMAP_LIST_ARGS_MAX_BYTES`], and the whole action inside
+/// [`KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES`].
+fn valid_command_action(action: &str, tail: &str, target: &str) -> bool {
+    if action.len() > KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES {
+        return false;
+    }
+    match tail.split_once(KEYMAP_LIST_COMMAND_ARGS_SEPARATOR) {
+        Some((bare, blob)) => {
+            bare == target
+                && !blob.is_empty()
+                && blob.len() <= KEYMAP_LIST_ARGS_MAX_BYTES
+                && !blob.chars().any(char::is_control)
+        }
+        None => tail == target,
+    }
 }
 
 /// Canonical single-line title: control characters become spaces, the result
@@ -707,6 +777,68 @@ mod tests {
     }
 
     #[test]
+    fn command_rows_with_an_args_document_are_kept() {
+        // Issue #2965 review: `keymap_row` feeds the canonical action (which
+        // now contains `" -- "`) into `KeymapRow::new`, so a whitespace-only
+        // token rule silently dropped every argument-carrying binding from
+        // `bitty.keymaps.list()`. The row must survive with the action
+        // verbatim and the bare target in `command`.
+        let target = "bitty-featured.search:search";
+        let action = format!(r#"command:{target} -- {{"needle":"a b"}}"#);
+        let row = KeymapRow::new(
+            "alt+g",
+            action.clone(),
+            KEYMAP_SOURCE_USER,
+            KEYMAP_CONTEXT_GLOBAL,
+            None,
+            Some(target.to_string()),
+        )
+        .expect("an argument-carrying binding must keep its row");
+        assert_eq!(row.action, action);
+        assert_eq!(row.command.as_deref(), Some(target));
+        assert!(row.title.is_none());
+
+        // The mirrored bounds are the binding surface's, not the CLI's.
+        assert_eq!(KEYMAP_LIST_ARGS_MAX_BYTES, 4096);
+        assert_eq!(KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES, 4365);
+
+        // A row at exactly the composed bound is kept: 128-byte owner plus
+        // 128-byte command plus a full-size args document.
+        let long_target = format!("{}:{}", "o".repeat(128), "c".repeat(128));
+        assert_eq!(long_target.len(), KEYMAP_LIST_COMMAND_MAX_BYTES);
+        let widest = format!(
+            r#"command:{long_target} -- {{"a":"{}"}}"#,
+            "x".repeat(KEYMAP_LIST_ARGS_MAX_BYTES - 8)
+        );
+        assert_eq!(widest.len(), KEYMAP_LIST_COMMAND_ACTION_MAX_BYTES);
+        assert!(
+            KeymapRow::new(
+                "alt+g",
+                widest.clone(),
+                KEYMAP_SOURCE_USER,
+                KEYMAP_CONTEXT_GLOBAL,
+                None,
+                Some(long_target.clone()),
+            )
+            .is_some(),
+            "a row at exactly the composed bound is kept"
+        );
+        // One byte past it is not.
+        assert!(
+            KeymapRow::new(
+                "alt+g",
+                format!("{widest}x"),
+                KEYMAP_SOURCE_USER,
+                KEYMAP_CONTEXT_GLOBAL,
+                None,
+                Some(long_target),
+            )
+            .is_none(),
+            "a row past the composed bound is dropped"
+        );
+    }
+
+    #[test]
     fn malformed_rows_are_rejected_instead_of_echoed() {
         let base = |chord: &str, action: &str| {
             KeymapRow::new(
@@ -800,6 +932,36 @@ mod tests {
             )
             .is_none(),
             "command over bound"
+        );
+
+        // Issue #2965: the args spelling has its own failure modes.
+        let args_row = |action: &str, command: Option<&str>| {
+            KeymapRow::new(
+                "alt+g",
+                action,
+                KEYMAP_SOURCE_USER,
+                KEYMAP_CONTEXT_GLOBAL,
+                None,
+                command.map(str::to_string),
+            )
+        };
+        assert!(args_row(r#"command:owner:cmd -- {"a":1}"#, Some("owner:cmd")).is_some());
+        assert!(args_row("command:owner:cmd", Some("owner:cmd")).is_some());
+        assert!(
+            args_row(r#"command:owner:cmd -- {"a":1}"#, None).is_none(),
+            "command action without a target"
+        );
+        assert!(
+            args_row(r#"command:owner:cmd -- {"a":1}"#, Some("other:cmd")).is_none(),
+            "the pre-separator half must equal `command`"
+        );
+        assert!(
+            args_row("command:owner:cmd -- ", Some("owner:cmd")).is_none(),
+            "separator without a document"
+        );
+        assert!(
+            args_row("command:owner:cmd -- {\"a\":\n1}", Some("owner:cmd")).is_none(),
+            "a control character in the args text drops the row"
         );
     }
 }

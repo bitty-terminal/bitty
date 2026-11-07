@@ -16,6 +16,8 @@
 #     `.SRCINFO` via `makepkg --printsrcinfo`
 #   - `package()` installs the exact artifact declared by `[[bin]]` in
 #     `crates/bitty-terminal/Cargo.toml`, at `/usr/bin/bitty`
+#   - `package()` installs `bittyd` only when `build()` selects the separate
+#     `bitty-daemon` workspace package (bitty#2999, bitty#3002)
 #   - the recipe no longer references the retired `bitty-terminal` artifact path
 #   - every desktop/icon source referenced by `package()` exists
 #
@@ -70,6 +72,15 @@ grep -Fq "install -Dm755 \"$INSTALL_SRC\" \"\$pkgdir/usr/bin/bitty\"" "$RECIPE" 
 # Guard against the crate-named (un-renamed) artifact returning in package().
 if awk '/^package\(\)/,/^}/' "$RECIPE" | grep -Fq "target/release/$PACKAGE_NAME"; then
   fail "package() references the crate-named target/release/$PACKAGE_NAME artifact"
+fi
+
+# `bittyd` is a separate workspace package (crates/bitty-daemon). When
+# package() installs it, build() must select it: `-p bitty-terminal` alone
+# never produces target/release/bittyd (bitty#2999 shipped green because no
+# gate compared the install list with the build selection).
+if awk '/^package\(\)/,/^}/' "$RECIPE" | grep -Fq 'target/release/bittyd'; then
+  awk '/^build\(\)/,/^}/' "$RECIPE" | grep -Eq -- '-p[[:space:]]+bitty-daemon' ||
+    fail "package() installs bittyd but build() does not select -p bitty-daemon"
 fi
 
 # `test "$(./target/release/<bin> --version)" = "$pkgver"` must reference the

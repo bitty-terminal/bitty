@@ -74,7 +74,8 @@ run_leg() { # <label> <distro> <image> <source-basename> <install-fragment> <sel
 	args="$(cat "$args_file")"
 	local needle
 	for needle in 'run' '--rm' "$image" 'sh' '-euc' "$fragment" \
-		'bitty --version' 'bitty doctor' 'bitty --headless'; do
+		'bitty --version' 'bittyd --version' 'BITTYD_ENDPOINT' \
+		'bittyd start' 'bittyd stop' 'bitty doctor' 'bitty --headless'; do
 		if ! grep -qF -- "$needle" <<<"$args"; then
 			echo "FAIL: $label missing '$needle'" >&2
 			printf '%s\n' "$args" >&2

@@ -924,6 +924,69 @@ else
   fail "INSTALL.md or packaging/README.md does not reference the openSUSE recipe"
 fi
 
+# 11. Daemon coverage (bitty#3002, bitty#2999): a recipe that installs bittyd
+#     must select bitty-daemon in its build, so the install can never copy an
+#     artifact the build did not produce. Prebuilt recipes pass an empty build
+#     pattern: their payload is the release bundle, which
+#     scripts/make-unix-bundle.sh already asserts contains bin/bittyd.
+daemon_gate() { # <label> <file> <install-ere> <build-ere|"">
+  local label=$1 file=$2 install_ere=$3 build_ere=$4
+  if grep -Eq -- "$install_ere" "$file"; then
+    if [[ -n "$build_ere" ]] && ! grep -Eq -- "$build_ere" "$file"; then
+      fail "$label installs bittyd but never builds bitty-daemon"
+    else
+      pass "$label builds bitty-daemon before installing bittyd"
+    fi
+  else
+    fail "$label does not install bittyd (every Linux recipe ships the daemon)"
+  fi
+}
+
+daemon_gate "Arch source recipe" "$REPO_ROOT/packaging/PKGBUILD" \
+  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+daemon_gate "Alpine APKBUILD" "$ALPINE_APKBUILD" \
+  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+daemon_gate "openSUSE spec" "$OPENSPEC" \
+  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+daemon_gate "Void template" "$VOID_TEMPLATE" \
+  'crates/bitty-daemon' '\-p[[:space:]]+bitty-daemon'
+daemon_gate "Solus recipe" "$SOLUS_RECIPE" \
+  '%cargo_install[[:space:]].*bittyd' '\-\-package[[:space:]]+bitty-daemon'
+if [[ -n "$src_ebuild" ]]; then
+  daemon_gate "Gentoo source ebuild" "$src_ebuild" \
+    'cargo_src_install.*bitty-daemon' 'cargo_src_compile.*bitty-daemon'
+fi
+if [[ -n "$bin_ebuild" ]]; then
+  daemon_gate "Gentoo binary ebuild" "$bin_ebuild" \
+    'dobin[[:space:]].*bittyd' ''
+fi
+
+# The BSD ports cannot serve the daemon yet (contract D-15: FreeBSD has no peer
+# pid in xucred, NetBSD/OpenBSD are unlisted cells), so they ship the terminal
+# only. The omission must stay explicit: each recipe says why, and no plist
+# lists a binary the build never produces.
+for port in freebsd netbsd openbsd; do
+  case "$port" in
+  freebsd)
+    port_makefile="$FREEBSD_MAKEFILE"
+    port_plist="$FREEBSD_PLIST"
+    ;;
+  netbsd)
+    port_makefile="$NETBSD_MAKEFILE"
+    port_plist="$NETBSD_PLIST"
+    ;;
+  openbsd)
+    port_makefile="$OPENBSD_MAKEFILE"
+    port_plist="$OPENBSD_PLIST"
+    ;;
+  esac
+  expect "$port_makefile" '`bittyd` is deliberately not built or installed' \
+    "$port recipe documents why bittyd is not packaged"
+  expect "$port_makefile" 'D-15' "$port recipe cites the D-15 endpoint contract"
+  reject "$port_plist" '(^|[[:space:]])(@bin[[:space:]]+)?bin/bittyd' \
+    "$port package does not list an unbuilt bittyd"
+done
+
 if [[ "$FAIL" -ne 0 ]]; then
   echo "check-distro-recipes.test.sh: FAIL" >&2
   exit 1

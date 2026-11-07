@@ -39,6 +39,10 @@ else
   expect_contains "$FLAKE_CONTENT" "nixConfig = {" "flake.nix declares nixConfig"
   expect_contains "$FLAKE_CONTENT" "https://bitty.cachix.org" "flake.nix points to bitty.cachix.org substituter"
   expect_contains "$FLAKE_CONTENT" "bitty.cachix.org-1:yglUvUc8ehSxMCnU5t5p7Rer56pGE+TNI7/pWbWDdmc=" "flake.nix declares Cachix public key"
+  # bitty#3000: the daemon is a separate flake package, not a bin of the
+  # terminal derivation, so the release job must build it by its own attr.
+  expect_contains "$FLAKE_CONTENT" "bittyd = craneLib.buildPackage" "flake.nix declares the bittyd derivation"
+  expect_contains "$FLAKE_CONTENT" "bittyd = bittyd;" "flake.nix exposes bittyd as a package"
 fi
 
 # 2. Assert release.yml workflow integration
@@ -53,6 +57,10 @@ else
   expect_contains "$WORKFLOW_CONTENT" "CACHIX_AUTH_TOKEN" "release.yml binds CACHIX_AUTH_TOKEN secret"
   expect_contains "$WORKFLOW_CONTENT" "NIX_RESULT" "release.yml channel-summary handles NIX_RESULT"
   expect_contains "$WORKFLOW_CONTENT" "Nix Flake (Cachix)" "release.yml channel-summary labels Nix Flake (Cachix)"
+  # bitty#3000: the Cachix job must cache and verify the daemon, not only the
+  # terminal, or a consumer pulling .#bittyd gets an uncached derivation.
+  expect_contains "$WORKFLOW_CONTENT" "nix build .#bittyd" "release.yml builds the bittyd flake package"
+  expect_contains "$WORKFLOW_CONTENT" "result-bittyd/bin/bittyd" "release.yml verifies the cached bittyd binary"
 fi
 
 # 3. Assert packaging documentation
@@ -63,6 +71,9 @@ else
   DOC_CONTENT="$(cat "$NIX_DOC")"
   expect_contains "$DOC_CONTENT" "https://bitty.cachix.org" "nix.md documents Cachix URL"
   expect_contains "$DOC_CONTENT" "bitty.cachix.org-1:yglUvUc8ehSxMCnU5t5p7Rer56pGE+TNI7/pWbWDdmc=" "nix.md documents Cachix public key"
+  # bitty#3000: the companion package and the deliberate absence of a unit.
+  expect_contains "$DOC_CONTENT" ".#bittyd" "nix.md documents the companion bittyd package"
+  expect_contains "$DOC_CONTENT" "no systemd unit" "nix.md states that Nix ships no systemd unit"
 fi
 
 if [[ "$FAIL" -ne 0 ]]; then

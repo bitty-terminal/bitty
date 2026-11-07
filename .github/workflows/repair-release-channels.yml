@@ -400,12 +400,27 @@ jobs:
 
           echo "adopted newer validated flake.lock from ${DEFAULT_BRANCH}"
           echo "adopt=true" >> "$GITHUB_OUTPUT"
-      - name: Build and push Nix package to Cachix
+      - name: Build and push Nix packages to Cachix
         if: steps.lock.outputs.adopt == 'true'
-        run: nix build .#bitty --print-build-logs
-      - name: Verify build artifact
+        run: |
+          nix build .#bitty --print-build-logs
+          # Cache the daemon package too (bitty#3000); the flake ships it as a
+          # separate derivation.
+          nix build .#bittyd --print-build-logs --out-link result-bittyd
+      - name: Verify build artifacts
         if: steps.lock.outputs.adopt == 'true'
         run: |
           set -euo pipefail
           test -x result/bin/bitty
-          scripts/check-version-output.sh "${TAG#v}" result/bin/bitty
+          test -x result-bittyd/bin/bittyd
+          version="${TAG#v}"
+          scripts/check-version-output.sh "$version" result/bin/bitty
+          daemon_version="$(result-bittyd/bin/bittyd --version)"
+          case "$daemon_version" in
+            "bittyd ${version} "*) ;;
+            *)
+              echo "::error::bittyd --version does not report $version: $daemon_version" >&2
+              exit 1
+              ;;
+          esac
+          echo "bittyd --version => $daemon_version"

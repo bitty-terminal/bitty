@@ -66,7 +66,10 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
   nix run github:bitty-terminal/bitty
   ```
 
-  _(Binary cache on `bitty.cachix.org`, see [`packaging/nix.md`](packaging/nix.md))_
+  The flake also exposes the `bittyd` session daemon as a companion package
+  (`nix build .#bittyd`). Nix ships no systemd unit, so start `bittyd` from
+  your own supervisor. _(Binary cache on `bitty.cachix.org`, see
+  [`packaging/nix.md`](packaging/nix.md))_
 
 - **AppImage (Universal Portable Linux)**:
   Download `bitty-<target>.AppImage`, `chmod +x`, and run. _(See [`packaging/appimage.md`](packaging/appimage.md))_

@@ -2496,9 +2496,14 @@ fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
 
     let calls = transport.calls();
     assert!(calls.contains("fetch"), "{calls}");
+    let pin = bitty_plugin_host::official::official_plugins()
+        .iter()
+        .find(|entry| entry.id == "bitty-terminal.bar")
+        .expect("the bar entry is in the official catalog")
+        .pin;
     assert!(
-        calls.contains("0fa151395fe9d9d8b3b9dc4ba047eb13fa7b45c4"),
-        "{calls}"
+        calls.contains(pin),
+        "the catalog pin is fetched verbatim: {calls}"
     );
     assert!(
         !calls.contains("curl "),

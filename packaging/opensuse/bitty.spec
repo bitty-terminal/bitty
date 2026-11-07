@@ -49,8 +49,9 @@ Bitty is a programmable, microkernel terminal emulator built around a small
 Rust core and a two-tiered extension architecture. One binary carries the
 terminal, a pane multiplexer, a GPU-accelerated renderer, and Lua extensions.
 
-This package installs the desktop entry, AppStream metainfo, the hicolor icon
-set, and the compiled terminfo database next to the binary.
+This package installs the terminal and the `bittyd` session daemon with its
+per-user systemd unit, plus the desktop entry, AppStream metainfo, the hicolor
+icon set, and the compiled terminfo database.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -58,12 +59,19 @@ set, and the compiled terminfo database next to the binary.
 %build
 # Cargo.lock is committed and authoritative; cargo honors it by default and
 # the release CI enforces divergence with `--locked`. Kept identical to the
-# cargo invocation in packaging/bitty.spec.
-cargo build --release -p bitty-terminal --bin bitty
+# cargo invocation in packaging/bitty.spec. `bittyd` is a separate workspace
+# package (crates/bitty-daemon), so it needs its own package selection; both
+# binaries ship from this spec.
+cargo build --release -p bitty-terminal --bin bitty -p bitty-daemon --bin bittyd
 
 %install
 install -d %{buildroot}%{_bindir}
 install -m 0755 target/release/bitty %{buildroot}%{_bindir}/bitty
+install -m 0755 target/release/bittyd %{buildroot}%{_bindir}/bittyd
+
+install -d %{buildroot}%{_prefix}/lib/systemd/user
+install -m 0644 packaging/systemd/bittyd.service \
+    %{buildroot}%{_prefix}/lib/systemd/user/bittyd.service
 
 install -d %{buildroot}%{_datadir}/applications
 install -m 0644 packaging/run.bitty.Bitty.desktop \
@@ -90,6 +98,8 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 %license LICENSE
 %doc README.md CHANGELOG.md
 %{_bindir}/bitty
+%{_bindir}/bittyd
+%{_prefix}/lib/systemd/user/bittyd.service
 %{_datadir}/applications/run.bitty.Bitty.desktop
 %{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml
 %{_datadir}/icons/hicolor/16x16/apps/bitty.png

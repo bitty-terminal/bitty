@@ -41,7 +41,13 @@ expected — see `WINDOWS-SMARTSCREEN.md`.
 What each script installs:
 
 - Linux x86_64/aarch64 glibc and x86_64 musl: the versioned `.tar.zst`
-  bundle (binary, desktop entry, icons, AppStream metainfo).
+  bundle (`bin/bitty` and `bin/bittyd`, desktop entry, icons, AppStream
+  metainfo, and the per-user systemd unit). The binaries go to `--bin-dir`
+  (default `~/.local/bin`); the unit goes to
+  `$XDG_CONFIG_HOME/systemd/user/bittyd.service` (fallback
+  `~/.config/systemd/user/bittyd.service`), never under the data directory,
+  and is skipped with a message when `systemctl` is absent. A custom
+  `--bin-dir` without `--prefix` stays binary-only.
 - macOS x86_64/arm64: the bare per-arch binary (the DMG is interactive and
   unsuitable for headless install; the same binary is the Homebrew fetch
   artifact).

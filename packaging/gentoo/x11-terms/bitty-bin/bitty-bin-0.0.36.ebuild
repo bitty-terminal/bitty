@@ -15,7 +15,9 @@ SRC_URI="
 LICENSE="MIT OR Apache-2.0"
 SLOT="0"
 KEYWORDS="-* ~amd64 ~arm64"
-IUSE=""
+# OpenRC is the default profile; the per-user daemon unit only makes sense
+# under a systemd user manager, so it is gated instead of always installed.
+IUSE="systemd"
 
 # Direct NEEDED sonames only, aligned with packaging/linux/runtime-deps.toml:
 # libfontconfig.so.1 and libfreetype.so.6. libgcc_s.so.1 comes from the
@@ -32,7 +34,7 @@ BDEPEND="
 	sys-libs/ncurses
 "
 
-QA_PREBUILT="usr/bin/bitty"
+QA_PREBUILT="usr/bin/bitty usr/bin/bittyd"
 
 src_unpack() {
 	default
@@ -46,7 +48,14 @@ src_unpack() {
 src_install() {
 	cd "${S}" || die
 
-	dobin bin/bitty
+	dobin bin/bitty bin/bittyd
+
+	# OpenRC profiles have no systemd user manager: users supervise
+	# `bittyd start` themselves (or write an OpenRC service).
+	if use systemd; then
+		insinto /usr/lib/systemd/user
+		doins share/systemd/user/bittyd.service
+	fi
 
 	domenu share/applications/run.bitty.Bitty.desktop
 	insinto /usr/share/metainfo

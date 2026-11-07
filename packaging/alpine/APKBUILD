@@ -19,12 +19,16 @@ prepare() {
 }
 
 build() {
+	# `bittyd` is a separate workspace package (crates/bitty-daemon), so it is
+	# not built by `-p bitty-terminal`. Both binaries ship from this package.
 	RUSTFLAGS="-C target-feature=-crt-static" \
-	cargo auditable build --release --locked -p bitty-terminal
+	cargo auditable build --release --locked -p bitty-terminal -p bitty-daemon
 }
 
 check() {
 	./target/release/bitty --version
+	# `bittyd --version` prints "bittyd <version> (service API <version>)".
+	./target/release/bittyd --version | cut -d' ' -f1-2 | grep -Fx "bittyd $pkgver"
 }
 
 package() {

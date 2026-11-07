@@ -1461,10 +1461,10 @@ Corpus rules:
   `subreaper_fallback` records a typed
   `session.cleanup: requires-verified_cleanup_sweep` assertion skip while the
   re-read stability, retry, and no-revival assertions still run. That is the
-  GitHub-hosted runner's cell today: its job runs in a root-owned `system.slice`
-  cgroup the daemon's delegation probe refuses, so the natural-exit sweep stays
-  `unverified` by design (the evidence file's `containment.*` diagnostics name
-  the exact refusal); `V-21` serves
+  GitHub-hosted runner's cell today: its job cgroup is not delegated to the
+  runner uid, so the daemon's delegation probe refuses and the natural-exit
+  sweep stays `unverified` by design (the evidence file's `containment.*`
+  diagnostics name the exact refusal); `V-21` serves
   the retained backlog on a reattach; `V-28` scans for a TCP listener; `C-09`
   walks the scope matrix and the one-code-per-missing-authority rule; `C-14`
   proves the refusal flood is aggregated with its suppressed count and

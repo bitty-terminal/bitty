@@ -308,11 +308,13 @@ impl ContainedChild {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::process::Stdio;
     use std::time::Duration;
 
     use super::*;
     use crate::containment::CLEANUP_GROUP_SIGNALLED;
+    use crate::containment::macos_sys::{observe_leader, observe_leader_with_arg};
 
     fn report() -> ContainmentReport {
         ContainmentReport::process_group(PlatformCell::current())
@@ -381,7 +383,10 @@ mod tests {
     ///
     /// This is the macOS replacement for the FreeBSD `waitid(WNOWAIT)` probe:
     /// the plan has to observe the exit before it signals the recorded group,
-    /// and the status must still be collectable afterwards.
+    /// and the status must still be collectable afterwards. The failure message
+    /// prints the production probe and both `proc_pidinfo` `arg` values, so a
+    /// runner failure says whether the call failed, returned a live status, or
+    /// named a gone pid.
     #[test]
     fn a_zombie_leader_is_observed_exited_without_a_reap() {
         let report = report();
@@ -399,8 +404,24 @@ mod tests {
             SessionMode::ProcessGroup,
         )
         .expect("a contained spawn");
-        let observed = wait_bounded(limits().kill_wait(), limits(), || child.leader_exited());
-        assert!(observed, "the exited leader must read as a zombie");
+        let pid = child.pid();
+        let last = Cell::new(observe_leader(pid));
+        let observed = wait_bounded(limits().kill_wait(), limits(), || {
+            let observation = observe_leader(pid);
+            last.set(observation);
+            observation.proved_exit(pid)
+        });
+        // XNU's `arg` is the zombie selector: `proc_find` does not return a
+        // zombie, so `arg = 0` misses it while `arg = 1` uses
+        // `proc_find_zombref`. Report both on failure.
+        let without_zombie_selector = observe_leader_with_arg(pid, 0);
+        let with_zombie_selector = observe_leader_with_arg(pid, 1);
+        assert!(
+            observed,
+            "the exited leader must read as a zombie: production probe {last}; \
+             arg=0 {without_zombie_selector}; arg=1 {with_zombie_selector}; pid {pid}",
+            last = last.get()
+        );
         // The peek did not reap it, so the handle still collects the status.
         let status = child.wait().expect("reap the leader");
         assert!(status.success(), "the leader exited cleanly");

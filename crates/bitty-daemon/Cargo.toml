@@ -77,6 +77,19 @@ zeroize = "1.9"
 # Windows compiles the typed UnsupportedPlatform path and links no nix code.
 nix = { workspace = true, features = ["fs", "poll", "process", "resource", "signal", "socket", "term", "uio", "user"] }
 
+[target.'cfg(target_os = "freebsd")'.dependencies]
+# bitty#2949: `PROC_REAP_*` has no safe wrapper in `nix` 0.31; the private
+# `freebsd_sys` module calls the workspace `libc` 0.2 `procctl` symbol. The
+# crate root keeps `#![deny(unsafe_code)]`; only that module is allowed it.
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# bitty#2949: one kill-on-close job object per session is the Windows
+# containment identity. The reviewed Win32 FFI stays in `bitty-winjob`; the
+# daemon only composes its safe API (probe, assign-before-resume, terminate,
+# and the active-process count that backs the `swept` claim).
+bitty-winjob = { version = "0.0.35", path = "../bitty-winjob" }
+
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The
 # 3.27.0 line is already in the workspace lockfile (through `proptest`), so

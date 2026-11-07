@@ -24,11 +24,14 @@
 //!
 //! # Still deferred
 //!
-//! The executable path digest and a native Windows job-object implementation
-//! remain out of this slice; the journal carries no argv or executable path.
-//! On non-Linux cells the boot id and `/proc` probe are unavailable, so every
-//! record is quarantined; Unix enforces `0700`/`0600` here, and the Windows
-//! owner-only runtime directory ACL is owned by the endpoint slice.
+//! The executable path digest remains out of this slice; the journal carries
+//! no argv or executable path. On non-Linux cells the boot id and `/proc`
+//! probe are unavailable, so every record is quarantined; Unix enforces
+//! `0700`/`0600` here, and the Windows owner-only runtime directory ACL is
+//! owned by the endpoint slice. The Windows job-object record and the
+//! FreeBSD/macOS process-group records are durable mechanism names only: the
+//! job handle is process-local and the group is not observable without the
+//! platform's own probe, so those records never become actionable.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -520,6 +523,20 @@ fn containment_field(containment: Option<&ContainmentRecord>) -> Option<String> 
             }
             Some(format!("cgroup {text}"))
         }
+        Some(ContainmentRecord::WindowsJob) => Some("windows_job".to_owned()),
+        Some(ContainmentRecord::FreebsdReaper { process_group }) => {
+            Some(encode_group("freebsd_reaper", *process_group))
+        }
+        Some(ContainmentRecord::ProcessGroup { process_group }) => {
+            Some(encode_group("process_group", *process_group))
+        }
+    }
+}
+
+fn encode_group(mechanism: &str, process_group: Option<ProcessGroupId>) -> String {
+    match process_group {
+        Some(group) => format!("{mechanism} {}", group.get()),
+        None => mechanism.to_owned(),
     }
 }
 
@@ -530,11 +547,34 @@ fn parse_containment(value: &str) -> Option<Option<ContainmentRecord>> {
     if value == "subreaper" {
         return Some(Some(ContainmentRecord::Subreaper));
     }
+    if value == "windows_job" {
+        return Some(Some(ContainmentRecord::windows_job()));
+    }
+    if let Some(group) = parse_group("freebsd_reaper", value) {
+        return Some(Some(ContainmentRecord::freebsd_reaper(group)));
+    }
+    if let Some(group) = parse_group("process_group", value) {
+        return Some(Some(ContainmentRecord::process_group(group)));
+    }
     let path = value.strip_prefix("cgroup ")?;
     if !valid_recorded_path(path) {
         return None;
     }
     Some(Some(ContainmentRecord::cgroup(path)))
+}
+
+/// Parse `"<mechanism>"` or `"<mechanism> <pgid>"`.
+fn parse_group(mechanism: &str, value: &str) -> Option<Option<ProcessGroupId>> {
+    let rest = value.strip_prefix(mechanism)?;
+    if rest.is_empty() {
+        return Some(None);
+    }
+    let digits = rest.strip_prefix(' ')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let raw: u32 = digits.parse().ok()?;
+    Some(Some(ProcessGroupId::new(raw)?))
 }
 
 fn valid_recorded_path(path: &str) -> bool {
@@ -937,11 +977,11 @@ impl OrphanJournal {
     /// Settle the record of a worker whose terminal transition was recorded.
     ///
     /// The cleanup class is the contract's own classification: `not_started`
-    /// (nothing was spawned) and `swept` (the whole cgroup subtree verified
-    /// empty and was removed) release the slot; `unverified` keeps the record
-    /// as a quarantine so an unprovable tree is never silently forgotten. A
-    /// missing record is a no-op, so the caller can settle twice without an
-    /// error.
+    /// (nothing was spawned) and `swept` (the whole containment identity
+    /// verified empty) release the slot; `group-signalled` and `unverified`
+    /// keep the record as a quarantine, because a signalled process group does
+    /// not prove a reparented or re-sessioned descendant is gone. A missing
+    /// record is a no-op, so the caller can settle twice without an error.
     ///
     /// # Errors
     ///
@@ -954,10 +994,12 @@ impl OrphanJournal {
     ) -> Result<(), JournalError> {
         match cleanup {
             CleanupClass::NotStarted | CleanupClass::Swept => self.remove(session_id),
-            CleanupClass::Unverified => match self.records.get(&session_id).cloned() {
-                Some(record) => self.quarantine(record, now),
-                None => Ok(()),
-            },
+            CleanupClass::GroupSignalled | CleanupClass::Unverified => {
+                match self.records.get(&session_id).cloned() {
+                    Some(record) => self.quarantine(record, now),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -1098,6 +1140,14 @@ fn classify(
                 containment,
             ))
         }
+        // The Windows job handle is process-local and the FreeBSD/macOS
+        // process-group records are not observable through `/proc`. This
+        // classifier only produces an exact identity on Linux, so a record
+        // from one of these mechanisms is never actionable: keep it
+        // quarantined rather than guessing at a pid.
+        ContainmentRecord::WindowsJob
+        | ContainmentRecord::FreebsdReaper { .. }
+        | ContainmentRecord::ProcessGroup { .. } => Disposition::Unverified,
     }
 }
 
@@ -1270,6 +1320,37 @@ mod tests {
 
     fn subreaper() -> ContainmentRecord {
         ContainmentRecord::Subreaper
+    }
+
+    #[test]
+    fn every_containment_record_round_trips_through_the_journal_field() {
+        let group = ProcessGroupId::new(4242).expect("positive group");
+        for record in [
+            containment(),
+            subreaper(),
+            ContainmentRecord::windows_job(),
+            ContainmentRecord::freebsd_reaper(None),
+            ContainmentRecord::freebsd_reaper(Some(group)),
+            ContainmentRecord::process_group(None),
+            ContainmentRecord::process_group(Some(group)),
+        ] {
+            let field = containment_field(Some(&record)).expect("the record encodes");
+            assert_eq!(
+                parse_containment(&field),
+                Some(Some(record.clone())),
+                "field {field:?} must round-trip"
+            );
+        }
+        // A zero group is not a group, and a truncated or over-long value is
+        // not a record.
+        for value in ["process_group 0", "process_group", "windows_job 1"] {
+            let parsed = parse_containment(value);
+            if value == "process_group" {
+                assert_eq!(parsed, Some(Some(ContainmentRecord::process_group(None))));
+            } else {
+                assert_eq!(parsed, None, "{value:?} is not a record");
+            }
+        }
     }
 
     fn limits(
@@ -1473,6 +1554,45 @@ mod tests {
             "a quarantined terminal record is never signalled"
         );
         assert_eq!(history.counts().unverified, 1);
+    }
+
+    #[test]
+    fn a_group_signalled_settle_quarantines_instead_of_releasing() {
+        let directory = TempDir::new().expect("temp dir");
+        let mut history = journal_in(&directory);
+        let session_id = session(0x24);
+        let process = identity(4242, 987_654, 4242);
+        history
+            .reserve(
+                session_id,
+                1,
+                MonotonicMs::from_millis(1),
+                ContainmentRecord::process_group(None),
+            )
+            .expect("reserve succeeds");
+        history
+            .commit(session_id, process)
+            .expect("commit succeeds");
+        history
+            .settle(
+                session_id,
+                CleanupClass::GroupSignalled,
+                MonotonicMs::from_millis(2),
+            )
+            .expect("settle succeeds");
+        assert_eq!(
+            history.counts(),
+            OrphanCounts {
+                reserved: 0,
+                committed: 0,
+                unverified: 1
+            },
+            "a signalled group is not a verified whole-tree sweep"
+        );
+        assert!(
+            history.contains(session_id),
+            "the record stays quarantined, never silently released"
+        );
     }
 
     #[test]

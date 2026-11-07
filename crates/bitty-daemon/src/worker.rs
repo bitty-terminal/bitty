@@ -286,6 +286,9 @@ pub fn planned_record(
             Some(root) => ContainmentRecord::cgroup(root.join(cgroup_name(instance, session))),
             None => ContainmentRecord::Subreaper,
         },
+        ContainmentKind::WindowsJob => ContainmentRecord::windows_job(),
+        ContainmentKind::FreebsdReaper => ContainmentRecord::freebsd_reaper(None),
+        ContainmentKind::ProcessGroup => ContainmentRecord::process_group(None),
         _ => ContainmentRecord::Subreaper,
     }
 }

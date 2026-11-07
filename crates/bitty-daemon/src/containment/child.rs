@@ -13,187 +13,31 @@
 //! pid it did not record.
 
 use std::collections::BTreeSet;
-use std::fmt;
 use std::fs::{File, read_dir, read_to_string};
 use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 
 use crate::containment::cgroup::{CgroupError, CgroupRoot, SessionCgroup};
 use crate::containment::linux_sys::{self, PidFd};
-use crate::containment::subreaper::{SubreaperGuard, SubreaperRefusal};
+use crate::containment::posix::{
+    drain_adopted, drain_group, forget_child, group_has_members, remember_child,
+};
+use crate::containment::subreaper::SubreaperGuard;
 use crate::containment::{
-    ContainmentKind, ContainmentLimits, ContainmentRecord, ContainmentRefusal, ContainmentReport,
-    ExecRefusal,
+    CleanupOutcome, ContainmentError, ContainmentKind, ContainmentLimits, ContainmentRecord,
+    ContainmentRefusal, ContainmentReport, SessionMode, classify_spawn_error, wait_bounded,
 };
 use crate::orphan::identity::{ProcessGroupId, ProcessIdentity, ProcessObservation, observe};
 use crate::registry::CleanupClass;
 
-/// Pids owned by a live [`ContainedChild`] handle. The fallback reaper uses
-/// this to avoid reaping another session's child while draining adopted
-/// grandchildren.
-static LIVE_CHILDREN: LazyLock<Mutex<BTreeSet<u32>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
-
-/// A spawn failure. Every variant refuses the spawn; none leaves an
-/// uncontained child running.
-#[derive(Debug)]
-pub enum ContainmentError {
-    /// The probe selected no mechanism.
-    Refused(ContainmentRefusal),
-    /// The cgroup plan failed before a child existed.
-    Cgroup(CgroupError),
-    /// The subreaper fallback is unavailable.
-    Subreaper(SubreaperRefusal),
-    /// `spawn` itself failed; no child was created.
-    Spawn(io::Error),
-    /// `exec` refused the program (`EACCES`, `ENOEXEC`, or `ENOENT`). No child
-    /// ran, so this is a distinct typed refusal instead of an untyped spawn
-    /// error (bitty#2790).
-    Exec(ExecRefusal),
-    /// The child's `/proc` identity could not be observed. The child existed
-    /// and was terminated; the carried class is what the cleanup could prove
-    /// (`unverified` for the process-group plan).
-    IdentityUnavailable(CleanupClass),
-    /// The child ran but was outside the session's cgroup subtree. The child
-    /// existed and was terminated; the carried class is what the cleanup could
-    /// prove (`swept` or `unverified`).
-    Uncontained(CleanupClass),
-}
-
-impl ContainmentError {
-    /// The cleanup class observed while the failed spawn was abandoned.
-    ///
-    /// A refusal, a pre-fork failure, an `exec` refusal, or an unavailable
-    /// mechanism started nothing ([`CleanupClass::NotStarted`]); a failure
-    /// after the fork reports what the plan could prove about the child it
-    /// killed.
-    #[must_use]
-    pub const fn cleanup(&self) -> CleanupClass {
-        match self {
-            Self::Refused(_)
-            | Self::Cgroup(_)
-            | Self::Subreaper(_)
-            | Self::Spawn(_)
-            | Self::Exec(_) => CleanupClass::NotStarted,
-            Self::IdentityUnavailable(cleanup) | Self::Uncontained(cleanup) => *cleanup,
-        }
-    }
-}
-
-impl fmt::Display for ContainmentError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Refused(refusal) => write!(formatter, "containment refused: {refusal}"),
-            Self::Cgroup(error) => write!(formatter, "cgroup containment failed: {error}"),
-            Self::Subreaper(error) => write!(formatter, "subreaper unavailable: {error}"),
-            Self::Spawn(error) => write!(formatter, "spawn failed: {error}"),
-            Self::Exec(refusal) => write!(formatter, "{refusal}"),
-            Self::IdentityUnavailable(cleanup) => write!(
-                formatter,
-                "spawned child identity could not be observed; cleanup {}",
-                cleanup.as_str()
-            ),
-            Self::Uncontained(cleanup) => write!(
-                formatter,
-                "spawned child escaped the session cgroup; cleanup {}",
-                cleanup.as_str()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ContainmentError {}
-
-impl From<CgroupError> for ContainmentError {
-    fn from(error: CgroupError) -> Self {
-        Self::Cgroup(error)
-    }
-}
-
-impl From<io::Error> for ContainmentError {
-    fn from(error: io::Error) -> Self {
-        Self::Spawn(error)
-    }
-}
-
-/// Turn a failed `Command::spawn` into the typed refusal it carries.
-///
-/// `std` reports the child-side `exec` errno through the close-on-exec pipe,
-/// so an `EACCES`/`ENOEXEC`/`ENOENT` here means no child ever ran. Every other
-/// errno (a fork refusal, a `pre_exec` failure) stays the untyped
-/// [`ContainmentError::Spawn`].
-fn classify_spawn_error(error: io::Error) -> ContainmentError {
-    match ExecRefusal::from_spawn_error(&error) {
-        Some(refusal) => ContainmentError::Exec(refusal),
-        None => ContainmentError::Spawn(error),
-    }
-}
-
-/// What a terminal cleanup could prove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CleanupOutcome {
-    class: CleanupClass,
-    signalled: usize,
-}
-
-impl CleanupOutcome {
-    /// The cleanup class (`swept`, `unverified`, `not_started`).
-    #[must_use]
-    pub const fn class(self) -> CleanupClass {
-        self.class
-    }
-
-    /// How many recorded members received a signal. Never a pid list.
-    #[must_use]
-    pub const fn signalled(self) -> usize {
-        self.signalled
-    }
-}
-
-/// Spawn a command inside the selected containment plan.
-///
-/// `name` must be unique per live session and carry the
-/// [`crate::containment::SESSION_CGROUP_PREFIX`] prefix; the caller derives it
-/// from the daemon instance and session ids, never from user text. `limits`
-/// bounds the escalation used by the failure path that abandons a child whose
-/// identity could not be observed.
+/// Spawn with an explicit [`SessionMode`] inside one of the two Linux plans.
 ///
 /// # Errors
 ///
-/// Refuses a non-enforced plan, an invalid name, a cgroup creation/membership
-/// failure, or a spawn failure. A child that fails the membership check is
-/// killed through its recorded identity before the error returns.
-pub fn spawn(
-    report: &ContainmentReport,
-    name: &str,
-    command: &mut Command,
-    limits: ContainmentLimits,
-) -> Result<ContainedChild, ContainmentError> {
-    spawn_with(report, name, command, limits, SessionMode::ProcessGroup)
-}
-
-/// How the spawned child relates to its process group and session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionMode {
-    /// The daemon puts the child in a fresh process group
-    /// (`setpgid(0, 0)`), which is the fallback containment identity.
-    ProcessGroup,
-    /// The caller's `pre_exec` establishes a new session (`setsid`), so the
-    /// child is already a session and process-group leader. Used by the PTY
-    /// spawn path, where `setsid` must run before `setpgid`.
-    NewSession,
-}
-
-/// Spawn with an explicit [`SessionMode`].
-///
-/// # Errors
-///
-/// The same refusals as [`spawn`].
+/// The same refusals as [`crate::containment::spawn`].
 pub fn spawn_with(
     report: &ContainmentReport,
     name: &str,
@@ -204,7 +48,7 @@ pub fn spawn_with(
     match report.kind() {
         ContainmentKind::CgroupV2 => spawn_cgroup(report, name, command, limits, mode),
         ContainmentKind::Subreaper => spawn_subreaper(name, command, mode),
-        ContainmentKind::Refused => Err(ContainmentError::Refused(
+        _ => Err(ContainmentError::Refused(
             report
                 .refusal()
                 .cloned()
@@ -691,39 +535,6 @@ fn leader_running(pid: u32) -> bool {
     !matches!(rest.trim_start().chars().next(), Some('Z' | 'X' | 'x'))
 }
 
-/// Reap every child in one recorded process group without blocking.
-///
-/// The group is the recorded identity, minted for this session; only its
-/// members are waited on. `WNOHANG` returns `StillAlive` when a member is
-/// still running, so the caller's bounded loop decides how long to wait.
-fn drain_group(pgid: u32) {
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-
-    let Ok(raw) = i32::try_from(pgid) else {
-        return;
-    };
-    loop {
-        match waitpid(nix::unistd::Pid::from_raw(-raw), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive)
-            | Ok(WaitStatus::Stopped(..))
-            | Ok(WaitStatus::Continued(_))
-            | Ok(WaitStatus::PtraceEvent(..))
-            | Ok(WaitStatus::PtraceSyscall(_))
-            | Err(_) => break,
-            Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {}
-        }
-    }
-}
-
-/// Whether the recorded process group still has any member, including a
-/// zombie. Signal 0 only checks existence; it never delivers anything.
-fn group_has_members(pgid: u32) -> bool {
-    let Ok(raw) = i32::try_from(pgid) else {
-        return false;
-    };
-    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), None).is_ok()
-}
-
 fn identity_matches(identity: ProcessIdentity) -> bool {
     match observe(identity.pid()) {
         ProcessObservation::Present {
@@ -737,24 +548,6 @@ fn identity_matches(identity: ProcessIdentity) -> bool {
         }
         ProcessObservation::Absent | ProcessObservation::Unreadable => false,
     }
-}
-
-fn remember_child(pid: u32) {
-    if let Ok(mut live) = LIVE_CHILDREN.lock() {
-        live.insert(pid);
-    }
-}
-
-fn forget_child(pid: u32) {
-    if let Ok(mut live) = LIVE_CHILDREN.lock() {
-        live.remove(&pid);
-    }
-}
-
-fn live_children() -> BTreeSet<u32> {
-    LIVE_CHILDREN
-        .lock()
-        .map_or_else(|_| BTreeSet::new(), |live| live.clone())
 }
 
 /// Every direct child of this process across its threads, from `/proc`.
@@ -823,58 +616,12 @@ pub(crate) fn drain_adopted_children() {
     drain_adopted(0);
 }
 
-/// Reap adopted children without stealing another session's child.
-///
-/// `waitid(WNOWAIT)` peeks at the next exited child; a pid owned by a live
-/// [`ContainedChild`] or the child this call is terminating is left for its own
-/// handle. Only an adopted grandchild (no handle) is reaped. Nothing is
-/// signalled and no name is resolved.
-fn drain_adopted(except: u32) {
-    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
-
-    let live = live_children();
-    loop {
-        let flags = WaitPidFlag::WNOHANG | WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT;
-        let status = match waitid(Id::All, flags) {
-            Ok(WaitStatus::StillAlive) | Err(_) => break,
-            Ok(status) => status,
-        };
-        let pid = match status {
-            WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => pid,
-            WaitStatus::Stopped(pid, _) | WaitStatus::Continued(pid) => pid,
-            WaitStatus::StillAlive | WaitStatus::PtraceEvent(..) | WaitStatus::PtraceSyscall(_) => {
-                break;
-            }
-        };
-        let raw = u32::try_from(pid.as_raw()).unwrap_or(0);
-        if raw == except || live.contains(&raw) {
-            break;
-        }
-        let _ = waitpid(pid, Some(WaitPidFlag::WNOHANG));
-    }
-}
-
-fn wait_bounded(
-    window: Duration,
-    limits: ContainmentLimits,
-    mut done: impl FnMut() -> bool,
-) -> bool {
-    let deadline = Instant::now() + window;
-    loop {
-        if done() {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        std::thread::sleep(limits.poll.min(deadline.saturating_duration_since(now)));
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::containment::ExecRefusal;
 
     #[test]
     fn a_post_spawn_failure_keeps_the_observed_cleanup_class() {

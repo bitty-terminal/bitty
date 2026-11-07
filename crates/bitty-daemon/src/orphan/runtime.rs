@@ -351,20 +351,22 @@ impl OrphanSupervisor {
     ///
     /// # Errors
     ///
-    /// Refuses daemon startup when the plan is enforced but the journal cannot
-    /// be opened; an unsupported cell returns the typed refusal instead.
+    /// Refuses daemon startup when the plan's records are verifiable but the
+    /// journal cannot be opened; a plan whose records cannot be re-checked
+    /// after a restart (and every refused cell) returns the typed unsupported
+    /// surface instead.
     pub fn open(
         directory: PathBuf,
         limits: &OrphanJournalLimits,
         report: &ContainmentReport,
         containment_limits: crate::containment::ContainmentLimits,
     ) -> Result<Self, OrphanOpenError> {
-        if !report.is_enforced() {
+        if !report.kind().verifies_orphans() {
             return Ok(Self::Unsupported {
                 cell: report.cell(),
                 reason: report
                     .refusal()
-                    .map_or_else(|| "containment refused".to_owned(), ToString::to_string),
+                    .map_or_else(|| report.summary(), ToString::to_string),
             });
         }
         let runtime = OrphanRuntime::open(directory, *limits, report, containment_limits)?;
@@ -575,6 +577,21 @@ mod tests {
         assert_eq!(first.committed, 0);
         assert_eq!(second, first);
         assert_eq!(runtime.counts().total(), 0);
+    }
+
+    #[test]
+    fn a_plan_without_a_durable_identity_does_not_open_a_journal() {
+        let report = ContainmentReport::windows_job(PlatformCell::WindowsX86_64);
+        let mut supervisor = OrphanSupervisor::open(
+            PathBuf::from("/nonexistent/bittyd-orphans"),
+            &OrphanJournalLimits::default(),
+            &report,
+            crate::containment::ContainmentLimits::default(),
+        )
+        .expect("an unverifiable plan is not an open failure");
+        assert!(!supervisor.is_served());
+        assert_eq!(supervisor.verify(MonotonicMs::ZERO).expect("verify"), None);
+        assert_eq!(supervisor.mechanism(), MECHANISM_NONE);
     }
 
     #[test]

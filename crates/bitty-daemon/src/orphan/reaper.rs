@@ -51,7 +51,11 @@ impl SystemOrphanReaper {
             ContainmentKind::CgroupV2 => report
                 .cgroup_root()
                 .and_then(|path| CgroupRoot::from_absolute(path.to_path_buf()).ok()),
-            ContainmentKind::Subreaper | ContainmentKind::Refused => None,
+            ContainmentKind::Subreaper
+            | ContainmentKind::WindowsJob
+            | ContainmentKind::FreebsdReaper
+            | ContainmentKind::ProcessGroup
+            | ContainmentKind::Refused => None,
         };
         Self {
             root,
@@ -198,8 +202,13 @@ impl OrphanReaper for SystemOrphanReaper {
         match orphan.containment() {
             ContainmentRecord::Cgroup { path } => self.reap_cgroup(path),
             // A restarted daemon is no longer the parent; the fallback cannot
-            // prove the descendant set and must not claim a sweep.
-            ContainmentRecord::Subreaper => ReapResult::Unverified,
+            // prove the descendant set and must not claim a sweep. A Windows
+            // job handle and a process group recorded on another cell are not
+            // observable from this Linux reaper either.
+            ContainmentRecord::Subreaper
+            | ContainmentRecord::WindowsJob
+            | ContainmentRecord::FreebsdReaper { .. }
+            | ContainmentRecord::ProcessGroup { .. } => ReapResult::Unverified,
         }
         #[cfg(not(target_os = "linux"))]
         {

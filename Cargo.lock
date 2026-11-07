@@ -223,7 +223,9 @@ version = "0.0.35"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-core",
+ "bitty-winjob",
  "getrandom 0.4.3",
+ "libc",
  "nix 0.31.3",
  "serde_json",
  "sha2",

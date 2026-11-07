@@ -1164,7 +1164,7 @@ return {}
         fixture
             .app
             .runtime
-            .arm_present_confirmation_at(std::time::Instant::now());
+            .arm_present_confirmation_for_test(std::time::Instant::now());
         assert!(
             fixture.app.runtime.present_confirm_deadline().is_some(),
             "precondition: a committed frame is awaiting confirmation"

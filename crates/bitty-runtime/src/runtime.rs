@@ -650,8 +650,14 @@ pub struct Runtime {
     /// flag keeps the retry path alive instead of silently staying headless
     /// until restart.
     gpu_reattach_required: bool,
-    /// Corrective full repaints requested because the last abandoned worker
-    /// exited (diagnostics/test evidence).
+    /// Corrective full repaints requested by a recovery path (diagnostics
+    /// evidence): the last abandoned worker exited, or a committed present was
+    /// never confirmed by the compositor (bitty#2989).
+    ///
+    /// The abandoned-worker case is attributed by the paired
+    /// [`Self::forced_repaint_owed`] flag and the committed-frame counter; an
+    /// unconfirmed present also moves the surface telemetry's
+    /// `present_unconfirmed` slot, so the two causes stay distinguishable.
     forced_repaint_requests: u64,
     /// A corrective repaint is owed and the next submitted frame carries it.
     forced_repaint_owed: bool,

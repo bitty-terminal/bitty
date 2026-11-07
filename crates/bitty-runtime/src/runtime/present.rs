@@ -2300,9 +2300,10 @@ impl Runtime {
     /// idle window arms nothing.
     #[must_use]
     pub fn present_confirm_deadline(&self) -> Option<std::time::Instant> {
-        if !self.surface_visible {
-            return None;
-        }
+        // Visibility is decided where the hide happens: a hide that retained
+        // work clears the bound (the reveal frame owns it), a hide that
+        // retained nothing keeps it so the deadline can tell a synthetic
+        // occlusion edge from a dropped frame.
         self.present_confirm_at
     }
 
@@ -2325,13 +2326,14 @@ impl Runtime {
         self.present_confirm_at = now.checked_add(PRESENT_CONFIRM_BOUND);
     }
 
-    /// Test-only seam: arms the confirmation bound without a GPU frame.
+    /// Test seam: arms the confirmation bound without a GPU frame.
     ///
-    /// The app-level wiring test drives the `RedrawRequested` → confirmation
-    /// handoff deterministically; production arms this only from a real
-    /// commit.
+    /// `#[cfg(test)]` cannot reach this: the wiring test that drives the
+    /// `RedrawRequested` → confirmation handoff lives in `bitty-terminal`, so
+    /// the seam has to exist in this crate's non-test build. Production arms
+    /// the bound only from a real commit; nothing else calls this.
     #[doc(hidden)]
-    pub fn arm_present_confirmation_at(&mut self, now: std::time::Instant) {
+    pub fn arm_present_confirmation_for_test(&mut self, now: std::time::Instant) {
         self.arm_present_confirmation(now);
     }
 
@@ -2366,13 +2368,24 @@ impl Runtime {
             return;
         }
         if !self.surface_visible {
-            // The occlusion gate keeps the damage and re-presents on reveal;
-            // forcing a frame here would only burn the repair budget.
-            return;
+            // bitty#2989: reaching an expiry while hidden means the hide
+            // retained nothing (a hide with retained work clears the bound),
+            // so no reveal frame is queued and no damage is waiting. An
+            // unanswered redraw is the only evidence the gate closed on, and
+            // a dropped frame produces exactly that evidence on a surface
+            // that is still mapped. Treat the expiry as counter-evidence:
+            // reopen the gate and queue the repair below. A genuinely hidden
+            // surface just fails the acquire and is bounded by the repair
+            // budget.
+            self.set_surface_visibility_at(now, true);
         }
         if self.present_confirm_misses >= PRESENT_CONFIRM_REPAIR_LIMIT {
-            // A surface that never confirms again is the stuck/failed-present
-            // recovery's job, not a periodic repaint.
+            // A surface that never confirms again must not become a periodic
+            // frame source. Neither the stuck-present bound nor the hidden
+            // repair engages here - both key on a pending frame or retained
+            // damage, and a committed frame consumed both - so the budget is
+            // the only stop. The surface stays as it is until an unrelated
+            // event, and `present_unconfirmed` records that it happened.
             return;
         }
         self.present_confirm_misses = self.present_confirm_misses.saturating_add(1);
@@ -2512,9 +2525,16 @@ impl Runtime {
             // let its old deadline win over the reveal's next-frame queue;
             // hidden ticks also must not re-arm it.
             self.suspend_surface_retry();
-            // bitty#2989: a hidden surface cannot be confirmed; the reveal
-            // frame re-arms the bound after it commits.
-            self.clear_present_confirmation();
+            // bitty#2989: a hide that retained work is unambiguous - the
+            // reveal frame re-presents it and re-arms the bound after that
+            // commit. A hide that retained *nothing* is not: the 300 ms
+            // starvation probe infers occlusion from an unanswered redraw,
+            // which is the same evidence a dropped frame leaves behind, and
+            // nothing would ever repaint a falsely-occluded surface. Keep the
+            // bound armed so it can disambiguate at its deadline.
+            if retained {
+                self.clear_present_confirmation();
+            }
             // Retain the cancelled presentation as damage, exactly as before,
             // and arm the bounded self-heal only when something real was
             // retained (bitty#2830 hypothesis 2). A clean hide arms nothing.
@@ -13272,6 +13292,63 @@ mod async_present_tests {
             runtime.present_confirm_deadline().is_some(),
             "the corrective frame arms its own confirmation"
         );
+        assert!(runtime.shutdown());
+    }
+
+    /// bitty#2989 review: the 300 ms synthetic occlusion edge infers a hidden
+    /// surface from an unanswered redraw, which is the same evidence a dropped
+    /// frame leaves behind. A hide that retained nothing must keep the bound
+    /// armed, and its expiry must reopen the gate and present - otherwise a
+    /// falsely occluded surface stays stale until an unrelated event.
+    #[test]
+    fn an_unconfirmed_present_survives_a_synthetic_occlusion_edge() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"stale frame");
+        let first = tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+
+        // The starvation probe closes the gate 300 ms into the unanswered
+        // redraw; the commit consumed the damage, so nothing was retained.
+        let occluded_at = deadline
+            .checked_sub(PRESENT_CONFIRM_BOUND)
+            .and_then(|start| start.checked_add(std::time::Duration::from_millis(300)))
+            .expect("the occlusion edge lands inside the bound");
+        runtime.set_surface_visibility_at(occluded_at, false);
+        assert!(
+            !runtime.is_surface_visible(),
+            "the synthetic edge closed the gate"
+        );
+        assert_eq!(
+            runtime.present_confirm_deadline(),
+            Some(deadline),
+            "a hide that retained nothing must not cancel the bound"
+        );
+
+        // The bound is the counter-evidence: it reopens the gate and presents.
+        assert!(
+            runtime.tick_at(deadline).is_none(),
+            "the corrective frame is submitted, not committed inline"
+        );
+        assert!(
+            runtime.is_surface_visible(),
+            "an unconfirmed expiry reopens a falsely occluded gate"
+        );
+        assert!(
+            runtime.pending_present.is_some(),
+            "the retained frame was rebuilt and re-presented"
+        );
+        let repair =
+            tick_until_committed(&mut runtime, TEST_WAIT).expect("the corrective frame commits");
+        assert!(repair.frame > first.frame, "a new frame reached the worker");
         assert!(runtime.shutdown());
     }
 

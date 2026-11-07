@@ -219,6 +219,15 @@ impl ContainedChild {
         self.identity
     }
 
+    /// The journal identity this plan can re-verify after a restart.
+    ///
+    /// The cgroup and subreaper plans record the `/proc` start time, so the
+    /// orphan verifier can re-check the exact process after a daemon restart.
+    #[must_use]
+    pub const fn durable_identity(&self) -> Option<ProcessIdentity> {
+        Some(self.identity)
+    }
+
     /// The recorded containment identity, suitable for the orphan journal.
     #[must_use]
     pub fn containment(&self) -> ContainmentRecord {

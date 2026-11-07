@@ -15,6 +15,7 @@
 
 use std::fmt;
 
+use crate::handshake::ClientId;
 use crate::limits::{LimitId, Limits};
 use crate::registry::{AttachId, MonotonicMs};
 
@@ -195,6 +196,10 @@ impl fmt::Display for LeaseRole {
 pub struct Lease {
     attach_id: AttachId,
     role: LeaseRole,
+    /// Server-assigned client id of the connection that attached. It is
+    /// identity data, not authority: the service serves it only in the
+    /// operator all-session view.
+    client_id: Option<ClientId>,
     attached_at: MonotonicMs,
     last_seen_at: MonotonicMs,
     expires_at: MonotonicMs,
@@ -206,6 +211,7 @@ impl Lease {
         Self {
             attach_id,
             role,
+            client_id: None,
             attached_at: now,
             last_seen_at: now,
             expires_at: MonotonicMs::from_millis(now.as_millis().saturating_add(ttl_ms)),
@@ -222,6 +228,17 @@ impl Lease {
     #[must_use]
     pub const fn role(self) -> LeaseRole {
         self.role
+    }
+
+    /// The client id of the attaching connection, once the service recorded it.
+    #[must_use]
+    pub const fn client_id(self) -> Option<ClientId> {
+        self.client_id
+    }
+
+    /// Record the attaching connection's server-assigned client id.
+    pub(crate) fn set_client_id(&mut self, client_id: ClientId) {
+        self.client_id = Some(client_id);
     }
 
     /// When the lease was created.

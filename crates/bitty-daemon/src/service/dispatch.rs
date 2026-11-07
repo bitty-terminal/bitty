@@ -95,8 +95,9 @@ use crate::orphan::{JournalError, OrphanSupervisor};
 use crate::peer::DispatchBoundary;
 use crate::registry::RegistryLimits;
 use crate::registry::{
-    AttachId, CleanupClass, DaemonInstanceId, LifecycleState, MonotonicMs, OwnerPeer,
-    RegistryRefusal, SessionId, SessionKind, SessionSnapshot, SpawnFailure, TerminalId,
+    AttachId, CleanupClass, DaemonInstanceId, ExitInformation, LifecycleState, MonotonicMs,
+    OriginKind, OwnerPeer, RegistryRefusal, Requester, SessionId, SessionKind, SessionSnapshot,
+    SpawnFailure, TerminalId,
 };
 use crate::service::grants::{
     GrantId, GrantKind, GrantRefusal, GrantStore, MintError, RevokeOutcome,
@@ -2033,6 +2034,9 @@ impl Service {
                 {
                     continue;
                 }
+                if snapshot.requested_by.is_none() {
+                    self.host.note_requester(session_id, Requester::daemon());
+                }
                 if let Ok(Termination::Completed(notice)) =
                     self.host
                         .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
@@ -2078,6 +2082,9 @@ impl Service {
                 .is_err()
             {
                 continue;
+            }
+            if snapshot.requested_by.is_none() {
+                self.host.note_requester(session_id, Requester::daemon());
             }
             // This branch only sees `Running`/`Stopping` sessions, so a
             // missing handle is a bound session whose worker was lost, never a
@@ -2342,6 +2349,16 @@ impl Service {
                 match created {
                     Ok(created) => {
                         let session_id = created.session.session_id;
+                        let created_by_kind = if self.has_operator_view(connection) {
+                            OriginKind::Operator
+                        } else {
+                            OriginKind::Consumer
+                        };
+                        self.host.note_origin(
+                            session_id,
+                            Some(connection.client_id()),
+                            created_by_kind,
+                        );
                         self.events.register(session_id);
                         self.initial_tokens
                             .insert(session_id, created.control_token);
@@ -2416,7 +2433,7 @@ impl Service {
                                 .map(|token| crate::handshake::hex(token.expose_secret()))
                         };
                         Ok(json!({
-                            "session": self.session_json(&snapshot, now),
+                            "session": self.session_json(connection, &snapshot, now),
                             "control_token": token,
                             "replayed": false,
                         }))
@@ -2579,7 +2596,7 @@ impl Service {
             now,
         );
         Ok(json!({
-            "session": self.session_json(snapshot, now),
+            "session": self.session_json(connection, snapshot, now),
             "control_token": token,
             "replayed": true,
         }))
@@ -2594,7 +2611,7 @@ impl Service {
         let session_id = parse_session_id(fields)?;
         let token = optional_control_token(fields)?;
         let snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
-        Ok(json!({"session": self.session_json(&snapshot, now)}))
+        Ok(json!({"session": self.session_json(connection, &snapshot, now)}))
     }
 
     fn session_list(
@@ -2610,7 +2627,7 @@ impl Service {
                 operator || self.holds_live_lease(connection, snapshot.session_id, now)
             })
             .map(|snapshot| {
-                let mut value = self.session_json(&snapshot, now);
+                let mut value = self.session_json(connection, &snapshot, now);
                 // `D-09`: the operator all-session view is the only view that
                 // carries the owner peer, and only as the two numeric facts.
                 // An ordinary view omits the key entirely (omit, never null).
@@ -2686,7 +2703,7 @@ impl Service {
                     .host
                     .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
-                    "session": self.session_json(&snapshot, now),
+                    "session": self.session_json(connection, &snapshot, now),
                     "attach_id": attach.map(|attach| attach.as_hex()),
                     "role": "controller",
                     "replayed": true,
@@ -2714,6 +2731,8 @@ impl Service {
                 {
                     Ok(claimed) => {
                         let attach_id = claimed.lease.attach_id();
+                        self.host
+                            .assign_lease_client(attach_id, connection.client_id());
                         // The attaching lease receives this event through its
                         // replay, so it is emitted to the leases that already
                         // existed before the new queue is registered.
@@ -2759,7 +2778,7 @@ impl Service {
                         );
                         let rotated = crate::handshake::hex(claimed.control_token.expose_secret());
                         let mut result = json!({
-                            "session": self.session_json(&claimed.session, now),
+                            "session": self.session_json(connection, &claimed.session, now),
                             "attach_id": attach_id.as_hex(),
                             "role": "controller",
                             "lease_expires_at_ms": claimed.lease.expires_at().as_millis(),
@@ -2826,6 +2845,8 @@ impl Service {
         match self.host.attach_observer(session_id, now) {
             Ok(attached) => {
                 let attach_id = attached.lease.attach_id();
+                self.host
+                    .assign_lease_client(attach_id, connection.client_id());
                 if self
                     .grants
                     .consume_to(
@@ -2887,7 +2908,7 @@ impl Service {
                     now,
                 );
                 let mut result = json!({
-                    "session": self.session_json(&session, now),
+                    "session": self.session_json(connection, &session, now),
                     "attach_id": attach_id.as_hex(),
                     "role": "observer",
                     "lease_expires_at_ms": attached.lease.expires_at().as_millis(),
@@ -3224,7 +3245,7 @@ impl Service {
                 now,
             );
             return Ok(json!({
-                "session": self.session_json(&snapshot, now),
+                "session": self.session_json(connection, &snapshot, now),
                 "attach_id": target.as_hex(),
                 "was_attached": false,
                 "not_attached": true,
@@ -3306,7 +3327,7 @@ impl Service {
                     now,
                 );
                 Ok(json!({
-                    "session": self.session_json(&detached.session, now),
+                    "session": self.session_json(connection, &detached.session, now),
                     "attach_id": target.as_hex(),
                     "was_attached": detached.was_attached,
                     "not_attached": !detached.was_attached,
@@ -3353,7 +3374,7 @@ impl Service {
                     .host
                     .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
-                    "session": self.session_json(&snapshot, now),
+                    "session": self.session_json(connection, &snapshot, now),
                     "controller": controller.map(|attach| attach.as_hex()),
                     "replayed": true,
                     "not_attached": controller.is_none(),
@@ -3434,7 +3455,7 @@ impl Service {
                             now,
                         );
                         Ok(json!({
-                            "session": self.session_json(&transferred.session, now),
+                            "session": self.session_json(connection, &transferred.session, now),
                             "controller": controller.as_hex(),
                             "previous_controller": transferred
                                 .previous_controller
@@ -3516,7 +3537,7 @@ impl Service {
             None,
             now,
         );
-        Ok(json!({"session": self.session_json(&resized, now)}))
+        Ok(json!({"session": self.session_json(connection, &resized, now)}))
     }
 
     /// Resolve a content request's session, generation, controller lease, and
@@ -3730,7 +3751,7 @@ impl Service {
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
-                "session": self.session_json(&snapshot, now),
+                "session": self.session_json(connection, &snapshot, now),
                 "accepted": false,
                 "not_running": true,
             }));
@@ -3766,6 +3787,16 @@ impl Service {
             _ => return Err(Refusal::invalid_request()),
         };
         let outcome = outcome.map_err(map_lease)?;
+        // Keep the first requester: a repeat or an escalated stop must not
+        // replace the actor whose request produced the first effective reason.
+        if snapshot.requested_by.is_none() {
+            let requester = if reason == "operator" {
+                Requester::operator(connection.client_id())
+            } else {
+                Requester::consumer(connection.client_id())
+            };
+            self.host.note_requester(session_id, requester);
+        }
         let terminal_reason = match reason {
             "cancel" => crate::registry::TerminalReason::ConsumerCancel,
             "timeout" => crate::registry::TerminalReason::ConsumerTimeout,
@@ -3792,7 +3823,7 @@ impl Service {
         let snapshot = self.visible(connection, session_id, None, now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
-                "session": self.session_json(&snapshot, now),
+                "session": self.session_json(connection, &snapshot, now),
                 "accepted": false,
                 "not_running": true,
             }));
@@ -3804,6 +3835,10 @@ impl Service {
             .host
             .kill(session_id, expected_generation, now)
             .map_err(map_lease)?;
+        if snapshot.requested_by.is_none() {
+            self.host
+                .note_requester(session_id, Requester::operator(connection.client_id()));
+        }
         self.finish_stop(
             connection,
             session_id,
@@ -3825,7 +3860,7 @@ impl Service {
     ) -> Result<Value, Refusal> {
         match outcome {
             StopOutcome::AlreadyTerminal { session } => Ok(json!({
-                "session": self.session_json(&session, now),
+                "session": self.session_json(connection, &session, now),
                 "accepted": false,
                 "not_running": true,
             })),
@@ -3865,7 +3900,7 @@ impl Service {
                     Termination::AlreadyTerminal { session } => session,
                 };
                 Ok(json!({
-                    "session": self.session_json(&snapshot, now),
+                    "session": self.session_json(connection, &snapshot, now),
                     "accepted": true,
                     "reason": accepted.reason.as_str(),
                     "stage": "not_started",
@@ -3887,7 +3922,7 @@ impl Service {
                     now,
                 );
                 Ok(json!({
-                    "session": self.session_json(&accepted.session, now),
+                    "session": self.session_json(connection, &accepted.session, now),
                     "accepted": true,
                     "reason": terminal_reason.as_str(),
                     "stage": accepted.stage.as_str(),
@@ -3922,7 +3957,7 @@ impl Service {
             now,
         );
         Ok(json!({
-            "session": self.session_json(&heartbeat.session, now),
+            "session": self.session_json(connection, &heartbeat.session, now),
             "attach_id": attach_id.as_hex(),
             "lease_expires_at_ms": heartbeat.lease.expires_at().as_millis(),
             "control_token": token,
@@ -3955,9 +3990,16 @@ impl Service {
     /// Render the shared metadata-only `session` object (`D-03`, `D-09`).
     ///
     /// Controller presence and the pending observer-grant count are metadata
-    /// additions (`1.2`, bitty#2806); the owner peer and terminal content are
-    /// never part of this object.
-    fn session_json(&self, snapshot: &SessionSnapshot, now: MonotonicMs) -> Value {
+    /// additions (`1.2`, bitty#2806); the worker correlation fields and the
+    /// terminal exit split are the `1.4` record slice. The owner peer, owner
+    /// client id, requester identity, and live attach list are operator-only:
+    /// an ordinary response omits them entirely (omit, never `null`).
+    fn session_json(
+        &self,
+        connection: &Connection,
+        snapshot: &SessionSnapshot,
+        now: MonotonicMs,
+    ) -> Value {
         let mut value = json!({
             "session_id": snapshot.session_id.as_hex(),
             "kind": snapshot.kind.as_str(),
@@ -3971,35 +4013,98 @@ impl Service {
             "pending_observer_grants": self.pending_observer_grants(snapshot, now),
             "created_at_ms": snapshot.created_at_ms.as_millis(),
             "last_seen_ms": snapshot.last_seen_ms.as_millis(),
+            "state_changed_at_ms": snapshot.state_changed_at.as_millis(),
+            "created_by_kind": snapshot.created_by_kind.as_str(),
         });
-        if let Some(map) = value.as_object_mut() {
-            if snapshot.state.is_terminal() {
-                map.insert(
-                    "terminal_reason".to_owned(),
-                    snapshot
-                        .terminal_reason
-                        .map(|reason| Value::String(reason.as_str().to_owned()))
-                        .unwrap_or(Value::Null),
-                );
-                map.insert(
-                    "cleanup".to_owned(),
-                    snapshot
-                        .cleanup
-                        .map(|cleanup| Value::String(cleanup.as_str().to_owned()))
-                        .unwrap_or(Value::Null),
-                );
-                // Why the spawn was refused, present exactly on
-                // `spawn_failed`. A static class, never a message: an `exec`
-                // refusal, a PTY allocation failure, and a bind refusal are
-                // distinguishable here instead of sharing one shape
-                // (bitty#2790).
-                if let Some(failure) = snapshot.spawn_failure {
-                    map.insert(
-                        "spawn_failure".to_owned(),
-                        Value::String(failure.as_str().to_owned()),
-                    );
-                }
+        let Some(map) = value.as_object_mut() else {
+            return value;
+        };
+        // A worker liveness signal exists only where supervision provides one:
+        // a registry-only session has no worker, so the key is absent.
+        if let Some(last_worker_seen) = snapshot.last_worker_seen_at {
+            map.insert(
+                "last_worker_seen_at_ms".to_owned(),
+                json!(last_worker_seen.as_millis()),
+            );
+        }
+        // The handle exists only after generation 1: a session that never
+        // bound a worker has nothing to correlate.
+        if let Some(handle) = snapshot.worker_handle.as_ref() {
+            map.insert(
+                "worker_handle".to_owned(),
+                Value::String(handle.as_str().to_owned()),
+            );
+        }
+        // The exit split is additive: `exit_code` for a wait status, `signal`
+        // for a signal death, and neither for a reason that has no wait status.
+        match snapshot.exit {
+            ExitInformation::ExitCode(code) => {
+                map.insert("exit_code".to_owned(), json!(code));
             }
+            ExitInformation::Signal(signal) => {
+                map.insert("signal".to_owned(), json!(signal));
+            }
+            ExitInformation::NotApplicable => {}
+        }
+        if snapshot.state.is_terminal() {
+            map.insert(
+                "terminal_reason".to_owned(),
+                snapshot
+                    .terminal_reason
+                    .map(|reason| Value::String(reason.as_str().to_owned()))
+                    .unwrap_or(Value::Null),
+            );
+            map.insert(
+                "cleanup".to_owned(),
+                snapshot
+                    .cleanup
+                    .map(|cleanup| Value::String(cleanup.as_str().to_owned()))
+                    .unwrap_or(Value::Null),
+            );
+            // Why the spawn was refused, present exactly on `spawn_failed`. A
+            // static class, never a message: an `exec` refusal, a PTY
+            // allocation failure, and a bind refusal are distinguishable here
+            // instead of sharing one shape (bitty#2790).
+            if let Some(failure) = snapshot.spawn_failure {
+                map.insert(
+                    "spawn_failure".to_owned(),
+                    Value::String(failure.as_str().to_owned()),
+                );
+            }
+        }
+        // `D-09`: the operator all-session view is the only view that carries
+        // the owner peer, the owner client id, the requester, and the live
+        // attach list. An ordinary view omits every key (omit, never `null`).
+        if self.has_operator_view(connection) {
+            if let Some(client) = snapshot.owner_client_id {
+                map.insert("owner_client_id".to_owned(), Value::String(client.as_hex()));
+            }
+            if let Some(requester) = snapshot.requested_by {
+                let mut value = json!({"kind": requester.kind().as_str()});
+                if let Some(client) = requester.client_id() {
+                    value["client_id"] = json!(client.as_hex());
+                }
+                map.insert("requested_by".to_owned(), value);
+            }
+            let attached: Vec<Value> = self
+                .host
+                .attached_leases(snapshot.session_id, now)
+                .into_iter()
+                .map(|lease| {
+                    let mut entry = json!({
+                        "attach_id": lease.attach_id.as_hex(),
+                        "role": lease.role.as_str(),
+                        "attached_at_ms": lease.attached_at.as_millis(),
+                        "last_seen_at_ms": lease.last_seen_at.as_millis(),
+                        "lease_expires_at_ms": lease.expires_at.as_millis(),
+                    });
+                    if let Some(client) = lease.client_id {
+                        entry["client_id"] = json!(client.as_hex());
+                    }
+                    entry
+                })
+                .collect();
+            map.insert("attached_leases".to_owned(), Value::Array(attached));
         }
         value
     }
@@ -4767,7 +4872,7 @@ mod tests {
             .snapshot(session_id, now)
             .expect("fixture snapshot");
         json!({
-            "session": service.session_json(&snapshot, now),
+            "session": service.session_json(connection, &snapshot, now),
             "control_token": token,
             "replayed": false,
         })
@@ -4908,7 +5013,7 @@ mod tests {
             )
             .expect("accepted");
         assert_eq!(response.wire_version, 1);
-        assert_eq!(response.service_api_version.to_string(), "1.3");
+        assert_eq!(response.service_api_version.to_string(), "1.4");
         assert_eq!(response.scopes.service, ServiceScopeSet::baseline());
         assert_eq!(response.daemon_pid, std::process::id());
         assert_eq!(response.peer_identity.pid, std::process::id());
@@ -6316,6 +6421,19 @@ mod tests {
             .expect("status");
         assert_eq!(terminal["session"]["state"], "terminated");
         assert_eq!(terminal["session"]["terminal_reason"], "daemon_stop");
+        assert_eq!(terminal["session"]["requested_by"]["kind"], "daemon");
+        assert!(
+            terminal["session"]["requested_by"]
+                .get("client_id")
+                .is_none(),
+            "a daemon stop names no client"
+        );
+        assert!(terminal["session"].get("exit_code").is_none());
+        assert!(terminal["session"].get("signal").is_none());
+        assert!(
+            terminal["session"].get("worker_handle").is_none(),
+            "a registry-only session never bound a worker"
+        );
     }
 
     #[test]

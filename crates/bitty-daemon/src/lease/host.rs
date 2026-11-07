@@ -18,10 +18,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::handshake::ClientId;
 use crate::registry::{
     AttachId, CleanupClass, CreateSession, DaemonInstanceId, Entropy, ExitInformation,
-    ID_GENERATION_ATTEMPTS, LifecycleState, MonotonicMs, OsEntropy, RegistryLimits, SessionId,
-    SessionRegistry, SessionSnapshot, SpawnFailure, TerminalOutcome, TerminalReason,
+    ID_GENERATION_ATTEMPTS, LifecycleState, MonotonicMs, OriginKind, OsEntropy, RegistryLimits,
+    Requester, SessionId, SessionRegistry, SessionSnapshot, SpawnFailure, TerminalOutcome,
+    TerminalReason,
 };
 
 use super::record::{Lease, LeaseLimits, LeaseRole};
@@ -448,6 +450,27 @@ pub struct ControlView {
     pub stop: Option<StopView>,
 }
 
+/// One live attach lease in the operator `attached` view.
+///
+/// The record is identity data, not authority: `attach_id` names the lease and
+/// `client_id` names the connection that attached. Only the operator
+/// all-session view serves it, exactly like the owner peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachedLease {
+    /// Server-assigned lease handle.
+    pub attach_id: AttachId,
+    /// Server-assigned client id of the attaching connection.
+    pub client_id: Option<ClientId>,
+    /// Observer or controller.
+    pub role: LeaseRole,
+    /// Monotonic attach time.
+    pub attached_at: MonotonicMs,
+    /// Monotonic time of the last successful request naming this lease.
+    pub last_seen_at: MonotonicMs,
+    /// Absolute monotonic expiry instant.
+    pub expires_at: MonotonicMs,
+}
+
 /// The non-secret view of an accepted stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StopView {
@@ -611,6 +634,79 @@ impl SessionHost {
         self.registry
             .snapshots()
             .map(move |snapshot| self.compose_snapshot(snapshot, now))
+    }
+
+    /// The live attach leases of one session in attach-id order.
+    ///
+    /// An expired lease awaiting the sweep is excluded, exactly like
+    /// `attach_count`. The service serves this only in the operator
+    /// all-session view.
+    #[must_use]
+    pub fn attached_leases(&self, session_id: SessionId, now: MonotonicMs) -> Vec<AttachedLease> {
+        self.sessions
+            .get(&session_id)
+            .map_or_else(Vec::new, |state| {
+                state
+                    .leases
+                    .values()
+                    .filter(|lease| !lease.is_expired_at(now))
+                    .map(|lease| AttachedLease {
+                        attach_id: lease.attach_id(),
+                        client_id: lease.client_id(),
+                        role: lease.role(),
+                        attached_at: lease.attached_at(),
+                        last_seen_at: lease.last_seen_at(),
+                        expires_at: lease.expires_at(),
+                    })
+                    .collect()
+            })
+    }
+
+    /// Record the server-assigned client id of an attaching connection.
+    ///
+    /// The service calls this immediately after a fresh observer attach or
+    /// controller claim. A no-op for a handle this host does not hold.
+    pub(crate) fn assign_lease_client(&mut self, attach_id: AttachId, client_id: ClientId) {
+        let Some(session_id) = self.lease_sessions.get(&attach_id).copied() else {
+            return;
+        };
+        if let Some(state) = self.sessions.get_mut(&session_id) {
+            if let Some(lease) = state.leases.get_mut(&attach_id) {
+                lease.set_client_id(client_id);
+            }
+        }
+    }
+
+    /// Store the create-time origin facts without a revision bump.
+    ///
+    /// A no-op when the record is unknown or already terminal.
+    pub fn note_origin(
+        &mut self,
+        session_id: SessionId,
+        owner_client_id: Option<ClientId>,
+        created_by_kind: OriginKind,
+    ) {
+        self.registry
+            .note_origin(session_id, owner_client_id, created_by_kind);
+    }
+
+    /// Store the actor that requested the terminal transition.
+    ///
+    /// A no-op when the record is unknown or already terminal.
+    pub fn note_requester(&mut self, session_id: SessionId, requester: Requester) {
+        self.registry.note_requester(session_id, requester);
+    }
+
+    /// Refresh the worker liveness timestamp without a revision bump.
+    ///
+    /// A no-op when the session is unknown or already terminal: supervision
+    /// may observe a worker after the record was frozen, and that observation
+    /// must not change the frozen record.
+    // Worker liveness is only observed by the Linux supervision pass, so the
+    // only consumer sits behind that cfg.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn observe_worker(&mut self, session_id: SessionId, now: MonotonicMs) {
+        let _ = self.registry.observe_worker(session_id, now);
     }
 
     /// The non-secret control summary, or `None` for an unknown session.

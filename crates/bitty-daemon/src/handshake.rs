@@ -825,14 +825,14 @@ mod tests {
                 server: SERVICE_API_VERSION,
             }
         );
-        assert!(error.to_string().contains("1.0..=1.3"));
+        assert!(error.to_string().contains("1.0..=1.4"));
     }
 
     #[test]
     fn negotiate_refuses_a_minor_outside_the_accepted_range() {
         assert!(
             negotiate(
-                &NegotiateRequest::new(ClientVersion::new(1, 4)),
+                &NegotiateRequest::new(ClientVersion::new(1, 5)),
                 &Limits::default()
             )
             .is_err()

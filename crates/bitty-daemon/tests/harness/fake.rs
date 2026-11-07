@@ -102,6 +102,8 @@ struct FakeConn {
     leases: BTreeSet<String>,
     host_grant: Option<String>,
     pending: BTreeMap<String, String>,
+    /// Server-assigned identity minted at negotiate.
+    client_id: String,
     /// The 32-hex `client_correlation_digest` this connection negotiated.
     correlation: Option<String>,
     /// The client asked for pushed events at negotiate (`D-10`).
@@ -132,6 +134,22 @@ struct FakeSession {
     leases: BTreeMap<String, FakeLease>,
     created_ms: u64,
     last_seen_ms: u64,
+    /// Last visible mutation (`state_revision` bump).
+    state_changed_ms: u64,
+    /// Server-assigned client id of the creating connection.
+    owner_client_id: String,
+    /// `consumer`, `operator`, or `daemon`.
+    created_by_kind: &'static str,
+    /// The actor that requested the terminal transition, when one did.
+    requested_by: Option<(&'static str, Option<String>)>,
+    /// Last worker liveness signal, if supervision provides one.
+    last_worker_seen_ms: Option<u64>,
+    /// Opaque worker correlation handle, present after generation 1.
+    worker_handle: Option<String>,
+    /// Wait-status exit code, present exactly on `worker_exit`.
+    exit_code: Option<u8>,
+    /// Terminating signal number, present exactly on `worker_signal`.
+    signal: Option<u32>,
     /// When this record became terminal, for the `terminal_retention_ms`
     /// collection window (`D-14`). `None` while the session is live.
     terminalized_ms: Option<u64>,
@@ -163,6 +181,12 @@ struct FakeSession {
 struct FakeLease {
     role: &'static str,
     expires_ms: u64,
+    /// Server-assigned client id of the attaching connection.
+    client_id: Option<String>,
+    /// Monotonic attach time.
+    attached_ms: u64,
+    /// Monotonic time of the last successful request naming this lease.
+    last_seen_ms: u64,
 }
 
 struct FakeGrant {
@@ -477,7 +501,7 @@ impl FakeDriver {
             .get("client_version")
             .and_then(|value| value.get("minor"))
             .and_then(Value::as_u64);
-        if major != Some(1) || !matches!(minor, Some(0..=3)) {
+        if major != Some(1) || !matches!(minor, Some(0..=4)) {
             let outcome = self.refuse("daemon.negotiate", "Validation", "VersionMismatch", None);
             self.connection(connection).closed = true;
             return outcome;
@@ -541,6 +565,7 @@ impl FakeDriver {
             }
         }
         let client_id = self.mint_id();
+        self.connection(connection).client_id = client_id.clone();
         let scopes = self.connection_scopes(connection);
         let limits: Vec<Value> = LimitId::ALL
             .into_iter()
@@ -560,7 +585,7 @@ impl FakeDriver {
             .collect();
         let value = json!({
             "wire_version": 1,
-            "service_api_version": {"major": 1, "minor": 3, "min_client_minor": 0},
+            "service_api_version": {"major": 1, "minor": 4, "min_client_minor": 0},
             "daemon_instance_id": self.instance,
             "daemon_pid": FAKE_DAEMON_PID,
             "server_identity": {
@@ -736,7 +761,7 @@ impl FakeDriver {
         }
     }
 
-    fn session_json(session: &FakeSession) -> Value {
+    fn session_json(session: &FakeSession, operator: bool, now: u64) -> Value {
         let mut value = json!({
             "session_id": session.id,
             "kind": session.kind,
@@ -750,10 +775,55 @@ impl FakeDriver {
             "pending_observer_grants": session.pending_grants,
             "created_at_ms": session.created_ms,
             "last_seen_ms": session.last_seen_ms,
+            "state_changed_at_ms": session.state_changed_ms,
+            "created_by_kind": session.created_by_kind,
         });
+        if let Some(last_worker_seen) = session.last_worker_seen_ms {
+            value["last_worker_seen_at_ms"] = json!(last_worker_seen);
+        }
+        if session.generation > 0 {
+            if let Some(handle) = session.worker_handle.as_ref() {
+                value["worker_handle"] = json!(handle);
+            }
+        }
+        if let Some(code) = session.exit_code {
+            value["exit_code"] = json!(code);
+        }
+        if let Some(signal) = session.signal {
+            value["signal"] = json!(signal);
+        }
         if matches!(session.state, "exited" | "failed" | "terminated") {
             value["terminal_reason"] = json!(session.terminal_reason);
             value["cleanup"] = json!(session.cleanup);
+        }
+        if operator {
+            value["owner_client_id"] = json!(session.owner_client_id);
+            if let Some((kind, client_id)) = session.requested_by.as_ref() {
+                let mut requester = json!({"kind": kind});
+                if let Some(client_id) = client_id {
+                    requester["client_id"] = json!(client_id);
+                }
+                value["requested_by"] = requester;
+            }
+            let attached: Vec<Value> = session
+                .leases
+                .iter()
+                .filter(|(_, lease)| lease.expires_ms > now)
+                .map(|(attach_id, lease)| {
+                    let mut entry = json!({
+                        "attach_id": attach_id,
+                        "role": lease.role,
+                        "attached_at_ms": lease.attached_ms,
+                        "last_seen_at_ms": lease.last_seen_ms,
+                        "lease_expires_at_ms": lease.expires_ms,
+                    });
+                    if let Some(client_id) = lease.client_id.as_ref() {
+                        entry["client_id"] = json!(client_id);
+                    }
+                    entry
+                })
+                .collect();
+            value["attached_leases"] = json!(attached);
         }
         value
     }
@@ -925,6 +995,9 @@ impl FakeDriver {
                 .map(|session| session.id.clone())
                 .collect();
             for id in ids {
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.requested_by = Some(("daemon", None));
+                }
                 if self.terminate(&id, "daemon_stop") {
                     terminated += 1;
                 }
@@ -1113,7 +1186,7 @@ impl FakeDriver {
             if remembered == &fingerprint {
                 if let Some(session) = self.sessions.get(session_id) {
                     let value = json!({
-                        "session": Self::session_json(session),
+                        "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
                         "control_token": session.initial_token,
                         "replayed": true,
                     });
@@ -1141,6 +1214,16 @@ impl FakeDriver {
         } else {
             "terminal"
         };
+        let owner_client_id = self
+            .conn(connection)
+            .map(|conn| conn.client_id.clone())
+            .unwrap_or_default();
+        let created_by_kind = if self.has_scope(connection, "daemon.inspect") {
+            "operator"
+        } else {
+            "consumer"
+        };
+        let worker_handle = bound.then(|| self.mint_id());
         let session = FakeSession {
             id: id.clone(),
             kind,
@@ -1159,6 +1242,14 @@ impl FakeDriver {
             leases: BTreeMap::new(),
             created_ms: now,
             last_seen_ms: now,
+            state_changed_ms: now,
+            owner_client_id,
+            created_by_kind,
+            requested_by: None,
+            last_worker_seen_ms: bound.then_some(now),
+            worker_handle,
+            exit_code: None,
+            signal: None,
             terminalized_ms: None,
             terminal_reason: None,
             cleanup: None,
@@ -1166,7 +1257,7 @@ impl FakeDriver {
         self.create_keys
             .insert(key.to_owned(), (fingerprint, id.clone()));
         let value = json!({
-            "session": Self::session_json(&session),
+            "session": Self::session_json(&session, self.has_scope(connection, "daemon.inspect"), self.now()),
             "control_token": token,
             "replayed": false,
         });
@@ -1240,8 +1331,11 @@ impl FakeDriver {
         // the same expiry a real resize does.
         let ttl = self.limits.effective(LimitId::AttachLeaseTtlMs);
         let controller = session.controller.clone();
+        let operator = self.has_scope(connection, "daemon.inspect");
+        let session_ms = self.now();
         let session = self.sessions.get_mut(session_id).expect("checked");
         session.revision += 1;
+        session.state_changed_ms = now;
         session.last_seen_ms = now;
         if let Some(lease) = controller
             .as_ref()
@@ -1249,7 +1343,7 @@ impl FakeDriver {
         {
             lease.expires_ms = now + ttl;
         }
-        let value = Self::session_json(session);
+        let value = Self::session_json(session, operator, session_ms);
         self.reply("session.resize", json!({"session": value}))
     }
 
@@ -1459,7 +1553,7 @@ impl FakeDriver {
         let Some(session) = self.sessions.get(session_id) else {
             return self.refuse("session.status", "NotFound", "NotFound", None);
         };
-        let value = json!({"session": Self::session_json(session)});
+        let value = json!({"session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now())});
         self.reply("session.status", value)
     }
 
@@ -1483,7 +1577,11 @@ impl FakeDriver {
                     })
             })
             .map(|session| {
-                let mut value = Self::session_json(session);
+                let mut value = Self::session_json(
+                    session,
+                    self.has_scope(connection, "daemon.inspect"),
+                    self.now(),
+                );
                 // `D-09`: only the operator all-session view carries the owner
                 // peer, and only the two numeric facts.
                 if operator {
@@ -1544,8 +1642,11 @@ impl FakeDriver {
         let expires = self.now() + self.limits.effective(LimitId::AttachLeaseTtlMs);
         let scopes = self.connection_scopes(connection);
         let server_ms = self.now();
+        let client_id = self.conn(connection).map(|conn| conn.client_id.clone());
+        let operator = self.has_scope(connection, "daemon.inspect");
         let session = self.sessions.get_mut(session_id).expect("checked");
         session.revision += 1;
+        session.state_changed_ms = server_ms;
         session.controller = Some(attach.clone());
         session.token = rotated.clone();
         session.initial_token = None;
@@ -1554,10 +1655,13 @@ impl FakeDriver {
             FakeLease {
                 role: "controller",
                 expires_ms: expires,
+                client_id,
+                attached_ms: server_ms,
+                last_seen_ms: server_ms,
             },
         );
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, operator, server_ms),
             "attach_id": attach.clone(),
             "role": "controller",
             "lease_expires_at_ms": expires,
@@ -1627,19 +1731,25 @@ impl FakeDriver {
         let expires = now + self.limits.effective(LimitId::AttachLeaseTtlMs);
         let scopes = self.connection_scopes(connection);
         let server_ms = self.now();
+        let client_id = self.conn(connection).map(|conn| conn.client_id.clone());
+        let operator = self.has_scope(connection, "daemon.inspect");
         let session = self.sessions.get_mut(session_id).expect("checked");
         // The contract counts grant consume and attach as two visible
         // mutations, matching the real service's post-consume snapshot bump.
         session.revision += 2;
+        session.state_changed_ms = server_ms;
         session.leases.insert(
             attach.clone(),
             FakeLease {
                 role: "observer",
                 expires_ms: expires,
+                client_id,
+                attached_ms: server_ms,
+                last_seen_ms: server_ms,
             },
         );
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, operator, server_ms),
             "attach_id": attach.clone(),
             "role": "observer",
             "lease_expires_at_ms": expires,
@@ -1931,7 +2041,7 @@ impl FakeDriver {
                     if owner == connection {
                         if let Some(session) = self.sessions.get(session_id) {
                             let value = json!({
-                                "session": Self::session_json(session),
+                                "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
                                 "attach_id": attach,
                                 "was_attached": false,
                                 "not_attached": true,
@@ -1958,17 +2068,20 @@ impl FakeDriver {
             return self.refuse("session.detach", "NotFound", "NotFound", None);
         };
         let (removed, value) = {
+            let operator = self.has_scope(connection, "daemon.inspect");
+            let now = self.now();
             let session = self.sessions.get_mut(&session_id).expect("found");
             let removed = session.leases.remove(attach).is_some();
             if removed {
                 session.revision += 1;
+                session.state_changed_ms = now;
                 if session.controller.as_deref() == Some(attach) {
                     session.controller = None;
                 }
             }
             let revoked = removed && !own;
             let value = json!({
-                "session": Self::session_json(session),
+                "session": Self::session_json(session, operator, now),
                 "attach_id": attach,
                 "was_attached": removed,
                 "not_attached": !removed,
@@ -2053,6 +2166,8 @@ impl FakeDriver {
         }
         let previous = self.sessions[session_id].controller.clone();
         let rotated = self.mint_token();
+        let operator = self.has_scope(connection, "daemon.inspect");
+        let now = self.now();
         let session = self.sessions.get_mut(session_id).expect("checked");
         if let Some(previous) = &previous {
             if let Some(lease) = session.leases.get_mut(previous) {
@@ -2066,9 +2181,10 @@ impl FakeDriver {
         session.token = rotated.clone();
         session.initial_token = None;
         session.revision += 1;
+        session.state_changed_ms = now;
         self.deliveries.insert(target.to_owned(), rotated);
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, operator, now),
             "controller": target,
             "previous_controller": previous,
             "replayed": false,
@@ -2096,7 +2212,7 @@ impl FakeDriver {
         };
         if is_terminal(session.state) {
             let value = json!({
-                "session": Self::session_json(session),
+                "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
                 "accepted": false,
                 "not_running": true,
             });
@@ -2125,10 +2241,19 @@ impl FakeDriver {
             "timeout" => "consumer_timeout",
             _ => "operator_abort",
         };
+        let requester_kind = if reason == "operator" {
+            "operator"
+        } else {
+            "consumer"
+        };
+        let requester_client = self.conn(connection).map(|conn| conn.client_id.clone());
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.requested_by = Some((requester_kind, requester_client));
+        }
         self.terminate(session_id, terminal);
         let session = &self.sessions[session_id];
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
             "accepted": true,
             "reason": terminal,
             "stage": "not_started",
@@ -2152,7 +2277,7 @@ impl FakeDriver {
         };
         if is_terminal(session.state) {
             let value = json!({
-                "session": Self::session_json(session),
+                "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
                 "accepted": false,
                 "not_running": true,
             });
@@ -2164,10 +2289,14 @@ impl FakeDriver {
         if let Err((class, code)) = self.control_authority(connection, session_id, None) {
             return self.refuse("session.kill", class, code, None);
         }
+        let requester_client = self.conn(connection).map(|conn| conn.client_id.clone());
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.requested_by = Some(("operator", requester_client));
+        }
         self.terminate(session_id, "operator_abort");
         let session = &self.sessions[session_id];
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
             "accepted": true,
             "reason": "operator_abort",
             "stage": "not_started",
@@ -2205,7 +2334,7 @@ impl FakeDriver {
         let token = self.connection(connection).pending.remove(attach);
         let session = &self.sessions[&session_id];
         let value = json!({
-            "session": Self::session_json(session),
+            "session": Self::session_json(session, self.has_scope(connection, "daemon.inspect"), self.now()),
             "attach_id": attach,
             "lease_expires_at_ms": expires,
             "control_token": token,
@@ -2235,6 +2364,7 @@ impl FakeDriver {
         session.initial_token = None;
         session.state = "terminated";
         session.terminalized_ms = Some(now);
+        session.state_changed_ms = now;
         session.terminal_reason = Some(reason);
         session.cleanup = Some(if session.generation > 0 {
             "swept"
@@ -2650,9 +2780,14 @@ mod tests {
             FakeLease {
                 role: "controller",
                 expires_ms: now + 60_000,
+                client_id: Some("22".repeat(16)),
+                attached_ms: now,
+                last_seen_ms: now,
             },
         );
         let terminal_id = fake.mint_id();
+        let owner_client_id = "22".repeat(16);
+        let worker_handle = fake.mint_id();
         fake.sessions.insert(
             id.clone(),
             FakeSession {
@@ -2669,6 +2804,14 @@ mod tests {
                 leases,
                 created_ms: now,
                 last_seen_ms: now,
+                state_changed_ms: now,
+                owner_client_id: owner_client_id.clone(),
+                created_by_kind: "consumer",
+                requested_by: None,
+                last_worker_seen_ms: Some(now),
+                worker_handle: Some(worker_handle),
+                exit_code: None,
+                signal: None,
                 terminalized_ms: None,
                 terminal_reason: None,
                 cleanup: None,
@@ -2681,6 +2824,7 @@ mod tests {
         let mut conn = FakeConn {
             negotiated: true,
             events: true,
+            client_id: owner_client_id,
             ..FakeConn::default()
         };
         for scope in ["session.inspect", "terminal.inspect", "terminal.input"] {

@@ -53,10 +53,12 @@ pub use self::child::{
     CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
 };
 pub use self::exec::{ExecRefusal, ExecRefusalKind};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use self::linux_sys::test_signal_state;
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux_sys::{
-    close_inherited_descriptors, dup_cloexec, establish_controlling_terminal, resize_pty,
-    set_cloexec, set_nonblocking,
+    close_inherited_descriptors, dup_cloexec, establish_controlling_terminal,
+    reset_child_signal_state, resize_pty, set_cloexec, set_nonblocking,
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::linux_sys::{drop_cloexec_before_exec, inheritable_probe_descriptor};

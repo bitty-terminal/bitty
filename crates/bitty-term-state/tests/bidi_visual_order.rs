@@ -475,6 +475,6 @@ fn resolving_never_mutates_the_snapshot() {
     assert_eq!(hash_before, state.state_hash());
     assert_eq!(
         bitty_term_state::canonical_public::CANONICAL_HASH_VERSION,
-        13
+        14
     );
 }

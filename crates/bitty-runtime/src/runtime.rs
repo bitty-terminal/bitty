@@ -1590,6 +1590,14 @@ pub struct Runtime {
     bell_observed: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     enhanced_keyboard_flags: u32,
+    /// xterm `modifyOtherKeys` level of the focused pane (`0` off, `1`
+    /// "user", `2` all modifiers).
+    ///
+    /// Mirrors [`bitty_term_state::Modes::modify_other_keys`] through
+    /// [`Self::sync_mode_caches_to_focus`] exactly like
+    /// [`Self::enhanced_keyboard_flags`], so observers see the focused pane's
+    /// negotiated protocol even across a focus transition with no PTY pump.
+    modify_other_keys_level: u8,
     /// Button whose press a mouse-tracking app received (bitty#2938).
     ///
     /// Drag motion must carry the held button's identity (`ESC[<32;..M` for
@@ -2330,6 +2338,7 @@ impl Runtime {
             plugin_notifications_dropped: 0,
             bell_observed: 0,
             enhanced_keyboard_flags: 0,
+            modify_other_keys_level: 0,
             mouse_drag_button: None,
             shift_pressed: false,
             control_pressed: false,
@@ -2652,6 +2661,7 @@ impl Runtime {
             plugin_notifications_dropped: 0,
             bell_observed: 0,
             enhanced_keyboard_flags: 0,
+            modify_other_keys_level: 0,
             mouse_drag_button: None,
             shift_pressed: false,
             control_pressed: false,
@@ -2978,6 +2988,17 @@ impl Runtime {
         self.enhanced_keyboard_flags
     }
 
+    /// Current xterm `modifyOtherKeys` level of the focused pane.
+    ///
+    /// `0` means the option is off; `1`/`2` are the xterm "user" and "all
+    /// modifiers" levels negotiated with `CSI > 4 ; Ps m`. Mirrors the
+    /// focused pane's mode register (primary fallback for session-less
+    /// leaves) like [`Self::enhanced_keyboard_flags`].
+    #[must_use]
+    pub fn modify_other_keys_level(&self) -> u8 {
+        self.modify_other_keys_level
+    }
+
     /// Whether Shift is currently latched (CTX-0159 read-only accessor).
     #[must_use]
     pub fn shift_pressed(&self) -> bool {
@@ -3065,6 +3086,23 @@ impl Runtime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Modifier/latch snapshot for the inspect path.
+    ///
+    /// Owned and `Send`, with no borrow into the runtime: the devtools
+    /// publisher and headless tests read the same values. The xterm
+    /// `modifyOtherKeys` level rides along with the Kitty flags so an
+    /// observer sees which key-encoding protocol the focused pane negotiated.
+    #[must_use]
+    pub fn inspect_modifier_snapshot(&self) -> crate::inspect::ModifierSnapshot {
+        crate::inspect::ModifierSnapshot {
+            shift: self.shift_pressed,
+            control: self.control_pressed,
+            alt: self.alt_pressed,
+            enhanced_keyboard_flags: self.enhanced_keyboard_flags,
+            modify_other_keys_level: self.modify_other_keys_level,
+        }
+    }
+
     /// Publish bounded read-only introspection snapshots to the `BITTY_SOCKET`
     /// live store (CTX-0159, Issue #258).
     ///
@@ -3089,12 +3127,7 @@ impl Runtime {
         );
         crate::inspect::publish_grid(&grid);
         crate::inspect::publish_input_ring(&self.inspect_ring.snapshot_all());
-        crate::inspect::publish_modifiers(&crate::inspect::ModifierSnapshot {
-            shift: self.shift_pressed,
-            control: self.control_pressed,
-            alt: self.alt_pressed,
-            enhanced_keyboard_flags: self.enhanced_keyboard_flags,
-        });
+        crate::inspect::publish_modifiers(&self.inspect_modifier_snapshot());
         // CTX-0532: the focus/mode telemetry mirrors the reader attribution:
         // bracketed paste and focus reporting come from the focused pane's
         // own register (primary fallback for session-less leaves).

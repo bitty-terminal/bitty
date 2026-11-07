@@ -1981,6 +1981,12 @@ impl State {
             // register; a `Query` synthesizes the spec reply `CSI ? flags u`.
             TerminalAction::EnhancedKeyboard { op } => self.apply_enhanced_keyboard(*op),
 
+            // xterm `modifyOtherKeys` key-modifier option (Pp = 4). The
+            // bounded level lives in the mode register next to the Kitty
+            // flags; a `Query` synthesizes the XTMODKEYS reply
+            // `CSI > 4 ; Ps m`.
+            TerminalAction::ModifyOtherKeys { op } => self.apply_modify_other_keys(*op),
+
             TerminalAction::Unknown(report) => match report.kind {
                 SequenceKind::Csi => self.telemetry.unknown_csi += 1,
                 SequenceKind::Esc => self.telemetry.unknown_esc += 1,
@@ -3913,6 +3919,28 @@ impl State {
             EnhancedKeyboardOp::Pop { n } => self.modes.enhanced_keyboard.pop(u32::from(n)),
             EnhancedKeyboardOp::Query => {
                 let payload = format!("\x1b[?{}u", self.modes.enhanced_keyboard.flags())
+                    .into_bytes()
+                    .into_boxed_slice();
+                self.replies.queue(payload);
+            }
+        }
+    }
+
+    /// Applies one xterm `modifyOtherKeys` operation (Pp = 4).
+    ///
+    /// `Set` stores the parser-bounded level in the mode register; `Query`
+    /// queues the XTMODKEYS reply `CSI > 4 ; Ps m`, the form xterm documents
+    /// as usable to restore the state ("XTerm's response can be used to
+    /// restore this state, because it is formatted as an XTMODKEYS control").
+    /// The register never emits bytes on its own (RFC: replies are queued,
+    /// not written).
+    fn apply_modify_other_keys(&mut self, op: bitty_vt::ModifyOtherKeysOp) {
+        match op {
+            bitty_vt::ModifyOtherKeysOp::Set { level } => {
+                self.modes.modify_other_keys = level;
+            }
+            bitty_vt::ModifyOtherKeysOp::Query => {
+                let payload = format!("\x1b[>4;{}m", self.modes.modify_other_keys)
                     .into_bytes()
                     .into_boxed_slice();
                 self.replies.queue(payload);

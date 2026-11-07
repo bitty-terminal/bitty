@@ -640,6 +640,70 @@ fn enhanced_keyboard_stack_set_push_pop_and_query_reply() {
 }
 
 #[test]
+fn modify_other_keys_level_set_reset_and_query_reply() {
+    use bitty_vt::ModifyOtherKeysOp;
+    let mut s = State::new();
+    assert_eq!(s.modes.modify_other_keys, 0, "default is off");
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: ModifyOtherKeysOp::Set { level: 1 },
+    });
+    assert_eq!(s.modes.modify_other_keys, 1);
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: ModifyOtherKeysOp::Set { level: 2 },
+    });
+    assert_eq!(s.modes.modify_other_keys, 2);
+    // Query replies with the live level in XTMODKEYS form without changing
+    // state (xterm: "formatted as an XTMODKEYS control").
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: ModifyOtherKeysOp::Query,
+    });
+    let replies = s.take_replies();
+    assert_eq!(&replies[0][..], b"\x1b[>4;2m");
+    // `CSI > 4 m` resets to the initial value.
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: ModifyOtherKeysOp::Set { level: 0 },
+    });
+    assert_eq!(s.modes.modify_other_keys, 0);
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: ModifyOtherKeysOp::Query,
+    });
+    let replies = s.take_replies();
+    assert_eq!(&replies[0][..], b"\x1b[>4;0m");
+}
+
+#[test]
+fn modify_other_keys_level_participates_in_the_state_hash() {
+    let mut negotiated = State::new();
+    negotiated.apply(&TerminalAction::ModifyOtherKeys {
+        op: bitty_vt::ModifyOtherKeysOp::Set { level: 2 },
+    });
+    let plain = State::new();
+    // Same grid and modes otherwise; only the encoding choice differs.
+    assert_ne!(negotiated.state_hash(), plain.state_hash());
+}
+
+#[test]
+fn modify_other_keys_level_survives_the_alternate_screen() {
+    // Unlike the Kitty flag register (which the protocol defines per
+    // screen), xterm's modifyOtherKeys is a single global resource, so the
+    // level is not swapped with the alt-screen mode save.
+    let mut s = State::new();
+    s.apply(&TerminalAction::ModifyOtherKeys {
+        op: bitty_vt::ModifyOtherKeysOp::Set { level: 2 },
+    });
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    assert_eq!(s.modes.modify_other_keys, 2);
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: false,
+    });
+    assert_eq!(s.modes.modify_other_keys, 2);
+}
+
+#[test]
 fn enhanced_keyboard_stack_is_bounded_and_evicts_oldest() {
     let mut s = State::new();
     for flags in 0..12u32 {

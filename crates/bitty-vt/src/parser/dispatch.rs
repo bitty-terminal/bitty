@@ -10,10 +10,10 @@ use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
     EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyNotificationChunk,
-    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseCoordinateEncoding,
-    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
-    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction,
-    UnrecognizedSequence, ZoneKind,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, MODIFY_OTHER_KEYS_MAX_LEVEL, Mode,
+    ModifyOtherKeysOp, MouseCoordinateEncoding, MouseTrackingMode, Notification,
+    NotificationSource, PaletteColorOp, PaletteOp, PointerShape, PointerShapeOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, TerminalAction, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 use crate::kitty_font_query::{
@@ -101,6 +101,75 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
                 // stays unknown telemetry.
                 if params.len() <= 1 && mode_value(params, 0) == 0 {
                     Some(EnhancedKeyboardOp::Query)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Classifies an xterm key-modifier-option sequence for
+    /// `modifyOtherKeys` (Pp = 4).
+    ///
+    /// Authoritative shapes (xterm `ctlseqs`, XTMODKEYS/XTQMODKEYS):
+    ///
+    /// - `CSI > 4 ; Ps m`: "The first parameter Pp identifies the resource
+    ///   to set/reset. The second parameter Pv is the value to assign to the
+    ///   resource", with `Pp = 4 -> modifyOtherKeys`;
+    /// - `CSI > 4 m`: "If the second parameter is omitted, the resource is
+    ///   reset to its initial value" — the initial value of `modifyOtherKeys`
+    ///   is `0`;
+    /// - `CSI ? 4 m`: "Query key modifier options (XTQMODKEYS)", answered as
+    ///   an XTMODKEYS control so the reply restores the state.
+    ///
+    /// Out-of-range levels (above [`MODIFY_OTHER_KEYS_MAX_LEVEL`]) and every
+    /// other resource id, sub-parameter form, or extra parameter return
+    /// `None`: the caller records inert unknown-CSI telemetry, so a level is
+    /// never silently clamped into a different one.
+    fn modify_other_keys_op(
+        intermediates: &[u8],
+        params: &Params,
+        final_byte: u8,
+    ) -> Option<ModifyOtherKeysOp> {
+        if final_byte != b'm' {
+            return None;
+        }
+        // Resource id 4 is modifyOtherKeys; the wire form carries no
+        // sub-parameters (`CSI > 4 : 1 m` is the "factor out modifiers" mask
+        // extension, which bitty does not implement).
+        let resource = |index: usize| -> Option<u16> {
+            let sub = sub_params(params, index)?;
+            if sub.len() != 1 {
+                return None;
+            }
+            sub.first().copied()
+        };
+        match intermediates {
+            b">" => {
+                if resource(0)? != 4 {
+                    return None;
+                }
+                match params.len() {
+                    // `CSI > 4 m`: reset to the initial value.
+                    1 => Some(ModifyOtherKeysOp::Set { level: 0 }),
+                    // `CSI > 4 ; Ps m`: assign `Ps`.
+                    2 => {
+                        let level = resource(1)?;
+                        u8::try_from(level)
+                            .ok()
+                            .filter(|level| *level <= MODIFY_OTHER_KEYS_MAX_LEVEL)
+                            .map(|level| ModifyOtherKeysOp::Set { level })
+                    }
+                    _ => None,
+                }
+            }
+            b"?" => {
+                // `vte` always delivers one parameter (the implicit `0`), so
+                // the bare `CSI ? m` query arrives as a single zero param and
+                // is not a modifyOtherKeys query.
+                if params.len() == 1 && resource(0)? == 4 {
+                    Some(ModifyOtherKeysOp::Query)
                 } else {
                     None
                 }
@@ -717,6 +786,18 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         if final_byte == b'u' && matches!(intermediates, b"=" | b">" | b"<" | b"?") {
             match Self::enhanced_keyboard_op(intermediates, params, final_byte) {
                 Some(op) => self.emit(TerminalAction::EnhancedKeyboard { op }),
+                None => self.unknown_csi(intermediates, final_byte),
+            }
+            return;
+        }
+
+        // xterm key-modifier options for `modifyOtherKeys` (Pp = 4):
+        // `CSI > 4 ; Ps m` (set), `CSI > 4 m` (reset), `CSI ? 4 m` (query).
+        // Classified before the generic intermediate guard below so these
+        // shapes never collapse to inert telemetry.
+        if final_byte == b'm' && matches!(intermediates, b">" | b"?") {
+            match Self::modify_other_keys_op(intermediates, params, final_byte) {
+                Some(op) => self.emit(TerminalAction::ModifyOtherKeys { op }),
                 None => self.unknown_csi(intermediates, final_byte),
             }
             return;

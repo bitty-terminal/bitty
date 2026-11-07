@@ -362,6 +362,41 @@ pub enum EnhancedKeyboardOp {
     Query,
 }
 
+/// Highest xterm `modifyOtherKeys` level this terminal implements.
+///
+/// xterm defines levels `0` (off), `1` ("user": the usual shift/control
+/// modifiers keep their legacy encoding, other modifiers escape-code the
+/// key), `2` ("all modifiers apply") and `3` (unmodified keys escape-coded
+/// too). Bitty implements `0..=2`; `3` and anything above it is rejected by
+/// the parser instead of being clamped into a different level.
+pub const MODIFY_OTHER_KEYS_MAX_LEVEL: u8 = 2;
+
+/// One xterm key-modifier-option operation for `modifyOtherKeys` (Pp = 4).
+///
+/// Wire shapes (xterm `ctlseqs`, "Set/reset key modifier options
+/// (XTMODKEYS)" and "Query key modifier options (XTQMODKEYS)"):
+///
+/// - `CSI > 4 ; Ps m` sets the level to `Ps`;
+/// - `CSI > 4 m` resets the resource to its initial value (`0`), because
+///   "If the second parameter is omitted, the resource is reset to its
+///   initial value";
+/// - `CSI ? 4 m` queries the resource and is answered with the XTMODKEYS
+///   form `CSI > 4 ; Ps m` so the reply can restore the state.
+///
+/// The parser only classifies the wire form; the level register lives in
+/// terminal state (RFC invariant 5), next to the Kitty flag register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModifyOtherKeysOp {
+    /// `CSI > 4 ; Ps m` (`level = Ps`) or `CSI > 4 m` (`level = 0`).
+    Set {
+        /// New level, already bounded to `0..=MODIFY_OTHER_KEYS_MAX_LEVEL`
+        /// by the parser.
+        level: u8,
+    },
+    /// `CSI ? 4 m`: report the live level as `CSI > 4 ; Ps m`.
+    Query,
+}
+
 /// XTerm mouse-tracking protocol level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MouseTrackingMode {
@@ -1115,6 +1150,18 @@ pub enum TerminalAction {
     EnhancedKeyboard {
         /// Classified wire operation.
         op: EnhancedKeyboardOp,
+    },
+    /// xterm `modifyOtherKeys` key-modifier option (`CSI > 4 ; Ps m`,
+    /// `CSI > 4 m`, `CSI ? 4 m`).
+    ///
+    /// The xterm-compatible sibling of the Kitty keyboard protocol: it is the
+    /// only negotiated form that reaches applications through tmux and the
+    /// VS Code terminal, where the Kitty `CSI u` negotiation is filtered.
+    /// Terminal state owns the bounded level register and synthesizes the
+    /// `CSI > 4 ; Ps m` reply for [`ModifyOtherKeysOp::Query`].
+    ModifyOtherKeys {
+        /// Classified wire operation.
+        op: ModifyOtherKeysOp,
     },
 
     // Device status and replies

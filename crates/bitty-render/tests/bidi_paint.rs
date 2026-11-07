@@ -252,7 +252,7 @@ fn rendering_leaves_the_canonical_hash_unchanged() {
     assert_eq!(hash, state.state_hash());
     assert_eq!(
         bitty_term_state::canonical_public::CANONICAL_HASH_VERSION,
-        13
+        14
     );
 }
 

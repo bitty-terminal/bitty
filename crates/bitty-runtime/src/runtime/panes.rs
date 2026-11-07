@@ -1214,24 +1214,27 @@ impl Runtime {
         }
     }
 
-    /// Re-syncs the global Kitty/mouse-capture caches to the focused leaf's
-    /// grid (or the primary grid when focus owns no session).
+    /// Re-syncs the global Kitty/xterm-protocol/mouse-capture caches to the
+    /// focused leaf's grid (or the primary grid when focus owns no session).
     ///
     /// CTX-0532: called on every focus transition and after any path that
     /// mutates a mode register (PTY apply, pane pump, spawn/close), so the
     /// public telemetry caches never lag the focused pane. The mode-sensitive
     /// reader paths read [`Self::focused_modes`] directly; these caches only
-    /// mirror them for `enhanced_keyboard_flags()` / `mouse_capture_active()` observers.
+    /// mirror them for `enhanced_keyboard_flags()` /
+    /// `modify_other_keys_level()` / `mouse_capture_active()` observers.
     pub(super) fn sync_mode_caches_to_focus(&mut self) {
-        let (enhanced_flags, mouse) = {
+        let (enhanced_flags, mouse, modify_other_keys) = {
             let modes = self.focused_modes();
             (
                 modes.enhanced_keyboard.flags(),
                 modes.mouse_tracking.is_some(),
+                modes.modify_other_keys,
             )
         };
         self.enhanced_keyboard_flags = enhanced_flags;
         self.mouse_capture_enabled = mouse;
+        self.modify_other_keys_level = modify_other_keys;
     }
 }
 

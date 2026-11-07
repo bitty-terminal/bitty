@@ -57,12 +57,15 @@ use crate::cell::{Attributes, Cell, Style};
 /// v13 adds the East Asian Ambiguous width policy (CTX-1609): the policy
 /// decides the width of every later `A` scalar, so states differing only in
 /// it are not behaviorally identical.
+/// v14 adds the xterm `modifyOtherKeys` level (Pp = 4): it selects between
+/// the legacy, xterm and Kitty key encodings for the same key event, so two
+/// states differing only in it emit different bytes.
 ///
-/// Paint-time BiDi (CTX-1612) adds **no** hash field and keeps v13:
+/// Paint-time BiDi (CTX-1612) adds **no** hash field and keeps the version:
 /// paragraph levels and visual columns are derived from the same logical
 /// cells at paint time, never stored, so replay and the canonical bytes of
 /// a given action stream are unchanged by `terminal.bidi`.
-pub const CANONICAL_HASH_VERSION: u32 = 13;
+pub const CANONICAL_HASH_VERSION: u32 = 14;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -227,6 +230,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 13);
+        assert_eq!(CANONICAL_HASH_VERSION, 14);
     }
 }

@@ -74,9 +74,9 @@ fn primary_text(rt: &Runtime) -> String {
 fn focus_transition_reattributes_capture_and_enhanced_keyboard_without_pump() {
     bitty_test_support::require_pty!();
     let mut rt = two_pane_runtime();
-    // Primary pane is the "app": mouse tracking (1000 + SGR 1006) and
-    // Kitty progressive flags (7727).
-    rt.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h\x1b[?7727h");
+    // Primary pane is the "app": mouse tracking (1000 + SGR 1006), Kitty
+    // progressive flags (7727) and xterm modifyOtherKeys level 2.
+    rt.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h\x1b[?7727h\x1b[>4;2m");
     // Plain split pane owns its own shell and no modes.
     rt.spawn_shell_for_view(ViewId::new(2), "/bin/sh", &["-c", "sleep 30"], 40, 12)
         .expect("spawn plain pane shell");
@@ -88,6 +88,11 @@ fn focus_transition_reattributes_capture_and_enhanced_keyboard_without_pump() {
         rt.enhanced_keyboard_flags(),
         0,
         "app pane must enable Kitty flags"
+    );
+    assert_eq!(
+        rt.modify_other_keys_level(),
+        2,
+        "app pane must report its xterm modifyOtherKeys level"
     );
 
     // Switch to the plain pane with NO PTY pump in between: the plain
@@ -101,6 +106,11 @@ fn focus_transition_reattributes_capture_and_enhanced_keyboard_without_pump() {
         rt.enhanced_keyboard_flags(),
         0,
         "plain pane inherited the app pane's Kitty flags"
+    );
+    assert_eq!(
+        rt.modify_other_keys_level(),
+        0,
+        "plain pane inherited the app pane's modifyOtherKeys level"
     );
 
     // Synthesized key encodes with the focused (plain) pane's modes:

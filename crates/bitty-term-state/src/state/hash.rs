@@ -53,6 +53,7 @@ impl State {
         for entry in self.modes.enhanced_keyboard.entries() {
             h.u8(*entry);
         }
+        h.u8(self.modes.modify_other_keys);
         // The inactive screen's kitty flag register (per-screen independence):
         // truth-bearing because re-entering the alternate screen resumes its
         // prior register (CTX-0575 F3).
@@ -307,4 +308,5 @@ fn write_modes(out: &mut CanonicalHasher, modes: &Modes) {
     for entry in modes.enhanced_keyboard.entries() {
         out.u8(*entry);
     }
+    out.u8(modes.modify_other_keys);
 }

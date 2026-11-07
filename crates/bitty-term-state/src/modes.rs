@@ -164,6 +164,18 @@ pub struct Modes {
     /// Kitty keyboard progressive flag register and bounded push/pop stack
     /// (CTX-0575). The live bitmask is [`EnhancedKeyboardState::flags`].
     pub enhanced_keyboard: EnhancedKeyboardState,
+    /// xterm `modifyOtherKeys` level (`0` off, `1` "user", `2` all
+    /// modifiers).
+    ///
+    /// Negotiated with `CSI > 4 ; Ps m` / `CSI > 4 m` and queried with
+    /// `CSI ? 4 m`; the xterm-compatible sibling of the Kitty flag register
+    /// and the only form that survives tmux and the VS Code terminal. The
+    /// parser bounds the level to `0..=2`, so this field never holds an
+    /// out-of-range value. Unlike [`EnhancedKeyboardState`], which the Kitty
+    /// protocol defines per screen, this is a single xterm resource: it is
+    /// carried by the mode register and therefore survives an alternate
+    /// screen switch without being swapped.
+    pub modify_other_keys: u8,
     /// Active mouse-tracking protocol level (`None`: off).
     pub mouse_tracking: Option<MouseTrackingMode>,
     /// Extended mouse coordinate encoding (`None`: legacy default).
@@ -187,6 +199,7 @@ impl Default for Modes {
             alternate_scroll: false,
             synchronized_update: false,
             enhanced_keyboard: EnhancedKeyboardState::default(),
+            modify_other_keys: 0,
             mouse_tracking: None,
             mouse_coordinate_encoding: None,
         }

@@ -355,24 +355,45 @@ impl Runtime {
     /// report-all-keys) is active. Caps-lock/num-lock bits, key-number-`0`
     /// pure-text events, and `ISO_LEVEL3/5_SHIFT` stay deferred — no stable
     /// platform source exists, so no encoding is guessed.
+    ///
+    /// xterm `modifyOtherKeys` (`CSI > 4 ; Ps m`, level 1/2) is encoded by
+    /// [`bitty_platform::keyboard::encode_key_event_modify_other_keys`] when
+    /// the Kitty flags are zero; it is the compatible path for tmux and the
+    /// VS Code terminal, which filter the Kitty negotiation. Kitty wins when
+    /// both are active, then the xterm level, then the legacy bytes.
     pub(super) fn encode_key_enhanced(&self, event: &KeyEvent) -> Option<Vec<u8>> {
-        let flags = self.focused_modes().enhanced_keyboard.flags();
-        if flags == 0 {
+        // Protocol precedence, pinned by
+        // `runtime/tests/modify_other_keys.rs`: a non-zero Kitty flag
+        // register wins and the xterm `modifyOtherKeys` level is ignored
+        // (kitty dropped the xterm option when it introduced `CSI u`);
+        // otherwise the xterm level drives the encoder; otherwise the legacy
+        // bytes are byte-identical to the pre-protocol encoder.
+        let (flags, level) = {
+            let modes = self.focused_modes();
+            (modes.enhanced_keyboard.flags(), modes.modify_other_keys)
+        };
+        if flags == 0 && level == 0 {
             return self.ext_key_fallback(event);
         }
         // CTX-0947: the Kitty frame decision lives in the platform layer
         // (`bitty_platform::keyboard::encode_key_event_kitty_protocol`);
         // `None` means the legacy fallback below. The modifier bitmask
         // (shift 1, alt 2, ctrl 4, super 8, hyper 16, meta 32) matches the
-        // platform `KITTY_MOD_*` bits positionally.
+        // platform `KITTY_MOD_*` / `XTERM_MOD_*` bits positionally.
         let modifiers: u32 = u32::from(self.shift_pressed)
             | (u32::from(self.alt_pressed) << 1)
             | (u32::from(self.control_pressed) << 2)
             | (u32::from(self.super_pressed) << 3)
             | (u32::from(self.hyper_pressed) << 4)
             | (u32::from(self.meta_pressed) << 5);
-        if let Some(frame) =
-            bitty_platform::keyboard::encode_key_event_kitty_protocol(event, modifiers, flags)
+        if flags != 0 {
+            if let Some(frame) =
+                bitty_platform::keyboard::encode_key_event_kitty_protocol(event, modifiers, flags)
+            {
+                return self.ext_key_or_fallback(frame);
+            }
+        } else if let Some(frame) =
+            bitty_platform::keyboard::encode_key_event_modify_other_keys(event, modifiers, level)
         {
             return self.ext_key_or_fallback(frame);
         }

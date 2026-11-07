@@ -615,6 +615,14 @@ pub struct ModifierSnapshot {
     pub alt: bool,
     /// Live Kitty keyboard flags (`0` means legacy).
     pub enhanced_keyboard_flags: u32,
+    /// Live xterm `modifyOtherKeys` level (`0` means off).
+    ///
+    /// Read by the devtools/inspect path through
+    /// [`crate::Runtime::modify_other_keys_level`]. The published wire
+    /// schema (`bitty-ipc`'s `ModifiersPublish`) has no field for it yet, so
+    /// the value is carried here without being serialized; adding the wire
+    /// field is a cross-repository `bitty-ipc` change.
+    pub modify_other_keys_level: u8,
 }
 
 /// Bounded focus/window snapshot (owned, `Send`).
@@ -993,6 +1001,7 @@ mod tests {
             control: true,
             alt: false,
             enhanced_keyboard_flags: 0,
+            modify_other_keys_level: 0,
         });
         publish_focus(&FocusSnapshot {
             focused: true,

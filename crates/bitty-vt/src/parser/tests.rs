@@ -601,6 +601,45 @@ fn enhanced_keyboard_negotiation_sequences_classify() {
 }
 
 #[test]
+fn modify_other_keys_sequences_classify() {
+    use crate::action::ModifyOtherKeysOp;
+    // `CSI > 4 ; Ps m` assigns the level; `CSI > 4 m` resets it to the
+    // initial value (0); `CSI ? 4 m` is the XTQMODKEYS query.
+    assert_eq!(
+        parse(b"\x1b[>4;1m\x1b[>4;2m\x1b[>4m\x1b[?4m"),
+        vec![
+            TerminalAction::ModifyOtherKeys {
+                op: ModifyOtherKeysOp::Set { level: 1 },
+            },
+            TerminalAction::ModifyOtherKeys {
+                op: ModifyOtherKeysOp::Set { level: 2 },
+            },
+            TerminalAction::ModifyOtherKeys {
+                op: ModifyOtherKeysOp::Set { level: 0 },
+            },
+            TerminalAction::ModifyOtherKeys {
+                op: ModifyOtherKeysOp::Query,
+            },
+        ]
+    );
+    // Out-of-range levels (xterm level 3 is not implemented, and 4+ is not a
+    // level at all) are ignored, never clamped into a different level. Other
+    // resources, the sub-parameter mask form, and extra parameters stay
+    // inert unknown telemetry as well.
+    assert_eq!(
+        parse(b"\x1b[>4;3m\x1b[>4;9m\x1b[>2;2m\x1b[>4:1m\x1b[>4;1;2m\x1b[?1m"),
+        vec![
+            unknown(SequenceKind::Csi, b'm', [b'>', 0]),
+            unknown(SequenceKind::Csi, b'm', [b'>', 0]),
+            unknown(SequenceKind::Csi, b'm', [b'>', 0]),
+            unknown(SequenceKind::Csi, b'm', [b'>', 0]),
+            unknown(SequenceKind::Csi, b'm', [b'>', 0]),
+            unknown(SequenceKind::Csi, b'm', [b'?', 0]),
+        ]
+    );
+}
+
+#[test]
 fn ansi_sm_rm_map_insert_and_linefeed_modes() {
     assert_eq!(
         parse(b"\x1b[4h\x1b[20h\x1b[4l\x1b[33l"),

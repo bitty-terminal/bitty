@@ -1466,12 +1466,13 @@ dropped, so `bittyd start &` no longer dies when its terminal closes.
 The per-user systemd unit ships at `/usr/lib/systemd/user/bittyd.service`
 (`packaging/systemd/bittyd.service`): `Type=simple`,
 `ExecStart=/usr/bin/bittyd start`, `Restart=on-failure`, `RestartSec=2`,
-`KillMode=mixed`, and `ProtectSystem=full` (`ProtectHome` is deliberately
-unset, because the daemon hosts the user's shells in their home directories).
-`NoNewPrivileges` and `PrivateTmp` are also deliberately unset: both are
-inherited by every hosted shell, and they break it — the first makes `sudo`,
-`su`, and every setuid helper fail, the second hides `/tmp/.X11-unix` and the
-tmux/screen sockets the session already owns.
+`KillMode=mixed`. No filesystem or privilege hardening is set, because every
+directive in that family is inherited by the hosted shells and breaks them:
+`NoNewPrivileges` makes `sudo`, `su`, and every setuid helper fail, `PrivateTmp`
+hides `/tmp/.X11-unix` and the tmux/screen sockets the session already owns, and
+`ProtectSystem` mounts `/usr`, `/boot`, and `/etc` read-only so a package upgrade
+launched from a hosted shell fails with `EROFS`. `ProtectHome` is likewise unset:
+the daemon hosts the user's shells in their home directories.
 
 A hosted shell also starts with a clean signal state: the daemon blocks
 `SIGTERM`/`SIGINT`/`SIGHUP` for its own signal fd, and a blocked mask plus any

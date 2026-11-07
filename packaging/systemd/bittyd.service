@@ -24,10 +24,8 @@ RestartSec=2
 # unit's cgroup.
 KillMode=mixed
 # Hardening a session host can actually work under: this unit runs the user's
-# arbitrary programs, so every restriction below is one a normal login session
-# also lives with. `/usr`, `/boot`, and `/etc` stay read-only, the home
-# directory stays writable and visible (`ProtectHome` is deliberately unset:
-# the daemon hosts shells in their home directories).
+# arbitrary programs, so every restriction here must be one a normal login
+# session also lives with. Nothing is set beyond the stop contract above.
 #
 # Deliberately not set, because each one breaks hosted shells rather than
 # containing them:
@@ -38,7 +36,10 @@ KillMode=mixed
 # - `PrivateTmp=`: it gives hosted shells a private `/tmp`, cutting them off
 #   from `/tmp/.X11-unix` (every X11 client) and from the tmux/screen sockets
 #   the user's own session already owns.
-ProtectSystem=full
+# - `ProtectSystem=`: it mounts `/usr`, `/boot`, and `/etc` read-only for
+#   everything in the unit's cgroup, so a package upgrade or credential change
+#   launched from a hosted shell (`sudo pacman -Syu`, `passwd`, `useradd`)
+#   fails with `EROFS` instead of doing its job.
 
 [Install]
 WantedBy=default.target

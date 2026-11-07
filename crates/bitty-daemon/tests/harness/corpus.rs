@@ -65,6 +65,18 @@ pub struct Vector {
     /// cell whose containment probe selected no mechanism refuses the worker
     /// path, while the reference fake always models a served worker cell.
     pub requires: Vec<String>,
+    /// Result paths whose exact value needs a capability the cell may not
+    /// serve, as `path -> requirement`.
+    ///
+    /// A vector that asserts a property with one sub-assertion weaker than the
+    /// rest (V-14/V-15 assert a `swept` cleanup next to the record's stability)
+    /// names the capability that sub-assertion needs. A driver whose facts
+    /// model the capability `true` asserts the value exactly; a driver that
+    /// models it `false` records a typed `requires-<requirement>` assertion
+    /// skip instead of comparing the value, because the cell cannot prove it.
+    /// A driver that does not model the capability at all fails the row: an
+    /// unmetered capability name must never read as a silent skip.
+    pub gated_assertions: BTreeMap<String, String>,
     pub host_grant: bool,
     /// A journal record the driver seeds before starting the daemon.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -144,6 +156,13 @@ pub struct Expect {
     pub distinct: Vec<String>,
     pub not_equal: BTreeMap<String, String>,
     pub not_equal_any: BTreeMap<String, Vec<String>>,
+    /// Two result paths that must hold the same value.
+    ///
+    /// A claim that relates two fields of one reply: the gap marker
+    /// `earliest_revision` must name the first revision the attach replay
+    /// actually served, so the pair is asserted instead of each field against
+    /// a literal.
+    pub path_equal: BTreeMap<String, String>,
     pub request_log: Option<RequestLogExpect>,
     pub exit_code: Option<i32>,
     pub stdout_contains: Vec<String>,
@@ -167,6 +186,7 @@ impl Expect {
             || !self.distinct.is_empty()
             || !self.not_equal.is_empty()
             || !self.not_equal_any.is_empty()
+            || !self.path_equal.is_empty()
             || self.request_log.is_some()
             || self.exit_code.is_some()
             || self.file_mode.is_some()
@@ -289,6 +309,24 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(fail("requires is not an array".to_owned())),
     };
+    let gated_assertions = match value.get("gated_assertions") {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(path, requirement)| {
+                let requirement = requirement
+                    .as_str()
+                    .ok_or_else(|| fail(format!("gated_assertions.{path} is not a string")))?;
+                if requirement.is_empty() {
+                    return Err(fail(format!(
+                        "gated_assertions.{path} names no requirement"
+                    )));
+                }
+                Ok((path.clone(), requirement.to_owned()))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
+        Some(_) => return Err(fail("gated_assertions is not an object".to_owned())),
+    };
     let setup = object(value, "setup").map_err(fail)?;
     let host_grant = match setup.get("host_grant") {
         None | Some(Value::Null) => false,
@@ -372,6 +410,19 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
             )));
         }
     }
+    // A gate must name a result path the row actually asserts: a typo would
+    // otherwise skip nothing and read as a full-strength row.
+    for path in gated_assertions.keys() {
+        let asserted = steps
+            .iter()
+            .chain(state.iter())
+            .any(|step| step.expect.result.contains_key(path));
+        if !asserted {
+            return Err(fail(format!(
+                "gated assertion {path} is not asserted by any step"
+            )));
+        }
+    }
     let known_defect = match value.get("known_defect") {
         None | Some(Value::Null) => None,
         Some(defect) => {
@@ -421,6 +472,7 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         decisions,
         drivers,
         requires,
+        gated_assertions,
         host_grant,
         orphan_record,
         injected,
@@ -500,6 +552,7 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         distinct: optional_string_array(value, "distinct")?,
         not_equal: string_map(value, "not_equal")?,
         not_equal_any: string_list_map(value, "not_equal_any")?,
+        path_equal: string_map(value, "path_equal")?,
         request_log: None,
         exit_code: optional_i32(value, "exit_code")?,
         stdout_contains: optional_string_array(value, "stdout_contains")?,
@@ -524,6 +577,19 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
     expect.hex_len = normalize_values(expect.hex_len);
     expect.not_equal = normalize_values(expect.not_equal);
     expect.not_equal_any = normalize_values(expect.not_equal_any);
+    expect.path_equal = expect
+        .path_equal
+        .into_iter()
+        .map(|(path, other)| (normalize_path(&path), normalize_path(&other)))
+        .collect();
+    for (path, other) in &expect.path_equal {
+        if path.is_empty() || other.is_empty() {
+            return Err("path_equal names an empty path".to_owned());
+        }
+        if path == other {
+            return Err(format!("path_equal compares {path} to itself"));
+        }
+    }
     expect.present = expect
         .present
         .iter()

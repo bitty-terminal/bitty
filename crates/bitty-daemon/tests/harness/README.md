@@ -81,6 +81,45 @@ never fork expectations.
   exists to rule out. A step without a typed expectation is rejected, so a
   vector cannot assert only "no crash".
 
+## Contract coverage
+
+`conformance.rs` carries `CONTRACT_VECTORS`, a table of every vector the
+accepted contract names (`V-01`–`V-34`, `C-01`–`C-19`) with the corpus `area`
+that marks its intent. `corpus_is_well_formed_and_frozen` asserts:
+
+- every required id is present exactly once (the parser also rejects a
+  duplicate id, and the test fails with `the corpus reuses the vector id`);
+- each row's `area` is the contract's area for that id, so a contract id cannot
+  silently carry another property;
+- every id outside the table sits in the extension namespace (`V-35`+, `C-20`+,
+  `F-01`), so an extension can never squat on a contract id.
+
+`coverage_gaps` is a pure function and
+`the_coverage_gate_reports_the_missing_or_misplaced_vector` pins both failure
+shapes: deleting one required row (or moving its `area`) makes the gate fail
+naming that id, not a count. A contract addition therefore lands as a table row
+plus a corpus row, and the failure is the missing id.
+
+A row the cell cannot serve is a typed skip, never a pass: `real_skip` /
+`fake_skip` carry the reason, `requires` names an advertised capability, a
+modeled feature, or a harness seam, and `deferred` records the contract half a
+row does not reach yet (for example `V-21`'s truncation marker, which needs an
+event-ring bound seam).
+
+A row whose assertions are only *partly* servable names the weaker claim with
+`gated_assertions` (`path -> requirement`) instead of dropping it or accepting a
+set of values. The driver's modeled feature decides: `true` compares the value
+exactly, `false` records a typed `"<path>: requires-<requirement>"` entry in the
+row's `skipped_assertions`, and a driver that does not model the capability at
+all fails the row. `V-14`/`V-15` use it for `session.cleanup` with
+`verified_cleanup_sweep`: the row still expects `"swept"`, and the real driver
+models the capability only when the daemon's own `daemon.status` names the
+delegated `cgroup_v2` subtree. A cell that falls back to
+`subreaper_fallback` (a hosted runner whose cgroup is not delegated) cannot
+prove a whole-tree sweep after a natural exit, so it records the assertion skip
+while the re-read stability, retry, and no-revival assertions still run at full
+strength.
+
 ## Steps
 
 A step has exactly one of `method` (with `connection` and `params`) or
@@ -113,7 +152,7 @@ Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
 `closed` (EOF after the reply), `transport` (`"closed"` when no reply arrives),
 `result`, `result_min`, `present`, `absent`, `array` (exact), `array_len`,
 `min_array_len`, `hex_len`, `distinct`, `not_equal`, `not_equal_any`,
-`request_log`,
+`path_equal`, `request_log`,
 `exit_code`, `stdout_contains`, `file_mode`, and `audit`. Paths are relative to
 the response `result`; a leading `result.` is accepted and normalized.
 
@@ -153,8 +192,13 @@ known-defect issue, instance id, step count, typed signature, failure step, and
 failure. The record contains no host path, username, socket path, port, token,
 or capability value. `features` carries driver-modeled service facts that are
 never advertised on the wire (for example `terminal_spawn`, the
-containment-plan gate of the accepted 1.3 terminal-spawn slice); `capabilities`
-stays the exact handshake set.
+containment-plan gate of the accepted 1.3 terminal-spawn slice, and
+`verified_cleanup_sweep`, whether that plan can prove a whole-tree sweep);
+`capabilities` stays the exact handshake set. `diagnostics` records the daemon's
+own explanation for a modeled fact (`containment.mechanism`,
+`containment.claim`, and the `containment.fallback` reason), and a row that
+skipped a gated assertion carries it in `skipped_assertions` with a
+`counts.skipped_assertions` total.
 
 `<cell>.parity.json` lists the shared vectors compared and the divergences. A
 fake run never closes a real row: the files are separate and the parity report

@@ -26,10 +26,175 @@ use harness::runner::{
 #[cfg(target_os = "linux")]
 use harness::real::RealDriver;
 
+/// Every vector the accepted contract names, with the corpus area that marks
+/// its intent.
+///
+/// This is the contract's vector list, not the corpus's. A contract addition
+/// the corpus does not answer fails here by id, and a corpus row that claims a
+/// contract id for a different property fails here by area. Extension vectors
+/// keep their own namespace (`V-35`+, `C-20`+, `F-01`) so they can never be
+/// mistaken for a contract row.
+///
+/// `C-10` carries the contract's own area, `Attach`: the row is the
+/// observer-grant store's injected-clock half (single use, TTL, expiry,
+/// revoke), and the area is the contract matrix label rather than a
+/// description of the fake-only arm.
+const CONTRACT_VECTORS: [(&str, &str); 53] = [
+    ("V-01", "handshake"),
+    ("V-02", "handshake"),
+    ("V-03", "handshake"),
+    ("V-04", "bounds"),
+    ("V-05", "attach"),
+    ("V-06", "attach"),
+    ("V-07", "attach"),
+    ("V-08", "attach"),
+    ("V-09", "attach"),
+    ("V-10", "attach"),
+    ("V-11", "lifecycle"),
+    ("V-12", "lifecycle"),
+    ("V-13", "lifecycle"),
+    ("V-14", "lifecycle"),
+    ("V-15", "lifecycle"),
+    ("V-16", "stop"),
+    ("V-17", "stop"),
+    ("V-18", "restart"),
+    ("V-19", "timeout"),
+    ("V-20", "retention"),
+    ("V-21", "reattach"),
+    ("V-22", "reattach"),
+    ("V-23", "bounds"),
+    ("V-24", "bounds"),
+    ("V-25", "trust-unix"),
+    ("V-26", "trust-unix"),
+    ("V-27", "trust-windows"),
+    ("V-28", "trust"),
+    ("V-29", "adapter"),
+    ("V-30", "adapter"),
+    ("V-31", "adapter"),
+    ("V-32", "adapter"),
+    ("V-33", "adapter"),
+    ("V-34", "cancellation"),
+    ("C-01", "identity"),
+    ("C-02", "trust"),
+    ("C-03", "orphans"),
+    ("C-04", "counters"),
+    ("C-05", "containment"),
+    ("C-06", "events"),
+    ("C-07", "audit"),
+    ("C-08", "absence"),
+    ("C-09", "authorization"),
+    ("C-10", "attach"),
+    ("C-11", "control"),
+    ("C-12", "child-scope"),
+    ("C-13", "orphans"),
+    ("C-14", "audit"),
+    ("C-15", "trust-plugin"),
+    ("C-16", "trust"),
+    ("C-17", "session"),
+    ("C-18", "termination"),
+    ("C-19", "consent"),
+];
+
+/// Every contract id the corpus rows do not serve with the contract's intent.
+///
+/// Pure so the gate itself is testable: a caller that passes a corpus missing
+/// one row gets that id back, rather than a count that hides which one.
+fn coverage_gaps(required: &[(&str, &str)], found: &[(String, String)]) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for (id, area) in required {
+        match found.iter().find(|(found_id, _)| found_id == id) {
+            None => gaps.push(format!("missing contract vector {id} ({area})")),
+            Some((_, found_area)) if found_area != area => gaps.push(format!(
+                "contract vector {id} serves area {found_area}, the contract row is {area}"
+            )),
+            Some(_) => {}
+        }
+    }
+    gaps
+}
+
+/// Split `V-14` into `("V", 14)`; a malformed id is `None`.
+fn contract_id_rank(id: &str) -> Option<(&str, u32)> {
+    let (prefix, number) = id.split_once('-')?;
+    Some((prefix, number.parse().ok()?))
+}
+
+#[test]
+fn the_coverage_gate_reports_the_missing_or_misplaced_vector() {
+    let full = [
+        ("V-13", "lifecycle"),
+        ("V-14", "lifecycle"),
+        ("V-15", "lifecycle"),
+    ];
+    let found = vec![
+        ("V-13".to_owned(), "lifecycle".to_owned()),
+        ("V-15".to_owned(), "lifecycle".to_owned()),
+    ];
+    assert_eq!(
+        coverage_gaps(&full, &found),
+        ["missing contract vector V-14 (lifecycle)"],
+        "the gate must name the id it misses, not a count"
+    );
+    let misplaced = vec![
+        ("V-13".to_owned(), "lifecycle".to_owned()),
+        ("V-14".to_owned(), "session-record".to_owned()),
+        ("V-15".to_owned(), "lifecycle".to_owned()),
+    ];
+    assert_eq!(
+        coverage_gaps(&full, &misplaced),
+        ["contract vector V-14 serves area session-record, the contract row is lifecycle"],
+        "a row that reuses a contract id for another property must fail"
+    );
+    let covered: Vec<(String, String)> = full
+        .iter()
+        .map(|(id, area)| ((*id).to_owned(), (*area).to_owned()))
+        .collect();
+    assert!(coverage_gaps(&full, &covered).is_empty());
+}
+
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 66, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 83, "corpus size changed");
+    let mut ids = std::collections::BTreeSet::new();
+    for vector in &corpus.vectors {
+        assert!(
+            ids.insert(vector.id.as_str()),
+            "the corpus reuses the vector id {}",
+            vector.id
+        );
+    }
+    let found: Vec<(String, String)> = corpus
+        .vectors
+        .iter()
+        .map(|vector| (vector.id.clone(), vector.area.clone()))
+        .collect();
+    let gaps = coverage_gaps(&CONTRACT_VECTORS, &found);
+    assert!(
+        gaps.is_empty(),
+        "the corpus does not cover the accepted contract: {gaps:#?}"
+    );
+    for vector in &corpus.vectors {
+        if CONTRACT_VECTORS
+            .iter()
+            .any(|(id, _)| *id == vector.id.as_str())
+        {
+            continue;
+        }
+        let (prefix, number) = contract_id_rank(&vector.id)
+            .unwrap_or_else(|| panic!("{} is not a contract or extension id", vector.id));
+        let extension = match prefix {
+            "V" => number >= 35,
+            "C" => number >= 20,
+            "F" => true,
+            _ => false,
+        };
+        assert!(
+            extension,
+            "{} sits in the contract namespace without a contract row",
+            vector.id
+        );
+    }
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
         "C-15", "C-16", "C-17",
@@ -78,6 +243,45 @@ fn corpus_is_well_formed_and_frozen() {
     for id in ["V-16", "V-17"] {
         let vector = corpus.vector(id).expect("stop vector");
         assert_eq!(vector.decisions, ["D-05"], "{id} decisions");
+    }
+    // The lifecycle pair keeps `swept` as the expected cleanup and gates only
+    // the comparison on the capability: the row must never carry a weakened
+    // value (or an accepted set) where the cell can prove the sweep.
+    for id in ["V-14", "V-15"] {
+        let vector = corpus.vector(id).expect("lifecycle vector");
+        assert_eq!(
+            vector
+                .gated_assertions
+                .get("session.cleanup")
+                .map(String::as_str),
+            Some("verified_cleanup_sweep"),
+            "{id} must gate only the cleanup sub-assertion"
+        );
+        let cleanup_values: Vec<&Value> = vector
+            .steps
+            .iter()
+            .chain(vector.state.iter())
+            .filter_map(|step| step.expect.result.get("session.cleanup"))
+            .collect();
+        assert!(
+            !cleanup_values.is_empty(),
+            "{id} asserts a cleanup class in at least one step"
+        );
+        assert!(
+            cleanup_values.iter().all(|value| *value == "swept"),
+            "{id} must still expect a swept cleanup, not a set that accepts unverified"
+        );
+        let other_assertions = vector
+            .steps
+            .iter()
+            .chain(vector.state.iter())
+            .flat_map(|step| step.expect.result.keys())
+            .filter(|path| path.as_str() != "session.cleanup")
+            .count();
+        assert!(
+            other_assertions > 0,
+            "{id} keeps the assertions that do not depend on the sweep"
+        );
     }
     let retention = corpus.vector("V-20").expect("retention vector");
     assert_eq!(retention.decisions, ["D-14"], "V-20 decisions");
@@ -207,6 +411,7 @@ fn not_equal_any_rejects_duplicate_ids() {
     vars.insert("a_sid".to_owned(), Value::String("a".repeat(32)));
     vars.insert("b_sid".to_owned(), Value::String("b".repeat(32)));
     let mut driver = FakeDriver::new();
+    let no_gates = BTreeMap::new();
     let reply = |id: &str| {
         Outcome::Reply(Reply {
             ok: true,
@@ -220,7 +425,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"a".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_err(),
         "a duplicate of the first id must fail"
@@ -231,7 +437,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"b".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_err(),
         "a duplicate of the second id must fail"
@@ -242,7 +449,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"c".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_ok(),
         "a distinct id must pass"
@@ -324,10 +532,12 @@ fn fake_conformance_corpus() {
     assert_eq!(
         skipped,
         [
-            "V-17", "V-18", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-            "C-08", "C-12", "C-15", "C-16", "V-49", "V-50", "V-55", "V-56", "V-57"
+            "V-14", "V-15", "V-17", "V-18", "V-21", "V-25", "V-26", "V-27", "V-28", "V-29", "V-30",
+            "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-13", "C-14", "C-15", "C-16",
+            "C-18", "C-07", "C-08", "C-12", "C-20", "C-23", "C-24", "V-49", "V-50", "V-55", "V-56",
+            "V-57"
         ],
-        "the fake suite skips exactly the real-only and amendment-gated vectors"
+        "the fake suite skips exactly the real-only, adapter-owned, cell-specific, and amendment-gated vectors"
     );
 }
 
@@ -352,6 +562,48 @@ fn real_conformance_corpus() {
         rows.iter().all(|row| row.driver == DriverKind::Real),
         "the real suite never carries a fake row"
     );
+    // The cleanup sub-assertion of V-14/V-15 is compared only where the cell
+    // can prove a whole-tree sweep; every other assertion in those rows is
+    // full strength. The expectation follows the daemon's own mechanism, so a
+    // hosted runner that falls back to the subreaper records the typed
+    // assertion skip instead of a silent pass.
+    let sweep_verified = facts
+        .features
+        .get("verified_cleanup_sweep")
+        .copied()
+        .expect("the real driver models the sweep capability");
+    let assertion_skips: Vec<(&str, &str)> = rows
+        .iter()
+        .flat_map(|row| {
+            row.skipped_assertions
+                .iter()
+                .map(move |skip| (row.id.as_str(), skip.as_str()))
+        })
+        .collect();
+    let expected_assertion_skips: Vec<(&str, &str)> = if sweep_verified {
+        Vec::new()
+    } else {
+        // A cell that cannot prove the sweep still runs the row (the stop
+        // path needs only an enforced plan); a cell with no plan at all skips
+        // the row outright, and the skip list below freezes that case.
+        let ran = ["V-14", "V-15"].iter().all(|id| {
+            rows.iter()
+                .any(|row| row.id == *id && row.status == RowStatus::Pass)
+        });
+        if ran {
+            vec![
+                ("V-14", "session.cleanup: requires-verified_cleanup_sweep"),
+                ("V-15", "session.cleanup: requires-verified_cleanup_sweep"),
+            ]
+        } else {
+            Vec::new()
+        }
+    };
+    assert_eq!(
+        assertion_skips, expected_assertion_skips,
+        "the gated cleanup assertion must be compared exactly where the cell can \
+         prove the sweep, and recorded as a typed skip everywhere else"
+    );
     let skipped: Vec<&str> = rows
         .iter()
         .filter(|row| row.status == RowStatus::Skip)
@@ -364,8 +616,11 @@ fn real_conformance_corpus() {
         .collect();
     assert_eq!(
         skipped,
-        ["V-06", "V-33", "V-42", "C-10", "F-01", "V-50"],
-        "only the injected-clock, adapter-owned, injected-queue, and amendment-gated vectors skip on Linux"
+        [
+            "V-06", "V-25", "V-26", "V-27", "V-29", "V-30", "V-33", "V-42", "C-15", "C-16", "C-18",
+            "C-12", "C-10", "F-01", "V-50"
+        ],
+        "only the injected-clock, adapter-owned, cell-specific, injected-queue, and amendment-gated vectors skip on Linux"
     );
 }
 
@@ -387,6 +642,7 @@ fn real_conformance_corpus() {
             skip_reason: Some(
                 "cell-not-servable (the served loop is Linux-only in this slice)".to_owned(),
             ),
+            skipped_assertions: Vec::new(),
             deferred: vector.deferred.clone(),
             known_defect: None,
             instance_id: String::new(),
@@ -466,9 +722,10 @@ fn compare_corpus_rows(
 #[cfg(target_os = "linux")]
 fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'static str>) {
     let mut expected_not_compared = vec![
-        "V-06", "V-17", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03",
-        "C-11", "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50", "V-55",
-        "V-56", "V-57",
+        "V-06", "V-14", "V-15", "V-17", "V-18", "V-21", "V-25", "V-26", "V-27", "V-28", "V-29",
+        "V-30", "V-33", "V-39", "V-40", "V-42", "V-43", "V-49", "V-50", "V-55", "V-56", "V-57",
+        "C-01", "C-02", "C-03", "C-07", "C-08", "C-10", "C-12", "C-13", "C-14", "C-15", "C-16",
+        "C-18", "C-20", "C-23", "C-24", "F-01",
     ];
     if !test_seams {
         // Without the real seams V-20 and V-44 are fake-only rows: the real
@@ -476,18 +733,18 @@ fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'s
         expected_not_compared.extend(["V-20", "V-44"]);
     }
     let expected_compared = match (real_serves_spawn, test_seams) {
-        (true, true) => 42,
-        (true, false) => 40,
+        (true, true) => 45,
+        (true, false) => 43,
         // The terminal-spawn vectors skip on the refused cell. V-48 needs no
         // process or containment plan, so it stays compared. V-52 needs a
-        // bound worker, so it joins them.
+        // bound worker, so it joins them. C-17 resizes a bound terminal.
         (false, true) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-52"]);
-            38
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "C-17", "V-52"]);
+            40
         }
         (false, false) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-52"]);
-            36
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "C-17", "V-52"]);
+            38
         }
     };
     expected_not_compared.sort_unstable();

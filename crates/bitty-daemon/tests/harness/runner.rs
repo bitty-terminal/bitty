@@ -54,6 +54,14 @@ pub struct ServiceFacts {
     pub features: BTreeMap<String, bool>,
     /// Harness-only seams the driver can use, never advertised on the wire.
     pub seams: BTreeMap<String, bool>,
+    /// Why a modeled capability is absent, as `name -> reason`.
+    ///
+    /// A driver records the service's own explanation for a modeled fact it
+    /// could not serve (the containment probe's fallback reason), so the
+    /// evidence file names the mechanism instead of leaving a `false` bit to
+    /// guesswork. Never a host path: the daemon's refusal text names the check,
+    /// not a location.
+    pub diagnostics: BTreeMap<String, String>,
 }
 
 /// One request the driver actually sent.
@@ -267,6 +275,12 @@ pub struct VectorOutcome {
     pub driver: DriverKind,
     pub status: RowStatus,
     pub skip_reason: Option<String>,
+    /// Sub-assertions this cell could not make, as `path: requires-<name>`.
+    ///
+    /// A row that passes every assertion its cell can serve and records one
+    /// here is a partial proof, not a failure and not a full pass: the report
+    /// names the capability the cell lacks.
+    pub skipped_assertions: Vec<String>,
     pub deferred: Option<String>,
     pub known_defect: Option<String>,
     pub instance_id: String,
@@ -323,6 +337,7 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
                     .unwrap_or("driver-not-required")
                     .to_owned(),
             ),
+            skipped_assertions: Vec::new(),
             deferred: vector.deferred.clone(),
             known_defect: None,
             instance_id: String::new(),
@@ -340,6 +355,7 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
         driver: driver.kind(),
         status: RowStatus::Pass,
         skip_reason: vector.skip_reason(driver.kind()).map(str::to_owned),
+        skipped_assertions: Vec::new(),
         deferred: vector.deferred.clone(),
         known_defect: known_defect_marker(vector, driver.kind()),
         instance_id: String::new(),
@@ -376,10 +392,33 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
         driver.finish();
         return row;
     }
+    // A gated sub-assertion is compared exactly when the cell models its
+    // capability, and recorded as a typed `requires-<name>` assertion skip when
+    // the cell models it `false`. A capability the driver does not model at all
+    // fails the row: an unmetered gate would hide the assertion everywhere.
+    let gated = match gated_paths(&vector.gated_assertions, &facts) {
+        Ok(gated) => gated,
+        Err(error) => {
+            row.status = RowStatus::Fail;
+            row.failure = Some(error);
+            driver.finish();
+            return row;
+        }
+    };
     for (index, step) in vector.steps.iter().chain(vector.state.iter()).enumerate() {
         row.steps += 1;
-        match execute_step(step, driver, &mut vars) {
-            Ok(signature) => row.signature.push(format!("{index}:{signature}")),
+        match execute_step(step, driver, &mut vars, &gated) {
+            Ok((signature, skips)) => {
+                row.signature.push(format!("{index}:{signature}"));
+                // One entry per (path, capability) claim the row did not make:
+                // a vector that reads the record three times records one skip,
+                // not three, so the report names what is unproved.
+                for skip in skips {
+                    if !row.skipped_assertions.contains(&skip) {
+                        row.skipped_assertions.push(skip);
+                    }
+                }
+            }
             Err(error) => {
                 row.status = RowStatus::Fail;
                 row.failure = Some(error);
@@ -453,9 +492,15 @@ fn known_defect_marker(vector: &Vector, driver: DriverKind) -> Option<String> {
         .map(|defect| format!("{}: {}", defect.issue, defect.reason))
 }
 
-fn execute_step(step: &Step, driver: &mut dyn Driver, vars: &mut Vars) -> Result<String, String> {
+fn execute_step(
+    step: &Step,
+    driver: &mut dyn Driver,
+    vars: &mut Vars,
+    gated: &BTreeMap<String, String>,
+) -> Result<(String, Vec<String>), String> {
     if let Some(action) = step.action.as_deref() {
-        return execute_action(action, step, driver, vars).map(|()| format!("action:{action}"));
+        return execute_action(action, step, driver, vars, gated)
+            .map(|skips| (format!("action:{action}"), skips));
     }
     let connection = step
         .connection
@@ -474,8 +519,8 @@ fn execute_step(step: &Step, driver: &mut dyn Driver, vars: &mut Vars) -> Result
             Some("drop_before_reply") => driver.call_dropping(connection, method, params),
             Some(other) => return Err(format!("unknown fault {other:?}")),
         };
-        match check_expect(&step.expect, &outcome, driver, connection, vars) {
-            Ok(()) => {
+        match check_expect(&step.expect, &outcome, driver, connection, vars, gated) {
+            Ok(skips) => {
                 if let Outcome::Reply(reply) = &outcome {
                     if reply.ok {
                         for (name, path) in &step.capture {
@@ -485,7 +530,7 @@ fn execute_step(step: &Step, driver: &mut dyn Driver, vars: &mut Vars) -> Result
                         }
                     }
                 }
-                return Ok(signature(&outcome));
+                return Ok((signature(&outcome), skips));
             }
             Err(error) => {
                 if step.expect.retry_ms == 0 || std::time::Instant::now() >= deadline {
@@ -504,15 +549,16 @@ fn execute_action(
     step: &Step,
     driver: &mut dyn Driver,
     vars: &mut Vars,
-) -> Result<(), String> {
+    gated: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
     let connection = step.connection.as_deref().unwrap_or("default");
     match action {
         "restart" => {
             let seeded = driver.restart()?;
             vars.extend(seeded);
-            Ok(())
+            Ok(Vec::new())
         }
-        "crash" => driver.crash(),
+        "crash" => driver.crash().map(|()| Vec::new()),
         "advance_clock" => {
             let millis = step
                 .args
@@ -520,19 +566,19 @@ fn execute_action(
                 .and_then(Value::as_u64)
                 .ok_or_else(|| "advance_clock needs args.ms".to_owned())?;
             driver.advance_clock(millis);
-            check_clock_advance(&step.expect)
+            check_clock_advance(&step.expect).map(|()| Vec::new())
         }
         "oversized_frame" => {
             let declared = arg_u32(step, "declared_len")?;
             let outcome = driver.oversized_frame(connection, declared);
-            check_expect(&step.expect, &outcome, driver, connection, vars)
+            check_expect(&step.expect, &outcome, driver, connection, vars, gated)
                 .map_err(|error| format!("oversized_frame: {error}"))
         }
         "partial_frame" => {
             let declared = arg_u32(step, "declared_len")?;
             let body = arg_usize(step, "body_bytes")?;
             let outcome = driver.partial_frame(connection, declared, body);
-            check_expect(&step.expect, &outcome, driver, connection, vars)
+            check_expect(&step.expect, &outcome, driver, connection, vars, gated)
                 .map_err(|error| format!("partial_frame: {error}"))
         }
         "raw_request" => {
@@ -547,7 +593,7 @@ fn execute_action(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let outcome = driver.raw_request(connection, request, expect_eof);
-            check_expect(&step.expect, &outcome, driver, connection, vars)
+            check_expect(&step.expect, &outcome, driver, connection, vars, gated)
                 .map_err(|error| format!("raw_request: {error}"))
         }
         "pipelined_negotiate" => {
@@ -562,7 +608,7 @@ fn execute_action(
                 .and_then(Value::as_u64)
                 .map(|body| body as usize);
             let outcome = driver.pipelined_negotiate(connection, &second, partial_body);
-            check_expect(&step.expect, &outcome, driver, connection, vars)
+            check_expect(&step.expect, &outcome, driver, connection, vars, gated)
                 .map_err(|error| format!("pipelined_negotiate: {error}"))
         }
         "audit" => {
@@ -571,7 +617,7 @@ fn execute_action(
                 .audit
                 .as_ref()
                 .ok_or_else(|| "audit action without expect.audit".to_owned())?;
-            check_audit(audit, &driver.audit_text(), vars)
+            check_audit(audit, &driver.audit_text(), vars).map(|()| Vec::new())
         }
         "peer_exit" => {
             let method = arg_string(step, "method")?;
@@ -580,14 +626,14 @@ fn execute_action(
             if let Some(audit) = step.expect.audit.as_ref() {
                 check_audit(audit, &driver.audit_text(), vars)?;
             }
-            Ok(())
+            Ok(Vec::new())
         }
         "queue_pressure" => {
             let method = arg_string(step, "method")?;
             let count = arg_usize(step, "count")?;
             let params = step.args.get("params").cloned().unwrap_or(Value::Null);
             let outcome = driver.queue_pressure(connection, method, count, &params);
-            check_expect(&step.expect, &outcome, driver, connection, vars)
+            check_expect(&step.expect, &outcome, driver, connection, vars, gated)
                 .map_err(|error| format!("queue_pressure: {error}"))
         }
         "refusal_burst" => {
@@ -598,7 +644,9 @@ fn execute_action(
                 .error_code
                 .as_deref()
                 .ok_or_else(|| "refusal_burst needs expect.error_code".to_owned())?;
-            driver.refusal_burst(connection, method, count, code)
+            driver
+                .refusal_burst(connection, method, count, code)
+                .map(|()| Vec::new())
         }
         "file_mode" => {
             let role = arg_string(step, "role")?;
@@ -612,9 +660,9 @@ fn execute_action(
             if mode != expected {
                 return Err(format!("{role} mode {mode:o}, expected {expected:o}"));
             }
-            Ok(())
+            Ok(Vec::new())
         }
-        "no_tcp_listener" => driver.no_tcp_listener(),
+        "no_tcp_listener" => driver.no_tcp_listener().map(|()| Vec::new()),
         "child_processes" => {
             let count = driver.child_process_count()?;
             let expected = step
@@ -626,7 +674,7 @@ fn execute_action(
             if count != expected {
                 return Err(format!("{count} child processes, expected {expected}"));
             }
-            Ok(())
+            Ok(Vec::new())
         }
         "daemon_absent" => {
             let observed = driver.daemon_absent()?;
@@ -640,7 +688,7 @@ fn execute_action(
                     return Err(format!("stdout does not contain {needle:?}"));
                 }
             }
-            Ok(())
+            Ok(Vec::new())
         }
         "cli_stop" => {
             let mode = arg_string(step, "mode")?;
@@ -655,7 +703,7 @@ fn execute_action(
                     return Err(format!("stdout does not contain {needle:?}"));
                 }
             }
-            Ok(())
+            Ok(Vec::new())
         }
         "request_log" => {
             let expect = step
@@ -663,7 +711,7 @@ fn execute_action(
                 .request_log
                 .as_ref()
                 .ok_or_else(|| "request_log action without expect.request_log".to_owned())?;
-            check_request_log(expect, &driver.requests())
+            check_request_log(expect, &driver.requests()).map(|()| Vec::new())
         }
         "read_events" => {
             let count = arg_usize(step, "count")?;
@@ -724,7 +772,7 @@ fn execute_action(
             if step.expect.closed && !driver.expect_eof(connection) {
                 return Err("the connection did not close after the events".to_owned());
             }
-            Ok(())
+            Ok(Vec::new())
         }
         other => Err(format!("unknown action {other:?}")),
     }
@@ -745,12 +793,13 @@ pub fn check_expect(
     driver: &mut dyn Driver,
     connection: &str,
     vars: &Vars,
-) -> Result<(), String> {
+    gated: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
     if expect.transport_closed {
         if !matches!(outcome, Outcome::Closed) {
             return Err("expected the transport to close without a reply".to_owned());
         }
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Outcome::Reply(reply) = outcome else {
         return Err("expected a reply, transport closed".to_owned());
@@ -810,7 +859,18 @@ pub fn check_expect(
             }
         }
     }
+    let mut skipped: Vec<String> = Vec::new();
     for (path, expected) in &expect.result {
+        // A gated path the cell cannot prove is still required to exist: only
+        // the exact value is unprovable, so the row cannot pass on a reply
+        // that omits the field.
+        if let Some(requirement) = gated.get(path) {
+            if path_get(&reply.result, path).is_none_or(Value::is_null) {
+                return Err(format!("missing result path {path}"));
+            }
+            skipped.push(format!("{path}: requires-{requirement}"));
+            continue;
+        }
         let expected = resolve(expected, vars);
         let actual =
             path_get(&reply.result, path).ok_or_else(|| format!("missing result path {path}"))?;
@@ -889,8 +949,50 @@ pub fn check_expect(
             }
         }
     }
+    check_result_relations(expect, &reply.result, vars)?;
+    if expect.closed && !driver.expect_eof(connection) {
+        return Err("expected the connection to close after the refusal".to_owned());
+    }
+    Ok(skipped)
+}
+
+/// Resolve the gated sub-assertions this cell cannot prove.
+///
+/// `Ok` holds `path -> requirement` for every gate whose capability the cell
+/// models `false`: those values are recorded as typed assertion skips instead
+/// of being compared. A capability the driver does not model at all is an
+/// error, because a gate naming an unmetered capability would otherwise skip
+/// the assertion on every cell, including the one that can serve it.
+pub fn gated_paths(
+    gated_assertions: &BTreeMap<String, String>,
+    facts: &ServiceFacts,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut gated = BTreeMap::new();
+    for (path, requirement) in gated_assertions {
+        match facts.features.get(requirement).copied() {
+            Some(true) => {}
+            Some(false) => {
+                gated.insert(path.clone(), requirement.clone());
+            }
+            None => {
+                return Err(format!(
+                    "gated assertion {path} names the unmodeled capability {requirement}"
+                ));
+            }
+        }
+    }
+    Ok(gated)
+}
+
+/// Check the expectations that relate the reply to a captured variable or to
+/// another field of the same reply.
+///
+/// `not_equal`, `not_equal_any`, and `path_equal` all compare live values, so a
+/// missing variable or a missing path is a failure: none of them can pass by
+/// asserting nothing.
+pub fn check_result_relations(expect: &Expect, result: &Value, vars: &Vars) -> Result<(), String> {
     for (path, variable) in &expect.not_equal {
-        let actual = path_get(&reply.result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
         let expected = vars
             .get(variable.trim_start_matches('@'))
             .ok_or_else(|| format!("unknown variable {variable}"))?;
@@ -899,7 +1001,7 @@ pub fn check_expect(
         }
     }
     for (path, variables) in &expect.not_equal_any {
-        let actual = path_get(&reply.result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
         for variable in variables {
             let expected = vars
                 .get(variable.trim_start_matches('@'))
@@ -909,8 +1011,12 @@ pub fn check_expect(
             }
         }
     }
-    if expect.closed && !driver.expect_eof(connection) {
-        return Err("expected the connection to close after the refusal".to_owned());
+    for (path, other) in &expect.path_equal {
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let counterpart = path_get(result, other).ok_or_else(|| format!("missing path {other}"))?;
+        if actual != counterpart {
+            return Err(format!("{path} is {actual}, {other} is {counterpart}"));
+        }
     }
     Ok(())
 }
@@ -1081,4 +1187,201 @@ pub fn path_get<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         };
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn expect_with_path_equal(path: &str, other: &str) -> Expect {
+        let mut expect = Expect::default();
+        expect.path_equal.insert(path.to_owned(), other.to_owned());
+        expect
+    }
+
+    #[test]
+    fn path_equal_accepts_two_matching_paths() {
+        let result = json!({
+            "earliest_revision": 3,
+            "backlog": [{"revision": 3}, {"revision": 4}],
+        });
+        check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect("the gap marker names the first replayed revision");
+    }
+
+    #[test]
+    fn path_equal_fails_when_the_gap_marker_names_a_dropped_revision() {
+        let result = json!({
+            "earliest_revision": 1,
+            "backlog": [{"revision": 3}, {"revision": 4}],
+        });
+        let error = check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect_err("a gap marker below the first served revision must fail");
+        assert!(
+            error.contains("earliest_revision is 1"),
+            "the failure must name the marker and what it holds: {error}"
+        );
+    }
+
+    #[test]
+    fn path_equal_fails_when_a_named_path_is_missing() {
+        let result = json!({ "earliest_revision": 1, "backlog": [] });
+        let error = check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect_err("an absent replayed revision must fail, not pass vacuously");
+        assert!(
+            error.contains("missing path backlog.0.revision"),
+            "the failure must name the missing path: {error}"
+        );
+    }
+
+    #[test]
+    fn not_equal_still_fails_on_an_unknown_variable() {
+        let mut expect = Expect::default();
+        expect
+            .not_equal
+            .insert("session_id".to_owned(), "@absent".to_owned());
+        let error = check_result_relations(&expect, &json!({ "session_id": "aa" }), &Vars::new())
+            .expect_err("a missing variable must fail");
+        assert!(error.contains("unknown variable @absent"), "{error}");
+    }
+
+    fn facts_modeling(requirement: &str, served: Option<bool>) -> ServiceFacts {
+        ServiceFacts {
+            features: served
+                .map(|served| (requirement.to_owned(), served))
+                .into_iter()
+                .collect(),
+            ..ServiceFacts::default()
+        }
+    }
+
+    fn gated_cleanup() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "session.cleanup".to_owned(),
+            "verified_cleanup_sweep".to_owned(),
+        )])
+    }
+
+    #[test]
+    fn a_gated_value_is_compared_exactly_on_a_cell_that_models_the_capability() {
+        let expect = {
+            let mut expect = Expect::default();
+            expect
+                .result
+                .insert("session.cleanup".to_owned(), json!("swept"));
+            expect
+        };
+        let gated = gated_paths(
+            &gated_cleanup(),
+            &facts_modeling("verified_cleanup_sweep", Some(true)),
+        )
+        .expect("a modeled capability resolves");
+        assert!(
+            gated.is_empty(),
+            "a cell that models the capability compares the value"
+        );
+        let reply = Outcome::Reply(Reply {
+            ok: true,
+            result: json!({ "session": { "cleanup": "unverified" } }),
+            error: None,
+        });
+        let error = check_expect(
+            &expect,
+            &reply,
+            &mut crate::harness::fake::FakeDriver::new(),
+            "operator",
+            &Vars::new(),
+            &gated,
+        )
+        .expect_err("a wrong cleanup class must fail where the cell can prove it");
+        assert!(
+            error.contains("result session.cleanup is \"unverified\""),
+            "the mismatch must be the value, not a missing path: {error}"
+        );
+    }
+
+    #[test]
+    fn a_gated_value_is_a_typed_assertion_skip_where_the_cell_cannot_prove_it() {
+        let mut expect = Expect::default();
+        expect
+            .result
+            .insert("session.cleanup".to_owned(), json!("swept"));
+        expect
+            .result
+            .insert("session.state".to_owned(), json!("exited"));
+        let gated = gated_paths(
+            &gated_cleanup(),
+            &facts_modeling("verified_cleanup_sweep", Some(false)),
+        )
+        .expect("a modeled capability resolves");
+        assert_eq!(
+            gated.get("session.cleanup").map(String::as_str),
+            Some("verified_cleanup_sweep"),
+            "an unprovable gate names the missing capability"
+        );
+        let reply = Outcome::Reply(Reply {
+            ok: true,
+            result: json!({ "session": { "cleanup": "unverified", "state": "exited" } }),
+            error: None,
+        });
+        let skips = check_expect(
+            &expect,
+            &reply,
+            &mut crate::harness::fake::FakeDriver::new(),
+            "operator",
+            &Vars::new(),
+            &gated,
+        )
+        .expect("the rest of the row still passes");
+        assert_eq!(
+            skips,
+            ["session.cleanup: requires-verified_cleanup_sweep"],
+            "the skip is typed and names the path and capability"
+        );
+        // The gated path must still be present: the cell cannot prove the
+        // value, but an absent field is a different (failing) claim.
+        let absent = Outcome::Reply(Reply {
+            ok: true,
+            result: json!({ "session": { "state": "exited" } }),
+            error: None,
+        });
+        assert!(
+            check_expect(
+                &expect,
+                &absent,
+                &mut crate::harness::fake::FakeDriver::new(),
+                "operator",
+                &Vars::new(),
+                &gated,
+            )
+            .is_err(),
+            "a gated field that disappears must fail, not skip"
+        );
+    }
+
+    #[test]
+    fn an_unmodeled_gated_capability_fails_instead_of_skipping() {
+        let error = gated_paths(
+            &gated_cleanup(),
+            &facts_modeling("verified_cleanup_sweep", None),
+        )
+        .expect_err("a gate the driver does not model must not read as a skip");
+        assert!(
+            error.contains("unmodeled capability verified_cleanup_sweep"),
+            "{error}"
+        );
+    }
 }

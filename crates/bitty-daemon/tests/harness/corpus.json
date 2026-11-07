@@ -2342,6 +2342,382 @@
       ]
     },
     {
+      "id": "V-14",
+      "title": "A signal death sweeps the tree, keeps the terminal record, and never restarts the worker",
+      "area": "lifecycle",
+      "decisions": [
+        "D-04",
+        "D-17"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "gated_assertions": {
+        "session.cleanup": "verified_cleanup_sweep"
+      },
+      "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v14-create",
+            "argv": [
+              "/bin/sh",
+              "-c",
+              "sleep 0.2; kill -KILL $$"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "capture": {
+            "record_worker_handle": "session.worker_handle",
+            "record_changed_at": "session.state_changed_at_ms",
+            "record_revision": "session.state_revision"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.cleanup",
+              "session.worker_handle"
+            ],
+            "result": {
+              "session.state": "failed",
+              "session.terminal_reason": "worker_signal",
+              "session.signal": 9,
+              "session.cleanup": "swept",
+              "session.generation": 1
+            },
+            "absent": [
+              "session.exit_code",
+              "session.requested_by"
+            ],
+            "retry_ms": 5000
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "failed",
+              "session.signal": 9,
+              "session.cleanup": "swept",
+              "session.generation": 1,
+              "session.terminal_reason": "worker_signal",
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
+            },
+            "absent": [
+              "session.exit_code"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v14-retry"
+          },
+          "capture": {
+            "retry_session_id": "session.session_id",
+            "retry_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "not_equal": {
+              "session.session_id": "@session_id",
+              "control_token": "@create_token"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "failed",
+              "session.terminal_reason": "worker_signal",
+              "session.generation": 1,
+              "session.cleanup": "swept",
+              "session.signal": 9,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a retry rebinds the failed session to a new worker instead of creating a new session",
+        "the terminal record loses its cleanup class on a repeat read",
+        "a signal death reports a wait-status exit code"
+      ]
+    },
+    {
+      "id": "V-15",
+      "title": "A natural exit records the wait status and a swept cleanup, and the record is immutable",
+      "area": "lifecycle",
+      "decisions": [
+        "D-04",
+        "D-17"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "gated_assertions": {
+        "session.cleanup": "verified_cleanup_sweep"
+      },
+      "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 4
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v15-create",
+            "argv": [
+              "/bin/sh",
+              "-c",
+              "sleep 0.2; exit 3"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "capture": {
+            "record_worker_handle": "session.worker_handle",
+            "record_changed_at": "session.state_changed_at_ms",
+            "record_revision": "session.state_revision"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.cleanup",
+              "session.worker_handle"
+            ],
+            "result": {
+              "session.state": "exited",
+              "session.terminal_reason": "worker_exit",
+              "session.exit_code": 3,
+              "session.cleanup": "swept",
+              "session.generation": 1
+            },
+            "absent": [
+              "session.signal",
+              "session.requested_by"
+            ],
+            "retry_ms": 5000
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "exited",
+              "session.terminal_reason": "worker_exit",
+              "session.exit_code": 3,
+              "session.cleanup": "swept",
+              "session.generation": 1,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
+            },
+            "absent": [
+              "session.signal"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v15-retry"
+          },
+          "capture": {
+            "retry_session_id": "session.session_id",
+            "retry_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "not_equal": {
+              "session.session_id": "@session_id",
+              "control_token": "@create_token"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "exited",
+              "session.terminal_reason": "worker_exit",
+              "session.generation": 1,
+              "session.cleanup": "swept",
+              "session.exit_code": 3,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an exited session is revived or rebound to a second worker",
+        "the immutable terminal record changes on a later read",
+        "a natural exit reports a signal"
+      ]
+    },
+    {
       "id": "V-16",
       "title": "A refuse stop with an active session is typed and leaves the daemon running",
       "area": "stop",
@@ -2464,8 +2840,12 @@
       "id": "V-17",
       "title": "A force stop terminates two registry-only terminal sessions with daemon_stop events",
       "area": "stop",
-      "decisions": ["D-05"],
-      "drivers": ["real"],
+      "decisions": [
+        "D-05"
+      ],
+      "drivers": [
+        "real"
+      ],
       "fake_skip": "requires-real-cli-and-event-wire (the reference fake has no CLI process and detaches leases at termination)",
       "setup": {
         "host_grant": true
@@ -2479,7 +2859,10 @@
           "connection": "operator",
           "method": "daemon.negotiate",
           "params": {
-            "client_version": {"major": 1, "minor": 0},
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
             "operator_capability": "@operator_capability"
           },
           "expect": {
@@ -2497,14 +2880,21 @@
           },
           "expect": {
             "ok": true,
-            "present": ["grant_id", "grant", "expires_at_ms"]
+            "present": [
+              "grant_id",
+              "grant",
+              "expires_at_ms"
+            ]
           }
         },
         {
           "connection": "creator",
           "method": "daemon.negotiate",
           "params": {
-            "client_version": {"major": 1, "minor": 0},
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
             "host_grant": "@host_grant",
             "events": true
           },
@@ -2560,7 +2950,10 @@
           "connection": "creator2",
           "method": "daemon.negotiate",
           "params": {
-            "client_version": {"major": 1, "minor": 0},
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
             "host_grant": "@grant2",
             "events": true
           },
@@ -2618,7 +3011,10 @@
           },
           "expect": {
             "exit_code": 0,
-            "stdout_contains": ["stopped (force)", "2 active session(s)"]
+            "stdout_contains": [
+              "stopped (force)",
+              "2 active session(s)"
+            ]
           }
         },
         {
@@ -2682,7 +3078,9 @@
           "args": {},
           "expect": {
             "request_log": {
-              "no_fields": ["pid"],
+              "no_fields": [
+                "pid"
+              ],
               "method_counts": {
                 "session.create": 2
               }
@@ -3001,9 +3399,16 @@
       "id": "V-20",
       "title": "A terminal record past terminal_retention_ms becomes NotFound and leaves the retained count",
       "area": "retention",
-      "decisions": ["D-14"],
-      "drivers": ["fake", "real"],
-      "requires": ["retention_clock_seam"],
+      "decisions": [
+        "D-14"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "retention_clock_seam"
+      ],
       "setup": {
         "host_grant": true
       },
@@ -3016,7 +3421,10 @@
           "connection": "creator",
           "method": "daemon.negotiate",
           "params": {
-            "client_version": {"major": 1, "minor": 0},
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
             "host_grant": "@host_grant",
             "events": true
           },
@@ -3092,7 +3500,10 @@
           "connection": "operator",
           "method": "daemon.negotiate",
           "params": {
-            "client_version": {"major": 1, "minor": 0},
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
             "operator_capability": "@operator_capability"
           },
           "expect": {
@@ -3160,6 +3571,223 @@
         "a collected terminal record never resolves",
         "the retained count drops exactly once",
         "the event ring and control keys are released with the record"
+      ]
+    },
+    {
+      "id": "V-21",
+      "title": "A reattach serves the session snapshot with a bounded, ordered backlog whose gap marker names the first replayed revision",
+      "area": "reattach",
+      "decisions": [
+        "D-10"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-retained-ring: the reference fake keeps no retained event ring, so its attach response has no backlog or gap marker",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the truncated-ring arm still needs an event-ring bound seam; the untruncated gap marker (`earliest_revision`) is asserted here",
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v21-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v21-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token",
+            "controller_earliest": "earliest_revision"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "backlog_truncated": false
+            },
+            "present": [
+              "backlog",
+              "backlog_truncated",
+              "earliest_revision"
+            ],
+            "min_array_len": {
+              "backlog": 1
+            },
+            "hex_len": {
+              "attach_id": 32
+            },
+            "path_equal": {
+              "earliest_revision": "backlog.0.revision"
+            },
+            "result_min": {
+              "earliest_revision": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.detach",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "was_attached": true
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "control_token": "@controller_token",
+            "idempotency_key": "v21-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant": 64,
+              "grant_id": 32
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer",
+              "backlog_truncated": false,
+              "earliest_revision": "@controller_earliest"
+            },
+            "present": [
+              "backlog",
+              "backlog_truncated",
+              "earliest_revision",
+              "session"
+            ],
+            "min_array_len": {
+              "backlog": 2
+            },
+            "hex_len": {
+              "attach_id": 32
+            },
+            "path_equal": {
+              "earliest_revision": "backlog.0.revision"
+            },
+            "result_min": {
+              "earliest_revision": 1
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "observer",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a reattach replays an unbounded history instead of a bounded ring",
+        "a reattach mints a second session or a new generation",
+        "the backlog carries another lease's attach id"
       ]
     },
     {
@@ -3775,6 +4403,405 @@
       "forbidden": [
         "no partial frame is parsed or dispatched",
         "the closure is one aggregated record"
+      ]
+    },
+    {
+      "id": "V-25",
+      "title": "A second uid is refused at the peer check before any frame is parsed",
+      "area": "trust-unix",
+      "decisions": [
+        "D-07",
+        "D-15"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-second-uid: the harness cannot present a second uid to the kernel peer check; every conformance connection runs as the daemon's uid",
+      "fake_skip": "requires-second-uid: an in-process fake has no kernel peer credential to mismatch",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "foreign",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v25-create"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a foreign uid never reaches handshake parsing",
+        "a foreign uid never creates a session or an orphan record",
+        "the refusal is content-free and names no peer value"
+      ]
+    },
+    {
+      "id": "V-26",
+      "title": "An endpoint mode or owner change fails closed with exit 6 and no terminal transitions",
+      "area": "trust-unix",
+      "decisions": [
+        "D-07",
+        "D-15"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-tamper-seam: the corpus cannot change the endpoint mode behind a running daemon or observe its exit code, so the fail-closed exit is not servable from the harness",
+      "fake_skip": "requires-tamper-seam: the reference fake owns no endpoint file",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "action": "file_mode",
+          "args": {
+            "role": "endpoint"
+          },
+          "expect": {
+            "file_mode": 384
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a tampered endpoint is served after the re-attest fails",
+        "a tamper exit promises a terminal transition",
+        "a live worker loses its journal record on a tamper exit"
+      ]
+    },
+    {
+      "id": "V-27",
+      "title": "A named pipe rejects a SID mismatch and a remote client at the pipe level",
+      "area": "trust-windows",
+      "decisions": [
+        "D-15"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-windows-cell: the named-pipe DACL, SID comparison, and remote client rejection exist only on the Windows cell (D-15)",
+      "fake_skip": "requires-windows-cell: the reference fake models no named pipe",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "remote",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v27-create"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a remote pipe client is accepted or attributed to the local user",
+        "a SID mismatch falls back to a weaker peer check",
+        "the local operator is denied because a remote client was refused"
+      ]
+    },
+    {
+      "id": "V-28",
+      "title": "The startup scan shows the daemon listens on no TCP endpoint",
+      "area": "trust",
+      "decisions": [
+        "D-15"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-listener: the reference fake opens no socket, so a listener scan would observe nothing",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "server_identity.endpoint_kind": "unix_socket"
+            },
+            "hex_len": {
+              "daemon_instance_id": 32
+            }
+          }
+        },
+        {
+          "action": "no_tcp_listener",
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        },
+        {
+          "action": "no_tcp_listener",
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "forbidden": [
+        "the daemon opens a TCP listener on any interface",
+        "a socket file substitutes for the documented local endpoint",
+        "the listen set changes after the handshake"
+      ]
+    },
+    {
+      "id": "V-29",
+      "title": "A driver with no server returns typed unavailable instead of failing the run",
+      "area": "adapter",
+      "decisions": [
+        "D-01"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "fake_skip": "adapter-owned: the consumer adapter answers before the daemon is involved and this crate has no adapter row",
+      "real_skip": "adapter-owned: the consumer adapter answers before the daemon is involved and this crate has no adapter row",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the typed-unavailable answer is produced by the consumer adapter, which the daemon corpus cannot exercise",
+      "steps": [
+        {
+          "connection": "client",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v29-create"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Unavailable",
+            "error_code": "Unavailable"
+          }
+        },
+        {
+          "connection": "client",
+          "method": "session.status",
+          "params": {
+            "session_id": "44444444444444444444444444444444"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Unavailable",
+            "error_code": "Unavailable"
+          }
+        }
+      ],
+      "state": [
+        {
+          "action": "child_processes",
+          "expect": {
+            "result": {
+              "count": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a missing daemon is reported as a session failure or a crash",
+        "the adapter retries with a weaker transport",
+        "the adapter spawns a worker with no daemon"
+      ]
+    },
+    {
+      "id": "V-30",
+      "title": "A refused adapter call sends no connection to the daemon",
+      "area": "adapter",
+      "decisions": [
+        "D-01"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "fake_skip": "adapter-owned: the consumer adapter answers before the daemon is involved and this crate has no adapter row",
+      "real_skip": "adapter-owned: the consumer adapter answers before the daemon is involved and this crate has no adapter row",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the adapter owns the connection decision, so the corpus cannot observe that no frame was sent",
+      "steps": [
+        {
+          "connection": "client",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a refused adapter call still opens a connection",
+        "a refused adapter call mints a session or a lease",
+        "the daemon observes an unnegotiated request"
       ]
     },
     {
@@ -6703,7 +7730,7 @@
       ]
     },
     {
-      "id": "C-11",
+      "id": "C-13",
       "title": "Orphan retire removes one quarantined record without signalling or adopting",
       "area": "orphans",
       "decisions": [
@@ -6878,6 +7905,801 @@
       "forbidden": [
         "retire signals or adopts nothing and only removes a quarantined record",
         "no pid is exposed"
+      ]
+    },
+    {
+      "id": "C-14",
+      "title": "A refusal flood is aggregated in audit with the suppressed count and histogram",
+      "area": "audit",
+      "decisions": [
+        "D-16"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-audit-sink: the reference fake has no bounded sink or budget window",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: rotation at audit_file_bytes and RLIMIT_CORE need a compiled-limit seam and a core-dump probe",
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c14-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "action": "refusal_burst",
+          "args": {
+            "method": "session.unknown",
+            "count": 60
+          },
+          "expect": {
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.unknown",
+          "params": null,
+          "fault": "drop_before_reply",
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "audit",
+          "expect": {
+            "audit": {
+              "contains": [
+                "sup=",
+                "h=not_found"
+              ],
+              "not_contains": [
+                "@create_token",
+                "@operator_capability"
+              ],
+              "line_bounds": [
+                {
+                  "needle": "a=wire r=refused c=not_found",
+                  "min": 1,
+                  "max": 21
+                },
+                {
+                  "needle": "sup=",
+                  "min": 1,
+                  "max": 1
+                }
+              ]
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "audit_degraded": false
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "audit_degraded": false
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a suppressed refusal is dropped silently instead of aggregated",
+        "the aggregate names a caller value or a token",
+        "a refusal flood becomes a mutation"
+      ]
+    },
+    {
+      "id": "C-15",
+      "title": "The plugin host denies a connect to the daemon endpoint",
+      "area": "trust-plugin",
+      "decisions": [
+        "D-07"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-plugin-host: the plugin host owns its own connection policy and no daemon row can exercise it",
+      "fake_skip": "requires-plugin-host: the reference fake has no plugin host",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the negative plugin-connect test needs the runtime crate's plugin host, not the daemon",
+      "steps": [
+        {
+          "connection": "plugin",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a plugin reaches the daemon endpoint through the plugin host",
+        "the plugin host weakens the peer check to serve a plugin",
+        "a denied plugin connect mints a lease"
+      ]
+    },
+    {
+      "id": "C-16",
+      "title": "A per-message credential mismatch closes the connection",
+      "area": "trust",
+      "decisions": [
+        "D-07"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-second-peer: the harness cannot attach a message whose SCM_CREDENTIALS differ from the captured peer",
+      "fake_skip": "requires-second-peer: the reference fake has no per-message credentials",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the mismatch test needs a second-peer socket helper",
+      "steps": [
+        {
+          "connection": "foreign",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "transport": "closed"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a message from a different peer is served on a captured connection",
+        "the mismatch is silently attributed to the captured peer",
+        "the connection keeps serving after the mismatch"
+      ]
+    },
+    {
+      "id": "C-17",
+      "title": "Only the controller lease resizes, and a resize increments the revision",
+      "area": "session",
+      "decisions": [
+        "D-03",
+        "D-09"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c17-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "c17-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c17-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant": 64,
+              "grant_id": 32
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 120,
+            "rows": 40
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 120,
+            "rows": 40
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "result_min": {
+              "session.state_revision": 2
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.attach_count": 2
+            },
+            "result_min": {
+              "session.state_revision": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an observer lease resize takes effect",
+        "a resize leaves the revision unchanged",
+        "a resize reports a new generation"
+      ]
+    },
+    {
+      "id": "C-18",
+      "title": "Termination is keyless and succeeds with a full idempotency store",
+      "area": "termination",
+      "decisions": [
+        "D-18"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "real_skip": "requires-full-store-seam: the compiled create-key store cannot be pre-filled from the corpus",
+      "fake_skip": "requires-full-store-seam: the reference fake models no create-key store bound",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: C-18 needs a create-key cap in the fake and a store-fill seam on the real driver before termination under a full store is provable",
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c18-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "reason": "cancel"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.kill",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "NotRunning"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a full idempotency store refuses abort, kill, or stop",
+        "a termination consumes or needs an idempotency key",
+        "a termination returns IdempotencyCapacity"
+      ]
+    },
+    {
+      "id": "C-19",
+      "title": "Host consent is single-use, revocable, and one code names each missing authority",
+      "area": "consent",
+      "decisions": [
+        "D-07"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: host-grant TTL expiry needs the injected clock the fake has; the real row proves mint, consume, single use, revoke, and the codes",
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "ttl_ms": 60000
+          },
+          "capture": {
+            "host_bearer": "grant",
+            "host_grant_id": "grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant": 64,
+              "grant_id": 32
+            },
+            "absent": [
+              "client_id"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_bearer"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c19-create"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "second",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_bearer"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "second",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c19-second"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
+          }
+        },
+        {
+          "connection": "unfunded",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "unfunded",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c19-unfunded"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "revoke",
+            "grant_id": "@host_grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@host_grant_id"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c19-revoked"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
+          }
+        },
+        {
+          "action": "child_processes",
+          "expect": {
+            "result": {
+              "count": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running",
+              "active_sessions": 1
+            }
+          }
+        },
+        {
+          "action": "audit",
+          "expect": {
+            "audit": {
+              "contains": [
+                "a=daemon.host_grant r=ok",
+                "a=session.create r=refused"
+              ]
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a host grant is consumed twice",
+        "a revoked grant still authorizes a create",
+        "the consent refusal spawns a process or names the grant bearer"
       ]
     },
     {
@@ -7745,6 +9567,189 @@
     },
     {
       "id": "C-09",
+      "title": "The scope matrix is decided before the target and one code names each missing authority",
+      "area": "authorization",
+      "decisions": [
+        "D-07"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: the both-authorities-missing arm (ScopeViolation with no process.spawn) needs an inspect-only scope seam; every same-user connection is granted process.spawn",
+      "steps": [
+        {
+          "connection": "client",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "scopes",
+              "capabilities"
+            ]
+          }
+        },
+        {
+          "connection": "client",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c09-consumer"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
+          }
+        },
+        {
+          "connection": "client",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ScopeViolation"
+          }
+        },
+        {
+          "connection": "client",
+          "method": "daemon.orphans.verify",
+          "params": null,
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ScopeViolation"
+          }
+        },
+        {
+          "connection": "client",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 0
+            }
+          }
+        },
+        {
+          "action": "child_processes",
+          "expect": {
+            "result": {
+              "count": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c09-operator"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
+          }
+        },
+        {
+          "connection": "granted",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "granted",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c09-granted"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running",
+              "active_sessions": 1
+            }
+          }
+        },
+        {
+          "action": "audit",
+          "expect": {
+            "audit": {
+              "contains": [
+                "a=session.create r=refused"
+              ]
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a missing host consent mints a session or spawns a process",
+        "the consent refusal substitutes for the scope refusal",
+        "a refused create is reported as an internal failure"
+      ]
+    },
+    {
+      "id": "C-11",
       "title": "A missing, stale, or rotated control token at a vacant control is InvalidControlToken",
       "area": "control",
       "decisions": [
@@ -7994,9 +9999,104 @@
       ]
     },
     {
+      "id": "C-12",
+      "title": "A spawned child holds no daemon descriptor and every descriptor is close-on-exec",
+      "area": "child-scope",
+      "decisions": [
+        "D-07"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "real_skip": "requires-child-fd-seam: the /proc/self/fd scan and close_range(CLOEXEC) proof are internal, and no corpus action reads a child's descriptor table",
+      "fake_skip": "requires-child-fd-seam: the reference fake spawns no process",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "deferred": "bitty#2917: proving the child scope needs a descriptor-table probe in the real driver",
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c12-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "session.worker_handle"
+            ]
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a child inherits the endpoint, audit, or journal descriptor",
+        "a non-CLOEXEC descriptor reaches the worker",
+        "the child reads another session's content"
+      ]
+    },
+    {
       "id": "C-10",
       "title": "An expired observer grant bumps the revision once and never again (injected clock)",
-      "area": "counters",
+      "area": "attach",
       "decisions": [
         "D-03"
       ],
@@ -8270,7 +10370,7 @@
       ]
     },
     {
-      "id": "C-12",
+      "id": "C-20",
       "title": "A pushed event follows its response and revisions are delivered in order",
       "area": "events",
       "decisions": [
@@ -8433,7 +10533,7 @@
       ]
     },
     {
-      "id": "C-13",
+      "id": "C-21",
       "title": "Each lease receives only its own copy of a pushed event",
       "area": "events",
       "decisions": [
@@ -8649,7 +10749,7 @@
       ]
     },
     {
-      "id": "C-14",
+      "id": "C-22",
       "title": "A connection without the event opt-in receives no event frame",
       "area": "events",
       "decisions": [
@@ -8767,7 +10867,7 @@
       ]
     },
     {
-      "id": "C-15",
+      "id": "C-23",
       "title": "The terminal transition is pushed with its marker before the record is read",
       "area": "events",
       "decisions": [
@@ -8914,7 +11014,7 @@
       ]
     },
     {
-      "id": "C-16",
+      "id": "C-24",
       "title": "A revoked lease receives its final frame on its own connection",
       "area": "events",
       "decisions": [
@@ -9202,7 +11302,7 @@
       ]
     },
     {
-      "id": "C-17",
+      "id": "C-25",
       "title": "Session and daemon metadata fields are served as additive 1.2 keys",
       "area": "metadata",
       "decisions": [

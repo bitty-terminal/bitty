@@ -9,22 +9,27 @@
 //! | --- | --- | --- | --- | --- |
 //! | `ContainmentKind::CgroupV2` | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` | yes |
 //! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded group empty, leader pidfd exited, every pre-signal descendant pidfd exited | `swept` when verified, else `unverified` | yes |
-//! | `ContainmentKind::WindowsJob` | one kill-on-close job object per session | every member assigned before it runs; `ActiveProcesses` zero after termination | `swept` when verified | no: implemented-only |
-//! | `ContainmentKind::FreebsdReaper` | `procctl(PROC_REAP_ACQUIRE)` reaper + recorded process group | recorded group empty, no live recorded descendant, and no live descendant the session cannot attribute elsewhere | `swept` when verified | no: implemented-only |
-//! | `ContainmentKind::ProcessGroup` | recorded process group only (macOS) | the group is signalled and observed gone; a reparented or re-sessioned descendant is not covered | `group-signalled` (`D-05`) | no: implemented-only |
+//! | `ContainmentKind::WindowsJob` | one kill-on-close job object per session | every member assigned before it runs; `ActiveProcesses` zero after termination | `swept` when verified | no: no ConPTY backend |
+//! | `ContainmentKind::FreebsdReaper` | `procctl(PROC_REAP_ACQUIRE)` reaper + recorded process group | recorded group empty, no live recorded descendant, and no live descendant the session cannot attribute elsewhere | `swept` when verified | yes |
+//! | `ContainmentKind::ProcessGroup` | recorded process group only (macOS) | the group is signalled and observed gone; a reparented or re-sessioned descendant is not covered | `group-signalled` (`D-05`) | yes (never `swept`) |
 //! | `ContainmentKind::Refused` | none | none | no spawn, typed refusal | yes (it refuses) |
 //!
 //! # Reachability
 //!
-//! `probe()` selects a plan on every supported cell, but only the Linux plans
-//! are on the served spawn path: [`crate::worker::spawn_path_served`] is
-//! `cfg!(target_os = "linux")`, `crate::service::dispatch` refuses
-//! `session.create` with `UnsupportedCapability` before any spawn on a cell it
-//! does not serve, and `crate::service::server` exports the Linux-only `unix`
-//! module with a typed stub everywhere else. The Windows, FreeBSD, and macOS
-//! plans are therefore **implemented-only (unwired)**: they are exercised by
-//! their own unit tests, and no product path reaches them until the PTY spawn
-//! path is ported. `is_enforced()` describes the mechanism, not reachability.
+//! [`crate::worker::spawn_path_served`] follows the selected plan, not the
+//! compiled cell: every POSIX plan that mints a containment identity is on the
+//! served spawn path, and `crate::service::dispatch` refuses `session.create`
+//! with `UnsupportedCapability` before any spawn only for a `Refused` plan or
+//! the Windows job plan. The Windows plan is **implemented-only (unwired)**:
+//! this crate has no ConPTY backend, so no Windows daemon can own a PTY yet
+//! (bitty#2985). `is_enforced()` describes the mechanism, not reachability: the
+//! macOS process-group plan is served but cannot prove a whole tree, which is
+//! why it reports `group-signalled` instead of `swept`.
+//!
+//! The served service loop (`crate::service::server`) still exports its `unix`
+//! module only on Linux, so on macOS and FreeBSD the pool, spawn, and cleanup
+//! path is compiled and unit-tested but the wire loop that would reach it is a
+//! typed stub.
 //!
 //! The fallback plans are deliberately weaker and say so. A process group
 //! alone can never prove a whole tree (`setsid`/`setpgid` escapes it), so the
@@ -47,17 +52,16 @@
 //!   Implemented-only: not on the served spawn path.
 //! - FreeBSD: the daemon acquires the `procctl(2)` reaper role so orphaned
 //!   descendants reparent to it, and records the child's process group.
-//!   Implemented-only: not on the served spawn path.
 //! - macOS: the recorded process group only; it must not claim `swept`.
-//!   Implemented-only: not on the served spawn path.
 //! - Any other cell, or a Windows build whose job object cannot be created,
 //!   returns [`ContainmentRefusal::UnsupportedPlatform`].
 //!
-//! The FreeBSD `procctl(2)` calls need raw FFI and no safe wrapper exists for
-//! `PROC_REAP_*`. Following the `bitty-sandbox` and `bitty-winjob` precedent,
-//! the crate root keeps `#![deny(unsafe_code)]` and only the private
-//! `freebsd_sys` module is allowed it, with every block carrying a `SAFETY`
-//! rationale and a safe API above it.
+//! The FreeBSD `procctl(2)` calls and the macOS exit peek need raw FFI and no
+//! safe wrapper exists for `PROC_REAP_*` or `proc_pidinfo(2)`. Following the
+//! `bitty-sandbox` and `bitty-winjob` precedent, the crate root keeps
+//! `#![deny(unsafe_code)]` and only the private `linux_sys`, `freebsd_sys`,
+//! `macos_sys`, and `posix_sys` modules are allowed it, with every block
+//! carrying a `SAFETY` rationale and a safe API above it.
 
 use std::fmt;
 use std::io;
@@ -85,9 +89,13 @@ mod linux;
 mod linux_sys;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_sys;
 mod plan;
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 mod posix;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+mod posix_sys;
 #[cfg(target_os = "linux")]
 mod subreaper;
 #[cfg(not(any(
@@ -107,14 +115,14 @@ pub(crate) use self::child::drain_adopted_children;
 pub use self::exec::{ExecRefusal, ExecRefusalKind};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::linux_sys::test_signal_state;
-#[cfg(target_os = "linux")]
-pub(crate) use self::linux_sys::{
-    close_inherited_descriptors, dup_cloexec, establish_controlling_terminal,
-    reset_child_signal_state, resize_pty, set_cloexec, set_nonblocking,
-};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::linux_sys::{drop_cloexec_before_exec, inheritable_probe_descriptor};
 pub use self::plan::ContainedChild;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+pub(crate) use self::posix_sys::{
+    close_inherited_descriptors, dup_cloexec, establish_controlling_terminal,
+    reset_child_signal_state, resize_pty, set_cloexec, set_nonblocking,
+};
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 

@@ -622,11 +622,9 @@ impl<'gc> CaptureState<'gc> {
                 "configuration tables may not have metatables".to_string(),
             ));
         }
-        if self.values > self.max_values() {
-            return Err(PlainConfigError::Limit(
-                "configuration value count exceeds limit".to_string(),
-            ));
-        }
+        // `capture` already refused when `values >= max_values()`, so a
+        // recheck here would be dead code: the count can never exceed the
+        // limit at this point.
         self.charge(1)?;
         self.active_tables.push(table);
         let result = self.capture_table_pairs(ctx, table, depth);

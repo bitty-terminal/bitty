@@ -159,8 +159,23 @@ pub const MAX_TOTAL_SNAPSHOT_BYTES: usize = 1_048_576;
 /// Maximum bytes copied for any single string in a configuration snapshot (`bitty#3039`).
 pub const MAX_SNAPSHOT_STRING_BYTES: usize = 65_536;
 
+/// Maximum raw table iteration steps scanned across one snapshot (`bitty#3039`).
+///
+/// Counts every `Table::iter` step, including keys the snapshot never captures
+/// (integer keys, keys past a per-table pair cap). This is what keeps the scan
+/// bounded when a table is mostly keys the pair cap would drop: the counter
+/// trips [`SnapshotBudget::fail_iteration_cap`], so an oversized table refuses
+/// the configuration instead of silently losing everything past the cap.
+///
+/// Sized at four times [`MAX_TOTAL_SNAPSHOT_NODES`]: a legitimate array-heavy
+/// configuration spends one step per element plus one per captured field
+/// (a full keymap list is ~4k steps), so the headroom is generous while the
+/// counter stays a hard bound. Written as a literal rather than the product so
+/// each bound can be raised on its own when testing that a test discriminates.
+pub const MAX_TOTAL_SNAPSHOT_SCAN_STEPS: usize = 16_384;
+
 /// Maximum table nesting depth traversed by [`ValueSnapshot::capture_table`].
-const MAX_SNAPSHOT_DEPTH: u8 = 16;
+pub const MAX_SNAPSHOT_DEPTH: u8 = 16;
 
 /// Fields rejected until their owning follow-up accepts them (DEC-0111
 /// section 1; CTX-1160 S1).
@@ -962,8 +977,12 @@ impl ConfigEval for LuaVm {
                     match exec.take_result::<Variadic<Vec<Value>>>(ctx) {
                         Ok(Ok(Variadic(values))) => {
                             if values.len() > MAX_CONFIG_RETURN_VALUES {
+                                // Bound the number of values snapshotted at all:
+                                // `from_returns` rejects anything past one, but
+                                // only after the whole variadic list was
+                                // materialized, so this cap has to hold first.
                                 return Taken::BudgetExceeded(format!(
-                                    "config must return a single table (returned {} values, max {})",
+                                    "config returned {} values, max {}",
                                     values.len(),
                                     MAX_CONFIG_RETURN_VALUES
                                 ));
@@ -1114,12 +1133,26 @@ enum ValueSnapshot {
     Opaque(&'static str),
 }
 
-/// Cumulative node and byte budget enforced across a configuration snapshot
-/// (`bitty#3039`).
+/// Cumulative node, byte, and scan-step budget enforced across a
+/// configuration snapshot (`bitty#3039`).
+///
+/// Charging is **per reference**, with no identity dedup: the same table
+/// reached twice through a DAG of aliases is captured, and charged, twice.
+/// That is deliberate — a shared subtable must not be able to recurse into an
+/// exponential snapshot, and per-reference charging is exactly what bounds the
+/// expansion.
+///
+/// [`Self::bytes`] is a lower bound on what the snapshot retains, not an exact
+/// heap figure: a table charges one byte plus `size_of` per scalar leaf, and
+/// ignores the `name.to_string()` copy every string key adds to `pairs`, the
+/// `Box` behind each child, and `Vec` growth slack. `MAX_TOTAL_SNAPSHOT_BYTES`
+/// is therefore a floor on the real footprint, and the per-string cap is what
+/// keeps any single allocation small.
 #[derive(Debug, Default)]
 struct SnapshotBudget {
     nodes: usize,
     bytes: usize,
+    scan_steps: usize,
     exceeded: Option<String>,
 }
 
@@ -1184,6 +1217,36 @@ impl SnapshotBudget {
             ));
         }
     }
+
+    /// Charge one raw table iteration step against the snapshot-wide scan cap.
+    ///
+    /// Returns `false` once the scan cap (or any other bound) is exhausted, so
+    /// callers stop iterating and the configuration is refused. This is what
+    /// makes the scan fail closed: keys the pair cap never reaches can no
+    /// longer be dropped silently.
+    fn charge_scan_step(&mut self) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        match self.scan_steps.checked_add(1) {
+            Some(next) if next <= MAX_TOTAL_SNAPSHOT_SCAN_STEPS => {
+                self.scan_steps = next;
+                true
+            }
+            _ => {
+                self.fail_iteration_cap();
+                false
+            }
+        }
+    }
+
+    fn fail_iteration_cap(&mut self) {
+        if !self.is_exceeded() {
+            self.exceeded = Some(format!(
+                "config table scan exceeds {MAX_TOTAL_SNAPSHOT_SCAN_STEPS} raw steps"
+            ));
+        }
+    }
 }
 
 impl ValueSnapshot {
@@ -1219,14 +1282,11 @@ impl ValueSnapshot {
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
-        let mut raw_iter_steps = 0usize;
         for (key, val) in table.iter() {
-            if budget.is_exceeded() {
-                break;
-            }
-            raw_iter_steps += 1;
-            if raw_iter_steps > MAX_CONFIG_KEYMAPS + cap + 1 {
-                truncated = true;
+            // Bound the raw scan (all keys, captured or skipped) with the
+            // snapshot-wide step budget: trip it and the configuration is
+            // refused, never silently completed with keys missing.
+            if !budget.charge_scan_step() {
                 break;
             }
             // Integer keys belong to the sequence portion; skip them here
@@ -1385,14 +1445,9 @@ impl ValueSnapshot {
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
-        let mut raw_iter_steps = 0usize;
         for (key, val) in table.iter() {
-            if budget.is_exceeded() {
-                break;
-            }
-            raw_iter_steps += 1;
-            if raw_iter_steps > MAX_CONFIG_KEYMAPS + MAX_CONFIG_NESTED_KEYS + 1 {
-                truncated = true;
+            // Same snapshot-wide raw-scan bound as `capture_table`.
+            if !budget.charge_scan_step() {
                 break;
             }
             if matches!(key, Value::Integer(_)) {
@@ -1507,7 +1562,7 @@ impl ConfigData {
         }
         if values.len() > 1 {
             return Err(format!(
-                "config must return a single table (returned {} values)",
+                "config must return a single table (returned {} values, expected 1)",
                 values.len()
             ));
         }
@@ -4609,19 +4664,92 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// R1 regression: a table long enough to exhaust the old per-table raw
+    /// step guard used to complete silently, dropping the keys the guard never
+    /// reached. The scan is now bounded by the snapshot budget and refuses
+    /// rather than truncating, so `bogus_field` is captured and the extractor
+    /// rejects it by path.
     #[test]
-    fn rejects_16_level_dag_table_without_exponential_expansion() {
+    fn long_sequence_table_still_reports_undeclared_field() {
+        let err = eval_err(
+            r#"
+            local t = {}
+            for i = 1, 1100 do t[i] = 1 end
+            t.bogus_field = 1
+            return { appearance = t }
+            "#,
+        );
+        assert!(
+            err.contains("undeclared field 'appearance.bogus_field'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_deep_dag_table_without_exponential_expansion() {
+        // 12 levels of `{ a = t, b = t }` is 2^13 - 1 = 8191 snapshot nodes at
+        // depth 12 (well under MAX_SNAPSHOT_DEPTH), so the node bound is the
+        // only thing that can refuse it. Asserting on "total nodes" alone keeps
+        // this test discriminating: raising MAX_TOTAL_SNAPSHOT_NODES makes it
+        // fail instead of quietly passing on a depth trip.
         let err = eval_err(
             r#"
             local t = { a = "leaf", b = "leaf" }
-            for i = 1, 16 do
+            for i = 1, 12 do
                 t = { a = t, b = t }
             end
             return t
             "#,
         );
+        assert!(err.contains("total nodes"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_snapshot_over_aggregate_byte_budget() {
+        // 17 × 64 KiB is 1,114,112 bytes: each string is under
+        // MAX_SNAPSHOT_STRING_BYTES, so only the aggregate byte bound can
+        // refuse this. The same string value is referenced 17 times on
+        // purpose: charging is per reference with no identity dedup.
+        let err = eval_err(&format!(
+            r#"
+            local s = string.rep('x', {})
+            local t = {{}}
+            for i = 1, 17 do
+                t["k" .. tostring(i)] = s
+            end
+            return {{ appearance = t }}
+            "#,
+            MAX_SNAPSHOT_STRING_BYTES
+        ));
         assert!(
-            err.contains("total nodes") || err.contains("maximum depth"),
+            err.contains(&format!(
+                "config snapshot exceeds {MAX_TOTAL_SNAPSHOT_BYTES} total bytes"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_table_scan_past_step_budget() {
+        // 20_000 raw steps is above MAX_TOTAL_SNAPSHOT_SCAN_STEPS on purpose,
+        // with a literal instead of the constant so raising the cap makes this
+        // fail (a self-sizing input would just move the goalposts).
+        // No key here is capturable within the pair cap (they are all integer
+        // keys), so the raw scan is what has to refuse: the configuration must
+        // not complete while silently dropping every key it never reached.
+        let err = eval_err(
+            r#"
+            local t = {}
+            for i = 1, 20000 do
+                t[i] = 1
+            end
+            return { appearance = t }
+            "#,
+        );
+        assert!(
+            err.contains(&format!(
+                "config table scan exceeds {MAX_TOTAL_SNAPSHOT_SCAN_STEPS} raw steps"
+            )),
             "unexpected error: {err}"
         );
     }
@@ -4663,8 +4791,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let err = eval_err(&format!("return {returns}"));
+        // Distinct from the `from_returns` refusal (`... returned N values,
+        // expected 1`), so this pins the pre-snapshot cap and not the shape
+        // check that would fire after it.
         assert!(
-            err.contains("config must return a single table"),
+            err.contains(&format!(
+                "returned {} values, max {MAX_CONFIG_RETURN_VALUES}",
+                MAX_CONFIG_RETURN_VALUES + 1
+            )),
             "unexpected error: {err}"
         );
     }

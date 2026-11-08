@@ -130,6 +130,17 @@ pub(crate) struct SelectionState {
     /// (`CSI 3 J`) clears the scrollback ring (`sb_len == 0`), and provides the
     /// rebase delta for purely live-grid selections after a scrollback clear.
     pub(crate) scrollback_len_at_start: usize,
+    /// Whether `selection` was bound as viewport cells of the scrolled
+    /// composite (`is_viewport_scrolled` at bind time, CTX-1752).
+    ///
+    /// The coordinate space is a fact about the **bind instant**, not a
+    /// property to re-derive later: `ED 3` (`CSI 3 J`) erases the scrollback
+    /// ring and the view snaps back to live inside the same PTY chunk, so
+    /// asking `is_viewport_scrolled` at read time would describe a different
+    /// space than the one the stored rows were written in. Both stale-range
+    /// guards in [`Runtime::resolve_selection_state`] compare against this
+    /// stamp instead.
+    pub(crate) viewport_relative: bool,
     /// `State::buffer_epoch()` when [`Self::press_buffer`] was captured.
     pub(crate) press_epoch: u64,
     /// `State::scrollback_evicted_total()` when [`Self::press_buffer`] was
@@ -565,10 +576,16 @@ impl Runtime {
         let sb_len = state.scrollback_len();
         let epoch_changed = state.buffer_epoch() != sel.epoch;
         let Some(pers) = sel.buffer else {
+            // A range bound in the scrolled viewport has no buffer identity
+            // to re-project from: once `ED 3` emptied the ring (and the
+            // viewport snapped to live) there is nothing left to name.
+            // The mutating site (`reconcile_selection_after_scrollback_clear`)
+            // drops that selection, pins included, so this read-time arm is
+            // the fail-closed backstop for any path that did not.
             if (epoch_changed || sb_len < sel.scrollback_len_at_start)
                 && sb_len == 0
                 && sel.scrollback_len_at_start > 0
-                && self.is_viewport_scrolled(sel.owner)
+                && sel.viewport_relative
             {
                 return None;
             }
@@ -600,6 +617,16 @@ impl Runtime {
                 return None;
             }
             if sb_len < old_sb_len {
+                // `ED 3` (`CSI 3 J`) records the **whole cleared ring** as
+                // evictions (`State::scrollback_evicted_total` jumps by the
+                // removed count, state.rs:3490), so a full clear lands exactly
+                // on `old_sb_len`. The `== 0` arm accepts a clear whose ring
+                // held nothing the range could see; it deliberately depends on
+                // that eviction accounting — if `clear` ever stopped bumping
+                // the total, a leftover range would silently rebase onto live
+                // rows. `reconcile_selection_after_scrollback_clear` decides
+                // the same question at the action site with the pre-clear
+                // baseline; keep the two in step.
                 if (evicted_since_start == 0 || evicted_since_start == old_sb_len) && sb_len == 0 {
                     old_sb_len
                 } else {
@@ -669,7 +696,12 @@ impl Runtime {
             }
             None => None,
         };
-        let selection = if sb_len < old_sb_len && self.is_viewport_scrolled(sel.owner) {
+        let selection = if sb_len < old_sb_len && sel.viewport_relative {
+            // The range was written in the scrolled viewport: re-project it
+            // from its buffer twin into whatever space it is in now (still
+            // scrolled, or live after an ED 3 snap). The bind-time stamp is
+            // deliberate — the current predicate describes a different space
+            // once the scrollback is gone.
             self.project_persistent(&adjusted_pers, sel.owner)?
         } else {
             sel.selection
@@ -738,11 +770,162 @@ impl Runtime {
             epoch,
             evicted_at,
             scrollback_len_at_start: sb_len,
+            viewport_relative: self.is_viewport_scrolled(owner),
             press_epoch: epoch,
             press_evicted_at: evicted_at,
             press_scrollback_len_at_start: sb_len,
             dragging,
             single_cell: false,
+        });
+        self.pending_full_redraw = true;
+    }
+
+    /// Reconciles the live selection with an `ED 3` (`CSI 3 J`) clear of the
+    /// scrollback ring (CTX-1752, bitty#3040).
+    ///
+    /// `was_scrolled` is the owner's `is_viewport_scrolled` **before** the
+    /// erase applied. The post-erase predicate and scroll offset describe the
+    /// *next* coordinate space: `retain_view_scroll_anchor` snaps the viewport
+    /// to live at the end of the same PTY chunk (`pty.rs`), so a range bound
+    /// to the old viewport would be silently reinterpreted as live-grid cells
+    /// and copy whatever now happens to sit at those rows. This method decides
+    /// from the pre-clear facts instead:
+    ///
+    /// - buffer-anchored ranges are rebased by the front eviction delta (a
+    ///   clear records the removed ring as evictions, so the delta is exact);
+    /// - a range that touched the cleared history (any endpoint below the
+    ///   delta) or that has no buffer identity at all is dropped outright, so
+    ///   its press pin (`anchor_press`/`press_boundary`) cannot outlive the
+    ///   viewport it was captured in;
+    /// - a viewport range over surviving live rows is re-projected into the
+    ///   live grid, and the owner snaps to live so the stored space and the
+    ///   view agree.
+    ///
+    /// Live (unscrolled) selections keep their cells; only their buffer
+    /// anchors shift, which is the same relaxation a pure prune needs.
+    pub(super) fn reconcile_selection_after_scrollback_clear(
+        &mut self,
+        owner: ViewId,
+        was_scrolled: bool,
+    ) {
+        let Some(sel) = self.selection_state else {
+            return;
+        };
+        if sel.owner != owner {
+            return;
+        }
+        let Some(state) = self.live_view_state(owner) else {
+            self.drop_selection();
+            return;
+        };
+        // Rows below `drift` left the front of the retained buffer since the
+        // range bound. `ED 3` records the cleared ring as evictions, so this
+        // is the exact rebase delta (and the exact survival threshold).
+        let Ok(drift) = usize::try_from(
+            state
+                .scrollback_evicted_total()
+                .saturating_sub(sel.evicted_at),
+        ) else {
+            self.drop_selection();
+            return;
+        };
+        if drift == 0 {
+            // Nothing the range could see left the buffer.
+            return;
+        }
+        let shift = |pos: BufferPos| -> Option<BufferPos> {
+            (pos.buffer_row >= drift).then(|| BufferPos::new(pos.buffer_row - drift, pos.col))
+        };
+        let Some(pers) = sel.buffer else {
+            // A viewport-relative range cannot outlive its viewport: there is
+            // no buffer identity to re-project. Drop the whole selection,
+            // pins included.
+            if was_scrolled {
+                self.drop_selection();
+            }
+            return;
+        };
+        let Some(anchor) = shift(pers.anchor) else {
+            self.drop_selection();
+            return;
+        };
+        let Some(focus) = shift(pers.focus) else {
+            self.drop_selection();
+            return;
+        };
+        let press_buffer = match sel.press_buffer {
+            Some(press) => match shift(press) {
+                Some(shifted) => Some(shifted),
+                None => {
+                    self.drop_selection();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let adjusted = PersistentSelection {
+            anchor,
+            focus,
+            ..pers
+        };
+        let selection = if was_scrolled {
+            // The view is about to sit on the live grid: re-express the range
+            // against that window, never the stale scrolled one (the history
+            // it named is gone).
+            let rows = u16::try_from(state.height()).unwrap_or(u16::MAX);
+            let cols = u16::try_from(state.width()).unwrap_or(u16::MAX);
+            match project_persistent_to(&adjusted, state.scrollback_len(), rows, cols) {
+                Some((start, end)) => Selection {
+                    anchor: CellPos::new(start.0, start.1),
+                    focus: CellPos::new(end.0, end.1),
+                    kind: adjusted.kind,
+                    active: adjusted.active,
+                },
+                None => {
+                    self.drop_selection();
+                    return;
+                }
+            }
+        } else {
+            sel.selection
+        };
+        let anchor_press = if was_scrolled {
+            // Viewport press rows are meaningless on the live grid; rebuild
+            // the pin from its buffer twin (columns survive both spaces).
+            press_buffer.map(|press| {
+                CellPos::new(
+                    u16::try_from(press.buffer_row).unwrap_or(u16::MAX),
+                    press.col,
+                )
+            })
+        } else {
+            sel.anchor_press
+        };
+        let (post_epoch, post_evicted, post_sb_len) = (
+            state.buffer_epoch(),
+            state.scrollback_evicted_total(),
+            state.scrollback_len(),
+        );
+        if was_scrolled {
+            // Keep the stored space and the view in step even when later
+            // bytes in this same chunk grow a fresh scrollback.
+            if let Some(leaf) = self.find_view_mut(owner) {
+                leaf.scroll_to_live();
+            }
+        }
+        self.selection_state = Some(SelectionState {
+            selection,
+            buffer: Some(adjusted),
+            press_buffer,
+            anchor_press,
+            viewport_relative: false,
+            epoch: post_epoch,
+            evicted_at: post_evicted,
+            scrollback_len_at_start: post_sb_len,
+            press_epoch: post_epoch,
+            press_evicted_at: post_evicted,
+            press_scrollback_len_at_start: post_sb_len,
+            ..sel
         });
         self.pending_full_redraw = true;
     }

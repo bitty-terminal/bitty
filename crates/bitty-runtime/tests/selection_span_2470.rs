@@ -892,3 +892,174 @@ fn ed3_invalidates_scrollback_selection_and_rebases_live_grid_selection_3040() {
     assert!(rt.has_selection(), "live selection must survive pure ED 3");
     assert_eq!(rt.selection_text().as_deref(), Some(expected.as_str()));
 }
+
+/// Inclusive live-grid rows named by the current selection.
+fn selection_rows(rt: &Runtime) -> Option<(u16, u16)> {
+    rt.selection().map(|sel| (sel.anchor.row, sel.focus.row))
+}
+
+/// Visual-select the two live-grid rows `press_row..=focus_row` of a scrolled
+/// viewport. Callers pick rows at or below the scroll offset (history rows).
+fn select_live_rows_while_scrolled(rt: &mut Runtime, id: ViewId, press_row: u16, focus_row: u16) {
+    rt.handle_cursor_moved(cell_edge(rt, id, press_row, 0));
+    press(rt);
+    rt.handle_cursor_moved(cell_edge(rt, id, focus_row, line_edge()));
+    release(rt);
+}
+
+#[test]
+fn ed3_reprojects_a_scrolled_selection_bound_to_live_rows_3040() {
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 0, 120);
+    rt.tick().expect("warm-up frame presents");
+    let id = view_id(&rt);
+    assert!(rt.state().scrollback_len() > 20, "scrollback must exist");
+
+    // Viewport rows below the scroll offset are *live-grid* rows drawn under a
+    // scrolled viewport: the range is viewport-relative even though its buffer
+    // identity is live. ED 3 then clears the history above it and snaps the
+    // view to live.
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 5.0));
+    let offset = scroll_offset(&rt);
+    assert!(offset > 0);
+    let sb_len = rt.state().scrollback_len();
+    let live_start = u16::try_from(offset).expect("offset fits a row");
+    let press_row = live_start + 2;
+    let focus_row = press_row + 1;
+    let anchor_buffer = buffer_row(&rt, offset, press_row);
+    let focus_buffer = buffer_row(&rt, offset, focus_row);
+    assert!(
+        anchor_buffer >= sb_len && focus_buffer >= sb_len,
+        "the chosen rows must still be live-grid content"
+    );
+    select_live_rows_while_scrolled(&mut rt, id, press_row, focus_row);
+    let before = rt.selection_text().expect("visual selection text");
+    assert_eq!(
+        selection_rows(&rt),
+        Some((press_row, focus_row)),
+        "a scrolled visual selection is stored in viewport rows"
+    );
+
+    rt.handle_pty_bytes(b"\x1b[3J");
+    assert_eq!(rt.state().scrollback_len(), 0);
+
+    // The range named live content, so it survives with its exact text — but
+    // it must now be addressed in *live-grid* rows, not the old viewport rows
+    // (which after the snap point at whatever text sits there now).
+    let after = rt.selection_text();
+    assert!(
+        after.is_none() || after.as_deref() == Some(before.as_str()),
+        "ED 3 must not re-point a surviving range at live rows: before {before:?}, after {after:?}"
+    );
+    match selection_rows(&rt) {
+        Some((anchor, focus)) => {
+            let expected = (
+                u16::try_from(anchor_buffer - sb_len).expect("row fits"),
+                u16::try_from(focus_buffer - sb_len).expect("row fits"),
+            );
+            assert_eq!(
+                (anchor, focus),
+                expected,
+                "selection() must address the rebased live rows, not the pre-clear viewport rows"
+            );
+            assert_eq!(
+                after.as_deref(),
+                Some(before.as_str()),
+                "the surviving range keeps its lines"
+            );
+        }
+        None => assert_eq!(after, None, "no cells and no text: fail closed together"),
+    }
+}
+
+#[test]
+fn ed3_mid_drag_while_scrolled_keeps_cells_and_text_in_step_3040() {
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 0, 120);
+    rt.tick().expect("warm-up frame presents");
+    let id = view_id(&rt);
+
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 6.0));
+    let offset = scroll_offset(&rt);
+    assert!(offset > 0);
+    let sb_len = rt.state().scrollback_len();
+    let live_start = u16::try_from(offset).expect("offset fits a row");
+    let press_row = live_start + 1;
+    let focus_row = live_start + 3;
+    let anchor_buffer = buffer_row(&rt, offset, press_row);
+    let focus_buffer = buffer_row(&rt, offset, focus_row);
+    assert!(anchor_buffer >= sb_len && focus_buffer >= sb_len);
+
+    rt.handle_cursor_moved(cell_edge(&rt, id, press_row, 0));
+    press(&mut rt);
+    rt.handle_cursor_moved(cell_edge(&rt, id, focus_row, line_edge()));
+    assert!(rt.is_selection_dragging(), "the drag is still in flight");
+    let before = rt.selection_text().expect("held drag text");
+
+    // The clear lands mid-drag: no release ever re-stamps the range.
+    rt.handle_pty_bytes(b"\x1b[3J");
+    assert_eq!(rt.state().scrollback_len(), 0);
+    assert!(rt.is_selection_dragging(), "the drag survives the clear");
+
+    let after = rt.selection_text();
+    assert!(
+        after.is_none() || after.as_deref() == Some(before.as_str()),
+        "ED 3 must not re-point the held range: before {before:?}, after {after:?}"
+    );
+    match selection_rows(&rt) {
+        Some((anchor, focus)) => {
+            assert_eq!(
+                (anchor, focus),
+                (
+                    u16::try_from(anchor_buffer - sb_len).expect("row fits"),
+                    u16::try_from(focus_buffer - sb_len).expect("row fits"),
+                ),
+                "selection() and selection_text() must name the same cells after the clear"
+            );
+            assert_eq!(after.as_deref(), Some(before.as_str()));
+        }
+        None => assert_eq!(after, None, "no cells and no text: fail closed together"),
+    }
+}
+
+#[test]
+fn ed3_with_a_line_printed_after_bind_rebases_by_the_actual_pre_clear_drift_3040() {
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 0, 120);
+    rt.tick().expect("warm-up frame presents");
+    let id = view_id(&rt);
+
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 5.0));
+    let offset = scroll_offset(&rt);
+    assert!(offset > 0);
+    let live_start = u16::try_from(offset).expect("offset fits a row");
+    let press_row = live_start + 3;
+    let focus_row = press_row + 1;
+    select_live_rows_while_scrolled(&mut rt, id, press_row, focus_row);
+    let before = rt.selection_text().expect("visual selection text");
+    let pers = rt.persistent_selection().expect("pointer range has a twin");
+
+    // One line scrolls into history between the bind and the clear. The
+    // selected live rows keep their identity, so the intended policy is:
+    // rebase by the *actual* pre-clear drift (the eviction delta), not by the
+    // ring length captured at bind, and keep the exact text.
+    rt.handle_pty_bytes(format!("{}\r\n", line_text(200)).as_bytes());
+    let pre_clear_sb = rt.state().scrollback_len();
+    assert!(pre_clear_sb > 0);
+
+    rt.handle_pty_bytes(b"\x1b[3J");
+    assert_eq!(rt.state().scrollback_len(), 0);
+    assert_eq!(
+        rt.selection_text().as_deref(),
+        Some(before.as_str()),
+        "a live-row range survives a ring that grew after the bind"
+    );
+    assert_eq!(
+        selection_rows(&rt),
+        Some((
+            u16::try_from(pers.anchor.buffer_row - pre_clear_sb).expect("row fits"),
+            u16::try_from(pers.focus.buffer_row - pre_clear_sb).expect("row fits"),
+        )),
+        "the rebase must subtract the ring length at the clear, not at the bind"
+    );
+}

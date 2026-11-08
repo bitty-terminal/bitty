@@ -70,7 +70,7 @@ use crate::audit::{
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
 use crate::containment::{ContainmentReport, ExecRefusalKind};
-use crate::content::{CONTENT_FRAME_BYTES, ContentFrame};
+use crate::content::{CONTENT_FRAME_BYTES, ContentFrame, UntrustedObservation};
 use crate::contract::{CAPABILITIES, Capabilities};
 use crate::events::{
     Event, EventBus, EventDetail, EventKind, EventLimits, LeaseClose, MAX_ATTACH_KEYS_PER_SESSION,
@@ -1303,6 +1303,13 @@ impl Service {
 
     /// Dispatch one resolved method.
     ///
+    /// A success response for a content-carrying method
+    /// ([`ServiceMethod::carries_terminal_content`]) is labeled here with
+    /// [`UntrustedObservation`] after the handler returns. The label is
+    /// server-attached and outside client reach: a request field can neither
+    /// suppress nor forge it, and a handler that rewrites, truncates, or
+    /// redacts bytes still serves a labeled response.
+    ///
     /// # Errors
     ///
     /// Returns a [`Refusal`] for every failure stage. Nothing is applied on a
@@ -1314,7 +1321,19 @@ impl Service {
         params: &Value,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        let result = self.dispatch_inner(connection, method, params, now);
+        let mut result = self.dispatch_inner(connection, method, params, now);
+        let labelled = match &mut result {
+            Ok(value) if method.carries_terminal_content() => {
+                UntrustedObservation::new().attach(value)
+            }
+            _ => true,
+        };
+        if !labelled {
+            // A content response that is not a JSON object cannot carry the
+            // label, so it is never served. This is an internal invariant, not
+            // a client-reachable path.
+            result = Err(Refusal::internal());
+        }
         match &result {
             Err(refusal) => {
                 // D-16: a refusal is attributed. The per-connection suppression
@@ -3612,6 +3631,11 @@ impl Service {
     }
 
     /// `session.read`: pull bounded output from the terminal content buffer.
+    ///
+    /// The success response carries the server-attached
+    /// `is_untrusted_surface: true` label added by [`Service::dispatch`];
+    /// terminal bytes are observation data, never instructions. The label is
+    /// present for a zero-byte read and for a read clipped by `max_bytes`.
     fn session_read(
         &mut self,
         connection: &mut Connection,
@@ -5029,7 +5053,7 @@ mod tests {
             )
             .expect("accepted");
         assert_eq!(response.wire_version, 1);
-        assert_eq!(response.service_api_version.to_string(), "1.4");
+        assert_eq!(response.service_api_version.to_string(), "1.5");
         assert_eq!(response.scopes.service, ServiceScopeSet::baseline());
         assert_eq!(response.daemon_pid, std::process::id());
         assert_eq!(response.peer_identity.pid, std::process::id());
@@ -8752,6 +8776,49 @@ mod tests {
         params
     }
 
+    /// Pump the worker pool until `session.read` returns content.
+    ///
+    /// `require_buffered` keeps reading until the response reports bytes left
+    /// after the pull, which proves the read was clipped by `max_bytes` rather
+    /// than returning a whole buffer.
+    fn read_content_until(
+        service: &mut Service,
+        connection: &mut Connection,
+        session_id: &str,
+        max_bytes: Option<u64>,
+        require_buffered: bool,
+        start_ms: u64,
+    ) -> Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut now = start_ms;
+        loop {
+            service.supervise(MonotonicMs::from_millis(now));
+            let mut params = json!({"session_id": session_id, "generation": 1});
+            if let Some(max) = max_bytes {
+                params["max_bytes"] = json!(max);
+            }
+            let response = service
+                .dispatch(
+                    connection,
+                    ServiceMethod::SessionRead,
+                    &params,
+                    MonotonicMs::from_millis(now),
+                )
+                .expect("content read");
+            let bytes = response["bytes"].as_u64().unwrap_or(0);
+            let buffered = response["buffered_bytes"].as_u64().unwrap_or(0);
+            if bytes > 0 && (!require_buffered || buffered > 0) {
+                return response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no terminal content arrived: {response}"
+            );
+            now = now.saturating_add(1);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn content_authority_requires_a_controller_lease_and_the_terminal_scopes() {
         let (mut service, _dir) = spawn_service();
@@ -9116,6 +9183,123 @@ mod tests {
             )
             .expect("live read");
         assert_eq!(live["bytes"], 0);
+    }
+
+    #[test]
+    fn a_content_read_response_carries_the_untrusted_observation_label() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-label",
+            json!([
+                "/bin/sh",
+                "-c",
+                "printf '0123456789abcdef0123456789abcdef'; sleep 5"
+            ]),
+            false,
+        );
+
+        let response = read_content_until(&mut service, &mut creator, &id, None, false, 20);
+        let object = response.as_object().expect("content response object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "buffered_bytes",
+                "bytes",
+                "data",
+                "generation",
+                "is_untrusted_surface",
+                "session_id",
+            ]),
+            "a content read carries exactly the content fields plus the label"
+        );
+        assert_eq!(response["is_untrusted_surface"], Value::Bool(true));
+        assert!(response["is_untrusted_surface"].is_boolean());
+        assert!(response["bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn a_content_request_cannot_clear_or_forge_the_untrusted_label() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-label-forge",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        // Every trust-shaped spelling a client could try is an unknown request
+        // field: the handler ignores it, and the service attaches its own
+        // label after the handler returns.
+        let response = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionRead,
+                &json!({
+                    "session_id": id,
+                    "generation": 1,
+                    "is_untrusted_surface": false,
+                    "untrusted": false,
+                    "label": "trusted",
+                    "observation": "trusted",
+                }),
+                MonotonicMs::from_millis(20),
+            )
+            .expect("read");
+        assert_eq!(response["is_untrusted_surface"], Value::Bool(true));
+        assert!(response["is_untrusted_surface"].is_boolean());
+        assert!(
+            response["label"].is_null(),
+            "a request-supplied label is never echoed: {response}"
+        );
+        assert!(
+            response["untrusted"].is_null(),
+            "a request-supplied trust value is never echoed: {response}"
+        );
+        assert!(
+            response["observation"].is_null(),
+            "a request-supplied observation value is never echoed: {response}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_content_read_still_carries_the_untrusted_label() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-label-truncated",
+            json!([
+                "/bin/sh",
+                "-c",
+                "printf '0123456789abcdef0123456789abcdef'; sleep 5"
+            ]),
+            false,
+        );
+
+        let response = read_content_until(&mut service, &mut creator, &id, Some(8), true, 20);
+        assert_eq!(response["bytes"], 8, "the read is clipped to max_bytes");
+        assert!(
+            response["buffered_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "the clipped read leaves bytes for a later pull: {response}"
+        );
+        assert_eq!(
+            response["data"].as_str().map(str::len),
+            Some(16),
+            "the clipped payload is eight hex-encoded bytes: {response}"
+        );
+        assert_eq!(response["is_untrusted_surface"], Value::Bool(true));
+        assert!(response["is_untrusted_surface"].is_boolean());
     }
 
     #[test]

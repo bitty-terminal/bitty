@@ -501,6 +501,23 @@ impl ServiceMethod {
         }
     }
 
+    /// Whether this method's success response can carry terminal bytes and
+    /// therefore must carry the server-attached untrusted-observation label.
+    ///
+    /// `session.read` is the only content-carrying response in the frozen
+    /// catalog. `session.attach` returns the bounded event backlog, whose
+    /// details are metadata only (terminal bytes ride separate
+    /// `session_content` frames); `session.subscribe` returns subscription
+    /// state; `session.write` and `session.resize` return counts and geometry;
+    /// `session.control.transfer` returns lease metadata. The catalog has no
+    /// `debug.*` method. A method added here that serves bytes must also be
+    /// added to this predicate, and the dispatch path attaches the label from
+    /// it so a handler cannot omit it.
+    #[must_use]
+    pub const fn carries_terminal_content(self) -> bool {
+        matches!(self, Self::SessionRead)
+    }
+
     /// The static reason this method is exempt from the post-handshake
     /// request deadline, when its synchronous handler can legitimately block
     /// past `request_timeout_ms`.
@@ -778,6 +795,17 @@ mod tests {
                 "lease.heartbeat",
             ]
         );
+    }
+
+    #[test]
+    fn only_session_read_is_classified_as_content_carrying() {
+        for method in ServiceMethod::ALL {
+            assert_eq!(
+                method.carries_terminal_content(),
+                method == ServiceMethod::SessionRead,
+                "{method:?} must be classified explicitly"
+            );
+        }
     }
 
     #[test]

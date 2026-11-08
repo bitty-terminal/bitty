@@ -35,8 +35,14 @@ pub const SERVICE_API_MAJOR: u16 = 1;
 /// `terminal.inspect` and `terminal.input` transport grants. `1.4` serves the
 /// accepted session record's worker, origin, requester, timestamp, and exit
 /// fields as additive keys, with the identity keys restricted to the operator
-/// all-session view (bitty#2918).
-pub const SERVICE_API_MINOR: u16 = 4;
+/// all-session view (bitty#2918). `1.5` serves the additive
+/// `is_untrusted_surface: true` label on every content-carrying response and
+/// `session_content` frame (bitty#3021): terminal bytes are untrusted
+/// observation data (`T-10` / `R-013`), and the label is server-attached so a
+/// request cannot suppress or forge it. The key is purely additive, so every
+/// existing field keeps its meaning and a `1.0` through `1.4` client that
+/// ignores unknown keys keeps working; `min_client_minor` stays `0`.
+pub const SERVICE_API_MINOR: u16 = 5;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
 /// `min_client_minor` starts at `0` for `1.0`).
@@ -158,7 +164,7 @@ impl ServiceApiVersion {
             && client.minor <= self.minor
     }
 
-    /// The accepted client range, for diagnostics (`1.0..=1.4`).
+    /// The accepted client range, for diagnostics (`1.0..=1.5`).
     #[must_use]
     pub fn client_range(self) -> String {
         format!(
@@ -235,11 +241,11 @@ mod tests {
     #[test]
     fn service_version_matches_the_accepted_contract() {
         assert_eq!(SERVICE_API_MAJOR, 1);
-        assert_eq!(SERVICE_API_MINOR, 4);
+        assert_eq!(SERVICE_API_MINOR, 5);
         assert_eq!(MIN_CLIENT_MINOR, 0);
-        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 4, 0));
-        assert_eq!(SERVICE_API_VERSION.to_string(), "1.4");
-        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.4");
+        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 5, 0));
+        assert_eq!(SERVICE_API_VERSION.to_string(), "1.5");
+        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.5");
     }
 
     #[test]
@@ -251,13 +257,16 @@ mod tests {
         assert!(server.accepts(ClientVersion::new(1, 1)));
         assert!(server.accepts(ClientVersion::new(1, 2)));
         assert!(server.accepts(ClientVersion::new(1, 3)));
-        assert!(!server.accepts(ClientVersion::new(1, 5)));
+        assert!(server.accepts(ClientVersion::new(1, 4)));
+        assert!(server.accepts(ClientVersion::new(1, 5)));
+        assert!(!server.accepts(ClientVersion::new(1, 6)));
 
-        let wider = ServiceApiVersion::new(1, 4, 2);
+        let wider = ServiceApiVersion::new(1, 5, 2);
         assert!(!wider.accepts(ClientVersion::new(1, 1)));
         assert!(wider.accepts(ClientVersion::new(1, 2)));
         assert!(wider.accepts(ClientVersion::new(1, 4)));
-        assert!(!wider.accepts(ClientVersion::new(1, 5)));
+        assert!(wider.accepts(ClientVersion::new(1, 5)));
+        assert!(!wider.accepts(ClientVersion::new(1, 6)));
     }
 
     #[test]

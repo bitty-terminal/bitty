@@ -554,6 +554,14 @@ apt-gpg-import-test:
 aur-bin-render-test:
     ./scripts/tests/check-aur-bin-render.test.sh
 
+# AUR source build gate (bitty#3011): a real `makepkg` build of
+# packaging/PKGBUILD whose produced package must contain usr/bin/bitty and
+# usr/bin/bittyd, plus mutation cases proving a package() that stops installing
+# a built binary fails the gate. Needs Arch tooling (makepkg, fakeroot, tic,
+# bsdtar); it skips the mutation cases where those are absent.
+aur-source-build-test:
+    ./scripts/tests/check-aur-source-build.test.sh
+
 # Install a package in a clean container and run the version/doctor/headless
 # smoke: `just install-smoke ubuntu dist/bitty-x86_64-unknown-linux-gnu.deb`
 install-smoke distro package:

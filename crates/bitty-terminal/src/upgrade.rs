@@ -719,9 +719,9 @@ pub struct Marker {
 impl Marker {
     /// Reads and parses a marker; every problem is an evidence string.
     fn read(path: &Path) -> Result<Self, String> {
-        let metadata =
-            std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        if !metadata.is_file() {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(format!("{}: not a regular file", path.display()));
         }
         if metadata.len() > MARKER_MAX_BYTES {
@@ -739,6 +739,7 @@ impl Marker {
     /// Strict parse of the flat marker object.
     fn parse(text: &str) -> Option<Self> {
         let fields = parse_flat_object(text)?;
+        let mut schema = None;
         let mut channel = None;
         let mut prefix = None;
         let mut bin_dir = None;
@@ -746,15 +747,26 @@ impl Marker {
         let mut binary_sha256 = None;
         let mut installed_at = None;
         for (key, value) in fields {
-            match key.as_str() {
-                "channel" => channel = Some(value),
-                "prefix" => prefix = Some(value),
-                "bin_dir" => bin_dir = Some(value),
-                "version" => version = Some(value),
-                "binary_sha256" => binary_sha256 = Some(value),
-                "installed_at" => installed_at = Some(value),
+            match (key.as_str(), value) {
+                ("schema", FlatValue::Raw(raw)) => schema = Some(raw),
+                ("schema", FlatValue::Str(_)) => return None,
+                ("channel", FlatValue::Str(val)) => channel = Some(val),
+                ("channel", FlatValue::Raw(_)) => return None,
+                ("prefix", FlatValue::Str(val)) => prefix = Some(val),
+                ("prefix", FlatValue::Raw(_)) => return None,
+                ("bin_dir", FlatValue::Str(val)) => bin_dir = Some(val),
+                ("bin_dir", FlatValue::Raw(_)) => return None,
+                ("version", FlatValue::Str(val)) => version = Some(val),
+                ("version", FlatValue::Raw(_)) => return None,
+                ("binary_sha256", FlatValue::Str(val)) => binary_sha256 = Some(val),
+                ("binary_sha256", FlatValue::Raw(_)) => return None,
+                ("installed_at", FlatValue::Str(val)) => installed_at = Some(val),
+                ("installed_at", FlatValue::Raw(_)) => return None,
                 _ => {}
             }
+        }
+        if schema?.parse::<u32>().ok()? != MARKER_SCHEMA {
+            return None;
         }
         let marker = Self {
             channel: channel?,
@@ -792,12 +804,54 @@ impl Marker {
 
     /// Writes the marker atomically (staged in the same directory).
     fn write(&self, path: &Path) -> std::io::Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+
         let Some(parent) = path.parent() else {
             return Err(std::io::Error::other("marker path has no parent"));
         };
+        if let Ok(meta) = std::fs::symlink_metadata(parent) {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "marker parent is a symlink or not a directory",
+                ));
+            }
+        }
         std::fs::create_dir_all(parent)?;
-        let staged = parent.join(format!(".install.json.{}.tmp", std::process::id()));
-        std::fs::write(&staged, self.to_json())?;
+        let parent_meta = std::fs::symlink_metadata(parent)?;
+        if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "marker parent is a symlink or not a directory",
+            ));
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to overwrite a symlink or non-regular marker file",
+                ));
+            }
+        }
+        let staged = parent.join(format!(
+            ".install.json.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(self.to_json().as_bytes())?;
+            file.sync_all()
+        })();
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&staged);
+            return Err(err);
+        }
         let result = std::fs::rename(&staged, path);
         if result.is_err() {
             let _ = std::fs::remove_file(&staged);
@@ -830,9 +884,15 @@ fn refresh_marker(env: &dyn Fn(&str) -> Option<String>, location: &Location, ver
     }
 }
 
+/// Flat JSON scalar value (`"..."` string vs unquoted literal).
+enum FlatValue {
+    Str(String),
+    Raw(String),
+}
+
 /// Strict parser for the flat JSON object the marker uses (string values,
 /// `\uXXXX` escapes, no nesting). Returns `None` on any deviation.
-fn parse_flat_object(text: &str) -> Option<Vec<(String, String)>> {
+fn parse_flat_object(text: &str) -> Option<Vec<(String, FlatValue)>> {
     let mut scanner = Scanner {
         bytes: text.as_bytes(),
         pos: 0,
@@ -950,11 +1010,12 @@ impl Scanner<'_> {
         }
     }
 
-    /// String, number, boolean, or null: the marker only reads strings, but
-    /// tolerating other scalars keeps forward-compatible fields harmless.
-    fn scalar(&mut self) -> Option<String> {
+    /// String, number, boolean, or null: string fields require `FlatValue::Str`
+    /// while `schema` requires `FlatValue::Raw`, keeping forward-compatible
+    /// unknown fields harmless.
+    fn scalar(&mut self) -> Option<FlatValue> {
         match self.peek()? {
-            b'"' => self.string(),
+            b'"' => self.string().map(FlatValue::Str),
             _ => {
                 let start = self.pos;
                 while let Some(byte) = self.peek() {
@@ -968,7 +1029,7 @@ impl Scanner<'_> {
                 }
                 std::str::from_utf8(&self.bytes[start..self.pos])
                     .ok()
-                    .map(str::to_string)
+                    .map(|raw| FlatValue::Raw(raw.to_string()))
             }
         }
     }
@@ -1255,6 +1316,16 @@ fn fetch_text(
     let url = format!("{base}/{suffix}");
     let scratch = scratch_path(probe, "text");
     let result = (|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&scratch)
+            .map_err(|error| {
+                io_failure(
+                    &format!("cannot create scratch file {}", scratch.display()),
+                    &error,
+                )
+            })?;
         let status = run_curl(&url, &scratch, max_bytes)?;
         require_http_ok(&url, status)?;
         let bytes = read_capped(&scratch, max_bytes)?;
@@ -1279,10 +1350,19 @@ fn scratch_path(probe: &Probe<'_>, tag: &str) -> PathBuf {
     ))
 }
 
-/// Reads at most `max_bytes`, refusing anything larger.
+/// Reads at most `max_bytes`, refusing anything larger or non-regular.
 fn read_capped(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Failure> {
-    let metadata =
-        std::fs::metadata(path).map_err(|error| io_failure(&path.display().to_string(), &error))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| io_failure(&path.display().to_string(), &error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Failure::new(
+            EXIT_PERM,
+            format!(
+                "refusing to read symlink or non-regular file: {}",
+                path.display()
+            ),
+        ));
+    }
     if metadata.len() > max_bytes {
         return Err(Failure::new(
             EXIT_GENERIC,
@@ -1384,7 +1464,38 @@ fn prev_path(binary: &Path) -> Result<PathBuf, Failure> {
 /// Staged download path in the install directory (same filesystem, so the
 /// final `rename(2)` is atomic).
 fn staged_path(bin_dir: &Path) -> PathBuf {
-    bin_dir.join(format!(".bitty-upgrade.{}.tmp", std::process::id()))
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    bin_dir.join(format!(
+        ".bitty-upgrade.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn ensure_overwrite_target_is_regular(path: &Path, label: &str) -> Result<(), Failure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(Failure::new(
+            EXIT_PERM,
+            format!(
+                "refusing to write through symlink {label}: {}",
+                path.display()
+            ),
+        )),
+        Ok(meta) if !meta.is_file() => Err(Failure::new(
+            EXIT_GENERIC,
+            format!(
+                "{} is not a regular file; refusing to overwrite it",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_failure(
+            &format!("cannot stat {}", path.display()),
+            &error,
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -1403,16 +1514,46 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 /// The previous binary is copied first (so a crash leaves a working
 /// `binary`), then the staged file is renamed over it in the same directory.
 fn install_binary(staged: &Path, binary: &Path, prev: &Path) -> Result<(), Failure> {
-    if !binary.is_file() {
-        return Err(Failure::new(
-            EXIT_GENERIC,
-            format!(
-                "{} is not a regular file; refusing to replace it",
-                binary.display()
-            ),
-        ));
+    match std::fs::symlink_metadata(binary) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Failure::new(
+                EXIT_PERM,
+                format!("refusing to replace symlink binary: {}", binary.display()),
+            ));
+        }
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            return Err(Failure::new(
+                EXIT_GENERIC,
+                format!(
+                    "{} is not a regular file; refusing to replace it",
+                    binary.display()
+                ),
+            ));
+        }
     }
-    if staged.parent() != binary.parent() {
+    match std::fs::symlink_metadata(staged) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Failure::new(
+                EXIT_PERM,
+                format!(
+                    "refusing to install symlink staged binary: {}",
+                    staged.display()
+                ),
+            ));
+        }
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            return Err(Failure::new(
+                EXIT_GENERIC,
+                format!(
+                    "{} is not a regular file; refusing to install it",
+                    staged.display()
+                ),
+            ));
+        }
+    }
+    if staged.parent() != binary.parent() || prev.parent() != binary.parent() {
         return Err(Failure::new(
             EXIT_GENERIC,
             format!(
@@ -1422,6 +1563,7 @@ fn install_binary(staged: &Path, binary: &Path, prev: &Path) -> Result<(), Failu
             ),
         ));
     }
+    ensure_overwrite_target_is_regular(prev, "backup")?;
     std::fs::copy(binary, prev).map_err(|error| {
         io_failure(
             &format!("cannot back up {} to {}", binary.display(), prev.display()),
@@ -1679,6 +1821,30 @@ fn self_update(
         return Ok(EXIT_OK);
     }
 
+    match std::fs::symlink_metadata(&location.bin_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Failure::new(
+                EXIT_PERM,
+                format!(
+                    "refusing to write into symlink install directory: {}",
+                    location.bin_dir.display()
+                ),
+            ));
+        }
+        Ok(meta) if meta.is_dir() => {}
+        _ => {
+            return Err(Failure::new(
+                EXIT_GENERIC,
+                format!(
+                    "{} is not a directory; refusing to upgrade in place",
+                    location.bin_dir.display()
+                ),
+            ));
+        }
+    }
+    ensure_overwrite_target_is_regular(&location.binary, "binary")?;
+    ensure_overwrite_target_is_regular(&prev, "backup")?;
+
     let sums = fetch_text(
         probe,
         base,
@@ -1694,6 +1860,16 @@ fn self_update(
 
     let staged = staged_path(&location.bin_dir);
     let staged_result = (|| -> Result<(), Failure> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|error| {
+                io_failure(
+                    &format!("cannot create staged download {}", staged.display()),
+                    &error,
+                )
+            })?;
         let status = run_curl(&asset_url, &staged, ASSET_MAX_BYTES)?;
         require_http_ok(&asset_url, status)?;
         let actual = sha256_file(&staged)
@@ -1824,12 +2000,22 @@ fn rollback_install(probe: &Probe<'_>, detection: &Detection, dry_run: bool) -> 
         ));
     }
     let prev = prev_path(&location.binary)?;
-    if !prev.is_file() {
-        return Err(Failure::new(
-            EXIT_GENERIC,
-            format!("no backup at {}; nothing to roll back", prev.display()),
-        ));
+    match std::fs::symlink_metadata(&prev) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(Failure::new(
+                EXIT_PERM,
+                format!("refusing to restore symlink backup: {}", prev.display()),
+            ));
+        }
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            return Err(Failure::new(
+                EXIT_GENERIC,
+                format!("no backup at {}; nothing to roll back", prev.display()),
+            ));
+        }
     }
+    ensure_overwrite_target_is_regular(&location.binary, "binary")?;
     let backup = probe_version(&prev).map_err(|failure| {
         Failure::new(
             EXIT_GENERIC,
@@ -2346,5 +2532,249 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  bitty-aarch64-
         std::fs::write(&foreign, b"new").expect("foreign staged");
         assert!(install_binary(&foreign, &binary, &prev).is_err());
         assert_eq!(std::fs::read(&binary).expect("binary"), b"new");
+    }
+
+    #[test]
+    fn marker_parse_requires_supported_schema_version() {
+        let marker = Marker {
+            channel: "script".to_string(),
+            prefix: "/home/user/.local".to_string(),
+            bin_dir: "/home/user/.local/bin".to_string(),
+            version: "0.0.27".to_string(),
+            binary_sha256: "a".repeat(64),
+            installed_at: "2026-11-06T10:00:00Z".to_string(),
+        };
+        let valid = marker.to_json();
+        assert_eq!(Marker::parse(&valid), Some(marker));
+
+        let future_schema = valid.replace("\"schema\": 1", "\"schema\": 2");
+        assert!(
+            Marker::parse(&future_schema).is_none(),
+            "future schema must fail closed"
+        );
+
+        let string_schema = valid.replace("\"schema\": 1", "\"schema\": \"1\"");
+        assert!(
+            Marker::parse(&string_schema).is_none(),
+            "non-numeric schema must fail closed"
+        );
+
+        let missing_schema = valid.replace("  \"schema\": 1,\n", "");
+        assert!(
+            Marker::parse(&missing_schema).is_none(),
+            "missing schema must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_read_and_write_refuse_symlinks() {
+        let scratch = Scratch::new("marker-symlinks");
+        let real_marker = scratch.join("real-install.json");
+        let marker = Marker {
+            channel: "script".to_string(),
+            prefix: scratch.join("prefix").display().to_string(),
+            bin_dir: scratch.join("prefix/bin").display().to_string(),
+            version: "0.0.27".to_string(),
+            binary_sha256: "a".repeat(64),
+            installed_at: "2026-11-06T10:00:00Z".to_string(),
+        };
+        std::fs::write(&real_marker, marker.to_json()).expect("write real marker");
+
+        let symlink_marker = scratch.join("symlink-install.json");
+        std::os::unix::fs::symlink(&real_marker, &symlink_marker).expect("symlink marker");
+        assert!(
+            Marker::read(&symlink_marker).is_err(),
+            "Marker::read must refuse symlinked install.json"
+        );
+
+        let victim = scratch.join("victim.txt");
+        std::fs::write(&victim, b"untouched").expect("write victim");
+        let symlink_target = scratch.join("data/bitty/install.json");
+        std::fs::create_dir_all(symlink_target.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&victim, &symlink_target).expect("symlink target");
+        let err = marker
+            .write(&symlink_target)
+            .expect_err("Marker::write must refuse symlinked target");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&victim).expect("read victim"), b"untouched");
+
+        let real_dir = scratch.join("real-dir");
+        std::fs::create_dir_all(&real_dir).expect("mkdir real-dir");
+        let symlink_dir = scratch.join("symlink-dir");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("symlink parent dir");
+        let err = marker
+            .write(&symlink_dir.join("install.json"))
+            .expect_err("Marker::write must refuse symlinked parent directory");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_binary_and_rollback_refuse_symlinks_without_clobbering_targets() {
+        let scratch = Scratch::new("install-symlinks");
+        let bin_dir = scratch.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let binary = bin_dir.join("bitty");
+        std::fs::write(&binary, b"old-binary").expect("binary");
+        let staged = bin_dir.join(".staged");
+        std::fs::write(&staged, b"new-binary").expect("staged");
+
+        // 1. Symlinked `bitty.prev` must be refused without touching the symlink target!
+        let victim = scratch.join("victim-file");
+        std::fs::write(&victim, b"preserve-me").expect("victim");
+        let prev = prev_path(&binary).expect("prev path");
+        std::os::unix::fs::symlink(&victim, &prev).expect("symlink prev");
+        let err = install_binary(&staged, &binary, &prev)
+            .expect_err("install_binary must refuse symlinked bitty.prev");
+        assert_eq!(err.code, EXIT_PERM);
+        assert_eq!(
+            std::fs::read(&victim).expect("victim bytes"),
+            b"preserve-me",
+            "symlink target must not be clobbered"
+        );
+        assert_eq!(
+            std::fs::read(&binary).expect("binary bytes"),
+            b"old-binary",
+            "installed binary must remain unchanged"
+        );
+        std::fs::remove_file(&prev).expect("remove symlink prev");
+
+        // 2. Dangling symlink `bitty.prev` must also be refused without creating the target!
+        let dangling_target = scratch.join("dangling-victim");
+        std::os::unix::fs::symlink(&dangling_target, &prev).expect("dangling symlink prev");
+        let err = install_binary(&staged, &binary, &prev)
+            .expect_err("install_binary must refuse dangling symlinked bitty.prev");
+        assert_eq!(err.code, EXIT_PERM);
+        assert!(
+            !dangling_target.exists(),
+            "dangling symlink target must not be created"
+        );
+        std::fs::remove_file(&prev).expect("remove dangling symlink prev");
+
+        // 3. Symlinked `binary` must be refused.
+        let symlink_bin = bin_dir.join("bitty-link");
+        std::os::unix::fs::symlink(&binary, &symlink_bin).expect("symlink binary");
+        let link_prev = prev_path(&symlink_bin).expect("link prev");
+        let err = install_binary(&staged, &symlink_bin, &link_prev)
+            .expect_err("install_binary must refuse symlinked binary");
+        assert_eq!(err.code, EXIT_PERM);
+
+        // 4. Symlinked `staged` must be refused.
+        let symlink_staged = bin_dir.join(".staged-link");
+        std::os::unix::fs::symlink(&staged, &symlink_staged).expect("symlink staged");
+        let err = install_binary(&symlink_staged, &binary, &prev)
+            .expect_err("install_binary must refuse symlinked staged");
+        assert_eq!(err.code, EXIT_PERM);
+
+        // 5. `rollback_install` must refuse a symlinked `bitty.prev`.
+        std::os::unix::fs::symlink(&victim, &prev).expect("symlink prev for rollback");
+        let empty_env: HashMap<String, String> = HashMap::new();
+        let lookup = |key: &str| empty_env.get(key).cloned();
+        let probe = Probe {
+            exe: binary.clone(),
+            path_dirs: Vec::new(),
+            env: &lookup,
+        };
+        let detection = Detection {
+            channel: Channel::Script,
+            evidence: "test".to_string(),
+            location: Some(Location::for_binary(binary.clone())),
+            helper: None,
+        };
+        let err = rollback_install(&probe, &detection, false)
+            .expect_err("rollback_install must refuse symlinked backup");
+        assert_eq!(err.code, EXIT_PERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_update_and_rollback_refuse_symlinked_install_paths() {
+        let scratch = Scratch::new("self-update-symlinks");
+        let empty_env: HashMap<String, String> = HashMap::new();
+        let lookup = |key: &str| empty_env.get(key).cloned();
+
+        // 1. `self_update` must refuse a symlinked install directory before
+        //    fetching anything, so nothing is ever written into the link
+        //    target's directory.
+        let real_bin = scratch.join("real-bin");
+        std::fs::create_dir_all(&real_bin).expect("real bin");
+        let link_bin = scratch.join("link-bin");
+        std::os::unix::fs::symlink(&real_bin, &link_bin).expect("symlink bin dir");
+        let binary = link_bin.join("bitty");
+        let probe = Probe {
+            exe: binary.clone(),
+            path_dirs: Vec::new(),
+            env: &lookup,
+        };
+        let detection = Detection {
+            channel: Channel::Script,
+            evidence: "test".to_string(),
+            location: Some(Location::for_binary(binary)),
+            helper: None,
+        };
+        let running = Semver::parse("1.0.0").expect("running version");
+        let latest = Semver::parse("2.0.0").expect("latest version");
+        let err = self_update(
+            &probe,
+            &detection,
+            "https://cdn.invalid",
+            "v2.0.0",
+            running,
+            latest,
+            false,
+        )
+        .expect_err("self_update must refuse symlinked bin dir");
+        assert_eq!(err.code, EXIT_PERM);
+        assert!(
+            err.message.contains("symlink install directory"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read_dir(&real_bin).expect("read real bin").count(),
+            0,
+            "nothing may be written into the real install directory"
+        );
+
+        // 2. `rollback_install` must refuse a symlinked current binary; the
+        //    backup stays in place and the link target keeps its bytes.
+        let rollback_bin = scratch.join("rollback-bin");
+        std::fs::create_dir_all(&rollback_bin).expect("rollback bin");
+        let victim = scratch.join("victim-binary");
+        std::fs::write(&victim, b"victim-binary-bytes").expect("write victim");
+        let linked_binary = rollback_bin.join("bitty");
+        std::os::unix::fs::symlink(&victim, &linked_binary).expect("symlink binary");
+        let prev = rollback_bin.join("bitty.prev");
+        std::fs::write(&prev, b"#!/bin/sh\nprintf 'bitty 0.0.1 (mut test)\\n'\n")
+            .expect("write backup");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod backup");
+        }
+        let detection = Detection {
+            channel: Channel::Script,
+            evidence: "test".to_string(),
+            location: Some(Location::for_binary(linked_binary.clone())),
+            helper: None,
+        };
+        let err = rollback_install(&probe, &detection, false)
+            .expect_err("rollback_install must refuse symlinked binary");
+        assert_eq!(err.code, EXIT_PERM);
+        assert!(err.message.contains("symlink binary"), "{}", err.message);
+        assert_eq!(
+            std::fs::read(&victim).expect("victim bytes"),
+            b"victim-binary-bytes",
+            "the symlink target must not be replaced"
+        );
+        assert!(prev.exists(), "the backup must not be consumed");
+        assert!(
+            std::fs::symlink_metadata(&linked_binary)
+                .expect("stat binary")
+                .file_type()
+                .is_symlink(),
+            "the symlink must still be there"
+        );
     }
 }

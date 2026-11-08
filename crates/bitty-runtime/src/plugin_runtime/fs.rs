@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::{self, Read as _};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -72,7 +72,7 @@ pub trait FileSystem: Send + Sync + Debug {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeFileSystem;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn path_for_bounded_traversal(path: &Path) -> PathBuf {
     let temp_dir = std::env::temp_dir();
     if path.is_absolute() && path.starts_with(&temp_dir) {
@@ -164,6 +164,62 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
     ))
 }
 
+#[cfg(windows)]
+fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let path = path_for_bounded_traversal(path);
+    let mut accumulated = PathBuf::new();
+    let mut components = path.components().peekable();
+    let mut saw_normal = false;
+    while let Some(component) = components.next() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {
+                accumulated.push(component.as_os_str());
+                continue;
+            }
+            Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "parent or prefix path component",
+                ));
+            }
+            Component::Normal(name) => {
+                saw_normal = true;
+                accumulated.push(name);
+            }
+        }
+        let final_component = components.peek().is_none();
+        if !final_component {
+            let metadata = std::fs::symlink_metadata(&accumulated)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "not a directory",
+                ));
+            }
+        }
+    }
+    if !saw_normal {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path has no file name",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&accumulated)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 impl FileSystem for NativeFileSystem {
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
@@ -193,18 +249,9 @@ impl FileSystem for NativeFileSystem {
     }
 
     fn read_bounded_bytes(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let file = open_bounded_regular_file(path)?;
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly"
-        )))]
+        #[cfg(not(any(unix, windows)))]
         let file = std::fs::File::open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -220,7 +267,8 @@ impl FileSystem for NativeFileSystem {
             ));
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        file.take((limit as u64).saturating_add(1))
+            .read_to_end(&mut bytes)?;
         if bytes.len() > limit || bytes.len() as u64 != metadata.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -696,5 +744,27 @@ mod tests {
         ))]
         nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).expect("fifo");
         assert!(NativeFileSystem.read_bounded_bytes(&path, 16).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_rejects_parent_dir_and_saturates_max_limit_3079() {
+        let dir = sweep_dir("bounded-read-3079");
+        let nested = dir.path().join("nested");
+        let path = nested.join("state.toml");
+        std::fs::create_dir(&nested).expect("nested directory");
+        std::fs::write(&path, b"state").expect("state");
+
+        let parent_traversal = nested.join("..").join("nested").join("state.toml");
+        assert!(
+            NativeFileSystem
+                .read_bounded_bytes(&parent_traversal, 16)
+                .is_err(),
+            "parent-dir traversal must be rejected"
+        );
+
+        let bytes = NativeFileSystem
+            .read_bounded_bytes(&path, usize::MAX)
+            .expect("usize::MAX limit must not overflow u64 take bound");
+        assert_eq!(bytes, b"state");
     }
 }

@@ -1692,6 +1692,7 @@ impl Runtime {
         // delete, and its stale completion must drop instead of
         // resurrecting the image.
         self.bump_kitty_local_delete_epoch(self.kitty_origin);
+        self.drop_pending_kitty_places(self.kitty_origin, Some(image_id), placement_id);
         let removed = self
             .kitty_images
             .delete_by_wire(self.kitty_origin, image_id, placement_id);
@@ -1782,6 +1783,7 @@ impl Runtime {
     /// Retires every rich layer entry for a dead origin token, including a
     /// dormant main-screen stash (pane teardown/respawn).
     pub(super) fn retire_kitty_origin(&mut self, origin: Option<u64>) {
+        self.bump_kitty_local_delete_epoch(origin);
         self.kitty_images.retire_origin(origin);
         self.kitty_alt_layers.remove(&origin);
         self.kitty_alt_stash.remove(&origin);
@@ -1805,6 +1807,7 @@ impl Runtime {
             return;
         }
         self.sync_kitty_screen();
+        self.drop_pending_kitty_places(self.kitty_origin, Some(wire_image), None);
         let removed = self
             .kitty_images
             .delete_by_wire(self.kitty_origin, wire_image, None);
@@ -1885,6 +1888,21 @@ impl Runtime {
             self.kitty_pending_places.pop_front();
         }
         self.kitty_pending_places.push_back(entry);
+    }
+
+    /// Drops retained spanless `a=p` requests matching `(origin, wire_image,
+    /// wire_placement)` (`None` wildcards the image or placement).
+    pub(super) fn drop_pending_kitty_places(
+        &mut self,
+        origin: Option<u64>,
+        wire_image: Option<u32>,
+        wire_placement: Option<u32>,
+    ) {
+        self.kitty_pending_places.retain(|pending| {
+            !(pending.origin == origin
+                && wire_image.is_none_or(|id| pending.keys.image_id == id)
+                && wire_placement.is_none_or(|pin| pending.keys.placement_id == pin))
+        });
     }
 
     /// Replays retained spanless placements for one newly stored image

@@ -21,9 +21,11 @@ use bitty_runtime::plugin_runtime::{
     ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering, ConfigReadFailure, ConfigReadValue,
     ConfigSourceLabel, ConfigSourceList, ConfigSourceRow, ConfigValueRow, ConfigWriteBackend,
     ConfigWriteFailure, EmptySettings, PluginEnabledRendering, PluginList, PluginListRow,
-    PluginRecord, PluginRuntime, PluginRuntimeConfig, ProfileList, ProfileListRow,
-    ProfileUseRendering, SnapshotSource, SourceClass, candidate_digest, content_digest,
-    manifest_toml, write_index,
+    PluginRecord, PluginRuntime, PluginRuntimeConfig, ProfileCloneOptions, ProfileCloneOutcome,
+    ProfileCreateOptions, ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome,
+    ProfileFailureKind, ProfileLifecycleRendering, ProfileList, ProfileListRow,
+    ProfileRenameOptions, ProfileRenameOutcome, ProfileUseRendering, ProfileWriteFailure,
+    SnapshotSource, SourceClass, candidate_digest, content_digest, manifest_toml, write_index,
 };
 
 struct NoSnapshot;
@@ -157,6 +159,194 @@ impl ConfigWriteBackend for RecordingBackend {
         // bitty#2814: a live-only switch reports no pending restart.
         Ok(ConfigApplyOutcome::Applied {
             pending_restart: false,
+        })
+    }
+
+    fn preview_profile_create(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+        options: &ProfileCreateOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let rendered = format!(
+            "+return {{ -- {name} force={} from={:?} preset={:?} }}",
+            options.force, options.from, options.preset
+        );
+        Ok(ProfileLifecycleRendering {
+            changed_keys: vec![format!("profiles.{name}")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+            replaces_existing: options.force,
+            selector_updated: false,
+            active: false,
+        })
+    }
+
+    fn apply_profile_create(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+        options: &ProfileCreateOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileCreateOutcome, ProfileWriteFailure> {
+        let rendered = format!(
+            "+return {{ -- {name} force={} from={:?} preset={:?} }}",
+            options.force, options.from, options.preset
+        );
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ProfileWriteFailure::new(
+                ProfileFailureKind::Stale,
+                "the profile candidate changed since it was previewed",
+            ));
+        }
+        Ok(ProfileCreateOutcome {
+            name: name.to_string(),
+            replaced: options.force,
+            backed_up: options.force,
+            extends: options.from.clone(),
+            preset: options.preset.clone(),
+        })
+    }
+
+    fn preview_profile_clone(
+        &self,
+        _plugin_id: &str,
+        src: &str,
+        dst: &str,
+        options: &ProfileCloneOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let rendered = format!("+clone {src} -> {dst} (force={})", options.force);
+        Ok(ProfileLifecycleRendering {
+            changed_keys: vec![format!("profiles.{dst}")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+            replaces_existing: options.force,
+            selector_updated: false,
+            active: false,
+        })
+    }
+
+    fn apply_profile_clone(
+        &self,
+        _plugin_id: &str,
+        src: &str,
+        dst: &str,
+        options: &ProfileCloneOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileCloneOutcome, ProfileWriteFailure> {
+        let rendered = format!("+clone {src} -> {dst} (force={})", options.force);
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ProfileWriteFailure::new(
+                ProfileFailureKind::Stale,
+                "the profile candidate changed since it was previewed",
+            ));
+        }
+        Ok(ProfileCloneOutcome {
+            source: src.to_string(),
+            target: dst.to_string(),
+            replaced: options.force,
+            backed_up: options.force,
+            extends: None,
+        })
+    }
+
+    fn preview_profile_rename(
+        &self,
+        _plugin_id: &str,
+        old: &str,
+        new: &str,
+        options: &ProfileRenameOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let rendered = format!(
+            "-profile = \"{old}\"\n+profile = \"{new}\" (force={})",
+            options.force
+        );
+        Ok(ProfileLifecycleRendering {
+            changed_keys: vec![
+                format!("profiles.{old}"),
+                format!("profiles.{new}"),
+                String::from("profile"),
+            ],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+            replaces_existing: options.force,
+            selector_updated: true,
+            active: true,
+        })
+    }
+
+    fn apply_profile_rename(
+        &self,
+        _plugin_id: &str,
+        old: &str,
+        new: &str,
+        options: &ProfileRenameOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileRenameOutcome, ProfileWriteFailure> {
+        let rendered = format!(
+            "-profile = \"{old}\"\n+profile = \"{new}\" (force={})",
+            options.force
+        );
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ProfileWriteFailure::new(
+                ProfileFailureKind::Stale,
+                "the profile candidate changed since it was previewed",
+            ));
+        }
+        Ok(ProfileRenameOutcome {
+            old_name: old.to_string(),
+            new_name: new.to_string(),
+            replaced: options.force,
+            backed_up: true,
+            selector_updated: true,
+        })
+    }
+
+    fn preview_profile_delete(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+        options: &ProfileDeleteOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        if name == "extended" {
+            return Err(ProfileWriteFailure::new(
+                ProfileFailureKind::Conflict,
+                "cannot delete 'extended': extended by 'child'",
+            ));
+        }
+        let rendered = format!("-return {{ -- {name} (force={}) }}", options.force);
+        Ok(ProfileLifecycleRendering {
+            changed_keys: vec![format!("profiles.{name}")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+            replaces_existing: false,
+            selector_updated: false,
+            active: false,
+        })
+    }
+
+    fn apply_profile_delete(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+        options: &ProfileDeleteOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileDeleteOutcome, ProfileWriteFailure> {
+        let rendered = format!("-return {{ -- {name} (force={}) }}", options.force);
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ProfileWriteFailure::new(
+                ProfileFailureKind::Stale,
+                "the profile candidate changed since it was previewed",
+            ));
+        }
+        Ok(ProfileDeleteOutcome {
+            name: name.to_string(),
+            backed_up: true,
+            was_active: false,
         })
     }
 
@@ -428,7 +618,99 @@ bitty.commands.register({ id = "deny", title = "Deny", run = function()
     errcode(function() return bitty.profiles.list() end),
     errcode(function() return bitty.config.preview_enabled("owner.plugin", true) end),
     errcode(function() return bitty.profiles.preview_use("work") end),
+    errcode(function() return bitty.profiles.preview_create("fresh") end),
+    errcode(function() return bitty.profiles.create("fresh", string.rep("0", 64)) end),
+    errcode(function() return bitty.profiles.preview_clone("work", "copy") end),
+    errcode(function() return bitty.profiles.clone("work", "copy", string.rep("0", 64)) end),
+    errcode(function() return bitty.profiles.preview_rename("work", "work2") end),
+    errcode(function() return bitty.profiles.rename("work", "work2", string.rep("0", 64)) end),
+    errcode(function() return bitty.profiles.preview_delete("work") end),
+    errcode(function() return bitty.profiles.delete("work", string.rep("0", 64)) end),
   }, ",")
+end })
+
+bitty.commands.register({ id = "profile_lifecycle", title = "Profile lifecycle", run = function()
+  assert(bitty.config.profiles == bitty.profiles, "bitty.config.profiles must alias bitty.profiles")
+  local listed = bitty.config.profiles.list()
+  assert(#listed.rows == 2 and #listed.profiles == 2, "list exposes both rows and profiles")
+
+  -- 1. Create with preset + embedded opts.digest
+  local pc = bitty.profiles.preview_create("fresh", { preset = "dark", force = true })
+  assert(#pc.digest == 64 and pc.changed and pc.replaces_existing)
+  local c = bitty.profiles.create("fresh", { preset = "dark", force = true, digest = pc.digest })
+  assert(c.name == "fresh" and c.created and c.replaced and c.backed_up and c.preset == "dark")
+
+  -- 2. Clone with trailing digest
+  local pcl = bitty.config.profiles.preview_clone("work", "work-copy")
+  local cl = bitty.config.profiles.clone("work", "work-copy", pcl.digest)
+  assert(cl.source == "work" and cl.name == "work-copy" and cl.cloned)
+
+  -- 3. Rename with trailing digest
+  local prn = bitty.profiles.preview_rename("work", "work-next", { force = true })
+  assert(prn.selector_updated)
+  local rn = bitty.profiles.rename("work", "work-next", { force = true }, prn.digest)
+  assert(rn.old_name == "work" and rn.new_name == "work-next" and rn.selector_updated and rn.reload == "auto")
+
+  -- 4. Delete with trailing digest
+  local pdl = bitty.profiles.preview_delete("work-next")
+  local dl = bitty.profiles.delete("work-next", pdl.digest)
+  assert(dl.name == "work-next" and dl.deleted and dl.backed_up)
+
+  return table.concat({ c.name, cl.name, rn.new_name, dl.name }, "|")
+end })
+
+bitty.commands.register({ id = "profile_refusals", title = "Profile refusals", run = function()
+  local pc = bitty.profiles.preview_create("once")
+  local first_ok = pcall(bitty.profiles.create, "once", pc.digest)
+  assert(first_ok, "first create succeeds")
+  local replay_code = errcode(function() return bitty.profiles.create("once", pc.digest) end)
+
+  local pc2 = bitty.profiles.preview_create("mismatch")
+  local mismatch_code = errcode(function()
+    return bitty.profiles.create("mismatch", { force = true }, pc2.digest)
+  end)
+
+  local no_digest = errcode(function() return bitty.profiles.create("nodigest") end)
+  local reserved_create = errcode(function() return bitty.profiles.preview_create("default") end)
+  local reserved_clone = errcode(function() return bitty.profiles.preview_clone("work", "default") end)
+  local reserved_rename = errcode(function() return bitty.profiles.preview_rename("default", "other") end)
+  local reserved_delete = errcode(function() return bitty.profiles.preview_delete("default") end)
+  local extended_delete = errcode(function() return bitty.profiles.preview_delete("extended") end)
+
+  -- Path traversal and invalid profile names must fail closed without leaking paths
+  for _, bad in ipairs({ "../evil", "../../etc/passwd", "a/b", "a\\b", "UpperCase", "-dash" }) do
+    local ok, err = pcall(bitty.profiles.preview_create, bad)
+    assert(not ok and err.code == "E_PROFILE_INVALID", "bad create name: " .. bad)
+    assert(not err.message:find("/", 1, true) and not err.message:find("\\", 1, true), "path leak: " .. err.message)
+  end
+  for _, bad in ipairs({ "../evil", "a/b", "a\\b" }) do
+    local ok, err = pcall(bitty.profiles.preview_delete, bad)
+    assert(not ok and err.code == "E_PROFILE_INVALID", "bad delete name: " .. bad)
+    assert(not err.message:find("/", 1, true) and not err.message:find("\\", 1, true), "path leak: " .. err.message)
+  end
+
+  return table.concat({
+    replay_code,
+    mismatch_code,
+    no_digest,
+    reserved_create,
+    reserved_clone,
+    reserved_rename,
+    reserved_delete,
+    extended_delete,
+  }, ",")
+end })
+
+bitty.commands.register({ id = "profile_cross_target", title = "Cross-target tokens", run = function()
+  -- A token is bound to its target: a clone digest cannot authorize a clone to
+  -- another destination, and a delete digest cannot authorize another name.
+  local pcl = bitty.profiles.preview_clone("work", "clone-a")
+  local cross_clone = errcode(function() return bitty.profiles.clone("work", "clone-b", pcl.digest) end)
+  local pdel = bitty.profiles.preview_delete("gone-a")
+  local cross_delete = errcode(function() return bitty.profiles.delete("gone-b", pdel.digest) end)
+  assert(cross_clone == "ERR:E_CONFIG_APPROVAL_REQUIRED", "cross clone: " .. cross_clone)
+  assert(cross_delete == "ERR:E_CONFIG_APPROVAL_REQUIRED", "cross delete: " .. cross_delete)
+  return "BOUND"
 end })
 
 bitty.commands.register({ id = "keys", title = "Bad keys", run = function()
@@ -462,6 +744,9 @@ const PROBE_COMMANDS: &[&str] = &[
     "use",
     "use_replay",
     "deny",
+    "profile_lifecycle",
+    "profile_refusals",
+    "profile_cross_target",
 ];
 
 /// Granted store package: a recorded grant is the only way a plugin receives
@@ -688,9 +973,33 @@ fn ungranted_generation_denies_every_new_verb() {
     assert_eq!(
         run(&mut rt, "deny"),
         "ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,\
-ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED"
+ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,\
+ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,\
+ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,\
+ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn profile_lifecycle_verbs_are_token_bound_and_refuse_invalid_or_reserved_targets() {
+    let (mut rt, _backend) = granted_runtime();
+    assert_eq!(
+        run(&mut rt, "profile_lifecycle"),
+        "fresh|work-copy|work-next|work-next"
+    );
+    assert_eq!(
+        run(&mut rt, "profile_refusals"),
+        "ERR:E_CONFIG_APPROVAL_REQUIRED,ERR:E_CONFIG_APPROVAL_REQUIRED,\
+ERR:E_CONFIG_APPROVAL_REQUIRED,ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT,\
+ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT"
+    );
+}
+
+#[test]
+fn profile_lifecycle_tokens_are_bound_to_their_exact_target() {
+    let (mut rt, _backend) = granted_runtime();
+    assert_eq!(run(&mut rt, "profile_cross_target"), "BOUND");
 }
 
 /// bitty#2972: a committed `config.manage` write is host I/O the plugin neither

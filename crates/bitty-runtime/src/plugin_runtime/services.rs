@@ -61,10 +61,13 @@ use super::config_write::{
     ConfigApplyOutcome, ConfigApprovalTarget, ConfigChange, ConfigManageToken,
     ConfigPreviewRendering, ConfigPreviewToken, ConfigReadValue, ConfigSetOutcome,
     ConfigSettingValue, ConfigSourceList, ConfigValueRow, ConfigWriteBackend, ConfigWriteGate,
-    PluginList, ProfileList, approval_digest, check_list_bounds, check_manage_rendering,
-    check_result_rows, config_backend_error, config_invalid_request, config_key_error,
-    config_limit_exceeded, config_read_error, config_unavailable, list_row_bytes,
-    manage_approval_digest, redact_config_value, writable_setting,
+    PluginList, ProfileCloneOptions, ProfileCloneOutcome, ProfileCreateOptions,
+    ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome, ProfileLifecycleRendering,
+    ProfileList, ProfileRenameOptions, ProfileRenameOutcome, ProfileWriteFailure, approval_digest,
+    check_list_bounds, check_manage_rendering, check_result_rows, config_backend_error,
+    config_invalid_request, config_key_error, config_limit_exceeded, config_read_error,
+    config_unavailable, list_row_bytes, manage_approval_digest, redact_config_value,
+    writable_setting,
 };
 use super::history::{
     HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
@@ -3627,6 +3630,280 @@ fn validate_manage_digest(digest: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Typed `E_PROFILE_USAGE` refusal for malformed profile lifecycle arguments.
+fn profile_usage_error(message: &str) -> BridgeError {
+    BridgeError::new("validation", "E_PROFILE_USAGE", message)
+}
+
+/// Typed `E_PROFILE_INVALID` refusal for invalid profile names or presets.
+fn profile_invalid_error(message: &str) -> BridgeError {
+    BridgeError::new("validation", "E_PROFILE_INVALID", message)
+}
+
+/// Typed `E_PROFILE_CONFLICT` refusal for reserved or conflicting profiles.
+fn profile_conflict_error(message: &str) -> BridgeError {
+    BridgeError::new("runtime", "E_PROFILE_CONFLICT", message)
+}
+
+/// Validate a new profile name (`[a-z0-9][a-z0-9_-]*`, `1..=64` bytes, no
+/// surrounding whitespace or path separators) without echoing unvalidated
+/// input.
+fn validate_new_profile_name(
+    raw: &LuaValue,
+    verb: &str,
+    role: &str,
+) -> Result<String, BridgeError> {
+    let LuaValue::String(name) = raw else {
+        return Err(profile_usage_error(&format!(
+            "profiles.{verb} {role} must be a profile name"
+        )));
+    };
+    if name.is_empty() {
+        return Err(profile_usage_error(&format!(
+            "profiles.{verb} requires a {role} profile name"
+        )));
+    }
+    if name.len() > 64 || name.trim() != name {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [a-z0-9][a-z0-9_-]*, no path separators)",
+        ));
+    }
+    let Ok(canonical) = bitty_config::file::validate_profile_name(name) else {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [a-z0-9][a-z0-9_-]*, no path separators)",
+        ));
+    };
+    let mut bytes = canonical.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [a-z0-9][a-z0-9_-]*, no path separators)",
+        ));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit())
+        || !bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [a-z0-9][a-z0-9_-]*, no path separators)",
+        ));
+    }
+    Ok(canonical.to_string())
+}
+
+/// Validate an existing profile name (`[A-Za-z0-9_-]{1,64}`, no surrounding
+/// whitespace or path separators) without echoing unvalidated input.
+fn validate_existing_profile_name(
+    raw: &LuaValue,
+    verb: &str,
+    role: &str,
+) -> Result<String, BridgeError> {
+    let LuaValue::String(name) = raw else {
+        return Err(profile_usage_error(&format!(
+            "profiles.{verb} {role} must be a profile name"
+        )));
+    };
+    if name.is_empty() {
+        return Err(profile_usage_error(&format!(
+            "profiles.{verb} requires a {role} profile name"
+        )));
+    }
+    if name.len() > 64 || name.trim() != name {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [A-Za-z0-9_-], no path separators)",
+        ));
+    }
+    let Ok(canonical) = bitty_config::file::validate_profile_name(name) else {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [A-Za-z0-9_-], no path separators)",
+        ));
+    };
+    if canonical != *name {
+        return Err(profile_invalid_error(
+            "invalid profile name (expected 1..64 bytes of [A-Za-z0-9_-], no path separators)",
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Split `(opts_or_digest, trailing_digest)` for profile lifecycle apply verbs.
+///
+/// Callers may pass:
+/// - `verb(name, digest)`
+/// - `verb(name, opts, digest)`
+/// - `verb(name, { ..., digest = digest })`
+///
+/// Calling `verb` without a digest fails closed with
+/// `E_CONFIG_APPROVAL_REQUIRED` after options are validated.
+#[allow(clippy::type_complexity)]
+fn split_profile_apply_args<'a>(
+    verb: &str,
+    opts_or_digest: Option<&'a LuaValue>,
+    trailing_digest: Option<&'a LuaValue>,
+) -> Result<(Option<&'a [(LuaValue, LuaValue)]>, Option<String>), BridgeError> {
+    match (opts_or_digest, trailing_digest) {
+        (None, None) => Ok((None, None)),
+        (None, Some(LuaValue::String(digest))) => Ok((None, Some(digest.clone()))),
+        (None, Some(_)) => Err(config_approval_mismatch()),
+        (Some(LuaValue::String(digest)), None) => Ok((None, Some(digest.clone()))),
+        (Some(LuaValue::String(_)), Some(_)) => Err(profile_usage_error(&format!(
+            "profiles.{verb} options must be a table when a trailing digest is given"
+        ))),
+        (Some(LuaValue::Table(entries)), trailing) => {
+            let mut embedded_digest: Option<String> = None;
+            for (k, v) in entries {
+                if matches!(k, LuaValue::String(key) if key == "digest") {
+                    match v {
+                        LuaValue::String(d) => embedded_digest = Some(d.clone()),
+                        LuaValue::Nil => {}
+                        _ => return Err(config_approval_mismatch()),
+                    }
+                }
+            }
+            let digest = match (embedded_digest, trailing) {
+                (Some(embedded), None) => Some(embedded),
+                (None, Some(LuaValue::String(trailing))) => Some(trailing.clone()),
+                (Some(embedded), Some(LuaValue::String(trailing))) => {
+                    if embedded != *trailing {
+                        return Err(config_approval_mismatch());
+                    }
+                    Some(embedded)
+                }
+                (_, Some(_)) => return Err(config_approval_mismatch()),
+                (None, None) => None,
+            };
+            Ok((Some(entries.as_slice()), digest))
+        }
+        (Some(_), None) => Err(config_approval_mismatch()),
+        (Some(_), Some(_)) => Err(profile_usage_error(&format!(
+            "profiles.{verb} options must be a table"
+        ))),
+    }
+}
+
+/// Parse options for `profiles.preview_create` and `profiles.create`.
+fn parse_profile_create_options(
+    target_name: &str,
+    entries: Option<&[(LuaValue, LuaValue)]>,
+    allow_digest_key: bool,
+) -> Result<ProfileCreateOptions, BridgeError> {
+    let mut opts = ProfileCreateOptions::default();
+    let Some(entries) = entries else {
+        return Ok(opts);
+    };
+    for (k, v) in entries {
+        let LuaValue::String(key) = k else {
+            return Err(profile_usage_error(
+                "profiles.create options keys must be strings",
+            ));
+        };
+        match key.as_str() {
+            "force" => match v {
+                LuaValue::Bool(flag) => opts.force = *flag,
+                LuaValue::Nil => {}
+                _ => {
+                    return Err(profile_usage_error(
+                        "profiles.create option 'force' must be a boolean",
+                    ));
+                }
+            },
+            "from" => match v {
+                LuaValue::String(_) => {
+                    let from = validate_existing_profile_name(v, "create", "from")?;
+                    if from == target_name {
+                        return Err(profile_invalid_error("cannot extend a profile from itself"));
+                    }
+                    opts.from = Some(from);
+                }
+                LuaValue::Nil => {}
+                _ => {
+                    return Err(profile_usage_error(
+                        "profiles.create option 'from' must be a profile name",
+                    ));
+                }
+            },
+            "preset" => match v {
+                LuaValue::String(preset) => {
+                    let normalized = preset.trim().to_ascii_lowercase();
+                    if !matches!(normalized.as_str(), "minimal" | "dark" | "light") {
+                        return Err(profile_invalid_error(
+                            "unknown preset (expected minimal, dark, or light)",
+                        ));
+                    }
+                    opts.preset = Some(normalized);
+                }
+                LuaValue::Nil => {}
+                _ => {
+                    return Err(profile_usage_error(
+                        "profiles.create option 'preset' must be a preset name",
+                    ));
+                }
+            },
+            "digest" if allow_digest_key => {}
+            _ => {
+                return Err(profile_usage_error(
+                    "profiles.create received an unknown option",
+                ));
+            }
+        }
+    }
+    if opts.from.is_some() && opts.preset.is_some() {
+        return Err(profile_usage_error(
+            "cannot combine 'from' and 'preset'; choose one starting point",
+        ));
+    }
+    Ok(opts)
+}
+
+/// Parse `{ force = bool }` options for `clone`, `rename`, and `delete`.
+fn parse_profile_force_option(
+    verb: &str,
+    entries: Option<&[(LuaValue, LuaValue)]>,
+    allow_digest_key: bool,
+) -> Result<bool, BridgeError> {
+    let Some(entries) = entries else {
+        return Ok(false);
+    };
+    let mut force = false;
+    for (k, v) in entries {
+        let LuaValue::String(key) = k else {
+            return Err(profile_usage_error(&format!(
+                "profiles.{verb} options keys must be strings"
+            )));
+        };
+        match key.as_str() {
+            "force" => match v {
+                LuaValue::Bool(flag) => force = *flag,
+                LuaValue::Nil => {}
+                _ => {
+                    return Err(profile_usage_error(&format!(
+                        "profiles.{verb} option 'force' must be a boolean"
+                    )));
+                }
+            },
+            "digest" if allow_digest_key => {}
+            _ => {
+                return Err(profile_usage_error(&format!(
+                    "profiles.{verb} received an unknown option"
+                )));
+            }
+        }
+    }
+    Ok(force)
+}
+
+/// Extract optional table entries for `preview_*` calls.
+fn extract_preview_opts<'a>(
+    verb: &str,
+    opts: Option<&'a LuaValue>,
+) -> Result<Option<&'a [(LuaValue, LuaValue)]>, BridgeError> {
+    match opts {
+        None | Some(LuaValue::Nil) => Ok(None),
+        Some(LuaValue::Table(entries)) => Ok(Some(entries.as_slice())),
+        Some(_) => Err(profile_usage_error(&format!(
+            "profiles.{verb} options must be a table"
+        ))),
+    }
+}
+
 /// Validate one bounded list string and reject path-shaped display data.
 fn validate_list_string(label: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
@@ -4035,11 +4312,14 @@ impl PluginServices {
                 ));
             }
         }
+        // The reply carries the same rows twice (`rows` plus the `profiles`
+        // alias), so charge the bytes actually sent rather than one copy.
         let bytes = list
             .rows
             .iter()
             .map(|row| list_row_bytes(&[&row.name]))
-            .sum();
+            .sum::<usize>()
+            .saturating_mul(2);
         check_list_bounds(list.rows.len(), bytes)?;
         self.config_charge_result_bytes(started, bytes)?;
         Ok(list)
@@ -4217,6 +4497,369 @@ impl PluginServices {
             Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
         )
     }
+
+    /// `bitty.profiles.preview_create`: render one profile-create candidate
+    /// and issue its approval token (CTX-1749).
+    fn profiles_preview_create(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<(String, ProfileLifecycleRendering), BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let name = validate_new_profile_name(name, "preview_create", "target")?;
+        if name == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of creating profiles default",
+            ));
+        }
+        let entries = extract_preview_opts("preview_create", opts)?;
+        let options = parse_profile_create_options(&name, entries, false)?;
+        self.config_charge(started, name.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_profile_create(&self.plugin_id, &name, &options)
+            .map_err(ProfileWriteFailure::into_bridge_error)?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::ProfileCreate { name, options };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate.borrow_mut().issue(
+            digest.clone(),
+            target,
+            rendering.candidate_digest.clone(),
+        );
+        Ok((digest, rendering))
+    }
+
+    /// `bitty.profiles.create`: apply one approved profile creation (CTX-1749).
+    fn profiles_create_with_expiry(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        trailing_digest: Option<&LuaValue>,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<ProfileCreateOutcome, BridgeError> {
+        self.config_authorize()?;
+        let name = validate_new_profile_name(name, "create", "target")?;
+        if name == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of creating profiles default",
+            ));
+        }
+        let (entries, digest) =
+            split_profile_apply_args("create", opts_or_digest, trailing_digest)?;
+        let options = parse_profile_create_options(&name, entries, true)?;
+        let Some(digest) = digest else {
+            return Err(config_approval_required("profiles.create"));
+        };
+        validate_manage_digest(&digest)?;
+        self.config_charge(started, name.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::ProfileCreate {
+            name: name.clone(),
+            options: options.clone(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(&digest, &target) else {
+            return Err(config_approval_required("profiles.create"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        backend
+            .apply_profile_create(&self.plugin_id, &name, &options, &candidate_digest)
+            .map_err(ProfileWriteFailure::into_bridge_error)
+    }
+
+    /// `bitty.profiles.preview_clone`: render one profile-clone candidate and
+    /// issue its approval token (CTX-1749).
+    fn profiles_preview_clone(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<(String, ProfileLifecycleRendering), BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let src = validate_existing_profile_name(src, "preview_clone", "source")?;
+        let dst = validate_new_profile_name(dst, "preview_clone", "destination")?;
+        if dst == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of cloning onto 'default'",
+            ));
+        }
+        if src == dst {
+            return Err(profile_invalid_error(
+                "source and destination profile names are identical",
+            ));
+        }
+        let entries = extract_preview_opts("preview_clone", opts)?;
+        let force = parse_profile_force_option("preview_clone", entries, false)?;
+        let options = ProfileCloneOptions { force };
+        self.config_charge(started, src.len() + dst.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_profile_clone(&self.plugin_id, &src, &dst, &options)
+            .map_err(ProfileWriteFailure::into_bridge_error)?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::ProfileClone { src, dst, options };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate.borrow_mut().issue(
+            digest.clone(),
+            target,
+            rendering.candidate_digest.clone(),
+        );
+        Ok((digest, rendering))
+    }
+
+    /// `bitty.profiles.clone`: apply one approved profile clone (CTX-1749).
+    fn profiles_clone_with_expiry(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        trailing_digest: Option<&LuaValue>,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<ProfileCloneOutcome, BridgeError> {
+        self.config_authorize()?;
+        let src = validate_existing_profile_name(src, "clone", "source")?;
+        let dst = validate_new_profile_name(dst, "clone", "destination")?;
+        if dst == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of cloning onto 'default'",
+            ));
+        }
+        if src == dst {
+            return Err(profile_invalid_error(
+                "source and destination profile names are identical",
+            ));
+        }
+        let (entries, digest) = split_profile_apply_args("clone", opts_or_digest, trailing_digest)?;
+        let force = parse_profile_force_option("clone", entries, true)?;
+        let options = ProfileCloneOptions { force };
+        let Some(digest) = digest else {
+            return Err(config_approval_required("profiles.clone"));
+        };
+        validate_manage_digest(&digest)?;
+        self.config_charge(started, src.len() + dst.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::ProfileClone {
+            src: src.clone(),
+            dst: dst.clone(),
+            options: options.clone(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(&digest, &target) else {
+            return Err(config_approval_required("profiles.clone"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        backend
+            .apply_profile_clone(&self.plugin_id, &src, &dst, &options, &candidate_digest)
+            .map_err(ProfileWriteFailure::into_bridge_error)
+    }
+
+    /// `bitty.profiles.preview_rename`: render one profile-rename candidate
+    /// and issue its approval token (CTX-1749).
+    fn profiles_preview_rename(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<(String, ProfileLifecycleRendering), BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let old = validate_existing_profile_name(old, "preview_rename", "source")?;
+        let new = validate_new_profile_name(new, "preview_rename", "destination")?;
+        if old == "default" || new == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the reserved implicit base profile and cannot be renamed",
+            ));
+        }
+        if old == new {
+            return Err(profile_invalid_error(
+                "old and new profile names are identical",
+            ));
+        }
+        let entries = extract_preview_opts("preview_rename", opts)?;
+        let force = parse_profile_force_option("preview_rename", entries, false)?;
+        let options = ProfileRenameOptions { force };
+        self.config_charge(started, old.len() + new.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_profile_rename(&self.plugin_id, &old, &new, &options)
+            .map_err(ProfileWriteFailure::into_bridge_error)?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::ProfileRename { old, new, options };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate.borrow_mut().issue(
+            digest.clone(),
+            target,
+            rendering.candidate_digest.clone(),
+        );
+        Ok((digest, rendering))
+    }
+
+    /// `bitty.profiles.rename`: apply one approved profile rename (CTX-1749).
+    fn profiles_rename_with_expiry(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        trailing_digest: Option<&LuaValue>,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<ProfileRenameOutcome, BridgeError> {
+        self.config_authorize()?;
+        let old = validate_existing_profile_name(old, "rename", "source")?;
+        let new = validate_new_profile_name(new, "rename", "destination")?;
+        if old == "default" || new == "default" {
+            return Err(profile_conflict_error(
+                "'default' is the reserved implicit base profile and cannot be renamed",
+            ));
+        }
+        if old == new {
+            return Err(profile_invalid_error(
+                "old and new profile names are identical",
+            ));
+        }
+        let (entries, digest) =
+            split_profile_apply_args("rename", opts_or_digest, trailing_digest)?;
+        let force = parse_profile_force_option("rename", entries, true)?;
+        let options = ProfileRenameOptions { force };
+        let Some(digest) = digest else {
+            return Err(config_approval_required("profiles.rename"));
+        };
+        validate_manage_digest(&digest)?;
+        self.config_charge(started, old.len() + new.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::ProfileRename {
+            old: old.clone(),
+            new: new.clone(),
+            options: options.clone(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(&digest, &target) else {
+            return Err(config_approval_required("profiles.rename"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        backend
+            .apply_profile_rename(&self.plugin_id, &old, &new, &options, &candidate_digest)
+            .map_err(ProfileWriteFailure::into_bridge_error)
+    }
+
+    /// `bitty.profiles.preview_delete`: render one profile-delete candidate
+    /// and issue its approval token (CTX-1749).
+    fn profiles_preview_delete(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<(String, ProfileLifecycleRendering), BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let name = validate_existing_profile_name(name, "preview_delete", "target")?;
+        let entries = extract_preview_opts("preview_delete", opts)?;
+        let force = parse_profile_force_option("preview_delete", entries, false)?;
+        if name == "default" && !force {
+            return Err(profile_conflict_error(
+                "'default' is the reserved implicit base profile; pass force = true to remove default.lua",
+            ));
+        }
+        let options = ProfileDeleteOptions { force };
+        self.config_charge(started, name.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_profile_delete(&self.plugin_id, &name, &options)
+            .map_err(ProfileWriteFailure::into_bridge_error)?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::ProfileDelete { name, options };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate.borrow_mut().issue(
+            digest.clone(),
+            target,
+            rendering.candidate_digest.clone(),
+        );
+        Ok((digest, rendering))
+    }
+
+    /// `bitty.profiles.delete`: apply one approved profile deletion (CTX-1749).
+    fn profiles_delete_with_expiry(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        trailing_digest: Option<&LuaValue>,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<ProfileDeleteOutcome, BridgeError> {
+        self.config_authorize()?;
+        let name = validate_existing_profile_name(name, "delete", "target")?;
+        let (entries, digest) =
+            split_profile_apply_args("delete", opts_or_digest, trailing_digest)?;
+        let force = parse_profile_force_option("delete", entries, true)?;
+        if name == "default" && !force {
+            return Err(profile_conflict_error(
+                "'default' is the reserved implicit base profile; pass force = true to remove default.lua",
+            ));
+        }
+        let options = ProfileDeleteOptions { force };
+        let Some(digest) = digest else {
+            return Err(config_approval_required("profiles.delete"));
+        };
+        validate_manage_digest(&digest)?;
+        self.config_charge(started, name.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::ProfileDelete {
+            name: name.clone(),
+            options: options.clone(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(&digest, &target) else {
+            return Err(config_approval_required("profiles.delete"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        backend
+            .apply_profile_delete(&self.plugin_id, &name, &options, &candidate_digest)
+            .map_err(ProfileWriteFailure::into_bridge_error)
+    }
 }
 
 /// Wire shape for one `config.get` row.
@@ -4290,21 +4933,19 @@ fn plugin_list_value(list: &PluginList) -> LuaValue {
 
 /// Wire shape for one `profiles.list` result.
 fn profile_list_value(list: &ProfileList) -> LuaValue {
+    let rows: Vec<LuaValue> = list
+        .rows
+        .iter()
+        .map(|row| {
+            LuaValue::table([
+                ("name", LuaValue::String(row.name.clone())),
+                ("active", LuaValue::Bool(row.active)),
+            ])
+        })
+        .collect();
     LuaValue::table([
-        (
-            "rows",
-            LuaValue::array(
-                list.rows
-                    .iter()
-                    .map(|row| {
-                        LuaValue::table([
-                            ("name", LuaValue::String(row.name.clone())),
-                            ("active", LuaValue::Bool(row.active)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
+        ("rows", LuaValue::array(rows.clone())),
+        ("profiles", LuaValue::array(rows)),
         (
             "active",
             list.active
@@ -4313,6 +4954,107 @@ fn profile_list_value(list: &ProfileList) -> LuaValue {
         ),
         ("count", LuaValue::Integer(list.rows.len() as i64)),
         ("truncated", LuaValue::Bool(list.truncated)),
+    ])
+}
+
+/// Wire shape for one `profiles.preview_create|clone|rename|delete` result.
+fn profile_lifecycle_preview_value(
+    digest: String,
+    rendering: ProfileLifecycleRendering,
+) -> LuaValue {
+    LuaValue::table([
+        ("digest", LuaValue::String(digest)),
+        ("rendered", LuaValue::String(rendering.rendered)),
+        ("changed", LuaValue::Bool(rendering.changed)),
+        (
+            "changed_keys",
+            LuaValue::array(
+                rendering
+                    .changed_keys
+                    .into_iter()
+                    .map(LuaValue::String)
+                    .collect(),
+            ),
+        ),
+        (
+            "replaces_existing",
+            LuaValue::Bool(rendering.replaces_existing),
+        ),
+        (
+            "selector_updated",
+            LuaValue::Bool(rendering.selector_updated),
+        ),
+        ("active", LuaValue::Bool(rendering.active)),
+    ])
+}
+
+/// Wire shape for one `profiles.create` result.
+fn profile_create_outcome_value(outcome: ProfileCreateOutcome) -> LuaValue {
+    LuaValue::table([
+        ("name", LuaValue::String(outcome.name)),
+        ("created", LuaValue::Bool(true)),
+        ("changed", LuaValue::Bool(true)),
+        ("replaced", LuaValue::Bool(outcome.replaced)),
+        ("backed_up", LuaValue::Bool(outcome.backed_up)),
+        (
+            "extends",
+            outcome.extends.map_or(LuaValue::Nil, LuaValue::String),
+        ),
+        (
+            "preset",
+            outcome.preset.map_or(LuaValue::Nil, LuaValue::String),
+        ),
+        ("reload", LuaValue::String("none".to_string())),
+    ])
+}
+
+/// Wire shape for one `profiles.clone` result.
+fn profile_clone_outcome_value(outcome: ProfileCloneOutcome) -> LuaValue {
+    LuaValue::table([
+        ("source", LuaValue::String(outcome.source)),
+        ("name", LuaValue::String(outcome.target.clone())),
+        ("target", LuaValue::String(outcome.target)),
+        ("cloned", LuaValue::Bool(true)),
+        ("changed", LuaValue::Bool(true)),
+        ("replaced", LuaValue::Bool(outcome.replaced)),
+        ("backed_up", LuaValue::Bool(outcome.backed_up)),
+        (
+            "extends",
+            outcome.extends.map_or(LuaValue::Nil, LuaValue::String),
+        ),
+        ("reload", LuaValue::String("none".to_string())),
+    ])
+}
+
+/// Wire shape for one `profiles.rename` result.
+fn profile_rename_outcome_value(outcome: ProfileRenameOutcome) -> LuaValue {
+    let reload = if outcome.selector_updated {
+        "auto"
+    } else {
+        "none"
+    };
+    LuaValue::table([
+        ("old_name", LuaValue::String(outcome.old_name)),
+        ("new_name", LuaValue::String(outcome.new_name.clone())),
+        ("name", LuaValue::String(outcome.new_name)),
+        ("renamed", LuaValue::Bool(true)),
+        ("changed", LuaValue::Bool(true)),
+        ("replaced", LuaValue::Bool(outcome.replaced)),
+        ("backed_up", LuaValue::Bool(outcome.backed_up)),
+        ("selector_updated", LuaValue::Bool(outcome.selector_updated)),
+        ("reload", LuaValue::String(reload.to_string())),
+    ])
+}
+
+/// Wire shape for one `profiles.delete` result.
+fn profile_delete_outcome_value(outcome: ProfileDeleteOutcome) -> LuaValue {
+    LuaValue::table([
+        ("name", LuaValue::String(outcome.name)),
+        ("deleted", LuaValue::Bool(true)),
+        ("changed", LuaValue::Bool(true)),
+        ("backed_up", LuaValue::Bool(outcome.backed_up)),
+        ("was_active", LuaValue::Bool(outcome.was_active)),
+        ("reload", LuaValue::String("none".to_string())),
     ])
 }
 
@@ -4456,6 +5198,120 @@ impl HostServices for PluginServices {
         // bitty#2814: `pending_restart` comes from the backend's live diff, so
         // a no-op switch and a live-only switch both report `false`.
         PluginServices::profiles_use_with_expiry(self, name, digest, Instant::now(), expiry)
+    }
+
+    fn profiles_preview_create(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let (digest, rendering) = PluginServices::profiles_preview_create(self, name, opts)?;
+        Ok(profile_lifecycle_preview_value(digest, rendering))
+    }
+
+    fn profiles_create(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let outcome = PluginServices::profiles_create_with_expiry(
+            self,
+            name,
+            opts_or_digest,
+            digest,
+            Instant::now(),
+            expiry,
+        )?;
+        Ok((true, profile_create_outcome_value(outcome)))
+    }
+
+    fn profiles_preview_clone(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let (digest, rendering) = PluginServices::profiles_preview_clone(self, src, dst, opts)?;
+        Ok(profile_lifecycle_preview_value(digest, rendering))
+    }
+
+    fn profiles_clone(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let outcome = PluginServices::profiles_clone_with_expiry(
+            self,
+            src,
+            dst,
+            opts_or_digest,
+            digest,
+            Instant::now(),
+            expiry,
+        )?;
+        Ok((true, profile_clone_outcome_value(outcome)))
+    }
+
+    fn profiles_preview_rename(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let (digest, rendering) = PluginServices::profiles_preview_rename(self, old, new, opts)?;
+        Ok(profile_lifecycle_preview_value(digest, rendering))
+    }
+
+    fn profiles_rename(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let outcome = PluginServices::profiles_rename_with_expiry(
+            self,
+            old,
+            new,
+            opts_or_digest,
+            digest,
+            Instant::now(),
+            expiry,
+        )?;
+        Ok((true, profile_rename_outcome_value(outcome)))
+    }
+
+    fn profiles_preview_delete(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let (digest, rendering) = PluginServices::profiles_preview_delete(self, name, opts)?;
+        Ok(profile_lifecycle_preview_value(digest, rendering))
+    }
+
+    fn profiles_delete(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let outcome = PluginServices::profiles_delete_with_expiry(
+            self,
+            name,
+            opts_or_digest,
+            digest,
+            Instant::now(),
+            expiry,
+        )?;
+        Ok((true, profile_delete_outcome_value(outcome)))
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {

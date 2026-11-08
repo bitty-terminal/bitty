@@ -1386,6 +1386,104 @@ pub trait HostServices {
         let _ = (name, digest, expiry);
         Err(BridgeError::not_implemented("bitty.profiles.use"))
     }
+    /// Render one profile-create candidate for `bitty.profiles.preview_create`
+    /// (CTX-1749).
+    fn profiles_preview_create(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (name, opts);
+        Err(BridgeError::not_implemented(
+            "bitty.profiles.preview_create",
+        ))
+    }
+    /// Apply one approved profile creation for `bitty.profiles.create`
+    /// (CTX-1749).
+    fn profiles_create(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let _ = (name, opts_or_digest, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.profiles.create"))
+    }
+    /// Render one profile-clone candidate for `bitty.profiles.preview_clone`
+    /// (CTX-1749).
+    fn profiles_preview_clone(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (src, dst, opts);
+        Err(BridgeError::not_implemented("bitty.profiles.preview_clone"))
+    }
+    /// Apply one approved profile clone for `bitty.profiles.clone`
+    /// (CTX-1749).
+    fn profiles_clone(
+        &self,
+        src: &LuaValue,
+        dst: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let _ = (src, dst, opts_or_digest, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.profiles.clone"))
+    }
+    /// Render one profile-rename candidate for `bitty.profiles.preview_rename`
+    /// (CTX-1749).
+    fn profiles_preview_rename(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (old, new, opts);
+        Err(BridgeError::not_implemented(
+            "bitty.profiles.preview_rename",
+        ))
+    }
+    /// Apply one approved profile rename for `bitty.profiles.rename`
+    /// (CTX-1749).
+    fn profiles_rename(
+        &self,
+        old: &LuaValue,
+        new: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let _ = (old, new, opts_or_digest, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.profiles.rename"))
+    }
+    /// Render one profile-delete candidate for `bitty.profiles.preview_delete`
+    /// (CTX-1749).
+    fn profiles_preview_delete(
+        &self,
+        name: &LuaValue,
+        opts: Option<&LuaValue>,
+    ) -> Result<LuaValue, BridgeError> {
+        let _ = (name, opts);
+        Err(BridgeError::not_implemented(
+            "bitty.profiles.preview_delete",
+        ))
+    }
+    /// Apply one approved profile deletion for `bitty.profiles.delete`
+    /// (CTX-1749).
+    fn profiles_delete(
+        &self,
+        name: &LuaValue,
+        opts_or_digest: Option<&LuaValue>,
+        digest: Option<&LuaValue>,
+        expiry: Instant,
+    ) -> Result<(bool, LuaValue), BridgeError> {
+        let _ = (name, opts_or_digest, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.profiles.delete"))
+    }
     /// Read one host environment variable for `bitty.env.get` (CTX-0330).
     ///
     /// Host-mediated and grant-gated: the implementation must return
@@ -7455,6 +7553,348 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("profiles table accepts 'use'");
+    profiles
+        .set(
+            ctx,
+            "preview_create",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.preview_create takes at most two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let opts = match stack.get(1) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let preview = state
+                        .services
+                        .profiles_preview_create(&name, opts.as_ref())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, preview.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'preview_create'");
+    profiles
+        .set(
+            ctx,
+            "create",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.create takes at most three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let second = match stack.get(1) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let third = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.profiles_create(
+                            &name,
+                            second.as_ref(),
+                            third.as_ref(),
+                            expiry,
+                        )
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (_wrote, table) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, table.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'create'");
+    profiles
+        .set(
+            ctx,
+            "preview_clone",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.preview_clone takes at most three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let src = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let dst = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let opts = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let preview = state
+                        .services
+                        .profiles_preview_clone(&src, &dst, opts.as_ref())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, preview.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'preview_clone'");
+    profiles
+        .set(
+            ctx,
+            "clone",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(4), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.clone takes at most four arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let src = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let dst = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let third = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let fourth = match stack.get(3) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.profiles_clone(
+                            &src,
+                            &dst,
+                            third.as_ref(),
+                            fourth.as_ref(),
+                            expiry,
+                        )
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (_wrote, table) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, table.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'clone'");
+    profiles
+        .set(
+            ctx,
+            "preview_rename",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.preview_rename takes at most three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let old = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let new = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let opts = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let preview = state
+                        .services
+                        .profiles_preview_rename(&old, &new, opts.as_ref())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, preview.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'preview_rename'");
+    profiles
+        .set(
+            ctx,
+            "rename",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(4), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.rename takes at most four arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let old = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let new = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let third = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let fourth = match stack.get(3) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.profiles_rename(
+                            &old,
+                            &new,
+                            third.as_ref(),
+                            fourth.as_ref(),
+                            expiry,
+                        )
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (_wrote, table) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, table.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'rename'");
+    profiles
+        .set(
+            ctx,
+            "preview_delete",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.preview_delete takes at most two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let opts = match stack.get(1) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let preview = state
+                        .services
+                        .profiles_preview_delete(&name, opts.as_ref())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, preview.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'preview_delete'");
+    profiles
+        .set(
+            ctx,
+            "delete",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.delete takes at most three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = LuaValue::from_lua(stack.get(0), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let second = match stack.get(1) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let third = match stack.get(2) {
+                        Value::Nil => None,
+                        raw => Some(
+                            LuaValue::from_lua(raw, state.limits)
+                                .map_err(|error| error.to_error(ctx))?,
+                        ),
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.profiles_delete(
+                            &name,
+                            second.as_ref(),
+                            third.as_ref(),
+                            expiry,
+                        )
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (_wrote, table) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, table.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'delete'");
+    let profiles_ro = readonly_table(ctx, profiles);
+    config
+        .set(ctx, "profiles", profiles_ro)
+        .expect("config table accepts 'profiles'");
 
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
@@ -7512,7 +7952,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts config");
     root.set(ctx, "plugins", readonly_table(ctx, plugins))
         .expect("root accepts plugins");
-    root.set(ctx, "profiles", readonly_table(ctx, profiles))
+    root.set(ctx, "profiles", profiles_ro)
         .expect("root accepts profiles");
     root.set(ctx, "component", readonly_table(ctx, component))
         .expect("root accepts component");

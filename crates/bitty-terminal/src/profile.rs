@@ -1126,6 +1126,7 @@ fn run_create(
         return Ok(Reply::new(text, result));
     }
     if existing {
+        let _backup = backup_profile_file("create", &path)?;
         write_profile_atomic(&path, &content, None).map_err(|err| match err {
             ProfileWriteError::Changed => changed_failure(ReadIntent::Edit, &path),
             ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Edit, &path),
@@ -1389,7 +1390,14 @@ fn run_rename(
                 backup = selector_backup;
                 selector_updated = true;
             }
-            Err(failure) => return Err(rollback_rename(&old_path, &new_path, failure)),
+            Err(failure) => {
+                return Err(rollback_rename(
+                    &old_path,
+                    &new_path,
+                    destination_backup.as_deref(),
+                    failure,
+                ));
+            }
         }
     }
     let text = format!(
@@ -1421,10 +1429,21 @@ fn run_rename(
 ///
 /// The profile bytes always live at one of the two names; a failed rollback
 /// reports where the fragment was preserved rather than pretending the
-/// command succeeded.
-fn rollback_rename(old_path: &Path, new_path: &Path, failure: Failure) -> Failure {
+/// command succeeded. When a forced rename had removed an existing destination
+/// after backing it up, the backup is restored to `new_path` so neither the
+/// source nor the replaced destination is lost.
+fn rollback_rename(
+    old_path: &Path,
+    new_path: &Path,
+    destination_backup: Option<&Path>,
+    failure: Failure,
+) -> Failure {
     match commit_profile_rename(new_path, old_path) {
         Ok(()) => {
+            if let Some(backup) = destination_backup {
+                let _ = std::fs::copy(backup, new_path);
+                sync_parent_dir(new_path);
+            }
             sync_parent_dir(old_path);
             failure
         }
@@ -2213,15 +2232,25 @@ fn prepare_selector_rename(
     let Some(selector) = selector_path(args) else {
         return Ok(None);
     };
-    if !selector.exists() || selector_profile_from_path(&selector).as_deref() != Some(old) {
+    let metadata = match std::fs::symlink_metadata(&selector) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(Failure::io(format!(
+                "bitty config profile rename: cannot inspect '{}': {err}",
+                selector.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Failure::invalid(format!(
+            "bitty config profile rename: selector '{}' is not a regular file",
+            selector.display()
+        )));
+    }
+    if selector_profile_from_path(&selector).as_deref() != Some(old) {
         return Ok(None);
     }
-    let metadata = std::fs::metadata(&selector).map_err(|err| {
-        Failure::io(format!(
-            "bitty config profile rename: cannot inspect '{}': {err}",
-            selector.display()
-        ))
-    })?;
     if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
         return Err(Failure::invalid(format!(
             "bitty config profile rename: '{}' exceeds {} bytes; refusing to rewrite it",
@@ -2314,7 +2343,8 @@ fn apply_selector_rename(
 /// Shared by the CLI and the `config.manage` profile backend so both read the
 /// persisted selection through the same strict loader.
 pub(crate) fn selector_profile_from_path(path: &Path) -> Option<String> {
-    if !path.exists() {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
     }
     let layer = bitty_config::file::load_user_layer(path).ok()?;
@@ -5380,6 +5410,1118 @@ fn create_user_config_exclusive(path: &Path, content: &str) -> std::io::Result<(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Plugin runtime profile lifecycle backend (`config.manage`, CTX-1749)
+// ---------------------------------------------------------------------------
+
+use bitty_runtime::plugin_runtime::{
+    ProfileCloneOptions, ProfileCloneOutcome, ProfileCreateOptions, ProfileCreateOutcome,
+    ProfileDeleteOptions, ProfileDeleteOutcome, ProfileFailureKind, ProfileLifecycleRendering,
+    ProfileRenameOptions, ProfileRenameOutcome, ProfileWriteFailure,
+};
+
+/// Build a `ProfileWriteFailure` with a guaranteed path-free message.
+fn plugin_profile_failure(
+    kind: ProfileFailureKind,
+    message: impl Into<String>,
+) -> ProfileWriteFailure {
+    ProfileWriteFailure::new(kind, message)
+}
+
+/// Validate a new profile name (`[a-z0-9][a-z0-9_-]*`, `1..=64` bytes) for
+/// the plugin surface without echoing unvalidated input.
+fn plugin_valid_new_name(raw: &str) -> Result<String, ProfileWriteFailure> {
+    if raw.is_empty() || raw.len() > 64 || raw.trim() != raw {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid new profile name: expected 1..64 bytes of [a-z0-9][a-z0-9_-]*",
+        ));
+    }
+    let Ok(name) = bitty_config::file::validate_profile_name(raw) else {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid new profile name: expected 1..64 bytes of [a-z0-9][a-z0-9_-]*",
+        ));
+    };
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit());
+    let rest_ok =
+        chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-');
+    if !first_ok || !rest_ok {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid new profile name: expected 1..64 bytes of [a-z0-9][a-z0-9_-]*",
+        ));
+    }
+    Ok(name)
+}
+
+/// Validate an existing profile name (`[A-Za-z0-9_-]{1,64}`) for the plugin
+/// surface without echoing unvalidated input.
+fn plugin_valid_existing_name(raw: &str) -> Result<String, ProfileWriteFailure> {
+    if raw.is_empty() || raw.len() > 64 || raw.trim() != raw {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid profile name: expected 1..64 bytes of [A-Za-z0-9_-]",
+        ));
+    }
+    let Ok(name) = bitty_config::file::validate_profile_name(raw) else {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid profile name: expected 1..64 bytes of [A-Za-z0-9_-]",
+        ));
+    };
+    if name != raw {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "invalid profile name: expected 1..64 bytes of [A-Za-z0-9_-]",
+        ));
+    }
+    Ok(name)
+}
+
+/// Inspect whether `<dir>/<name>.lua` exists as a regular file, refusing
+/// symlinks and special files with a path-free message.
+fn plugin_profile_exists(name: &str, path: &Path) -> Result<bool, ProfileWriteFailure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("refusing to follow symlink for profile '{name}'"),
+        )),
+        Ok(meta) if !meta.is_file() => Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' is not a regular file"),
+        )),
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(plugin_profile_failure(
+            ProfileFailureKind::Io,
+            format!("cannot inspect profile '{name}'"),
+        )),
+    }
+}
+
+/// Read an existing profile's bytes and identity for the plugin lifecycle
+/// path, returning path-free errors.
+fn plugin_read_existing_profile(
+    name: &str,
+    path: &Path,
+) -> Result<(String, ProfileIdentity), ProfileWriteFailure> {
+    if !plugin_profile_exists(name, path)? {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::NotFound,
+            format!("profile '{name}' not found"),
+        ));
+    }
+    read_profile(ReadIntent::Copy, name, path).map_err(|failure| match failure.code {
+        "E_PROFILE_NOT_FOUND" => plugin_profile_failure(
+            ProfileFailureKind::NotFound,
+            format!("profile '{name}' not found"),
+        ),
+        "E_PROFILE_CONFLICT" => plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("profile '{name}' changed concurrently"),
+        ),
+        "E_PROFILE_IO" => plugin_profile_failure(
+            ProfileFailureKind::Io,
+            format!("cannot read profile '{name}'"),
+        ),
+        _ => plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' is invalid"),
+        ),
+    })
+}
+
+/// Render a bounded diff for profile lifecycle previews.
+///
+/// Uses `bounded_line_diff` directly when the full diff fits within
+/// `CONFIG_PREVIEW_MAX_LINES` and `CONFIG_PREVIEW_MAX_RENDERED_BYTES`. When a
+/// documented preset (`dark`/`light`) or a heavily commented profile exceeds
+/// the 128-line visual cap because of `--` comment headers, comment-only lines
+/// are stripped from the visual preview while `candidate_digest` always binds
+/// the complete, unstripped file bytes.
+fn profile_lifecycle_diff(previous: &str, updated: &str) -> String {
+    use bitty_runtime::plugin_runtime::{
+        CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
+    };
+    if let Ok(diff) = bounded_line_diff(previous, updated) {
+        return diff;
+    }
+    let strip_comments = |text: &str| -> String {
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("--")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let prev_code = strip_comments(previous);
+    let next_code = strip_comments(updated);
+    if let Ok(diff) = bounded_line_diff(&prev_code, &next_code) {
+        return diff;
+    }
+    let mut rendered = String::new();
+    let mut lines = 0usize;
+    for line in prev_code.lines() {
+        if lines + 1 >= CONFIG_PREVIEW_MAX_LINES {
+            break;
+        }
+        let entry = format!("-{line}\n");
+        if rendered.len() + entry.len() + 32 > CONFIG_PREVIEW_MAX_RENDERED_BYTES {
+            break;
+        }
+        rendered.push_str(&entry);
+        lines += 1;
+    }
+    for line in next_code.lines() {
+        if lines + 1 >= CONFIG_PREVIEW_MAX_LINES {
+            break;
+        }
+        let entry = format!("+{line}\n");
+        if rendered.len() + entry.len() + 32 > CONFIG_PREVIEW_MAX_RENDERED_BYTES {
+            break;
+        }
+        rendered.push_str(&entry);
+        lines += 1;
+    }
+    rendered.trim_end_matches('\n').to_string()
+}
+
+/// Load the user layer at `selector_path` (if present) for cross-layer
+/// profile validation without reading host env vars.
+fn load_user_layer_for_plugin(
+    selector_path: &Path,
+) -> Result<Option<bitty_config::LayeredPlan>, ProfileWriteFailure> {
+    let meta = match std::fs::symlink_metadata(selector_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Io,
+                "cannot inspect the user configuration layer",
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "the user configuration layer is not a regular file",
+        ));
+    }
+    bitty_config::file::load_user_layer(selector_path)
+        .map(Some)
+        .map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                "the user configuration layer is invalid",
+            )
+        })
+}
+
+/// Validate a profile `chain` merged under the user layer at `selector_path`.
+fn validate_chain_with_selector(
+    name: &str,
+    selector_path: &Path,
+    chain: Vec<bitty_config::LayeredPlan>,
+) -> Result<(), ProfileWriteFailure> {
+    let user = load_user_layer_for_plugin(selector_path)?;
+    let merged = bitty_config::file::resolve_effective_with_profiles(
+        user,
+        chain,
+        &bitty_config::file::CliOverrides::default(),
+    )
+    .map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' fails validation when merged with the user configuration"),
+        )
+    })?;
+    let mut effective = merged.effective;
+    bitty_config::local_theme::apply_selection(&mut effective).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' has an invalid theme selection"),
+        )
+    })?;
+    bitty_config::keymap::resolve_keymaps(&effective).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' has invalid keymap bindings"),
+        )
+    })?;
+    let runtime = crate::config_cli::runtime_config_from_effective_for(
+        &effective,
+        crate::config_cli::startup_prefer_light(),
+    )
+    .map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' exceeds runtime configuration bounds"),
+        )
+    })?;
+    bitty_runtime::validate_background_images(&runtime).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{name}' has an invalid background image configuration"),
+        )
+    })?;
+    Ok(())
+}
+
+/// Prepared `profiles.create` candidate.
+struct PreparedProfileCreate {
+    name: String,
+    path: PathBuf,
+    content: String,
+    existing_identity: Option<ProfileIdentity>,
+    replaces_existing: bool,
+    extends: Option<String>,
+    preset: Option<String>,
+    rendering: ProfileLifecycleRendering,
+}
+
+fn prepare_profile_create_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    raw_name: &str,
+    options: &ProfileCreateOptions,
+) -> Result<PreparedProfileCreate, ProfileWriteFailure> {
+    let name = plugin_valid_new_name(raw_name)?;
+    if name == "default" {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of creating profiles default",
+        ));
+    }
+    if options.from.is_some() && options.preset.is_some() {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Usage,
+            "cannot combine 'from' and 'preset'; choose one starting point",
+        ));
+    }
+    let path = profile_path(dir, &name);
+    let existing = plugin_profile_exists(&name, &path)?;
+    if existing && !options.force {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("profile '{name}' already exists; pass force = true to replace it"),
+        ));
+    }
+    let (previous, existing_identity) = if existing {
+        let (bytes, id) = plugin_read_existing_profile(&name, &path)?;
+        (bytes, Some(id))
+    } else {
+        (String::new(), None)
+    };
+
+    let (content, extends, preset) = if let Some(from_raw) = options.from.as_deref() {
+        let from = plugin_valid_existing_name(from_raw)?;
+        if from == name {
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                "cannot extend a profile from itself",
+            ));
+        }
+        let from_path = profile_path(dir, &from);
+        let (src_content, _src_identity) = plugin_read_existing_profile(&from, &from_path)?;
+        let source =
+            clone_source_from_content(dir, &from, &from_path, src_content).map_err(|_| {
+                plugin_profile_failure(
+                    ProfileFailureKind::Invalid,
+                    format!("base profile '{from}' is invalid"),
+                )
+            })?;
+        // The created body is the source copied verbatim, so the `extends`
+        // it records is the source's own parent, never the source name.
+        // Derive it from the parsed candidate (the last chain link) exactly
+        // as `profiles.clone` does, so the outcome cannot claim a base the
+        // written file does not contain.
+        let extends = source
+            .chain
+            .last()
+            .and_then(|layer| layer.plan.extends.clone());
+        validate_chain_with_selector(&name, selector_path, source.chain)?;
+        (source.content, extends, None)
+    } else if let Some(preset_raw) = options.preset.as_deref() {
+        let parsed = crate::init::InitProfilePreset::parse(preset_raw).ok_or_else(|| {
+            plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                "unknown preset (expected minimal, dark, or light)",
+            )
+        })?;
+        let content = preset_profile_lua(parsed).to_string();
+        validate_new_profile(&content, &path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                format!("profile '{name}' failed preset validation"),
+            )
+        })?;
+        (content, None, Some(parsed.name().to_string()))
+    } else {
+        let content = new_profile_lua(&name);
+        validate_new_profile(&content, &path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                format!("profile '{name}' failed validation"),
+            )
+        })?;
+        (content, None, None)
+    };
+
+    let active = effective_profile_name(active_profile, selector_profile_from_path(selector_path))
+        .as_deref()
+        == Some(name.as_str());
+    let rendered = profile_lifecycle_diff(&previous, &content);
+    let digest_preimage = format!(
+        "create\0name={name}\0existed={existing}\0prev_len={}\0{previous}\0next_len={}\0{content}",
+        previous.len(),
+        content.len()
+    );
+    let candidate_digest = bitty_package::integrity::sha256_hex(digest_preimage.as_bytes());
+    let changed_keys = vec![format!("profiles.{name}")];
+
+    Ok(PreparedProfileCreate {
+        name,
+        path,
+        content,
+        existing_identity,
+        replaces_existing: existing,
+        extends,
+        preset,
+        rendering: ProfileLifecycleRendering {
+            changed_keys,
+            rendered,
+            candidate_digest,
+            changed: true,
+            replaces_existing: existing,
+            selector_updated: false,
+            active,
+        },
+    })
+}
+
+/// Preview `profiles.create` in `dir`.
+pub(crate) fn preview_profile_create_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    name: &str,
+    options: &ProfileCreateOptions,
+) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+    Ok(prepare_profile_create_in_dir(dir, selector_path, active_profile, name, options)?.rendering)
+}
+
+/// Apply an approved `profiles.create` in `dir`.
+pub(crate) fn apply_profile_create_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    name: &str,
+    options: &ProfileCreateOptions,
+    expected_candidate_digest: &str,
+) -> Result<ProfileCreateOutcome, ProfileWriteFailure> {
+    let prepared =
+        prepare_profile_create_in_dir(dir, selector_path, active_profile, name, options)?;
+    if prepared.rendering.candidate_digest != expected_candidate_digest {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Stale,
+            "the profile candidate changed since it was previewed",
+        ));
+    }
+    let backed_up = if prepared.replaces_existing {
+        backup_profile_file("create", &prepared.path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot back up existing profile '{}'", prepared.name),
+            )
+        })?;
+        write_profile_atomic(
+            &prepared.path,
+            &prepared.content,
+            prepared.existing_identity.as_ref(),
+        )
+        .map_err(|err| match err {
+            ProfileWriteError::Changed => plugin_profile_failure(
+                ProfileFailureKind::Stale,
+                "the profile changed since it was previewed",
+            ),
+            ProfileWriteError::NotRegular => plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                format!("profile '{}' is not a regular file", prepared.name),
+            ),
+            ProfileWriteError::Io(_) => plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot replace profile '{}'", prepared.name),
+            ),
+        })?;
+        true
+    } else {
+        create_exclusive(&prepared.path, &prepared.content).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                plugin_profile_failure(
+                    ProfileFailureKind::Conflict,
+                    format!("profile '{}' already exists", prepared.name),
+                )
+            } else {
+                plugin_profile_failure(
+                    ProfileFailureKind::Io,
+                    format!("cannot create profile '{}'", prepared.name),
+                )
+            }
+        })?;
+        false
+    };
+    Ok(ProfileCreateOutcome {
+        name: prepared.name,
+        replaced: prepared.replaces_existing,
+        backed_up,
+        extends: prepared.extends,
+        preset: prepared.preset,
+    })
+}
+
+/// Prepared `profiles.clone` candidate.
+struct PreparedProfileClone {
+    src: String,
+    dst: String,
+    dst_path: PathBuf,
+    content: String,
+    dst_identity: Option<ProfileIdentity>,
+    replaces_existing: bool,
+    extends: Option<String>,
+    rendering: ProfileLifecycleRendering,
+}
+
+fn prepare_profile_clone_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    raw_src: &str,
+    raw_dst: &str,
+    options: &ProfileCloneOptions,
+) -> Result<PreparedProfileClone, ProfileWriteFailure> {
+    let src = plugin_valid_existing_name(raw_src)?;
+    let dst = plugin_valid_new_name(raw_dst)?;
+    if dst == "default" {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            "'default' is the implicit base profile when no profile is selected; edit init.lua directly instead of cloning onto 'default'",
+        ));
+    }
+    if src == dst {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "source and destination profile names are identical",
+        ));
+    }
+    let src_path = profile_path(dir, &src);
+    let dst_path = profile_path(dir, &dst);
+    let (src_content, _src_identity) = plugin_read_existing_profile(&src, &src_path)?;
+    let source = clone_source_from_content(dir, &src, &src_path, src_content).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("source profile '{src}' is invalid"),
+        )
+    })?;
+    let extends = source
+        .chain
+        .last()
+        .and_then(|layer| layer.plan.extends.clone());
+    validate_chain_with_selector(&src, selector_path, source.chain)?;
+
+    let dst_exists = plugin_profile_exists(&dst, &dst_path)?;
+    if dst_exists && !options.force {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("profile '{dst}' already exists; pass force = true to replace it"),
+        ));
+    }
+    let (previous, dst_identity) = if dst_exists {
+        let (bytes, id) = plugin_read_existing_profile(&dst, &dst_path)?;
+        (bytes, Some(id))
+    } else {
+        (String::new(), None)
+    };
+
+    let active = effective_profile_name(active_profile, selector_profile_from_path(selector_path))
+        .as_deref()
+        == Some(dst.as_str());
+    let rendered = profile_lifecycle_diff(&previous, &source.content);
+    let digest_preimage = format!(
+        "clone\0src={src}\0dst={dst}\0existed={dst_exists}\0prev_len={}\0{previous}\0next_len={}\0{}",
+        previous.len(),
+        source.content.len(),
+        source.content
+    );
+    let candidate_digest = bitty_package::integrity::sha256_hex(digest_preimage.as_bytes());
+    let changed_keys = vec![format!("profiles.{dst}")];
+
+    Ok(PreparedProfileClone {
+        src,
+        dst,
+        dst_path,
+        content: source.content,
+        dst_identity,
+        replaces_existing: dst_exists,
+        extends,
+        rendering: ProfileLifecycleRendering {
+            changed_keys,
+            rendered,
+            candidate_digest,
+            changed: true,
+            replaces_existing: dst_exists,
+            selector_updated: false,
+            active,
+        },
+    })
+}
+
+/// Preview `profiles.clone` in `dir`.
+pub(crate) fn preview_profile_clone_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    src: &str,
+    dst: &str,
+    options: &ProfileCloneOptions,
+) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+    Ok(
+        prepare_profile_clone_in_dir(dir, selector_path, active_profile, src, dst, options)?
+            .rendering,
+    )
+}
+
+/// Apply an approved `profiles.clone` in `dir`.
+pub(crate) fn apply_profile_clone_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    src: &str,
+    dst: &str,
+    options: &ProfileCloneOptions,
+    expected_candidate_digest: &str,
+) -> Result<ProfileCloneOutcome, ProfileWriteFailure> {
+    let prepared =
+        prepare_profile_clone_in_dir(dir, selector_path, active_profile, src, dst, options)?;
+    if prepared.rendering.candidate_digest != expected_candidate_digest {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Stale,
+            "the profile candidate changed since it was previewed",
+        ));
+    }
+    let backed_up = if prepared.replaces_existing {
+        backup_profile_file("clone", &prepared.dst_path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot back up existing profile '{}'", prepared.dst),
+            )
+        })?;
+        write_profile_atomic(
+            &prepared.dst_path,
+            &prepared.content,
+            prepared.dst_identity.as_ref(),
+        )
+        .map_err(|err| match err {
+            ProfileWriteError::Changed => plugin_profile_failure(
+                ProfileFailureKind::Stale,
+                "the destination profile changed since it was previewed",
+            ),
+            ProfileWriteError::NotRegular => plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                format!("profile '{}' is not a regular file", prepared.dst),
+            ),
+            ProfileWriteError::Io(_) => plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot replace profile '{}'", prepared.dst),
+            ),
+        })?;
+        true
+    } else {
+        create_exclusive(&prepared.dst_path, &prepared.content).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                plugin_profile_failure(
+                    ProfileFailureKind::Conflict,
+                    format!("profile '{}' already exists", prepared.dst),
+                )
+            } else {
+                plugin_profile_failure(
+                    ProfileFailureKind::Io,
+                    format!("cannot create profile '{}'", prepared.dst),
+                )
+            }
+        })?;
+        false
+    };
+    Ok(ProfileCloneOutcome {
+        source: prepared.src,
+        target: prepared.dst,
+        replaced: prepared.replaces_existing,
+        backed_up,
+        extends: prepared.extends,
+    })
+}
+
+/// Prepared `profiles.rename` candidate.
+struct PreparedProfileRename {
+    old: String,
+    new: String,
+    old_path: PathBuf,
+    new_path: PathBuf,
+    replaces_existing: bool,
+    selector_update: Option<SelectorRename>,
+    rendering: ProfileLifecycleRendering,
+}
+
+fn prepare_selector_rename_at_path(
+    selector_path: &Path,
+    old: &str,
+    new: &str,
+    old_chain: Vec<bitty_config::LayeredPlan>,
+) -> Result<Option<SelectorRename>, ProfileWriteFailure> {
+    let metadata = match std::fs::symlink_metadata(selector_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Io,
+                "cannot inspect the persisted profile selector",
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "the persisted profile selector is not a regular file",
+        ));
+    }
+    if selector_profile_from_path(selector_path).as_deref() != Some(old) {
+        return Ok(None);
+    }
+    if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "the persisted profile selector exceeds its maximum file size",
+        ));
+    }
+    let content = std::fs::read_to_string(selector_path).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Io,
+            "cannot read the persisted profile selector",
+        )
+    })?;
+    let Some(rewritten) = rewrite_selector_profile(&content, new) else {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!(
+                "cannot update the persisted selector for '{old}': no top-level short-quoted profile assignment"
+            ),
+        ));
+    };
+    let source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::User,
+        Some(selector_path.display().to_string()),
+    );
+    let plan = bitty_config::file::parse_lua_config(&rewritten, &source).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "rewritten profile selector failed validation",
+        )
+    })?;
+    match plan.selector {
+        Some(found) if found.profile == new => {}
+        _ => {
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Invalid,
+                "rewritten profile selector did not preserve the new profile selection",
+            ));
+        }
+    }
+    validate_prospective_selector_chain(
+        SelectorIntent::Rename { previous: old },
+        new,
+        old_chain,
+        selector_path,
+        &rewritten,
+    )
+    .map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("renaming '{old}' to '{new}' failed selector validation"),
+        )
+    })?;
+    Ok(Some(SelectorRename {
+        path: selector_path.to_path_buf(),
+        rewritten,
+    }))
+}
+
+fn prepare_profile_rename_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    raw_old: &str,
+    raw_new: &str,
+    options: &ProfileRenameOptions,
+) -> Result<PreparedProfileRename, ProfileWriteFailure> {
+    let old = plugin_valid_existing_name(raw_old)?;
+    let new = plugin_valid_new_name(raw_new)?;
+    if old == "default" || new == "default" {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            "'default' is the reserved implicit base profile and cannot be renamed",
+        ));
+    }
+    if old == new {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            "old and new profile names are identical",
+        ));
+    }
+    let old_path = profile_path(dir, &old);
+    let new_path = profile_path(dir, &new);
+    let (old_bytes, _old_identity) = plugin_read_existing_profile(&old, &old_path)?;
+    let new_exists = plugin_profile_exists(&new, &new_path)?;
+    if new_exists && !options.force {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("profile '{new}' already exists; pass force = true to replace it"),
+        ));
+    }
+    let dependents = referencing_profiles(dir, &old);
+    if !dependents.is_empty() {
+        let list = dependents
+            .iter()
+            .map(|dep| format!("'{dep}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("cannot rename '{old}': extended by {list}"),
+        ));
+    }
+    let old_chain = bitty_config::file::load_profile_chain_in_dir(&old, dir).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Invalid,
+            format!("profile '{old}' is invalid"),
+        )
+    })?;
+    let selector_update = prepare_selector_rename_at_path(selector_path, &old, &new, old_chain)?;
+    let new_previous = if new_exists {
+        plugin_read_existing_profile(&new, &new_path)?.0
+    } else {
+        String::new()
+    };
+
+    let selector_updated = selector_update.is_some();
+    let active = effective_profile_name(active_profile, selector_profile_from_path(selector_path))
+        .as_deref()
+        == Some(old.as_str());
+    let mut changed_keys = vec![format!("profiles.{old}"), format!("profiles.{new}")];
+    if selector_updated {
+        changed_keys.push(String::from("profile"));
+    }
+    let rendered = if new_exists {
+        profile_lifecycle_diff(&new_previous, &old_bytes)
+    } else if selector_updated {
+        format!("-profile = \"{old}\"\n+profile = \"{new}\"")
+    } else {
+        format!("-profiles.{old}\n+profiles.{new}")
+    };
+    let selector_bytes = selector_update
+        .as_ref()
+        .map_or("", |u| u.rewritten.as_str());
+    let digest_preimage = format!(
+        "rename\0old={old}\0new={new}\0existed={new_exists}\0old_len={}\0{old_bytes}\0new_prev_len={}\0{new_previous}\0sel={selector_updated}\0sel_len={}\0{selector_bytes}",
+        old_bytes.len(),
+        new_previous.len(),
+        selector_bytes.len()
+    );
+    let candidate_digest = bitty_package::integrity::sha256_hex(digest_preimage.as_bytes());
+
+    Ok(PreparedProfileRename {
+        old,
+        new,
+        old_path,
+        new_path,
+        replaces_existing: new_exists,
+        selector_update,
+        rendering: ProfileLifecycleRendering {
+            changed_keys,
+            rendered,
+            candidate_digest,
+            changed: true,
+            replaces_existing: new_exists,
+            selector_updated,
+            active,
+        },
+    })
+}
+
+/// Preview `profiles.rename` in `dir`.
+pub(crate) fn preview_profile_rename_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    old: &str,
+    new: &str,
+    options: &ProfileRenameOptions,
+) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+    Ok(
+        prepare_profile_rename_in_dir(dir, selector_path, active_profile, old, new, options)?
+            .rendering,
+    )
+}
+
+/// Restore a replaced rename destination from its backup.
+///
+/// A failed restore is an internal invariant break, not a detail to drop: the
+/// caller must not report only the trigger error while the destination file is
+/// missing.
+fn restore_rename_destination(
+    backup: &Path,
+    destination: &Path,
+) -> Result<(), ProfileWriteFailure> {
+    if std::fs::copy(backup, destination).is_err() {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Internal,
+            "cannot restore the replaced destination after a failed rename",
+        ));
+    }
+    sync_parent_dir(destination);
+    Ok(())
+}
+
+/// Apply an approved `profiles.rename` in `dir`.
+pub(crate) fn apply_profile_rename_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    old: &str,
+    new: &str,
+    options: &ProfileRenameOptions,
+    expected_candidate_digest: &str,
+) -> Result<ProfileRenameOutcome, ProfileWriteFailure> {
+    let prepared =
+        prepare_profile_rename_in_dir(dir, selector_path, active_profile, old, new, options)?;
+    if prepared.rendering.candidate_digest != expected_candidate_digest {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Stale,
+            "the profile candidate changed since it was previewed",
+        ));
+    }
+    let destination_backup = if prepared.replaces_existing {
+        let backup = backup_profile_file("rename", &prepared.new_path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot back up existing profile '{}'", prepared.new),
+            )
+        })?;
+        std::fs::remove_file(&prepared.new_path).map_err(|_| {
+            plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!("cannot replace existing profile '{}'", prepared.new),
+            )
+        })?;
+        sync_parent_dir(&prepared.new_path);
+        Some(backup)
+    } else {
+        None
+    };
+
+    match commit_profile_rename(&prepared.old_path, &prepared.new_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(backup) = &destination_backup {
+                restore_rename_destination(backup, &prepared.new_path)?;
+            }
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Conflict,
+                format!("profile '{}' already exists", prepared.new),
+            ));
+        }
+        Err(_) => {
+            if let Some(backup) = &destination_backup {
+                restore_rename_destination(backup, &prepared.new_path)?;
+            }
+            return Err(plugin_profile_failure(
+                ProfileFailureKind::Io,
+                format!(
+                    "cannot rename profile '{}' to '{}'",
+                    prepared.old, prepared.new
+                ),
+            ));
+        }
+    }
+    sync_parent_dir(&prepared.new_path);
+
+    let mut selector_updated = false;
+    let mut selector_backed_up = false;
+    if let Some(update) = &prepared.selector_update {
+        match apply_selector_rename(dir, &prepared.old, &prepared.new, update) {
+            Ok(selector_backup) => {
+                selector_updated = true;
+                selector_backed_up = selector_backup.is_some();
+            }
+            Err(_) => {
+                commit_profile_rename(&prepared.new_path, &prepared.old_path).map_err(|_| {
+                    plugin_profile_failure(
+                        ProfileFailureKind::Internal,
+                        format!(
+                            "selector update and rollback both failed while renaming '{}' to '{}'",
+                            prepared.old, prepared.new
+                        ),
+                    )
+                })?;
+                if let Some(backup) = &destination_backup {
+                    restore_rename_destination(backup, &prepared.new_path)?;
+                }
+                sync_parent_dir(&prepared.old_path);
+                return Err(plugin_profile_failure(
+                    ProfileFailureKind::Invalid,
+                    format!(
+                        "cannot update the persisted selector when renaming '{}' to '{}'",
+                        prepared.old, prepared.new
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(ProfileRenameOutcome {
+        old_name: prepared.old,
+        new_name: prepared.new,
+        replaced: prepared.replaces_existing,
+        backed_up: destination_backup.is_some() || selector_backed_up,
+        selector_updated,
+    })
+}
+
+/// Prepared `profiles.delete` candidate.
+struct PreparedProfileDelete {
+    name: String,
+    path: PathBuf,
+    was_active: bool,
+    rendering: ProfileLifecycleRendering,
+}
+
+fn prepare_profile_delete_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    raw_name: &str,
+    options: &ProfileDeleteOptions,
+) -> Result<PreparedProfileDelete, ProfileWriteFailure> {
+    let name = plugin_valid_existing_name(raw_name)?;
+    if name == "default" && !options.force {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            "'default' is the reserved implicit base profile; pass force = true to remove default.lua",
+        ));
+    }
+    let path = profile_path(dir, &name);
+    let (existing_bytes, _identity) = plugin_read_existing_profile(&name, &path)?;
+    let selector_active =
+        selector_profile_from_path(selector_path).as_deref() == Some(name.as_str());
+    let launch_active = active_profile == Some(name.as_str());
+    let was_active = selector_active || launch_active;
+    if was_active && !options.force {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!(
+                "profile '{name}' is currently active; switch profiles first or pass force = true"
+            ),
+        ));
+    }
+    let dependents = referencing_profiles(dir, &name);
+    if !dependents.is_empty() {
+        let list = dependents
+            .iter()
+            .map(|dep| format!("'{dep}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Conflict,
+            format!("cannot delete '{name}': extended by {list}"),
+        ));
+    }
+
+    let rendered = profile_lifecycle_diff(&existing_bytes, "");
+    let digest_preimage = format!(
+        "delete\0name={name}\0active={was_active}\0len={}\0{existing_bytes}",
+        existing_bytes.len()
+    );
+    let candidate_digest = bitty_package::integrity::sha256_hex(digest_preimage.as_bytes());
+    let changed_keys = vec![format!("profiles.{name}")];
+
+    Ok(PreparedProfileDelete {
+        name,
+        path,
+        was_active,
+        rendering: ProfileLifecycleRendering {
+            changed_keys,
+            rendered,
+            candidate_digest,
+            changed: true,
+            replaces_existing: false,
+            selector_updated: false,
+            active: was_active,
+        },
+    })
+}
+
+/// Preview `profiles.delete` in `dir`.
+pub(crate) fn preview_profile_delete_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    name: &str,
+    options: &ProfileDeleteOptions,
+) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+    Ok(prepare_profile_delete_in_dir(dir, selector_path, active_profile, name, options)?.rendering)
+}
+
+/// Apply an approved `profiles.delete` in `dir`.
+pub(crate) fn apply_profile_delete_in_dir(
+    dir: &Path,
+    selector_path: &Path,
+    active_profile: Option<&str>,
+    name: &str,
+    options: &ProfileDeleteOptions,
+    expected_candidate_digest: &str,
+) -> Result<ProfileDeleteOutcome, ProfileWriteFailure> {
+    let prepared =
+        prepare_profile_delete_in_dir(dir, selector_path, active_profile, name, options)?;
+    if prepared.rendering.candidate_digest != expected_candidate_digest {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Stale,
+            "the profile candidate changed since it was previewed",
+        ));
+    }
+    backup_profile_file("delete", &prepared.path).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Io,
+            format!("cannot back up profile '{}' before deletion", prepared.name),
+        )
+    })?;
+    std::fs::remove_file(&prepared.path).map_err(|_| {
+        plugin_profile_failure(
+            ProfileFailureKind::Io,
+            format!("cannot remove profile '{}'", prepared.name),
+        )
+    })?;
+    sync_parent_dir(&prepared.path);
+    Ok(ProfileDeleteOutcome {
+        name: prepared.name,
+        backed_up: true,
+        was_active: prepared.was_active,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7063,5 +8205,81 @@ mod tests {
             before
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn create_force_backs_up_existing_and_rollback_rename_restores_destination_backup() {
+        let root = scratch_dir("profile-audit-fixes");
+        let profiles_dir = root.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("profiles dir");
+        let selector_path = root.join("init.lua");
+
+        // 1. `run_create` with `--force` on an existing profile backs up the old bytes.
+        let work_path = profiles_dir.join("work.lua");
+        std::fs::write(&work_path, "return { font = { size = 17 } }\n").expect("seed work");
+        let mut args = crate::cli::parse_args(&[]);
+        args.config_path = Some(selector_path.to_string_lossy().into_owned());
+        let opts = ProfileOptions {
+            force: true,
+            dry_run: false,
+            from: None,
+            preset: Some(String::from("minimal")),
+        };
+        run_create(&args, &opts, &profiles_dir, "work").expect("create --force");
+        let has_work_backup = std::fs::read_dir(&profiles_dir)
+            .expect("read profiles")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("work.lua.bak-")
+                    && std::fs::read_to_string(entry.path())
+                        .is_ok_and(|body| body.contains("size = 17"))
+            });
+        assert!(
+            has_work_backup,
+            "run_create --force must back up the replaced profile"
+        );
+
+        // 2. `rollback_rename` restores `destination_backup` to `new_path`.
+        let old_path = profiles_dir.join("old.lua");
+        let new_path = profiles_dir.join("new.lua");
+        let dst_bak = profiles_dir.join("new.lua.bak-123");
+        std::fs::write(&new_path, "return { font = { size = 11 } }\n").expect("moved old->new");
+        std::fs::write(&dst_bak, "return { font = { size = 22 } }\n").expect("dst backup");
+        let returned = rollback_rename(
+            &old_path,
+            &new_path,
+            Some(&dst_bak),
+            Failure::io(String::from("selector write failed")),
+        );
+        assert_eq!(returned.code, "E_PROFILE_IO");
+        assert_eq!(
+            std::fs::read_to_string(&old_path).expect("restored old"),
+            "return { font = { size = 11 } }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&new_path).expect("restored new from backup"),
+            "return { font = { size = 22 } }\n"
+        );
+        assert!(dst_bak.exists(), "backup file remains available on disk");
+
+        // 3. Symlinked selector is ignored/refused by `selector_profile_from_path` and `prepare_selector_rename`.
+        #[cfg(unix)]
+        {
+            let target_file = root.join("foreign.lua");
+            std::fs::write(
+                &target_file,
+                "return { format = \"bitty-profile-v1\", profile = \"old\" }\n",
+            )
+            .expect("foreign");
+            std::os::unix::fs::symlink(&target_file, &selector_path).expect("symlink selector");
+            assert_eq!(selector_profile_from_path(&selector_path), None);
+            assert!(
+                prepare_selector_rename(&args, "old", "new").is_err(),
+                "prepare_selector_rename must refuse a symlinked selector"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

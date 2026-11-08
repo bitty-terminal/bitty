@@ -698,6 +698,207 @@ pub struct ProfileUseRendering {
     pub changed: bool,
 }
 
+/// Options for `profiles.preview_create` / `profiles.create` (CTX-1749).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileCreateOptions {
+    /// Seed from an existing profile name (`--from`).
+    pub from: Option<String>,
+    /// Seed from a named preset (`minimal` | `dark` | `light`, `--preset`).
+    pub preset: Option<String>,
+    /// Replace an existing profile after backing it up (`--force`).
+    pub force: bool,
+}
+
+/// Options for `profiles.preview_clone` / `profiles.clone` (CTX-1749).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileCloneOptions {
+    /// Replace an existing destination after backing it up (`--force`).
+    pub force: bool,
+}
+
+/// Options for `profiles.preview_rename` / `profiles.rename` (CTX-1749).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileRenameOptions {
+    /// Replace an existing destination after backing it up (`--force`).
+    pub force: bool,
+}
+
+/// Options for `profiles.preview_delete` / `profiles.delete` (CTX-1749).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileDeleteOptions {
+    /// Delete even when the profile is active or named `default` (`--force`).
+    pub force: bool,
+}
+
+/// One backend-rendered profile-lifecycle candidate (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileLifecycleRendering {
+    /// Changed logical keys (for example `profiles.work`, `profile`).
+    pub changed_keys: Vec<String>,
+    /// Exact bounded diff the user approves.
+    pub rendered: String,
+    /// SHA-256 of the exact candidate preimage and postimage.
+    pub candidate_digest: String,
+    /// Whether the lifecycle operation modifies persisted state.
+    pub changed: bool,
+    /// Whether an existing destination profile will be backed up and replaced.
+    pub replaces_existing: bool,
+    /// Whether `rename` will rewrite the persisted selector.
+    pub selector_updated: bool,
+    /// Whether the target profile is currently the active persisted profile.
+    pub active: bool,
+}
+
+/// Path-free outcome for `profiles.create` (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCreateOutcome {
+    /// Created or replaced profile name.
+    pub name: String,
+    /// Whether an existing profile was replaced.
+    pub replaced: bool,
+    /// Whether an existing profile was backed up before replacement.
+    pub backed_up: bool,
+    /// Base profile (`extends`) recorded in the created profile.
+    pub extends: Option<String>,
+    /// Preset name when seeded with `preset`.
+    pub preset: Option<String>,
+}
+
+/// Path-free outcome for `profiles.clone` (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCloneOutcome {
+    /// Source profile name.
+    pub source: String,
+    /// Destination profile name.
+    pub target: String,
+    /// Whether an existing destination profile was replaced.
+    pub replaced: bool,
+    /// Whether an existing destination was backed up before replacement.
+    pub backed_up: bool,
+    /// Base profile (`extends`) recorded in the cloned profile.
+    pub extends: Option<String>,
+}
+
+/// Path-free outcome for `profiles.rename` (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRenameOutcome {
+    /// Previous profile name.
+    pub old_name: String,
+    /// New profile name.
+    pub new_name: String,
+    /// Whether an existing destination profile was replaced.
+    pub replaced: bool,
+    /// Whether an existing destination or selector was backed up.
+    pub backed_up: bool,
+    /// Whether the persisted selector was rewritten to `new_name`.
+    pub selector_updated: bool,
+}
+
+/// Path-free outcome for `profiles.delete` (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileDeleteOutcome {
+    /// Deleted profile name.
+    pub name: String,
+    /// Whether a timestamped backup was created before removal.
+    pub backed_up: bool,
+    /// Whether the deleted profile was the active persisted profile.
+    pub was_active: bool,
+}
+
+/// Typed refusal kind for `profiles.create|clone|rename|delete` (CTX-1749).
+///
+/// Matches `bitty config profile` (`E_PROFILE_*`) and the `config.manage`
+/// approval/target gates (`E_CONFIG_*`). Path-free by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFailureKind {
+    /// Invalid option combination or unknown preset (`E_PROFILE_USAGE`).
+    Usage,
+    /// Invalid profile name, syntax, schema, or unrewritable selector (`E_PROFILE_INVALID`).
+    Invalid,
+    /// Reserved `default`, existing target without `force`, active profile, or `extends` dependent (`E_PROFILE_CONFLICT`).
+    Conflict,
+    /// Missing source or target profile (`E_PROFILE_NOT_FOUND`).
+    NotFound,
+    /// Filesystem failure (`E_PROFILE_IO`).
+    Io,
+    /// Internal invariant or rollback failure (`E_PROFILE_INTERNAL`).
+    Internal,
+    /// No writable profile backend is installed (`E_CONFIG_UNAVAILABLE`).
+    Unavailable,
+    /// Candidate bytes moved between preview and apply (`E_CONFIG_STALE`).
+    Stale,
+}
+
+impl ProfileFailureKind {
+    /// Stable path-free error code matching `bitty config profile`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Usage => "E_PROFILE_USAGE",
+            Self::Invalid => "E_PROFILE_INVALID",
+            Self::Conflict => "E_PROFILE_CONFLICT",
+            Self::NotFound => "E_PROFILE_NOT_FOUND",
+            Self::Io => "E_PROFILE_IO",
+            Self::Internal => "E_PROFILE_INTERNAL",
+            Self::Unavailable => "E_CONFIG_UNAVAILABLE",
+            Self::Stale => "E_CONFIG_STALE",
+        }
+    }
+
+    /// Stable error class for the bridge table.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Usage | Self::Invalid | Self::Conflict | Self::NotFound => "validation",
+            Self::Io => "io",
+            Self::Internal | Self::Unavailable | Self::Stale => "runtime",
+        }
+    }
+}
+
+/// Path-free failure returned by profile lifecycle backend methods (CTX-1749).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileWriteFailure {
+    /// Typed refusal kind.
+    pub kind: ProfileFailureKind,
+    /// Path-free human diagnostic (never contains `/` or `\`).
+    pub message: String,
+}
+
+impl ProfileWriteFailure {
+    /// Construct one path-free profile failure, sanitizing any path separator
+    /// as a defense-in-depth invariant.
+    #[must_use]
+    pub fn new(kind: ProfileFailureKind, message: impl Into<String>) -> Self {
+        let message = message.into().replace(['/', '\\'], "_");
+        Self { kind, message }
+    }
+
+    /// `E_CONFIG_UNAVAILABLE` refusal.
+    #[must_use]
+    pub fn unavailable() -> Self {
+        Self::new(
+            ProfileFailureKind::Unavailable,
+            "no writable profile configuration layer is available",
+        )
+    }
+
+    /// `E_CONFIG_STALE` refusal.
+    #[must_use]
+    pub fn stale() -> Self {
+        Self::new(
+            ProfileFailureKind::Stale,
+            "the profile candidate changed since it was previewed",
+        )
+    }
+
+    /// Map this failure to the plugin-visible [`BridgeError`].
+    #[must_use]
+    pub fn into_bridge_error(self) -> BridgeError {
+        BridgeError::new(self.kind.class(), self.kind.code(), self.message)
+    }
+}
+
 /// One host-issued manage-write token for a non-scalar intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigManageToken {
@@ -781,6 +982,38 @@ pub enum ConfigApprovalTarget {
         /// Validated profile name.
         name: String,
     },
+    /// One profile creation or replacement (`profiles.create`).
+    ProfileCreate {
+        /// Validated target profile name.
+        name: String,
+        /// Validated creation options.
+        options: ProfileCreateOptions,
+    },
+    /// One profile clone (`profiles.clone`).
+    ProfileClone {
+        /// Validated source profile name.
+        src: String,
+        /// Validated destination profile name.
+        dst: String,
+        /// Validated clone options.
+        options: ProfileCloneOptions,
+    },
+    /// One profile rename (`profiles.rename`).
+    ProfileRename {
+        /// Validated current profile name.
+        old: String,
+        /// Validated new profile name.
+        new: String,
+        /// Validated rename options.
+        options: ProfileRenameOptions,
+    },
+    /// One profile deletion (`profiles.delete`).
+    ProfileDelete {
+        /// Validated target profile name.
+        name: String,
+        /// Validated delete options.
+        options: ProfileDeleteOptions,
+    },
 }
 
 impl ConfigApprovalTarget {
@@ -797,6 +1030,21 @@ impl ConfigApprovalTarget {
                 format!("plugin-enabled\0{id}\0{enabled}")
             }
             Self::ProfileUse { name } => format!("profile-use\0{name}"),
+            Self::ProfileCreate { name, options } => format!(
+                "profile-create\0{name}\0{}\0{}\0{}",
+                options.from.as_deref().unwrap_or(""),
+                options.preset.as_deref().unwrap_or(""),
+                options.force
+            ),
+            Self::ProfileClone { src, dst, options } => {
+                format!("profile-clone\0{src}\0{dst}\0{}", options.force)
+            }
+            Self::ProfileRename { old, new, options } => {
+                format!("profile-rename\0{old}\0{new}\0{}", options.force)
+            }
+            Self::ProfileDelete { name, options } => {
+                format!("profile-delete\0{name}\0{}", options.force)
+            }
         }
     }
 }
@@ -1007,6 +1255,126 @@ pub trait ConfigWriteBackend {
         _expected_candidate_digest: &str,
     ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
         Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Render one profile-create candidate without writing (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn preview_profile_create(
+        &self,
+        _plugin_id: &str,
+        _name: &str,
+        _options: &ProfileCreateOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Apply one approved profile-create candidate (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn apply_profile_create(
+        &self,
+        _plugin_id: &str,
+        _name: &str,
+        _options: &ProfileCreateOptions,
+        _expected_candidate_digest: &str,
+    ) -> Result<ProfileCreateOutcome, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Render one profile-clone candidate without writing (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn preview_profile_clone(
+        &self,
+        _plugin_id: &str,
+        _src: &str,
+        _dst: &str,
+        _options: &ProfileCloneOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Apply one approved profile-clone candidate (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn apply_profile_clone(
+        &self,
+        _plugin_id: &str,
+        _src: &str,
+        _dst: &str,
+        _options: &ProfileCloneOptions,
+        _expected_candidate_digest: &str,
+    ) -> Result<ProfileCloneOutcome, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Render one profile-rename candidate without writing (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn preview_profile_rename(
+        &self,
+        _plugin_id: &str,
+        _old: &str,
+        _new: &str,
+        _options: &ProfileRenameOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Apply one approved profile-rename candidate (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn apply_profile_rename(
+        &self,
+        _plugin_id: &str,
+        _old: &str,
+        _new: &str,
+        _options: &ProfileRenameOptions,
+        _expected_candidate_digest: &str,
+    ) -> Result<ProfileRenameOutcome, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Render one profile-delete candidate without writing (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn preview_profile_delete(
+        &self,
+        _plugin_id: &str,
+        _name: &str,
+        _options: &ProfileDeleteOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Apply one approved profile-delete candidate (CTX-1749).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ProfileWriteFailure`].
+    fn apply_profile_delete(
+        &self,
+        _plugin_id: &str,
+        _name: &str,
+        _options: &ProfileDeleteOptions,
+        _expected_candidate_digest: &str,
+    ) -> Result<ProfileDeleteOutcome, ProfileWriteFailure> {
+        Err(ProfileWriteFailure::unavailable())
     }
 }
 

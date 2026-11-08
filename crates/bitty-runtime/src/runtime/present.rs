@@ -12592,6 +12592,203 @@ mod surface_visibility_tests {
         );
         assert_eq!(rt.hidden_repair_deadline(), None);
     }
+
+    /// bitty#3026: a workspace switch must not move a scrolled viewport.
+    ///
+    /// The production switch shape is `Suspended` plus a keyboard focus loss,
+    /// then a focus gain plus `Resumed`. An app that enabled focus reporting
+    /// (DECSET 1004) receives the `CSI O` / `CSI I` reports on those edges.
+    /// Delivering them through the typing path applied the CTX-0243
+    /// snap-to-live, so every switch returned a scrolled viewport to the live
+    /// bottom (the owner's report: paging works, switching away and back loses
+    /// the page). The reports are terminal protocol traffic, not typing: they
+    /// must reach the child without moving the viewport, and a pure
+    /// hide/reveal must not write or resize anything at all.
+    #[test]
+    fn workspace_switch_keeps_a_scrolled_viewport_and_only_sends_focus_reports() {
+        let mut rt = runtime();
+        // The TUI asked for focus in/out reports.
+        rt.handle_pty_bytes(b"\x1b[?1004h");
+        // Long output fills scrollback; present the live tail.
+        for index in 0..60 {
+            rt.handle_pty_bytes(format!("line {index:02} {}\r\n", "Z".repeat(60)).as_bytes());
+        }
+        let t0 = std::time::Instant::now();
+        assert!(rt.tick_at(t0).is_some(), "the live frame presents");
+        assert!(rt.tick_at(t0).is_none(), "the live frame idles");
+
+        // Page up through the production keymap action, then present it.
+        assert!(rt.scroll_focused_page(true), "the view pages into history");
+        assert!(rt.tick_at(t0).is_some(), "the paged frame presents");
+        let view_id = rt.focused_view().expect("a focused view");
+        let before_offset = rt
+            .presented_scroll_offset(view_id)
+            .expect("the focused view is live");
+        assert!(before_offset > 0, "the view must be scrolled into history");
+        let before_rows = rt
+            .layout()
+            .find_leaf(view_id)
+            .expect("focused leaf")
+            .visible_text_rows(rt.state());
+        let before_frame = rt.headless_rgba().expect("a presented headless frame");
+        let before_grid = (rt.state().width(), rt.state().height());
+        let before_extent = rt.surface_extent();
+        let before_input = rt.pending_input_len();
+
+        // A pure hide/reveal (no focus edge) writes nothing, resizes nothing,
+        // and repaints the identical frame.
+        let hidden = t0 + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(hidden, false);
+        let shown = hidden + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(shown, true);
+        assert!(rt.tick_at(shown).is_some(), "the reveal frame presents");
+        assert_eq!(
+            rt.pending_input_len(),
+            before_input,
+            "a pure hide/reveal must write no PTY bytes"
+        );
+        assert_eq!(
+            (rt.state().width(), rt.state().height()),
+            before_grid,
+            "a pure hide/reveal must not resize the grid"
+        );
+        assert_eq!(
+            rt.surface_extent(),
+            before_extent,
+            "a pure hide/reveal must not resize the surface"
+        );
+        assert_eq!(
+            rt.presented_scroll_offset(view_id),
+            Some(before_offset),
+            "a pure hide/reveal must keep the scroll offset"
+        );
+        assert_eq!(
+            rt.headless_rgba().as_deref(),
+            Some(before_frame.as_slice()),
+            "a pure hide/reveal must repaint the same frame"
+        );
+
+        // The real switch: away (suspend + focus loss), back (focus gain +
+        // resume). Only the requested focus reports may reach the child.
+        let away = shown + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(away, false);
+        rt.set_focused(false);
+        let back = away + std::time::Duration::from_millis(20);
+        rt.set_focused(true);
+        rt.set_surface_visibility_at(back, true);
+        assert!(rt.tick_at(back).is_some(), "the switch-back frame presents");
+
+        assert_eq!(
+            rt.presented_scroll_offset(view_id),
+            Some(before_offset),
+            "the switch must keep the scroll offset"
+        );
+        let after_rows = rt
+            .layout()
+            .find_leaf(view_id)
+            .expect("focused leaf")
+            .visible_text_rows(rt.state());
+        assert_eq!(
+            after_rows, before_rows,
+            "the switch must present the same viewport"
+        );
+        assert_eq!(
+            after_rows.first(),
+            before_rows.first(),
+            "the first visible row must match the pre-hide viewport"
+        );
+        assert_eq!(
+            rt.headless_rgba().as_deref(),
+            Some(before_frame.as_slice()),
+            "the switch must repaint the identical frame"
+        );
+        assert_eq!(
+            &rt.pending_input()[before_input..],
+            b"\x1b[O\x1b[I",
+            "only the requested focus reports may reach the child"
+        );
+        assert_eq!(
+            (rt.state().width(), rt.state().height()),
+            before_grid,
+            "the switch must not resize the grid"
+        );
+        assert_eq!(
+            rt.surface_extent(),
+            before_extent,
+            "the switch must not resize the surface"
+        );
+    }
+
+    /// bitty#3026 alternate-screen guard: a full-screen TUI owns its own
+    /// scroll. Bitty must present exactly the app's current screen across a
+    /// switch — no scrollback composite, no offset change, no reset.
+    #[test]
+    fn workspace_switch_presents_the_alternate_screen_unchanged() {
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"\x1b[?1004h");
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        assert!(
+            rt.state().alt_screen_active(),
+            "the app owns the alt screen"
+        );
+        for index in 0..40 {
+            rt.handle_pty_bytes(format!("alt {index:02} {}\r\n", "Q".repeat(40)).as_bytes());
+        }
+        let t0 = std::time::Instant::now();
+        assert!(rt.tick_at(t0).is_some(), "the alt frame presents");
+
+        let view_id = rt.focused_view().expect("a focused view");
+        // Paging is inert on the alt screen (fail-closed): it never composites
+        // primary history over the app's own screen.
+        assert!(rt.scroll_focused_page(true), "paging stays callable");
+        assert_eq!(
+            rt.presented_scroll_offset(view_id),
+            Some(0),
+            "the alt screen owns no scrollback view"
+        );
+        assert!(rt.tick_at(t0).is_some(), "the inert page still presents");
+        let before_rows = rt
+            .layout()
+            .find_leaf(view_id)
+            .expect("focused leaf")
+            .visible_text_rows(rt.state());
+        let before_frame = rt.headless_rgba().expect("a presented headless frame");
+        let before_input = rt.pending_input_len();
+
+        let away = t0 + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(away, false);
+        rt.set_focused(false);
+        let back = away + std::time::Duration::from_millis(20);
+        rt.set_focused(true);
+        rt.set_surface_visibility_at(back, true);
+        assert!(rt.tick_at(back).is_some(), "the switch-back frame presents");
+
+        assert!(
+            rt.state().alt_screen_active(),
+            "the app still owns the screen"
+        );
+        assert_eq!(
+            rt.presented_scroll_offset(view_id),
+            Some(0),
+            "the switch must not arm a scrollback offset on the alt screen"
+        );
+        let after_rows = rt
+            .layout()
+            .find_leaf(view_id)
+            .expect("focused leaf")
+            .visible_text_rows(rt.state());
+        assert_eq!(after_rows, before_rows, "the app's screen is unchanged");
+        assert_eq!(
+            rt.headless_rgba().as_deref(),
+            Some(before_frame.as_slice()),
+            "the switch must present the app's screen byte-identically"
+        );
+        assert_eq!(
+            &rt.pending_input()[before_input..],
+            b"\x1b[O\x1b[I",
+            "only the requested focus reports may reach the child"
+        );
+    }
 }
 
 #[cfg(test)]

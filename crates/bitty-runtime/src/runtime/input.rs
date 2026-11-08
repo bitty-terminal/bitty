@@ -817,11 +817,12 @@ impl Runtime {
     }
 
     /// Routes already-encoded input bytes to the focused shell without the
-    /// CTX-0243 snap-to-live (issue #1394).
+    /// CTX-0243 snap-to-live (issue #1394, bitty#3026).
     ///
     /// Split out of [`Self::push_input_bytes_multipane`] so a Kitty key
-    /// *release* frame can reuse the identical routing while skipping the
-    /// snap: a release carries no new output, so it must not yank a
+    /// *release* frame and the focus-report protocol pair (`CSI O`/`CSI I`)
+    /// can reuse the identical routing while skipping the snap: neither
+    /// carries new output, so neither may yank a
     ///
     /// Returns whether the bytes reached a live PTY writer (`true`) or were
     /// only buffered headless (`false`, session-less non-primary leaf or no
@@ -2231,10 +2232,14 @@ impl Runtime {
         // CTX-0532: focus reporting follows the focused pane's own mode
         // register (primary fallback for session-less leaves), so a window
         // focus-in while a pane session owns the keyboard reports to the
-        // session that would receive the bytes.
+        // session that would receive the bytes. bitty#3026: a focus report is
+        // terminal protocol traffic, not typing, so it takes the no-snap
+        // route: a workspace switch delivers a focus-out/in pair, and the
+        // CTX-0243 snap-to-live on `push_input_bytes` returned every scrolled
+        // viewport to the bottom on every switch.
         if self.focused_modes().focus_events {
             let seq = if focused { "\x1b[I" } else { "\x1b[O" };
-            self.push_input_bytes(seq.as_bytes());
+            self.route_input_bytes(seq.as_bytes());
         }
         self.publish_inspect_snapshot();
     }

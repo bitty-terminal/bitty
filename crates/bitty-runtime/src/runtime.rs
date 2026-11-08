@@ -1430,6 +1430,19 @@ pub struct Runtime {
     kitty_log: log_throttle::LogThrottle,
     /// Rate-limited diagnostics for shell/forwarder spawn failures (CTX-0473).
     spawn_log: log_throttle::LogThrottle,
+    /// Consecutive empty renders of one text-bearing leaf and the leaf they
+    /// belong to (bitty#3032). Reset the moment that leaf renders again.
+    empty_leaf_retry: (Option<ViewId>, u8),
+    /// One bounded from-truth rebuild is owed for [`Self::empty_leaf_retry`]
+    /// (bitty#3032).
+    ///
+    /// Separate from `pending_full_redraw` because the guard runs while the
+    /// frame is being built: the present that follows consumes the redraw
+    /// flags at its start, so a flag set there would never survive to the next
+    /// tick. This one is folded into the next tick's `pending_full` instead.
+    empty_leaf_retry_owed: bool,
+    /// Rate-limited diagnostic for the bounded empty-leaf retry (bitty#3032).
+    empty_leaf_log: log_throttle::LogThrottle,
     /// Total failed real-GPU presents (issue #2570).
     ///
     /// Drives the bounded log policy: the first [`GPU_PRESENT_LOG_BURST`]
@@ -1504,6 +1517,13 @@ pub struct Runtime {
     /// the retry/recovery/damage behaviour is deterministic without an adapter.
     #[cfg(test)]
     test_present: Option<TestPresentSeam>,
+    /// Test-only empty-leaf seam (bitty#3032): `(leaf, frames left)`.
+    ///
+    /// Clears that leaf's just-rendered primitives for the next `frames left`
+    /// frames, which is the one condition production cannot reach on demand:
+    /// a text-bearing leaf whose render comes back empty.
+    #[cfg(test)]
+    test_empty_leaf: Option<(ViewId, u32)>,
     pending_activation_gesture: Option<ActivationGesture>,
     /// Exact URI bound to [`Self::pending_activation_gesture`] at mint time
     /// (CTX-0577); consumed together with it so the live consumer never
@@ -2350,6 +2370,9 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
+            empty_leaf_retry: (None, 0),
+            empty_leaf_retry_owed: false,
+            empty_leaf_log: log_throttle::LogThrottle::new(log_throttle::LOG_THROTTLE_WINDOW, 1),
             gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
             // Issue #2589: the gate starts visible so the startup path and
@@ -2361,6 +2384,8 @@ impl Runtime {
             speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
+            #[cfg(test)]
+            test_empty_leaf: None,
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,
@@ -2677,6 +2702,9 @@ impl Runtime {
                 log_throttle::LOG_THROTTLE_WINDOW,
                 log_throttle::LOG_THROTTLE_BURST,
             ),
+            empty_leaf_retry: (None, 0),
+            empty_leaf_retry_owed: false,
+            empty_leaf_log: log_throttle::LogThrottle::new(log_throttle::LOG_THROTTLE_WINDOW, 1),
             gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
             // Issue #2589: the gate starts visible so the startup path and
@@ -2688,6 +2716,8 @@ impl Runtime {
             speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
+            #[cfg(test)]
+            test_empty_leaf: None,
             pending_activation_gesture: None,
             pending_activation_uri: None,
             hyperlink_press_uri: None,

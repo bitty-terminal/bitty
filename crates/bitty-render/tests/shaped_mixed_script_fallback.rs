@@ -90,8 +90,11 @@ fn mixed_han_and_emoji_gap_resolves_each_cluster() {
     let clusters = ShapedRunSource::shape_run(&mut shaper, "请\u{1F600}", &[primary], &attrs)
         .expect("shaping must not fail");
     assert_eq!(clusters.len(), 2, "one cluster per scalar");
-    // Host-independent: the Han cluster resolves from the fixture, on every
-    // image, because that is the reported bug.
+    // Host-independent: the Han cluster never ends up uncovered, because that
+    // is the reported bug. The extra face is appended after the host database
+    // and the fallback walk's family-name sort decides among them, so an image
+    // that does carry a CJK face may legitimately resolve Han from it; the
+    // vendored subset is what has to answer when the host cannot.
     assert!(
         !clusters[0].uncovered,
         "the Han cluster resolves even with no host CJK face, got {:?}",
@@ -101,14 +104,12 @@ fn mixed_han_and_emoji_gap_resolves_each_cluster() {
             clusters[0].uncovered
         )
     );
-    // Host-independent: the Han cluster must never end up uncovered, because
-    // that is the reported bug. The extra face is appended after the host
-    // faces (the fallback walk's family-name sort decides among them), so an
-    // image that does carry a CJK face may legitimately resolve Han from it;
-    // only an image with no Han coverage must fall through to the vendored
-    // subset, and that is where the fixture is mandatory.
+    // `host_covers` on this shaper would always answer yes: the fixture is one
+    // of its own faces. Probe a host-only stack to learn what the host itself
+    // can do, then hold the resolver to it.
+    let host_han = SwashSingle::new().is_ok_and(|mut host| host_covers(&mut host, '请'));
     let han_family = shaper.loaded_face_family(clusters[0].face);
-    if host_covers(&mut shaper, '请') {
+    if host_han {
         assert!(
             han_family.is_some(),
             "the Han cluster must resolve to a loaded face, got {:?}",

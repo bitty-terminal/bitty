@@ -226,6 +226,12 @@ impl ConPtyChild {
 /// may modify the buffer while parsing, so the caller passes it by unique
 /// borrow.
 fn build_command_line(program: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
+    if program.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "program must not be empty",
+        ));
+    }
     let mut command_line = Vec::new();
     append_quoted(program, &mut command_line)?;
     for arg in args {
@@ -248,14 +254,12 @@ fn append_quoted(arg: &OsStr, command_line: &mut Vec<u16>) -> io::Result<()> {
             "command line argument must not contain NUL",
         ));
     }
-    // Space, tab, newline, vertical tab, and double quote force quoting
-    // (u16 code units: patterns cannot carry `as` casts), as does a
-    // trailing backslash (see above).
+    // Space, ASCII control whitespace (\t, \n, \x0B, \x0C, \r), and double
+    // quote force quoting (u16 code units: patterns cannot carry `as` casts),
+    // as does a trailing backslash (see above).
     let needs_quotes = wide.is_empty()
         || wide.last() == Some(&(b'\\' as u16))
-        || wide
-            .iter()
-            .any(|unit| matches!(*unit, 32 | 9 | 10 | 11 | 34));
+        || wide.iter().any(|unit| matches!(*unit, 32 | 9..=13 | 34));
     if !needs_quotes {
         command_line.extend_from_slice(&wide);
         return Ok(());
@@ -418,6 +422,20 @@ mod tests {
         let bad = OsString::from_wide(&['a' as u16, 0, 'b' as u16]);
         let error = build_command_line(OsStr::new("prog"), &[bad]).expect_err("NUL refused");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn empty_program_is_refused() {
+        let error = build_command_line(OsStr::new(""), &[os("/c")]).expect_err("empty program");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn carriage_return_and_form_feed_args_are_quoted() {
+        let line = build_command_line(OsStr::new("prog"), &[os("a\rb"), os("c\x0cd")])
+            .expect("command line");
+        let text = String::from_utf16(&line[..line.len() - 1]).expect("utf16");
+        assert_eq!(text, "prog \"a\rb\" \"c\x0cd\"");
     }
 
     #[test]

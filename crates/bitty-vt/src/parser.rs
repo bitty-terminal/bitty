@@ -712,23 +712,6 @@ impl Parser {
                         apc_discarding,
                         control_string,
                     );
-                } else if next == 0x18 || next == 0x1A {
-                    abort_apc(
-                        kitty,
-                        apc_buf,
-                        apc_payload,
-                        in_apc,
-                        apc_discarding,
-                        control_string,
-                    );
-                    feed_vte(
-                        state_machine,
-                        &mut bridge,
-                        control_string,
-                        reject_log,
-                        &[next],
-                    );
-                    i = 1;
                 } else if next == b'_' {
                     abort_apc(
                         kitty,
@@ -851,14 +834,33 @@ impl Parser {
                     OscOutcome::FinishedThenPassThrough => {
                         control_string.end_diversion();
                         finish_iterm2(&mut bridge, iterm2, reject_log);
-                        feed_vte(
-                            state_machine,
-                            &mut bridge,
-                            control_string,
-                            reject_log,
-                            iterm2.replay(),
-                        );
                         iterm2.clear_replay();
+                        if byte == b'_' {
+                            begin_apc(
+                                kitty,
+                                apc_buf,
+                                apc_payload,
+                                in_apc,
+                                apc_discarding,
+                                control_string,
+                            );
+                            i += 1;
+                            continue;
+                        } else if byte == b']' {
+                            kitty.note_interleaved(1);
+                            control_string.begin_diversion();
+                            iterm2.begin();
+                            i += 1;
+                            continue;
+                        } else {
+                            feed_vte(
+                                state_machine,
+                                &mut bridge,
+                                control_string,
+                                reject_log,
+                                &[0x1B],
+                            );
+                        }
                     }
                 }
             }

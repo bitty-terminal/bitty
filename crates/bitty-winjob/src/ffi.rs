@@ -350,9 +350,16 @@ impl Drop for PseudoConsole {
     }
 }
 
-/// Validates a console dimension: `COORD` carries `i16` lanes, so a `u16`
-/// size that does not fit is refused instead of truncating.
+/// Validates a console dimension: `COORD` carries positive `i16` lanes, so a
+/// zero or oversized `u16` size is refused instead of truncating or passing a
+/// zero-sized viewport to `CreatePseudoConsole` / `ResizePseudoConsole`.
 fn console_lane(value: u16, what: &'static str) -> io::Result<i16> {
+    if value == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("console {what} must be non-zero"),
+        ));
+    }
     i16::try_from(value).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -685,4 +692,28 @@ pub(crate) fn set_standard_stream(which: STD_HANDLE, handle: RawHandle) -> io::R
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_lane_rejects_zero_and_oversized_dimensions() {
+        assert_eq!(
+            console_lane(0, "width").expect_err("zero refused").kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(console_lane(1, "width").expect("min"), 1);
+        assert_eq!(
+            console_lane(i16::MAX as u16, "height").expect("max"),
+            i16::MAX
+        );
+        assert_eq!(
+            console_lane(i16::MAX as u16 + 1, "height")
+                .expect_err("oversized refused")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }

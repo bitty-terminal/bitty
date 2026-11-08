@@ -24,17 +24,23 @@ use bitty_runtime::plugin_runtime::{
     CONFIG_LIST_MAX_BYTES, CONFIG_LIST_MAX_ROWS, ConfigApplyOutcome, ConfigChange,
     ConfigPreviewRendering, ConfigReadFailure, ConfigReadValue, ConfigSourceLabel,
     ConfigSourceList, ConfigSourceRow, ConfigValueRow, ConfigWriteBackend, ConfigWriteFailure,
-    PluginEnabledRendering, PluginList, PluginListRow, ProfileList, ProfileListRow,
-    ProfileUseRendering, candidate_digest, list_row_bytes,
+    PluginEnabledRendering, PluginList, PluginListRow, ProfileCloneOptions, ProfileCloneOutcome,
+    ProfileCreateOptions, ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome,
+    ProfileLifecycleRendering, ProfileList, ProfileListRow, ProfileRenameOptions,
+    ProfileRenameOutcome, ProfileUseRendering, ProfileWriteFailure, candidate_digest,
+    list_row_bytes,
 };
 
 use crate::config_cli::ConfigValue;
 use crate::init::render_selector_lua;
 use crate::plugin::{self, PluginFailure};
 use crate::profile::{
-    PROFILE_SCAN_CAP, SchemaField, UserLayerConfigWriter, bounded_line_diff,
-    effective_profile_name, resolved_profile_name, rewrite_selector_profile, scan_names,
-    schema_field_entry, selector_profile_from_path, validate_prospective_selector_for_write,
+    PROFILE_SCAN_CAP, SchemaField, UserLayerConfigWriter, apply_profile_clone_in_dir,
+    apply_profile_create_in_dir, apply_profile_delete_in_dir, apply_profile_rename_in_dir,
+    bounded_line_diff, effective_profile_name, preview_profile_clone_in_dir,
+    preview_profile_create_in_dir, preview_profile_delete_in_dir, preview_profile_rename_in_dir,
+    resolved_profile_name, rewrite_selector_profile, scan_names, schema_field_entry,
+    selector_profile_from_path, validate_prospective_selector_for_write,
 };
 
 /// One app-side backend implementing every `config.manage` method.
@@ -520,6 +526,198 @@ impl ConfigWriteBackend for AppConfigManage {
         let pending_restart = crate::config_reload::classify_profile_switch(name);
         Ok(ConfigApplyOutcome::Applied { pending_restart })
     }
+
+    fn preview_profile_create(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        options: &ProfileCreateOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        preview_profile_create_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            name,
+            options,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.preview_create", failure);
+        })
+    }
+
+    fn apply_profile_create(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        options: &ProfileCreateOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileCreateOutcome, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        apply_profile_create_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            name,
+            options,
+            expected_candidate_digest,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.create", failure);
+        })
+    }
+
+    fn preview_profile_clone(
+        &self,
+        plugin_id: &str,
+        src: &str,
+        dst: &str,
+        options: &ProfileCloneOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        preview_profile_clone_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            src,
+            dst,
+            options,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.preview_clone", failure);
+        })
+    }
+
+    fn apply_profile_clone(
+        &self,
+        plugin_id: &str,
+        src: &str,
+        dst: &str,
+        options: &ProfileCloneOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileCloneOutcome, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        apply_profile_clone_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            src,
+            dst,
+            options,
+            expected_candidate_digest,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.clone", failure);
+        })
+    }
+
+    fn preview_profile_rename(
+        &self,
+        plugin_id: &str,
+        old: &str,
+        new: &str,
+        options: &ProfileRenameOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        preview_profile_rename_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            old,
+            new,
+            options,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.preview_rename", failure);
+        })
+    }
+
+    fn apply_profile_rename(
+        &self,
+        plugin_id: &str,
+        old: &str,
+        new: &str,
+        options: &ProfileRenameOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileRenameOutcome, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        apply_profile_rename_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            old,
+            new,
+            options,
+            expected_candidate_digest,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.rename", failure);
+        })
+    }
+
+    fn preview_profile_delete(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        options: &ProfileDeleteOptions,
+    ) -> Result<ProfileLifecycleRendering, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        preview_profile_delete_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            name,
+            options,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.preview_delete", failure);
+        })
+    }
+
+    fn apply_profile_delete(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        options: &ProfileDeleteOptions,
+        expected_candidate_digest: &str,
+    ) -> Result<ProfileDeleteOutcome, ProfileWriteFailure> {
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        apply_profile_delete_in_dir(
+            &self.profiles_dir,
+            &self.target,
+            active.as_deref(),
+            name,
+            options,
+            expected_candidate_digest,
+        )
+        .inspect_err(|failure| {
+            log_profile_refusal(plugin_id, "profiles.delete", failure);
+        })
+    }
 }
 
 /// Map one `bitty-config` projected value onto the wire scalar.
@@ -559,6 +757,17 @@ fn plugin_read_failure(failure: PluginFailure) -> ConfigReadFailure {
 fn log_refusal(plugin_id: &str, verb: &str, failure: ConfigWriteFailure) {
     crate::logging::warn(|| {
         format!("bitty: config.manage {verb} by '{plugin_id}' refused ({failure:?})")
+    });
+}
+
+/// Log a profile lifecycle refusal with plugin attribution.
+fn log_profile_refusal(plugin_id: &str, verb: &str, failure: &ProfileWriteFailure) {
+    crate::logging::warn(|| {
+        format!(
+            "bitty: config.manage {verb} by '{plugin_id}' refused ({}: {})",
+            failure.kind.code(),
+            failure.message
+        )
     });
 }
 
@@ -1565,6 +1774,178 @@ mod tests {
             selector.contains("profile = \"default\""),
             "a failed write leaves the selector intact"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_lifecycle_create_clone_rename_delete_round_trip_and_refusals() {
+        use bitty_runtime::plugin_runtime::ProfileFailureKind;
+
+        let dir = scratch("profile-lifecycle");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
+        std::fs::write(
+            dir.join("profiles/default.lua"),
+            "return { appearance = { theme = \"dark\" } }\n",
+        )
+        .expect("default");
+        std::fs::write(
+            dir.join("init.lua"),
+            "return { format = \"bitty-profile-v1\", profile = \"default\" }\n",
+        )
+        .expect("selector");
+
+        let backend = backend(&dir, None);
+
+        // 1. Create a plain profile.
+        let create_opts = ProfileCreateOptions::default();
+        let preview = backend
+            .preview_profile_create("p", "work", &create_opts)
+            .expect("preview create");
+        assert!(preview.changed);
+        assert!(!preview.replaces_existing);
+        assert_eq!(preview.changed_keys, vec!["profiles.work"]);
+        let created = backend
+            .apply_profile_create("p", "work", &create_opts, &preview.candidate_digest)
+            .expect("apply create");
+        assert_eq!(created.name, "work");
+        assert!(!created.replaced);
+        assert!(!created.backed_up);
+        assert!(dir.join("profiles/work.lua").is_file());
+
+        // 2. Creating an existing profile without force conflicts.
+        let conflict = backend
+            .preview_profile_create("p", "work", &create_opts)
+            .expect_err("existing conflicts");
+        assert_eq!(conflict.kind, ProfileFailureKind::Conflict);
+        assert!(!conflict.message.contains('/') && !conflict.message.contains('\\'));
+
+        // 3. Creating with `preset = "light"` and `force = true` backs up the replaced profile.
+        let force_preset = ProfileCreateOptions {
+            force: true,
+            from: None,
+            preset: Some("light".to_string()),
+        };
+        let preview = backend
+            .preview_profile_create("p", "work", &force_preset)
+            .expect("preview force preset");
+        assert!(preview.replaces_existing);
+        let replaced = backend
+            .apply_profile_create("p", "work", &force_preset, &preview.candidate_digest)
+            .expect("apply force preset");
+        assert!(replaced.replaced);
+        assert!(replaced.backed_up);
+        assert_eq!(replaced.preset.as_deref(), Some("light"));
+        let has_work_backup = std::fs::read_dir(dir.join("profiles"))
+            .expect("read profiles")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("work.lua.bak-")
+            });
+        assert!(
+            has_work_backup,
+            "force create must leave a timestamped backup"
+        );
+
+        // 4. Clone `work` -> `work-copy`.
+        let clone_opts = ProfileCloneOptions::default();
+        let preview = backend
+            .preview_profile_clone("p", "work", "work-copy", &clone_opts)
+            .expect("preview clone");
+        let cloned = backend
+            .apply_profile_clone(
+                "p",
+                "work",
+                "work-copy",
+                &clone_opts,
+                &preview.candidate_digest,
+            )
+            .expect("apply clone");
+        assert_eq!(cloned.source, "work");
+        assert_eq!(cloned.target, "work-copy");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("profiles/work-copy.lua")).expect("copy"),
+            std::fs::read_to_string(dir.join("profiles/work.lua")).expect("work"),
+        );
+
+        // 5. Switch active selector to `work-copy`, then rename `work-copy` -> `work-renamed`
+        //    and verify the persisted selector updates automatically.
+        let switch_preview = backend
+            .preview_profile_use("p", "work-copy")
+            .expect("preview use");
+        backend
+            .apply_profile_use("p", "work-copy", &switch_preview.candidate_digest)
+            .expect("apply use");
+        let rename_opts = ProfileRenameOptions::default();
+        let preview = backend
+            .preview_profile_rename("p", "work-copy", "work-renamed", &rename_opts)
+            .expect("preview rename");
+        assert!(preview.selector_updated);
+        let renamed = backend
+            .apply_profile_rename(
+                "p",
+                "work-copy",
+                "work-renamed",
+                &rename_opts,
+                &preview.candidate_digest,
+            )
+            .expect("apply rename");
+        assert!(renamed.selector_updated);
+        assert!(!dir.join("profiles/work-copy.lua").exists());
+        assert!(dir.join("profiles/work-renamed.lua").is_file());
+        let selector = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
+        assert!(
+            selector.contains("profile = \"work-renamed\""),
+            "{selector}"
+        );
+
+        // 6. Refusal: cannot delete active profile `work-renamed` without `force = true`.
+        let del_opts = ProfileDeleteOptions::default();
+        let active_err = backend
+            .preview_profile_delete("p", "work-renamed", &del_opts)
+            .expect_err("active profile refused");
+        assert_eq!(active_err.kind, ProfileFailureKind::Conflict);
+
+        // 7. Refusal: cannot delete or rename a profile extended by another profile.
+        std::fs::write(
+            dir.join("profiles/child.lua"),
+            "return { extends = \"work\" }\n",
+        )
+        .expect("child");
+        let ext_del_err = backend
+            .preview_profile_delete("p", "work", &ProfileDeleteOptions { force: true })
+            .expect_err("extended profile refused even with force");
+        assert_eq!(ext_del_err.kind, ProfileFailureKind::Conflict);
+        assert!(ext_del_err.message.contains("child"));
+        let ext_ren_err = backend
+            .preview_profile_rename("p", "work", "work2", &ProfileRenameOptions { force: true })
+            .expect_err("extended profile rename refused");
+        assert_eq!(ext_ren_err.kind, ProfileFailureKind::Conflict);
+
+        // 8. Delete `child` (inactive, no dependents) and verify backup is created.
+        let preview = backend
+            .preview_profile_delete("p", "child", &del_opts)
+            .expect("preview delete child");
+        let deleted = backend
+            .apply_profile_delete("p", "child", &del_opts, &preview.candidate_digest)
+            .expect("apply delete child");
+        assert_eq!(deleted.name, "child");
+        assert!(deleted.backed_up);
+        assert!(!deleted.was_active);
+        assert!(!dir.join("profiles/child.lua").exists());
+        let has_child_backup = std::fs::read_dir(dir.join("profiles"))
+            .expect("read profiles")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("child.lua.bak-")
+            });
+        assert!(has_child_backup, "delete must keep a timestamped backup");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

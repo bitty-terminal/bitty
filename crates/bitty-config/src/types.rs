@@ -4436,6 +4436,11 @@ impl EffectiveConfig {
         self.selection.validate()?;
         self.history.validate()?;
         self.layout.validate()?;
+        self.workspace.validate()?;
+        self.chrome.validate()?;
+        if let Some(ms) = self.leader_timeout_ms {
+            crate::keymap::validate_leader_timeout_ms(ms)?;
+        }
         self.decoration.validate()?;
         // CTX-0343: every merged `views` entry must stay structurally valid
         // (grammar/bounds); the per-View AC-1/AC-2 contrast check then runs
@@ -7928,6 +7933,42 @@ mod tests {
             safe,
             EffectiveConfig::default().with_safe_decoration(),
             "safe is deterministic regardless of input styling"
+        );
+    }
+
+    #[test]
+    fn effective_config_validate_covers_workspace_chrome_and_leader_timeout() {
+        let bad_ws = EffectiveConfig {
+            workspace: WorkspaceConfig {
+                layout: Some("INVALID UPPER".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            bad_ws.validate().unwrap_err().field(),
+            Some("workspace.layout")
+        );
+
+        let bad_chrome = EffectiveConfig {
+            chrome: ChromeConfig {
+                bottom_order: vec![String::new()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            bad_chrome.validate().unwrap_err().field(),
+            Some("chrome.bottom.order")
+        );
+
+        let bad_leader = EffectiveConfig {
+            leader_timeout_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            bad_leader.validate().unwrap_err().field(),
+            Some("leader_timeout_ms")
         );
     }
 }

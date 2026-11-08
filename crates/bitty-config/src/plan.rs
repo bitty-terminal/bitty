@@ -364,6 +364,9 @@ impl ConfigPlan {
         if let Some(w) = &self.workspace {
             w.validate()?;
         }
+        if let Some(c) = &self.chrome {
+            c.validate()?;
+        }
         if let Some(d) = &self.decoration {
             d.validate()?;
         }
@@ -430,6 +433,8 @@ impl ConfigPlan {
                 .is_none_or(HistoryConfigPlan::is_empty)
             && self.close_confirm.is_none()
             && self.layout.is_none()
+            && self.workspace.is_none()
+            && self.chrome.is_none()
             && self.decoration.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
@@ -651,5 +656,33 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn plan_validate_rejects_invalid_chrome() {
+        let p = ConfigPlan {
+            chrome: Some(ChromeConfig {
+                top_order: vec![String::new()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = p.validate().unwrap_err();
+        assert_eq!(err.field(), Some("chrome.top.order"));
+    }
+
+    #[test]
+    fn plan_is_empty_covers_workspace_and_chrome() {
+        let with_ws = ConfigPlan {
+            workspace: Some(WorkspaceConfig::default()),
+            ..Default::default()
+        };
+        assert!(!with_ws.is_empty());
+
+        let with_chrome = ConfigPlan {
+            chrome: Some(ChromeConfig::default()),
+            ..Default::default()
+        };
+        assert!(!with_chrome.is_empty());
     }
 }

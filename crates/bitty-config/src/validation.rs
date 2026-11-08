@@ -136,6 +136,16 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(e);
         }
     }
+    if let Some(v) = &plan.workspace {
+        if let Err(e) = v.validate() {
+            out.push(e);
+        }
+    }
+    if let Some(v) = &plan.chrome {
+        if let Err(e) = v.validate() {
+            out.push(e);
+        }
+    }
     if let Some(v) = &plan.decoration {
         if let Err(e) = v.validate() {
             out.push(e);
@@ -326,5 +336,30 @@ mod tests {
     #[test]
     fn empty_stack_valid() {
         validate_stack(&[]).expect("empty stack valid");
+    }
+
+    #[test]
+    fn collect_diagnostics_covers_workspace_and_chrome() {
+        use crate::types::{ChromeConfig, WorkspaceConfig};
+        let plan = ConfigPlan {
+            workspace: Some(WorkspaceConfig {
+                layout: Some("INVALID UPPER".into()),
+                ..Default::default()
+            }),
+            chrome: Some(ChromeConfig {
+                top_order: vec![String::new()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let diags = collect_diagnostics(&plan);
+        assert!(
+            diags.iter().any(|e| e.field() == Some("workspace.layout")),
+            "workspace.layout error must be collected: {diags:?}"
+        );
+        assert!(
+            diags.iter().any(|e| e.field() == Some("chrome.top.order")),
+            "chrome.top.order error must be collected: {diags:?}"
+        );
     }
 }

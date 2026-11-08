@@ -924,15 +924,65 @@ else
   fail "INSTALL.md or packaging/README.md does not reference the openSUSE recipe"
 fi
 
-# 11. Daemon coverage (bitty#3002, bitty#2999): a recipe that installs bittyd
-#     must select bitty-daemon in its build, so the install can never copy an
-#     artifact the build did not produce. Prebuilt recipes pass an empty build
-#     pattern: their payload is the release bundle, which
-#     scripts/make-unix-bundle.sh already asserts contains bin/bittyd.
+# 11. Daemon coverage (bitty#3002, bitty#2999, bitty#3010): a recipe that
+#     installs bittyd must select bitty-daemon in its build, so the install can
+#     never copy an artifact the build did not produce. The install needle is
+#     matched only inside the packing section, never over the whole file: a
+#     `./target/release/bittyd --version` probe in check() proves the binary was
+#     built, it never proves the package ships it (bitty#3010 hole 1).
+#     Comments are stripped on both needles so a commented-out invocation gates
+#     nothing (bitty#3010 hole 2). Prebuilt recipes pass an empty build pattern:
+#     their payload is the release bundle, which scripts/make-unix-bundle.sh
+#     already asserts contains bin/bittyd.
+
+# strip_comments — drop trailing `#` comments and whole comment lines, so a
+# recipe that only *mentions* an invocation in a comment cannot satisfy a gate.
+strip_comments() {
+  sed -E 's/[[:space:]]#.*$//' | grep -Ev '^[[:space:]]*#'
+}
+
+# pack_section FILE — print only the body that copies built artifacts into the
+# package: package()/post_install()/src_install() for shell recipes, the RPM
+# %install stage for a spec, and the Solus YAML `install:` block. check() and
+# %check are deliberately not part of the evidence: they run after the build
+# and say nothing about what the package installs.
+pack_section() {
+  local file=$1
+  case $file in
+  */package.yml)
+    awk '
+      /^install:[[:space:]]*\|/ { inside = 1; next }
+      inside && /^[[:space:]]*#/ { next }
+      inside && /^[^[:space:]]/ { exit }
+      inside { print }
+    ' "$file"
+    ;;
+  *.spec)
+    awk '
+      /^%install([[:space:]]|$)/ { inside = 1; next }
+      inside && /^%/ { exit }
+      inside { print }
+    ' "$file"
+    ;;
+  *)
+    awk '
+      /^(package|post_install|src_install)\(\)[[:space:]]*\{/ { inside = 1; next }
+      inside && /^\}/ { exit }
+      inside { print }
+    ' "$file"
+    ;;
+  esac
+}
+
 daemon_gate() { # <label> <file> <install-ere> <build-ere|"">
   local label=$1 file=$2 install_ere=$3 build_ere=$4
-  if grep -Eq -- "$install_ere" "$file"; then
-    if [[ -n "$build_ere" ]] && ! grep -Eq -- "$build_ere" "$file"; then
+  local install_body build_body
+  install_body="$(pack_section "$file" | strip_comments || true)"
+  build_body="$(strip_comments <"$file" || true)"
+  if [[ -z "${install_body//[[:space:]]/}" ]]; then
+    fail "$label has no recognizable install section in ${file#"$REPO_ROOT"/} (expected package(), src_install(), %install, or a Solus install: block)"
+  elif grep -Eq -- "$install_ere" <<<"$install_body"; then
+    if [[ -n "$build_ere" ]] && ! grep -Eq -- "$build_ere" <<<"$build_body"; then
       fail "$label installs bittyd but never builds bitty-daemon"
     else
       pass "$label builds bitty-daemon before installing bittyd"
@@ -943,15 +993,15 @@ daemon_gate() { # <label> <file> <install-ere> <build-ere|"">
 }
 
 daemon_gate "Arch source recipe" "$REPO_ROOT/packaging/PKGBUILD" \
-  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+  'target/release/bittyd' '-p[[:space:]]+bitty-daemon'
 daemon_gate "Alpine APKBUILD" "$ALPINE_APKBUILD" \
-  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+  'target/release/bittyd' '-p[[:space:]]+bitty-daemon'
 daemon_gate "openSUSE spec" "$OPENSPEC" \
-  'target/release/bittyd' '\-p[[:space:]]+bitty-daemon'
+  'target/release/bittyd' '-p[[:space:]]+bitty-daemon'
 daemon_gate "Void template" "$VOID_TEMPLATE" \
-  'crates/bitty-daemon' '\-p[[:space:]]+bitty-daemon'
+  'crates/bitty-daemon' '-p[[:space:]]+bitty-daemon'
 daemon_gate "Solus recipe" "$SOLUS_RECIPE" \
-  '%cargo_install[[:space:]].*bittyd' '\-\-package[[:space:]]+bitty-daemon'
+  '%cargo_install[[:space:]].*bittyd' '--package[[:space:]]+bitty-daemon'
 if [[ -n "$src_ebuild" ]]; then
   daemon_gate "Gentoo source ebuild" "$src_ebuild" \
     'cargo_src_install.*bitty-daemon' 'cargo_src_compile.*bitty-daemon'

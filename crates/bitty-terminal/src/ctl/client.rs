@@ -495,9 +495,9 @@ pub(super) fn connect_verified_endpoint(
 pub(super) fn parse_ctl_response(payload: &[u8]) -> Result<CtlIpcOutcome, String> {
     let text = std::str::from_utf8(payload)
         .map_err(|_| String::from("bitty ctl: response is not utf-8 json"))?;
-    if text.contains("\"result\"") && !text.contains("\"error\"") {
-        let result = extract_top_value(text, "result")
-            .ok_or_else(|| String::from("bitty ctl: response has no result"))?;
+    let result_val = extract_top_value(text, "result");
+    let error_val = extract_top_value(text, "error");
+    if let Some(result) = result_val.filter(|_| error_val.is_none()) {
         return Ok(CtlIpcOutcome {
             ok: true,
             result_json: result,
@@ -506,8 +506,7 @@ pub(super) fn parse_ctl_response(payload: &[u8]) -> Result<CtlIpcOutcome, String
             message: String::new(),
         });
     }
-    if text.contains("\"error\"") {
-        let err_obj = extract_top_value(text, "error").unwrap_or_default();
+    if let Some(err_obj) = error_val {
         let category =
             extract_string_from(&err_obj, "category").unwrap_or_else(|| String::from("transport"));
         let code =
@@ -525,47 +524,46 @@ pub(super) fn parse_ctl_response(payload: &[u8]) -> Result<CtlIpcOutcome, String
     Err(String::from("bitty ctl: malformed response envelope"))
 }
 
-/// Extract a top-level `"key": <value>` JSON value (object, string, number,
-/// bool, null) as raw text. Balanced-brace scan, quote-aware.
-//
-// Used by both the unix IPC client (`parse_ctl_response`) and the
-// platform-independent table renderer (`render_table`), so it stays
-// compiled on all targets.
-fn extract_top_value(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let pos = text.find(&needle)?;
-    let after = &text[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let mut rest = after[colon + 1..].trim_start();
-    if rest.is_empty() {
+/// Scan a JSON string literal starting at `s` (whose first byte must be `"`),
+/// returning the byte length of the literal including both quotes.
+fn scan_json_string(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first().copied() != Some(b'"') {
         return None;
     }
-    let first = rest.as_bytes()[0];
-    if first == b'"' {
-        // String: scan to closing unescaped quote.
-        let mut i = 1usize;
-        let bytes = rest.as_bytes();
-        while i < bytes.len() {
-            match bytes[i] {
-                b'"' => {
-                    return Some(rest[..i + 1].to_string());
-                }
-                b'\\' => {
-                    i += 2;
-                }
-                _ => {
-                    let ch = rest[i..].chars().next()?;
-                    i += ch.len_utf8();
-                }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(i + 1),
+            b'\\' => {
+                i += 1;
+                let ch = s.get(i..)?.chars().next()?;
+                i += ch.len_utf8();
+            }
+            _ => {
+                let ch = s.get(i..)?.chars().next()?;
+                i += ch.len_utf8();
             }
         }
-        return None;
     }
-    if first == b'{' {
-        let mut depth = 0usize;
+    None
+}
+
+/// Scan a single JSON value (object, array, string, number, bool, or null)
+/// starting at `s` (already trimmed of leading whitespace) and return the
+/// raw slice covering that value.
+fn scan_json_value(s: &str) -> Option<&str> {
+    let first = *s.as_bytes().first()?;
+    if first == b'"' {
+        let len = scan_json_string(s)?;
+        return Some(&s[..len]);
+    }
+    if first == b'{' || first == b'[' {
+        let mut brace_depth = 0usize;
+        let mut bracket_depth = 0usize;
         let mut in_str = false;
         let mut esc = false;
-        for (idx, ch) in rest.char_indices() {
+        for (idx, ch) in s.char_indices() {
             if in_str {
                 if esc {
                     esc = false;
@@ -578,11 +576,18 @@ fn extract_top_value(text: &str, key: &str) -> Option<String> {
             }
             match ch {
                 '"' => in_str = true,
-                '{' => depth += 1,
+                '{' => brace_depth += 1,
                 '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(rest[..idx + ch.len_utf8()].to_string());
+                    brace_depth = brace_depth.checked_sub(1)?;
+                    if brace_depth == 0 && bracket_depth == 0 {
+                        return Some(&s[..idx + ch.len_utf8()]);
+                    }
+                }
+                '[' => bracket_depth += 1,
+                ']' => {
+                    bracket_depth = bracket_depth.checked_sub(1)?;
+                    if brace_depth == 0 && bracket_depth == 0 {
+                        return Some(&s[..idx + ch.len_utf8()]);
                     }
                 }
                 _ => {}
@@ -590,13 +595,39 @@ fn extract_top_value(text: &str, key: &str) -> Option<String> {
         }
         return None;
     }
-    // Number/bool/null: to next `,` or `}`.
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    rest = rest[..end].trim_end();
-    if rest.is_empty() {
+    let end = s.find([',', '}', ']']).unwrap_or(s.len());
+    let val = s[..end].trim_end();
+    if val.is_empty() {
         return None;
     }
-    Some(rest.to_string())
+    Some(val)
+}
+
+/// Extract a top-level (depth == 1) `"key": <value>` JSON value (object,
+/// array, string, number, bool, null) as raw text. Quote- and depth-aware.
+//
+// Used by both the unix IPC client (`parse_ctl_response`) and the
+// platform-independent table renderer (`render_table`), so it stays
+// compiled on all targets.
+pub(super) fn extract_top_value(text: &str, key: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    let mut rest = trimmed.strip_prefix('{')?;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() || rest.starts_with('}') {
+            return None;
+        }
+        let key_len = scan_json_string(rest)?;
+        let raw_key = &rest[..key_len];
+        rest = rest[key_len..].trim_start();
+        rest = rest.strip_prefix(':')?.trim_start();
+        let val = scan_json_value(rest)?;
+        if unescape_json_string(raw_key).as_deref() == Some(key) {
+            return Some(val.to_string());
+        }
+        rest = rest[val.len()..].trim_start();
+        rest = rest.strip_prefix(',')?;
+    }
 }
 
 /// Extract a `"key": "string"` field from a flat JSON object (unescaped).
@@ -625,6 +656,9 @@ fn unescape_json_string(literal: &str) -> Option<String> {
         match chars.next()? {
             '"' => out.push('"'),
             '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
             'n' => out.push('\n'),
             'r' => out.push('\r'),
             't' => out.push('\t'),

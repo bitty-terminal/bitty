@@ -761,10 +761,10 @@ if [[ -f "$OPENSPEC" ]]; then
   done
 
   # Cargo invocation: source build of the binary crate, no prebuilt payload.
-  if grep -qE '^cargo build --release (--locked )?-p bitty-terminal --bin bitty$' "$OPENSPEC"; then
-    pass "openSUSE spec builds the binary with cargo"
+  if grep -qE '^cargo build --release (--locked )?-p bitty-terminal --bin bitty -p bitty-daemon --bin bittyd$' "$OPENSPEC"; then
+    pass "openSUSE spec builds both binaries with cargo"
   else
-    fail "openSUSE spec missing 'cargo build --release -p bitty-terminal --bin bitty'"
+    fail "openSUSE spec missing 'cargo build --release -p bitty-terminal --bin bitty -p bitty-daemon --bin bittyd'"
   fi
 
   # Terminfo is compiled, never installed as the raw source file.

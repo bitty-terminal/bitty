@@ -53,7 +53,8 @@ sudo eopkg install bitty-0.0.31-1-1-x86_64.eopkg
 
 ## Features
 
-- Uses Solus `%cargo_build` and `%cargo_install` macros targeting `bitty-terminal`.
+- Uses Solus `%cargo_build` and `%cargo_install` macros targeting both the
+  `bitty` and `bittyd` binaries.
 - Automatically installs desktop entry (`run.bitty.Bitty.desktop`), AppStream
   metadata (`run.bitty.Bitty.metainfo.xml`), and Hicolor icons (16px to 512px + SVG).
 - Compiles the terminfo database into `/usr/share/terminfo` using `tic -x`.

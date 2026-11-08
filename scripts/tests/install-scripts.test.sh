@@ -242,6 +242,11 @@ make_fake_bitty() { # <path> <version>: executable --version smoke stub.
   chmod +x "$1"
 }
 
+make_fake_bittyd() { # <path> <version>: executable daemon --version smoke stub.
+  printf '#!/bin/sh\necho "bittyd %s (service API v1)"\n' "$2" >"$1"
+  chmod +x "$1"
+}
+
 # macOS bare-binary fixtures (both arches so host-native auto-detect works
 # on either runner; no tar needed on this path).
 make_fake_bitty "$FAKE_REL/bitty-aarch64-apple-darwin" "$FAKE_VER"
@@ -251,7 +256,7 @@ write_sidecar "$FAKE_REL/bitty-x86_64-apple-darwin"
 
 # 9a. macOS live install via the pointer (no --version): fetch, verify,
 # extract-free copy, smoke.
-mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bin" 2>&1)" && mac_status=0 || mac_status=$?
+mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" XDG_DATA_HOME="$TMP/fake-data" "$SCRIPT" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bin" 2>&1)" && mac_status=0 || mac_status=$?
 if ((mac_status != 0)); then
   echo "FAIL: macOS pointer install exited $mac_status" >&2
   printf '%s\n' "$mac_out" >&2
@@ -271,7 +276,7 @@ else
 fi
 
 # 9b. Explicit --version against the fake CDN agrees with the pointer.
-mac_exp_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-exp-bin" 2>&1)" && mac_exp_status=0 || mac_exp_status=$?
+mac_exp_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" XDG_DATA_HOME="$TMP/fake-data" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-exp-bin" 2>&1)" && mac_exp_status=0 || mac_exp_status=$?
 if ((mac_exp_status != 0)); then
   echo "FAIL: macOS explicit-version install exited $mac_exp_status" >&2
   printf '%s\n' "$mac_exp_out" >&2
@@ -284,7 +289,7 @@ fi
 # 9c. Corrupted macOS payload fails closed on the sidecar.
 cp "$FAKE_REL/bitty-aarch64-apple-darwin" "$TMP/mac-good"
 printf 'tamper' >>"$FAKE_REL/bitty-aarch64-apple-darwin"
-corrupt_mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bad" 2>&1)" && corrupt_mac_status=0 || corrupt_mac_status=$?
+corrupt_mac_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" XDG_DATA_HOME="$TMP/fake-data" "$SCRIPT" --version "$FAKE_VER" --target aarch64-apple-darwin --bin-dir "$TMP/fake-mac-bad" 2>&1)" && corrupt_mac_status=0 || corrupt_mac_status=$?
 cp "$TMP/mac-good" "$FAKE_REL/bitty-aarch64-apple-darwin"
 if ((corrupt_mac_status == 0)); then
   echo "FAIL: corrupted macOS payload installed but failure was expected" >&2
@@ -309,10 +314,17 @@ elif ! command -v tar >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1; then
 else
   BUNDLE_TOP="bitty-$FAKE_VER-x86_64-unknown-linux-gnu"
   BUNDLE_STAGE="$TMP/bundle-stage"
-  mkdir -p "$BUNDLE_STAGE/$BUNDLE_TOP/bin" "$BUNDLE_STAGE/$BUNDLE_TOP/share/applications"
+  mkdir -p "$BUNDLE_STAGE/$BUNDLE_TOP/bin" \
+    "$BUNDLE_STAGE/$BUNDLE_TOP/share/applications" \
+    "$BUNDLE_STAGE/$BUNDLE_TOP/share/systemd/user"
   make_fake_bitty "$BUNDLE_STAGE/$BUNDLE_TOP/bin/bitty" "$FAKE_VER"
   chmod 755 "$BUNDLE_STAGE/$BUNDLE_TOP/bin/bitty"
+  # bitty#2998: the release bundle ships the daemon and the per-user unit, so
+  # the fixture carries both and the install legs assert them.
+  make_fake_bittyd "$BUNDLE_STAGE/$BUNDLE_TOP/bin/bittyd" "$FAKE_VER"
   printf 'fake desktop entry\n' >"$BUNDLE_STAGE/$BUNDLE_TOP/share/applications/fake.desktop"
+  printf '[Unit]\nDescription=fake bittyd\n' \
+    >"$BUNDLE_STAGE/$BUNDLE_TOP/share/systemd/user/bittyd.service"
   BUNDLE="$FAKE_REL/$BUNDLE_TOP.tar.zst"
   if ! (cd "$BUNDLE_STAGE" && tar -c "$BUNDLE_TOP" | zstd -19 -o "$BUNDLE" 2>/dev/null); then
     echo "FAIL: could not assemble the fake Linux bundle" >&2
@@ -322,13 +334,14 @@ else
     write_sidecar "$BUNDLE"
 
     # 9e. Linux pointer install hermetic (--bin-dir: binary-only, no share).
-    linux_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target x86_64-unknown-linux-gnu --bin-dir "$TMP/fake-linux-bin" 2>&1)" && linux_status=0 || linux_status=$?
+    linux_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" XDG_DATA_HOME="$TMP/fake-data" \
+      "$SCRIPT" --target x86_64-unknown-linux-gnu --bin-dir "$TMP/fake-linux-bin" 2>&1)" && linux_status=0 || linux_status=$?
     if ((linux_status != 0)); then
       echo "FAIL: Linux pointer install exited $linux_status" >&2
       printf '%s\n' "$linux_out" >&2
       FAIL=1
     else
-      for needle in 'checksum OK' 'smoke OK' 'skipping desktop integration'; do
+      for needle in 'checksum OK' 'smoke OK' 'skipping desktop integration' 'installed bittyd'; do
         if ! grep -qF -- "$needle" <<<"$linux_out"; then
           echo "FAIL: Linux pointer install missing '$needle'" >&2
           printf '%s\n' "$linux_out" >&2
@@ -339,10 +352,23 @@ else
         echo "FAIL: Linux pointer install binary does not report $FAKE_VER" >&2
         FAIL=1
       fi
+      if [[ ! -x "$TMP/fake-linux-bin/bittyd" ]]; then
+        echo "FAIL: Linux pointer install missing bin/bittyd" >&2
+        FAIL=1
+      fi
     fi
 
-    # 9f. Linux pointer install with --prefix carries share/ integration.
-    prefix_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target x86_64-unknown-linux-gnu --prefix "$TMP/fake-prefix" 2>&1)" && prefix_status=0 || prefix_status=$?
+    # 9f. Linux pointer install with --prefix carries share/ integration and
+    # installs the systemd user unit into the XDG config dir, not share/.
+    mkdir -p "$TMP/systemctl-bin"
+    cat >"$TMP/systemctl-bin/systemctl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:?}"
+STUB
+    chmod +x "$TMP/systemctl-bin/systemctl"
+    prefix_out="$(PATH="$TMP/systemctl-bin:$PATH" SYSTEMCTL_LOG="$TMP/systemctl.log" \
+      XDG_CONFIG_HOME="$TMP/fake-config" XDG_DATA_HOME="$TMP/fake-data" \
+      BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --target x86_64-unknown-linux-gnu --prefix "$TMP/fake-prefix" 2>&1)" && prefix_status=0 || prefix_status=$?
     if ((prefix_status != 0)); then
       echo "FAIL: Linux --prefix install exited $prefix_status" >&2
       printf '%s\n' "$prefix_out" >&2
@@ -352,12 +378,33 @@ else
         echo "FAIL: Linux --prefix install binary does not report $FAKE_VER" >&2
         FAIL=1
       fi
+      if [[ ! -x "$TMP/fake-prefix/bin/bittyd" ]]; then
+        echo "FAIL: Linux --prefix install missing bin/bittyd" >&2
+        FAIL=1
+      fi
+      if [[ ! -f "$TMP/fake-config/systemd/user/bittyd.service" ]]; then
+        echo "FAIL: Linux --prefix install missing systemd user unit" >&2
+        FAIL=1
+      fi
+      if [[ -e "$TMP/fake-prefix/share/systemd" ]]; then
+        echo "FAIL: Linux --prefix install left the unit under share/systemd" >&2
+        FAIL=1
+      fi
+      if ! grep -qF -- '--user daemon-reload' "$TMP/systemctl.log" 2>/dev/null; then
+        echo "FAIL: Linux --prefix install did not reload the systemd user manager" >&2
+        FAIL=1
+      fi
       if [[ ! -f "$TMP/fake-prefix/share/applications/fake.desktop" ]]; then
         echo "FAIL: Linux --prefix install missing share/applications/fake.desktop" >&2
         FAIL=1
       fi
       if ! grep -qF -- 'installed desktop integration' <<<"$prefix_out"; then
         echo "FAIL: Linux --prefix install missing desktop-integration note" >&2
+        printf '%s\n' "$prefix_out" >&2
+        FAIL=1
+      fi
+      if ! grep -qF -- 'smoke OK: bittyd stop (no daemon)' <<<"$prefix_out"; then
+        echo "FAIL: Linux --prefix install missing the bittyd stop smoke" >&2
         printf '%s\n' "$prefix_out" >&2
         FAIL=1
       fi
@@ -407,7 +454,7 @@ if [[ -n "$native_skip" ]]; then
   echo "SKIP: host-native leg ($native_skip)" >&2
 fi
 if ((run_native)); then
-  native_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" "$SCRIPT" --bin-dir "$TMP/fake-native-bin" 2>&1)" && native_status=0 || native_status=$?
+  native_out="$(BITTY_CDN_BASE="file://$FAKE_CDN" XDG_DATA_HOME="$TMP/fake-data" "$SCRIPT" --bin-dir "$TMP/fake-native-bin" 2>&1)" && native_status=0 || native_status=$?
   if ((native_status != 0)); then
     echo "FAIL: host-native pointer install exited $native_status ($host_os)" >&2
     printf '%s\n' "$native_out" >&2

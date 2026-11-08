@@ -30,6 +30,12 @@ USE_LANGUAGES=	c c++
 
 CARGO_BUILD_ARGS+=	-p bitty-terminal --bin bitty
 
+# `bittyd` is deliberately not built or installed. NetBSD is not a cell in the
+# accepted endpoint contract (D-15), so the daemon refuses it as an unlisted
+# platform: there is no reviewed peer-identity mechanism to serve a session
+# host with. Add the daemon (build, do-install, PLIST) in the same change that
+# makes the cell servable; until then the package ships the terminal only.
+
 INSTALLATION_DIRS+=	bin
 INSTALLATION_DIRS+=	share/applications
 INSTALLATION_DIRS+=	share/metainfo

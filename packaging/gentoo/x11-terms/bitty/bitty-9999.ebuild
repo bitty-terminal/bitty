@@ -25,7 +25,9 @@ LICENSE="MIT OR Apache-2.0"
 SLOT="0"
 # Live ebuild: never keyworded (Gentoo devmanual).
 KEYWORDS=""
-IUSE=""
+# OpenRC is the default profile; the per-user daemon unit only makes sense
+# under a systemd user manager, so it is gated instead of always installed.
+IUSE="systemd"
 
 # Direct NEEDED sonames only, aligned with packaging/linux/runtime-deps.toml:
 # libfontconfig.so.1 and libfreetype.so.6. libgcc_s.so.1 comes from the
@@ -43,7 +45,7 @@ BDEPEND="
 	virtual/rust
 "
 
-QA_FLAGS_IGNORED="usr/bin/bitty"
+QA_FLAGS_IGNORED="usr/bin/bitty usr/bin/bittyd"
 
 src_unpack() {
 	git-r3_src_unpack
@@ -51,15 +53,25 @@ src_unpack() {
 }
 
 src_compile() {
-	cargo_src_compile -p bitty-terminal --bin bitty
+	# `bittyd` is a separate workspace package (crates/bitty-daemon), so it
+	# needs its own package selection; both binaries ship from this ebuild.
+	cargo_src_compile -p bitty-terminal --bin bitty -p bitty-daemon --bin bittyd
 }
 
 src_test() {
 	cargo_src_test -p bitty-terminal --bin bitty
+	cargo_src_test -p bitty-daemon
 }
 
 src_install() {
-	cargo_src_install -p bitty-terminal --bin bitty
+	cargo_src_install -p bitty-terminal --bin bitty -p bitty-daemon --bin bittyd
+
+	# OpenRC profiles have no systemd user manager: users supervise
+	# `bittyd start` themselves (or write an OpenRC service).
+	if use systemd; then
+		insinto /usr/lib/systemd/user
+		doins packaging/systemd/bittyd.service
+	fi
 
 	domenu packaging/run.bitty.Bitty.desktop
 	insinto /usr/share/metainfo

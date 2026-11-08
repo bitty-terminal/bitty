@@ -30,7 +30,7 @@
 #
 #   --mode full       (release / on demand)
 #     * runs the unmodified recipe end to end: `makepkg --force --nocheck
-#       --syncdeps`, so cargo fetch/build really happen and every declared
+#       dependencies installed, so cargo fetch/build really happen and every declared
 #       dependency must exist in the pacman repos;
 #     * same package-content assertions on the real binary package.
 #     Ceiling: `--nocheck` skips the recipe's `check()` smoke test (project CI
@@ -144,25 +144,27 @@ command -v tic >/dev/null 2>&1 ||
 if [[ "$EUID" -eq 0 && -z "${AUR_GATE_AS_BUILDER:-}" ]]; then
   id builder >/dev/null 2>&1 || useradd --create-home builder ||
     die "cannot create the unprivileged 'builder' account"
-  # Full mode uses makepkg --syncdeps, which installs the recipe's declared
-  # dependencies through sudo. Grant the throwaway build account that one
-  # privilege — but only inside a container, where the rule dies with the
-  # sandbox. Running the gate as root on a developer host must not silently
-  # leave a passwordless sudo rule behind: there, run it as your normal user
-  # and let makepkg prompt.
-  if [[ "$MODE" == full ]]; then
-    if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
-      die "refusing to run --mode full as root outside a container; run it as your normal user so makepkg --syncdeps can use your sudo"
-    fi
-    command -v sudo >/dev/null 2>&1 ||
-      die "full mode needs sudo for makepkg --syncdeps (pacman -S --needed sudo)"
-    printf 'builder ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/aur-gate-builder
-    chmod 440 /etc/sudoers.d/aur-gate-builder
-    visudo -cf /etc/sudoers.d/aur-gate-builder >/dev/null ||
-      die "generated sudoers rule for builder is invalid"
-  fi
   WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/aur-source-build.XXXXXX")"
   chown -R builder:builder "$WORKROOT"
+  # Full mode installs the recipe's declared dependencies here, as root, and
+  # then runs makepkg with --nodeps. The build account never gets a privilege
+  # escalation: in the release job the same container later holds the publish
+  # key, so a dependency build script must not be able to reach root or plant
+  # state the publish step would execute (bitty#3027).
+  #
+  # The declarations are enumerated as `builder`, never as root: a PKGBUILD is
+  # untrusted code, so sourcing it may not run with root's authority. The
+  # resulting names are validated before pacman sees them.
+  if [[ "$MODE" == full ]]; then
+    deps_file="$WORKROOT/declared-deps.txt"
+    su builder -s /bin/bash -c "bash -c 'source \"\$1\" >/dev/null 2>&1; printf \"%s\\n\" \"\${depends[@]}\" \"\${makedepends[@]}\"' _ '$RECIPE'" >"$deps_file" ||
+      die "cannot enumerate the recipe's declared dependencies"
+    mapfile -t root_deps < <(grep -E '^[A-Za-z0-9@._+<>=:-]+$' "$deps_file" | sort -u)
+    ((${#root_deps[@]})) || die "full mode found no declared dependencies to install"
+    echo "gate: installing ${#root_deps[@]} declared dependenc(y/ies) as root before the unprivileged build"
+    pacman -S --needed --noconfirm "${root_deps[@]}" ||
+      die "a declared dependency could not be installed (a wrong or missing makedepends must fail CI, not the next release)"
+  fi
   reexec=("$REPO_ROOT/scripts/check-aur-source-build.sh")
   [[ -x "$REPO_ROOT/scripts/check-aur-source-build.sh" ]] ||
     reexec=(bash "$REPO_ROOT/scripts/check-aur-source-build.sh")
@@ -218,9 +220,10 @@ echo "gate: workdir=$WORKROOT"
 
 # --- Declared dependencies must resolve ------------------------------------
 # #3011 names "a missing makedepends never fails CI" as part of the hole. Full
-# mode proves it by installing them (--syncdeps). Plumbing mode does not
-# install, so it resolves every declared dependency name against the pacman
-# repos instead: a typo'd or deleted package still fails here, cheaply.
+# mode proves it by installing them as root before the unprivileged build.
+# Plumbing mode does not install, so it resolves every declared dependency name
+# against the pacman repos instead: a typo'd or deleted package still fails
+# here, cheaply.
 check_dep_names() {
   command -v pacman >/dev/null 2>&1 || {
     echo "gate: pacman unavailable, dependency-name resolution skipped (full mode installs deps instead)"
@@ -382,8 +385,8 @@ else
   # real dependency install. The copy is still used so makepkg runs in a
   # writable dir owned by builder and never dirties the checkout.
   cp "$RECIPE_COPY" "$BUILD_DIR/PKGBUILD"
-  echo "gate: full build of the unmodified recipe (--syncdeps --nocheck); this compiles the workspace"
-  run_makepkg "$BUILD_DIR" --syncdeps --cleanbuild
+  echo "gate: full build of the unmodified recipe (--nodeps --nocheck); this compiles the workspace"
+  run_makepkg "$BUILD_DIR" --nodeps --cleanbuild
   inspect_package "$BUILD_DIR"
 fi
 

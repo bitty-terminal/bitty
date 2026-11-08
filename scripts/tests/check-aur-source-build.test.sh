@@ -169,10 +169,15 @@ else
     pass "release.yml aur delegates the build (and its dependency install) to the gate"
   fi
 fi
-if grep -qF -- '--syncdeps' "$GATE"; then
-  pass "gate's full mode installs the declared dependencies with --syncdeps"
+if grep -qF -- 'pacman -S --needed --noconfirm' "$GATE"; then
+  pass "gate's full mode installs the declared dependencies as root before the build"
 else
   fail "gate's full mode never resolves dependencies"
+fi
+if grep -qF -- '--syncdeps' "$GATE"; then
+  fail "gate delegates dependency install to makepkg --syncdeps (bitty#3027)"
+else
+  pass "full mode runs makepkg without --syncdeps"
 fi
 
 if ! command -v makepkg >/dev/null 2>&1 || ! command -v tic >/dev/null 2>&1 ||
@@ -305,6 +310,20 @@ if command -v pacman >/dev/null 2>&1 &&
 else
   echo "SKIP: pacman repo database unavailable, makedepends resolution case skipped"
 fi
+
+# bitty#3027: the gate must never mint a privilege escalation. In the release
+# job the same container later holds the publish key, so a dependency build
+# script must not be able to reach root or plant state the publish step runs.
+# The literal is split so this file does not trip its own search.
+deny_pattern='NOPASS''WD'
+if grep -rn "$deny_pattern" ./scripts >/dev/null 2>&1; then
+  fail "the gate writes a passwordless sudo rule (bitty#3027)"
+fi
+rule_pattern='sudo''ers'
+if grep -n "$rule_pattern" ./scripts/check-aur-source-build.sh >/dev/null 2>&1; then
+  fail "check-aur-source-build.sh still mentions a sudoers rule (bitty#3027)"
+fi
+pass "no passwordless sudo rule is written"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "check-aur-source-build.test: FAIL" >&2

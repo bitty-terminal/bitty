@@ -51,6 +51,7 @@ esac
 
 if [[ -z "$DEST_DIR" ]]; then
   DEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-cdn-sidecar.XXXXXX")"
+  trap 'rm -rf "$DEST_DIR"' EXIT
 fi
 mkdir -p "$DEST_DIR"
 ASSET_PATH="$DEST_DIR/$ASSET"

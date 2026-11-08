@@ -134,9 +134,7 @@ bittyd --version
 # Exercise the packaged daemon on an isolated endpoint, never the default
 # socket. `bittyd start` stays in the foreground, so background it and stop it
 # through the authenticated CLI once it has bound the socket.
-daemon_dir=/tmp/bittyd-smoke
-rm -rf "$daemon_dir"
-mkdir -p "$daemon_dir"
+daemon_dir="$(mktemp -d /tmp/bitty-daemon-smoke.XXXXXX)"
 chmod 700 "$daemon_dir"
 BITTYD_ENDPOINT="$daemon_dir/bittyd.sock"
 export BITTYD_ENDPOINT

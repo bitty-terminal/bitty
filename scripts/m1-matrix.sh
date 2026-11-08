@@ -184,6 +184,7 @@ cmd_run() {
   local entry suite pkg min log rc passed failed ignored status
   local failures=0 table
   table="$(mktemp)"
+  trap 'rm -f "${table:-}"' RETURN EXIT
   {
     printf '### M1 compatibility matrix — `%s`\n\n' "$platform"
     printf '| Suite | Package | Result | Passed | Failed | Ignored |\n'
@@ -250,6 +251,7 @@ cmd_aggregate() {
 
   local combined problems=""
   combined="$(mktemp)"
+  trap 'rm -f "${combined:-}"' RETURN EXIT
   local f
   for f in "$dir"/*.tsv; do
     [ -e "$f" ] || continue

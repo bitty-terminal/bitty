@@ -39,6 +39,8 @@
 #     are defensible, and no program in the corpus depends on it.
 
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -80,29 +82,34 @@ def capture(cmd: str, cols: int, rows: int, keys: list[str], settle: float):
     with tempfile.NamedTemporaryFile(suffix=".raw", delete=False) as handle:
         raw_path = handle.name
     try:
-        subprocess.run(
-            ["tmux", "-L", sock, "-f", "/dev/null", "new-session", "-d",
-             "-x", str(cols), "-y", str(rows), cmd],
-            check=True, capture_output=True,
-        )
-        subprocess.run(["tmux", "-L", sock, "set-option", "-g", "status", "off"],
-                       capture_output=True)
-        subprocess.run(["tmux", "-L", sock, "pipe-pane", "-O", "-t", "0",
-                        f"cat > {raw_path}"], capture_output=True)
-        time.sleep(settle)
-        for key in keys:
-            subprocess.run(["tmux", "-L", sock, "send-keys", "-t", "0", key],
-                           capture_output=True)
-            time.sleep(0.4)
-        if keys:
-            time.sleep(0.6)
-        pane = subprocess.run(["tmux", "-L", sock, "capture-pane", "-p", "-t", "0"],
-                              capture_output=True, text=True, check=True).stdout
+        try:
+            subprocess.run(
+                ["tmux", "-L", sock, "-f", "/dev/null", "new-session", "-d",
+                 "-x", str(cols), "-y", str(rows), cmd],
+                check=True, capture_output=True,
+            )
+            subprocess.run(["tmux", "-L", sock, "set-option", "-g", "status", "off"],
+                           capture_output=True, check=False)
+            subprocess.run(["tmux", "-L", sock, "pipe-pane", "-O", "-t", "0",
+                            f"cat > {shlex.quote(raw_path)}"], capture_output=True, check=False)
+            time.sleep(settle)
+            for key in keys:
+                subprocess.run(["tmux", "-L", sock, "send-keys", "-t", "0", key],
+                               capture_output=True, check=False)
+                time.sleep(0.4)
+            if keys:
+                time.sleep(0.6)
+            pane = subprocess.run(["tmux", "-L", sock, "capture-pane", "-p", "-t", "0"],
+                                  capture_output=True, text=True, check=True).stdout
+        finally:
+            subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True, check=False)
+        with open(raw_path, "rb") as handle:
+            raw = handle.read()
     finally:
-        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
-    with open(raw_path, "rb") as handle:
-        raw = handle.read()
-    os.unlink(raw_path)
+        try:
+            os.unlink(raw_path)
+        except OSError:
+            pass
     grid = [line.rstrip() for line in pane.splitlines()]
     while grid and grid[-1] == "":
         grid.pop()
@@ -110,7 +117,9 @@ def capture(cmd: str, cols: int, rows: int, keys: list[str], settle: float):
 
 
 def slugify(cmd: str) -> str:
-    keep = [ch if ch.isalnum() else "-" for ch in cmd.split()[0]]
+    tokens = cmd.split()
+    first = tokens[0] if tokens else ""
+    keep = [ch if ch.isalnum() else "-" for ch in first]
     return "".join(keep).strip("-") or "program"
 
 
@@ -157,11 +166,12 @@ CORPUS = [
 
 def main(argv: list[str]) -> int:
     class Opts:
-        cols = 100
-        rows = 30
-        keys: list[str] = []
-        settle = 1.8
-        capture: str | None = None
+        def __init__(self) -> None:
+            self.cols = 100
+            self.rows = 30
+            self.keys: list[str] = []
+            self.settle = 1.8
+            self.capture: str | None = None
 
     opts = Opts()
     rest = list(argv)
@@ -170,20 +180,27 @@ def main(argv: list[str]) -> int:
     while rest:
         arg = rest.pop(0)
         if arg == "--":
-            commands.append(" ".join(rest))
+            cmd_str = " ".join(rest).strip()
+            if cmd_str:
+                commands.append(cmd_str)
             rest = []
         elif arg == "--corpus":
             corpus = True
-        elif arg == "--cols":
-            opts.cols = int(rest.pop(0))
-        elif arg == "--rows":
-            opts.rows = int(rest.pop(0))
-        elif arg == "--keys":
-            opts.keys = rest.pop(0).split(",")
-        elif arg == "--settle":
-            opts.settle = float(rest.pop(0))
-        elif arg == "--capture":
-            opts.capture = rest.pop(0)
+        elif arg in ("--cols", "--rows", "--keys", "--settle", "--capture"):
+            if not rest:
+                print(f"missing value for {arg}", file=sys.stderr)
+                return 2
+            val = rest.pop(0)
+            if arg == "--cols":
+                opts.cols = int(val)
+            elif arg == "--rows":
+                opts.rows = int(val)
+            elif arg == "--keys":
+                opts.keys = [k for k in val.split(",") if k]
+            elif arg == "--settle":
+                opts.settle = float(val)
+            elif arg == "--capture":
+                opts.capture = val
         elif arg in ("-h", "--help"):
             print(USAGE)
             return 0
@@ -197,16 +214,25 @@ def main(argv: list[str]) -> int:
 
     # The corpus programs read a file in the current directory.
     workdir = tempfile.mkdtemp(prefix="vtreff-")
-    with open(os.path.join(workdir, "probe.txt"), "w") as handle:
-        for i in range(200):
-            handle.write(f"line {i:03}  alpha beta gamma delta epsilon zeta eta theta\n")
+    try:
+        with open(os.path.join(workdir, "probe.txt"), "w") as handle:
+            handle.writelines(
+                f"line {i:03}  alpha beta gamma delta epsilon zeta eta theta\n"
+                for i in range(200)
+            )
 
-    results = []
-    if corpus:
-        for label, cmd in CORPUS:
-            results.append(run_one(label, f"sh -c 'cd {workdir} && {cmd}'", opts))
-    for index, cmd in enumerate(commands):
-        results.append(run_one(cmd.split()[0] if cmd else f"cmd{index}", cmd, opts))
+        results = []
+        if corpus:
+            quoted_workdir = shlex.quote(workdir)
+            for label, cmd in CORPUS:
+                results.append(
+                    run_one(label, f"sh -c {shlex.quote(f'cd {quoted_workdir} && {cmd}')}", opts)
+                )
+        for index, cmd in enumerate(commands):
+            tokens = cmd.split()
+            results.append(run_one(tokens[0] if tokens else f"cmd{index}", cmd, opts))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
     passed = sum(1 for ok in results if ok)
     print(f"\n{passed}/{len(results)} grids match the reference terminal")

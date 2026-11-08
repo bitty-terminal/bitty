@@ -35,8 +35,14 @@ def parse_ar(data: bytes) -> dict[str, bytes]:
 
     while offset < total_len:
         if offset + 60 > total_len:
-            break
+            raise ValueError(
+                f"Truncated ar member header at offset {offset} (remaining {total_len - offset} bytes)"
+            )
         header = data[offset : offset + 60]
+        if header[58:60] != b"`\n":
+            raise ValueError(
+                f"Invalid ar member header magic at offset {offset}: {header[58:60]!r}"
+            )
         offset += 60
 
         name = header[:16].decode("ascii", errors="replace").strip().rstrip("/")
@@ -47,6 +53,11 @@ def parse_ar(data: bytes) -> dict[str, bytes]:
             raise ValueError(
                 f"Invalid size in ar header for member '{name}': {size_str}"
             ) from exc
+
+        if size < 0 or offset + size > total_len:
+            raise ValueError(
+                f"Truncated ar member '{name}': header declares {size} bytes, only {total_len - offset} remain"
+            )
 
         member_data = data[offset : offset + size]
         offset += size
@@ -76,8 +87,9 @@ def extract_control_file(deb_path: pathlib.Path) -> str:
     # Use tarfile to open the compressed tar bytes
     with tarfile.open(fileobj=io.BytesIO(control_tar_bytes)) as tar:
         for member in tar.getmembers():
-            base_name = os.path.basename(member.name)
-            if base_name == "control":
+            if not member.isfile():
+                continue
+            if os.path.normpath(member.name) == "control":
                 extracted = tar.extractfile(member)
                 if extracted is not None:
                     return extracted.read().decode("utf-8", errors="replace")
@@ -109,7 +121,9 @@ def parse_control_fields(control_text: str) -> dict[str, str]:
     current_value_lines: list[str] = []
 
     for line in control_text.splitlines():
-        if not line:
+        if not line.strip():
+            if fields or current_key:
+                break
             continue
         if line.startswith((" ", "\t")):
             if current_key:

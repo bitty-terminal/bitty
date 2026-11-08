@@ -182,6 +182,16 @@ else
   pass "generate-apt-repo.sh fails closed on corrupted deb"
 fi
 
+# Fail-closed check (bitty#3089): truncated ar member payload must be rejected
+TRUNC_DIR="$TMP/trunc_dist"
+mkdir -p "$TRUNC_DIR"
+head -c 90 "$DIST_DIR/bitty-x86_64-unknown-linux-gnu.deb" >"$TRUNC_DIR/bitty-truncated.deb"
+if "$GEN_SH" --dist-dir "$TRUNC_DIR" --repo-dir "$TMP/trunc_repo" >/dev/null 2>&1; then
+  fail "generate-apt-repo.sh accepted truncated ar member deb"
+else
+  pass "generate-apt-repo.sh fails closed on truncated ar member deb"
+fi
+
 # --- 3. Workflow assertions -------------------------------------------------
 expect_contains "$WORKFLOW" "apt:" "release.yml defines apt job"
 expect_contains "$WORKFLOW" "environment: release" "release.yml apt job runs in release environment"

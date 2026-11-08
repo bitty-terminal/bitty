@@ -1,9 +1,9 @@
 use super::apply::{apply_control_envelope, reload_config_json, snapshot_text_with_images};
 #[cfg(unix)]
 use super::apply::{drain_global_control_queue_with, drain_global_control_queue_with_barrier};
-#[cfg(unix)]
-use super::client::resolve_ctl_target;
-use super::client::{extract_string_from, extract_top_value, parse_ctl_response};
+use super::client::{
+    extract_string_from, extract_top_value, parse_ctl_response, resolve_ctl_target,
+};
 use super::render::{
     class_for_server_error, exit_for_server_error, format_failure, format_panels_table,
     format_success, format_workspaces_table,

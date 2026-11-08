@@ -36,6 +36,15 @@ Runtime libraries: the package links fontconfig and freetype2 via pkgsrc
 `buildlink3.mk`. X11, Wayland, and Vulkan backends are loaded at runtime
 with `dlopen`.
 
+## Session daemon (`bittyd`)
+
+**Not shipped, deliberately.** The package builds
+`-p bitty-terminal --bin bitty` only. NetBSD is not a cell in the accepted
+endpoint contract (`D-15`), so the daemon refuses it as an unlisted platform:
+there is no reviewed peer-identity mechanism to serve a session host with. The
+daemon, its `do-install` step, and its `PLIST` entries land in the same change
+that makes the cell servable; until then the package ships the terminal alone.
+
 ## Building with pkgsrc
 
 The pkgsrc framework requires building inside a pkgsrc tree:

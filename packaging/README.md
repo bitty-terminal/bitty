@@ -300,23 +300,36 @@ systemctl --user enable --now bittyd
 loginctl enable-linger "$USER"   # optional: keep it running without a login session
 ```
 
-Install destinations by channel:
+Install destinations and daemon content by channel. Every recipe in this tree
+has a row: `bittyd` lands in `/usr/bin/bittyd`, and the unit, when a channel
+installs it, lands in `/usr/lib/systemd/user/bittyd.service`.
 
-| Channel                              | Installs the unit                                                             |
-| ------------------------------------ | ----------------------------------------------------------------------------- |
-| `nfpm.yaml` deb/rpm                  | yes, `/usr/lib/systemd/user/bittyd.service`                                   |
-| `nfpm.yaml` archlinux                | yes, `/usr/lib/systemd/user/bittyd.service`                                   |
-| `nfpm.yaml` apk                      | no: Alpine runs OpenRC and ships no systemd user manager                      |
-| `packaging/PKGBUILD` (AUR)           | yes, from `packaging/systemd/bittyd.service`                                  |
-| `packaging/PKGBUILD.bin`             | yes, from the release bundle `share/systemd/user/`                            |
-| `packaging/bitty.spec` (RPM/Copr)    | yes, from the release bundle `share/systemd/user/`                            |
-| `packaging/opensuse/bitty.spec`      | yes, from `packaging/systemd/bittyd.service`                                  |
-| `packaging/solus/package.yml`        | yes, from `packaging/systemd/bittyd.service`                                  |
-| `packaging/gentoo/` ebuilds          | yes under `USE=systemd`; OpenRC is the default profile                        |
-| `packaging/void/` template           | no: Void's default init is runit                                              |
-| `packaging/alpine/APKBUILD`          | no: OpenRC only, recorded in the recipe                                       |
-| `packaging/{freebsd,netbsd,openbsd}` | no: the daemon refuses those cells (contract `D-15`)                          |
-| `scripts/install.sh`                 | yes, `$XDG_CONFIG_HOME/systemd/user` (falls back to `~/.config/systemd/user`) |
+| Channel (recipe)                                         | Ships `bittyd`                                                                                                                                 | Unit                                                                            |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `nfpm.yaml` deb (Debian/Ubuntu)                          | yes: `contents` entry `/usr/bin/bittyd`                                                                                                        | yes, `/usr/lib/systemd/user/bittyd.service`                                     |
+| `nfpm.yaml` rpm (Fedora/RHEL)                            | yes: same `contents` entry                                                                                                                     | yes                                                                             |
+| `nfpm.yaml` archlinux                                    | yes: same `contents` entry                                                                                                                     | yes                                                                             |
+| `nfpm.yaml` apk (Alpine)                                 | yes: same `contents` entry                                                                                                                     | no: Alpine runs OpenRC and ships no systemd user manager                        |
+| `packaging/PKGBUILD` (AUR `bitty`)                       | yes: built and installed explicitly                                                                                                            | yes, from `packaging/systemd/bittyd.service`                                    |
+| `packaging/PKGBUILD.bin` (AUR `bitty-bin`)               | yes: `bin/bittyd` from the release bundle                                                                                                      | yes, from the bundle `share/systemd/user/`                                      |
+| `packaging/bitty.spec` (Copr RPM)                        | yes: `bin/bittyd` from the release bundle                                                                                                      | yes, from the bundle `share/systemd/user/`                                      |
+| `packaging/opensuse/bitty.spec` (OBS)                    | yes: built and installed explicitly                                                                                                            | yes, from `packaging/systemd/bittyd.service`                                    |
+| `packaging/solus/package.yml`                            | yes: `%cargo_install bitty bittyd`                                                                                                             | yes, from `packaging/systemd/bittyd.service`                                    |
+| `packaging/gentoo/x11-terms/bitty` (live source)         | yes: `cargo_src_install ... -p bitty-daemon --bin bittyd`                                                                                      | yes under `USE=systemd`; OpenRC is the default profile                          |
+| `packaging/gentoo/x11-terms/bitty-bin` (prebuilt)        | yes: `dobin bin/bitty bin/bittyd`                                                                                                              | yes under `USE=systemd`                                                         |
+| `packaging/void/srcpkgs/bitty/template`                  | yes: `post_install` cargo-installs the daemon                                                                                                  | no: Void's default init is runit                                                |
+| `packaging/alpine/APKBUILD` (aports draft)               | yes: installed next to the terminal                                                                                                            | no: OpenRC only, recorded in the recipe                                         |
+| `packaging/freebsd/x11/bitty`                            | no: deliberate. The accepted endpoint contract (`D-15`) refuses FreeBSD (`LOCAL_PEERCRED` exposes `xucred` without a peer pid)                 | no                                                                              |
+| `packaging/netbsd/x11/bitty`                             | no: deliberate. NetBSD is not a `D-15` cell, so the daemon refuses it                                                                          | no                                                                              |
+| `packaging/openbsd/x11/bitty`                            | no: deliberate. OpenBSD is not a `D-15` cell, so the daemon refuses it                                                                         | no                                                                              |
+| `packaging/flathub/run.bitty.Bitty.yaml`                 | no: deliberate, tracked in #3004                                                                                                               | no                                                                              |
+| `scripts/make-appimage.sh`                               | no: the AppDir carries one executable, copied from `--binary`                                                                                  | no                                                                              |
+| Homebrew (`release.yml` renders the formula at tag time) | no: the formula installs the bare macOS binary as `bitty`                                                                                      | no                                                                              |
+| Scoop (`release.yml` renders the manifest at tag time)   | no: the manifest shims the bare `.exe` as `bitty`                                                                                              | no                                                                              |
+| winget / `setup.exe` / portable ZIP                      | no: the release job copies `bittyd` for `*-linux-*` targets only, so no Windows artifact contains it; Windows also has no served spawn (#2985) | no                                                                              |
+| `flake.nix`                                              | yes, as the companion `.#bittyd` package (`packages.bittyd`), separate from `.#bitty`                                                          | no: a store path is not a stable `ExecStart` target                             |
+| `scripts/install.sh` (Linux x86_64/aarch64 glibc + musl) | yes: installs `bin/bittyd` from the bundle; a pre-daemon bundle installs the terminal only and logs the skip                                   | best effort: `$XDG_CONFIG_HOME/systemd/user`, fallback `~/.config/systemd/user` |
+| `cargo install --git ... bitty-terminal`                 | no: that package selection installs `bitty` only                                                                                               | no                                                                              |
 
 The versioned Linux bundle carries it as
 `share/systemd/user/bittyd.service`, which is what the prebuilt recipes
@@ -326,6 +339,38 @@ enables or starts the unit: a user unit is enabled per user. `scripts/install.sh
 copies the unit into the user unit directory and reloads the user manager when
 one is reachable, but still leaves `systemctl --user enable --now bittyd` to the
 user.
+
+## Operator capability file (`bittyd.operator`)
+
+`bittyd` mints one operator capability per start and writes it to
+`$XDG_RUNTIME_DIR/bitty/bittyd.operator` (`CAPABILITY_FILE_NAME` in
+`crates/bitty-daemon/src/operator.rs`; the `bitty` subdirectory under the
+runtime root is `RUNTIME_SUBDIR` in `crates/bitty-daemon/src/endpoint.rs`). The
+file holds one 64-character lowercase hex bearer plus a trailing newline, and it
+is rewritten on every start, so a capability from a previous run stops working
+the moment the daemon restarts.
+
+Both halves of the path are attested, not just created:
+
+- the runtime directory must be a real directory owned by the invoking uid with
+  mode `0700`; the daemon creates it with that mode when absent and refuses a
+  symlink, a foreign owner, or any other mode;
+- the capability file is opened `O_NOFOLLOW` and written `0600`; loading refuses
+  a symlink, a non-regular file, a foreign owner, or any mode other than `0600`.
+
+`XDG_RUNTIME_DIR` must be set and absolute — there is no `/tmp` fallback, and an
+unset or relative value fails the daemon before the endpoint is bound. Minting
+happens before binding too, so a directory or file that cannot be written fails
+the start instead of running without a capability.
+
+No recipe in this tree creates, templates, or ships the file, and no install
+script may pre-seed it: the daemon owns it end to end. It is an **intent gate,
+not a privilege boundary** — any process running as the same uid can read it —
+so it records operator intent and never isolates the operator from a same-uid
+program. It gates `daemon.inspect` and `daemon.control`; verification keeps the
+value in memory, the file is never read on a request path, and a missing store, a
+wrong bearer, and a peer-check failure all collapse to the same
+`Unauthenticated` refusal.
 
 ## Nix Flake
 
@@ -395,11 +440,11 @@ convenience source install, not a packaged one.
 
 ## Homebrew
 
-On release tags where the publish job runs, the Homebrew formula is generated by `.github/workflows/release.yml` from the release assets and committed to the external tap `bitty-terminal/homebrew-tap` at tag time. The formula downloads the per-arch binaries from the R2-backed CDN (`https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-apple-darwin`) and embeds the published sha256; the generated formula documents the GitHub Releases URL as the fallback. The publish job waits for `r2-mirror` and verifies each artifact against its `.sha256` sidecar before rendering. Only a tag-time published formula counts as supported; a CI-built macOS binary is not support evidence. The repository keeps no in-repo formula copy; the former build-from-source `0.0.1` reference was retired as stale.
+On release tags where the publish job runs, the Homebrew formula is generated by `.github/workflows/release.yml` from the release assets and committed to the external tap `bitty-terminal/homebrew-tap` at tag time. The formula downloads the per-arch binaries from the R2-backed CDN (`https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-apple-darwin`) and embeds the published sha256; the generated formula documents the GitHub Releases URL as the fallback. The publish job waits for `r2-mirror` and verifies each artifact against its `.sha256` sidecar before rendering. Only a tag-time published formula counts as supported; a CI-built macOS binary is not support evidence. The repository keeps no in-repo formula copy; the former build-from-source `0.0.1` reference was retired as stale. The formula installs the single `bitty` binary and does not carry `bittyd` (see the install-destination table under `systemd user unit` above).
 
 ## Scoop
 
-On release tags where the publish job runs, the Scoop manifest is generated by `.github/workflows/release.yml` from the release assets and committed to the external bucket `bitty-terminal/scoop-bucket` at tag time. Both architecture URLs and the `autoupdate` templates point at the R2-backed CDN (`https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-pc-windows-msvc.exe`), the manifest embeds the published sha256 hash, and its `notes` field documents the GitHub Releases fallback. The manifest exposes the raw asset as the `bitty` shim and declares a `Bitty` Start Menu shortcut, so app search resolves the install. The publish job waits for `r2-mirror` and verifies each artifact against its `.sha256` sidecar before rendering. Only a tag-time published manifest counts as supported; a CI-built Windows binary is not support evidence. The repository keeps no in-repo manifest copy; the former `0.0.1` reference was retired as stale. Scoop stays portable: it ships the bare `bitty-*.exe` assets, never the setup installer below, so it sidesteps the setup-installer dialog (Windows may still show a first-run reputation check).
+On release tags where the publish job runs, the Scoop manifest is generated by `.github/workflows/release.yml` from the release assets and committed to the external bucket `bitty-terminal/scoop-bucket` at tag time. Both architecture URLs and the `autoupdate` templates point at the R2-backed CDN (`https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-pc-windows-msvc.exe`), the manifest embeds the published sha256 hash, and its `notes` field documents the GitHub Releases fallback. The manifest exposes the raw asset as the `bitty` shim and declares a `Bitty` Start Menu shortcut, so app search resolves the install. The publish job waits for `r2-mirror` and verifies each artifact against its `.sha256` sidecar before rendering. Only a tag-time published manifest counts as supported; a CI-built Windows binary is not support evidence. The repository keeps no in-repo manifest copy; the former `0.0.1` reference was retired as stale. Scoop stays portable: it ships the bare `bitty-*.exe` assets, never the setup installer below, so it sidesteps the setup-installer dialog (Windows may still show a first-run reputation check). It carries no daemon: the Windows artifacts contain no `bittyd` (see the install-destination table under `systemd user unit` above).
 
 ## Windows setup installer (CTX-1064, #1810)
 
@@ -617,13 +662,25 @@ Rationale per OS:
   carries `bin/bitty` and `bin/bittyd` plus the desktop entry, icons,
   AppStream metainfo, the systemd user unit, and
   `LICENSE`/`README.md`/`CHANGELOG.md` under one top-level directory; the
-  bare binary has no desktop integration. `install.sh` extracts both binaries,
-  installs the desktop integration under `share/`, and places the unit in
-  `$XDG_CONFIG_HOME/systemd/user` (fallback `~/.config/systemd/user`).
-  The session host ships on Linux cells only: the macOS and Windows builds
-  select the `refused` containment plan, so a daemon there could not create a
-  session. Musl/Alpine uses its own native-musl bundle,
+  bare binary has no desktop integration. `install.sh` extracts the bundle,
+  installs `bin/bitty` and `bin/bittyd` side by side (a bundle published before
+  the daemon existed installs the terminal alone and logs the skip), installs
+  the desktop integration under `share/`, and copies the unit into
+  `$XDG_CONFIG_HOME/systemd/user` (fallback `~/.config/systemd/user`) when
+  `systemctl` is present. Musl/Alpine uses its own native-musl bundle,
   never the glibc one.
+- No macOS or Windows artifact carries a daemon: the `build` job copies
+  `dist/bittyd-<target>` for `*-linux-*` targets only
+  (`.github/workflows/release.yml`). That is a packaging decision, not a
+  containment one. After #2982 and #2997 the served terminal-spawn path covers
+  every plan that can mint a containment identity — Linux (`CgroupV2`,
+  `Subreaper`), macOS (`ProcessGroup`) and FreeBSD (`FreebsdReaper`) — through
+  `worker::spawn_path_served` in `crates/bitty-daemon/src/worker.rs`, with the
+  Linux-only half (`cgroup`, `subreaper`, `child`) compiled under
+  `#[cfg(target_os = "linux")]` in `crates/bitty-daemon/src/containment/`.
+  Windows is the exception: the `WindowsJob` plan cannot be reached because the
+  crate has no ConPTY backend, so every Windows spawn is refused with
+  `Denied/UnsupportedCapability`; the port is tracked in #2985.
 - macOS fetches the bare per-arch binary, not the Universal DMG. The DMG is an
   interactive drag-to-install image (`hdiutil` mount plus Finder copy),
   unsuitable for headless `curl | bash`; a bare binary is a single directly

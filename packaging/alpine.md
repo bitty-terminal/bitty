@@ -70,6 +70,21 @@ The template adheres to Alpine aports packaging standards:
 - Declares `license="MIT OR Apache-2.0"`, matching `Cargo.toml`, the AUR
   recipes, the RPM spec, and `nfpm.yaml`.
 
+## Session daemon (`bittyd`)
+
+Both Alpine paths ship the daemon:
+
+- the published `.apk` — `nfpm.yaml` installs `target/release/bittyd` as
+  `/usr/bin/bittyd` for every packager, so the musl package carries it;
+- the aports template — `cargo auditable build ... -p bitty-terminal
+  -p bitty-daemon` plus an explicit `install` of both binaries.
+
+Neither installs the systemd unit: Alpine runs OpenRC and ships no systemd user
+manager, so `packaging/systemd/bittyd.service` would never be loaded (the
+`package()` comment in `packaging/alpine/APKBUILD` records that). Supervise
+`bittyd start` with an OpenRC service, or run it in the foreground — it does not
+fork and drains `SIGHUP`.
+
 ## Release timing
 
 Source and checksum steps run **at tag time**. `abuild checksum` fetches

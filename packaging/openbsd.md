@@ -36,6 +36,15 @@ Runtime libraries: the port declares the binary's direct `NEEDED` libraries
 only — fontconfig and freetype2. X11, Wayland, and Vulkan backends are loaded
 at runtime with `dlopen` and come from the desktop stack.
 
+## Session daemon (`bittyd`)
+
+**Not shipped, deliberately.** The port builds
+`-p bitty-terminal --bin bitty` only. OpenBSD is not a cell in the accepted
+endpoint contract (`D-15`), so the daemon refuses it as an unlisted platform:
+there is no reviewed peer-identity mechanism to serve a session host with. The
+daemon, its `do-install` step, and its `PLIST` entries land in the same change
+that makes the cell servable; until then the port ships the terminal alone.
+
 ## Building from the ports tree
 
 The OpenBSD Ports framework requires building inside a ports tree:

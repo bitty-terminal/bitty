@@ -4944,15 +4944,38 @@ impl Runtime {
                     };
                 }
                 if shift.is_none() && has_visible_text && list.glyphs.is_empty() {
-                    if let Ok(fallback) = self.renderer.render_with_bidi(
-                        &view_snapshot,
-                        &damage,
-                        view_wraps.as_deref(),
-                        view_bidi,
-                    ) {
-                        if !fallback.glyphs.is_empty() {
-                            list = fallback;
-                        }
+                    let full_damage = Damage {
+                        generation: current_gen,
+                        regions: vec![DamagedRegion::Grid(DamageRect::full(
+                            view_snapshot.height as u16,
+                            view_snapshot.width as u16,
+                        ))]
+                        .into_boxed_slice(),
+                    };
+                    if let Ok(fallback) = self
+                        .renderer
+                        .render_shaped_with_bidi(
+                            &view_snapshot,
+                            &full_damage,
+                            self.config.disable_ligatures,
+                            &self.config.font_features,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                        .ok()
+                        .filter(|candidate| !candidate.glyphs.is_empty())
+                        .ok_or(())
+                        .or_else(|()| {
+                            self.renderer.render_with_bidi(
+                                &view_snapshot,
+                                &full_damage,
+                                view_wraps.as_deref(),
+                                view_bidi,
+                            )
+                        })
+                        && !fallback.glyphs.is_empty()
+                    {
+                        list = fallback;
                     }
                 }
                 // Issue #1409 (CTX-0797): the first leaf of this attempt fixes
@@ -5070,10 +5093,15 @@ impl Runtime {
                 self.maybe_inject_test_empty_leaf(view_id, &mut fills, &mut glyphs);
                 if fills.is_empty() || (has_visible_text && glyphs.is_empty()) {
                     // bitty#3032: an empty render must never become the
-                    // retained list a later clean frame reuses. Drop the entry
-                    // and let the bounded retry rebuild the leaf from truth.
+                    // retained list a later clean frame reuses. Drop the entry;
+                    // only arm the cross-frame retry when `fills.is_empty()`
+                    // because a glyphless leaf after the synchronous full-grid
+                    // shaped + unshaped pass above means the host font stack
+                    // lacks drawable glyph bitmaps for the screen's codepoints.
                     self.presented_leaf_frames.remove(&view_id);
-                    self.note_empty_leaf_render(view_id, has_visible_text);
+                    if fills.is_empty() {
+                        self.note_empty_leaf_render(view_id, has_visible_text);
+                    }
                 } else {
                     if self.empty_leaf_retry.0 == Some(view_id) {
                         self.empty_leaf_retry = (None, 0);

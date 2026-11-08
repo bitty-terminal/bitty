@@ -925,11 +925,16 @@ impl PlacementStore {
         self.cascade_orphans();
     }
 
-    /// Clears placements on one screen (`ED` full-clear, alt switches) while
-    /// retaining `U=1` virtual prototypes.
+    /// Clears placements on one screen (`ED` full-clear, alt switches).
+    ///
+    /// Unlike the physical selectors and `d=a`, a full clear drops `U=1`
+    /// virtual prototypes too: the placeholder cells they describe are
+    /// erased with the grid, and downstream mirrors (`bitty-rich`
+    /// `clear_virtual_for_origin`, the runtime's ED 2/ED 22 handling) keep
+    /// both clear paths in parity with this function.
     pub fn clear_screen(&mut self, on_alt: bool) {
         self.placements
-            .retain(|entry| entry.virtual_proto || entry.on_alt_screen != on_alt);
+            .retain(|entry| entry.on_alt_screen != on_alt);
         self.cascade_orphans();
     }
 
@@ -1406,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn unsized_placement_outside_scroll_region_is_not_scrolled_and_clear_screen_keeps_virtual_proto()
+    fn unsized_placement_outside_scroll_region_is_not_scrolled_and_clear_screen_drops_virtual_proto()
      {
         let mut zero_rows = placed(1, 1, 6, 0);
         zero_rows.rows = 0;
@@ -1426,14 +1431,28 @@ mod tests {
             6
         );
 
+        // Lifetime contract (module docs): `ED` full-clears and alt switches
+        // drop `U=1` prototypes, while `d=a` spares them (S4, #1849).
         let mut proto = placed(2, 1, 0, 0);
         proto.virtual_proto = true;
         store.upsert(proto);
         store.clear_screen(false);
         assert!(
-            store.get(2, 1).is_some(),
-            "U=1 virtual prototype must survive clear_screen"
+            store.get(2, 1).is_none(),
+            "clear_screen must drop U=1 prototypes on a full clear"
         );
         assert!(store.get(1, 1).is_none());
+
+        let mut spared = placed(3, 1, 0, 0);
+        spared.virtual_proto = true;
+        store.upsert(spared);
+        assert_eq!(
+            store.apply_delete(KittyDeleteSelector::AllVisible, (0, 0), false, false),
+            0
+        );
+        assert!(
+            store.get(3, 1).is_some(),
+            "d=a (AllVisible) always spares U=1 prototypes"
+        );
     }
 }

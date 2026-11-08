@@ -624,9 +624,9 @@ jobs:
     runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 20
-    # Runtime: 5s for the gate and 17s for the negative test, measured against
-    # the archlinux container image locally (24 cores, warm pacman cache). CI
-    # adds the image pull plus `pacman -Syu`; budget 20m above.
+    # Runtime: 47s wall for this job on PR #3017 (image pull + `pacman -Syu` +
+    # gate + negative test; gate 6s, test 22s inside the container). Budget
+    # 20m above, and the gate's own `timeout` is 600s.
     steps:
       # Image packages first, checkout second: actions/checkout needs git in
       # the container, and archlinux:latest does not ship it.

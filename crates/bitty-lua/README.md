@@ -117,6 +117,93 @@ that points `git` at another repository, and a plugin able to write the pane
 tree could plant it (latent today, because `fs.write` is not implemented).
 `.git` policy and an inode-bound cwd are tracked follow-ups.
 
+## Lua surface: profile lifecycle (CTX-1749)
+
+```lua
+local p = bitty.profiles.preview_create("work", { from = "default" })
+local created, err = bitty.profiles.create("work", { from = "default", digest = p.digest })
+```
+
+`bitty.profiles` is also mounted as `bitty.config.profiles`; both names are the
+same read-only table. It lists profiles and drives four lifecycle pairs:
+create, clone, rename, and delete. Every mutation is two calls:
+`preview_<verb>` renders the exact bounded diff and issues a one-shot approval
+digest, and `<verb>` applies that digest. The digest binds the plugin ID, the
+verb, the target name(s), the options, and the full candidate
+preimage/postimage, so a preview cannot authorize a different profile, a
+different option set, or different bytes. A digest is accepted either as the
+trailing argument or as `opts.digest` (both must match when both are given);
+without one, the apply call fails closed with `E_CONFIG_APPROVAL_REQUIRED`, and
+a consumed, expired, or wrong-target token fails with the same code (a digest
+that is not lowercase SHA-256 hex is `E_CONFIG_APPROVAL_MISMATCH`). All calls
+require the recorded `config.manage` grant.
+
+| Verb | Arguments | Result |
+| ---- | --------- | ------ |
+| `list` | none | `rows` and the identical `profiles` array (`{ name, active }`), `active`, `count`, `truncated`. |
+| `preview_create` | `name[, opts]` | `digest`, `rendered`, `changed`, `changed_keys`, `replaces_existing`, `selector_updated = false`, `active`. |
+| `create` | `name[, opts][, digest]` | `name`, `created`, `changed`, `replaced`, `backed_up`, `extends`, `preset`, `reload = "none"`. |
+| `preview_clone` | `src, dst[, opts]` | Preview shape above (`selector_updated = false`). |
+| `clone` | `src, dst[, opts][, digest]` | `source`, `name`, `target`, `cloned`, `changed`, `replaced`, `backed_up`, `extends`, `reload = "none"`. |
+| `preview_rename` | `old, new[, opts]` | Preview shape above; `selector_updated` says whether the persisted selector will be rewritten. |
+| `rename` | `old, new[, opts][, digest]` | `old_name`, `new_name`, `name`, `renamed`, `changed`, `replaced`, `backed_up`, `selector_updated`, `reload` (`"auto"` when the selector moved, else `"none"`). |
+| `preview_delete` | `name[, opts]` | Preview shape above; `active` flags the currently persisted profile. |
+| `delete` | `name[, opts][, digest]` | `name`, `deleted`, `changed`, `backed_up`, `was_active`, `reload = "none"`. |
+
+Options are a closed table: an unknown key, a non-boolean `force`, or a
+non-table argument is `E_PROFILE_USAGE`, never ignored. `preview_create`
+accepts `{ force?, from?, preset? }` and `create` accepts the same table plus
+`digest?`. `from` names an existing profile whose bytes are copied verbatim
+(the new body therefore keeps the source's own `extends`, and the outcome
+reports that recorded base); `preset` is one of `minimal`, `dark`, or `light`;
+and `from` and `preset` are mutually exclusive. `preview_clone`,
+`preview_rename`, and `preview_delete` accept `{ force? }`; their apply verbs
+accept `{ force?, digest? }`.
+
+The pre-existing `list`, `preview_use`, and `use` verbs keep their contracts:
+`preview_use` returns `digest`, `rendered`, `keys`, and `changed`, and `use`
+returns `active`, `changed`, `reload = "auto"`, and `pending_restart`.
+
+`force` semantics:
+
+| Verb | Without `force` | With `force` |
+| ---- | --------------- | ------------ |
+| `create` | an existing destination is `E_PROFILE_CONFLICT`. | the destination is backed up as `<name>.lua.bak-<epoch>` and replaced. |
+| `clone` | an existing destination is `E_PROFILE_CONFLICT`. | same backup-then-replace behaviour. |
+| `rename` | an existing destination is `E_PROFILE_CONFLICT`. | the destination is backed up and replaced; the source is then renamed and the persisted selector rewritten when it named the source (the selector is backed up too). |
+| `delete` | the active profile and the reserved `default` are `E_PROFILE_CONFLICT`. | the active profile and/or `default.lua` may be removed; a timestamped backup is always kept. |
+
+Independently of `force`, a profile that another profile extends cannot be
+deleted or renamed (`E_PROFILE_CONFLICT` naming the dependents), and `default`
+cannot be renamed. Names are `[a-z0-9][a-z0-9_-]*`, 1..=64 bytes, with no path
+separators; refusals are path-free (no host path is ever echoed).
+
+**Deleting the active profile.** `delete(name, { force = true })` on the active
+profile is allowed and intentionally leaves the persisted selector dangling:
+the next launch fails closed with "profile not found". This mirrors
+`bitty config profile delete --force`. The preview always reports
+`active = true` for an active target so a confirmation surface can require an
+explicit acknowledgement; a plugin that wants to avoid the dangling state must
+`preview_use`/`use` another profile first. The same rule applies to
+`default.lua`, which is only the implicit base profile when no profile is
+selected.
+
+| Code | Meaning |
+| ---- | ------- |
+| `E_CAPABILITY_DENIED` | the generation holds no recorded `config.manage` grant. |
+| `E_CONFIG_UNAVAILABLE` | no writable profile backend is installed. |
+| `E_CONFIG_APPROVAL_REQUIRED` | missing, replayed, expired, or wrong-target digest (apply calls). |
+| `E_CONFIG_APPROVAL_MISMATCH` | a digest is not a lowercase SHA-256 hex string, or the trailing and embedded digests disagree. |
+| `E_CONFIG_STALE` | the candidate bytes moved between preview and apply. |
+| `E_PROFILE_USAGE` | malformed arguments: non-table options, unknown option key, wrong value type, or `from` combined with `preset`. |
+| `E_PROFILE_INVALID` | invalid profile name, unknown preset, profile body that fails validation, unrewritable selector, or a selector update that cannot be validated. |
+| `E_PROFILE_CONFLICT` | reserved `default` where it is refused, an existing target without `force`, active-profile delete without `force`, or an `extends` dependent. |
+| `E_PROFILE_NOT_FOUND` | the source or target profile does not exist. |
+| `E_PROFILE_IO` | a filesystem operation failed; the previous bytes are preserved where a rollback was possible. |
+| `E_PROFILE_INTERNAL` | a rollback or restore invariant failed; the payload names the operation, never a path. |
+| `E_DEF_INVALID` | wrong arity or a non-string name argument. |
+| `E_DEF_LIMIT` / `E_TIMEOUT` | the `config.manage` call/byte budget or the authorization deadline was exceeded. |
+
 ## Evidence
 
 - `tests/readiness_mirror.rs` (RUN-29) mirrors the Phodopus executable gate

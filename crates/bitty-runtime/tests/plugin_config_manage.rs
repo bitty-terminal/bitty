@@ -701,6 +701,18 @@ bitty.commands.register({ id = "profile_refusals", title = "Profile refusals", r
   }, ",")
 end })
 
+bitty.commands.register({ id = "profile_cross_target", title = "Cross-target tokens", run = function()
+  -- A token is bound to its target: a clone digest cannot authorize a clone to
+  -- another destination, and a delete digest cannot authorize another name.
+  local pcl = bitty.profiles.preview_clone("work", "clone-a")
+  local cross_clone = errcode(function() return bitty.profiles.clone("work", "clone-b", pcl.digest) end)
+  local pdel = bitty.profiles.preview_delete("gone-a")
+  local cross_delete = errcode(function() return bitty.profiles.delete("gone-b", pdel.digest) end)
+  assert(cross_clone == "ERR:E_CONFIG_APPROVAL_REQUIRED", "cross clone: " .. cross_clone)
+  assert(cross_delete == "ERR:E_CONFIG_APPROVAL_REQUIRED", "cross delete: " .. cross_delete)
+  return "BOUND"
+end })
+
 bitty.commands.register({ id = "keys", title = "Bad keys", run = function()
   return table.concat({
     errcode(function() return bitty.config.preview("terminal.shell", "/bin/sh") end),
@@ -734,6 +746,7 @@ const PROBE_COMMANDS: &[&str] = &[
     "deny",
     "profile_lifecycle",
     "profile_refusals",
+    "profile_cross_target",
 ];
 
 /// Granted store package: a recorded grant is the only way a plugin receives
@@ -981,6 +994,12 @@ fn profile_lifecycle_verbs_are_token_bound_and_refuse_invalid_or_reserved_target
 ERR:E_CONFIG_APPROVAL_REQUIRED,ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT,\
 ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT,ERR:E_PROFILE_CONFLICT"
     );
+}
+
+#[test]
+fn profile_lifecycle_tokens_are_bound_to_their_exact_target() {
+    let (mut rt, _backend) = granted_runtime();
+    assert_eq!(run(&mut rt, "profile_cross_target"), "BOUND");
 }
 
 /// bitty#2972: a committed `config.manage` write is host I/O the plugin neither

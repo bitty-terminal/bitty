@@ -4312,11 +4312,14 @@ impl PluginServices {
                 ));
             }
         }
+        // The reply carries the same rows twice (`rows` plus the `profiles`
+        // alias), so charge the bytes actually sent rather than one copy.
         let bytes = list
             .rows
             .iter()
             .map(|row| list_row_bytes(&[&row.name]))
-            .sum();
+            .sum::<usize>()
+            .saturating_mul(2);
         check_list_bounds(list.rows.len(), bytes)?;
         self.config_charge_result_bytes(started, bytes)?;
         Ok(list)

@@ -561,8 +561,9 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "audio.state.read" => "Read volume, mute, and port state (bounded snapshot)",
         "audio.state.control" => "Change volume and mute state (bounded steps)",
         "config.manage" => {
-            "Change allowlisted user configuration values (write-only, high-risk, \
-             per-change approval)"
+            "Change allowlisted user configuration values and the saved profile \
+             lifecycle (create, clone, rename, delete, selector rewrite; \
+             write-only, high-risk, per-change approval)"
         }
         _ => "Requested capability",
     }
@@ -942,8 +943,9 @@ mod tests {
         assert!(granted.is_high_risk());
         assert_eq!(
             effect_statement(&granted),
-            "Change allowlisted user configuration values (write-only, high-risk, \
-             per-change approval)"
+            "Change allowlisted user configuration values and the saved profile \
+             lifecycle (create, clone, rename, delete, selector rewrite; \
+             write-only, high-risk, per-change approval)"
         );
         assert!(CapabilityId::parse("config.manage:user").is_err());
         for unknown in [

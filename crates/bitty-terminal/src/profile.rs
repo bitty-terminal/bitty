@@ -5736,8 +5736,17 @@ fn prepare_profile_create_in_dir(
                     format!("base profile '{from}' is invalid"),
                 )
             })?;
+        // The created body is the source copied verbatim, so the `extends`
+        // it records is the source's own parent, never the source name.
+        // Derive it from the parsed candidate (the last chain link) exactly
+        // as `profiles.clone` does, so the outcome cannot claim a base the
+        // written file does not contain.
+        let extends = source
+            .chain
+            .last()
+            .and_then(|layer| layer.plan.extends.clone());
         validate_chain_with_selector(&name, selector_path, source.chain)?;
-        (source.content, Some(from), None)
+        (source.content, extends, None)
     } else if let Some(preset_raw) = options.preset.as_deref() {
         let parsed = crate::init::InitProfilePreset::parse(preset_raw).ok_or_else(|| {
             plugin_profile_failure(
@@ -6268,6 +6277,25 @@ pub(crate) fn preview_profile_rename_in_dir(
     )
 }
 
+/// Restore a replaced rename destination from its backup.
+///
+/// A failed restore is an internal invariant break, not a detail to drop: the
+/// caller must not report only the trigger error while the destination file is
+/// missing.
+fn restore_rename_destination(
+    backup: &Path,
+    destination: &Path,
+) -> Result<(), ProfileWriteFailure> {
+    if std::fs::copy(backup, destination).is_err() {
+        return Err(plugin_profile_failure(
+            ProfileFailureKind::Internal,
+            "cannot restore the replaced destination after a failed rename",
+        ));
+    }
+    sync_parent_dir(destination);
+    Ok(())
+}
+
 /// Apply an approved `profiles.rename` in `dir`.
 pub(crate) fn apply_profile_rename_in_dir(
     dir: &Path,
@@ -6309,8 +6337,7 @@ pub(crate) fn apply_profile_rename_in_dir(
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             if let Some(backup) = &destination_backup {
-                let _ = std::fs::copy(backup, &prepared.new_path);
-                sync_parent_dir(&prepared.new_path);
+                restore_rename_destination(backup, &prepared.new_path)?;
             }
             return Err(plugin_profile_failure(
                 ProfileFailureKind::Conflict,
@@ -6319,8 +6346,7 @@ pub(crate) fn apply_profile_rename_in_dir(
         }
         Err(_) => {
             if let Some(backup) = &destination_backup {
-                let _ = std::fs::copy(backup, &prepared.new_path);
-                sync_parent_dir(&prepared.new_path);
+                restore_rename_destination(backup, &prepared.new_path)?;
             }
             return Err(plugin_profile_failure(
                 ProfileFailureKind::Io,
@@ -6342,29 +6368,26 @@ pub(crate) fn apply_profile_rename_in_dir(
                 selector_backed_up = selector_backup.is_some();
             }
             Err(_) => {
-                return match commit_profile_rename(&prepared.new_path, &prepared.old_path) {
-                    Ok(()) => {
-                        if let Some(backup) = &destination_backup {
-                            let _ = std::fs::copy(backup, &prepared.new_path);
-                            sync_parent_dir(&prepared.new_path);
-                        }
-                        sync_parent_dir(&prepared.old_path);
-                        Err(plugin_profile_failure(
-                            ProfileFailureKind::Invalid,
-                            format!(
-                                "cannot update the persisted selector when renaming '{}' to '{}'",
-                                prepared.old, prepared.new
-                            ),
-                        ))
-                    }
-                    Err(_) => Err(plugin_profile_failure(
+                commit_profile_rename(&prepared.new_path, &prepared.old_path).map_err(|_| {
+                    plugin_profile_failure(
                         ProfileFailureKind::Internal,
                         format!(
                             "selector update and rollback both failed while renaming '{}' to '{}'",
                             prepared.old, prepared.new
                         ),
-                    )),
-                };
+                    )
+                })?;
+                if let Some(backup) = &destination_backup {
+                    restore_rename_destination(backup, &prepared.new_path)?;
+                }
+                sync_parent_dir(&prepared.old_path);
+                return Err(plugin_profile_failure(
+                    ProfileFailureKind::Invalid,
+                    format!(
+                        "cannot update the persisted selector when renaming '{}' to '{}'",
+                        prepared.old, prepared.new
+                    ),
+                ));
             }
         }
     }

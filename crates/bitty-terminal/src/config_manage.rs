@@ -1812,6 +1812,39 @@ mod tests {
         assert!(!created.backed_up);
         assert!(dir.join("profiles/work.lua").is_file());
 
+        // 1b. `create --from` writes the source bytes verbatim, so the outcome
+        //     reports the `extends` the new file actually records (the
+        //     source's parent), never the source name itself.
+        write_profile(&dir, "base", "return { window = { opacity = 0.9 } }\n");
+        write_profile(&dir, "seeded", "return { extends = \"base\" }\n");
+        let from_opts = ProfileCreateOptions {
+            force: false,
+            from: Some(String::from("seeded")),
+            preset: None,
+        };
+        let preview = backend
+            .preview_profile_create("p", "derived", &from_opts)
+            .expect("preview create from");
+        let derived = backend
+            .apply_profile_create("p", "derived", &from_opts, &preview.candidate_digest)
+            .expect("apply create from");
+        assert_eq!(
+            derived.extends.as_deref(),
+            Some("base"),
+            "create --from reports the recorded extends, not the source name"
+        );
+        let derived_body =
+            std::fs::read_to_string(dir.join("profiles/derived.lua")).expect("derived");
+        assert_eq!(
+            derived_body,
+            std::fs::read_to_string(dir.join("profiles/seeded.lua")).expect("seeded"),
+            "create --from copies the source bytes verbatim"
+        );
+        assert!(
+            derived_body.contains("extends = \"base\""),
+            "the derived profile keeps the source's parent: {derived_body}"
+        );
+
         // 2. Creating an existing profile without force conflicts.
         let conflict = backend
             .preview_profile_create("p", "work", &create_opts)
@@ -1907,6 +1940,34 @@ mod tests {
             .preview_profile_delete("p", "work-renamed", &del_opts)
             .expect_err("active profile refused");
         assert_eq!(active_err.kind, ProfileFailureKind::Conflict);
+
+        // 6b. `force = true` on the active profile is an intentional documented
+        //     consequence: the selector is left dangling and the next launch
+        //     fails closed with "profile not found". The preview must flag the
+        //     target as active so a confirmation surface can surface it.
+        let forced_active = ProfileDeleteOptions { force: true };
+        let preview = backend
+            .preview_profile_delete("p", "work-renamed", &forced_active)
+            .expect("preview force delete active");
+        assert!(
+            preview.active,
+            "the delete preview must flag the active target"
+        );
+        let deleted_active = backend
+            .apply_profile_delete(
+                "p",
+                "work-renamed",
+                &forced_active,
+                &preview.candidate_digest,
+            )
+            .expect("apply force delete active");
+        assert!(deleted_active.was_active);
+        assert!(!dir.join("profiles/work-renamed.lua").exists());
+        let dangling = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
+        assert!(
+            dangling.contains("profile = \"work-renamed\""),
+            "the selector is intentionally left dangling: {dangling}"
+        );
 
         // 7. Refusal: cannot delete or rename a profile extended by another profile.
         std::fs::write(

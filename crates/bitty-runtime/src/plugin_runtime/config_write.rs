@@ -874,42 +874,6 @@ impl ProfileWriteFailure {
         Self { kind, message }
     }
 
-    /// `E_PROFILE_USAGE` refusal.
-    #[must_use]
-    pub fn usage(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::Usage, message)
-    }
-
-    /// `E_PROFILE_INVALID` refusal.
-    #[must_use]
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::Invalid, message)
-    }
-
-    /// `E_PROFILE_CONFLICT` refusal.
-    #[must_use]
-    pub fn conflict(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::Conflict, message)
-    }
-
-    /// `E_PROFILE_NOT_FOUND` refusal.
-    #[must_use]
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::NotFound, message)
-    }
-
-    /// `E_PROFILE_IO` refusal.
-    #[must_use]
-    pub fn io(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::Io, message)
-    }
-
-    /// `E_PROFILE_INTERNAL` refusal.
-    #[must_use]
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::new(ProfileFailureKind::Internal, message)
-    }
-
     /// `E_CONFIG_UNAVAILABLE` refusal.
     #[must_use]
     pub fn unavailable() -> Self {

@@ -91,15 +91,18 @@ impl Runtime {
         let Some(focused) = self.focused_view() else {
             return false;
         };
-        let Some((start_buf, end_buf)) = self.state.last_command_output_rows() else {
+        let Some(grid) = self.live_view_state(focused) else {
+            return false;
+        };
+        let Some((start_buf, end_buf)) = grid.last_command_output_rows() else {
             return false;
         };
         if end_buf < start_buf {
             return false;
         }
-        let sb_len = self.state.scrollback_len();
-        let height = self.state.height();
-        let width = self.state.width();
+        let sb_len = grid.scrollback_len();
+        let height = grid.height();
+        let width = grid.width();
         if width == 0 || height == 0 {
             return false;
         }
@@ -114,7 +117,7 @@ impl Runtime {
         if start_live >= height || end_live >= height {
             return false;
         }
-        let snapshot = self.state.snapshot();
+        let snapshot = grid.snapshot();
         let selection = Selection::line_drag(
             &snapshot,
             CellPos::new(start_live as u16, 0),
@@ -131,15 +134,18 @@ impl Runtime {
         let Some(focused) = self.focused_view() else {
             return false;
         };
-        let sb_len = self.state.scrollback_len();
-        let total = sb_len + self.state.height();
+        let Some(grid) = self.live_view_state(focused) else {
+            return false;
+        };
+        let sb_len = grid.scrollback_len();
+        let total = sb_len + grid.height();
         let Some((start, rows)) = self.focused_view_window(focused, total, sb_len) else {
             return false;
         };
         let target = if forward {
-            self.state.next_prompt_buffer_row(start)
+            grid.next_prompt_buffer_row(start)
         } else {
-            self.state.prev_prompt_buffer_row(start)
+            grid.prev_prompt_buffer_row(start)
         };
         let Some(row) = target else {
             return false;
@@ -150,8 +156,7 @@ impl Runtime {
         // Place the target at the viewport top: start == row.
         let desired = total.saturating_sub(rows).saturating_sub(row).min(sb_len);
         let changed = {
-            let layout = &mut self.layout;
-            let Some(view) = layout.find_leaf_mut(focused) else {
+            let Some(view) = self.find_view_mut(focused) else {
                 return false;
             };
             if view.scroll_offset().min(sb_len) == desired {
@@ -177,7 +182,7 @@ impl Runtime {
         total: usize,
         sb_len: usize,
     ) -> Option<(usize, usize)> {
-        let leaf = self.layout.find_leaf(view)?;
+        let leaf = self.find_view(view)?;
         let rows = leaf.rows() as usize;
         if rows == 0 {
             return None;
@@ -185,5 +190,108 @@ impl Runtime {
         let offset = leaf.scroll_offset().min(sb_len);
         let start = total.saturating_sub(rows).saturating_sub(offset);
         Some((start, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed_command(rt: &mut Runtime, view: Option<ViewId>, cmd: &str, output: &[&str]) {
+        let mut seq = String::new();
+        seq.push_str("\u{1b}]133;A\u{7}prompt$ \u{1b}]133;B\u{7}");
+        seq.push_str(cmd);
+        seq.push_str("\r\n\u{1b}]133;C\u{7}");
+        for line in output {
+            seq.push_str(line);
+            seq.push_str("\r\n");
+        }
+        seq.push_str("\u{1b}]133;D;0\u{7}\u{1b}]133;A\u{7}prompt$ ");
+        match view {
+            Some(v) => rt.handle_pane_bytes(v, seq.as_bytes()),
+            None => rt.handle_pty_bytes(seq.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn sessionless_non_primary_leaf_fails_closed_3060() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        rt.force_headless_clipboard();
+        let primary = ViewId::new(1);
+        let other = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            crate::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(other, 80, 24)),
+        ));
+        let h = rt.state().height();
+        for i in 0..(h + 4) {
+            feed_command(
+                &mut rt,
+                None,
+                &format!("cmd{i}"),
+                &[&format!("primary-{i}")],
+            );
+        }
+
+        assert!(rt.set_focus(other));
+        assert!(
+            !rt.select_command_output(),
+            "session-less non-primary leaf must not select primary grid output"
+        );
+        assert!(
+            !rt.jump_to_prompt(PromptDirection::Prev),
+            "session-less non-primary leaf must not jump using primary grid prompts"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_pane_session_uses_focused_pane_state_3060() {
+        bitty_test_support::require_pty!();
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        rt.force_headless_clipboard();
+        let primary = ViewId::new(1);
+        let pane = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            crate::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(pane, 80, 24)),
+        ));
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == pane)
+            .expect("pane frame");
+        rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], frame.cols, frame.rows)
+            .expect("spawn pane shell");
+
+        feed_command(&mut rt, None, "primary-cmd", &["primary-out"]);
+        for i in 0..30 {
+            feed_command(
+                &mut rt,
+                Some(pane),
+                &format!("pane-cmd-{i}"),
+                &[&format!("pane-out-{i}")],
+            );
+        }
+
+        assert!(rt.set_focus(pane));
+        assert!(rt.select_command_output());
+        assert_eq!(rt.selection_owner(), Some(pane));
+        assert_eq!(rt.selection_text().as_deref(), Some("pane-out-29"));
+
+        assert!(rt.jump_to_prompt(PromptDirection::Prev));
+        let pane_offset = rt
+            .layout()
+            .find_leaf(pane)
+            .expect("pane leaf")
+            .scroll_offset();
+        assert!(
+            pane_offset > 0,
+            "focused split pane must scroll to its own prompt"
+        );
     }
 }

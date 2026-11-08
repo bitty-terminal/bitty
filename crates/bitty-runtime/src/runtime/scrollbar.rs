@@ -325,6 +325,9 @@ impl Runtime {
             self.pending_full_redraw = true;
             return false;
         }
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return true;
+        }
         let sb_len = self.scrollback_len();
         let thumb_y = pos.y - f64::from(track.y) - drag.grab_offset_px;
         let offset =
@@ -363,5 +366,52 @@ impl Runtime {
         self.scrollbar_drag = None;
         self.pending_full_redraw = true;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollbar_drag_to_ignores_non_finite_cursor_without_snapping_to_live_3060() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        let h = rt.state().height();
+        for i in 0..(h + 20) {
+            rt.handle_pty_bytes(format!("line {i:03}\r\n").as_bytes());
+        }
+        let focused = rt.focused_view().expect("focused view");
+        let sb_len = rt.scrollback_len();
+        assert!(sb_len >= 20);
+        rt.layout
+            .find_leaf_mut(focused)
+            .expect("focused leaf")
+            .set_scroll_offset(10, sb_len);
+
+        let (view, track, thumb) = rt.scrollbar_track_thumb().expect("track and thumb");
+        assert_eq!(view, focused);
+        rt.scrollbar_drag = Some(ScrollbarDrag {
+            view,
+            grab_offset_px: 2.0,
+        });
+
+        assert!(rt.scrollbar_drag_to(CursorPosition {
+            x: f64::from(track.x),
+            y: f64::NAN,
+        }));
+        assert!(rt.scrollbar_drag_to(CursorPosition {
+            x: f64::NAN,
+            y: f64::from(track.y + thumb.y as i32),
+        }));
+        assert!(rt.scrollbar_drag_to(CursorPosition {
+            x: f64::from(track.x),
+            y: f64::INFINITY,
+        }));
+        assert!(rt.is_scrollbar_dragging());
+        assert_eq!(
+            rt.layout.find_leaf(focused).unwrap().scroll_offset(),
+            10,
+            "non-finite cursor during scrollbar drag must not reset scroll_offset to 0"
+        );
     }
 }

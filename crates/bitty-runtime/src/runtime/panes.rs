@@ -333,12 +333,7 @@ impl Runtime {
     pub fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
         if let Some(source) = self.focused_view() {
             if source != target {
-                let report = match self.pane_sessions.get(&source) {
-                    Some(session) => session.state.cwd_report(),
-                    // A session-less focused leaf (the primary grid owner) reports
-                    // through the runtime-global state.
-                    None => self.state.cwd_report(),
-                };
+                let report = self.session_state_for(source).and_then(State::cwd_report);
                 if let Some(report) = report {
                     if let Some(path) = osc7_cwd_path(report) {
                         if path.is_dir() {
@@ -1399,6 +1394,37 @@ mod tests {
     #[test]
     fn percent_decode_keeps_plus_literal() {
         assert_eq!(percent_decode("/a+b").as_deref(), Some(&b"/a+b"[..]));
+    }
+
+    #[test]
+    fn inherited_cwd_for_sessionless_non_primary_leaf_does_not_leak_primary_report_3060() {
+        let dir = std::env::temp_dir();
+        let mut rt = Runtime::with_defaults().expect("headless build");
+        let primary = ViewId::new(1);
+        let sessionless_other = ViewId::new(2);
+        let target = ViewId::new(3);
+        rt.set_layout(LayoutNode::split(
+            crate::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(sessionless_other, 80, 24)),
+        ));
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let url = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
+        rt.handle_pty_bytes(format!("\x1b]7;{url}\x07").as_bytes());
+
+        // When the primary owner is focused, a new pane inherits its OSC 7 directory.
+        assert!(rt.set_focus(primary));
+        assert!(rt.inherited_cwd_for(target).is_some());
+
+        // When a session-less non-primary leaf is focused, it does not own the
+        // primary grid and must not leak the primary grid's OSC 7 directory.
+        assert!(rt.set_focus(sessionless_other));
+        assert_eq!(rt.inherited_cwd_for(target), None);
     }
 
     #[cfg(unix)]

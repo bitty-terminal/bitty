@@ -1823,6 +1823,24 @@ impl Runtime {
     /// drift.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
+        let delta = match delta {
+            ScrollDelta::Lines(x, y) => ScrollDelta::Lines(
+                if x.is_finite() {
+                    x.clamp(-32.0, 32.0)
+                } else {
+                    0.0
+                },
+                if y.is_finite() {
+                    y.clamp(-32.0, 32.0)
+                } else {
+                    0.0
+                },
+            ),
+            ScrollDelta::Pixels(px, py) => ScrollDelta::Pixels(
+                if px.is_finite() { px } else { 0.0 },
+                if py.is_finite() { py } else { 0.0 },
+            ),
+        };
         // CTX-0159: retain a bounded wheel trace for screenshots-free probes.
         match delta {
             ScrollDelta::Lines(x, y) => {
@@ -2046,11 +2064,11 @@ impl Runtime {
             ScrollDelta::Pixels(px, py) => {
                 // Accumulate pixel deltas; threshold = configured pixels
                 // per notch (default 16 = one default cell height).
-                self.wheel_accum_x += px as f32;
-                self.wheel_accum_y += py as f32;
                 let bound = 4.0 * pixels_per_notch;
-                self.wheel_accum_y = self.wheel_accum_y.clamp(-bound, bound);
-                self.wheel_accum_x = self.wheel_accum_x.clamp(-bound, bound);
+                let px_f32 = (px as f32).clamp(-bound, bound);
+                let py_f32 = (py as f32).clamp(-bound, bound);
+                self.wheel_accum_x = (self.wheel_accum_x + px_f32).clamp(-bound, bound);
+                self.wheel_accum_y = (self.wheel_accum_y + py_f32).clamp(-bound, bound);
                 let notches_y = self.wheel_accum_y / pixels_per_notch;
                 let notches_x = self.wheel_accum_x / pixels_per_notch;
                 if notches_y.trunc() != 0.0 || notches_x.trunc() != 0.0 {
@@ -2549,5 +2567,46 @@ mod tests {
         let (dropped, flush_failed) = write_input_best_effort(&mut FlushFailingWriter, b"abc");
         assert_eq!(dropped, 0);
         assert!(flush_failed);
+    }
+
+    #[test]
+    fn non_finite_wheel_deltas_do_not_poison_accumulators_3060() {
+        use super::*;
+
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        let h = rt.state().height();
+        for i in 0..(h + 10) {
+            rt.handle_pty_bytes(format!("line {i:03}\r\n").as_bytes());
+        }
+        assert!(rt.scrollback_len() >= 10);
+
+        rt.handle_wheel(ScrollDelta::Lines(f32::NAN, f32::NAN));
+        rt.handle_wheel(ScrollDelta::Lines(f32::INFINITY, f32::NEG_INFINITY));
+        rt.handle_wheel(ScrollDelta::Pixels(f64::NAN, f64::NAN));
+        rt.handle_wheel(ScrollDelta::Pixels(f64::INFINITY, f64::NEG_INFINITY));
+
+        assert!(rt.wheel_line_accum_x.is_finite());
+        assert!(rt.wheel_line_accum_y.is_finite());
+        assert!(rt.wheel_accum_x.is_finite());
+        assert!(rt.wheel_accum_y.is_finite());
+
+        let focused = rt.focused_view().expect("focused view");
+        assert_eq!(rt.layout().find_leaf(focused).unwrap().scroll_offset(), 0);
+
+        // Subsequent finite wheel scrolls must still move the viewport.
+        rt.handle_wheel(ScrollDelta::Lines(0.0, 1.0));
+        let offset_after_lines = rt.layout().find_leaf(focused).unwrap().scroll_offset();
+        assert!(
+            offset_after_lines > 0,
+            "finite line wheel must scroll after NaN/Inf"
+        );
+
+        let px_notch = f64::from(rt.config().scroll_pixels_per_notch.max(1));
+        rt.handle_wheel(ScrollDelta::Pixels(0.0, px_notch));
+        let offset_after_pixels = rt.layout().find_leaf(focused).unwrap().scroll_offset();
+        assert!(
+            offset_after_pixels > offset_after_lines,
+            "finite pixel wheel must scroll after NaN/Inf"
+        );
     }
 }

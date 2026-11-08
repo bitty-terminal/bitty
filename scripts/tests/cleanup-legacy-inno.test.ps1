@@ -201,6 +201,22 @@ try {
   Assert-True (Test-Path -LiteralPath $userShortcut) 'second run deleted the user-authored shortcut'
   Write-Host 'PASS: second run is a no-op (no removals, no SHChangeNotify)'
 
+  # --- a group folder holding only the two Inno shortcuts still goes ------
+  $emptyAppData = Join-Path $root 'empty\appdata'
+  $emptyLocalAppData = Join-Path $root 'empty\localappdata'
+  $emptyGroupDir = Join-Path $emptyAppData 'Microsoft\Windows\Start Menu\Programs\Bitty'
+  $emptyLegacyDir = Join-Path $emptyLocalAppData 'Programs\Bitty'
+  New-Item -ItemType Directory -Force -Path $emptyGroupDir, $emptyLegacyDir | Out-Null
+  Set-Content -LiteralPath (Join-Path $emptyGroupDir 'Bitty.lnk') -Value 'inno start menu shortcut'
+  Set-Content -LiteralPath (Join-Path $emptyGroupDir 'Uninstall Bitty.lnk') -Value 'inno uninstall shortcut'
+  Set-Content -LiteralPath (Join-Path $emptyLegacyDir 'bitty.exe') -Value 'stale inno payload'
+  $env:AppData = $emptyAppData
+  $env:LocalAppData = $emptyLocalAppData
+  $emptyRun = Remove-BittyLegacyInnoSetup -CurrentInstallDir $currentDir -DesktopDir (Join-Path $root 'empty\desktop')
+  Assert-True ($emptyRun -eq $true) 'a folder holding only the Inno shortcuts reported no removals'
+  Assert-True (-not (Test-Path -LiteralPath $emptyGroupDir)) 'an empty-of-user-content group folder survived (the folder should be dropped once it is empty)'
+  Write-Host 'PASS: the group folder is dropped once it holds nothing but what Inno created'
+
   # --- nested -InstallDir: the legacy tree holds the fresh binary --------
   $nestedAppData = Join-Path $root 'nested\appdata'
   $nestedLocalAppData = Join-Path $root 'nested\localappdata'

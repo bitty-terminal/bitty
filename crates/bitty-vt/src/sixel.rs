@@ -315,6 +315,7 @@ fn walk(
         let byte = payload[index];
         match byte {
             b'#' => {
+                repeat = 1;
                 index += 1;
                 let register = parse_number(payload, &mut index)?;
                 if register as usize >= SIXEL_MAX_COLORS {
@@ -339,6 +340,7 @@ fn walk(
                 }
             }
             b'"' => {
+                repeat = 1;
                 index += 1;
                 let mut values = [0u32; 4];
                 let mut count = 0usize;
@@ -390,6 +392,11 @@ fn walk(
                 index += 1;
             }
             SIXEL_DATA_BASE..=0x7E => {
+                if repeat == 0 {
+                    repeat = 1;
+                    index += 1;
+                    continue;
+                }
                 let bits = byte - SIXEL_DATA_BASE;
                 // Expansion checks before the strips exist (T-02): one data
                 // byte may claim up to `repeat` columns and a full band.
@@ -892,5 +899,31 @@ mod tests {
         assert!(
             matches!(error, SixelReject::TooManyPixels { pixels } if pixels > SIXEL_MAX_PIXELS)
         );
+    }
+
+    #[test]
+    fn zero_repeat_does_not_inflate_extent_or_cells() {
+        // A payload whose only sixel data has repeat 0 draws no pixels and must
+        // fail closed as Empty.
+        assert_eq!(decode_sixel(b"!0~", opaque()), Err(SixelReject::Empty));
+
+        // Following a drawn 1x1 pixel (`@`) with `!0~` must not inflate the
+        // image height from 1 to 6 for a zero-column repeat.
+        let image = decode_sixel(&with_white(b"@!0~"), opaque()).expect("1x1 pixel decodes");
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(pixel(&image, 0, 0), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn non_data_commands_reset_pending_repeat() {
+        // A stray `!5` before `#` or `"` must not leak across the colour or
+        // raster-attribute command into a subsequent sixel data byte.
+        let after_color =
+            decode_sixel(b"!5#1;2;100;0;0@", opaque()).expect("colour command resets repeat");
+        assert_eq!((after_color.width, after_color.height), (1, 1));
+
+        let after_raster =
+            decode_sixel(b"!5\"1;1;10;10@", opaque()).expect("raster command resets repeat");
+        assert_eq!((after_raster.width, after_raster.height), (1, 1));
     }
 }

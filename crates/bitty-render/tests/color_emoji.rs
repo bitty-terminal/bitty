@@ -390,6 +390,47 @@ fn overlay_text_paints_the_color_glyph() {
     );
 }
 
+#[test]
+fn fallback_rasterizer_preserves_emoji_presentation_across_grid_and_overlay() {
+    use bitty_render::FallbackRasterizer;
+
+    let wrapped = FallbackRasterizer::new(ColorFake::new(), vec!["Emoji Tail".to_string()]);
+    let query = FontQuery {
+        family: "Fake Color".into(),
+        style: FontStyle::Normal,
+        point_size: 12.0,
+    };
+    let mut renderer = GridRenderer::new(
+        wrapped,
+        &query,
+        CellMetrics::new(u32::from(CELL.0), u32::from(CELL.1)).unwrap(),
+    )
+    .expect("renderer");
+
+    let mut state = State::new();
+    state.apply(&TerminalAction::Print(GraphemeCell::from('\u{2705}')));
+    let snapshot = state.snapshot();
+    let damage = Damage {
+        generation: snapshot.generation,
+        regions: state.damage_since(0).into_boxed_slice(),
+    };
+    let list = renderer.render(&snapshot, &damage).expect("render");
+    assert_eq!(list.glyphs.len(), 1);
+    assert!(
+        matches!(list.glyphs[0].source, GlyphSource::ColorAtlas { .. }),
+        "FallbackRasterizer must preserve EmojiPresentation::Emoji on grid path, got {:?}",
+        list.glyphs[0].source
+    );
+
+    let overlay = renderer.overlay_text_glyphs("\u{1F680}", (0, 0), 4, DEFAULT_FG);
+    assert_eq!(overlay.len(), 1);
+    assert!(
+        matches!(overlay[0].source, GlyphSource::ColorAtlas { .. }),
+        "FallbackRasterizer must preserve EmojiPresentation::Emoji on overlay path, got {:?}",
+        overlay[0].source
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Live font evidence (BITTY_RENDER_FONT_TESTS=1)
 // ---------------------------------------------------------------------------

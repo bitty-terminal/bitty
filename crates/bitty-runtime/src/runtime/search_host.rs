@@ -443,6 +443,9 @@ impl Runtime {
         }
         let grid = grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
             .ok_or_else(|| HostOpError::Unavailable("bound view owns no live grid".to_string()))?;
+        // Field-disjoint lookup on purpose: `grid` borrows `pane_sessions` /
+        // `state` and is still live below, so `self.find_view_mut(view)` (a
+        // `&mut self` method) would conflict with it. Keep the chain per store.
         let Some(leaf) = self
             .layout
             .find_leaf_mut(view)

@@ -461,44 +461,86 @@ mod tests {
     use super::*;
     use bitty_ui::{LayoutNode, SplitAxis};
 
-    #[test]
-    fn unbound_search_refresh_updates_matches_when_focused_view_is_detached_float_or_pinned() {
+    /// Seeds two leaves and gives `pane` its own `PaneSession`, so the pane's
+    /// grid can differ from the primary grid.
+    fn runtime_with_pane(pane: ViewId) -> Runtime {
         let mut rt = Runtime::with_defaults().expect("runtime builds");
         rt.set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
-            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+            LayoutNode::leaf(View::new(pane, 80, 24)),
         ));
-        let v1 = ViewId::new(1);
-        rt.float_detach(v1).expect("detach v1");
-        assert!(rt.set_focus(v1));
+        rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 24)
+            .expect("spawn pane shell");
+        rt
+    }
 
-        rt.handle_pty_bytes(b"needle-one\r\n");
+    #[test]
+    fn unbound_search_refresh_reads_focused_detached_float_grid() {
+        bitty_test_support::require_pty!();
+        let primary = ViewId::new(1);
+        let float = ViewId::new(2);
+        let mut rt = runtime_with_pane(float);
+
+        // Search is inactive, so neither feed touches the match set. The pane's
+        // own session holds one match; the primary grid holds two.
+        rt.handle_pane_bytes(float, b"needle-pane\r\n");
+        rt.handle_pty_bytes(b"needle-one\r\nneedle-two\r\n");
+
+        rt.float_detach(float).expect("detach float");
+        assert!(rt.set_focus(primary));
         rt.search_set("needle", SearchOptions::default());
-        assert_eq!(rt.search_match_count(), 1);
-
-        // Simulate an unbound search (`search_view == None`) while focused on the
-        // detached float, then feed a second match and refresh.
-        rt.search_view = None;
-        rt.handle_pty_bytes(b"needle-two\r\n");
-        rt.search_refresh();
         assert_eq!(
             rt.search_match_count(),
             2,
-            "unbound search_refresh must find the focused detached float's grid"
+            "search binds to the primary grid"
         );
 
-        // Restore and pin the view, then verify unbound search_refresh still updates.
-        rt.float_restore(v1).expect("restore float");
-        rt.pin_floating(v1).expect("pin v1");
-        assert!(rt.set_focus(v1));
-        rt.handle_pty_bytes(b"needle-three\r\n");
+        // Unbound fallback (the only reachable unbound state): the keyboard
+        // view is the focused detached float, which owns a PaneSession. The
+        // refresh must read that session's grid (1 match), not decline because
+        // the view is not a layout leaf (which would leave the stale 2).
+        rt.search_view = None;
+        assert!(rt.set_focus(float));
         rt.search_refresh();
         assert_eq!(
             rt.search_match_count(),
-            3,
-            "unbound search_refresh must find the focused pinned view's grid"
+            1,
+            "unbound search_refresh must read the focused detached float's own grid"
+        );
+    }
+
+    #[test]
+    fn unbound_search_refresh_reads_focused_pinned_grid() {
+        bitty_test_support::require_pty!();
+        let primary = ViewId::new(1);
+        let pinned = ViewId::new(2);
+        let mut rt = runtime_with_pane(pinned);
+
+        rt.handle_pane_bytes(pinned, b"needle-pane\r\n");
+        rt.handle_pty_bytes(b"needle-one\r\nneedle-two\r\n");
+
+        // A pinned view is not a layout leaf either; same expectation.
+        rt.float_detach(pinned).expect("detach float");
+        rt.float_restore(pinned).expect("restore float");
+        rt.pin_floating(pinned).expect("pin view");
+
+        assert!(rt.set_focus(primary));
+        rt.search_set("needle", SearchOptions::default());
+        assert_eq!(
+            rt.search_match_count(),
+            2,
+            "search binds to the primary grid"
+        );
+
+        rt.search_view = None;
+        assert!(rt.set_focus(pinned));
+        rt.search_refresh();
+        assert_eq!(
+            rt.search_match_count(),
+            1,
+            "unbound search_refresh must read the focused pinned view's own grid"
         );
     }
 }

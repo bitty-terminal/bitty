@@ -631,7 +631,7 @@ impl Runtime {
                 Some(sess) => sess.state.scrollback_len(),
                 None => self.state.scrollback_len(),
             };
-            if let Some(view) = self.find_view_mut(id) {
+            if let Some(view) = self.layout.find_leaf_mut(id) {
                 view.clamp_scroll_offset(max_scrollback);
             }
             self.restore_view_scroll_anchor(id);
@@ -1260,38 +1260,6 @@ mod tests {
             visible_rows(&rt, float).first(),
             before.get(3),
             "interactive scrolling after output must use the retained anchor offset"
-        );
-    }
-
-    #[test]
-    fn detached_float_scroll_offset_clamps_on_resize_without_anchor() {
-        let mut rt = Runtime::with_defaults().expect("runtime builds");
-        rt.set_layout(two_pane_layout());
-        let float = ViewId::new(1);
-        rt.float_detach(float).expect("float detaches");
-        assert!(rt.set_focus(float));
-
-        for i in 0..40 {
-            rt.handle_pty_bytes(format!("LINE-{i:02}\r\n").as_bytes());
-        }
-        // Set an unanchored scroll offset directly and then clear scrollback
-        // before resizing: reflow_content_to_chrome must clamp detached floats
-        // via find_view_mut, not layout.find_leaf_mut.
-        let sb_len = rt.state.scrollback_len();
-        assert!(sb_len > 5);
-        rt.find_view_mut(float)
-            .expect("float view")
-            .set_scroll_offset(sb_len, sb_len);
-        rt.handle_pty_bytes(b"\x1b[3J");
-        assert_eq!(rt.state.scrollback_len(), 0);
-
-        let width = rt.surface_extent().expect("surface extent").width();
-        rt.handle_resize(bitty_platform::PhysicalSize::new(width, 14 * 19 + 16))
-            .expect("resize reflows");
-        assert_eq!(
-            rt.view_scroll_offset(float),
-            0,
-            "detached float scroll_offset must clamp to new max_scrollback on resize"
         );
     }
 

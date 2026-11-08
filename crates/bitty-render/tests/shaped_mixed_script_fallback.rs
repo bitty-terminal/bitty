@@ -96,6 +96,20 @@ fn mixed_han_and_emoji_gap_resolves_each_cluster() {
 /// cluster of the run was `uncovered`, so only the `>` prefix painted.
 #[test]
 fn han_row_with_a_trailing_emoji_keeps_its_glyphs() {
+    // Calibration: the regression is "adding an emoji must not drop the Han
+    // glyphs", so it only means something on a host whose font stack covers
+    // the Han line at all. A host without a CJK face paints neither line and
+    // must skip rather than fail (CI images vary).
+    let Some((control, _)) = render_line("> 请问饿七五二二头痛医头用") else {
+        return;
+    };
+    if control.glyphs_emitted < 13 {
+        eprintln!(
+            "skipped: host has no CJK face for the reported line ({} glyphs)",
+            control.glyphs_emitted
+        );
+        return;
+    }
     let Some((counters, list)) = render_line("> 请问饿七五二二头痛医头用\u{1F600}")
     else {
         return;

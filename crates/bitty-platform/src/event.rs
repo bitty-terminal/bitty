@@ -794,6 +794,20 @@ pub(crate) fn map_modifiers_changed(mods: winit::event::Modifiers) -> WindowEven
     })
 }
 
+fn clamp_utf8_boundary(text: &str, index: usize) -> usize {
+    let mut clamped = index.min(text.len());
+    while clamped > 0 && !text.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
+}
+
+fn sanitize_ime_cursor(text: &str, (start, end): (usize, usize)) -> (usize, usize) {
+    let start = clamp_utf8_boundary(text, start);
+    let end = clamp_utf8_boundary(text, end).max(start);
+    (start, end)
+}
+
 pub(crate) fn map_ime(ime: winit::event::Ime) -> Option<ImeEvent> {
     match ime {
         winit::event::Ime::Enabled => Some(ImeEvent::Enabled),
@@ -812,6 +826,7 @@ pub(crate) fn map_ime(ime: winit::event::Ime) -> Option<ImeEvent> {
             } else {
                 text
             };
+            let cursor = cursor.map(|range| sanitize_ime_cursor(&bounded, range));
             Some(ImeEvent::Preedit(bounded, cursor))
         }
         winit::event::Ime::Commit(text) => {
@@ -1164,6 +1179,32 @@ mod tests {
                 physical.height()
             ))),
             Some(WindowEventKind::Resized(physical))
+        );
+    }
+
+    #[test]
+    fn ime_preedit_clamps_and_snaps_cursor_to_char_boundaries() {
+        // Long preedit (> 128 chars) with cursor beyond the truncated length.
+        let long_text = "あ".repeat(140);
+        let mapped = map_ime(winit::event::Ime::Preedit(
+            long_text,
+            Some((135 * 3, 140 * 3)),
+        ))
+        .expect("preedit mapped");
+        let expected_len = 128 * 3;
+        assert_eq!(
+            mapped,
+            ImeEvent::Preedit("あ".repeat(128), Some((expected_len, expected_len)))
+        );
+
+        // Mid-codepoint and inverted cursor indices snap back to UTF-8 char boundaries
+        // and enforce start <= end.
+        let short = String::from("aあb"); // bytes: 'a' (0..1), 'あ' (1..4), 'b' (4..5)
+        let mapped_mid = map_ime(winit::event::Ime::Preedit(short, Some((3, 2))))
+            .expect("preedit with mid-char cursor");
+        assert_eq!(
+            mapped_mid,
+            ImeEvent::Preedit(String::from("aあb"), Some((1, 1)))
         );
     }
 }

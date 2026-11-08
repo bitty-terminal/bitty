@@ -133,10 +133,16 @@ pub struct RawBluetoothDevice {
 /// the check lives here so fixtures and host share one rule.
 #[must_use]
 pub fn bluez_path_in_scope(path: &str) -> bool {
-    if path == BLUEZ_OBJECT_ROOT || path.is_empty() {
+    let Some(rest) = path.strip_prefix("/org/bluez/") else {
         return false;
-    }
-    path.starts_with("/org/bluez/")
+    };
+    !rest.is_empty()
+        && rest.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
 }
 
 /// Validate a `XX:XX:XX:XX:XX:XX` address shape (17 bytes, five colons,
@@ -534,6 +540,12 @@ mod tests {
         assert!(bluez_path_in_scope("/org/bluez/hci0"));
         assert!(bluez_path_in_scope("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"));
         assert!(!bluez_path_in_scope("/org/bluez"));
+        assert!(!bluez_path_in_scope("/org/bluez/"));
+        assert!(!bluez_path_in_scope("/org/bluez//hci0"));
+        assert!(!bluez_path_in_scope("/org/bluez/hci0/"));
+        assert!(!bluez_path_in_scope("/org/bluez/./hci0"));
+        assert!(!bluez_path_in_scope("/org/bluez/../org/freedesktop/DBus"));
+        assert!(!bluez_path_in_scope("/org/bluez/hci0/.."));
         assert!(!bluez_path_in_scope("/org/bluezother/hci0"));
         assert!(!bluez_path_in_scope("/org/freedesktop/DBus"));
         assert!(!bluez_path_in_scope(""));

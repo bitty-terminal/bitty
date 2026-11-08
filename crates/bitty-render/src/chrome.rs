@@ -167,17 +167,21 @@ impl ChromeCornerGlyphs {
         }
     }
 
-    /// Glyph for one [`CORNER_ORDER`] index.
+    /// Glyph for one [`CORNER_ORDER`] index, or `None` when out of bounds.
     #[must_use]
     pub const fn glyph(&self, corner: usize) -> Option<char> {
-        self.corners[corner]
+        if corner < self.corners.len() {
+            self.corners[corner]
+        } else {
+            None
+        }
     }
 
     /// Quadrant mask for one [`CORNER_ORDER`] index, or `None` when the host
-    /// cannot draw block elements.
+    /// cannot draw block elements or `corner` is out of bounds.
     #[must_use]
     pub const fn mask(&self, corner: usize, coverage: ChromeGlyphCoverage) -> Option<char> {
-        if matches!(coverage, ChromeGlyphCoverage::Full) {
+        if corner < CHROME_CORNER_MASKS.len() && matches!(coverage, ChromeGlyphCoverage::Full) {
             Some(CHROME_CORNER_MASKS[corner])
         } else {
             None
@@ -707,7 +711,12 @@ mod tests {
     fn corner_glyph_fallback_is_documented_and_total() {
         let full = ChromeCornerGlyphs::resolve(ChromeGlyphCoverage::Full);
         assert_eq!(full.corners, [Some('╭'), Some('╮'), Some('╰'), Some('╯')]);
+        assert_eq!(full.glyph(0), Some('╭'));
+        assert_eq!(full.glyph(4), None);
+        assert_eq!(full.glyph(usize::MAX), None);
         assert_eq!(full.mask(0, ChromeGlyphCoverage::Full), Some('▘'));
+        assert_eq!(full.mask(4, ChromeGlyphCoverage::Full), None);
+        assert_eq!(full.mask(usize::MAX, ChromeGlyphCoverage::Full), None);
         let basic = ChromeCornerGlyphs::resolve(ChromeGlyphCoverage::Basic);
         assert_eq!(basic.corners, [Some('┌'), Some('┐'), Some('└'), Some('┘')]);
         assert_eq!(basic.mask(0, ChromeGlyphCoverage::Basic), None);

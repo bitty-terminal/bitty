@@ -43,8 +43,28 @@ fn validate_uri_common(uri: &str, scheme: &str) -> Result<ValidatedUrl, Platform
     {
         return Err(PlatformError::InvalidUrl);
     }
-    if !matches!(scheme, "http" | "https" | "mailto" | "file") {
-        return Err(PlatformError::InvalidUrl);
+    match scheme {
+        "http" | "https" => {
+            let Some(rest) = uri[scheme.len()..].strip_prefix("://") else {
+                return Err(PlatformError::InvalidUrl);
+            };
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            if authority.is_empty() || authority.starts_with('-') {
+                return Err(PlatformError::InvalidUrl);
+            }
+        }
+        "mailto" => {
+            let rest = &uri[scheme.len() + 1..];
+            if rest.is_empty() || rest.starts_with('-') {
+                return Err(PlatformError::InvalidUrl);
+            }
+        }
+        "file" => {
+            if !uri.starts_with("file:///") {
+                return Err(PlatformError::InvalidUrl);
+            }
+        }
+        _ => return Err(PlatformError::InvalidUrl),
     }
     let forbidden = |byte| {
         matches!(
@@ -105,24 +125,19 @@ fn is_local_file_url(uri: &str) -> bool {
     let Some(path) = uri.strip_prefix("file:///") else {
         return false;
     };
-    let mut segment = Vec::new();
-    for byte in path.bytes() {
-        if byte == b'/' {
-            if segment == b".." {
-                return false;
-            }
-            segment.clear();
-        } else {
-            segment.push(byte);
-        }
-    }
-    if segment == b".." {
+    let raw_path = path.split(['?', '#']).next().unwrap_or("");
+    if raw_path.is_empty() || raw_path.split('/').any(|segment| segment == "..") {
         return false;
     }
     !uri.as_bytes().windows(3).any(|window| {
         window[0] == b'%'
-            && matches!(window[1].to_ascii_lowercase(), b'2' | b'5')
-            && matches!(window[2].to_ascii_lowercase(), b'e' | b'f' | b'c')
+            && matches!(
+                [
+                    window[1].to_ascii_lowercase(),
+                    window[2].to_ascii_lowercase()
+                ],
+                [b'2', b'e'] | [b'2', b'f'] | [b'5', b'c']
+            )
     })
 }
 
@@ -227,16 +242,47 @@ mod tests {
     #[test]
     fn file_opener_requires_local_authority_free_form() {
         assert!(is_local_file_url("file:///tmp/report.txt"));
+        assert!(is_local_file_url("file:///tmp/report%2c1%5e2%5f3.txt"));
+        assert!(validate_file_url("file:///tmp/report%2c1%5e2%5f3.txt").is_ok());
         for uri in [
             "file://attacker/share",
             "file://server/share",
             "file://%2Ftmp/share",
             "file:///tmp/%2e%2e/etc/passwd",
             "file:///tmp/%2Fetc/passwd",
+            "file:///tmp/%5cetc/passwd",
+            "file:///tmp/..?foo",
+            "file:///tmp/..#bar",
+            "file:///..?foo",
+            "file:///",
+            "file:///?foo",
         ] {
             assert!(
                 !is_local_file_url(uri),
                 "accepted non-local file URI: {uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scheme_structure_rejects_empty_relative_and_option_leading_targets() {
+        for uri in [
+            "http:",
+            "https:",
+            "mailto:",
+            "http://",
+            "https://",
+            "http:///path",
+            "https:///path",
+            "http:relative/path",
+            "https:relative/path",
+            "http://-option/path",
+            "https://-option/path",
+            "mailto:-oProxyCommand=id",
+        ] {
+            assert!(
+                validate_url(uri).is_err(),
+                "accepted malformed URI structure: {uri:?}"
             );
         }
     }

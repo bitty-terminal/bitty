@@ -508,7 +508,7 @@ impl FakeDriver {
             .get("client_version")
             .and_then(|value| value.get("minor"))
             .and_then(Value::as_u64);
-        if major != Some(1) || !matches!(minor, Some(0..=4)) {
+        if major != Some(1) || !matches!(minor, Some(0..=5)) {
             let outcome = self.refuse("daemon.negotiate", "Validation", "VersionMismatch", None);
             self.connection(connection).closed = true;
             return outcome;
@@ -592,7 +592,7 @@ impl FakeDriver {
             .collect();
         let value = json!({
             "wire_version": 1,
-            "service_api_version": {"major": 1, "minor": 4, "min_client_minor": 0},
+            "service_api_version": {"major": 1, "minor": 5, "min_client_minor": 0},
             "daemon_instance_id": self.instance,
             "daemon_pid": FAKE_DAEMON_PID,
             "server_identity": {
@@ -1457,6 +1457,7 @@ impl FakeDriver {
                 "data": encode_hex(&data),
                 "bytes": data.len(),
                 "buffered_bytes": buffered,
+                "is_untrusted_surface": true,
             }),
         )
     }

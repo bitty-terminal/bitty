@@ -29,7 +29,7 @@ use bitty_ipc_api::wire::{
     validate_no_ambient_auth, validate_response_envelope, validate_wire_version,
 };
 
-use crate::content::{CONTENT_EVENT_KIND, ContentFrame};
+use crate::content::{CONTENT_EVENT_KIND, ContentFrame, UntrustedObservation};
 use crate::contract::ClientVersion;
 use crate::events::{Event, EventDetail};
 use crate::handshake::{
@@ -332,31 +332,38 @@ pub fn render_event(id: &str, event: &Event) -> Result<Vec<u8>, Refusal> {
 /// The shape is the event envelope plus a `session_content` event:
 /// `{"v":1,"id":...,"event":{"kind":"session_content","instance_id":...,
 /// "session_id":...,"attach_id":...,"generation":...,"revision":...,
-/// "terminal":false,"sequence":...,"data":"<hex>","buffered_bytes":...}}`.
+/// "terminal":false,"sequence":...,"data":"<hex>","buffered_bytes":...,
+/// "is_untrusted_surface":true}}`.
 /// The envelope facts match every other event (`D-10`); `sequence` orders
 /// content because taking bytes from the buffer does not advance the session
 /// revision. The raw bytes are lowercase hex, so every byte value survives
-/// JSON. No pid, path, argv, environment, or audit text is present.
+/// JSON. The `is_untrusted_surface` label is server-attached
+/// ([`UntrustedObservation`]): terminal bytes are observation data, never
+/// instructions. No pid, path, argv, environment, or audit text is present.
 ///
 /// # Errors
 ///
 /// Returns [`Refusal::internal`] when the payload exceeds the frame bound.
 pub fn render_content_event(id: &str, content: &ContentFrame) -> Result<Vec<u8>, Refusal> {
+    let mut event = json!({
+        "kind": CONTENT_EVENT_KIND,
+        "instance_id": content.instance_id.as_hex(),
+        "session_id": content.session_id.as_hex(),
+        "attach_id": content.attach_id.as_hex(),
+        "generation": content.generation,
+        "revision": content.revision,
+        "terminal": false,
+        "sequence": content.sequence,
+        "data": crate::content::encode_hex(&content.data),
+        "buffered_bytes": content.buffered_bytes,
+    });
+    if !UntrustedObservation::new().attach(&mut event) {
+        return Err(Refusal::internal());
+    }
     let payload = json!({
         "v": ACCEPTED_WIRE_VERSION,
         "id": id,
-        "event": {
-            "kind": CONTENT_EVENT_KIND,
-            "instance_id": content.instance_id.as_hex(),
-            "session_id": content.session_id.as_hex(),
-            "attach_id": content.attach_id.as_hex(),
-            "generation": content.generation,
-            "revision": content.revision,
-            "terminal": false,
-            "sequence": content.sequence,
-            "data": crate::content::encode_hex(&content.data),
-            "buffered_bytes": content.buffered_bytes,
-        },
+        "event": event,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|_| Refusal::internal())?;
     frame(&bytes)
@@ -670,6 +677,8 @@ mod tests {
         assert_eq!(value["event"]["sequence"], 3);
         assert_eq!(value["event"]["data"], "006869ff");
         assert_eq!(value["event"]["buffered_bytes"], 9);
+        assert_eq!(value["event"]["is_untrusted_surface"], true);
+        assert!(value["event"]["is_untrusted_surface"].is_boolean());
         for forbidden in ["pid", "path", "argv", "env", "cwd", "token"] {
             assert!(
                 value["event"].get(forbidden).is_none(),

@@ -3199,6 +3199,14 @@ fn terminal_content_reads_writes_and_refuses_observers_and_terminal_records() {
     assert_eq!(empty["ok"], true, "{empty}");
     assert_eq!(empty["result"]["bytes"], 0);
     assert_eq!(empty["result"]["data"], "");
+    assert_eq!(
+        empty["result"]["is_untrusted_surface"], true,
+        "every content response is labeled untrusted observation data: {empty}"
+    );
+    assert!(
+        empty["result"]["is_untrusted_surface"].is_boolean(),
+        "the label is a typed boolean, not a string: {empty}"
+    );
 
     // A controller write reaches the PTY; `cat` echoes it back through the
     // terminal, and the read observes the echoed bytes.
@@ -3226,6 +3234,10 @@ fn terminal_content_reads_writes_and_refuses_observers_and_terminal_records() {
             json!({"session_id": session_id, "generation": 1, "max_bytes": 4096}),
         );
         assert_eq!(read["ok"], true, "{read}");
+        assert_eq!(
+            read["result"]["is_untrusted_surface"], true,
+            "a read carrying terminal bytes is labeled: {read}"
+        );
         seen.extend(decode_content(
             read["result"]["data"].as_str().expect("content hex"),
         ));
@@ -4735,6 +4747,14 @@ mod event_wire {
             assert_eq!(event["attach_id"], attach_id, "{event}");
             assert_eq!(event["generation"], 1, "{event}");
             assert_eq!(event["terminal"], false, "{event}");
+            assert_eq!(
+                event["is_untrusted_surface"], true,
+                "a content frame is labeled untrusted observation data: {event}"
+            );
+            assert!(
+                event["is_untrusted_surface"].is_boolean(),
+                "the content-frame label is a typed boolean: {event}"
+            );
             assert_eq!(
                 event["instance_id"].as_str(),
                 Some(instance.as_str()),

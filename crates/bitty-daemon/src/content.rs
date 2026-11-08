@@ -35,9 +35,19 @@
 //! Content frames carry the frozen event envelope fact (`instance_id`,
 //! `revision`, and a constant `terminal: false`) plus the session id,
 //! generation, sequence, raw bytes, and the current buffered-byte count.
+//!
+//! # Untrusted observation
+//!
+//! Every response and frame that carries terminal bytes is labeled with
+//! [`UntrustedObservation`] (`is_untrusted_surface: true`), the `bitty-ipc`
+//! vocabulary for terminal output (T-10 / R-013). The service attaches the
+//! label after the handler returns, so a request cannot suppress or forge it,
+//! and a response that clips or rewrites bytes still carries it.
 
 use std::collections::VecDeque;
 use std::fmt;
+
+use serde_json::Value;
 
 use crate::limits::LimitId;
 use crate::registry::{AttachId, DaemonInstanceId, SessionId};
@@ -64,6 +74,56 @@ pub const CONTENT_BUFFER_BYTES: usize = LimitId::MaxChunkBytes.default_value() a
 
 /// The frozen event kind for a pushed content frame.
 pub const CONTENT_EVENT_KIND: &str = "session_content";
+
+/// The server-attached untrusted-observation label (`T-10` / `R-013`).
+///
+/// Terminal bytes are observation data, never instructions. The label uses the
+/// `bitty-ipc` result vocabulary exactly: the boolean field
+/// [`Self::FIELD`] (`is_untrusted_surface`), always `true`. The type has one
+/// value, so a response cannot be built with a false or absent label, and the
+/// service attaches it after the handler returns: a request field can neither
+/// suppress nor forge it. Redaction, truncation, or any other rewrite of the
+/// response body happens before attachment and cannot remove it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UntrustedObservation;
+
+impl UntrustedObservation {
+    /// The wire field name, identical to the `bitty-ipc` result field.
+    pub const FIELD: &'static str = "is_untrusted_surface";
+
+    /// The one label value.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Whether the labeled surface is an untrusted observation.
+    ///
+    /// Always `true`; provided so call sites read intent, not a field.
+    #[must_use]
+    pub const fn is_untrusted_surface(self) -> bool {
+        true
+    }
+
+    /// Attach the label to a response object.
+    ///
+    /// Returns `true` when the label was inserted. A non-object response
+    /// returns `false` and is left untouched, so a caller that expects a
+    /// content response treats it as an internal invariant rather than
+    /// serving unlabeled bytes.
+    pub fn attach(self, response: &mut Value) -> bool {
+        match response {
+            Value::Object(object) => {
+                object.insert(
+                    Self::FIELD.to_owned(),
+                    Value::Bool(self.is_untrusted_surface()),
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// One bounded per-session content buffer.
 ///
@@ -333,5 +393,34 @@ mod tests {
         assert_eq!(CONTENT_FRAME_BYTES * 4, chunk);
         assert!(CONTENT_FRAME_ENCODED_MAX < frame);
         assert_eq!(CONTENT_BUFFER_BYTES, chunk);
+    }
+
+    #[test]
+    fn the_untrusted_label_is_always_true_and_survives_response_rewrites() {
+        let label = UntrustedObservation::new();
+        assert!(label.is_untrusted_surface());
+
+        let mut response = serde_json::json!({"data": "0011", "truncated": false});
+        assert!(label.attach(&mut response));
+        assert_eq!(response[UntrustedObservation::FIELD], true);
+        assert!(response[UntrustedObservation::FIELD].is_boolean());
+
+        // A redaction or truncation rewrites the body; the label is attached
+        // after every handler transformation and stays present.
+        response["data"] = serde_json::json!("<redacted>");
+        response
+            .as_object_mut()
+            .expect("object")
+            .remove("truncated");
+        assert_eq!(response[UntrustedObservation::FIELD], true);
+
+        // Attaching again is idempotent, never a second value.
+        assert!(label.attach(&mut response));
+        assert_eq!(response[UntrustedObservation::FIELD], true);
+
+        // A non-object cannot silently claim the label.
+        let mut scalar = serde_json::json!("content");
+        assert!(!label.attach(&mut scalar));
+        assert_eq!(scalar, serde_json::json!("content"));
     }
 }

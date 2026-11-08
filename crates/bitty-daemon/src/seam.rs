@@ -157,7 +157,7 @@ mod tests {
     fn rendered_status_names_the_seam_explicitly() {
         let rendered = SeamStatus::current().render();
         assert!(rendered.contains("session-host seam"));
-        assert!(rendered.contains("service API: 1.4 (accepted client range 1.0..=1.4)"));
+        assert!(rendered.contains("service API: 1.5 (accepted client range 1.0..=1.5)"));
         assert!(rendered.contains("terminal_sessions"));
         assert!(rendered.contains("observer_grants"));
         assert!(

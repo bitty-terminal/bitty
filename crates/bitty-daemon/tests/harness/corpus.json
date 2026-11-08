@@ -50,7 +50,7 @@
             "result": {
               "wire_version": 1,
               "service_api_version.major": 1,
-              "service_api_version.minor": 4,
+              "service_api_version.minor": 5,
               "service_api_version.min_client_minor": 0,
               "daemon_state": "running",
               "capabilities.worker_sessions": "@worker_sessions",
@@ -157,7 +157,7 @@
           "params": {
             "client_version": {
               "major": 1,
-              "minor": 5
+              "minor": 6
             }
           },
           "expect": {
@@ -11336,7 +11336,7 @@
           "expect": {
             "ok": true,
             "result": {
-              "service_api_version.minor": 4
+              "service_api_version.minor": 5
             }
           }
         },

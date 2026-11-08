@@ -109,8 +109,8 @@
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
 //! - [`content`]: the bounded terminal byte buffer, the hex codec, the
-//!   content-frame budget, and the envelope-ready `session_content` frame
-//!   (`D-10`, `D-14`).
+//!   content-frame budget, the envelope-ready `session_content` frame, and the
+//!   server-attached untrusted-observation label (`D-10`, `D-14`, `T-10`).
 //!
 //! A `session.create kind: terminal` with the bounded spawn specification
 //! spawns through the contained path and binds generation 1; without a

@@ -122,8 +122,8 @@ of the service surface.
 
 | Item                 | Value                                                                                                                                                                | Where                                                                         |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Service API version  | `{major: 1, minor: 4}`                                                                                                                                               | `contract::SERVICE_API_VERSION`                                               |
-| Minimum client minor | `0` (`1.0..=1.4` accepted)                                                                                                                                           | `contract::MIN_CLIENT_MINOR`                                                  |
+| Service API version  | `{major: 1, minor: 5}`                                                                                                                                               | `contract::SERVICE_API_VERSION`                                               |
+| Minimum client minor | `0` (`1.0..=1.5` accepted)                                                                                                                                           | `contract::MIN_CLIENT_MINOR`                                                  |
 | Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` reserved and `false` in every build (`D-01`) | `contract::CAPABILITIES`, `worker::WORKER_SESSIONS_SERVED`                    |
 | Handshake method     | `daemon.negotiate`                                                                                                                                                   | `contract::NEGOTIATE_METHOD`                                                  |
 | Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                           | `handshake::negotiate`                                                        |
@@ -873,11 +873,11 @@ skips nothing.
 A bound terminal owns the content plane; a worker process does not. Three
 methods serve it, all controller-only in this slice:
 
-| Method              | Scope              | Request → Response                                                                                |
-| ------------------- | ------------------ | ------------------------------------------------------------------------------------------------- |
-| `session.read`      | `terminal.inspect` | `{session_id, generation, max_bytes?}` → `{session_id, generation, data, bytes, buffered_bytes}`  |
-| `session.write`     | `terminal.input`   | `{session_id, generation, data}` → `{session_id, generation, accepted, remaining, backpressure}`  |
-| `session.subscribe` | `terminal.inspect` | `{session_id, generation}` → `{session_id, generation, subscribed, already_subscribed, sequence}` |
+| Method              | Scope              | Request → Response                                                                                                           |
+| ------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `session.read`      | `terminal.inspect` | `{session_id, generation, max_bytes?}` → `{session_id, generation, data, bytes, buffered_bytes, is_untrusted_surface: true}` |
+| `session.write`     | `terminal.input`   | `{session_id, generation, data}` → `{session_id, generation, accepted, remaining, backpressure}`                             |
+| `session.subscribe` | `terminal.inspect` | `{session_id, generation}` → `{session_id, generation, subscribed, already_subscribed, sequence}`                            |
 
 `data` is lowercase hex in both directions, so every byte value survives JSON
 without a second wire type. `max_bytes` is optional and capped at
@@ -901,7 +901,10 @@ controller that wants to hold a lease while reading must keep heartbeating.
 `events: true`; a non-opted controller gets `Denied/UnsupportedCapability`.
 Subscribed frames ride the negotiated event connection with the frozen event
 envelope: `{"kind":"session_content","instance_id","session_id","attach_id",
-"generation","revision","terminal":false,"sequence","data","buffered_bytes"}`.
+"generation","revision","terminal":false,"sequence","data","buffered_bytes",
+"is_untrusted_surface":true}`. The `is_untrusted_surface` key is the
+server-attached untrusted-observation label described in
+[Untrusted-observation label](#untrusted-observation-label-service-15-bitty3021).
 `revision` is the session's `state_revision` at emission, so a content frame
 names the snapshot it was taken under; content is ordered and deduplicated by
 `(session_id, attach_id, sequence)`, never by revision alone, because several
@@ -1113,7 +1116,7 @@ and `daemon_state`.
   file, so a missing file and a wrong bearer are indistinguishable.
 - A `host_grant` that cannot be consumed adds no scope and does not close the
   connection; `session.create` then returns `Denied/ConsentRequired`.
-- A version outside `1.0..=1.4` is `VersionMismatch` and closes. A second
+- A version outside `1.0..=1.5` is `VersionMismatch` and closes. A second
   negotiate, or any frame read before the negotiate request, is
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
   The gate runs after the per-frame wire version and before the rate limiter,
@@ -1340,6 +1343,37 @@ natural exit, a worker signal, a spawn failure, or a supervision failure. The
 existing `attached` boolean is unchanged: the live list is a separate key, so
 the addition stays wire-additive. The operator keys are omitted from an ordinary
 `session.status` and `session.list` view, exactly like the owner peer.
+
+### Untrusted-observation label (service 1.5, bitty#3021)
+
+Terminal bytes are untrusted observation data, never instructions (`T-10` /
+`R-013`; `P0-AC-024`). Service `1.5` labels every response that can carry
+terminal content with the `bitty-ipc` result vocabulary:
+
+```json
+{ "is_untrusted_surface": true }
+```
+
+The label is a boolean field named exactly like the `bitty-ipc`
+`ExecutionResult`/`RichFragment` field, not a second label type. It is always
+`true`: terminal bytes have no trusted variant. `session.read` is the only
+catalog response that carries terminal bytes, so every `session.read` success
+carries the key, including a zero-byte read and a read clipped by `max_bytes`.
+`session_content` frames carry the same key, because a subscribed controller
+receives the same bytes on the event wire. `session.attach` carries event
+backlog metadata only, `session.write`/`session.resize`/`session.control.transfer`
+return counts and metadata, and the catalog has no `debug.*` method.
+
+The label is server-attached in `Service::dispatch` after the handler returns,
+from the frozen method classification
+(`ServiceMethod::carries_terminal_content`). A handler cannot omit it, and no
+request field can suppress or forge it: trust-shaped request keys are unknown
+parameters, ignored by the handler, and never echoed into the result. The
+attachment happens after every handler rewrite, so truncation, redaction, or
+any other transformation of the body leaves the label present. The addition is
+purely additive on the wire: a `1.0` through `1.4` client that ignores unknown
+keys keeps working, `min_client_minor` stays `0`, and the minor bump to `1.5`
+is what lets a client that requires the label negotiate for it.
 
 ### Audit sink
 

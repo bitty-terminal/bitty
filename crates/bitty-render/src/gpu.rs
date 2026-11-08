@@ -191,6 +191,23 @@ impl BackendKind {
             wgpu::Backend::Noop => BackendKind::Noop,
         }
     }
+
+    /// Stable lowercase name for logs and diagnostics (bitty#3014).
+    ///
+    /// The `Debug` form is a Rust identifier (`Dx12`), which is not what a
+    /// health check should print for a user; this is the spelling the
+    /// graphics API itself uses.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+            Self::Dx12 => "d3d12",
+            Self::Gl => "opengl",
+            Self::BrowserWebGpu => "webgpu",
+            Self::Noop => "noop",
+        }
+    }
 }
 
 /// Owned re-description of the upstream device classification.
@@ -216,6 +233,18 @@ impl DeviceClass {
             UpstreamDeviceType::Cpu => DeviceClass::Cpu,
             UpstreamDeviceType::VirtualGpu => DeviceClass::Virtual,
             UpstreamDeviceType::Other => DeviceClass::Other,
+        }
+    }
+
+    /// Stable lowercase name for logs and diagnostics (bitty#3014).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Discrete => "discrete",
+            Self::Integrated => "integrated",
+            Self::Cpu => "software",
+            Self::Virtual => "virtual",
+            Self::Other => "other",
         }
     }
 }
@@ -361,6 +390,55 @@ pub fn instance_descriptor() -> InstanceDescriptor {
 #[must_use]
 pub fn full_backends_descriptor() -> InstanceDescriptor {
     InstanceDescriptor::from_env_or_default()
+}
+
+/// Adapter the renderer's own selection rule resolves on this host.
+///
+/// Diagnostics-only probe (bitty#3014): `bitty doctor` must name the adapter
+/// the runtime actually uses — a DXGI/D3D12 adapter on Windows, the Metal
+/// device on macOS, Vulkan/GL on Linux — instead of a Linux device-node
+/// count. It builds the same instance the renderer builds
+/// ([`instance_descriptor`]) and runs the same `request_adapter` call the
+/// runtime's initialization makes, then stops: no logical device, no queue,
+/// no surface, nothing presented, and no error beyond the renderer's own.
+///
+/// # Errors
+///
+/// [`RenderError::NoCompatibleAdapter`] when no enabled backend produced an
+/// adapter (a host with no graphics stack at all).
+pub async fn probe_selected_adapter() -> Result<AdapterSummary, RenderError> {
+    let primary = instance_descriptor();
+    let full = full_backends_descriptor();
+    match request_adapter_summary(&primary).await {
+        Err(RenderError::NoCompatibleAdapter)
+            if should_retry_with_full_backends(
+                primary.backends,
+                full.backends,
+                cfg!(target_os = "windows"),
+            ) =>
+        {
+            request_adapter_summary(&full).await
+        }
+        other => other,
+    }
+}
+
+/// Requests an adapter for `descriptor` and copies its info out.
+async fn request_adapter_summary(
+    descriptor: &InstanceDescriptor,
+) -> Result<AdapterSummary, RenderError> {
+    let instance = Instance::new(descriptor);
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions::default())
+        .await
+        .map_err(|_| RenderError::NoCompatibleAdapter)?;
+    let info = adapter.get_info();
+    Ok(AdapterSummary {
+        name: info.name,
+        driver: info.driver,
+        backend: BackendKind::from_upstream(info.backend),
+        class: DeviceClass::from_upstream(info.device_type),
+    })
 }
 
 /// Whether a guarded `NoCompatibleAdapter` may retry with the full backend set.
@@ -3025,6 +3103,31 @@ mod tests {
     use bitty_platform::PhysicalSize;
     use bitty_term_state::{State, TerminalAction};
     use bitty_vt::GraphemeCell;
+
+    /// bitty#3014: `bitty doctor` prints these labels, so the spelling is a
+    /// contract (`d3d12`, not the `Dx12` Debug form).
+    #[test]
+    fn adapter_labels_are_api_spellings() {
+        for (kind, label) in [
+            (BackendKind::Vulkan, "vulkan"),
+            (BackendKind::Metal, "metal"),
+            (BackendKind::Dx12, "d3d12"),
+            (BackendKind::Gl, "opengl"),
+            (BackendKind::BrowserWebGpu, "webgpu"),
+            (BackendKind::Noop, "noop"),
+        ] {
+            assert_eq!(kind.label(), label);
+        }
+        for (class, label) in [
+            (DeviceClass::Discrete, "discrete"),
+            (DeviceClass::Integrated, "integrated"),
+            (DeviceClass::Cpu, "software"),
+            (DeviceClass::Virtual, "virtual"),
+            (DeviceClass::Other, "other"),
+        ] {
+            assert_eq!(class.label(), label);
+        }
+    }
 
     struct FakeRasterizer {
         next_id: u64,

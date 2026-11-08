@@ -819,8 +819,12 @@ fn probe_shaped_stack(family: &str, size: f32) -> Result<(), String> {
 
 /// Display presence: Wayland (`WAYLAND_DISPLAY`) or X11 (`DISPLAY`).
 /// Neither present is a warn (headless smoke is the supported fallback).
+///
+/// This is the Linux/FreeBSD mapping only; [`ProbePlatform::display`] is the
+/// entry point doctor uses, because the same environment variables cannot
+/// exist on Windows or macOS (bitty#3014).
 #[must_use]
-pub fn check_display(
+fn unix_display(
     wayland: Option<&str>,
     x11: Option<&str>,
     session_type: Option<&str>,
@@ -860,8 +864,11 @@ pub fn check_display(
 
 /// GPU presence via DRM render nodes. Absent is a warn: the headless software
 /// seam renders without a GPU.
+///
+/// Linux mapping only; [`ProbePlatform::gpu`] dispatches per host because
+/// `/dev/dri` is not a Windows or macOS path (bitty#3014).
 #[must_use]
-pub fn check_gpu(dri_cards: usize) -> DoctorCheck {
+fn unix_gpu(dri_cards: usize) -> DoctorCheck {
     if dri_cards > 0 {
         DoctorCheck::pass(
             "gpu",
@@ -876,6 +883,242 @@ pub fn check_gpu(dri_cards: usize) -> DoctorCheck {
                 .to_string(),
             "no DRM card nodes".to_string(),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Display and GPU probes per host (bitty#3014)
+// ---------------------------------------------------------------------------
+
+/// Host family that owns the display and GPU probe shape.
+///
+/// Mirrors [`RemediationPlatform`]: selected from the compile-time target,
+/// never guessed from a host path, so one tested table replaces a Linux-shaped
+/// probe that ran on every OS. Wayland/X11 variables and `/dev/dri` exist on
+/// Linux and FreeBSD only; Windows presents through a Win32 desktop session
+/// and DXGI, macOS through an Aqua window server and Metal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePlatform {
+    /// Linux: Wayland/X11 environment plus DRM card nodes.
+    Linux,
+    /// FreeBSD: the same session environment, DRM modules from ports.
+    FreeBsd,
+    /// macOS: the Aqua window server plus the Metal device.
+    MacOs,
+    /// Windows: the Win32 session plus the DXGI/D3D12 adapter.
+    Windows,
+    /// Any other target: no platform claim, so the rows warn instead of
+    /// reporting a verdict that cannot apply.
+    Other,
+}
+
+impl ProbePlatform {
+    /// Platform this build runs on, from the compile-time target.
+    ///
+    /// Same rule as [`RemediationPlatform::host`]: the OS is a property of the
+    /// target triple, so nothing is read from the environment to decide which
+    /// probe shape applies.
+    #[must_use]
+    pub const fn host() -> Self {
+        if cfg!(target_os = "linux") {
+            return Self::Linux;
+        }
+        if cfg!(target_os = "freebsd") {
+            return Self::FreeBsd;
+        }
+        if cfg!(target_os = "macos") {
+            return Self::MacOs;
+        }
+        if cfg!(windows) {
+            return Self::Windows;
+        }
+        Self::Other
+    }
+
+    /// Display row for this host.
+    ///
+    /// Linux and FreeBSD use the session environment variables; Windows names
+    /// the Win32 session (`SESSIONNAME`) and warns only when there is no
+    /// interactive session (session 0 / `Services`); macOS names the window
+    /// server session (`launchctl managername`, `Aqua` when one exists).
+    #[must_use]
+    pub fn display(self, evidence: &DisplayEvidence) -> DoctorCheck {
+        match self {
+            Self::Linux | Self::FreeBsd => unix_display(
+                evidence.wayland.as_deref(),
+                evidence.x11.as_deref(),
+                evidence.session_type.as_deref(),
+            ),
+            Self::MacOs => macos_display(evidence.window_server.as_deref()),
+            Self::Windows => win32_display(evidence.win32_session.as_deref()),
+            Self::Other => DoctorCheck::warn(
+                "display",
+                "Display server",
+                "this target has no display probe: GUI support is unverified here; headless (`--headless`) still works"
+                    .to_string(),
+                "unsupported target".to_string(),
+            ),
+        }
+    }
+
+    /// GPU row for this host.
+    ///
+    /// Linux and FreeBSD keep the DRM card-node evidence; Windows and macOS
+    /// name the adapter the renderer's own selection rule resolves, and warn
+    /// with a hint that names this platform's driver model only.
+    #[must_use]
+    pub fn gpu(self, evidence: &GpuEvidence) -> DoctorCheck {
+        match self {
+            Self::Linux => unix_gpu(evidence.dri_cards),
+            Self::FreeBsd => freebsd_gpu(evidence.dri_cards),
+            Self::MacOs => adapter_gpu(
+                evidence.adapter.as_ref(),
+                "no Metal device: GPU presentation stays on the headless software seam; run on hardware with Metal support (Apple silicon, or a Metal-capable Intel Mac)",
+                "no Metal device",
+            ),
+            Self::Windows => adapter_gpu(
+                evidence.adapter.as_ref(),
+                "no DXGI adapter: GPU presentation stays on the headless software seam; update the WDDM display driver (Device Manager) or run on a host with a GPU",
+                "no DXGI adapter",
+            ),
+            Self::Other => DoctorCheck::warn(
+                "gpu",
+                "GPU / wgpu",
+                "this target has no GPU probe: GPU presentation stays on the headless software seam".to_string(),
+                "unsupported target".to_string(),
+            ),
+        }
+    }
+}
+
+/// Raw display evidence, collected once per run on the host that produced it.
+///
+/// Every field is optional because a field only exists on the platforms that
+/// define it; the [`ProbePlatform`] mapping never reads a field that cannot
+/// apply to its host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisplayEvidence {
+    /// `WAYLAND_DISPLAY` value (Linux/FreeBSD).
+    pub wayland: Option<String>,
+    /// `DISPLAY` value (Linux/FreeBSD).
+    pub x11: Option<String>,
+    /// `XDG_SESSION_TYPE` value (Linux/FreeBSD).
+    pub session_type: Option<String>,
+    /// Interactive Win32 session name from `SESSIONNAME` (`Console`,
+    /// `RDP-Tcp#0`, ...). `Services` is session 0, which has no desktop.
+    pub win32_session: Option<String>,
+    /// macOS window-server session name from `launchctl managername`
+    /// (`Aqua` when a logged-in window server exists).
+    pub window_server: Option<String>,
+}
+
+/// Raw GPU evidence, collected once per run on the host that produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuEvidence {
+    /// `card*` node count under `/dev/dri` (Linux/FreeBSD).
+    pub dri_cards: usize,
+    /// Adapter the renderer's selection rule resolved (Windows/macOS); `None`
+    /// when no backend produced one or the probe is not applicable.
+    pub adapter: Option<AdapterProbe>,
+}
+
+/// Adapter description copied out of the renderer's probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterProbe {
+    /// Driver-reported adapter name (DXGI description or Metal device name).
+    pub name: String,
+    /// Graphics backend in use (`d3d12`, `metal`, ...).
+    pub backend: &'static str,
+    /// Device class (`discrete`, `integrated`, `software`, ...).
+    pub class: &'static str,
+}
+
+/// Win32 display row: the named desktop session, or a headless explain.
+fn win32_display(session: Option<&str>) -> DoctorCheck {
+    let session = session.map(str::trim).filter(|s| !s.is_empty());
+    match session {
+        Some(name) if !name.eq_ignore_ascii_case("services") => DoctorCheck::pass(
+            "display",
+            "Display server",
+            format!("Win32 session ({name})"),
+        ),
+        Some(name) => DoctorCheck::warn(
+            "display",
+            "Display server",
+            format!(
+                "Win32 session 0 ({name}) has no desktop: start bitty from an interactive logon (Console or Remote Desktop); headless (`--headless`) still works"
+            ),
+            format!("session 0 ({name}), no interactive desktop"),
+        ),
+        None => DoctorCheck::warn(
+            "display",
+            "Display server",
+            "no Win32 session (SESSIONNAME unset): GUI needs an interactive logon; headless (`--headless`) still works"
+                .to_string(),
+            "no Win32 session".to_string(),
+        ),
+    }
+}
+
+/// macOS display row: the named window-server session, or a headless explain.
+fn macos_display(window_server: Option<&str>) -> DoctorCheck {
+    let server = window_server.map(str::trim).filter(|s| !s.is_empty());
+    match server {
+        Some(name) if name.eq_ignore_ascii_case("aqua") => DoctorCheck::pass(
+            "display",
+            "Display server",
+            format!("macOS window server ({name} session)"),
+        ),
+        Some(name) => DoctorCheck::warn(
+            "display",
+            "Display server",
+            format!(
+                "macOS window server session is {name}, not Aqua: log in to the desktop session for GUI; headless (`--headless`) still works"
+            ),
+            format!("no Aqua session ({name})"),
+        ),
+        None => DoctorCheck::warn(
+            "display",
+            "Display server",
+            "no macOS window server (launchctl managername unavailable): GUI needs a logged-in Aqua session; headless (`--headless`) still works"
+                .to_string(),
+            "no window server".to_string(),
+        ),
+    }
+}
+
+/// FreeBSD GPU row: DRM nodes, with the port's own module remediation.
+fn freebsd_gpu(dri_cards: usize) -> DoctorCheck {
+    if dri_cards > 0 {
+        DoctorCheck::pass(
+            "gpu",
+            "GPU / wgpu",
+            format!("{dri_cards} DRM card node(s) in /dev/dri"),
+        )
+    } else {
+        DoctorCheck::warn(
+            "gpu",
+            "GPU / wgpu",
+            "no /dev/dri card nodes: run `pkg install drm-kmod`, add the GPU module to kld_list (`i915kms` or `amdgpu`) in /etc/rc.conf, then reboot; presentation stays on the headless software seam until then"
+                .to_string(),
+            "no DRM card nodes".to_string(),
+        )
+    }
+}
+
+/// Windows/macOS GPU row: the selected adapter, or a headless explain with the
+/// platform's own `hint`.
+fn adapter_gpu(adapter: Option<&AdapterProbe>, hint: &str, detail: &str) -> DoctorCheck {
+    match adapter {
+        Some(adapter) => DoctorCheck::pass(
+            "gpu",
+            "GPU / wgpu",
+            format!(
+                "selected {} adapter: {} ({})",
+                adapter.backend, adapter.name, adapter.class
+            ),
+        ),
+        None => DoctorCheck::warn("gpu", "GPU / wgpu", hint.to_string(), detail.to_string()),
     }
 }
 
@@ -1082,14 +1325,16 @@ pub struct DoctorInputs {
     pub font_chain: FontChainInput,
     /// Text-stack preference plus the shaped-stack probe (CTX-1607).
     pub text_stack: TextStackInput,
-    /// `WAYLAND_DISPLAY` value.
-    pub wayland: Option<String>,
-    /// `DISPLAY` value.
-    pub x11: Option<String>,
-    /// `XDG_SESSION_TYPE` value.
-    pub session_type: Option<String>,
-    /// Count of `/dev/dri/card*` nodes.
-    pub dri_cards: usize,
+    /// Display evidence: the session environment plus this platform's own
+    /// signal (Win32 session name, macOS window server). bitty#3014.
+    pub display: DisplayEvidence,
+    /// GPU evidence: DRM card nodes on Linux/FreeBSD, or the adapter the
+    /// renderer selects on Windows/macOS. bitty#3014.
+    pub gpu: GpuEvidence,
+    /// Host family that owns the display/GPU probe shape (bitty#3014).
+    /// [`ProbePlatform::Other`] makes both rows say the target is unverified
+    /// instead of reporting a Linux-shaped verdict.
+    pub probe_platform: ProbePlatform,
     /// Clipboard helpers found on PATH.
     pub clipboard_backends: Vec<String>,
     /// Platform family that owns the install remediation text (bitty#2974).
@@ -1249,12 +1494,8 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             check_fonts(inputs.platform, inputs.font_tool_available, &family_refs),
             check_font_chain(&inputs.font_chain),
             check_text_stack(&inputs.text_stack),
-            check_display(
-                inputs.wayland.as_deref(),
-                inputs.x11.as_deref(),
-                inputs.session_type.as_deref(),
-            ),
-            check_gpu(inputs.dri_cards),
+            inputs.probe_platform.display(&inputs.display),
+            inputs.probe_platform.gpu(&inputs.gpu),
             check_clipboard(&clipboard_refs),
             check_pty(inputs.platform, inputs.pty_available, &inputs.pty_detail),
             check_terminfo(inputs.term.as_deref(), inputs.terminfo_found),
@@ -2614,6 +2855,42 @@ pub fn dri_card_count() -> usize {
     }
 }
 
+/// macOS window-server session name from `launchctl managername`.
+///
+/// A GUI session runs in the `Aqua` bootstrap namespace; a process with no
+/// logged-in window server answers `System` or `Background`. Bounded like
+/// every other external probe doctor runs, and `None` when the command cannot
+/// run at all (the mapping then reports no window server).
+#[cfg(target_os = "macos")]
+fn macos_window_server_session() -> Option<String> {
+    let out = run_bounded("launchctl", &["managername"], 3)?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Adapter the renderer's own selection rule resolves on this host
+/// (bitty#3014).
+///
+/// `bitty_render::gpu::probe_selected_adapter` builds the instance the runtime
+/// builds and stops after `request_adapter`: no device, no queue, no surface,
+/// nothing presented. The owned labels are what the platform mapping prints
+/// (`d3d12` on Windows, `metal` on macOS).
+///
+/// Windows/macOS only: those are the targets whose GPU evidence is an adapter
+/// rather than a DRM card-node count.
+#[cfg(any(windows, target_os = "macos"))]
+fn probe_selected_adapter() -> Option<AdapterProbe> {
+    let summary = pollster::block_on(bitty_render::gpu::probe_selected_adapter()).ok()?;
+    Some(AdapterProbe {
+        name: summary.name,
+        backend: summary.backend.label(),
+        class: summary.class.label(),
+    })
+}
+
 /// Truncates evidence strings to `max` chars on a char boundary.
 fn truncate(raw: &str, max: usize) -> String {
     if raw.len() <= max {
@@ -2769,6 +3046,32 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
     let x11 = std::env::var("DISPLAY").ok();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
     let dri_cards = dri_card_count();
+    // bitty#3014: every platform's own session signal is collected here, and
+    // `ProbePlatform` decides which evidence its mapping reads. Nothing below
+    // changes an exit code: the rows stay advisory.
+    #[cfg(windows)]
+    let win32_session = std::env::var("SESSIONNAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    #[cfg(not(windows))]
+    let win32_session = None;
+    #[cfg(target_os = "macos")]
+    let window_server = macos_window_server_session();
+    #[cfg(not(target_os = "macos"))]
+    let window_server = None;
+    let display = DisplayEvidence {
+        wayland,
+        x11,
+        session_type,
+        win32_session,
+        window_server,
+    };
+    #[cfg(any(windows, target_os = "macos"))]
+    let adapter = probe_selected_adapter();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let adapter = None;
+    let gpu = GpuEvidence { dri_cards, adapter };
     let clipboard_backends: Vec<String> = DOCTOR_CLIPBOARD_CANDIDATES
         .iter()
         .filter_map(|name| find_on_path(name).map(|_| (*name).to_string()))
@@ -2840,10 +3143,9 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         families,
         font_chain: font_chain_input,
         text_stack,
-        wayland,
-        x11,
-        session_type,
-        dri_cards,
+        display,
+        gpu,
+        probe_platform: ProbePlatform::host(),
         clipboard_backends,
         // bitty#2974: hints name this host's own package manager; an
         // unrecognised platform yields no package command.
@@ -2993,10 +3295,18 @@ mod tests {
                 invalid_env: false,
                 probe: Some(Ok(())),
             },
-            wayland: Some("wayland-0".to_string()),
-            x11: None,
-            session_type: Some("wayland".to_string()),
-            dri_cards: 1,
+            display: DisplayEvidence {
+                wayland: Some("wayland-0".to_string()),
+                session_type: Some("wayland".to_string()),
+                ..DisplayEvidence::default()
+            },
+            gpu: GpuEvidence {
+                dri_cards: 1,
+                adapter: None,
+            },
+            // Deterministic fixture: the display/GPU matrix selects a
+            // platform explicitly (bitty#3014).
+            probe_platform: ProbePlatform::Linux,
             clipboard_backends: vec!["wl-copy".to_string()],
             // Deterministic fixture: hint tests select a platform explicitly.
             platform: RemediationPlatform::Other,
@@ -3073,9 +3383,8 @@ mod tests {
     #[test]
     fn warn_only_keeps_exit_zero() {
         let mut inputs = healthy_inputs();
-        inputs.wayland = None;
-        inputs.x11 = None;
-        inputs.dri_cards = 0;
+        inputs.display = DisplayEvidence::default();
+        inputs.gpu = GpuEvidence::default();
         inputs.clipboard_backends.clear();
         let report = assemble_report(&inputs);
         assert!(report.summary().warn >= 3);
@@ -3527,19 +3836,262 @@ mod tests {
 
     #[test]
     fn display_prefers_wayland_then_x11_then_warn() {
+        let ev = |wayland: Option<&str>, x11: Option<&str>| DisplayEvidence {
+            wayland: wayland.map(str::to_string),
+            x11: x11.map(str::to_string),
+            ..DisplayEvidence::default()
+        };
         assert_eq!(
-            check_display(Some("wayland-0"), None, None).status,
+            ProbePlatform::Linux
+                .display(&ev(Some("wayland-0"), None))
+                .status,
             DoctorStatus::Pass
         );
         assert_eq!(
-            check_display(None, Some(":0"), None).status,
+            ProbePlatform::Linux.display(&ev(None, Some(":0"))).status,
             DoctorStatus::Pass
         );
-        assert_eq!(check_display(None, None, None).status, DoctorStatus::Warn);
         assert_eq!(
-            check_display(Some("  "), Some(""), None).status,
+            ProbePlatform::Linux.display(&ev(None, None)).status,
             DoctorStatus::Warn
         );
+        assert_eq!(
+            ProbePlatform::Linux
+                .display(&ev(Some("  "), Some("")))
+                .status,
+            DoctorStatus::Warn
+        );
+    }
+
+    /// bitty#3014: the display and GPU rows are mapped per host, the way
+    /// `RemediationPlatform` maps the pty/fonts hints (#2974). Each cell
+    /// asserts the evidence that host can actually produce, and that a
+    /// Windows or macOS host is never judged by Linux evidence.
+    #[test]
+    fn display_and_gpu_map_per_platform() {
+        // --- Linux: Wayland/X11 environment, DRM card nodes. -------------
+        let linux = ProbePlatform::Linux.display(&DisplayEvidence {
+            wayland: Some("wayland-0".to_string()),
+            session_type: Some("wayland".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(linux.status, DoctorStatus::Pass);
+        assert!(
+            linux.detail.contains("Wayland (wayland-0)"),
+            "{}",
+            linux.detail
+        );
+
+        let linux_headless = ProbePlatform::Linux.display(&DisplayEvidence::default());
+        assert_eq!(linux_headless.status, DoctorStatus::Warn);
+        assert!(
+            linux_headless.hint.contains("WAYLAND_DISPLAY"),
+            "{}",
+            linux_headless.hint
+        );
+
+        let linux_gpu_missing = ProbePlatform::Linux.gpu(&GpuEvidence::default());
+        assert_eq!(linux_gpu_missing.status, DoctorStatus::Warn);
+        assert!(
+            linux_gpu_missing.hint.contains("/dev/dri"),
+            "{}",
+            linux_gpu_missing.hint
+        );
+        let linux_gpu_ok = ProbePlatform::Linux.gpu(&GpuEvidence {
+            dri_cards: 2,
+            adapter: None,
+        });
+        assert_eq!(linux_gpu_ok.status, DoctorStatus::Pass);
+        assert!(
+            linux_gpu_ok.detail.contains("2 DRM card node"),
+            "{}",
+            linux_gpu_ok.detail
+        );
+
+        // --- FreeBSD: same session variables, DRM kernel modules. --------
+        let freebsd = ProbePlatform::FreeBsd.display(&DisplayEvidence {
+            x11: Some(":0".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(freebsd.status, DoctorStatus::Pass);
+        assert!(freebsd.detail.contains("X11 (:0)"), "{}", freebsd.detail);
+
+        let freebsd_gpu_missing = ProbePlatform::FreeBsd.gpu(&GpuEvidence::default());
+        assert_eq!(freebsd_gpu_missing.status, DoctorStatus::Warn);
+        assert!(
+            freebsd_gpu_missing.hint.contains("drm-kmod"),
+            "the FreeBSD hint names the port, got {:?}",
+            freebsd_gpu_missing.hint
+        );
+        let freebsd_gpu_ok = ProbePlatform::FreeBsd.gpu(&GpuEvidence {
+            dri_cards: 1,
+            adapter: None,
+        });
+        assert_eq!(freebsd_gpu_ok.status, DoctorStatus::Pass);
+
+        // --- macOS: Aqua window server, Metal device. --------------------
+        let macos = ProbePlatform::MacOs.display(&DisplayEvidence {
+            window_server: Some("Aqua".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(macos.status, DoctorStatus::Pass);
+        assert_eq!(macos.detail, "macOS window server (Aqua session)");
+
+        let macos_headless = ProbePlatform::MacOs.display(&DisplayEvidence::default());
+        assert_eq!(macos_headless.status, DoctorStatus::Warn);
+        assert!(
+            macos_headless.hint.contains("Aqua"),
+            "{}",
+            macos_headless.hint
+        );
+        assert!(
+            !macos_headless.hint.contains("WAYLAND_DISPLAY"),
+            "a macOS hint must not name Linux session variables: {}",
+            macos_headless.hint
+        );
+
+        let macos_gpu = ProbePlatform::MacOs.gpu(&GpuEvidence {
+            dri_cards: 0,
+            adapter: Some(AdapterProbe {
+                name: "Apple M2".to_string(),
+                backend: "metal",
+                class: "integrated",
+            }),
+        });
+        assert_eq!(macos_gpu.status, DoctorStatus::Pass);
+        assert!(
+            macos_gpu.detail.contains("Apple M2") && macos_gpu.detail.contains("metal"),
+            "{}",
+            macos_gpu.detail
+        );
+        let macos_gpu_missing = ProbePlatform::MacOs.gpu(&GpuEvidence::default());
+        assert_eq!(macos_gpu_missing.status, DoctorStatus::Warn);
+        assert!(
+            macos_gpu_missing.hint.contains("Metal"),
+            "{}",
+            macos_gpu_missing.hint
+        );
+        assert!(
+            !macos_gpu_missing.hint.contains("/dev/dri"),
+            "a macOS hint must not name a Linux device path: {}",
+            macos_gpu_missing.hint
+        );
+
+        // --- Windows: Win32 session, DXGI/D3D12 adapter. -----------------
+        // Empty Wayland/X11 evidence is the normal Windows case; it must not
+        // be read as headless when a Win32 session exists (the bug).
+        let windows = ProbePlatform::Windows.display(&DisplayEvidence {
+            win32_session: Some("Console".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(windows.status, DoctorStatus::Pass);
+        assert_eq!(windows.detail, "Win32 session (Console)");
+
+        let windows_rdp = ProbePlatform::Windows.display(&DisplayEvidence {
+            win32_session: Some("RDP-Tcp#0".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(windows_rdp.status, DoctorStatus::Pass);
+        assert!(
+            windows_rdp.detail.contains("RDP-Tcp#0"),
+            "the session is named: {}",
+            windows_rdp.detail
+        );
+
+        let windows_session0 = ProbePlatform::Windows.display(&DisplayEvidence {
+            win32_session: Some("Services".to_string()),
+            ..DisplayEvidence::default()
+        });
+        assert_eq!(windows_session0.status, DoctorStatus::Warn);
+        assert!(
+            windows_session0.hint.contains("session 0"),
+            "{}",
+            windows_session0.hint
+        );
+        assert!(
+            !windows_session0.hint.contains("WAYLAND_DISPLAY"),
+            "{}",
+            windows_session0.hint
+        );
+
+        let windows_no_session = ProbePlatform::Windows.display(&DisplayEvidence::default());
+        assert_eq!(windows_no_session.status, DoctorStatus::Warn);
+        assert!(
+            windows_no_session.hint.contains("SESSIONNAME"),
+            "{}",
+            windows_no_session.hint
+        );
+
+        let windows_gpu = ProbePlatform::Windows.gpu(&GpuEvidence {
+            dri_cards: 0,
+            adapter: Some(AdapterProbe {
+                name: "NVIDIA GeForce RTX 4070".to_string(),
+                backend: "d3d12",
+                class: "discrete",
+            }),
+        });
+        assert_eq!(windows_gpu.status, DoctorStatus::Pass);
+        assert!(
+            windows_gpu.detail.contains("NVIDIA GeForce RTX 4070")
+                && windows_gpu.detail.contains("d3d12")
+                && windows_gpu.detail.contains("discrete"),
+            "{}",
+            windows_gpu.detail
+        );
+
+        let windows_warp = ProbePlatform::Windows.gpu(&GpuEvidence {
+            dri_cards: 0,
+            adapter: Some(AdapterProbe {
+                name: "Microsoft Basic Render Driver".to_string(),
+                backend: "d3d12",
+                class: "software",
+            }),
+        });
+        assert_eq!(windows_warp.status, DoctorStatus::Pass);
+        assert!(
+            windows_warp.detail.contains("software"),
+            "the software fallback is named: {}",
+            windows_warp.detail
+        );
+
+        let windows_gpu_missing = ProbePlatform::Windows.gpu(&GpuEvidence::default());
+        assert_eq!(windows_gpu_missing.status, DoctorStatus::Warn);
+        assert!(
+            windows_gpu_missing.hint.contains("DXGI"),
+            "{}",
+            windows_gpu_missing.hint
+        );
+        for linux_only in ["/dev/dri", "Mesa", "Vulkan", "WAYLAND_DISPLAY"] {
+            assert!(
+                !windows_gpu_missing.hint.contains(linux_only),
+                "a Windows hint must not name {linux_only:?}: {}",
+                windows_gpu_missing.hint
+            );
+        }
+
+        // --- Unrecognised target: no platform claim, still advisory. -----
+        let other = ProbePlatform::Other.display(&DisplayEvidence::default());
+        assert_eq!(other.status, DoctorStatus::Warn);
+        let other_gpu = ProbePlatform::Other.gpu(&GpuEvidence::default());
+        assert_eq!(other_gpu.status, DoctorStatus::Warn);
+
+        // Exit codes are unchanged by the mapping (bitty#3014): with only
+        // headless display/GPU evidence on any host, the report still exits
+        // clean — these rows are advisory, exactly like before.
+        for platform in [
+            ProbePlatform::Linux,
+            ProbePlatform::FreeBsd,
+            ProbePlatform::MacOs,
+            ProbePlatform::Windows,
+        ] {
+            let mut inputs = healthy_inputs();
+            inputs.probe_platform = platform;
+            inputs.display = DisplayEvidence::default();
+            inputs.gpu = GpuEvidence::default();
+            let report = assemble_report(&inputs);
+            assert_eq!(report.exit_code(), EXIT_OK, "{platform:?}");
+            assert!(report.ok(), "{platform:?}");
+        }
     }
 
     #[test]

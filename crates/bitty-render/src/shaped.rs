@@ -877,6 +877,14 @@ impl SwashSingle {
     /// face) even though its face is still resident.
     fn scan_dynamic_face(&mut self, c: char, point_size: f32) -> Option<FontId> {
         let px = Self::px(point_size);
+        // Probe with the scalar's default presentation. `scan_dynamic_face`
+        // is char-keyed, so a VS16 sequence over a text-default base (e.g.
+        // U+2764 U+FE0F) still probes as text here; the cluster-aware
+        // decision lives in `shape_with` / `glyph_source_for`. The probed
+        // *source set* does not depend on the flag (both orders end in the
+        // color-bitmap strike), so only `is_some()` coverage is observable
+        // from this function — the flag orders the probe and keeps it equal
+        // to the render path's preference.
         let emoji = bitty_term_state::is_emoji_presentation(c);
         // Already-resident dynamic faces first: preserves coverage across
         // outcome-cache evictions without spending quota or loading bytes.
@@ -3111,13 +3119,16 @@ mod tests {
             byte_offset,
             presentation: bitty_term_state::EmojiPresentation::Text,
         };
-        // HarfBuzz emits RTL runs in descending byte-offset order:
-        // byte 4 (not a scaffold), byte 2 (scaffold lead), byte 0 (not a scaffold).
-        // After sorting into logical order [0, 2, 4], the scaffold at byte 2 (index 1)
-        // must mark logical index 1 and 2 as `ligature_part`, NOT logical index 0!
+        // HarfBuzz emits RTL runs in descending byte-offset order, so the
+        // visual-first entry carries the *highest* byte offset. The scaffold
+        // is placed on that entry: an index-based pass over the pre-sort
+        // flags would mark logical clusters 0 and 1, while the flag's own
+        // cluster is logical index 2. A reversal-symmetric flag vector
+        // (`[false, true, false]`) cannot tell those apart, which is why the
+        // fixture below is deliberately asymmetric.
         let entries = vec![
-            (mk_cluster(4, 2), false),
-            (mk_cluster(2, 1), true),
+            (mk_cluster(4, 2), true),
+            (mk_cluster(2, 1), false),
             (mk_cluster(0, 0), false),
         ];
         let finalized = finalize_shaped_clusters(entries, RunDirection::Rtl);
@@ -3128,13 +3139,33 @@ mod tests {
         );
         assert_eq!(finalized[1].byte_offset, 2);
         assert!(
-            finalized[1].ligature_part,
-            "scaffold cluster at byte 2 must be marked ligature_part"
+            !finalized[1].ligature_part,
+            "logical cluster 1 must not inherit a scaffold flag from pre-sort visual order"
         );
         assert_eq!(finalized[2].byte_offset, 4);
         assert!(
             finalized[2].ligature_part,
-            "cluster following scaffold in logical order must be marked ligature_part"
+            "the scaffold cluster itself must be marked ligature_part"
+        );
+        // Second fixture: the scaffold leads a multi-cluster run in logical
+        // order, so its logical successor is the cluster to mark. Unsorted
+        // flags would mark visual index 0 (logical byte 6) instead.
+        let entries = vec![
+            (mk_cluster(6, 3), false),
+            (mk_cluster(4, 2), false),
+            (mk_cluster(3, 1), false),
+            (mk_cluster(2, 0), true),
+        ];
+        let finalized = finalize_shaped_clusters(entries, RunDirection::Rtl);
+        let offsets: Vec<usize> = finalized.iter().map(|c| c.byte_offset).collect();
+        assert_eq!(offsets, vec![2, 3, 4, 6]);
+        assert!(
+            finalized[0].ligature_part && finalized[1].ligature_part,
+            "scaffold at byte 2 must mark itself and its logical follower"
+        );
+        assert!(
+            !finalized[2].ligature_part && !finalized[3].ligature_part,
+            "clusters outside the scaffold span must stay unmarked"
         );
     }
 }

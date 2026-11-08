@@ -212,3 +212,47 @@ fn missing_color_atlas_stays_an_error() {
         bitty_render::RenderError::InvalidInput { .. }
     ));
 }
+
+/// bitty#3005: a color-atlas payload shorter than its declared dimensions is a
+/// wiring bug for *every* color glyph, not one glyph's defect. It is refused
+/// once, before the frame paints, instead of silently dropping color glyphs
+/// that are fully addressable — the divergence the GPU path never had.
+#[test]
+fn short_color_atlas_payload_is_refused_before_painting() {
+    let mut list = stale_slot_row();
+    // Make the placement fully addressable: the only defect left is the
+    // payload length, so a per-slot length check would paint nothing and
+    // still return `Ok(())`.
+    let GlyphSource::ColorAtlas { slot } = &mut list.glyphs[2].source else {
+        unreachable!("the emoji instance rides the color atlas")
+    };
+    slot.y = 0;
+
+    let coverage = vec![0xFFu8; 8 * 16];
+    let dims = AtlasDims {
+        width: 8,
+        height: 16,
+    };
+    let color_dims = AtlasDims {
+        width: 16,
+        height: 16,
+    };
+    // One row short of the declared 16x16 atlas.
+    let color = EMOJI.repeat(16 * 15);
+    let mut surface = surface();
+    let error = draw_list_onto_color(
+        &list,
+        Some((&coverage, dims)),
+        Some((&color, color_dims)),
+        &mut surface,
+    )
+    .expect_err("a short color-atlas payload is a caller wiring bug");
+    assert!(
+        matches!(error, bitty_render::RenderError::InvalidInput { .. }),
+        "the refusal stays loud, got {error:?}"
+    );
+    assert!(
+        !cell_is_painted(&surface, 0),
+        "the call-level refusal happens before any fill or glyph paints"
+    );
+}

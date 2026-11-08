@@ -528,19 +528,39 @@ pub fn draw_list_onto(
 /// A *glyph-level* defect is dropped alone (bitty#2994): a placement that
 /// falls outside its atlas — the shape a stale slot takes after the atlas was
 /// reset — or an inline mask that disagrees with its own dimensions skips that
-/// one instance and the rest of the list still paints. Only a missing atlas
-/// payload (a caller wiring bug, not a glyph defect) refuses the list.
+/// one instance and the rest of the list still paints. A *call-level* defect
+/// refuses the whole list: a missing atlas payload (a caller wiring bug, not a
+/// glyph defect), and a color-atlas payload shorter than its own dimensions —
+/// the latter validated once per call, before any fill or glyph paints,
+/// because it is the same bug for every color glyph rather than one glyph's
+/// defect.
 ///
 /// # Errors
 ///
-/// [`RenderError::InvalidInput`] when an atlas instance exists but the
-/// matching atlas was not supplied.
+/// [`RenderError::InvalidInput`] when a glyph names an atlas that was not
+/// supplied, or when a color atlas is supplied short of the length its
+/// declared dimensions imply.
 pub fn draw_list_onto_color(
     list: &crate::grid::DrawList,
     atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
     color_atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
     surface: &mut SurfaceRgba,
 ) -> Result<(), RenderError> {
+    // bitty#3005: the color-atlas payload length is a property of the call,
+    // not of one glyph. Validate it once here — before any fill is painted —
+    // and keep it `InvalidInput`: a short RGBA payload is a caller wiring bug,
+    // not the stale-slot defect the per-glyph drop exists for. Applying the
+    // length check per slot instead dropped every color glyph silently, while
+    // `pipeline.rs` counted the drop and `gpu.rs` painted the rows it had.
+    if let Some((texels, dims)) = color_atlas {
+        if list
+            .glyphs
+            .iter()
+            .any(|glyph| matches!(glyph.source, crate::grid::GlyphSource::ColorAtlas { .. }))
+        {
+            validate_color_atlas_payload(texels, dims)?;
+        }
+    }
     for fill in &list.fills {
         surface.fill_rect(fill.rect, fill.color);
     }
@@ -672,6 +692,32 @@ pub fn draw_list_onto_color(
     Ok(())
 }
 
+/// Length of an RGBA color atlas, or `None` when the multiplication overflows.
+fn color_atlas_payload_len(dims: crate::atlas::AtlasDims) -> Option<usize> {
+    usize::from(dims.width)
+        .checked_mul(usize::from(dims.height))?
+        .checked_mul(4)
+}
+
+/// Refuses a color-atlas payload that is shorter than its declared dimensions
+/// (bitty#3005).
+///
+/// This is a caller wiring bug that applies to every color glyph in the list,
+/// so it is validated once per call and stays loud. A slot that leaves an
+/// otherwise complete atlas is the glyph-level defect that
+/// [`color_slot_rows`] drops.
+fn validate_color_atlas_payload(
+    texels: &[u8],
+    dims: crate::atlas::AtlasDims,
+) -> Result<(), RenderError> {
+    match color_atlas_payload_len(dims) {
+        Some(expected) if texels.len() >= expected => Ok(()),
+        _ => Err(RenderError::InvalidInput {
+            reason: "color atlas payload is shorter than its dimensions",
+        }),
+    }
+}
+
 /// Rows of one color-atlas placement, or `None` when the placement cannot be
 /// addressed at all (bitty#2994).
 ///
@@ -686,15 +732,17 @@ fn color_slot_rows<'a>(
     let height = usize::from(dims.height);
     let slot_w = usize::from(slot.width);
     let slot_h = usize::from(slot.height);
-    let expected = stride.checked_mul(height)?.checked_mul(4)?;
     let right = usize::from(slot.x).checked_add(slot_w)?;
     let bottom = usize::from(slot.y).checked_add(slot_h)?;
     if slot_w == 0 || slot_h == 0 || right > stride || bottom > height {
         return None;
     }
-    if texels.len() < expected {
-        return None;
-    }
+    // The whole payload was validated once per call (`validate_color_atlas_payload`),
+    // so every row below is inside `texels` and this walk cannot panic.
+    debug_assert!(
+        color_atlas_payload_len(dims).is_some_and(|expected| texels.len() >= expected),
+        "draw_list_onto_color validates the color atlas payload before any slot"
+    );
     Some((0..slot_h).map(move |row| {
         let start = ((usize::from(slot.y) + row) * stride + usize::from(slot.x)) * 4;
         &texels[start..start + slot_w * 4]

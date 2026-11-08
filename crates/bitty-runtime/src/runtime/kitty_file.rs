@@ -812,6 +812,17 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Advances one origin's delete generation without clearing `kitty_pending_places`.
+    ///
+    /// Used by identity-scoped deletes (`kitty_delete_rendered_image`), which
+    /// evict only the deleted `(wire_image, placement_id)` from
+    /// `kitty_pending_places` so unrelated pending `a=p` requests on the same
+    /// origin survive.
+    pub(crate) fn advance_kitty_local_delete_epoch(&mut self, origin: Option<u64>) {
+        let next = self.kitty_local_delete_epoch_for(origin).wrapping_add(1);
+        self.kitty_local_delete_epoch.insert(origin, next);
+    }
+
     /// Advances one origin's delete generation (CTX-1110 fix pass).
     ///
     /// Every rendered-layer delete/clear/retire for the origin calls this,
@@ -820,8 +831,7 @@ impl Runtime {
     /// (stores nothing) by design: precision per wire id would need
     /// unbounded per-id state for no visible gain.
     pub(crate) fn bump_kitty_local_delete_epoch(&mut self, origin: Option<u64>) {
-        let next = self.kitty_local_delete_epoch_for(origin).wrapping_add(1);
-        self.kitty_local_delete_epoch.insert(origin, next);
+        self.advance_kitty_local_delete_epoch(origin);
         self.drop_pending_kitty_places(origin, None, None);
     }
 
@@ -2494,8 +2504,13 @@ mod tests {
             ..Default::default()
         };
 
-        // 1. Delete evicts a stashed pending `a=p` so a later transmit-only (`a=t`)
-        //    with the same `i=` does not replay the deleted placement.
+        // 1. Delete evicts a stashed pending `a=p` for the deleted image while
+        //    preserving pending `a=p` requests for other images on the same origin.
+        let other_keys = bitty_vt::KittyControlKeys {
+            image_id: 79,
+            placement_id: 1,
+            ..Default::default()
+        };
         rt.stash_pending_kitty_place(crate::runtime::kitty_images::PendingKittyPlace {
             origin: None,
             anchor_col: 0,
@@ -2504,6 +2519,15 @@ mod tests {
             cols: 0,
             rows: 0,
             keys,
+        });
+        rt.stash_pending_kitty_place(crate::runtime::kitty_images::PendingKittyPlace {
+            origin: None,
+            anchor_col: 2,
+            anchor_row: 0,
+            scrollback_base: 0,
+            cols: 0,
+            rows: 0,
+            keys: other_keys,
         });
         assert_eq!(rt.kitty_delete_rendered_image(77, None), 0);
         rt.kitty_display_image_with_wire(
@@ -2525,6 +2549,26 @@ mod tests {
             0,
             "transmit-only after delete must not replay stale pending a=p"
         );
+        rt.kitty_display_image_with_wire(
+            32,
+            Some(1),
+            Some(1),
+            Some('t'),
+            0,
+            0,
+            0,
+            &[0xFF, 0xFF, 0x00, 0xFF],
+            0,
+            79,
+            0,
+        )
+        .expect("unrelated image transmit-only must succeed");
+        assert_eq!(
+            rt.kitty_placement_count(),
+            1,
+            "unrelated pending a=p on the same origin must survive identity delete"
+        );
+        assert_eq!(rt.kitty_delete_rendered_image(79, None), 1);
 
         // 2. Failed local transmit (`a=t`) evicts a stashed pending `a=p` for the same id.
         let keys2 = bitty_vt::KittyControlKeys {

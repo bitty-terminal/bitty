@@ -1691,7 +1691,7 @@ impl Runtime {
         // a transmit pending on a hung filesystem completes after this
         // delete, and its stale completion must drop instead of
         // resurrecting the image.
-        self.bump_kitty_local_delete_epoch(self.kitty_origin);
+        self.advance_kitty_local_delete_epoch(self.kitty_origin);
         self.drop_pending_kitty_places(self.kitty_origin, Some(image_id), placement_id);
         let removed = self
             .kitty_images

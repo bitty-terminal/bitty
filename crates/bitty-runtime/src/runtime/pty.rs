@@ -1765,6 +1765,23 @@ impl Runtime {
                 }
                 continue;
             }
+            // CTX-1752: `ED 3` (`CSI 3 J`) erases scrollback history. Capture
+            // the owner's pre-clear viewport here: after the apply the ring is
+            // empty and `retain_view_scroll_anchor` snaps the viewport to live
+            // later in this same chunk, so neither the post-clear predicate nor
+            // the post-clear offset can decide which coordinate space a
+            // selection was bound in.
+            let ed3_owner = matches!(
+                &action,
+                TerminalAction::EraseInDisplay {
+                    mode: bitty_vt::EraseDisplayMode::Scrollback,
+                }
+            )
+            .then(|| {
+                self.fed_grid_view()
+                    .map(|view| (view, self.is_viewport_scrolled(view)))
+            })
+            .flatten();
             let damage = self.state.apply(&action);
             // #2442: swap the origin's image plane at the mode transition
             // itself (not only on the next tick), so a `?1049h`/`a=T` pair
@@ -1814,7 +1831,9 @@ impl Runtime {
             // selection on all grid-erasing actions.
             // ED 3 (EraseDisplayMode::Scrollback) clears scrollback history
             // but leaves the live grid; live-grid selections remain valid,
-            // so scrollback-only clears keep live selection.
+            // so scrollback-only clears keep live selection. CTX-1752: the
+            // decision is made against the pre-clear viewport captured above,
+            // because the view snaps to live later in this chunk.
             let grid_erased = matches!(action, TerminalAction::FullReset)
                 || matches!(
                     action,
@@ -1832,6 +1851,12 @@ impl Runtime {
                 if let Some(fed) = self.fed_grid_view() {
                     self.drop_selection_owned_by(fed);
                 }
+            }
+            if let Some((view, was_scrolled)) = ed3_owner {
+                // A scrollback-only clear cannot keep a viewport-relative
+                // range: rebase buffer anchors now, while the pre-clear
+                // coordinate space is still known (CTX-1752, bitty#3040).
+                self.reconcile_selection_after_scrollback_clear(view, was_scrolled);
             }
             // Kitty image placement clear on display erase (CTX-0883, issue #1545):
             // When FullReset or a whole-screen erase (ED 2 All, ED 22 ScrollAndClear)

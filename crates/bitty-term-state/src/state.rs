@@ -4416,4 +4416,72 @@ mod insert_mode_damage_tests {
             dmg.regions
         );
     }
+
+    /// A `U+10EEEE` placeholder is a width-1 print, so `IRM` shifts the row
+    /// tail exactly like any other glyph: the damage must cover it.
+    #[test]
+    fn insert_mode_placeholder_print_damages_shifted_row_tail() {
+        let mut state = State::new();
+        for ch in ['a', 'b', 'c', 'd'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(1),
+            col: bitty_vt::Col(2),
+        });
+        state.apply(&TerminalAction::SetMode {
+            mode: Mode::Insert,
+            enabled: true,
+        });
+        let dmg = state.apply(&TerminalAction::Print(GraphemeCell::from('\u{10EEEE}')));
+        assert!(
+            dmg.regions.iter().any(|region| matches!(
+                region,
+                DamagedRegion::Grid(r)
+                    if r.top == 0 && r.left <= 1 && r.right == (GRID_COLUMNS as u16 - 1)
+            )),
+            "insert-mode placeholder print must damage the shifted row tail, got {:?}",
+            dmg.regions
+        );
+    }
+
+    /// An emoji-presentation selector widens a committed one-cell cluster to
+    /// two cells; under `IRM` the inserted spacer shifts the row tail, so the
+    /// damage must reach the row end rather than stopping at the spacer.
+    #[test]
+    fn insert_mode_wide_cluster_growth_damages_shifted_row_tail() {
+        let mut state = State::new();
+        // `U+2764` is text-presentation width 1; `U+FE0F` grows it to 2.
+        state.apply(&TerminalAction::Print(GraphemeCell::from('\u{2764}')));
+        for ch in ['a', 'b', 'c'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(1),
+            col: bitty_vt::Col(2),
+        });
+        state.apply(&TerminalAction::SetMode {
+            mode: Mode::Insert,
+            enabled: true,
+        });
+        let dmg = state.apply(&TerminalAction::Print(GraphemeCell::from('\u{FE0F}')));
+        assert!(
+            dmg.regions.iter().any(|region| matches!(
+                region,
+                DamagedRegion::Grid(r)
+                    if r.top == 0 && r.left == 0 && r.right == (GRID_COLUMNS as u16 - 1)
+            )),
+            "insert-mode cluster growth must damage the shifted row tail, got {:?}",
+            dmg.regions
+        );
+        assert_eq!(
+            state.screens_active().get(0, 0).width,
+            2,
+            "the selector-16 cluster must commit as two cells"
+        );
+        assert!(
+            state.screens_active().get(0, 1).spacer,
+            "column 1 holds the wide spacer"
+        );
+    }
 }

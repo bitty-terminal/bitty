@@ -249,7 +249,7 @@ impl Runtime {
         // other unbound readers use (`search_grid`).
         let grid = self
             .keyboard_view()
-            .filter(|view| self.layout.find_leaf(*view).is_some())
+            .filter(|view| self.find_view(*view).is_some())
             .and_then(|view| grid_of(&self.pane_sessions, self.primary_view, &self.state, view));
         if let Some(grid) = grid {
             self.search_state.refresh(grid);
@@ -453,5 +453,52 @@ impl Runtime {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_ui::{LayoutNode, SplitAxis};
+
+    #[test]
+    fn unbound_search_refresh_updates_matches_when_focused_view_is_detached_float_or_pinned() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let v1 = ViewId::new(1);
+        rt.float_detach(v1).expect("detach v1");
+        assert!(rt.set_focus(v1));
+
+        rt.handle_pty_bytes(b"needle-one\r\n");
+        rt.search_set("needle", SearchOptions::default());
+        assert_eq!(rt.search_match_count(), 1);
+
+        // Simulate an unbound search (`search_view == None`) while focused on the
+        // detached float, then feed a second match and refresh.
+        rt.search_view = None;
+        rt.handle_pty_bytes(b"needle-two\r\n");
+        rt.search_refresh();
+        assert_eq!(
+            rt.search_match_count(),
+            2,
+            "unbound search_refresh must find the focused detached float's grid"
+        );
+
+        // Restore and pin the view, then verify unbound search_refresh still updates.
+        rt.float_restore(v1).expect("restore float");
+        rt.pin_floating(v1).expect("pin v1");
+        assert!(rt.set_focus(v1));
+        rt.handle_pty_bytes(b"needle-three\r\n");
+        rt.search_refresh();
+        assert_eq!(
+            rt.search_match_count(),
+            3,
+            "unbound search_refresh must find the focused pinned view's grid"
+        );
     }
 }

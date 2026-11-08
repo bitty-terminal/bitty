@@ -433,7 +433,8 @@ impl Runtime {
     /// fail-closed instead of inventing a target.
     #[must_use]
     pub fn cw_latest_command_id(&self) -> Option<CommandId> {
-        blocks(&self.state).last().map(|block| block.id)
+        let state = self.focused_state().unwrap_or(&self.state);
+        blocks(state).last().map(|block| block.id)
     }
 
     /// Applies one present-path fold verb to the focused view's latest
@@ -923,5 +924,42 @@ mod tests {
             .hint_link_cell(&frames, link_payload, "s")
             .expect("link hint cell must resolve for detached float owner");
         assert_eq!(link_cell.view, primary);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cw_latest_command_id_reads_focused_pane_session_state() {
+        bitty_test_support::require_pty!();
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        let primary = ViewId::new(1);
+        let pane = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(pane, 80, 24)),
+        ));
+        rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 30"], 40, 24)
+            .expect("spawn pane shell");
+
+        // Primary has no OSC 133 marks; pane 2 has one OSC 133 command block.
+        rt.handle_pane_bytes(
+            pane,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07file\r\n\x1b]133;D;0\x07",
+        );
+
+        assert!(rt.set_focus(primary));
+        assert_eq!(
+            rt.cw_latest_command_id(),
+            None,
+            "primary has no OSC 133 command block"
+        );
+
+        assert!(rt.set_focus(pane));
+        let cmd_id = rt
+            .cw_latest_command_id()
+            .expect("focused pane must resolve its own OSC 133 command block");
+        assert_eq!(rt.cw_fold_latest(CwFoldAction::Collapse), Some(true));
+        assert!(rt.cw_fold_is_folded(cmd_id));
     }
 }

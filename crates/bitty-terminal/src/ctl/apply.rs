@@ -347,7 +347,10 @@ pub fn apply_control(
         let num = ipc_ctl::parse_terminal_id(&terminal_id)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         let target_view = ViewId::new(u64::from(num));
-        if !runtime.layout().leaf_ids().contains(&target_view) {
+        let is_live = runtime.layout().leaf_ids().contains(&target_view)
+            || runtime.floated_views().contains(&target_view)
+            || runtime.pinned_views().contains(&target_view);
+        if !is_live {
             return Err((
                 "usage",
                 "NotFound",
@@ -378,7 +381,10 @@ pub fn apply_control(
         let num = ipc_ctl::parse_terminal_id(&terminal_id)
             .map_err(|err| ("usage", "InvalidParams", format!("{err}")))?;
         let target_view = ViewId::new(u64::from(num));
-        if !runtime.layout().leaf_ids().contains(&target_view) {
+        let is_live = runtime.layout().leaf_ids().contains(&target_view)
+            || runtime.floated_views().contains(&target_view)
+            || runtime.pinned_views().contains(&target_view);
+        if !is_live {
             return Err((
                 "usage",
                 "NotFound",
@@ -490,9 +496,12 @@ pub fn apply_control(
         if runtime.close_pane_session(&target_view) {
             return Ok(format!("{{\"closed\":\"{terminal_id}\"}}"));
         }
-        // No pane session: refuse the last leaf so the layout is never
-        // stranded empty; otherwise report NotFound.
-        if runtime.layout().leaf_ids().contains(&target_view) {
+        // No pane session: refuse a live session-less view so the layout is
+        // never stranded empty; otherwise report NotFound.
+        let is_live = runtime.layout().leaf_ids().contains(&target_view)
+            || runtime.floated_views().contains(&target_view)
+            || runtime.pinned_views().contains(&target_view);
+        if is_live {
             return Err((
                 "usage",
                 "Conflict",
@@ -899,7 +908,19 @@ fn create_split_leaf(
     // globally by `ViewId`, so a local scan aliases another workspace's shell.
     let new_id = runtime.next_view_id_global();
     let mut layout = runtime.layout().clone();
-    if !split_leaf(&mut layout, focused, axis, new_id, place_new_first) {
+    let target = if layout.find_leaf(focused).is_some() {
+        focused
+    } else if let Some(plan) = runtime
+        .panel_split_plan()
+        .filter(|p| layout.find_leaf(p.target).is_some())
+    {
+        plan.target
+    } else if let Some(first) = layout.leaf_ids().into_iter().next() {
+        first
+    } else {
+        focused
+    };
+    if !split_leaf(&mut layout, target, axis, new_id, place_new_first) {
         return Err((
             "usage",
             "Conflict",
@@ -1077,5 +1098,67 @@ fn append_json_escaped(out: &mut String, s: &str) {
             }
             c => out.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
+
+    #[test]
+    fn ctl_send_text_close_and_split_support_detached_float_and_pinned_views() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let v1 = ViewId::new(1);
+        rt.float_detach(v1).expect("detach v1 into float store");
+        assert!(rt.set_focus(v1));
+        rt.handle_pty_bytes(b"float-output-line\r\n");
+
+        // 1. `terminal text` succeeds for a detached float.
+        let text_params = ipc_ctl::params_terminal_id("t:1");
+        let text_json = apply_control(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&text_params),
+        )
+        .expect("terminal text on detached float must succeed");
+        assert!(text_json.contains("float-output-line"));
+
+        // 2. `terminal send` succeeds when the detached float is focused.
+        let send_params = ipc_ctl::params_send_input("t:1", "hello\n");
+        let send_json = apply_control(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&send_params))
+            .expect("terminal send on focused detached float must succeed");
+        assert!(send_json.contains("\"sent_to\":\"t:1\""));
+
+        // 3. `terminal close` on a session-less detached float returns Conflict (not NotFound).
+        let close_err = apply_control(&mut rt, ipc_ctl::METHOD_CLOSE_TERMINAL, Some(&text_params))
+            .expect_err("session-less detached float must return Conflict");
+        assert_eq!(close_err.1, "Conflict");
+
+        // 4. Restore and pin v1, then verify `terminal text`, `terminal send`, and `view split`.
+        rt.float_restore(v1).expect("restore float");
+        rt.pin_floating(v1).expect("pin v1");
+        assert!(rt.set_focus(v1));
+        let pinned_text = apply_control(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&text_params),
+        )
+        .expect("terminal text on pinned view must succeed");
+        assert!(pinned_text.contains("\"terminal_id\":\"t:1\""));
+        let pinned_send = apply_control(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&send_params))
+            .expect("terminal send on focused pinned view must succeed");
+        assert!(pinned_send.contains("\"sent_to\":\"t:1\""));
+
+        let split_params = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+        let split_json = apply_control(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split_params))
+            .expect("view split while pinned view is focused must split tiled base");
+        assert!(split_json.contains("\"new_view\":\"v:3\""));
     }
 }

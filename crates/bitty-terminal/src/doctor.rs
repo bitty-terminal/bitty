@@ -221,21 +221,21 @@ pub enum RemediationPlatform {
 impl RemediationPlatform {
     /// Platform this build runs on.
     ///
-    /// The operating system comes from the compile-time target, exactly like
-    /// the rest of the platform code in this workspace. A Linux distribution
-    /// family is not part of a target triple, so it is read from the
-    /// distribution's own `/etc/os-release` declaration (with the upstream
+    /// The operating system is [`ProbePlatform::host`], the one target→OS
+    /// mapping in this module (bitty#3014), so the pty/font hints and the
+    /// display/GPU rows can never disagree about the host. A Linux
+    /// distribution family is not part of a target triple, so it is read from
+    /// the distribution's own `/etc/os-release` declaration (with the upstream
     /// fallback `/usr/lib/os-release`) — never from `uname` and never guessed
-    /// from a host path. Every other target is [`Self::Other`].
+    /// from a host path. Every non-FreeBSD target that is not a recognised
+    /// Linux family is [`Self::Other`].
     #[must_use]
     pub fn host() -> Self {
-        if cfg!(target_os = "freebsd") {
-            return Self::FreeBsd;
+        match ProbePlatform::host() {
+            ProbePlatform::FreeBsd => Self::FreeBsd,
+            ProbePlatform::Linux => os_release_family(os_release_contents().as_deref()),
+            ProbePlatform::MacOs | ProbePlatform::Windows | ProbePlatform::Other => Self::Other,
         }
-        if cfg!(target_os = "linux") {
-            return os_release_family(os_release_contents().as_deref());
-        }
-        Self::Other
     }
 
     /// Manual step for a missing PTY multiplexer, or `None` when this platform
@@ -892,11 +892,14 @@ fn unix_gpu(dri_cards: usize) -> DoctorCheck {
 
 /// Host family that owns the display and GPU probe shape.
 ///
-/// Mirrors [`RemediationPlatform`]: selected from the compile-time target,
-/// never guessed from a host path, so one tested table replaces a Linux-shaped
-/// probe that ran on every OS. Wayland/X11 variables and `/dev/dri` exist on
-/// Linux and FreeBSD only; Windows presents through a Win32 desktop session
-/// and DXGI, macOS through an Aqua window server and Metal.
+/// This is the single target→OS mapping in this module (bitty#3014):
+/// [`RemediationPlatform::host`] layers the Linux distribution family on top
+/// of it, so the probe rows and the pty/font hints share one host decision.
+/// The OS comes from the compile-time target, never from a host path, and one
+/// tested table replaces the Linux-shaped probe that ran on every OS.
+/// Wayland/X11 variables and `/dev/dri` exist on Linux and FreeBSD only;
+/// Windows presents through a Win32 desktop session and DXGI, macOS through an
+/// Aqua window server and Metal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbePlatform {
     /// Linux: Wayland/X11 environment plus DRM card nodes.
@@ -915,9 +918,10 @@ pub enum ProbePlatform {
 impl ProbePlatform {
     /// Platform this build runs on, from the compile-time target.
     ///
-    /// Same rule as [`RemediationPlatform::host`]: the OS is a property of the
-    /// target triple, so nothing is read from the environment to decide which
-    /// probe shape applies.
+    /// The OS is a property of the target triple, so nothing is read from the
+    /// environment to decide which probe shape applies. This is the only
+    /// target→OS mapping in the module; [`RemediationPlatform::host`] adds the
+    /// Linux distribution family on top of it.
     #[must_use]
     pub const fn host() -> Self {
         if cfg!(target_os = "linux") {
@@ -4091,6 +4095,60 @@ mod tests {
             let report = assemble_report(&inputs);
             assert_eq!(report.exit_code(), EXIT_OK, "{platform:?}");
             assert!(report.ok(), "{platform:?}");
+        }
+    }
+
+    /// bitty#3014 acceptance: no Linux session variable, device path, or
+    /// driver package may reach a Windows row. Every Windows shape is checked
+    /// — both warn rows and the passing rows — because a future hint or detail
+    /// is the surface that regressed.
+    #[test]
+    fn windows_hints_name_no_linux_probe_evidence() {
+        let checks = [
+            ProbePlatform::Windows.display(&DisplayEvidence {
+                win32_session: Some("Console".to_string()),
+                ..DisplayEvidence::default()
+            }),
+            ProbePlatform::Windows.display(&DisplayEvidence {
+                win32_session: Some("Services".to_string()),
+                ..DisplayEvidence::default()
+            }),
+            ProbePlatform::Windows.display(&DisplayEvidence::default()),
+            ProbePlatform::Windows.gpu(&GpuEvidence {
+                dri_cards: 0,
+                adapter: Some(AdapterProbe {
+                    name: "NVIDIA GeForce RTX 4070".to_string(),
+                    backend: "d3d12",
+                    class: "discrete",
+                }),
+            }),
+            ProbePlatform::Windows.gpu(&GpuEvidence::default()),
+        ];
+        for check in checks {
+            let text = format!("{} {}", check.hint, check.detail);
+            for forbidden in ["/dev/dri", "Mesa", "DISPLAY"] {
+                assert!(
+                    !text.contains(forbidden),
+                    "a Windows {} row must not name {forbidden:?}: {text}",
+                    check.id
+                );
+            }
+            let lowered = text.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("wayland"),
+                "a Windows {} row must not name Wayland: {text}",
+                check.id
+            );
+            // `dri` as a standalone token only: the Windows hint legitimately
+            // says "display driver", which is the WDDM model, not the Linux
+            // DRI stack.
+            assert!(
+                !text
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case("dri")),
+                "a Windows {} row must not name DRI: {text}",
+                check.id
+            );
         }
     }
 

@@ -1559,15 +1559,10 @@ impl Runtime {
         // runtimes): there is no recipe to replay, and the session-less
         // non-owner leaf never paints or feeds the primary.
         if let Some((program, args)) = self.primary_spawn.clone() {
-            let (cols, rows) = self
-                .present_frames()
-                .iter()
-                .find(|frame| frame.view == fresh_id)
-                .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
-                .unwrap_or((
-                    self.cols.min(u16::MAX as usize) as u16,
-                    self.rows.min(u16::MAX as usize) as u16,
-                ));
+            let (cols, rows) = self.presented_frame_cells(fresh_id).unwrap_or((
+                self.cols.min(u16::MAX as usize) as u16,
+                self.rows.min(u16::MAX as usize) as u16,
+            ));
             let tail: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Err(err) = self.spawn_shell_for_view_in(
                 fresh_id,

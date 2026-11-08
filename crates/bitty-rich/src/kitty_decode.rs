@@ -409,6 +409,34 @@ pub fn precheck_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
     png_admission(payload).map(|_| ())
 }
 
+/// Verifies that a PNG payload would **decode**, for the `a=q` support
+/// probe.
+///
+/// [`precheck_png_payload`] is header-only by design, so a payload with a
+/// valid `IHDR` and a corrupt or truncated stream past it passes it and is
+/// then refused by the codec — a probe built on it answers `OK` for bytes
+/// the transmit path rejects, which tells a client images work and paints
+/// nothing (review follow-up F3 on issue #2875).
+///
+/// This wrapper runs the same admission gate first (so an oversize
+/// declaration still refuses before any pixel buffer exists) and then
+/// decodes, discarding the bitmap. The probe therefore answers `OK` only
+/// when loading would in fact succeed, which is exactly what kitty's
+/// support query promises (`docs/graphics-protocol.rst:440-442`: "the
+/// terminal tries to load the image and tells you whether loading
+/// succeeded"). Cost is the same bounded decode the transmit would run:
+/// allocation is capped by [`KITTY_DECODE_MAX_BYTES`] and refused upfront
+/// when the header is inadmissible.
+///
+/// # Errors
+///
+/// The admission errors of [`precheck_png_payload`], plus
+/// [`KittyDecodeError::MalformedPng`] for a stream the codec refuses.
+pub fn verify_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
+    png_admission(payload)?;
+    decode_png(payload).map(|_| ())
+}
+
 /// Shared body of the PNG admission gate.
 ///
 /// Returns the sniffed `(width, height)` plus the pixel count the RGBA8
@@ -705,6 +733,36 @@ mod tests {
                 "{w}x{h} ({want}): gate and decoder must agree on the refusal"
             );
         }
+    }
+
+    #[test]
+    fn verify_png_payload_refuses_a_stream_the_gate_admits() {
+        // F3 (#2875 follow-up): the support probe must not answer `OK` for a
+        // stream the decoder refuses. The header gate still admits this
+        // shape (see the test above), so the probe-side verifier is what
+        // makes the verdict honest.
+        let bytes = png_with_ihdr(1, 1);
+        precheck_png_payload(&bytes).expect("the gate reads only the header");
+        let err = verify_png_payload(&bytes).expect_err("a truncated stream cannot load");
+        assert!(
+            matches!(err, KittyDecodeError::MalformedPng(_)),
+            "a truncated stream is malformed, got {err:?}"
+        );
+        // And the verifier still accepts a decodable payload.
+        verify_png_payload(PNG_1X1_RGBA_RED).expect("a real PNG must verify");
+    }
+
+    #[test]
+    fn verify_png_payload_keeps_the_oversize_refusal_ahead_of_the_decode() {
+        // Admission runs first, so an over-cap declaration refuses without
+        // ever allocating the decoded bitmap (the reason the probe used the
+        // header gate in the first place).
+        let bytes = png_with_ihdr(9000, 1);
+        let err = verify_png_payload(&bytes).expect_err("over-cap must refuse");
+        assert!(
+            matches!(err, KittyDecodeError::DimensionsTooLarge { .. }),
+            "the gate's refusal must win, got {err:?}"
+        );
     }
 
     #[test]

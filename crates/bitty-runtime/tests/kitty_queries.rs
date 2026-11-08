@@ -433,3 +433,34 @@ fn query_probe_refusal_implies_the_same_payload_paints_nothing() {
         "a refused probe must name a payload that paints nothing"
     );
 }
+
+#[test]
+fn query_probe_refuses_a_png_stream_the_decoder_refuses() {
+    // Issue #2875 review follow-up F3: the probe used a header-only gate, so
+    // a PNG with a valid `IHDR` and a corrupt tail answered `OK` and then
+    // painted nothing — the exact lie the probe⇒paint contract forbids. The
+    // verdict now runs the decoder, so "OK" means "these bytes load".
+    let mut rt = make_runtime();
+    // Valid 1x1 RGBA IHDR, then the real IDAT/IEND replaced by garbage: no
+    // codec can load this, but the header gate accepts it.
+    let mut corrupt = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137,
+    ];
+    corrupt.extend_from_slice(b"not a zlib stream");
+    let probe = format!("\x1b_Gi=77,f=100,a=q,m=0;{}\x1b\\", base64(&corrupt));
+    rt.handle_pty_bytes(probe.as_bytes());
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=77;EINVAL:bad data\x1b\\".to_vec()],
+        "a probe must not answer OK for bytes the decoder refuses"
+    );
+    // The same bytes transmitted store nothing: probe and transmit agree.
+    let display = format!(
+        "\x1b_Gi=77,f=100,a=T,c=1,r=1,m=0;{}\x1b\\",
+        base64(&corrupt)
+    );
+    rt.handle_pty_bytes(display.as_bytes());
+    let _ = rt.tick();
+    assert_eq!(rt.kitty_image_count(), 0, "refused payload stores nothing");
+}

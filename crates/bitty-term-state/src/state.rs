@@ -2324,37 +2324,115 @@ impl State {
     /// relative (the specification forbids cursor motion for relatives
     /// regardless of `C=`).
     fn kitty_place(&mut self, cols: u16, rows: u16, cursor_move: u8, keys: KittyControlKeys) {
+        self.kitty_place_inner(None, cols, rows, cursor_move, keys, false);
+    }
+
+    /// Records an `a=p` placement whose cell span the **runtime** derived
+    /// from the image's pixel size (issue #2875).
+    ///
+    /// Kitty's rule for a placement without `c=`/`r=` is "display at the
+    /// image's natural size in cells" (`ceil(pixels / cell)`), but terminal
+    /// truth holds no decoded pixels, so it cannot compute that span and
+    /// refuses a spanless place ([`Self::kitty_place`]). The runtime owns
+    /// both the decoded image and the live cell metrics, so it resolves the
+    /// span and records the placement through this seam; anchor, parent
+    /// link, `z`, cursor advance and damage are exactly `kitty_place`'s.
+    ///
+    /// The caller must have resolved a non-empty span; an empty one still
+    /// refuses (nothing to anchor, no cursor advance) and returns `false`.
+    /// Returns `true` when the placement was recorded.
+    pub fn apply_kitty_place_derived(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cursor_move: u8,
+        keys: KittyControlKeys,
+    ) -> bool {
+        self.apply_kitty_place_derived_at(None, cols, rows, cursor_move, keys)
+    }
+
+    /// Anchor-explicit form of [`Self::apply_kitty_place_derived`].
+    ///
+    /// `anchor` is the **wire** cursor cell the client emitted the command
+    /// at, for a placement whose pixels arrived after the command (a
+    /// local-medium transmit completing on the async worker). The live
+    /// cursor has moved on by then, so the recorded anchor must come from
+    /// the enqueue rather than from `self.cursor`. `None` anchors at the
+    /// live cursor, exactly like the wire seam.
+    ///
+    /// The caller passes `cursor_move = 1` on the deferred path: the
+    /// client's own `C=` decision was already applied against the command's
+    /// position at drain time, and moving the live cursor again from a
+    /// completed read would reorder the stream.
+    pub fn apply_kitty_place_derived_at(
+        &mut self,
+        anchor: Option<(u16, u16)>,
+        cols: u16,
+        rows: u16,
+        cursor_move: u8,
+        keys: KittyControlKeys,
+    ) -> bool {
+        let placed = self.kitty_place_inner(anchor, cols, rows, cursor_move, keys, true);
+        self.enforce_cursor_invariants();
+        self.finalize_batch();
+        placed
+    }
+
+    /// Shared body of the wire and runtime-derived placement seams.
+    ///
+    /// `anchor` overrides the live cursor (deferred replay) and `derived`
+    /// marks a span the runtime computed from pixels
+    /// ([`Self::apply_kitty_place_derived`]); the wire seam refuses a
+    /// spanless command because it cannot know the image's size.
+    fn kitty_place_inner(
+        &mut self,
+        anchor: Option<(u16, u16)>,
+        cols: u16,
+        rows: u16,
+        cursor_move: u8,
+        keys: KittyControlKeys,
+        derived: bool,
+    ) -> bool {
         let on_alt = self.alt_screen_active();
         let virtual_proto = keys.is_virtual_placement();
         if virtual_proto && keys.has_parent() {
             // A virtual prototype cannot hang off a parent (kitty
             // `EINVAL`): refuse, count, done.
             self.telemetry.kitty_refused += 1;
-            return;
+            return false;
         }
-        if cols == 0 && rows == 0 {
+        if cols == 0 && rows == 0 && !derived {
             // Headless sizing needs explicit spans: pixels are unknown
             // here, so a spanless place names nothing to anchor and no
             // cursor advance to apply. (The decoder still stores the
             // pixels downstream; only the grid anchor is skipped.)
             self.telemetry.kitty_refused += 1;
-            return;
+            return false;
         }
-        let (anchor_row, anchor_col) = self.cursor_xy();
+        if cols == 0 || rows == 0 {
+            // A derived span must cover both axes; a single empty axis
+            // names no rectangle to scale into.
+            self.telemetry.kitty_refused += 1;
+            return false;
+        }
+        let (live_row, live_col) = self.cursor_xy();
+        let (anchor_row, anchor_col) = anchor
+            .map(|(col, row)| (usize::from(row), usize::from(col)))
+            .unwrap_or((live_row, live_col));
         let (anchor_row, anchor_col, relative) = if keys.has_parent() {
             let Some(parent) = self
                 .kitty_placements
                 .resolve_parent(keys.parent_id, keys.parent_placement_id)
             else {
                 self.telemetry.kitty_refused += 1;
-                return;
+                return false;
             };
             if parent.virtual_proto {
                 // Offsets from a prototype's nowhere-anchor are
                 // meaningless; the renderer derives virtual children
                 // from `U+10EEEE` runs instead.
                 self.telemetry.kitty_refused += 1;
-                return;
+                return false;
             }
             let row = parent.anchor_row.saturating_add_signed(keys.parent_dy);
             let col = parent.anchor_col.saturating_add_signed(keys.parent_dx);
@@ -2406,6 +2484,7 @@ impl State {
                 .saturating_add(rows)
                 .min(self.height as u16 - 1);
         }
+        true
     }
 
     /// Applies an `a=d` deletion command.

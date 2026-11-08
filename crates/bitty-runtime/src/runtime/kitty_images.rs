@@ -143,6 +143,49 @@ impl std::fmt::Display for KittyImageError {
 
 impl std::error::Error for KittyImageError {}
 
+/// One `a=p` placement whose cell span the runtime could not resolve when
+/// the command drained (issue #2875).
+///
+/// The image.nvim "normal" backend transmits with `a=t,f=100,t=f` (a
+/// local-medium read that completes on the async worker) and then places
+/// with `a=p` and **no `c=`/`r=`**: kitty's rule is "display at the image's
+/// natural size in cells", so the span is `ceil(pixels / cell)` and can
+/// only be computed once the pixels are stored. The placement command
+/// usually arrives in the same PTY read as the transmit, before the read
+/// completes, so the request is retained here (bounded) and replayed by
+/// [`Runtime::flush_pending_kitty_places`] when the store lands. Without
+/// it the placement is dropped forever and the client paints nothing.
+///
+/// The anchor and scrollback base are the drain-time cursor, never the
+/// cursor at completion time; `keys` carries the wire identity, `z`, and
+/// the parent link so the replay records exactly what the client asked
+/// for. Bounded by [`KITTY_PENDING_PLACES_MAX`] (drop-oldest), which keeps
+/// a hostile stream from growing it without a matching transmit.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingKittyPlace {
+    /// Origin whose plane the placement belongs to (`None` primary).
+    pub origin: Option<u64>,
+    /// Drain-time cursor cell the command anchored at.
+    pub anchor_col: u16,
+    /// Drain-time cursor row the command anchored at.
+    pub anchor_row: u16,
+    /// Drain-time scrollback base (the paint pass scrolls against it).
+    pub scrollback_base: usize,
+    /// Wire `c=`/`r=` spans as received (`0` marks the axis to derive).
+    pub cols: u16,
+    /// Wire `r=` span as received (`0` marks the axis to derive).
+    pub rows: u16,
+    /// Wire identity and placement keys, replayed verbatim.
+    pub keys: bitty_vt::KittyControlKeys,
+}
+
+/// Bound on retained spanless placements awaiting their pixels.
+///
+/// One per protocol placement the client asked for; a real client places a
+/// handful of images per frame, so 32 covers a full screen of previews
+/// while keeping a stream that places without ever transmitting bounded.
+pub(super) const KITTY_PENDING_PLACES_MAX: usize = 32;
+
 /// Outcome of [`Runtime::kitty_display_image`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KittyDisplayOutcome {
@@ -528,6 +571,9 @@ impl Runtime {
         // `a=f`/`a=c` commands resolve this image as their animation
         // target (no-op for anonymous transmits).
         self.kitty_images.set_wire_image(image, wire_image);
+        // Issue #2875: a spanless `a=p` that drained before these pixels
+        // landed can be sized and recorded now (no-op when none wait).
+        self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -746,6 +792,8 @@ impl Runtime {
         // S1 (#1849): tag the stored root with its wire `i=` id (see the
         // borrowed seam above).
         self.kitty_images.set_wire_image(image, wire_image);
+        // Issue #2875: replay any spanless `a=p` waiting on these pixels.
+        self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -833,6 +881,9 @@ impl Runtime {
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
         self.kitty_images.set_wire_image(image, wire_image);
+        // Issue #2875: the async local-medium completion path is where a
+        // spanless `a=p` waiting on these pixels is replayed.
+        self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -1763,19 +1814,145 @@ impl Runtime {
         }
     }
 
+    /// Cell span for a placement, deriving a missing axis from the image's
+    /// pixel size (issue #2875).
+    ///
+    /// Kitty displays a placement without `c=`/`r=` at the image's natural
+    /// size: `cols = ceil(width / cell_width)`, `rows = ceil(height /
+    /// cell_height)` (`docs/graphics-protocol.rst`, "Controlling displayed
+    /// image layout"). Terminal truth cannot compute that (it holds no
+    /// pixels), so the runtime resolves it here and hands the result to the
+    /// truth seam — the same numbers `bitty_rich::KittyImageLayer` derives
+    /// at admission, so the two layers never disagree about the footprint.
+    ///
+    /// Pixels come from the wire `w=`/`h=` display region when the client
+    /// sends one (image.nvim crops that way), else from the origin-scoped
+    /// store, else from the `s=`/`v=` a raw payload declares. `None` means
+    /// the placement cannot be sized yet (a PNG whose pixels are still being
+    /// read by the local-medium worker): the caller retains the request and
+    /// replays it when the store lands
+    /// ([`Self::flush_pending_kitty_places`]).
+    pub(super) fn kitty_place_span(
+        &self,
+        origin: Option<u64>,
+        cols_c: u16,
+        rows_r: u16,
+        keys: &bitty_vt::KittyControlKeys,
+        width_s: Option<u32>,
+        height_v: Option<u32>,
+    ) -> Option<(u16, u16)> {
+        if cols_c != 0 && rows_r != 0 {
+            return Some((cols_c, rows_r));
+        }
+        let metrics = self.live_cell_metrics();
+        if metrics.width == 0 || metrics.height == 0 {
+            return None;
+        }
+        let region = (keys.src_w != 0 && keys.src_h != 0).then_some((keys.src_w, keys.src_h));
+        let stored = self
+            .kitty_images
+            .find_root_for_origin(origin, keys.image_id)
+            .and_then(|image| self.kitty_images.get(image))
+            .map(|image| (image.width, image.height));
+        let declared = match (width_s, height_v) {
+            (Some(width), Some(height)) if width != 0 && height != 0 => Some((width, height)),
+            _ => None,
+        };
+        let pixels = region.or(stored).or(declared)?;
+        let span = |explicit: u16, pixels: u32, cell_px: u32| -> u16 {
+            if explicit != 0 {
+                return explicit;
+            }
+            pixels.div_ceil(cell_px).max(1).min(u32::from(u16::MAX)) as u16
+        };
+        let cols = span(cols_c, pixels.0, metrics.width);
+        let rows = span(rows_r, pixels.1, metrics.height);
+        (cols != 0 && rows != 0).then_some((cols, rows))
+    }
+
+    /// Retains a spanless `a=p` whose pixels are still in flight.
+    ///
+    /// Drop-oldest past [`KITTY_PENDING_PLACES_MAX`], and a re-place of the
+    /// same wire identity replaces its earlier entry so a client that
+    /// re-places every redraw never queues duplicates.
+    pub(super) fn stash_pending_kitty_place(&mut self, entry: PendingKittyPlace) {
+        self.kitty_pending_places.retain(|pending| {
+            !(pending.origin == entry.origin
+                && pending.keys.image_id == entry.keys.image_id
+                && pending.keys.placement_id == entry.keys.placement_id)
+        });
+        while self.kitty_pending_places.len() >= KITTY_PENDING_PLACES_MAX {
+            self.kitty_pending_places.pop_front();
+        }
+        self.kitty_pending_places.push_back(entry);
+    }
+
+    /// Replays retained spanless placements for one newly stored image
+    /// (issue #2875).
+    ///
+    /// Runs after a successful store on the drain that owns `origin`: the
+    /// pixels now exist, so the span resolves and the placement is recorded
+    /// in terminal truth (at the command's drain-time anchor, with `C=1`
+    /// semantics — see [`bitty_term_state::State::apply_kitty_place_derived_at`])
+    /// and in the presentation layer. Entries for other origins and other
+    /// images are retained untouched.
+    pub(super) fn flush_pending_kitty_places(&mut self, wire_image: u32) {
+        if wire_image == 0 || self.kitty_pending_places.is_empty() {
+            return;
+        }
+        let origin = self.kitty_origin;
+        let mut replay = Vec::new();
+        let mut kept = std::collections::VecDeque::with_capacity(self.kitty_pending_places.len());
+        while let Some(entry) = self.kitty_pending_places.pop_front() {
+            if entry.origin == origin && entry.keys.image_id == wire_image {
+                replay.push(entry);
+            } else {
+                kept.push_back(entry);
+            }
+        }
+        self.kitty_pending_places = kept;
+        for entry in replay {
+            let Some((cols, rows)) = self.kitty_place_span(
+                entry.origin,
+                entry.cols,
+                entry.rows,
+                &entry.keys,
+                None,
+                None,
+            ) else {
+                continue;
+            };
+            self.kitty_place_stored(
+                entry.anchor_col,
+                entry.anchor_row,
+                entry.scrollback_base,
+                cols,
+                rows,
+                entry.keys.z_index,
+                entry.keys.image_id,
+                entry.keys.placement_id,
+            );
+            self.state.apply_kitty_place_derived_at(
+                Some((entry.anchor_col, entry.anchor_row)),
+                cols,
+                rows,
+                1,
+                entry.keys,
+            );
+            self.pending_full_redraw = true;
+        }
+    }
+
     /// Mirrors a bodiless `a=p` placement of an already-transmitted image
     /// into the rich pixel layer (issue #2875).
     ///
     /// `a=p` names an image by wire id and places it at the cursor without
     /// carrying pixels; terminal truth records the anchor, spans, and `z=`
-    /// in [`bitty_term_state::PlacementStore`], but until this arm ran the
-    /// pixel layer never learned about it, so a client that transmits with
-    /// `a=t` and then places with `a=p` showed nothing. This seam resolves
-    /// the stored root through the origin-scoped wire map
-    /// ([`bitty_rich::KittyImageLayer::find_root_for_origin`]) and re-uses
-    /// the same admission path as a transmit-and-display placement
-    /// (`display_for_origin_with_wire`), including per-origin quotas and
-    /// the `(origin, wire image, wire placement)` identity that protocol
+    /// in [`bitty_term_state::PlacementStore`], and this seam mirrors it
+    /// into the pixel layer through the same admission path as a
+    /// transmit-and-display placement (`display_for_origin_with_wire`),
+    /// including per-origin quotas and the
+    /// `(origin, wire image, wire placement)` identity that protocol
     /// deletes match.
     ///
     /// A pinned re-put (`p != 0`) replaces the rendered placement instead of
@@ -1788,7 +1965,9 @@ impl Runtime {
     ///
     /// Returns `false` when the command names nothing painted: `i=0`
     /// (anonymous), no stored image for this origin, or a placement-quota
-    /// refusal. Every refusal paints nothing and evicts nothing.
+    /// refusal. Every refusal paints nothing and evicts nothing; the caller
+    /// retains a spanless request whose pixels are still in flight
+    /// ([`Self::stash_pending_kitty_place`]).
     #[allow(clippy::too_many_arguments)]
     pub fn kitty_place_stored(
         &mut self,
@@ -2249,12 +2428,14 @@ impl Runtime {
                 ));
             }
             // PNG declares no meaningful `s`/`v` (the `IHDR` governs), so
-            // `precheck_declared_image` cannot judge it. Validate the header
-            // through the same gate the transmit path runs (issue #2875
-            // scope 4): a probe must never answer `OK` for bytes the decoder
-            // then refuses, because that tells a client images work and
-            // paints nothing.
-            if channels.is_none() && bitty_rich::precheck_png_payload(payload).is_err() {
+            // `precheck_declared_image` cannot judge it. Probe the *whole*
+            // stream through the decoder, not just its header (review
+            // follow-up F3 on #2875): a header-only gate answers `OK` for a
+            // corrupt or truncated `IDAT` tail the transmit path then
+            // refuses, which tells a client images work and paints nothing.
+            // The admission gate still runs first, so an inadmissible
+            // declaration refuses before any pixel buffer exists.
+            if channels.is_none() && bitty_rich::verify_png_payload(payload).is_err() {
                 return Some((
                     crate::queries::kitty_probe_einval_reply(image_id, "bad data"),
                     false,

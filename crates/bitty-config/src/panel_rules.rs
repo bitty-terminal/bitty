@@ -338,34 +338,9 @@ fn check_regex_syntax(pat: &str) -> Result<(), String> {
                 idx += 2;
             }
             '[' => {
-                let mut end = idx + 1;
-                if end < chars.len() && chars[end] == '^' {
-                    end += 1;
-                }
-                if end < chars.len() && chars[end] == ']' {
-                    end += 1;
-                }
-                let mut closed = false;
-                let mut j = end;
-                while j < chars.len() {
-                    if chars[j] == '\\' {
-                        j += 2;
-                        continue;
-                    }
-                    if chars[j] == ']' {
-                        closed = true;
-                        break;
-                    }
-                    j += 1;
-                }
-                if !closed {
-                    return Err("unterminated character class".to_string());
-                }
-                if j == end {
-                    return Err("empty character class".to_string());
-                }
+                let (_, next) = parse_class(&chars, idx).map_err(str::to_string)?;
                 have_atom = true;
-                idx = j + 1;
+                idx = next;
             }
             ']' => return Err("unmatched class close".to_string()),
             '(' | ')' | '{' | '}' | '|' => {
@@ -381,13 +356,13 @@ fn check_regex_syntax(pat: &str) -> Result<(), String> {
 }
 
 /// Exact `cmd` matching: equals the full command line or the program
-/// basename (text after the final `/`).
+/// basename (text after the final `/` or `\`).
 fn matches_cmd_exact(pattern: &str, cmd_line: &str) -> bool {
     if pattern == cmd_line {
         return true;
     }
     let program = cmd_line.split_whitespace().next().unwrap_or(cmd_line);
-    let basename = program.rsplit('/').next().unwrap_or(program);
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
     pattern == program || pattern == basename
 }
 
@@ -432,7 +407,8 @@ fn split_anchors(pattern: &str) -> (bool, bool, &str) {
         body = rest;
     }
     if let Some(rest) = body.strip_suffix('$') {
-        if !rest.ends_with('\\') {
+        let trailing_backslashes = rest.chars().rev().take_while(|&c| c == '\\').count();
+        if trailing_backslashes % 2 == 0 {
             end = true;
             body = rest;
         }
@@ -476,7 +452,7 @@ fn parse_atoms(body: &str) -> Option<Vec<(Atom, Quant)>> {
             }
             '.' => Atom::Any,
             '[' => {
-                let (atom, next) = parse_class(&chars, idx)?;
+                let (atom, next) = parse_class(&chars, idx).ok()?;
                 idx = next;
                 let quant = peek_quant(&chars, idx);
                 if quant != Quant::One {
@@ -513,24 +489,24 @@ fn peek_quant(chars: &[char], idx: usize) -> Quant {
 }
 
 /// Parses a `[...]` class starting at `start` (which holds `[`).
-fn parse_class(chars: &[char], start: usize) -> Option<(Atom, usize)> {
+fn parse_class(chars: &[char], start: usize) -> Result<(Atom, usize), &'static str> {
     let mut idx = start + 1;
     let mut negate = false;
     if idx < chars.len() && chars[idx] == '^' {
         negate = true;
         idx += 1;
     }
+    let body_start = idx;
     let mut singles = Vec::new();
     let mut ranges = Vec::new();
     if idx < chars.len() && chars[idx] == ']' {
         singles.push(']');
         idx += 1;
     }
-    let mut first = true;
     while idx < chars.len() {
-        if chars[idx] == ']' && !first {
+        if chars[idx] == ']' {
             idx += 1;
-            return Some((
+            return Ok((
                 Atom::Class {
                     negate,
                     ranges,
@@ -541,7 +517,7 @@ fn parse_class(chars: &[char], start: usize) -> Option<(Atom, usize)> {
         }
         let lo = if chars[idx] == '\\' {
             if idx + 1 >= chars.len() {
-                return None;
+                return Err("unterminated character class");
             }
             idx += 2;
             chars[idx - 1]
@@ -554,7 +530,7 @@ fn parse_class(chars: &[char], start: usize) -> Option<(Atom, usize)> {
             idx += 1;
             let hi = if chars[idx] == '\\' {
                 if idx + 1 >= chars.len() {
-                    return None;
+                    return Err("unterminated character class");
                 }
                 idx += 2;
                 chars[idx - 1]
@@ -564,15 +540,17 @@ fn parse_class(chars: &[char], start: usize) -> Option<(Atom, usize)> {
                 ch
             };
             if lo > hi {
-                return None;
+                return Err("inverted character class range");
             }
             ranges.push((lo, hi));
         } else {
             singles.push(lo);
         }
-        first = false;
     }
-    None
+    if idx == body_start + 1 && singles.as_slice() == [']'] && ranges.is_empty() {
+        return Err("empty character class");
+    }
+    Err("unterminated character class")
 }
 
 /// Whether `atom` matches `ch`.
@@ -936,5 +914,31 @@ mod tests {
         assert_eq!(PanelPresentation::parse("fullscreen"), None);
         assert_eq!(PanelPresentation::parse("Floating"), None);
         assert_eq!(PanelPresentation::parse(""), None);
+    }
+
+    #[test]
+    fn regex_class_validation_matches_evaluator_and_windows_basename() {
+        // Leading `]` in `[...]` and `[^...]` is a valid literal `]` member.
+        validate_regex_pattern("cmd_regex", "[]]").expect("[]] is valid");
+        validate_regex_pattern("cmd_regex", "[^]]").expect("[^]] is valid");
+        assert!(matches_regex("^[]]$", "]"));
+        assert!(!matches_regex("^[^]]$", "]"));
+        assert!(matches_regex("^[^]]$", "a"));
+
+        // Inverted ranges and empty classes are rejected at validation time.
+        assert!(validate_regex_pattern("cmd_regex", "[z-a]").is_err());
+        assert!(validate_regex_pattern("cmd_regex", "[]").is_err());
+        assert!(validate_regex_pattern("cmd_regex", "[^]").is_err());
+        assert!(validate_regex_pattern("cmd_regex", "[\\]").is_err());
+
+        // Even number of trailing backslashes before `$` keeps `$` as end anchor.
+        validate_regex_pattern("cmd_regex", r"^foo\\$").expect("escaped backslash before anchor");
+        assert!(matches_regex(r"^foo\\$", r"foo\"));
+        assert!(!matches_regex(r"^foo\\$", r"foo\bar"));
+        assert!(matches_regex(r"^foo\$", "foo$"));
+
+        // Windows path separator extracts basename in exact `cmd` matcher.
+        let rule = rule_cmd("btop.exe");
+        assert!(rule.matches(r"C:\Tools\btop.exe --utf", "", "terminal"));
     }
 }

@@ -325,6 +325,9 @@ fn config_version_slot(source: &str, table_open: usize) -> ConfigVersionSlot {
             {
                 index += 1;
             }
+            if start > 0 && matches!(bytes[start - 1], b'.' | b':') {
+                continue;
+            }
             if &source[start..index] != "config_version" {
                 continue;
             }
@@ -332,7 +335,7 @@ fn config_version_slot(source: &str, table_open: usize) -> ConfigVersionSlot {
             while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
-            if bytes.get(cursor) != Some(&b'=') {
+            if bytes.get(cursor) != Some(&b'=') || bytes.get(cursor + 1) == Some(&b'=') {
                 continue;
             }
             cursor += 1;
@@ -343,7 +346,7 @@ fn config_version_slot(source: &str, table_open: usize) -> ConfigVersionSlot {
             while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
                 cursor += 1;
             }
-            if cursor > value_start {
+            if cursor > value_start && is_literal_field_end(source, cursor) {
                 return ConfigVersionSlot::Literal(value_start..cursor);
             }
             return ConfigVersionSlot::NonLiteral;
@@ -351,6 +354,23 @@ fn config_version_slot(source: &str, table_open: usize) -> ConfigVersionSlot {
         index += 1;
     }
     ConfigVersionSlot::Absent
+}
+
+/// Checks that an integer literal in a Lua table field is followed only by
+/// whitespace/comments before `,`, `;`, or `}`.
+fn is_literal_field_end(source: &str, mut cursor: usize) -> bool {
+    let bytes = source.as_bytes();
+    loop {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b'-') && bytes.get(cursor + 1) == Some(&b'-') {
+            cursor = skip_comment(source, cursor);
+            continue;
+        }
+        break;
+    }
+    matches!(bytes.get(cursor), Some(b',' | b';' | b'}'))
 }
 
 /// Indentation of the first content line inside the returned table.
@@ -572,6 +592,33 @@ mod tests {
         let out = stamp_config_version(source, 1).expect("stamp");
         assert!(out.contains("-- return { not_me = true }"));
         assert!(out.contains("return { nested = true }"));
+        assert!(out.contains("    config_version = 1,"));
+    }
+
+    #[test]
+    fn stamp_refuses_float_or_compound_version_and_ignores_comparisons() {
+        for bad in [
+            "return {\n    config_version = 1.5,\n}\n",
+            "return {\n    config_version = 0 + 1,\n}\n",
+            "return {\n    config_version = 0x1,\n}\n",
+        ] {
+            let err = stamp_config_version(bad, 1).expect_err("non-integer must refuse");
+            assert!(
+                err.to_string().contains("not an integer literal"),
+                "{bad}: {err}"
+            );
+        }
+
+        let with_cmp_and_member = concat!(
+            "return {\n",
+            "    other = tbl.config_version,\n",
+            "    flag = config_version == 0,\n",
+            "    config_version = 0,\n",
+            "}\n",
+        );
+        let out = stamp_config_version(with_cmp_and_member, 1).expect("stamp real slot");
+        assert!(out.contains("other = tbl.config_version,"));
+        assert!(out.contains("flag = config_version == 0,"));
         assert!(out.contains("    config_version = 1,"));
     }
 }

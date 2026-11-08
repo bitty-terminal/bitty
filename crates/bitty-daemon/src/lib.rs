@@ -60,7 +60,7 @@
 //!
 //! # Frozen here
 //!
-//! - [`contract::SERVICE_API_VERSION`]: service API `1.3` with minimum client
+//! - [`contract::SERVICE_API_VERSION`]: service API `1.5` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `events`,
 //!   `observer_grants`, `control_transfer`, `idempotent_mutations`, and the

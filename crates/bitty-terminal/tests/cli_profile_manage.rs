@@ -233,6 +233,21 @@ const PIN_BASE: &str = r##"return {
 }
 "##;
 
+/// Timestamped `<name>.lua.bak-*` siblings left beside a profile.
+fn profile_backups(root: &Path, name: &str) -> Vec<PathBuf> {
+    let prefix = format!("{name}.lua.bak-");
+    std::fs::read_dir(root.join("bitty").join("profiles"))
+        .expect("profiles dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect()
+}
+
 /// Leaves no `.*.tmp-*` staging files behind.
 fn assert_no_temp_files(root: &Path, what: &str) {
     let leftovers: Vec<String> = std::fs::read_dir(root.join("bitty").join("profiles"))
@@ -2297,5 +2312,145 @@ fn failing_set_and_edit_keep_the_original_bytes() {
         "return {\n    font = { family = \"Edited\", size = 13 },\n}\n"
     );
     assert_no_temp_files(&root, "edit");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clone_force_replaces_destination_and_keeps_the_source_parent() {
+    let root = scratch_root("clone-force");
+    write_profile(&root, "base", "return { window = { opacity = 0.9 } }\n");
+    let source = "return { extends = \"base\", font = { family = \"Mono\", size = 12 } }\n";
+    write_profile(&root, "src", source);
+    write_profile(&root, "dst", "return {}\n");
+
+    let refused = run_bitty(&root, &["config", "profile", "clone", "src", "dst"]);
+    assert_exit(&refused, 2, "clone onto existing without --force");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "dst")).expect("dst"),
+        "return {}\n",
+        "a refused clone leaves the destination intact"
+    );
+
+    let forced = run_bitty(
+        &root,
+        &[
+            "config", "profile", "clone", "src", "dst", "--force", "--json",
+        ],
+    );
+    let text = assert_json_line(&forced, "clone --force");
+    assert!(text.contains("\"force\":true"), "{text}");
+    assert!(text.contains("\"backup\":\""), "{text}");
+    let cloned = std::fs::read_to_string(profile_path(&root, "dst")).expect("clone");
+    assert_eq!(cloned, source, "clone copies the source bytes verbatim");
+    assert!(
+        cloned.contains("extends = \"base\""),
+        "the clone keeps the source's parent: {cloned}"
+    );
+    assert!(
+        !cloned.contains("extends = \"src\""),
+        "the clone never points at its own source: {cloned}"
+    );
+    let backups = profile_backups(&root, "dst");
+    assert_eq!(backups.len(), 1, "one destination backup: {backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).expect("backup"),
+        "return {}\n",
+        "the backup holds the replaced destination"
+    );
+
+    let shown = run_bitty(&root, &["config", "profile", "show", "dst"]);
+    assert_ok(&shown, "show clone");
+    let layers = stdout(&shown);
+    assert!(layers.contains("base.lua"), "{layers}");
+    assert!(
+        !layers.contains("src.lua"),
+        "the clone chain does not include the source: {layers}"
+    );
+    assert_no_temp_files(&root, "clone force");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rename_force_replaces_destination_after_backup() {
+    let root = scratch_root("rename-force");
+    let source = "return { font = { family = \"Mono\", size = 12 } }\n";
+    write_profile(&root, "old", source);
+    write_profile(&root, "taken", "return {}\n");
+
+    let refused = run_bitty(&root, &["config", "profile", "rename", "old", "taken"]);
+    assert_exit(&refused, 2, "rename onto existing without --force");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "old")).expect("old"),
+        source,
+        "a refused rename keeps the source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "taken")).expect("taken"),
+        "return {}\n",
+        "a refused rename keeps the destination"
+    );
+
+    let forced = run_bitty(
+        &root,
+        &[
+            "config", "profile", "rename", "old", "taken", "--force", "--json",
+        ],
+    );
+    let text = assert_json_line(&forced, "rename --force");
+    assert!(text.contains("\"force\":true"), "{text}");
+    assert!(text.contains("\"destination_backup\":\""), "{text}");
+    assert!(!profile_path(&root, "old").exists());
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "taken")).expect("renamed"),
+        source
+    );
+    let backups = profile_backups(&root, "taken");
+    assert_eq!(backups.len(), 1, "one destination backup: {backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).expect("backup"),
+        "return {}\n",
+        "the backup holds the replaced destination"
+    );
+    assert_no_temp_files(&root, "rename force");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn delete_leaves_a_timestamped_backup_and_force_removes_default() {
+    let root = scratch_root("delete-backup");
+    let body = "return { appearance = { theme = \"light\" } }\n";
+    write_profile(&root, "work", body);
+
+    let deleted = run_bitty(&root, &["config", "profile", "delete", "work", "--json"]);
+    let text = assert_json_line(&deleted, "delete --json");
+    assert!(text.contains("\"deleted\":true"), "{text}");
+    assert!(text.contains("\"backup\":\""), "{text}");
+    assert!(!profile_path(&root, "work").exists());
+    let backups = profile_backups(&root, "work");
+    assert_eq!(backups.len(), 1, "one delete backup: {backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).expect("backup"),
+        body,
+        "the delete backup holds the removed bytes"
+    );
+
+    write_profile(&root, "default", "return {}\n");
+    let refused = run_bitty(&root, &["config", "profile", "delete", "default"]);
+    assert_exit(&refused, 2, "delete default without --force");
+    assert!(profile_path(&root, "default").exists());
+    let forced = run_bitty(
+        &root,
+        &[
+            "config", "profile", "delete", "default", "--force", "--json",
+        ],
+    );
+    assert_ok(&forced, "delete default --force");
+    assert!(!profile_path(&root, "default").exists());
+    assert_eq!(
+        profile_backups(&root, "default").len(),
+        1,
+        "a forced default delete keeps a backup"
+    );
+    assert_no_temp_files(&root, "delete backup");
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -6,13 +6,17 @@
 //! - `create NAME [--from EXISTING|--preset NAME] [--force]`: write a
 //!   minimal, valid Lua profile, seeded from a preset or an existing profile.
 //!   An existing name is refused unless `--force`.
-//! - `clone SRC DST`: copy the source profile bytes verbatim (never
-//!   overwrites).
-//! - `rename OLD NEW`: rename one profile file in place and rewrite the
-//!   persisted `init.lua` selector when it named `OLD`; a failed selector
-//!   update rolls the rename back so the fragment is never lost.
-//! - `delete NAME [--force]`: remove one profile (never `default`, never a
-//!   profile another profile `extends`; the active profile needs `--force`).
+//! - `clone SRC DST [--force]`: copy the source profile bytes verbatim.
+//!   A clone is a standalone copy: it keeps the source's own `extends`
+//!   parent (so it inherits the same base chain) and never names the source
+//!   in `extends`. An existing destination is refused unless `--force`.
+//! - `rename OLD NEW [--force]`: rename one profile file in place and rewrite
+//!   the persisted `init.lua` selector when it named `OLD`; a failed selector
+//!   update rolls the rename back so the fragment is never lost. An existing
+//!   destination is refused unless `--force`.
+//! - `delete NAME [--force]`: copy the profile to a `<name>.lua.bak-<epoch>`
+//!   sibling, then remove it (never a profile another profile `extends`; the
+//!   active profile and `default` need `--force`).
 //! - `list`: bounded directory metadata only; never evaluates Lua.
 //! - `show NAME`: loads the single-parent `extends` chain (bounded) and
 //!   prints the profile-only effective values with attribution.
@@ -63,6 +67,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::Args;
 use crate::config_cli::{ConfigFormat, ConfigValue, bounded_message, config_format};
@@ -98,6 +103,9 @@ const MAX_SCHEMA_PATH_BYTES: usize = 128;
 /// Temporary-name attempts for one atomic profile replacement.
 const PROFILE_MAX_TEMP_ATTEMPTS: u32 = 16;
 
+/// Timestamped-backup name attempts beside one profile (collision fallback).
+const PROFILE_MAX_BACKUP_ATTEMPTS: u32 = 16;
+
 /// Process-local counter for unique profile temporary names.
 static PROFILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -108,9 +116,15 @@ pub(crate) fn profile_usage() -> String {
      verbs:\n\
      \x20 create NAME [--from EXISTING|--preset NAME] [--force]\n\
      \x20                     create a profile (seeded; --force replaces an existing name)\n\
-     \x20 clone SRC DST      copy SRC's Lua bytes to a new profile DST\n\
-     \x20 rename OLD NEW     rename a profile file and update the persisted selector\n\
-     \x20 delete NAME        remove a profile (--force when it is active)\n\
+     \x20 clone SRC DST [--force]\n\
+     \x20                     copy SRC's Lua bytes to DST (--force replaces DST);\n\
+     \x20                     the clone keeps SRC's extends parent, never SRC itself\n\
+     \x20 rename OLD NEW [--force]\n\
+     \x20                     rename a profile and update the persisted selector\n\
+     \x20                     (--force replaces an existing NEW after a backup)\n\
+     \x20 delete NAME [--force]\n\
+     \x20                     back up NAME to <name>.lua.bak-<epoch>, then remove it\n\
+     \x20                     (--force when it is active or named `default`)\n\
      \x20 list               list profile names (sorted, bounded; no Lua evaluation)\n\
      \x20 show NAME          load + validate the extends chain and print profile values\n\
      \x20 use NAME           activate NAME by rewriting only the init.lua selector\n\
@@ -124,7 +138,8 @@ pub(crate) fn profile_usage() -> String {
      --json (or --format json) prints one versioned envelope per command.\n\
      --dry-run validates a write and reports it without touching the filesystem.\n\
      Writes are validated before any file change and committed atomically;\n\
-     `default` is reserved for `bitty init`. Quote values that contain spaces;\n\
+     `default` is reserved for `bitty init` (delete needs --force). Quote values\n\
+     that contain spaces;\n\
      font.fallback takes a comma-separated list. `set` on a profile that only\n\
      inherits `font`, `window`, `terminal`, `layout`, `decoration`, `scrollbar`,\n\
      or `appearance` pins every inherited leaf of that table into the profile\n\
@@ -294,8 +309,8 @@ impl Reply {
 /// Write options shared by the mutating profile verbs (CTX-1693).
 #[derive(Debug, Default)]
 struct ProfileOptions {
-    /// `--force`: allow replacing an existing profile (`create`) or removing
-    /// the active profile (`delete`).
+    /// `--force`: allow replacing an existing destination (`create`, `clone`,
+    /// `rename`) or removing the active/`default` profile (`delete`).
     force: bool,
     /// `--dry-run`: validate and report without any filesystem mutation.
     dry_run: bool,
@@ -331,10 +346,18 @@ impl ProfileOptions {
 
     /// Rejects a flag on a verb that cannot honour it.
     fn validate_for(&self, verb: ProfileVerb, raw_verb: &str) -> Result<(), Failure> {
-        if self.force && !matches!(verb, ProfileVerb::Create | ProfileVerb::Delete) {
+        if self.force
+            && !matches!(
+                verb,
+                ProfileVerb::Create
+                    | ProfileVerb::Clone
+                    | ProfileVerb::Rename
+                    | ProfileVerb::Delete
+            )
+        {
             return Err(Failure::usage(format!(
-                "bitty config profile {raw_verb}: --force is not supported (only create and delete \
-                 overwrite or remove state)"
+                "bitty config profile {raw_verb}: --force is not supported (only create, clone, \
+                 rename, and delete overwrite or remove state)"
             )));
         }
         if (self.from.is_some() || self.preset.is_some()) && verb != ProfileVerb::Create {
@@ -1146,7 +1169,11 @@ fn preset_profile_lua(preset: crate::init::InitProfilePreset) -> String {
     }
 }
 
-/// `bitty config profile clone SRC DST`.
+/// `bitty config profile clone SRC DST [--force]`.
+///
+/// The clone copies the source bytes verbatim. Its `extends` therefore names
+/// the source's own parent (never the source), so the clone inherits the same
+/// base chain as `SRC` but stays independent of later `SRC` edits.
 fn run_clone(
     args: &Args,
     options: &ProfileOptions,
@@ -1157,10 +1184,18 @@ fn run_clone(
     let src = valid_name("clone", raw_src)?;
     let dst = valid_new_name("clone", raw_dst)?;
     reject_reserved("clone", &dst)?;
+    if src == dst {
+        return Err(Failure::conflict(format!(
+            "bitty config profile clone: source and destination are the same profile ('{src}')"
+        )));
+    }
     let src_path = profile_path(dir, &src);
     let dst_path = profile_path(dir, &dst);
     ensure_present("clone", &src, &src_path)?;
-    ensure_absent("clone", &dst, &dst_path)?;
+    let dst_exists = profile_entry_exists("clone", &dst_path)?;
+    if dst_exists && !options.force {
+        return Err(exists_failure("clone", &dst, &dst_path));
+    }
     // Read the source exactly once and parse/validate those same bytes. A
     // second read (the old chain-load-then-copy shape) could observe a file
     // changed by an editor, a hardlink writer, or a symlink swap between the
@@ -1180,30 +1215,52 @@ fn run_clone(
             &dst,
             &dst_path,
             &format!(
-                ",\"source\":{},\"changed\":false,\"dry_run\":true",
-                json_string(&src)
+                ",\"source\":{},\"changed\":false,\"dry_run\":true,\"force\":{},\"backup\":null",
+                json_string(&src),
+                options.force
             ),
         );
         return Ok(Reply::new(text, result));
     }
-    create_exclusive(&dst_path, &content).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            exists_failure("clone", &dst, &dst_path)
-        } else {
-            io_failure("clone", &format!("create '{}'", dst_path.display()), &err)
-        }
-    })?;
+    let backup = if dst_exists {
+        let backup = backup_profile_file("clone", &dst_path)?;
+        write_profile_atomic(&dst_path, &content, None).map_err(|err| match err {
+            ProfileWriteError::Changed => changed_failure(ReadIntent::Copy, &dst_path),
+            ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Copy, &dst_path),
+            ProfileWriteError::Io(err) => {
+                io_failure("clone", &format!("replace '{}'", dst_path.display()), &err)
+            }
+        })?;
+        Some(backup)
+    } else {
+        create_exclusive(&dst_path, &content).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                exists_failure("clone", &dst, &dst_path)
+            } else {
+                io_failure("clone", &format!("create '{}'", dst_path.display()), &err)
+            }
+        })?;
+        None
+    };
     let text = format!(
-        "bitty config profile clone: cloned '{src}' to '{dst}' ('{}')\n",
-        dst_path.display()
+        "bitty config profile clone: cloned '{src}' to '{dst}' ('{}'){}\n",
+        dst_path.display(),
+        backup.as_deref().map_or_else(String::new, |backup| format!(
+            "; backup '{}'",
+            backup.display()
+        ))
     );
     let result = profile_result(
         "clone",
         &dst,
         &dst_path,
         &format!(
-            ",\"source\":{},\"changed\":true,\"dry_run\":false",
-            json_string(&src)
+            ",\"source\":{},\"changed\":true,\"dry_run\":false,\"force\":{},\"backup\":{}",
+            json_string(&src),
+            options.force,
+            backup
+                .as_deref()
+                .map_or_else(|| String::from("null"), json_path)
         ),
     );
     Ok(Reply::new(text, result))
@@ -1234,7 +1291,10 @@ fn run_rename(
     let old_path = profile_path(dir, &old);
     let new_path = profile_path(dir, &new);
     ensure_present("rename", &old, &old_path)?;
-    ensure_absent("rename", &new, &new_path)?;
+    let new_exists = profile_entry_exists("rename", &new_path)?;
+    if new_exists && !options.force {
+        return Err(exists_failure("rename", &new, &new_path));
+    }
     reject_referenced("rename", &old, dir)?;
     let old_chain = bitty_config::file::load_profile_chain_in_dir(&old, dir)
         .map_err(|err| invalid_profile("rename", &old, &err))?;
@@ -1264,13 +1324,35 @@ fn run_rename(
             }
         );
         let result = format!(
-            "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":false,\"dry_run\":true,\"selector_updated\":false,\"selector_would_update\":{would_update}}}",
+            "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":false,\"dry_run\":true,\"force\":{},\"selector_updated\":false,\"selector_would_update\":{would_update},\"backup\":null,\"destination_backup\":null}}",
             json_string(&new),
             json_path(&new_path),
-            json_string(&old)
+            json_string(&old),
+            options.force
         );
         return Ok(Reply::new(text, result));
     }
+    // A forced rename replaces an existing NEW only after keeping its bytes
+    // in a timestamped sibling; the remove is what lets the no-replace commit
+    // below stay race-safe.
+    let destination_backup = if new_exists {
+        let backup = backup_profile_file("rename", &new_path)?;
+        std::fs::remove_file(&new_path).map_err(|err| {
+            io_failure(
+                "rename",
+                &format!(
+                    "remove existing '{}' (backup kept at '{}')",
+                    new_path.display(),
+                    backup.display()
+                ),
+                &err,
+            )
+        })?;
+        sync_parent_dir(&new_path);
+        Some(backup)
+    } else {
+        None
+    };
     // The pre-check above gives the clear "already exists" error, but it is
     // only a check: a destination created between it and the rename would be
     // silently overwritten by POSIX `rename`. Use the no-replace form where
@@ -1281,6 +1363,11 @@ fn run_rename(
             return Err(exists_failure("rename", &new, &new_path));
         }
         Err(err) => {
+            // Restore the replaced destination when the commit itself fails,
+            // so a forced rename never loses both files.
+            if let Some(backup) = &destination_backup {
+                let _ = std::fs::copy(backup, &new_path);
+            }
             return Err(io_failure(
                 "rename",
                 &format!(
@@ -1306,15 +1393,24 @@ fn run_rename(
         }
     }
     let text = format!(
-        "bitty config profile rename: renamed '{old}' to '{new}' ('{}')\n",
-        new_path.display()
+        "bitty config profile rename: renamed '{old}' to '{new}' ('{}'){}\n",
+        new_path.display(),
+        destination_backup
+            .as_deref()
+            .map_or_else(String::new, |backup| {
+                format!("; replaced destination backed up to '{}'", backup.display())
+            })
     );
     let result = format!(
-        "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":true,\"dry_run\":false,\"selector_updated\":{selector_updated},\"selector_would_update\":{selector_would_update},\"backup\":{}}}",
+        "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":true,\"dry_run\":false,\"force\":{},\"selector_updated\":{selector_updated},\"selector_would_update\":{selector_would_update},\"backup\":{},\"destination_backup\":{}}}",
         json_string(&new),
         json_path(&new_path),
         json_string(&old),
+        options.force,
         backup
+            .as_deref()
+            .map_or_else(|| String::from("null"), json_path),
+        destination_backup
             .as_deref()
             .map_or_else(|| String::from("null"), json_path)
     );
@@ -1351,7 +1447,13 @@ fn run_delete(
     raw_name: &str,
 ) -> Result<Reply, Failure> {
     let name = valid_name("delete", raw_name)?;
-    reject_reserved("delete", &name)?;
+    if name == "default" && !options.force {
+        return Err(Failure::conflict(
+            "bitty config profile delete: profile 'default' is reserved for `bitty init`; \
+             re-run with --force to delete it (a timestamped backup is kept)"
+                .to_string(),
+        ));
+    }
     let path = profile_path(dir, &name);
     ensure_present("delete", &name, &path)?;
     if !options.force {
@@ -1360,34 +1462,43 @@ fn run_delete(
     reject_referenced("delete", &name, dir)?;
     if options.dry_run {
         let text = format!(
-            "bitty config profile delete: would delete '{name}' ('{}')\n",
+            "bitty config profile delete: would back up and delete '{name}' ('{}')\n",
             path.display()
         );
         let result = format!(
-            "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":false,\"changed\":false,\"dry_run\":true,\"force\":{}}}",
+            "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":false,\"changed\":false,\"dry_run\":true,\"force\":{},\"backup\":null}}",
             json_string(&name),
             json_path(&path),
             options.force
         );
         return Ok(Reply::new(text, result));
     }
+    // Copy the bytes first: a failed backup refuses the delete, and the
+    // removed fragment always has a sibling recovery copy.
+    let backup = backup_profile_file("delete", &path)?;
     if let Err(err) = std::fs::remove_file(&path) {
         return Err(io_failure(
             "delete",
-            &format!("remove '{}'", path.display()),
+            &format!(
+                "remove '{}' (backup kept at '{}')",
+                path.display(),
+                backup.display()
+            ),
             &err,
         ));
     }
     sync_parent_dir(&path);
     let text = format!(
-        "bitty config profile delete: deleted '{name}' ('{}')\n",
-        path.display()
+        "bitty config profile delete: deleted '{name}' ('{}'; backup '{}')\n",
+        path.display(),
+        backup.display()
     );
     let result = format!(
-        "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":true,\"changed\":true,\"dry_run\":false,\"force\":{}}}",
+        "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":true,\"changed\":true,\"dry_run\":false,\"force\":{},\"backup\":{}}}",
         json_string(&name),
         json_path(&path),
-        options.force
+        options.force,
+        json_path(&backup)
     );
     Ok(Reply::new(text, result))
 }
@@ -1825,9 +1936,9 @@ fn profile_path(dir: &Path, name: &str) -> PathBuf {
 
 /// Whether the entry exists and is a regular file (never a symlink).
 ///
-/// `create --force` needs the existence answer without the conflict refusal
-/// [`ensure_absent`] returns; a symlink or special file is still refused
-/// before any write.
+/// The write verbs need the existence answer without an unconditional
+/// conflict refusal; a symlink or special file is still refused before any
+/// write.
 fn profile_entry_exists(verb: &str, path: &Path) -> Result<bool, Failure> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(Failure::invalid(format!(
@@ -1848,7 +1959,8 @@ fn profile_entry_exists(verb: &str, path: &Path) -> Result<bool, Failure> {
     }
 }
 
-/// Refuses the `default` profile name for creating/removing/renaming.
+/// Refuses the `default` profile name for create/clone/rename; `delete`
+/// handles the reserved name itself because `--force` may remove it.
 fn reject_reserved(verb: &str, name: &str) -> Result<(), Failure> {
     if name == "default" {
         return Err(Failure::conflict(format!(
@@ -1973,19 +2085,6 @@ fn ensure_present(verb: &str, name: &str, path: &Path) -> Result<(), Failure> {
             "bitty config profile {verb}: profile '{name}' not found ('{}')",
             path.display()
         ))),
-        Err(err) => Err(io_failure(
-            verb,
-            &format!("inspect '{}'", path.display()),
-            &err,
-        )),
-    }
-}
-
-/// Requires the profile file to be absent (any existing entry conflicts).
-fn ensure_absent(verb: &str, name: &str, path: &Path) -> Result<(), Failure> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Err(exists_failure(verb, name, path)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(io_failure(
             verb,
             &format!("inspect '{}'", path.display()),
@@ -3161,6 +3260,102 @@ fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
                 .collect()
         }),
     }
+}
+
+/// Copies one regular profile file to a collision-free
+/// `<name>.lua.bak-<epoch>` sibling, syncs it, and returns its path.
+///
+/// The backup is created exclusively, so an existing backup is never
+/// overwritten; a same-second collision gets a `-<n>` suffix. The source is
+/// inspected without following symlinks and bounded by the loader limit.
+fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
+    // Open without following the final component where the platform supports
+    // it, so a symlink swapped in after the caller's check cannot redirect
+    // the backup at another file.
+    let mut source = match open_profile_no_follow(path) {
+        Ok(file) => file,
+        Err(err) if is_symlink_refusal(&err) => {
+            return Err(Failure::invalid(format!(
+                "bitty config profile {verb}: refusing to follow symlink '{}'",
+                path.display()
+            )));
+        }
+        Err(err) => {
+            return Err(io_failure(
+                verb,
+                &format!("open '{}'", path.display()),
+                &err,
+            ));
+        }
+    };
+    let metadata = source
+        .metadata()
+        .map_err(|err| io_failure(verb, &format!("inspect '{}'", path.display()), &err))?;
+    if !is_regular_profile_file(&metadata) {
+        return Err(Failure::invalid(format!(
+            "bitty config profile {verb}: '{}' is not a regular file; refusing to back it up",
+            path.display()
+        )));
+    }
+    if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(Failure::invalid(format!(
+            "bitty config profile {verb}: '{}' exceeds {} bytes; refusing to back it up",
+            path.display(),
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    source
+        .read_to_end(&mut bytes)
+        .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
+    let name = path.file_name().map_or_else(
+        || String::from("profile.lua"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    for attempt in 0..PROFILE_MAX_BACKUP_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            path.with_file_name(format!("{name}.bak-{stamp}"))
+        } else {
+            path.with_file_name(format!("{name}.bak-{stamp}-{attempt}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+                if let Err(err) = result {
+                    drop(file);
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(io_failure(
+                        verb,
+                        &format!("write backup '{}'", candidate.display()),
+                        &err,
+                    ));
+                }
+                let _ = std::fs::set_permissions(&candidate, metadata.permissions());
+                sync_parent_dir(&candidate);
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(io_failure(
+                    verb,
+                    &format!("create backup '{}'", candidate.display()),
+                    &err,
+                ));
+            }
+        }
+    }
+    Err(Failure::io(format!(
+        "bitty config profile {verb}: exhausted {PROFILE_MAX_BACKUP_ATTEMPTS} backup names beside '{}'",
+        path.display()
+    )))
 }
 
 /// Creates a brand-new profile file exclusively, writes it, and syncs it.
@@ -6103,8 +6298,8 @@ mod tests {
 
     #[test]
     fn rename_maps_a_raced_destination_to_the_conflict_class() {
-        // The pre-check (`ensure_absent`) passed, then a concurrent creator
-        // landed. The no-replace commit reports `AlreadyExists`, and
+        // The pre-check (`profile_entry_exists`) passed, then a concurrent
+        // creator landed. The no-replace commit reports `AlreadyExists`, and
         // `run_rename` must turn that into the same conflict/exit-2 class as
         // the pre-check, leaving both files byte-identical to the race state.
         let (dir, args) = scratch_profile_root("rename-race");

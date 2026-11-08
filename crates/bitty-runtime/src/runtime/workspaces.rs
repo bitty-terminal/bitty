@@ -906,6 +906,11 @@ impl Runtime {
                 // float remains: clearing would drop keyboard routing even
                 // though a visible, typable panel survives.
                 self.focus = Focus::with_focus(next);
+            } else if let Some(next) = self.pinned.ids().last().copied() {
+                // Issue #3074: when the tiled base is empty and the last
+                // detached float is discarded, fall back to the topmost
+                // surviving pinned panel instead of clearing focus.
+                self.focus = Focus::with_focus(next);
             } else {
                 self.focus.clear();
             }
@@ -994,6 +999,33 @@ impl Runtime {
         self.set_layout_closing(layout, closed);
         let focused = self.set_focus(survivor);
         debug_assert!(focused, "pinned survivor must be focusable");
+        self.primary_view = Some(survivor);
+        self.sync_primary_geometry();
+        Some(survivor)
+    }
+
+    /// Retires the live layout's sole tiled leaf after its shell closed while
+    /// a detached float survives in the active workspace (issue #3074).
+    ///
+    /// Mirrors [`Self::retire_sole_tiled_leaf_for_pinned`] for workspace-local
+    /// detached floats: removes `closed` from the singleton live layout and
+    /// binds focus plus primary-grid ownership to the surviving float (or
+    /// preserves focus on a float/pin that already held focus).
+    pub fn retire_sole_tiled_leaf_for_floated(&mut self, closed: ViewId) -> Option<ViewId> {
+        let leaves = self.layout.leaf_ids();
+        if leaves.len() != 1 || leaves[0] != closed {
+            return None;
+        }
+        let survivor = self
+            .focus
+            .focused()
+            .filter(|&id| id != closed && (self.floats.contains(id) || self.pinned.contains(id)))
+            .or_else(|| self.floats.paint_ids().last().copied())?;
+        let mut layout = self.layout.clone();
+        layout.remove_leaf(closed)?;
+        self.set_layout_closing(layout, closed);
+        let focused = self.set_focus(survivor);
+        debug_assert!(focused, "detached float survivor must be focusable");
         self.primary_view = Some(survivor);
         self.sync_primary_geometry();
         Some(survivor)
@@ -5673,6 +5705,54 @@ mod tests {
             floated.fixed_size(),
             Some(bitty_ui::Size::new(64, 18)),
             "stamp_rule_fixed_size must stamp fixed_size on detached floats in self.floats"
+        );
+    }
+
+    #[test]
+    fn discard_floated_falls_back_to_surviving_pin_on_empty_base_and_retires_sole_leaf_for_float_3074()
+     {
+        let mut rt = fresh();
+        let host = rt.focused_view().expect("focus");
+        let float_view = ViewId::new(2);
+        let pin_view = ViewId::new(3);
+        let leaf1 = rt.layout().find_leaf(host).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(float_view, 40, 12)),
+                LayoutNode::leaf(View::new(pin_view, 40, 12)),
+            ),
+        ));
+        rt.float_detach(float_view).expect("detach float");
+        rt.pin_floating(pin_view).expect("pin");
+        assert_eq!(rt.layout().leaf_ids(), vec![host]);
+
+        // Retiring the sole tiled leaf when a detached float survives removes
+        // `host` and transfers focus + primary ownership to `float_view`.
+        assert_eq!(
+            rt.retire_sole_tiled_leaf_for_floated(host),
+            Some(float_view)
+        );
+        assert!(rt.layout().leaf_ids().is_empty());
+        assert_eq!(rt.focused_view(), Some(float_view));
+        assert_eq!(rt.primary_view(), Some(float_view));
+
+        // Discarding the last detached float on an empty base while `pin_view`
+        // survives hands focus and primary ownership to `pin_view`.
+        assert!(rt.discard_floated(float_view));
+        assert_eq!(
+            rt.focused_view(),
+            Some(pin_view),
+            "discard_floated over an empty base must fall back to the surviving pinned panel"
+        );
+        assert_eq!(
+            rt.primary_view(),
+            Some(pin_view),
+            "primary_view must follow the surviving pinned panel"
         );
     }
 }

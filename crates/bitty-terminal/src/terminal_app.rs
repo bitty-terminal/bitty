@@ -4286,6 +4286,7 @@ impl TerminalApp {
                     if was_float
                         && self.runtime.layout().leaf_count() == 0
                         && self.runtime.floated_views().is_empty()
+                        && self.runtime.pinned_count() == 0
                         && self.runtime.workspace_count() > 1
                     {
                         let workspace = self.runtime.active_workspace_index();
@@ -4349,13 +4350,21 @@ impl TerminalApp {
                 if self.runtime.layout().leaf_ids().contains(&view)
                     && self.runtime.leaf_count() <= 1
                 {
-                    // CTX-1337 (#2222): a pinned panel survives outside the
-                    // live layout, so the exited last tiled pane must not
-                    // keep its session-less leaf focused. Retire the leaf
-                    // and hand focus plus primary ownership to the pin,
-                    // exactly like the close_view path.
-                    if self.runtime.pinned_count() > 0
-                        && self.runtime.floated_count() == 0
+                    // CTX-1337 (#2222) & #3074: a detached float or pinned
+                    // panel survives outside the live layout, so the exited
+                    // last tiled pane must not keep its session-less leaf
+                    // focused. Retire the leaf and hand focus plus primary
+                    // ownership to the surviving float/pin, matching close_view.
+                    if self.runtime.floated_count() > 0
+                        && self
+                            .runtime
+                            .retire_sole_tiled_leaf_for_floated(view)
+                            .is_some()
+                    {
+                        crate::logging::info(|| {
+                            format!("bitty: pane shell {view:?} exited — float base leaf retired")
+                        });
+                    } else if self.runtime.pinned_count() > 0
                         && self
                             .runtime
                             .retire_sole_tiled_leaf_for_pinned(view)
@@ -4479,8 +4488,22 @@ impl TerminalApp {
                             )
                         });
                     }
+                } else if self.runtime.floated_count() > 0
+                    && self
+                        .runtime
+                        .retire_sole_tiled_leaf_for_floated(primary_view)
+                        .is_some()
+                {
+                    // Issue #3074: the last tiled primary shell exited while a
+                    // detached float survives. Retire the dead leaf and leave
+                    // the float as focus plus primary owner instead of a
+                    // session-less ghost tile.
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: primary shell {primary_view:?} exited — float base leaf retired"
+                        )
+                    });
                 } else if self.runtime.pinned_count() > 0
-                    && self.runtime.floated_count() == 0
                     && self
                         .runtime
                         .retire_sole_tiled_leaf_for_pinned(primary_view)

@@ -1327,6 +1327,11 @@ impl Runtime {
         for pin in &snap.pinned {
             self.pinned.restore(pin.view.clone(), pin.anchor, pin.after);
         }
+        // Issue #3074: a restore installs a whole new world, so any pre-restore
+        // parked scratchpad leaf and its primary-ownership handoff must be
+        // cleared (the high-water raise above already accounted for its id).
+        self.scratchpad = ScratchpadSlot::new();
+        self.scratchpad_primary_owner = None;
         // CTX-0536 (#923): a restored snapshot installs ids directly; raise
         // the monotonic high-water so a later allocation never reuses one.
         self.raise_view_id_high_water();
@@ -1626,13 +1631,18 @@ impl Runtime {
             panes: snap
                 .workspaces
                 .iter()
-                .map(|ws| ws.panes.len())
+                .map(|ws| ws.panes.len() + ws.floats.len())
                 .sum::<usize>()
                 + snap.pinned.len(),
             scrollback_lines: snap
                 .workspaces
                 .iter()
-                .flat_map(|ws| ws.panes.iter().map(|pane| pane.scrollback.len()))
+                .flat_map(|ws| {
+                    ws.panes
+                        .iter()
+                        .map(|pane| pane.scrollback.len())
+                        .chain(ws.floats.iter().map(|float| float.scrollback.len()))
+                })
                 .sum::<usize>()
                 + snap
                     .pinned
@@ -2524,5 +2534,48 @@ mod tests {
             validate_snapshot(&future),
             Err(SessionError::UnsupportedVersion(_))
         ));
+    }
+
+    #[test]
+    fn apply_session_snapshot_clears_scratchpad_and_save_summary_counts_floats_3074() {
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let first = rt.focused_view().expect("seed focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.scratchpad_hide(first)
+            .expect("park primary in scratchpad");
+        assert!(rt.scratchpad_occupied());
+
+        let snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        rt.apply_session_snapshot(&snap)
+            .expect("apply snapshot must succeed");
+        assert!(
+            !rt.scratchpad_occupied(),
+            "apply_session_snapshot must clear any pre-restore parked scratchpad leaf"
+        );
+        assert!(
+            rt.scratchpad_show().is_err(),
+            "scratchpad_show after restore must not inject a pre-restore ghost leaf"
+        );
+
+        // Detach leaf 2 into `floats` and verify `save_session_to_path` counts
+        // `ws.floats` in `SessionSaveSummary.panes` and `scrollback_lines`.
+        let backend = Arc::new(RecordingBackend::at("stub-session"));
+        rt.set_session_backend(Some(backend));
+        rt.float_detach(ViewId::new(2))
+            .expect("detach second pane into floats");
+        let summary = rt
+            .save_session_to_path(Path::new("stub-session"))
+            .expect("save with recording backend");
+        assert_eq!(
+            summary.panes, 2,
+            "SessionSaveSummary.panes must include detached floats alongside tiled and pinned panes"
+        );
     }
 }

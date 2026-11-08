@@ -1814,6 +1814,7 @@ impl TerminalApp {
                     // workspace instead of a blank surface.
                     let prune_after_discard = self.runtime.floated_views() == vec![focused]
                         && self.runtime.layout().leaf_count() == 0
+                        && self.runtime.pinned_count() == 0
                         && self.runtime.workspace_count() > 1;
                     if self.runtime.discard_floating_view(focused) {
                         eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");

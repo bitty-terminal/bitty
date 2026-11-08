@@ -924,24 +924,24 @@ fn load_plugin_settings_with_plugins_and_diagnostics_and_limits(
                     (Some(bytes), Some(canonical))
                 }
                 Err(ConfigReadError::NotFound) => match &paths.alias_lua {
-                    Some(alias_path) => match read_bounded_regular_file(alias_path) {
-                        Ok(bytes) => (
-                            Some(bytes),
-                            Some(SelectedPluginFile {
-                                path: alias_path.clone(),
-                                kind: PluginConfigKind::AliasLua,
-                            }),
-                        ),
-                        Err(ConfigReadError::NotFound) => (None, None),
-                        Err(ConfigReadError::Rejected(error)) => {
-                            return loaded_settings(
-                                merge_lua_settings(declared, None, base),
-                                Some(error),
-                                None,
-                                path_diagnostics,
-                            );
+                    Some(alias_path) => {
+                        let alias = SelectedPluginFile {
+                            path: alias_path.clone(),
+                            kind: PluginConfigKind::AliasLua,
+                        };
+                        match read_bounded_regular_file(alias_path) {
+                            Ok(bytes) => (Some(bytes), Some(alias)),
+                            Err(ConfigReadError::NotFound) => (None, None),
+                            Err(ConfigReadError::Rejected(error)) => {
+                                return loaded_settings(
+                                    merge_lua_settings(declared, None, base),
+                                    Some(error),
+                                    Some(alias),
+                                    path_diagnostics,
+                                );
+                            }
                         }
-                    },
+                    }
                     None => (None, None),
                 },
                 Err(ConfigReadError::Rejected(error)) => {
@@ -1014,7 +1014,7 @@ fn load_plugin_settings_with_plugins_and_diagnostics_and_limits(
         }
         Err(ConfigReadError::Rejected(error)) => {
             let resolved = resolve_plugin_settings(declared, None, base);
-            return loaded_settings(resolved, Some(error), None, path_diagnostics);
+            return loaded_settings(resolved, Some(error), Some(legacy), path_diagnostics);
         }
     };
     match plugin_file::parse_plugin_file(&bytes) {
@@ -1661,5 +1661,42 @@ mod tests {
         let loaded =
             load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&invalid));
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
+    }
+
+    #[test]
+    fn rejected_alias_and_legacy_files_report_selected_file_3079() {
+        let root = TestRoot::new("rejected-selected-3079");
+        let dir = root.path();
+        let plugins = root.plugins();
+        std::fs::create_dir_all(&plugins).expect("temp dir");
+        let ids = vec!["xuepoo.bar".to_string()];
+        let oversize = vec![b'a'; bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES + 1];
+
+        let alias_path = plugins.join("bar.lua");
+        std::fs::write(&alias_path, &oversize).expect("oversize alias");
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
+        assert!(loaded.file_error.is_some());
+        assert_eq!(
+            loaded.selected_file,
+            Some(SelectedPluginFile {
+                path: alias_path.clone(),
+                kind: PluginConfigKind::AliasLua,
+            })
+        );
+        std::fs::remove_file(&alias_path).expect("remove alias");
+
+        let legacy_path = plugins.join("xuepoo.bar.toml");
+        std::fs::write(&legacy_path, &oversize).expect("oversize legacy");
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
+        assert!(loaded.file_error.is_some());
+        assert_eq!(
+            loaded.selected_file,
+            Some(SelectedPluginFile {
+                path: legacy_path,
+                kind: PluginConfigKind::LegacyToml,
+            })
+        );
     }
 }

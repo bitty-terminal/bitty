@@ -812,6 +812,17 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Advances one origin's delete generation without clearing `kitty_pending_places`.
+    ///
+    /// Used by identity-scoped deletes (`kitty_delete_rendered_image`), which
+    /// evict only the deleted `(wire_image, placement_id)` from
+    /// `kitty_pending_places` so unrelated pending `a=p` requests on the same
+    /// origin survive.
+    pub(crate) fn advance_kitty_local_delete_epoch(&mut self, origin: Option<u64>) {
+        let next = self.kitty_local_delete_epoch_for(origin).wrapping_add(1);
+        self.kitty_local_delete_epoch.insert(origin, next);
+    }
+
     /// Advances one origin's delete generation (CTX-1110 fix pass).
     ///
     /// Every rendered-layer delete/clear/retire for the origin calls this,
@@ -820,8 +831,8 @@ impl Runtime {
     /// (stores nothing) by design: precision per wire id would need
     /// unbounded per-id state for no visible gain.
     pub(crate) fn bump_kitty_local_delete_epoch(&mut self, origin: Option<u64>) {
-        let next = self.kitty_local_delete_epoch_for(origin).wrapping_add(1);
-        self.kitty_local_delete_epoch.insert(origin, next);
+        self.advance_kitty_local_delete_epoch(origin);
+        self.drop_pending_kitty_places(origin, None, None);
     }
 
     /// Enqueues one display read without doing I/O (CTX-1110).
@@ -1158,9 +1169,23 @@ impl Runtime {
                     });
                 }
             }
-            KittyLocalOp::Display { .. }
-            | KittyLocalOp::Virtual { .. }
-            | KittyLocalOp::Frame { .. } => {
+            KittyLocalOp::Display { wire_image, .. } | KittyLocalOp::Virtual { wire_image, .. } => {
+                if *wire_image != 0 {
+                    self.drop_pending_kitty_places(origin, Some(*wire_image), None);
+                }
+                if let Some(suppressed) = self.kitty_log.admit_now() {
+                    let what = if from_spawn {
+                        "spawn refused"
+                    } else {
+                        "queue full"
+                    };
+                    eprintln!(
+                        "bitty: rejecting kitty local image ({what}): stored nothing{}",
+                        super::log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+            KittyLocalOp::Frame { .. } => {
                 if let Some(suppressed) = self.kitty_log.admit_now() {
                     let what = if from_spawn {
                         "spawn refused"
@@ -1284,9 +1309,18 @@ impl Runtime {
                     });
                 }
             }
-            KittyLocalOp::Display { .. }
-            | KittyLocalOp::Virtual { .. }
-            | KittyLocalOp::Frame { .. } => {
+            KittyLocalOp::Display { wire_image, .. } | KittyLocalOp::Virtual { wire_image, .. } => {
+                if *wire_image != 0 {
+                    self.drop_pending_kitty_places(origin, Some(*wire_image), None);
+                }
+                if let Some(suppressed) = self.kitty_log.admit_now() {
+                    eprintln!(
+                        "bitty: rejecting kitty local image (read timed out): stored nothing{}",
+                        super::log_throttle::suppressed_suffix(suppressed)
+                    );
+                }
+            }
+            KittyLocalOp::Frame { .. } => {
                 if let Some(suppressed) = self.kitty_log.admit_now() {
                     eprintln!(
                         "bitty: rejecting kitty local image (read timed out): stored nothing{}",
@@ -1406,6 +1440,9 @@ impl Runtime {
                                 super::log_throttle::suppressed_suffix(suppressed)
                             );
                         }
+                        if *wire_image != 0 {
+                            self.drop_pending_kitty_places(origin, Some(*wire_image), None);
+                        }
                         if action_a
                             .is_none_or(|a| bitty_rich::KittyAction::from_a(Some(a)).displays())
                         {
@@ -1419,6 +1456,9 @@ impl Runtime {
                             "bitty: rejecting kitty local image ({err}): stored nothing{}",
                             super::log_throttle::suppressed_suffix(suppressed)
                         );
+                    }
+                    if *wire_image != 0 {
+                        self.drop_pending_kitty_places(origin, Some(*wire_image), None);
                     }
                     if action_a.is_none_or(|a| bitty_rich::KittyAction::from_a(Some(a)).displays())
                     {
@@ -2453,5 +2493,141 @@ mod tests {
         assert_eq!(rt.kitty_image_count(), 1, "post-delete transmit lands");
         assert_eq!(rt.kitty_placement_count(), 1);
         let _ = std::fs::remove_dir_all(file.parent().expect("temp parent"));
+    }
+
+    #[test]
+    fn failed_or_deleted_local_transmit_evicts_pending_kitty_place_3079() {
+        let mut rt = async_runtime();
+        let keys = bitty_vt::KittyControlKeys {
+            image_id: 77,
+            placement_id: 3,
+            ..Default::default()
+        };
+
+        // 1. Delete evicts a stashed pending `a=p` for the deleted image while
+        //    preserving pending `a=p` requests for other images on the same origin.
+        let other_keys = bitty_vt::KittyControlKeys {
+            image_id: 79,
+            placement_id: 1,
+            ..Default::default()
+        };
+        rt.stash_pending_kitty_place(crate::runtime::kitty_images::PendingKittyPlace {
+            origin: None,
+            anchor_col: 0,
+            anchor_row: 0,
+            scrollback_base: 0,
+            cols: 0,
+            rows: 0,
+            keys,
+        });
+        rt.stash_pending_kitty_place(crate::runtime::kitty_images::PendingKittyPlace {
+            origin: None,
+            anchor_col: 2,
+            anchor_row: 0,
+            scrollback_base: 0,
+            cols: 0,
+            rows: 0,
+            keys: other_keys,
+        });
+        assert_eq!(rt.kitty_delete_rendered_image(77, None), 0);
+        rt.kitty_display_image_with_wire(
+            32,
+            Some(1),
+            Some(1),
+            Some('t'),
+            0,
+            0,
+            0,
+            &[0xFF, 0x00, 0x00, 0xFF],
+            0,
+            77,
+            0,
+        )
+        .expect("transmit-only must succeed");
+        assert_eq!(
+            rt.kitty_placement_count(),
+            0,
+            "transmit-only after delete must not replay stale pending a=p"
+        );
+        rt.kitty_display_image_with_wire(
+            32,
+            Some(1),
+            Some(1),
+            Some('t'),
+            0,
+            0,
+            0,
+            &[0xFF, 0xFF, 0x00, 0xFF],
+            0,
+            79,
+            0,
+        )
+        .expect("unrelated image transmit-only must succeed");
+        assert_eq!(
+            rt.kitty_placement_count(),
+            1,
+            "unrelated pending a=p on the same origin must survive identity delete"
+        );
+        assert_eq!(rt.kitty_delete_rendered_image(79, None), 1);
+
+        // 2. Failed local transmit (`a=t`) evicts a stashed pending `a=p` for the same id.
+        let keys2 = bitty_vt::KittyControlKeys {
+            image_id: 78,
+            ..Default::default()
+        };
+        rt.stash_pending_kitty_place(crate::runtime::kitty_images::PendingKittyPlace {
+            origin: None,
+            anchor_col: 0,
+            anchor_row: 0,
+            scrollback_base: 0,
+            cols: 0,
+            rows: 0,
+            keys: keys2,
+        });
+        let req = KittyLocalRequest {
+            origin: None,
+            delete_epoch: rt.kitty_local_delete_epoch_for(None),
+            anchor_col: 0,
+            anchor_row: 0,
+            scrollback_base: 0,
+            op: KittyLocalOp::Display {
+                format_f: 100,
+                width_s: None,
+                height_v: None,
+                action_a: Some('t'),
+                cols_c: 0,
+                rows_r: 0,
+                cursor_movement_c: 0,
+                wire_image: 78,
+                wire_placement: 0,
+            },
+            name: b"/nonexistent".to_vec().into_boxed_slice(),
+            medium: bitty_vt::KittyMedium::File,
+            data_size: 0,
+            data_offset: 0,
+            format_f: 100,
+            width_s: None,
+            height_v: None,
+        };
+        rt.complete_kitty_local_request(&req, Err(KittyLocalReadError::Io("open")));
+        rt.kitty_display_image_with_wire(
+            32,
+            Some(1),
+            Some(1),
+            Some('t'),
+            0,
+            0,
+            0,
+            &[0x00, 0xFF, 0x00, 0xFF],
+            0,
+            78,
+            0,
+        )
+        .expect("subsequent transmit-only must succeed");
+        assert_eq!(
+            rt.kitty_placement_count(),
+            0,
+            "transmit-only after failed local read must not replay stale pending a=p"
+        );
     }
 }

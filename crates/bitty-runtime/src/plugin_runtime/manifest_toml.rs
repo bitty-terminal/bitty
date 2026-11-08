@@ -616,6 +616,7 @@ fn parse_key(raw: &str) -> Result<String, String> {
 fn strip_comment(line: &str) -> &str {
     let bytes = line.as_bytes();
     let mut in_string = false;
+    let mut in_single_quote = false;
     let mut escaped = false;
     for (index, byte) in bytes.iter().enumerate() {
         if in_string {
@@ -628,8 +629,16 @@ fn strip_comment(line: &str) -> &str {
             }
             continue;
         }
+        if in_single_quote {
+            if *byte == b'\'' {
+                in_single_quote = false;
+            }
+            continue;
+        }
         if *byte == b'"' {
             in_string = true;
+        } else if *byte == b'\'' {
+            in_single_quote = true;
         } else if *byte == b'#' {
             return &line[..index];
         }
@@ -1241,18 +1250,26 @@ fn parse_array(value: &str) -> Result<Vec<String>, String> {
     let mut current = String::new();
     let mut in_string = false;
     let mut escaped = false;
+    let mut need_comma = false;
     for ch in inner.chars() {
         if in_string {
             if escaped {
-                current.push(ch);
+                match ch {
+                    '"' => current.push('"'),
+                    '\\' => current.push('\\'),
+                    'n' => current.push('\n'),
+                    't' => current.push('\t'),
+                    'r' => current.push('\r'),
+                    other => return Err(format!("unsupported escape '\\{other}'")),
+                }
                 escaped = false;
             } else if ch == '\\' {
-                current.push(ch);
                 escaped = true;
             } else if ch == '"' {
                 in_string = false;
                 items.push(current.clone());
                 current.clear();
+                need_comma = true;
             } else {
                 current.push(ch);
             }
@@ -1260,10 +1277,19 @@ fn parse_array(value: &str) -> Result<Vec<String>, String> {
         }
         match ch {
             '"' => {
+                if need_comma {
+                    return Err("missing ',' between string array items".to_string());
+                }
                 in_string = true;
                 current.clear();
             }
-            ',' | ' ' | '\n' | '\t' | '\r' => {}
+            ',' => {
+                if !need_comma {
+                    return Err("unexpected ',' in string array".to_string());
+                }
+                need_comma = false;
+            }
+            ' ' | '\n' | '\t' | '\r' => {}
             other => return Err(format!("unexpected character '{other}' in string array")),
         }
     }
@@ -2156,5 +2182,43 @@ mod tests {
                 "fragment must fail closed: {fragment:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_array_unescapes_strings_and_enforces_comma_grammar_3079() {
+        let body = format!(
+            "{}\n[hints]\nnext_steps = [\"Run \\\"bitty\\\" in C:\\\\bin.\", \"Line1\\tcol2\",]\n",
+            minimal_body("xuepoo.escapes")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("escaped array must parse");
+        assert_eq!(
+            manifest.next_steps,
+            vec![
+                "Run \"bitty\" in C:\\bin.".to_string(),
+                "Line1\tcol2".to_string()
+            ]
+        );
+
+        for malformed in [
+            "[hints]\nnext_steps = [\"bad\\xescape\"]\n",
+            "[hints]\nnext_steps = [\"missing\" \"comma\"]\n",
+            "[hints]\nnext_steps = [,\"leading\"]\n",
+            "[hints]\nnext_steps = [\"double\",, \"comma\"]\n",
+            "[hints]\nnext_steps = [,]\n",
+        ] {
+            let body = format!("{}\n{malformed}", minimal_body("xuepoo.badarray"));
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "malformed array must fail closed: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_comment_preserves_hash_inside_single_quoted_keys_3079() {
+        assert_eq!(
+            strip_comment("'process.spawn:git#1' = true # trailing comment"),
+            "'process.spawn:git#1' = true "
+        );
     }
 }

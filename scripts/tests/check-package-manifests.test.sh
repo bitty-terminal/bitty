@@ -223,7 +223,7 @@ if [[ -x "$WINGET_GEN" ]]; then
     pass "winget generator rejects non-CDN base URL"
   fi
 
-  if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "$SETUP_SHA" --base-url "https://cdn.bitty.run/releases/v${VERSION}0" >/dev/null 2>&1; then
+  if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "$SETUP_SHA" --base-url "https://cdn.bitty.run/releases/v${VERSION}0" --output-dir "$TMP/rejected-prefix" >/dev/null 2>&1; then
     fail "winget generator accepted version-prefix collision base URL"
   else
     pass "winget generator rejects version-prefix collision base URL"

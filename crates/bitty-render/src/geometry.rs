@@ -149,6 +149,19 @@ impl RectPx {
     /// under-covers — safe for damage semantics.
     #[must_use]
     pub fn union_bounding(a: &RectPx, b: &RectPx) -> RectPx {
+        match (a.is_empty(), b.is_empty()) {
+            (true, true) => {
+                return RectPx {
+                    x: a.x.min(b.x),
+                    y: a.y.min(b.y),
+                    width: 0,
+                    height: 0,
+                };
+            }
+            (true, false) => return *b,
+            (false, true) => return *a,
+            (false, false) => {}
+        }
         let x = i64::from(a.x).min(i64::from(b.x));
         let y = i64::from(a.y).min(i64::from(b.y));
         let right = a.right_exclusive().max(b.right_exclusive());
@@ -261,6 +274,16 @@ mod tests {
         let a = RectPx::new(-5, 0, 10, 10);
         let b = RectPx::new(20, 30, 5, 5);
         assert_eq!(RectPx::union_bounding(&a, &b), RectPx::new(-5, 0, 30, 35));
+
+        // Empty inputs do not stretch the non-empty input's bounds or fabricate positive area.
+        let empty_origin = RectPx::new(0, 0, 0, 0);
+        let empty_far = RectPx::new(50, 60, 0, 10);
+        assert_eq!(RectPx::union_bounding(&empty_origin, &b), b);
+        assert_eq!(RectPx::union_bounding(&b, &empty_origin), b);
+        assert_eq!(RectPx::union_bounding(&empty_far, &a), a);
+        let both_empty = RectPx::union_bounding(&empty_origin, &empty_far);
+        assert!(both_empty.is_empty());
+        assert_eq!(both_empty.area(), 0);
     }
 
     #[test]

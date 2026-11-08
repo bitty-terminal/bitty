@@ -173,12 +173,23 @@ impl SurfaceRgba {
                             / 3;
                         (c as u8, c as u8, c as u8, c as u8)
                     }
-                    BitmapFormat::Rgba => (
-                        bitmap.data[s],
-                        bitmap.data[s + 1],
-                        bitmap.data[s + 2],
-                        bitmap.data[s + 3],
-                    ),
+                    BitmapFormat::Rgba => {
+                        let (r, g, b, a) = (
+                            bitmap.data[s],
+                            bitmap.data[s + 1],
+                            bitmap.data[s + 2],
+                            bitmap.data[s + 3],
+                        );
+                        match bitmap.alpha {
+                            crate::glyph::AlphaMode::Premultiplied => (r, g, b, a),
+                            crate::glyph::AlphaMode::Straight => (
+                                premultiply_byte(r, a),
+                                premultiply_byte(g, a),
+                                premultiply_byte(b, a),
+                                a,
+                            ),
+                        }
+                    }
                 };
 
                 // Premultiplied over: out = src + dst * (1 - src_a), all
@@ -626,7 +637,7 @@ pub fn draw_list_onto_color(
                         u32::from(slot.width),
                         1,
                         glyph.dest[0],
-                        glyph.dest[1] + i32::try_from(row).unwrap_or(0),
+                        glyph.dest[1].saturating_add(i32::try_from(row).unwrap_or(0)),
                     );
                 }
             }
@@ -903,6 +914,17 @@ mod tests {
         // out.b = 0 + 255*(127/255) = 127
         // out.a = 128 + 255*(127/255) = 255
         assert_eq!(&surface.as_bytes()[..4], &[128, 0, 127, 255]);
+
+        // Straight-alpha RGBA bitmap (e.g. CBDT/sbix PNG strike) premultiplies
+        // RGB by alpha before blending instead of saturating to [255, 0, 127, 255].
+        let mut straight_surface = SurfaceRgba::try_new(1, 1).unwrap();
+        straight_surface.clear([0, 0, 255, 255]);
+        let straight_half_red =
+            rgba_pixel(255, 0, 0, 128).with_alpha(crate::glyph::AlphaMode::Straight);
+        straight_surface
+            .blend_glyph(&straight_half_red, 0, 0)
+            .unwrap();
+        assert_eq!(&straight_surface.as_bytes()[..4], &[128, 0, 127, 255]);
     }
 
     #[test]
@@ -1297,7 +1319,7 @@ mod tests {
             let mut surface = SurfaceRgba::try_new(4, 4).unwrap();
             surface.clear([0, 0, 0, 255]);
             draw_list_onto(&list_with(layer), None, &mut surface).unwrap();
-            let o = (1 * 4 + 1) * 4;
+            let o = (4 + 1) * 4;
             [
                 surface.as_bytes()[o],
                 surface.as_bytes()[o + 1],

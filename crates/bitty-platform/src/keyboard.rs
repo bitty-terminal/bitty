@@ -890,6 +890,12 @@ fn kitty_key_frame(
 ) -> Option<Vec<u8>> {
     // Worst case per codepoint field is 1 separator + 10 decimal digits.
     const EMBED_CODEPOINT_MAX: usize = 11;
+    let embed = embed.filter(|text| {
+        text.chars().any(|ch| {
+            let value = ch as u32;
+            value >= 0x20 && !(0x7f..=0x9f).contains(&value)
+        })
+    });
     let mut out = String::with_capacity(MAX_KITTY_FRAME_BYTES);
     out.push_str("\x1b[");
     let second = modifiers != 0 || event_type.is_some();
@@ -904,7 +910,7 @@ fn kitty_key_frame(
     if second || third {
         out.push(';');
         if second {
-            out.push_str(&(modifiers + 1).to_string());
+            out.push_str(&modifiers.saturating_add(1).to_string());
             if let Some(event_type) = event_type {
                 out.push(':');
                 out.push_str(&event_type.to_string());
@@ -1138,7 +1144,7 @@ fn xterm_modified_functional_key(named: NamedKey) -> Option<(&'static str, u8)> 
 /// Builds one `CSI 27 ; {1+mask} ; {codepoint} ~` frame, bounded and
 /// drop-not-truncate.
 fn modify_other_keys_frame(modifiers: u32, codepoint: u32) -> Option<Vec<u8>> {
-    let frame = format!("\x1b[27;{};{}~", modifiers + 1, codepoint).into_bytes();
+    let frame = format!("\x1b[27;{};{}~", modifiers.saturating_add(1), codepoint).into_bytes();
     if frame.len() <= MAX_MODIFY_OTHER_KEYS_FRAME_BYTES {
         Some(frame)
     } else {
@@ -1149,7 +1155,7 @@ fn modify_other_keys_frame(modifiers: u32, codepoint: u32) -> Option<Vec<u8>> {
 /// Builds one `CSI {params} ; {1+mask} {final}` frame for a key that keeps
 /// its own xterm form, bounded and drop-not-truncate.
 fn modify_functional_key_frame(params: &str, final_byte: u8, modifiers: u32) -> Option<Vec<u8>> {
-    let mut frame = format!("\x1b[{params};{}", modifiers + 1).into_bytes();
+    let mut frame = format!("\x1b[{params};{}", modifiers.saturating_add(1)).into_bytes();
     frame.push(final_byte);
     if frame.len() <= MAX_MODIFY_OTHER_KEYS_FRAME_BYTES {
         Some(frame)
@@ -2152,6 +2158,24 @@ mod tests {
         .expect("frame must be emitted");
         assert!(frame.len() <= MAX_KITTY_FRAME_BYTES);
         assert_eq!(*frame.last().unwrap(), b'u');
+    }
+
+    #[test]
+    fn kitty_control_only_embed_omits_dangling_separator_and_saturates_modifiers() {
+        // When `embed` contains only C0/C1 control characters and no second
+        // parameter is present, `kitty_key_frame` must not emit a dangling `;`.
+        assert_eq!(
+            kitty_key_frame(97, None, 0, None, Some("\x07\x1b\u{0085}"), b'u'),
+            Some(b"\x1b[97u".to_vec())
+        );
+        assert_eq!(
+            kitty_key_frame(97, None, 0, None, Some(""), b'u'),
+            Some(b"\x1b[97u".to_vec())
+        );
+        // `u32::MAX` modifiers saturate instead of overflowing `modifiers + 1`.
+        assert!(kitty_key_frame(97, None, u32::MAX, None, None, b'u').is_some());
+        assert!(modify_other_keys_frame(u32::MAX, 97).is_some());
+        assert!(modify_functional_key_frame("1", b'A', u32::MAX).is_some());
     }
 
     #[test]

@@ -15111,6 +15111,8 @@ mod prompt_reveal_tests {
         rt.handle_pty_bytes(AWS_PROMPT.as_bytes());
     }
 
+    /// Unix-only, with the split/second-workspace reveal tests that call it.
+    #[cfg(unix)]
     fn feed_pane(rt: &mut Runtime, view: ViewId, rows: &[String]) {
         for row in rows {
             rt.handle_pane_bytes(view, row.as_bytes());
@@ -15118,6 +15120,8 @@ mod prompt_reveal_tests {
         rt.handle_pane_bytes(view, AWS_PROMPT.as_bytes());
     }
 
+    /// Unix-only: the pane is a real `/bin/cat` PTY, which Windows lacks.
+    #[cfg(unix)]
     fn split_rt(pane: ViewId) -> Runtime {
         let mut rt = runtime();
         rt.set_layout(LayoutNode::split(
@@ -15136,6 +15140,8 @@ mod prompt_reveal_tests {
         rt
     }
 
+    /// Unix-only: the pane is a real `/bin/cat` PTY, which Windows lacks.
+    #[cfg(unix)]
     fn second_workspace_rt(pane: &mut ViewId) -> Runtime {
         let mut rt = runtime();
         rt.workspace_new().expect("ws2");
@@ -15252,6 +15258,7 @@ mod prompt_reveal_tests {
         assert_switch_wrote_nothing(&actual, input_before, grid_before, extent_before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reveal_keeps_the_unterminated_prompt_split_pane() {
         bitty_test_support::require_pty!();
@@ -15298,6 +15305,7 @@ mod prompt_reveal_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reveal_keeps_the_unterminated_prompt_second_workspace() {
         bitty_test_support::require_pty!();
@@ -15388,6 +15396,7 @@ mod prompt_reveal_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reveal_shows_the_split_pane_prompt_that_arrived_while_hidden() {
         bitty_test_support::require_pty!();
@@ -15431,6 +15440,7 @@ mod prompt_reveal_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reveal_shows_the_second_workspace_prompt_that_arrived_while_hidden() {
         bitty_test_support::require_pty!();

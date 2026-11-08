@@ -842,6 +842,11 @@ fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
 ///
 /// Quote- and depth-aware: keys inside string values or nested `{}`/`[]`
 /// containers are ignored.
+///
+/// Duplicate top-level `key` entries are refused (`None`): the two scanners in
+/// this workspace (here and `plugin_ipc::top_value_span`) both fail closed
+/// rather than pick a winner, because a first-wins reader facing a last-wins
+/// parser is exactly the ambiguity a hostile payload needs.
 fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let trimmed = text.trim();
     let body = trimmed
@@ -852,6 +857,7 @@ fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let mut i = 0usize;
     let mut depth = 0usize;
     let mut expect_key = true;
+    let mut found: Option<&'a str> = None;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => {
@@ -860,7 +866,10 @@ fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
                     let after = body[next..].trim_start();
                     if let Some(rest) = after.strip_prefix(':') {
                         if unescape_literal(&literal).as_deref() == Some(key) {
-                            return Some(rest.trim_start());
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some(rest.trim_start());
                         }
                         expect_key = false;
                         i = body.len() - rest.len();
@@ -891,19 +900,29 @@ fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
             }
         }
     }
-    None
+    found
+}
+
+/// Whether `rest` begins at a top-level JSON value delimiter (end, whitespace,
+/// `,`, or `}`), so an identifier or float prefix cannot be read as the value.
+fn at_json_delimiter(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}')
 }
 
 /// Extract a top-level `"key": <number>` as `u64` (for `active`, bounds).
+///
+/// Non-digit suffixes are refused, so `1.5`, `1e2`, and `1abc` are absent
+/// rather than silently truncated to their integer prefix.
 fn extract_number(text: &str, key: &str) -> Option<u64> {
     let rest = find_top_level_key_value(text, key)?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
+    if rest.starts_with('"') || rest.starts_with('{') || rest.starts_with('[') {
         return None;
     }
-    rest[..end].parse::<u64>().ok()
+    let digits_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 || digits_len > 20 || !at_json_delimiter(&rest[digits_len..]) {
+        return None;
+    }
+    rest[..digits_len].parse::<u64>().ok()
 }
 
 /// Extract a top-level `"key": true|false` as `bool`.
@@ -1204,5 +1223,50 @@ mod tests {
         let reload_json = r#"{"message":"\"reloaded\":true,\"plan_version\":99","reloaded":false,"plan_version":3}"#;
         assert_eq!(super::extract_bool(reload_json, "reloaded"), Some(false));
         assert_eq!(super::extract_number(reload_json, "plan_version"), Some(3));
+    }
+
+    #[test]
+    fn json_extractors_ignore_nested_same_name_keys_3075() {
+        // The input a raw `text.find("\"active\":")` reader gets wrong: a
+        // nested object carries the same key names, with different values,
+        // *before* the real top-level entries.
+        let json = r#"{"outer":{"active":99,"workspaces":["ws:99"]},"names":["main","logs"],"workspaces":["ws:1","ws:2"],"active":1,"active_id":"ws:1"}"#;
+        assert_eq!(super::extract_number(json, "active"), Some(1));
+        let table = super::format_workspaces_table(json).expect("workspace table");
+        assert!(table.contains("\nws:1 main yes"), "{table}");
+        assert!(table.contains("\nws:2 logs no"), "{table}");
+        assert!(
+            !table.contains("ws:99"),
+            "a nested array must not be read as the top-level one: {table}"
+        );
+
+        // Same shape for the string/bool scanners.
+        let reload_json =
+            r#"{"meta":{"reloaded":true,"plan_version":99},"reloaded":false,"plan_version":3}"#;
+        assert_eq!(super::extract_bool(reload_json, "reloaded"), Some(false));
+        assert_eq!(super::extract_number(reload_json, "plan_version"), Some(3));
+
+        // Duplicate top-level keys are ambiguous across layers, so both
+        // scanners refuse them instead of picking a winner.
+        assert!(
+            super::format_workspaces_table(r#"{"workspaces":["ws:1"],"workspaces":["ws:9"]}"#)
+                .is_none(),
+            "a duplicated top-level array must fail closed"
+        );
+        assert_eq!(
+            super::extract_number(r#"{"active":1,"active":2}"#, "active"),
+            None
+        );
+        assert_eq!(
+            super::extract_bool(r#"{"reloaded":true,"reloaded":false}"#, "reloaded"),
+            None
+        );
+
+        // Numeric-looking prefixes are refused, not truncated to the digits.
+        assert_eq!(super::extract_number(r#"{"active":1.5}"#, "active"), None);
+        assert_eq!(super::extract_number(r#"{"active":1e2}"#, "active"), None);
+        assert_eq!(super::extract_number(r#"{"active":1abc}"#, "active"), None);
+        assert_eq!(super::extract_number(r#"{"active":true}"#, "active"), None);
+        assert_eq!(super::extract_number(r#"{"active":"1"}"#, "active"), None);
     }
 }

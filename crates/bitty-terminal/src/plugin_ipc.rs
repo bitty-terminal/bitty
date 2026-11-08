@@ -237,26 +237,55 @@ fn skip_json_string(raw: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Find the raw value span after a top-level `"key":` in a JSON object
-/// (caller decides shape). Quote- and depth-aware so keys embedded inside
-/// string values or nested containers never match.
-fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
-    let trimmed = params.trim();
-    let body = trimmed.strip_prefix('{')?;
+/// Outcome of a top-level object key lookup.
+///
+/// `Ambiguous` is not the same as `Absent`: callers that treat "absent" as
+/// "no filter" or "use the default" must fail closed on an ambiguous key
+/// rather than silently dropping the caller's restriction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopKey<'a> {
+    /// The key does not appear at the top level.
+    Absent,
+    /// The key appears exactly once; this is the raw value span after `:`
+    /// (caller decides the shape).
+    Value(&'a str),
+    /// The key appears more than once at the top level.
+    Ambiguous,
+}
+
+/// Find the raw value span after a top-level `"key":` in a JSON object.
+/// Quote- and depth-aware so keys embedded inside string values or nested
+/// containers never match.
+///
+/// Duplicate top-level `key` entries are reported as [`TopKey::Ambiguous`]
+/// instead of resolving to the first or last occurrence: the envelope is
+/// parsed upstream with last-wins semantics (`bitty-ipc-devtools` `json.rs`),
+/// so a params scanner that picked the first occurrence would hand two layers
+/// of the same request two different values.
+fn top_key<'a>(params: &'a str, key: &str) -> TopKey<'a> {
+    let Some(body) = params.trim().strip_prefix('{') else {
+        return TopKey::Absent;
+    };
     let bytes = body.as_bytes();
     let mut i = 0usize;
     let mut depth = 0usize;
     let mut expect_key = true;
+    let mut found: Option<&'a str> = None;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => {
                 if depth == 0 && expect_key {
-                    let (decoded_key, consumed) = decode_json_string(&body[i..])?;
+                    let Some((decoded_key, consumed)) = decode_json_string(&body[i..]) else {
+                        return TopKey::Absent;
+                    };
                     let next = i + consumed;
                     let after = body[next..].trim_start();
                     if let Some(rest) = after.strip_prefix(':') {
                         if decoded_key == key {
-                            return Some(rest.trim_start());
+                            if found.is_some() {
+                                return TopKey::Ambiguous;
+                            }
+                            found = Some(rest.trim_start());
                         }
                         expect_key = false;
                         i = body.len() - rest.len();
@@ -264,7 +293,10 @@ fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
                     }
                     i = next;
                 } else {
-                    i = skip_json_string(body, i)?;
+                    match skip_json_string(body, i) {
+                        Some(next) => i = next,
+                        None => return TopKey::Absent,
+                    }
                 }
             }
             b'{' | b'[' => {
@@ -287,19 +319,26 @@ fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
                 i += 1;
             }
             _ => {
-                let ch = body[i..].chars().next()?;
+                let Some(ch) = body[i..].chars().next() else {
+                    return TopKey::Absent;
+                };
                 i += ch.len_utf8();
             }
         }
     }
-    None
+    match found {
+        Some(value) => TopKey::Value(value),
+        None => TopKey::Absent,
+    }
 }
 
 /// Extract a top-level JSON string field with escape decoding; `None` when
-/// the key is absent or the value is not a JSON string.
+/// the key is absent, ambiguous, or the value is not a JSON string.
 fn top_string(params: &str, key: &str) -> Option<String> {
-    let value = top_value_span(params, key)?;
-    decode_json_string(value).map(|(decoded, _)| decoded)
+    match top_key(params, key) {
+        TopKey::Value(value) => decode_json_string(value).map(|(decoded, _)| decoded),
+        TopKey::Absent | TopKey::Ambiguous => None,
+    }
 }
 
 /// Whether `rest` begins at a top-level JSON value delimiter (end, whitespace,
@@ -309,9 +348,11 @@ fn at_json_delimiter(rest: &str) -> bool {
 }
 
 /// Extract a top-level unsigned integer field; `None` for strings/objects/
-/// arrays/non-digits/floats/exponents.
+/// arrays/non-digits/floats/exponents/ambiguous keys.
 fn top_uint(params: &str, key: &str) -> Option<u64> {
-    let value = top_value_span(params, key)?;
+    let TopKey::Value(value) = top_key(params, key) else {
+        return None;
+    };
     if value.starts_with('"') || value.starts_with('{') || value.starts_with('[') {
         return None;
     }
@@ -324,9 +365,10 @@ fn top_uint(params: &str, key: &str) -> Option<u64> {
 
 /// Whether `params` carries an explicit JSON `null` for `key`.
 fn top_is_null(params: &str, key: &str) -> bool {
-    top_value_span(params, key)
-        .and_then(|value| value.strip_prefix("null"))
-        .is_some_and(at_json_delimiter)
+    let TopKey::Value(value) = top_key(params, key) else {
+        return false;
+    };
+    value.strip_prefix("null").is_some_and(at_json_delimiter)
 }
 
 fn validate_plugin_id(raw: &str) -> Result<(), String> {
@@ -346,6 +388,10 @@ fn validate_generation(value: u64) -> Result<(), String> {
 }
 
 /// Parse the optional `generation` filter for `listPlugins`.
+///
+/// Every non-`null`, non-integer shape fails closed with `InvalidParams` — a
+/// duplicated key included, because treating an ambiguous key as "absent"
+/// would silently widen the listing the caller asked to narrow.
 fn list_generation(params: &str) -> Result<Option<u64>, HandlerError> {
     if !params.trim_start().starts_with('{') {
         return Err(HandlerError::new(
@@ -354,22 +400,30 @@ fn list_generation(params: &str) -> Result<Option<u64>, HandlerError> {
             "listPlugins requires an object params".to_string(),
         ));
     }
-    if top_is_null(params, "generation") {
-        return Ok(None);
-    }
-    if let Some(generation) = top_uint(params, "generation") {
-        validate_generation(generation)
-            .map_err(|reason| HandlerError::new("usage", "InvalidParams", reason))?;
-        return Ok(Some(generation));
-    }
-    if top_value_span(params, "generation").is_some() {
-        return Err(HandlerError::new(
+    let invalid = || {
+        HandlerError::new(
             "usage",
             "InvalidParams",
             "generation must be null or an integer >= 1".to_string(),
-        ));
+        )
+    };
+    match top_key(params, "generation") {
+        TopKey::Absent => Ok(None),
+        TopKey::Ambiguous => Err(invalid()),
+        TopKey::Value(_) => {
+            if top_is_null(params, "generation") {
+                return Ok(None);
+            }
+            match top_uint(params, "generation") {
+                Some(generation) => {
+                    validate_generation(generation)
+                        .map_err(|reason| HandlerError::new("usage", "InvalidParams", reason))?;
+                    Ok(Some(generation))
+                }
+                None => Err(invalid()),
+            }
+        }
     }
-    Ok(None)
 }
 
 /// Map the runtime's stable lowercase lifecycle label to the accepted
@@ -491,6 +545,63 @@ mod tests {
             manifest_hash: "a".repeat(64),
             capabilities: vec!["ui.rich".to_string()],
         }
+    }
+
+    #[test]
+    fn top_level_scanners_ignore_nested_and_duplicate_keys_3075() {
+        // A nested object carrying the same key names *before* the real
+        // top-level entries is the input a raw `params.find` reader gets
+        // wrong; it must not shadow them.
+        let nested = r#"{"outer":{"generation":99,"pluginId":"xuepoo.nested"},"generation":3,"pluginId":"xuepoo.one"}"#;
+        assert_eq!(super::top_uint(nested, "generation"), Some(3));
+        assert_eq!(
+            super::top_string(nested, "pluginId").as_deref(),
+            Some("xuepoo.one")
+        );
+        // A nested array is skipped just the same.
+        assert_eq!(
+            super::top_uint(r#"{"outer":["generation",5],"generation":2}"#, "generation"),
+            Some(2)
+        );
+        // A nested null is not a top-level null.
+        assert!(!super::top_is_null(
+            r#"{"outer":{"generation":null},"generation":1}"#,
+            "generation"
+        ));
+
+        // Duplicate top-level keys are refused rather than resolved
+        // first-wins: the envelope layer is last-wins, so two readers of one
+        // request must not disagree.
+        assert_eq!(
+            super::top_uint(r#"{"generation":1,"generation":2}"#, "generation"),
+            None
+        );
+        assert_eq!(
+            super::top_string(r#"{"pluginId":"a.b","pluginId":"c.d"}"#, "pluginId"),
+            None
+        );
+        assert!(!super::top_is_null(
+            r#"{"generation":null,"generation":null}"#,
+            "generation"
+        ));
+
+        // Null boundary: the literal `null` is a value, an identifier prefix
+        // is not.
+        assert!(super::top_is_null(r#"{"generation":null}"#, "generation"));
+        assert!(super::top_is_null(r#"{"generation": null }"#, "generation"));
+        assert!(!super::top_is_null(
+            r#"{"generation":nullable}"#,
+            "generation"
+        ));
+        assert!(!super::top_is_null(r#"{"generation":nulls}"#, "generation"));
+
+        // Numeric prefixes stay refused.
+        assert_eq!(super::top_uint(r#"{"generation":1.5}"#, "generation"), None);
+        assert_eq!(super::top_uint(r#"{"generation":1e2}"#, "generation"), None);
+        assert_eq!(
+            super::top_uint(r#"{"generation":1abc}"#, "generation"),
+            None
+        );
     }
 
     #[test]
@@ -691,6 +802,63 @@ mod tests {
             handle_get_plugin(&inspect, &shadowed)
                 .expect("served")
                 .contains("\"id\":\"xuepoo.one\"")
+        );
+
+        // bitty#3075: a nested object carrying the same key name must not
+        // shadow the real top-level one at the handler boundary either.
+        let nested_shadow = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"meta":{"pluginId":"xuepoo.absent"},"pluginId":"xuepoo.one"}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_get_plugin(&inspect, &nested_shadow)
+                .expect("served")
+                .contains("\"id\":\"xuepoo.one\"")
+        );
+
+        // `null` generation means "no filter"; an identifier prefix does not.
+        let null_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":null}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_list_plugins(&inspect, &null_generation)
+                .expect("null generation is no filter")
+                .contains("xuepoo.one")
+        );
+        let identifier_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":nullable}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &identifier_generation)
+                .expect_err("identifier generation")
+                .code,
+            "InvalidParams"
+        );
+
+        // Duplicate top-level params keys are ambiguous, so they fail closed
+        // instead of letting this scanner and the last-wins envelope parser
+        // read different values out of one request.
+        let duplicate_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":1,"generation":2}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &duplicate_generation)
+                .expect_err("duplicate generation")
+                .code,
+            "InvalidParams"
+        );
+        let duplicate_plugin_id = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"pluginId":"xuepoo.one","pluginId":"xuepoo.absent"}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_get_plugin(&inspect, &duplicate_plugin_id)
+                .expect_err("duplicate pluginId")
+                .code,
+            "InvalidParams"
         );
         publish(None);
     }

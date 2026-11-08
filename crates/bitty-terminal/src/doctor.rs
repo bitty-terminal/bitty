@@ -1993,27 +1993,60 @@ fn io_exit_code(err: &std::io::Error, fallback: i32) -> i32 {
 /// [`run_bounded`] (no shell, no pipes, kill by PID on timeout). Failures
 /// carry their exit class (`7` permission, `5` compatibility).
 fn install_bundled_terminfo(dir: &Path) -> Result<PathBuf, (i32, String)> {
+    use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err((
+            EXIT_PERM,
+            format!(
+                "refusing to write into symlink terminfo directory {}",
+                dir.display()
+            ),
+        ));
+    }
     std::fs::create_dir_all(dir).map_err(|err| {
         (
             io_exit_code(&err, EXIT_COMPAT),
             format!("cannot create terminfo directory {}: {err}", dir.display()),
         )
     })?;
+    if !std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+    {
+        return Err((
+            EXIT_PERM,
+            format!(
+                "refusing to write into symlink or non-directory terminfo root {}",
+                dir.display()
+            ),
+        ));
+    }
     let staged = dir.join(format!(
         ".bitty-doctor-terminfo-{}-{}.ti",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        std::fs::write(&staged, BUNDLED_TERMINFO_SOURCE).map_err(|err| {
-            (
-                io_exit_code(&err, EXIT_COMPAT),
-                format!("cannot stage terminfo source: {err}"),
-            )
-        })?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .map_err(|err| {
+                (
+                    io_exit_code(&err, EXIT_COMPAT),
+                    format!("cannot stage terminfo source: {err}"),
+                )
+            })?;
+        file.write_all(BUNDLED_TERMINFO_SOURCE.as_bytes())
+            .map_err(|err| {
+                (
+                    io_exit_code(&err, EXIT_COMPAT),
+                    format!("cannot stage terminfo source: {err}"),
+                )
+            })?;
+        drop(file);
         let dir_str = dir.to_str().ok_or_else(|| {
             (
                 EXIT_COMPAT,
@@ -2182,9 +2215,32 @@ pub fn fix_profile_selector(
     // check owns that message. A parse error likewise stays a diagnostic.
     let plan = bitty_config::file::parse_lua_config(&content, &source).ok()?;
     let selected = plan.selector?.profile;
+    if std::fs::symlink_metadata(profiles_dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "replace symlink {} with a regular directory before running `bitty doctor --fix`",
+                profiles_dir.display()
+            ),
+            "profiles directory is a symlink; refusing automatic selector repair".to_string(),
+        ));
+    }
     let selected_path = profiles_dir.join(format!("{selected}.lua"));
-    if selected_path.is_file() {
-        return None;
+    match std::fs::symlink_metadata(&selected_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Some(FixReceipt::hint(
+                "profile-selector",
+                format!(
+                    "replace symlink {} with a regular profile file",
+                    selected_path.display()
+                ),
+                format!(
+                    "selected profile `{selected}` is a symlink; refusing automatic selector repair"
+                ),
+            ));
+        }
+        Ok(meta) if meta.is_file() => return None,
+        _ => {}
     }
     if selected == "default" {
         return Some(FixReceipt::hint(
@@ -2197,15 +2253,29 @@ pub fn fix_profile_selector(
         ));
     }
     let default_path = profiles_dir.join("default.lua");
-    if !default_path.is_file() {
-        return Some(FixReceipt::hint(
-            "profile-selector",
-            format!(
-                "run `bitty init` to create {}, then `bitty config profile use default`",
-                default_path.display()
-            ),
-            format!("selected profile `{selected}` is missing and no default profile exists"),
-        ));
+    match std::fs::symlink_metadata(&default_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Some(FixReceipt::hint(
+                "profile-selector",
+                format!(
+                    "replace symlink {} with a regular profile file before running `bitty doctor --fix`",
+                    default_path.display()
+                ),
+                "profiles/default.lua is a symlink; refusing to select it automatically"
+                    .to_string(),
+            ));
+        }
+        Ok(meta) if meta.is_file() => {}
+        _ => {
+            return Some(FixReceipt::hint(
+                "profile-selector",
+                format!(
+                    "run `bitty init` to create {}, then `bitty config profile use default`",
+                    default_path.display()
+                ),
+                format!("selected profile `{selected}` is missing and no default profile exists"),
+            ));
+        }
     }
     let Some(rewritten) = crate::profile::rewrite_selector_profile(&content, "default") else {
         return Some(FixReceipt::hint(
@@ -2217,6 +2287,21 @@ pub fn fix_profile_selector(
             "no single top-level `profile = \"...\"` assignment to rewrite".to_string(),
         ));
     };
+    if !bitty_config::file::parse_lua_config(&rewritten, &source).is_ok_and(|validated| {
+        validated
+            .selector
+            .as_ref()
+            .is_some_and(|sel| sel.profile == "default")
+    }) {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "edit {} and set `profile = \"default\"` manually",
+                selector.display()
+            ),
+            "rewritten selector did not validate as a `default` profile selector".to_string(),
+        ));
+    }
     let changed = selector.display().to_string();
     let from = format!(
         "profile = \"{selected}\" (missing: {})",
@@ -4749,5 +4834,51 @@ mod tests {
             json.chars().filter(|c| *c == '}').count(),
             "unbalanced: {json}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminfo_and_selector_repairs_refuse_symlinked_targets() {
+        let root = scratch_root("repair-symlinks");
+
+        // 1. Symlinked terminfo directory must be refused with EXIT_PERM.
+        let real_terminfo = root.join("real-terminfo");
+        std::fs::create_dir_all(&real_terminfo).expect("mkdir real-terminfo");
+        let symlink_terminfo = root.join("symlink-terminfo");
+        std::os::unix::fs::symlink(&real_terminfo, &symlink_terminfo).expect("symlink terminfo");
+        let (code, detail) =
+            install_bundled_terminfo(&symlink_terminfo).expect_err("refuse symlink terminfo dir");
+        assert_eq!(code, EXIT_PERM);
+        assert!(detail.contains("symlink"), "{detail}");
+
+        // 2. Symlinked `profiles/default.lua` must stay a hint without rewriting `init.lua`.
+        let config = root.join("config").join("init.lua");
+        let selector_body = "return { format = \"bitty-profile-v1\", profile = \"work\" }\n";
+        write_file(&config, selector_body);
+        let profiles = root.join("config").join("profiles");
+        std::fs::create_dir_all(&profiles).expect("mkdir profiles");
+        let real_default = root.join("real-default.lua");
+        write_file(&real_default, "return { format = \"bitty-profile-v1\" }\n");
+        std::os::unix::fs::symlink(&real_default, profiles.join("default.lua"))
+            .expect("symlink default.lua");
+        let receipt =
+            fix_profile_selector(&config, &profiles, false).expect("symlink default.lua hint");
+        assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
+        assert!(receipt.detail.contains("symlink"), "{receipt:?}");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read config"),
+            selector_body,
+            "selector must not be rewritten when default.lua is a symlink"
+        );
+
+        // 3. Symlinked `profiles/` directory must also stay a hint without rewriting `init.lua`.
+        let symlink_profiles = root.join("config").join("symlink-profiles");
+        std::os::unix::fs::symlink(&profiles, &symlink_profiles).expect("symlink profiles dir");
+        let receipt = fix_profile_selector(&config, &symlink_profiles, false)
+            .expect("symlink profiles dir hint");
+        assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
+        assert!(receipt.detail.contains("symlink"), "{receipt:?}");
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

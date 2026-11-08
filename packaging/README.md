@@ -329,11 +329,16 @@ user.
 
 ## Nix Flake
 
-`flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.98.1`, filtered source bounded, no unsafe. Check:
+`flake.nix` provides `packages.default` (`bitty`) and the companion `bittyd`
+session daemon via `crane` + `rust-overlay` at `1.98.1`, filtered source
+bounded, no unsafe. The flake ships no systemd unit: a store path is not a
+stable `ExecStart` target, so run `bittyd start` from your own supervisor.
+Check:
 
 ```sh
 nix flake check
 nix build .#bitty
+nix build .#bittyd
 ```
 
 ## AUR

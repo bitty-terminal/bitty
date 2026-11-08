@@ -34,6 +34,23 @@ Install Bitty into your user profile:
 nix profile install github:bitty-terminal/bitty
 ```
 
+### Session Daemon (`bittyd`)
+
+The flake exposes the daemon as a separate package (the terminal package does
+not carry it):
+
+```sh
+nix build github:bitty-terminal/bitty#bittyd
+nix profile install github:bitty-terminal/bitty#bittyd
+```
+
+The flake deliberately installs no systemd unit: `ExecStart` would need a
+stable path, and a Nix store path changes with every rebuild. Supervise
+`bittyd start` yourself (for example a home-manager
+`systemd.user.services.bittyd` unit whose `ExecStart` points at
+`${pkgs.bittyd}/bin/bittyd start`). The release job builds and caches both
+`.#bitty` and `.#bittyd`.
+
 ### Binary Cache Acceleration (Cachix)
 
 The `flake.nix` includes `nixConfig` to automatically request the binary cache.
@@ -166,6 +183,8 @@ the flake and uploads precompiled store closures directly to Cachix using
     name: bitty
     authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 - run: nix build .#bitty --print-build-logs
+- run: nix build .#bittyd --print-build-logs --out-link result-bittyd
 ```
 
-This guarantees zero compile time on client machines when fetching supported tags.
+This guarantees zero compile time on client machines when fetching supported
+tags, for both the terminal and the daemon.

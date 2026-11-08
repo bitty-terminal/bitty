@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-smoke.sh — install a freshly built package in a clean container of
-# its distro and run the --version / doctor / headless smoke (034 item 5).
+# its distro and run the binary and daemon smoke (034 item 5, bitty#3002).
 #
 # The host must have docker and network access to the distro repositories; the
 # container is discarded with `--rm`. Runtime libraries are installed
@@ -40,7 +40,8 @@ Options:
   -h, --help       Show this help.
 
 Installs the package in a clean container (ubuntu:24.04, fedora:latest,
-archlinux:latest, or alpine:3.22) and runs `bitty --version`, `bitty doctor`,
+archlinux:latest, or alpine:3.22) and runs `bitty --version`, `bittyd
+--version`, an isolated `bittyd start`/`bittyd stop` cycle, `bitty doctor`,
 and `bitty --headless`; any failing step fails the script.
 EOF
 }
@@ -130,6 +131,42 @@ command -v docker >/dev/null 2>&1 || die "docker not found (needed to run the cl
 
 smoke='bitty --version
 bittyd --version
+# Exercise the packaged daemon on an isolated endpoint, never the default
+# socket. `bittyd start` stays in the foreground, so background it and stop it
+# through the authenticated CLI once it has bound the socket.
+daemon_dir=/tmp/bittyd-smoke
+rm -rf "$daemon_dir"
+mkdir -p "$daemon_dir"
+chmod 700 "$daemon_dir"
+BITTYD_ENDPOINT="$daemon_dir/bittyd.sock"
+export BITTYD_ENDPOINT
+bittyd start &
+daemon_pid=$!
+tries=0
+while [ ! -S "$BITTYD_ENDPOINT" ]; do
+  tries=$((tries + 1))
+  if [ "$tries" -gt 100 ]; then
+    echo "bittyd did not bind $BITTYD_ENDPOINT" >&2
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" || true
+    exit 1
+  fi
+  sleep 0.1
+done
+# The socket is bound before the operator capability is minted, so a stop that
+# lands in that window is retried instead of treated as a package failure.
+tries=0
+while ! bittyd stop; do
+  tries=$((tries + 1))
+  if [ "$tries" -gt 50 ]; then
+    echo "bittyd stop did not succeed" >&2
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" || true
+    exit 1
+  fi
+  sleep 0.1
+done
+wait "$daemon_pid"
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty doctor
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty --headless'
 

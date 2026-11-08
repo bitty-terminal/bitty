@@ -1373,6 +1373,10 @@ jobs:
                   echo "::error::$base bittyd --version does not report $version: $daemon_version" >&2
                   exit 1
                 fi
+                # `bittyd stop` with no daemon is a supported exit 0. The
+                # endpoint override points inside the extracted bundle, so the
+                # smoke never touches a real user socket (bitty#3002).
+                BITTYD_ENDPOINT="$dest/bittyd-smoke.sock" "$daemon" stop
                 ;;
               x86_64-unknown-linux-musl)
                 # The musl bundle is built with `-crt-static` disabled so that
@@ -2036,16 +2040,34 @@ jobs:
           name: bitty
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
-      - name: Build and push Nix package to Cachix
-        run: nix build .#bitty --print-build-logs
-      - name: Verify build artifact
+      - name: Build and push Nix packages to Cachix
+        run: |
+          nix build .#bitty --print-build-logs
+          # The daemon is a separate flake package (bitty#3000); build it in
+          # its own out-link so both derivations land in Cachix and the
+          # verification below has a stable path.
+          nix build .#bittyd --print-build-logs --out-link result-bittyd
+      - name: Verify build artifacts
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           test -x result/bin/bitty
+          test -x result-bittyd/bin/bittyd
           version="${TAG#v}"
           scripts/check-version-output.sh "$version" result/bin/bitty
+          # `bittyd --version` prints the crate and service API versions, so
+          # the one-line terminal checker does not apply; require the release
+          # version in the daemon's first line.
+          daemon_version="$(result-bittyd/bin/bittyd --version)"
+          case "$daemon_version" in
+            "bittyd ${version} "*) ;;
+            *)
+              echo "::error::bittyd --version does not report $version: $daemon_version" >&2
+              exit 1
+              ;;
+          esac
+          echo "bittyd --version => $daemon_version"
 
   # CTX-1413 (#1847): the immutable mirror is the preferred download source
   # for the AUR bitty-bin, Homebrew, and Scoop publishers above. Those jobs

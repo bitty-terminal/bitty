@@ -734,7 +734,7 @@ impl OcclusionProbe {
             return None;
         }
         let requested_at = self.last_request?;
-        if now.duration_since(requested_at) < OCCLUSION_STARVE {
+        if now.saturating_duration_since(requested_at) < OCCLUSION_STARVE {
             return None;
         }
         self.occluded = true;
@@ -1111,6 +1111,14 @@ mod tests {
             probe.starvation_edge(pending),
             None,
             "a fresh request inside the starve span is healthy"
+        );
+        // bitty#3055: an out-of-order Instant (e.g. a cross-thread
+        // `WindowHandle::request_redraw` stamped slightly after the caller's
+        // `now` snapshot) must saturate to zero rather than panicking.
+        assert_eq!(
+            probe.starvation_edge(t0),
+            None,
+            "now < requested_at must saturate to zero and return None"
         );
         assert_eq!(
             probe.starvation_edge(pending + OCCLUSION_STARVE),

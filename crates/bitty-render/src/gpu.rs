@@ -1106,6 +1106,23 @@ fn headless_present_stats(frame: u64, draw_list: &DrawList) -> PresentStats {
     }
 }
 
+/// Refuses a color-atlas payload shorter than its declared dimensions
+/// (bitty#3005 / bitty#3055).
+pub(crate) fn validate_color_atlas_payload(
+    texels: &[u8],
+    dims: AtlasDims,
+) -> Result<(), RenderError> {
+    let expected = usize::from(dims.width)
+        .checked_mul(usize::from(dims.height))
+        .and_then(|pixels| pixels.checked_mul(4));
+    match expected {
+        Some(len) if texels.len() >= len => Ok(()),
+        _ => Err(RenderError::InvalidInput {
+            reason: "color atlas payload is shorter than its dimensions",
+        }),
+    }
+}
+
 /// An owned GPU surface: either a real `wgpu` surface created from a
 /// [`SurfaceTarget`] or a headless fake for unit tests.
 ///
@@ -1731,170 +1748,37 @@ impl Surface {
             .glyphs
             .iter()
             .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color && color_atlas.is_none() {
-            return Err(PresentFailure::Error(RenderError::InvalidInput {
-                reason: "color atlas instance requires color atlas texels",
-            }));
+        if needs_color {
+            let Some((texels, dims)) = color_atlas else {
+                return Err(PresentFailure::Error(RenderError::InvalidInput {
+                    reason: "color atlas instance requires color atlas texels",
+                }));
+            };
+            validate_color_atlas_payload(texels, dims).map_err(PresentFailure::Error)?;
         }
 
         match &self.kind {
             SurfaceKind::Headless => {
                 telemetry::headless_present();
-                // Headless composite onto CPU buffer — mirrors
-                // `software::draw_list_onto` but lives here so the sw-fallback
-                // feature is not required for headless tests.
+                // Headless composite onto CPU buffer — delegates to the shared
+                // `composite_headless_draw_list` helper so `ImagePaintLayer::BelowText`
+                // z-ordering matches `headless_present_color`, `software::draw_list_onto`,
+                // and the real-GPU pipeline (bitty#3055).
                 let width = config.extent.width();
                 let height = config.extent.height();
                 // CR-RENDER-01: fail closed before allocating; extreme extents
                 // must not reach `vec!` unchecked.
                 let len = headless_buffer_len(width, height).map_err(PresentFailure::Error)?;
                 let mut rgba = vec![0u8; len];
-                // Clear to the resolved theme background (premultiplied,
-                // CTX-0355); matches the GPU clear color above.
-                {
-                    let bg = self.theme_palette().background;
-                    let pr = premultiply(bg[0], bg[3]);
-                    let pg = premultiply(bg[1], bg[3]);
-                    let pb = premultiply(bg[2], bg[3]);
-                    let pa = bg[3];
-                    for px in rgba.chunks_exact_mut(4) {
-                        px[0] = pr;
-                        px[1] = pg;
-                        px[2] = pb;
-                        px[3] = pa;
-                    }
-                }
-                // Fills.
-                for fill in &draw_list.fills {
-                    fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-                }
-                // Rounded decoration fills/rings (CTX-0311).
-                for fill in &draw_list.rounded_fills {
-                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-                }
-                // CTX-0347: per-`View` background images paint above cell
-                // backgrounds and the ring, below overlay fills and glyphs.
-                for blit in &draw_list.backgrounds {
-                    blend_rgba_blit_rgba(&mut rgba, width, height, blit);
-                }
-                for fill in &draw_list.overlay_fills {
-                    fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-                }
-                // CTX-1477: card surface, hosted row backgrounds, then ring.
-                for fill in &draw_list.overlay_card_rounded_fills {
-                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-                }
-                for fill in &draw_list.overlay_content_fills {
-                    fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-                }
-                for fill in &draw_list.overlay_rounded_fills {
-                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-                }
-                // Glyphs. Color glyphs paint from their own atlas at the same
-                // point of the paint order (CTX-1691).
-                blend_color_glyphs_rgba(&mut rgba, width, height, &draw_list.glyphs, color_atlas);
-                if let Some((texels, dims)) = atlas {
-                    for glyph in &draw_list.glyphs {
-                        match &glyph.source {
-                            crate::grid::GlyphSource::Atlas { slot } => {
-                                let stride = usize::from(dims.width);
-                                let slot_w = usize::from(slot.width);
-                                let slot_h = usize::from(slot.height);
-                                if slot_h == 0 || slot_w == 0 {
-                                    continue;
-                                }
-                                let Some(mask_len) = slot_w.checked_mul(slot_h) else {
-                                    continue;
-                                };
-                                let mut mask = Vec::with_capacity(mask_len);
-                                for row in 0..slot_h {
-                                    let Some(start) = (usize::from(slot.y) + row)
-                                        .checked_mul(stride)
-                                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
-                                    else {
-                                        mask.clear();
-                                        break;
-                                    };
-                                    let Some(end) = start.checked_add(slot_w) else {
-                                        mask.clear();
-                                        break;
-                                    };
-                                    let Some(row_data) = texels.get(start..end) else {
-                                        mask.clear();
-                                        break;
-                                    };
-                                    mask.extend_from_slice(row_data);
-                                }
-                                if mask.len() != mask_len {
-                                    continue;
-                                }
-                                blend_coverage_mask_rgba(
-                                    &mut rgba,
-                                    width,
-                                    height,
-                                    &mask,
-                                    slot.width.into(),
-                                    slot.height.into(),
-                                    glyph.dest[0],
-                                    glyph.dest[1],
-                                    glyph.color,
-                                    glyph.clip,
-                                );
-                            }
-                            crate::grid::GlyphSource::Inline {
-                                mask,
-                                width: w,
-                                height: h,
-                            } => {
-                                blend_coverage_mask_rgba(
-                                    &mut rgba,
-                                    width,
-                                    height,
-                                    mask,
-                                    *w,
-                                    *h,
-                                    glyph.dest[0],
-                                    glyph.dest[1],
-                                    glyph.color,
-                                    glyph.clip,
-                                );
-                            }
-                            // Painted by `blend_color_glyphs_rgba` above: the
-                            // color atlas is a separate texture, so this
-                            // coverage pass has nothing to sample.
-                            crate::grid::GlyphSource::ColorAtlas { .. } => {}
-                        }
-                    }
-                } else {
-                    for glyph in &draw_list.glyphs {
-                        if let crate::grid::GlyphSource::Inline {
-                            mask,
-                            width: w,
-                            height: h,
-                        } = &glyph.source
-                        {
-                            blend_coverage_mask_rgba(
-                                &mut rgba,
-                                width,
-                                height,
-                                mask,
-                                *w,
-                                *h,
-                                glyph.dest[0],
-                                glyph.dest[1],
-                                glyph.color,
-                                glyph.clip,
-                            );
-                        }
-                    }
-                }
-                // Kitty images (CTX-0248): topmost present-layer blits,
-                // above fills and glyphs, never grid truth. The headless
-                // CPU compositor blends every entry; the real-GPU branch
-                // below uploads and paints them since CTX-0291.
-                for blit in &draw_list.images {
-                    blend_rgba_blit_rgba(&mut rgba, width, height, blit);
-                }
+                clear_headless_rgba(&mut rgba, self.theme_palette().background);
+                self.composite_headless_draw_list(
+                    &mut rgba,
+                    width,
+                    height,
+                    draw_list,
+                    atlas,
+                    color_atlas,
+                );
                 // CTX-0290: apply the window opacity to the finished
                 // premultiplied buffer, the CPU equivalent of the GPU
                 // alpha-pinning blend below. No-op at opacity 1.0.
@@ -1904,19 +1788,7 @@ impl Surface {
                 state.headless_rgba = Some(rgba);
                 state.headless_rgba_extent = Some(config.extent);
                 state.headless_rgba_opacity = Some(opacity);
-                Ok(PresentStats {
-                    frame: state.frame,
-                    fills: draw_list.fills.len()
-                        + draw_list.overlay_fills.len()
-                        + draw_list.overlay_content_fills.len(),
-                    rounded_fills: draw_list.rounded_fills.len()
-                        + draw_list.overlay_card_rounded_fills.len()
-                        + draw_list.overlay_rounded_fills.len(),
-                    glyphs: draw_list.glyphs.len(),
-                    headless: true,
-                    images: draw_list.images.len(),
-                    images_skipped: 0,
-                })
+                Ok(headless_present_stats(state.frame, draw_list))
             }
             SurfaceKind::Gpu { surface, .. } => {
                 // Real GPU path: validate, then draw the DrawList through
@@ -2354,10 +2226,13 @@ impl Surface {
             .glyphs
             .iter()
             .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color && color_atlas.is_none() {
-            return Err(RenderError::InvalidInput {
-                reason: "color atlas instance requires color atlas texels",
-            });
+        if needs_color {
+            let Some((texels, dims)) = color_atlas else {
+                return Err(RenderError::InvalidInput {
+                    reason: "color atlas instance requires color atlas texels",
+                });
+            };
+            validate_color_atlas_payload(texels, dims)?;
         }
         let width = config.extent.width();
         let height = config.extent.height();
@@ -3758,6 +3633,31 @@ mod tests {
                 )),
             )
             .expect("the clearing present accepts a color atlas");
+        // bitty#3055: a short color-atlas payload is a caller wiring bug and
+        // must be refused before painting on the headless path too.
+        let short_texels = [0x00u8, 0x00, 0xFF, 0xFF].repeat(15);
+        let err = surface
+            .headless_present_color(
+                &color_glyph_only(),
+                None,
+                Some((
+                    &short_texels,
+                    crate::atlas::AtlasDims {
+                        width: 4,
+                        height: 4,
+                    },
+                )),
+            )
+            .expect_err("a short color-atlas payload must be refused");
+        assert!(
+            matches!(
+                err,
+                RenderError::InvalidInput {
+                    reason: "color atlas payload is shorter than its dimensions"
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     /// `headless_present` stores the buffer opacity-scaled. A retained present
@@ -4375,6 +4275,20 @@ mod tests {
             });
             surface.headless_present(&list, None).expect("present");
             let rgba = surface.headless_rgba().expect("rgba");
+            if gpu_tests_enabled() {
+                if let Ok(ctx) = block_on(GpuContext::initialize()) {
+                    let via_present =
+                        Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+                    via_present
+                        .present_draw_list(&ctx, &list, None)
+                        .expect("present_draw_list on headless surface");
+                    assert_eq!(
+                        via_present.headless_rgba().expect("rgba"),
+                        rgba,
+                        "present_draw_list and headless_present must composite BelowText/AboveText identically"
+                    );
+                }
+            }
             let idx = (2 * 8 + 2) * 4;
             [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
         };

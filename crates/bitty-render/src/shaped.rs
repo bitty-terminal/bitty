@@ -397,7 +397,7 @@ impl SwashSingle {
     /// `extra` faces join a *private* copy of the host database, so the
     /// per-scalar fallback walk
     /// ([`GlyphRasterizer::dynamic_face_for`]) can resolve scalars no host
-    /// face covers. The process-wide [`system_db`] is untouched, so other
+    /// face covers. The process-wide `system_db` is untouched, so other
     /// sessions in the process are unaffected and a fixture registered here
     /// can never shadow a real host face ordering.
     ///

@@ -101,11 +101,26 @@ fn mixed_han_and_emoji_gap_resolves_each_cluster() {
             clusters[0].uncovered
         )
     );
-    assert_eq!(
-        shaper.loaded_face_family(clusters[0].face).as_deref(),
-        Some(HAN_TEST_FAMILY),
-        "the Han cluster must come from the vendored subset"
-    );
+    // Host-independent: the Han cluster must never end up uncovered, because
+    // that is the reported bug. The extra face is appended after the host
+    // faces (the fallback walk's family-name sort decides among them), so an
+    // image that does carry a CJK face may legitimately resolve Han from it;
+    // only an image with no Han coverage must fall through to the vendored
+    // subset, and that is where the fixture is mandatory.
+    let han_family = shaper.loaded_face_family(clusters[0].face);
+    if host_covers(&mut shaper, '请') {
+        assert!(
+            han_family.is_some(),
+            "the Han cluster must resolve to a loaded face, got {:?}",
+            (clusters[0].byte_offset, clusters[0].face)
+        );
+    } else {
+        assert_eq!(
+            han_family.as_deref(),
+            Some(HAN_TEST_FAMILY),
+            "with no host Han face the cluster must come from the vendored subset"
+        );
+    }
     if !host_covers(&mut shaper, '\u{1F600}') {
         eprintln!(
             "note: host has no emoji face; the Han cluster still resolved from \

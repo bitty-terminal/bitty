@@ -1577,17 +1577,12 @@ impl Runtime {
         if targets.is_empty() {
             return;
         }
-        let frames = self.present_frames();
         let tail: Vec<&str> = args.iter().map(String::as_str).collect();
         for view in targets {
-            let (cols, rows) = frames
-                .iter()
-                .find(|frame| frame.view == view)
-                .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
-                .unwrap_or((
-                    self.cols.min(u16::MAX as usize) as u16,
-                    self.rows.min(u16::MAX as usize) as u16,
-                ));
+            let (cols, rows) = self.presented_frame_cells(view).unwrap_or((
+                self.cols.min(u16::MAX as usize) as u16,
+                self.rows.min(u16::MAX as usize) as u16,
+            ));
             if let Err(err) = self.spawn_shell_for_view(view, &program, &tail, cols, rows) {
                 // Rate-limited (CTX-0473): session restore replays spawns for
                 // every view; a broken recipe must not flood stderr.

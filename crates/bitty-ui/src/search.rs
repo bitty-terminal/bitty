@@ -405,7 +405,7 @@ impl SearchState {
                 } else {
                     // target >= end
                     // bring target to bottom: start = target+1 - rows
-                    let new_start = target + 1 - rows;
+                    let new_start = (target + 1).saturating_sub(rows);
                     total.saturating_sub(rows).saturating_sub(new_start)
                 };
                 let clamped = desired_offset.min(sb_len);
@@ -427,8 +427,9 @@ impl SearchState {
                 // Match to the right: show its start at left edge.
                 m.col_start
             } else {
-                // Match to the left: show its end at right edge.
-                m.col_end + 1 - cols
+                // Match to the left: show its end at right edge, saturating to 0
+                // when `m.col_end + 1 < cols` (CTX-1756 / bitty#3053).
+                (m.col_end + 1).saturating_sub(cols)
             };
             let clamped = desired_col_off.min(max_col_off);
             if clamped != col_off {
@@ -767,5 +768,21 @@ mod tests {
             ua.visible_highlights(&view, &a),
             ub.visible_highlights(&view, &b)
         );
+    }
+
+    #[test]
+    fn scroll_to_current_left_of_col_offset_does_not_underflow() {
+        let mut state = State::new();
+        prints(&mut state, "needle in haystack");
+        let mut ui = SearchState::new();
+        ui.set_search(&state, "needle", SearchOptions::default());
+        assert_eq!(ui.match_count(), 1);
+        // Viewport is 80 cols wide, scrolled horizontally to col_offset = 10.
+        // The match "needle" spans cols 0..=5 (`m.col_end + 1 = 6 < cols = 80`).
+        let mut view = View::new(ViewId::new(1), 80, 24);
+        view.set_col_offset(10);
+        let changed = ui.scroll_to_current(&mut view, &state);
+        assert!(changed);
+        assert_eq!(view.col_offset(), 0);
     }
 }

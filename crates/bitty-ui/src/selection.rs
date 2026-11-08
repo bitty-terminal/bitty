@@ -577,6 +577,35 @@ fn snap_to_leading_opt(snapshot: Option<&Snapshot>, pos: CellPos) -> CellPos {
     }
 }
 
+fn buffer_row_cells(
+    state: &bitty_term_state::State,
+    buffer_row: usize,
+) -> Option<&[bitty_term_state::Cell]> {
+    let sb_len = state.scrollback_len();
+    if buffer_row < sb_len {
+        state
+            .scrollback_line(buffer_row)
+            .map(|line| line.cells.as_ref())
+    } else {
+        state.live_grid_row(buffer_row - sb_len)
+    }
+}
+
+fn snap_buffer_pos(state: &bitty_term_state::State, bp: BufferPos) -> BufferPos {
+    let Some(cells) = buffer_row_cells(state, bp.buffer_row) else {
+        return bp;
+    };
+    if cells.is_empty() {
+        return bp;
+    }
+    let col = (bp.col as usize).min(cells.len().saturating_sub(1));
+    if cells[col].spacer && col > 0 {
+        BufferPos::new(bp.buffer_row, (col - 1) as u16)
+    } else {
+        BufferPos::new(bp.buffer_row, col as u16)
+    }
+}
+
 fn clamp_pos(snapshot: &Snapshot, pos: CellPos) -> CellPos {
     let row = (pos.row as usize).min(snapshot.height.saturating_sub(1)) as u16;
     let col = (pos.col as usize).min(snapshot.width.saturating_sub(1)) as u16;
@@ -877,12 +906,12 @@ impl PersistentSelection {
             return None;
         }
         let to_cell = |bp: BufferPos| {
-            let row = (bp.buffer_row - start) as u16;
-            let col = bp.col;
-            CellPos::new(row, col)
+            let snapped = snap_buffer_pos(state, bp);
+            let row = (snapped.buffer_row - start) as u16;
+            CellPos::new(row, snapped.col)
         };
-        let anchor = snap_to_leading(&state.snapshot(), to_cell(self.anchor));
-        let focus = snap_to_leading(&state.snapshot(), to_cell(self.focus));
+        let anchor = to_cell(self.anchor);
+        let focus = to_cell(self.focus);
         // Clamp viewport rows/cols to view size.
         let max_row = view.rows().saturating_sub(1);
         let max_col = view.cols().saturating_sub(1);
@@ -949,29 +978,12 @@ impl PersistentSelection {
             return self.block_text(state);
         }
         let (start_bp, end_bp) = self.ordered_buffer_endpoints(state)?;
-        let sb_len = state.scrollback_len();
         let mut out = String::new();
         for buffer_row in start_bp.buffer_row..=end_bp.buffer_row {
-            let (cells, width) = if buffer_row < sb_len {
-                if let Some(line) = state.scrollback_line(buffer_row) {
-                    (line.cells.clone(), line.cells.len())
-                } else {
-                    continue;
-                }
-            } else {
-                let snap = state.snapshot();
-                let grid_row = buffer_row - sb_len;
-                if grid_row >= snap.height {
-                    continue;
-                }
-                let start = grid_row * snap.width;
-                let end = start + snap.width;
-                if end > snap.cells.len() {
-                    continue;
-                }
-                let slice = snap.cells[start..end].to_vec();
-                (slice.into_boxed_slice(), snap.width)
+            let Some(cells) = buffer_row_cells(state, buffer_row) else {
+                continue;
             };
+            let width = cells.len();
             let col_start = if buffer_row == start_bp.buffer_row {
                 start_bp.col as usize
             } else {
@@ -1016,8 +1028,9 @@ impl PersistentSelection {
         Some(out)
     }
 
-    /// Resolves the stored endpoints by line id and returns them in buffer
-    /// order (oldest row first, then lowest column).
+    /// Resolves the stored endpoints by line id, snaps wide-character spacer
+    /// columns to their leading cells on each endpoint's buffer row, and returns
+    /// them in buffer order (oldest row first, then lowest column).
     ///
     /// `None` when either endpoint was pruned or its stored scrollback line id
     /// no longer sits at the stored buffer row.
@@ -1032,7 +1045,7 @@ impl PersistentSelection {
         // guarantees scrollback_line(buffer_row).id == stored id, but double-check
         // here and locate by id to guard against stale buffer_row after pruning.
         let resolve = |bp: BufferPos, line_id: Option<u64>| -> Option<BufferPos> {
-            if let Some(id) = line_id {
+            let resolved = if let Some(id) = line_id {
                 let line = state.scrollback_line(bp.buffer_row)?;
                 if line.id != id {
                     return None;
@@ -1047,12 +1060,13 @@ impl PersistentSelection {
                     }
                 }
                 match found_idx {
-                    Some(idx) if idx == bp.buffer_row => Some(bp),
-                    _ => None,
+                    Some(idx) if idx == bp.buffer_row => bp,
+                    _ => return None,
                 }
             } else {
-                Some(bp)
-            }
+                bp
+            };
+            Some(snap_buffer_pos(state, resolved))
         };
         let eff_anchor = resolve(self.anchor, self.anchor_line_id)?;
         let eff_focus = resolve(self.focus, self.focus_line_id)?;
@@ -1081,31 +1095,12 @@ impl PersistentSelection {
         } else {
             (end_bp.col, start_bp.col)
         };
-        let sb_len = state.scrollback_len();
         let mut out = String::new();
         for buffer_row in start_bp.buffer_row..=end_bp.buffer_row {
-            let (cells, width) = if buffer_row < sb_len {
-                if let Some(line) = state.scrollback_line(buffer_row) {
-                    (line.cells.clone(), line.cells.len())
-                } else {
-                    continue;
-                }
-            } else {
-                let snap = state.snapshot();
-                let grid_row = buffer_row - sb_len;
-                if grid_row >= snap.height {
-                    continue;
-                }
-                let start = grid_row * snap.width;
-                let end = start + snap.width;
-                if end > snap.cells.len() {
-                    continue;
-                }
-                (
-                    snap.cells[start..end].to_vec().into_boxed_slice(),
-                    snap.width,
-                )
+            let Some(cells) = buffer_row_cells(state, buffer_row) else {
+                continue;
             };
+            let width = cells.len();
             let mut line = String::new();
             let mut col = col_min as usize;
             let col_end = col_max as usize;
@@ -1610,5 +1605,77 @@ mod tests {
         // The reverse anchor order produces the same logical range text.
         let reversed = Selection::simple(CellPos::new(0, 6), CellPos::new(0, 4));
         assert_eq!(reversed.text(&snapshot), "אבג");
+    }
+
+    #[test]
+    fn persistent_selection_snaps_against_scrollback_row_not_live_grid() {
+        use crate::view::{View, ViewId};
+
+        let mut state = State::new();
+        // Scrollback line 0: "A中B" (wide char at col 1, spacer at col 2)
+        prints(&mut state, "A中B");
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        // Scrollback line 1: "abcd" (all narrow ASCII)
+        prints(&mut state, "abcd");
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        // Push both into scrollback
+        for _ in 0..state.height() {
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        // Now put a wide character on live grid row 1 at cols 1..=2 ("X好Y")
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(2),
+            col: bitty_vt::Col(1),
+        });
+        prints(&mut state, "X好Y");
+
+        let sb_len = state.scrollback_len();
+        assert!(sb_len >= 2);
+        let mut view = View::new(ViewId::new(1), state.width(), state.height());
+        view.set_scroll_offset(sb_len, sb_len);
+
+        // 1) Selecting spacer col 2 on scrollback line 0 ("A中B") must snap to col 1 ("中")
+        //    both in `to_view_selection` and `text`/`block_text`, even though live grid row 0 is blank.
+        let line0_id = state.scrollback_line(0).unwrap().id;
+        let pers_wide_spacer = PersistentSelection {
+            anchor: BufferPos::new(0, 2),
+            anchor_line_id: Some(line0_id),
+            focus: BufferPos::new(0, 2),
+            focus_line_id: Some(line0_id),
+            kind: SelectionKind::Simple,
+            active: false,
+        };
+        let view_sel = pers_wide_spacer
+            .to_view_selection(&view, &state)
+            .expect("scrollback row 0 is visible in scrolled view");
+        assert_eq!(view_sel.anchor, CellPos::new(0, 1));
+        assert_eq!(view_sel.focus, CellPos::new(0, 1));
+        assert_eq!(pers_wide_spacer.text(&state).as_deref(), Some("中"));
+
+        let pers_block_spacer = PersistentSelection {
+            kind: SelectionKind::Block,
+            ..pers_wide_spacer
+        };
+        assert_eq!(pers_block_spacer.text(&state).as_deref(), Some("中"));
+
+        // 2) Selecting col 2 ('c') on scrollback line 1 ("abcd") must NOT be snapped to col 1
+        //    even though live grid row 1 has a wide spacer at col 2 ("X好Y").
+        let line1_id = state.scrollback_line(1).unwrap().id;
+        let pers_narrow = PersistentSelection {
+            anchor: BufferPos::new(1, 2),
+            anchor_line_id: Some(line1_id),
+            focus: BufferPos::new(1, 3),
+            focus_line_id: Some(line1_id),
+            kind: SelectionKind::Simple,
+            active: false,
+        };
+        let view_sel_narrow = pers_narrow
+            .to_view_selection(&view, &state)
+            .expect("scrollback row 1 is visible in scrolled view");
+        assert_eq!(view_sel_narrow.anchor, CellPos::new(1, 2));
+        assert_eq!(view_sel_narrow.focus, CellPos::new(1, 3));
+        assert_eq!(pers_narrow.text(&state).as_deref(), Some("cd"));
     }
 }

@@ -4686,3 +4686,68 @@ fn truncated_osc52_write_is_dispatched_before_the_refusal() {
     let cuts = [5 + CAP - 1, 5 + CAP, 5 + CAP + 1];
     assert_capped_stream_invariant(&stream, &expected, &cuts);
 }
+
+#[test]
+fn held_esc_before_can_or_sub_in_apc_is_chunk_invariant() {
+    // CTX-1762 (bitty#3063): when an APC is aborted by `ESC` followed by `CAN`
+    // (`0x18`) or `SUB` (`0x1A`), splitting the stream between `ESC` and
+    // `CAN`/`SUB` must forward `ESC` to `vte` before `CAN`/`SUB` just like the
+    // single-buffer path, so an open `vte` OSC dispatches on `ESC` instead of
+    // being silently aborted by `CAN`/`SUB`.
+    for cancel in [0x18_u8, 0x1A_u8] {
+        let mut stream = b"\x1b]0;title\x1b_Gf=32\x1b".to_vec();
+        stream.push(cancel);
+        stream.extend_from_slice(b"ok");
+        let expected = vec![
+            TerminalAction::OscTitle {
+                text: BoundedString::new("title"),
+            },
+            TerminalAction::PrintControl(ControlChar(cancel)),
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ];
+        assert_split_invariant(&stream, &expected);
+    }
+}
+
+#[test]
+fn aborted_osc1337_routes_following_iterm2_osc_and_kitty_apc_diversions() {
+    // CTX-1762 (bitty#3063): when an `OSC 1337;File=` body is aborted by
+    // `ESC ]` (another `OSC 1337;File=`) or `ESC _` (a Kitty graphics APC),
+    // `OscOutcome::FinishedThenPassThrough` must route the `[0x1B, byte]`
+    // introducer into the respective diversion instead of feeding it to `vte`.
+    let mut to_iterm2 = b"\x1b]1337;File=inline=1:YWJj".to_vec();
+    to_iterm2.extend_from_slice(iterm2_wire("inline=1;width=1", &ITERM2_PNG_1X1).as_bytes());
+    to_iterm2.extend_from_slice(b"ok");
+    let expected_iterm2 = vec![
+        TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::Aborted,
+        },
+        iterm2_image(1, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&to_iterm2, &expected_iterm2);
+
+    let to_apc =
+        b"\x1b]1337;File=inline=1:YWJj\x1b_Gf=32,s=1,v=1,a=T,m=0;/wAA/w==\x1b\\ok".to_vec();
+    let expected_apc = vec![
+        TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::Aborted,
+        },
+        TerminalAction::KittyGraphics {
+            format_f: 32,
+            width_s: Some(1),
+            height_v: Some(1),
+            action_a: Some('T'),
+            cols_c: 0,
+            rows_r: 0,
+            cursor_movement_c: 0,
+            payload: vec![0xFF, 0, 0, 0xFF].into_boxed_slice(),
+            control: crate::kitty_apc::KittyControlKeys::default(),
+        },
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&to_apc, &expected_apc);
+}

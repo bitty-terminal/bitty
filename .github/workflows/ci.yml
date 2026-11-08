@@ -1865,6 +1865,21 @@ jobs:
           if ($urls[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
           Write-Host 'install.ps1 5.1 dry-run OK'
 
+      # CTX-1750 (bitty#3038): the legacy Inno Setup cleanup deletes files in
+      # the user's Start Menu and under %LOCALAPPDATA%, so the live install leg
+      # above is not enough -- a crash there still passes while a wrong
+      # deletion goes unnoticed. This drives the shipped cleanup function
+      # bodies against a throwaway fixture and runs the cleanup twice: the
+      # second run must be a no-op (no removals, no SHChangeNotify), a
+      # user-authored shortcut in the Start Menu group must survive, a nested
+      # -InstallDir must never be deleted, and the legacy uninstall key must
+      # outlive a warned-about directory removal.
+      - name: Verify install.ps1 legacy Inno Setup cleanup (idempotent, non-destructive)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts/tests/cleanup-legacy-inno.test.ps1')
+
       # CTX-1681 (#2863) / CTX-1720 (#2926): install.ps1 only downloads from
       # the CDN, but the documented -CdnBase test override lets this step serve
       # a locally assembled fixture from a loopback HTTP server. That exercises

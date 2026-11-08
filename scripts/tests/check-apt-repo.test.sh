@@ -112,12 +112,28 @@ def ar_member(name, data):
     pad = b'\x0a' if len(data) % 2 == 1 else b''
     return header + data + pad
 
-ar_data = b'\x21\x3c\x61\x72\x63\x68\x3e\x0a'
-ar_data += ar_member('debian-binary', b'2.0\x0a')
-ar_data += ar_member('control.tar.gz', control_tar_bytes)
-ar_data += ar_member('data.tar.gz', data_tar_bytes)
+members = [
+    ar_member('debian-binary', b'2.0\x0a'),
+    ar_member('control.tar.gz', control_tar_bytes),
+    ar_member('data.tar.gz', data_tar_bytes),
+]
+magic = b'\x21\x3c\x61\x72\x63\x68\x3e\x0a'
+ar_data = magic + b''.join(members)
 
 pathlib.Path('$DIST_DIR/bitty-x86_64-unknown-linux-gnu.deb').write_bytes(ar_data)
+
+# Truncation fixtures (bitty#3089). Both leave debian-binary and control.tar.gz
+# byte-identical, so a parser that silently stops at a short read still builds a
+# full repo from them; only the header/size guards can reject them. Offsets are
+# derived from the assembled archive so they cannot drift with member sizes.
+assert len(data_tar_bytes) > 10, 'empty data.tar.gz unexpectedly small'
+fixtures = pathlib.Path('$TMP/trunc_fixtures')
+fixtures.mkdir(parents=True, exist_ok=True)
+# Cut 10 bytes off the final member's payload: all headers intact.
+(fixtures / 'short_payload.deb').write_bytes(ar_data[:-10])
+# Cut 20 bytes into the final member header: fewer than 60 bytes remain.
+data_header_offset = len(magic) + len(members[0]) + len(members[1])
+(fixtures / 'short_header.deb').write_bytes(ar_data[: data_header_offset + 20])
 "
 
 [[ -f "$DIST_DIR/bitty-x86_64-unknown-linux-gnu.deb" ]] || fail "Synthetic deb creation failed"
@@ -182,15 +198,25 @@ else
   pass "generate-apt-repo.sh fails closed on corrupted deb"
 fi
 
-# Fail-closed check (bitty#3089): truncated ar member payload must be rejected
-TRUNC_DIR="$TMP/trunc_dist"
-mkdir -p "$TRUNC_DIR"
-head -c 90 "$DIST_DIR/bitty-x86_64-unknown-linux-gnu.deb" >"$TRUNC_DIR/bitty-truncated.deb"
-if "$GEN_SH" --dist-dir "$TRUNC_DIR" --repo-dir "$TMP/trunc_repo" >/dev/null 2>&1; then
-  fail "generate-apt-repo.sh accepted truncated ar member deb"
-else
-  pass "generate-apt-repo.sh fails closed on truncated ar member deb"
-fi
+# Fail-closed check (bitty#3089): a partial read of the final ar member must be rejected
+# instead of silently generating a repo from the members that were read successfully.
+expect_truncation_rejected() { # <fixture-file> <label>
+  local fixture="$1" label="$2" fixture_dir repo_dir
+  fixture_dir="$TMP/trunc_$(basename "$fixture" .deb)"
+  repo_dir="$TMP/trunc_repo_$(basename "$fixture" .deb)"
+  mkdir -p "$fixture_dir"
+  cp "$fixture" "$fixture_dir/bitty_0.0.26_amd64.deb"
+  if "$GEN_SH" --dist-dir "$fixture_dir" --repo-dir "$repo_dir" >/dev/null 2>&1; then
+    fail "generate-apt-repo.sh accepted $label"
+  elif compgen -G "$repo_dir/pool/main/b/bitty/*.deb" >/dev/null; then
+    fail "generate-apt-repo.sh rejected $label but still staged a package"
+  else
+    pass "generate-apt-repo.sh fails closed on $label"
+  fi
+}
+
+expect_truncation_rejected "$TMP/trunc_fixtures/short_payload.deb" "deb truncated inside the final ar member payload"
+expect_truncation_rejected "$TMP/trunc_fixtures/short_header.deb" "deb truncated inside the final ar member header"
 
 # --- 3. Workflow assertions -------------------------------------------------
 expect_contains "$WORKFLOW" "apt:" "release.yml defines apt job"

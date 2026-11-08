@@ -254,8 +254,9 @@ jobs:
         if: matrix.shard == 1
         run: ./scripts/check-vendored-winit.sh
 
-      # Arch tooling is absent on ubuntu-24.04, so this gate runs its
-      # in-tree assertions and skips the makepkg --printsrcinfo probe.
+      # Arch tooling is absent on ubuntu-24.04, so the AUR source-build gate
+      # below runs its static assertions here and skips the makepkg mutation
+      # cases (the `aur-source-build` job runs them for real in archlinux).
       - name: Validate packaging recipes (artifact-install consistency)
         if: matrix.shard == 1
         run: |
@@ -266,6 +267,7 @@ jobs:
           bash scripts/tests/check-package-manifests.test.sh
           bash scripts/tests/check-release-smoke-fail-closed.test.sh
           bash scripts/tests/check-aur-bin-render.test.sh
+          bash scripts/tests/check-aur-source-build.test.sh
           bash scripts/tests/check-apt-repo.test.sh
           bash scripts/tests/import-apt-gpg-key.test.sh
           bash scripts/tests/check-release-channels.test.sh
@@ -601,6 +603,43 @@ jobs:
         run: |
           bash scripts/tests/check-extension-pins.test.sh
           bash scripts/check-extension-pins.sh
+
+  # bitty#3011: until now the only `makepkg` invocation on a PR was
+  # `--printsrcinfo`, which parses the recipe and never runs prepare(), build(),
+  # or package(). A package() that stopped installing a built binary — or a
+  # build() that dropped the workspace member producing it — stayed green until
+  # a release published it (#2999's failure class). This job builds the real
+  # packaging/PKGBUILD with a real makepkg in Arch, on every pull request.
+  #
+  # Bounded on purpose: plumbing mode stubs prepare()/build() (no cargo
+  # compile) but runs the recipe's own package() under fakeroot and inspects
+  # the binary package it produces. The stub honors the recipe's build()
+  # selection, so a dropped `-p bitty-daemon` still fails the real install.
+  # scripts/tests/check-aur-source-build.test.sh runs the same gate against
+  # mutated recipes and requires exit 1, so the gate's ability to fail is
+  # proven on every run, not just assumed. The real cargo build runs in the
+  # release `aur` job (`--mode full`).
+  aur-source-build:
+    name: AUR source build (Arch, real makepkg)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    timeout-minutes: 20
+    # Runtime: 47s wall for this job on PR #3017 (image pull + `pacman -Syu` +
+    # gate + negative test; gate 6s, test 22s inside the container). Budget
+    # 20m above, and the gate's own `timeout` is 600s.
+    steps:
+      # Image packages first, checkout second: actions/checkout needs git in
+      # the container, and archlinux:latest does not ship it.
+      - name: Install Arch build dependencies
+        run: |
+          pacman-key --init
+          pacman -Syu --noconfirm --needed git base-devel ncurses libarchive
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Gate — real makepkg build of packaging/PKGBUILD
+        run: bash scripts/check-aur-source-build.sh --mode plumbing --timeout 600
+      - name: Gate — negative cases (a broken package() must fail the gate)
+        run: bash scripts/tests/check-aur-source-build.test.sh
 
   msrv:
     name: MSRV 1.85 check

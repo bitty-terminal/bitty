@@ -1502,7 +1502,10 @@ jobs:
     needs: [release, validate]
     runs-on: ubuntu-24.04
     container: archlinux:latest
-    timeout-minutes: 10
+    # Was 10m, which only covered rendering `.SRCINFO`. The job now builds the
+    # real source package first (bitty#3011): a cold `cargo build --release
+    # --locked` of the whole workspace inside the container.
+    timeout-minutes: 75
     if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_PUBLISH == 'true' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1510,6 +1513,16 @@ jobs:
         run: |
           pacman-key --init
           pacman -Syu --noconfirm git openssh pacman-contrib base-devel
+      # bitty#3011: publishing must not be the first real build of this recipe.
+      # Full mode runs the unmodified packaging/PKGBUILD through
+      # `makepkg --syncdeps --nocheck`, so prepare()/build()/package() really
+      # execute: the workspace compiles, every declared dependency must install,
+      # and the produced package must contain usr/bin/bitty and usr/bin/bittyd.
+      # Bounded by the gate's 45m wall clock and the 75m job timeout.
+      - name: Gate — build the source package with makepkg
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: bash scripts/check-aur-source-build.sh --mode full --timeout 2700 --expect-version "$REF_NAME"
       - name: Publish to AUR
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}

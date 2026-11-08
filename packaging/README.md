@@ -322,7 +322,7 @@ installs it, lands in `/usr/lib/systemd/user/bittyd.service`.
 | `packaging/freebsd/x11/bitty`                            | no: deliberate. The accepted endpoint contract (`D-15`) refuses FreeBSD (`LOCAL_PEERCRED` exposes `xucred` without a peer pid)                 | no                                                                              |
 | `packaging/netbsd/x11/bitty`                             | no: deliberate. NetBSD is not a `D-15` cell, so the daemon refuses it                                                                          | no                                                                              |
 | `packaging/openbsd/x11/bitty`                            | no: deliberate. OpenBSD is not a `D-15` cell, so the daemon refuses it                                                                         | no                                                                              |
-| `packaging/flathub/run.bitty.Bitty.yaml`                 | no: deliberate, tracked in #3004                                                                                                               | no                                                                              |
+| `packaging/flathub/` (Flatpak)                           | no daemon: the Flatpak sandbox has no systemd user manager, so the build installs neither `bin/bittyd` nor its unit (bitty#3004)                                                                                                               | no                                                                              |
 | `scripts/make-appimage.sh`                               | no: the AppDir carries one executable, copied from `--binary`                                                                                  | no                                                                              |
 | Homebrew (`release.yml` renders the formula at tag time) | no: the formula installs the bare macOS binary as `bitty`                                                                                      | no                                                                              |
 | Scoop (`release.yml` renders the manifest at tag time)   | no: the manifest shims the bare `.exe` as `bitty`                                                                                              | no                                                                              |
@@ -330,6 +330,12 @@ installs it, lands in `/usr/lib/systemd/user/bittyd.service`.
 | `flake.nix`                                              | yes, as the companion `.#bittyd` package (`packages.bittyd`), separate from `.#bitty`                                                          | no: a store path is not a stable `ExecStart` target                             |
 | `scripts/install.sh` (Linux x86_64/aarch64 glibc + musl) | yes: installs `bin/bittyd` from the bundle; a pre-daemon bundle installs the terminal only and logs the skip                                   | best effort: `$XDG_CONFIG_HOME/systemd/user`, fallback `~/.config/systemd/user` |
 | `cargo install --git ... bitty-terminal`                 | no: that package selection installs `bitty` only                                                                                               | no                                                                              |
+
+Flathub is the one channel where the sandbox rules the daemon out by
+construction, so the manifest ships the terminal only and drops the bundle's
+unit; the decision and its rationale are recorded in
+`packaging/flathub/README.md` and asserted by
+`scripts/tests/check-distro-recipes.test.sh`.
 
 The versioned Linux bundle carries it as
 `share/systemd/user/bittyd.service`, which is what the prebuilt recipes

@@ -33,6 +33,16 @@ modules:
   - name: bitty
     buildsystem: simple
     build-commands:
+      # bittyd is deliberately not installed (bitty#3004). The bundle carries
+      # `bin/bittyd` and `share/systemd/user/bittyd.service`, but the Flatpak
+      # sandbox has no systemd user manager, so nothing inside it can enable
+      # the unit, and a daemon started here would host shells confined to the
+      # sandbox instead of the user's session. The daemon ships on the channels
+      # that do have a supervisor (deb/rpm/AUR/prebuilt bundle/install.sh).
+      # The omission is recorded again in README.md and in the channel table of
+      # packaging/README.md, and gated by
+      # scripts/tests/check-distro-recipes.test.sh.
+      #
       # The `share/` tree carries the desktop entry, hicolor icons, and
       # AppStream metainfo. Terminfo ships as the raw source `terminfo/bitty.ti`
       # at the bundle ROOT (not inside share/), so it is compiled here with
@@ -40,6 +50,9 @@ modules:
       # read a raw source entry from TERMINFO_DIRS without compilation.
       - install -Dm755 -t /app/bin bin/bitty
       - cp -a share/. /app/share/
+      # Drop the bundle's systemd user unit: it points at /usr/bin/bittyd,
+      # which this build does not install, and no manager would read it.
+      - rm -f /app/share/systemd/user/bittyd.service
       - tic -x -o /app/share/terminfo terminfo/bitty.ti
     # The url and sha256 of each source move together: refresh both from the
     # `*.sha256` sidecar published alongside that release's bundle asset. Never

@@ -10,6 +10,7 @@
 #   - NetBSD (pkgsrc recipe: Makefile, PLIST, DESCR, distinfo)
 #   - Solus Linux (ypkg package.yml)
 #   - openSUSE (OBS spec + source service)
+#   - Flathub (Flatpak manifest and its README: the deliberate no-daemon decision)
 #
 # Version-agnostic on purpose: recipe versions are derived from the files
 # themselves (globbed ebuild names, pkgver/version fields) and cross-checked
@@ -1014,7 +1015,8 @@ fi
 # The BSD ports cannot serve the daemon yet (contract D-15: FreeBSD has no peer
 # pid in xucred, NetBSD/OpenBSD are unlisted cells), so they ship the terminal
 # only. The omission must stay explicit: each recipe says why, and no plist
-# lists a binary the build never produces.
+# lists a binary the build never produces. Flathub is the other documented
+# exception (section 12): its sandbox has no systemd user manager at all.
 for port in freebsd netbsd openbsd; do
   case "$port" in
   freebsd)
@@ -1036,6 +1038,143 @@ for port in freebsd netbsd openbsd; do
   reject "$port_plist" '(^|[[:space:]])(@bin[[:space:]]+)?bin/bittyd' \
     "$port package does not list an unbuilt bittyd"
 done
+
+# 12. Flathub (bitty#3004): the Flatpak sandbox has no systemd user manager, so
+#     the manifest is a terminal-only channel. The omission of `bin/bittyd` and
+#     of the bundle's systemd user unit must stay recorded in the manifest, the
+#     Flathub README, and the packaging channel table, and no build line may
+#     install the daemon. The negative cases replay the check against mutated
+#     copies of the live corpus, so every expectation below can actually fail.
+FLATHUB_MANIFEST="$REPO_ROOT/packaging/flathub/run.bitty.Bitty.yaml"
+FLATHUB_README="$REPO_ROOT/packaging/flathub/README.md"
+PACKAGING_README="$REPO_ROOT/packaging/README.md"
+
+# flathub_decision ROOT — 0 when the no-daemon decision is recorded under ROOT
+# and no build line contradicts it; prints one line per violation.
+flathub_decision() {
+  local root=$1 problems=0
+  local manifest="$root/packaging/flathub/run.bitty.Bitty.yaml"
+  local flathub_readme="$root/packaging/flathub/README.md"
+  local channel_readme="$root/packaging/README.md"
+  local file
+
+  for file in "$manifest" "$flathub_readme" "$channel_readme"; do
+    if [[ ! -f "$file" ]]; then
+      echo "missing ${file#"$root"/}"
+      problems=1
+    fi
+  done
+  ((problems == 0)) || return 1
+
+  if ! grep -Eq '^[[:space:]]*- install -Dm755 -t /app/bin bin/bitty$' "$manifest"; then
+    echo "manifest does not install bin/bitty"
+    problems=1
+  fi
+  if ! grep -qF 'bittyd is deliberately not installed' "$manifest"; then
+    echo "manifest does not record that bittyd is deliberately not installed"
+    problems=1
+  fi
+  if ! grep -qF 'no systemd user manager' "$manifest"; then
+    echo "manifest does not state that the sandbox has no systemd user manager"
+    problems=1
+  fi
+  if grep -Ev '^[[:space:]]*#' "$manifest" | grep -Eq 'install[[:space:]]+[^#]*bin/bittyd'; then
+    echo "manifest installs bin/bittyd although the sandbox cannot run it"
+    problems=1
+  fi
+  if ! grep -qF -- '- rm -f /app/share/systemd/user/bittyd.service' "$manifest"; then
+    echo "manifest keeps the bundle's systemd user unit, which no sandbox manager reads"
+    problems=1
+  fi
+
+  if ! grep -qF 'bittyd is deliberately not installed' "$flathub_readme"; then
+    echo "Flathub README does not record that bittyd is deliberately not installed"
+    problems=1
+  fi
+  if ! grep -qF 'no systemd user manager' "$flathub_readme"; then
+    echo "Flathub README does not explain the missing systemd user manager"
+    problems=1
+  fi
+  if ! grep -qF 'There is no way to run `bittyd`' "$flathub_readme"; then
+    echo "Flathub README does not say whether the daemon can be run at all"
+    problems=1
+  fi
+
+  if ! grep -Eq '^\| `packaging/flathub/`.*\| no daemon:' "$channel_readme"; then
+    echo "packaging channel table does not mark Flathub as no daemon"
+    problems=1
+  fi
+
+  return "$problems"
+}
+
+flathub_problems="$(flathub_decision "$REPO_ROOT" || true)"
+if [[ -z "$flathub_problems" ]]; then
+  pass "Flathub no-daemon decision is recorded in the manifest, Flathub README, and channel table"
+else
+  while IFS= read -r flathub_problem; do
+    fail "Flathub no-daemon decision: $flathub_problem"
+  done <<<"$flathub_problems"
+fi
+
+# Negative corpus: mutated copies of the three decision-bearing files must each
+# be rejected, so a silently dropped decision fails here instead of passing.
+FLATHUB_NEGATIVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/flathub-decision.XXXXXX")"
+trap 'rm -rf "$FLATHUB_NEGATIVE_ROOT"' EXIT
+
+flathub_mirror() { # DEST — copy the decision-bearing files into DEST
+  mkdir -p "$1/packaging/flathub"
+  cp "$FLATHUB_MANIFEST" "$1/packaging/flathub/run.bitty.Bitty.yaml"
+  cp "$FLATHUB_README" "$1/packaging/flathub/README.md"
+  cp "$PACKAGING_README" "$1/packaging/README.md"
+}
+
+# drop_line FILE LITERAL — rewrite FILE without the lines holding LITERAL. A
+# missing LITERAL is reported instead of silently leaving the case vacuous.
+drop_line() {
+  local file=$1 literal=$2
+  if ! grep -qF -- "$literal" "$file"; then
+    fail "negative-case guard: '$literal' is missing from ${file#"$FLATHUB_NEGATIVE_ROOT"/}"
+    return 0
+  fi
+  grep -vF -- "$literal" "$file" >"$file.tmp"
+  mv "$file.tmp" "$file"
+}
+
+expect_flathub_failure() { # DEST DESCRIPTION — the mutated tree must be rejected
+  if flathub_decision "$1" >/dev/null; then
+    fail "Flathub gate accepted a tree where $2"
+  else
+    pass "Flathub gate rejects a tree where $2"
+  fi
+}
+
+flathub_case="$FLATHUB_NEGATIVE_ROOT/manifest-decision"
+flathub_mirror "$flathub_case"
+drop_line "$flathub_case/packaging/flathub/run.bitty.Bitty.yaml" \
+  'bittyd is deliberately not installed'
+expect_flathub_failure "$flathub_case" "the manifest decision was removed"
+
+flathub_case="$FLATHUB_NEGATIVE_ROOT/readme-decision"
+flathub_mirror "$flathub_case"
+drop_line "$flathub_case/packaging/flathub/README.md" \
+  'bittyd is deliberately not installed'
+expect_flathub_failure "$flathub_case" "the Flathub README decision was removed"
+
+flathub_case="$FLATHUB_NEGATIVE_ROOT/manifest-installs-daemon"
+flathub_mirror "$flathub_case"
+awk '{ print } /^[[:space:]]*- install -Dm755 -t \/app\/bin bin\/bitty$/ {
+  print "      - install -Dm755 -t /app/bin bin/bittyd"
+}' "$flathub_case/packaging/flathub/run.bitty.Bitty.yaml" >"$flathub_case/manifest.tmp"
+mv "$flathub_case/manifest.tmp" "$flathub_case/packaging/flathub/run.bitty.Bitty.yaml"
+expect_flathub_failure "$flathub_case" "a build line installs bin/bittyd"
+
+flathub_case="$FLATHUB_NEGATIVE_ROOT/channel-table"
+flathub_mirror "$flathub_case"
+awk '{ if ($0 ~ /^\| `packaging\/flathub\/`/) sub(/\| no daemon:/, "| yes:") ; print }' \
+  "$flathub_case/packaging/README.md" >"$flathub_case/channel.tmp"
+mv "$flathub_case/channel.tmp" "$flathub_case/packaging/README.md"
+expect_flathub_failure "$flathub_case" "the channel table stops marking Flathub as no daemon"
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "check-distro-recipes.test.sh: FAIL" >&2

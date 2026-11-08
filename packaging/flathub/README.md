@@ -26,19 +26,37 @@ comments (and this file) already document.
   `--filesystem=host-os:ro` so the terminal can see and launch host shells.
   The same pattern is used by WezTerm and GNOME Console on Flathub.
 - Module: extracts the release `.tar.zst` bundle with
-  `strip-components: 1` (bundle layout: `bin/bitty`, `share/...`,
+  `strip-components: 1` (bundle layout: `bin/bitty`, `bin/bittyd`, `share/...`,
   root-level `terminfo/bitty.ti`), installs
   `bin/bitty` into `/app/bin`, copies `share/` (desktop entry, hicolor
-  icons, AppStream metainfo) into `/app/share`, and compiles the terminfo
+  icons, AppStream metainfo) into `/app/share`, drops the bundle's systemd
+  user unit (see below), and compiles the terminfo
   entry with `ncurses` `tic -x -o /app/share/terminfo terminfo/bitty.ti`
   (the same pattern PKGBUILD/bitty.spec use).
 
-## Session daemon (`bittyd`)
+## Daemon: `bittyd` is not shipped
 
-**daemon: no — deliberate, tracked in #3004.** The manifest installs `bin/bitty`
-only (`run.bitty.Bitty.yaml`, `build-commands`), so the Flatpak ships the
-terminal without the session host. `#3004` owns both the decision and the
-manifest change; do not add the daemon here as a drive-by edit.
+The release bundle carries `bin/bittyd` and
+`share/systemd/user/bittyd.service`, but the manifest installs neither.
+bittyd is deliberately not installed, for three reasons:
+
+- The Flatpak sandbox has no systemd user manager: `org.freedesktop.Platform`
+  runs no per-user systemd instance, so `systemctl --user enable bittyd` inside
+  the sandbox has nothing to talk to and the unit could never be enabled.
+- `bittyd` hosts the user's shells through the per-user containment plan.
+  Inside the sandbox every process it spawned would inherit the app's own
+  filesystem and device view, so it could not be the session host described by
+  ADR-0019 and the `bittyd` session-host contract.
+- `command: bitty` starts the terminal; nothing in the sandbox supervises a
+  background process, so a shipped binary would be dead weight.
+
+Flathub is therefore a **no daemon** channel: the terminal works, `bittyd` does
+not exist in it. A user who needs the session daemon installs a channel that
+ships it (`.deb`/`.rpm`/AUR/prebuilt bundle or `install.sh`), where the unit
+lands on disk and is enabled per user with
+`systemctl --user enable --now bittyd`. There is no way to run `bittyd` from
+the Flatpak build: the binary is not installed, so
+`flatpak run --command=bittyd run.bitty.Bitty start` fails.
 
 ## Submission checklist (owner)
 
@@ -48,7 +66,12 @@ manifest change; do not add the daemon here as a drive-by edit.
    (`.tar.zst.sha256` under the same tag as the download URL).
 3. Build locally: `flatpak-builder --user --install --force-clean build-dir
    run.bitty.Bitty.yaml`.
-4. Open the Flathub submission. This is the only step that has any release —
+4. State in the submission body that the build is terminal-only: it installs
+   `bin/bitty` and deliberately omits `bin/bittyd` and its systemd user unit,
+   because the sandbox has no systemd user manager. Point users who need the
+   session daemon at a channel that ships it; there is no way to run `bittyd`
+   from the Flatpak build.
+5. Open the Flathub submission. This is the only step that has any release —
    the manifest will not reach Flathub through any automation in this repo.
 
 ## Refresh procedure (each release)

@@ -416,6 +416,56 @@ pub(crate) fn init_shell_candidates(
     out
 }
 
+/// Resolves the effective `$SHELL` seed for interactive `bitty init` on the
+/// current host (CTX-1755, bitty#3048).
+///
+/// When `shell_env` carries a non-blank value, it wins verbatim (trimmed)
+/// without invoking `platform_default`. When `shell_env` is `None` or blank,
+/// `platform_default` supplies the host fallback (on Windows, the resolved
+/// `pwsh.exe` / `powershell.exe` / `cmd.exe` from
+/// [`crate::spawn::resolve_default_shell`]; on Unix, `Ok(None)` so
+/// [`init_shell_candidates`] keeps its existing common-shells + `/bin/sh`
+/// menu). The unresolved Windows arm is returned instead of swallowed, so the
+/// caller can warn instead of silently re-offering `/bin/sh` (bitty#3048).
+pub(crate) fn init_effective_shell_env_for_host(
+    shell_env: Option<&str>,
+    platform_default: impl FnOnce() -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell>,
+) -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
+    if let Some(trimmed) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(trimmed.to_string()));
+    }
+    Ok(platform_default()?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
+/// One-line warning for an unresolved platform default (CTX-1755).
+///
+/// Mirrors the unusable-`$SHELL` warning: names the candidates that were
+/// probed (through [`crate::spawn::UnresolvedDefaultShell`]'s `Display`) and
+/// states what the run actually does — no `terminal.shell` is written unless
+/// the user types a path — so the fallback is never silent again
+/// (bitty#3048). The dispatch prints it through its injected output writer,
+/// and `init_dispatch_interactive_unresolved_platform_default_leaves_shell_unset`
+/// pins the emitted line and the resulting file at the call site.
+pub(crate) fn init_unresolved_platform_shell_warning(
+    err: &crate::spawn::UnresolvedDefaultShell,
+) -> String {
+    format!("bitty init: {err}; leaving shell unset unless you type a shell path")
+}
+
+#[cfg(windows)]
+pub(crate) fn init_platform_default_shell()
+-> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
+    crate::spawn::resolve_default_shell(None, None).map(|resolved| Some(resolved.program))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn init_platform_default_shell()
+-> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
+    Ok(None)
+}
+
 /// Parses one shell-step answer: empty takes the menu default (index 0), a
 /// `1`-based number picks a menu entry, anything else is a custom path
 /// through [`init_clean_shell`]. Total: every input maps to a value or a
@@ -685,23 +735,25 @@ pub(crate) fn init_shell_name_hint(init_args: &[String]) -> Option<String> {
 }
 
 /// Detects the shell name for the handoff (CTX-1132, #1913): the wizard's
-/// chosen shell wins, else `$SHELL`, else `bash` fallback. Never reads the
-/// environment itself (pure over injected values, English-only).
+/// chosen shell wins, else `$SHELL`. Returns `None` when neither maps to a
+/// supported `shell-init` shell (`cmd.exe` has no `CompletionShell`), so the
+/// caller suppresses the hint instead of printing a wrong bash line. Never
+/// reads the environment itself (pure over injected values, English-only).
 pub(crate) fn init_detect_shell_for_handoff(
     chosen_shell: Option<&str>,
     shell_env: Option<&str>,
-) -> String {
+) -> Option<String> {
     if let Some(chosen) = chosen_shell {
         if let Some(name) = init_shell_name_from_path(chosen) {
-            return name;
+            return Some(name);
         }
     }
     if let Some(env) = shell_env {
         if let Some(name) = init_shell_name_from_path(env) {
-            return name;
+            return Some(name);
         }
     }
-    "bash".to_string()
+    None
 }
 
 /// Renders the exact shell-integration handoff line for a shell name
@@ -5271,6 +5323,12 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) home: Option<&'a str>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,
+    /// Stands in for the host platform default-shell probe (CTX-1755).
+    /// `None` uses the real [`init_platform_default_shell`]; tests inject a
+    /// resolver here so the dispatch path is exercised hermetically (the
+    /// same seam style as the injected `shell_exists` predicate).
+    pub(crate) platform_shell:
+        Option<&'a dyn Fn() -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell>>,
 }
 
 /// Runs `bitty init`; returns the process exit code.
@@ -5305,6 +5363,7 @@ pub(crate) fn run_init_subcommand_with_env(
         xdg_data_home: data_home.as_deref(),
         home: home.as_deref(),
         stdin_is_tty: std::io::stdin().is_terminal(),
+        platform_shell: None,
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -5680,7 +5739,19 @@ pub(crate) fn run_init_subcommand_with_io(
     // every other name keeps the generated-defaults flow below. `--yes` is
     // accepted with a preset but changes nothing (the seed is already fixed).
     let init_preset = init_profile.as_deref().and_then(InitProfilePreset::parse);
-    let answers = if let Some(preset) = init_preset {
+    // Effective `$SHELL` seed for the interactive wizard (CTX-1755): `$SHELL`
+    // wins, else the host platform default. Hoisted out of the answers chain so
+    // the shell-init handoff below reads the same value instead of re-deriving
+    // it from `env.shell` (review nit 4).
+    let mut effective_shell: Option<String> = None;
+    // The wizard's Enter answer when the platform probe failed and no seed
+    // resolved: its menu still ends with `FALLBACK_SHELL`, which is bitty#3048
+    // itself. Remembered so that answer can be dropped below.
+    let mut unresolved_menu_default: Option<String> = None;
+    // The wizard's own menu predicate, bound once so "the answer was the menu
+    // default" is decided from the same source the menu was built from.
+    let shell_exists: fn(&str) -> bool = |path| std::path::Path::new(path).exists();
+    let mut answers = if let Some(preset) = init_preset {
         let mut answers = init_preset_answers(preset);
         init_apply_overrides(&mut answers, &overrides);
         answers
@@ -5733,11 +5804,30 @@ pub(crate) fn run_init_subcommand_with_io(
         } else {
             None
         };
+        // The host platform default (Windows only) is the last seed before
+        // the menu's POSIX fallback. An unresolved probe is warned about — on
+        // the injected writer, so the dispatch test can pin the line — and
+        // leaves the wizard with no seed: its menu default is then a shell
+        // this host never resolved, which `unresolved_menu_default` records
+        // so the answer is dropped after the wizard (#3048).
+        let platform_default = env
+            .platform_shell
+            .unwrap_or(&init_platform_default_shell as &dyn Fn() -> _);
+        match init_effective_shell_env_for_host(env.shell, platform_default) {
+            Ok(shell) => effective_shell = shell,
+            Err(err) => {
+                let _ = writeln!(output, "{}", init_unresolved_platform_shell_warning(&err));
+                let _ = output.flush();
+                unresolved_menu_default = init_shell_candidates(None, &shell_exists)
+                    .into_iter()
+                    .next();
+            }
+        }
         match run_init_interactive_with_preview(
             input,
             output,
-            env.shell,
-            &|path| std::path::Path::new(path).exists(),
+            effective_shell.as_deref(),
+            &shell_exists,
             &overrides,
             color,
             preview.as_mut(),
@@ -5751,6 +5841,15 @@ pub(crate) fn run_init_subcommand_with_io(
             }
         }
     };
+    if let Some(menu_default) = unresolved_menu_default.as_deref() {
+        // Unresolved platform probe (Windows only in production): the warning
+        // just promised no `terminal.shell` unless the user types one, so an
+        // Enter on the menu's synthesized default must not become
+        // `shell = "/bin/sh"` (#3048). A path the user typed is kept verbatim.
+        if answers.shell.as_deref() == Some(menu_default) {
+            answers.shell = None;
+        }
+    }
     // CTX-1132 (#1913) follow-up decisions (no filesystem writes yet):
     // plugin selection, fetch opt-in, component opt-in, shell-init print.
     // Prompts fail closed (EOF/cancel/too many invalid -> exit 1, nothing
@@ -6111,12 +6210,23 @@ pub(crate) fn run_init_subcommand_with_io(
             let _ = output.flush();
         }
         if print_shell_init {
-            let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
-            let line = init_shell_init_line(&detected);
-            let source_hint = init_shell_source_hint(&detected);
-            println!(
-                "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
-            );
+            // The hint prints whenever a shell can be detected, through the
+            // same injected writer as the rest of the follow-up output, so a
+            // dispatch test can observe both branches. A shell with no
+            // `CompletionShell` (e.g. cmd.exe) prints nothing: the installer
+            // has no line for it and the old bash fallback was wrong. The
+            // fallback is `effective_shell`, the seeded value, not `$SHELL`.
+            if let Some(detected) =
+                init_detect_shell_for_handoff(answers.shell.as_deref(), effective_shell.as_deref())
+            {
+                let line = init_shell_init_line(&detected);
+                let source_hint = init_shell_source_hint(&detected);
+                let _ = writeln!(
+                    output,
+                    "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+                );
+            }
+            let _ = output.flush();
         }
         0
     }

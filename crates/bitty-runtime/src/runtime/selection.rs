@@ -123,12 +123,21 @@ pub(crate) struct SelectionState {
     /// Readers subtract the drift so a selection survives ordinary pruning
     /// and denies only when an endpoint was actually evicted (issue #2470).
     pub(crate) evicted_at: u64,
+    /// `State::scrollback_len()` when [`Self::buffer`] was bound (`bitty#3040`).
+    ///
+    /// Distinguishes scrollback-anchored rows (`buffer_row < scrollback_len_at_start`)
+    /// from live-grid rows (`buffer_row >= scrollback_len_at_start`) when `ED 3`
+    /// (`CSI 3 J`) clears the scrollback ring (`sb_len == 0`), and provides the
+    /// rebase delta for purely live-grid selections after a scrollback clear.
+    pub(crate) scrollback_len_at_start: usize,
     /// `State::buffer_epoch()` when [`Self::press_buffer`] was captured.
     pub(crate) press_epoch: u64,
     /// `State::scrollback_evicted_total()` when [`Self::press_buffer`] was
     /// captured. Drag extension rebases the press row with this baseline so a
     /// prune between pointer events cannot silently move the anchor.
     pub(crate) press_evicted_at: u64,
+    /// `State::scrollback_len()` when [`Self::press_buffer`] was captured (`bitty#3040`).
+    pub(crate) press_scrollback_len_at_start: usize,
     /// Whether a pointer drag is currently extending `selection`.
     pub(crate) dragging: bool,
     /// Whether `selection` is a deliberately selected single cell
@@ -553,27 +562,56 @@ impl Runtime {
         sel: SelectionState,
         state: &State,
     ) -> Option<SelectionState> {
-        let Some(pers) = sel.buffer else {
-            return Some(sel);
-        };
         let sb_len = state.scrollback_len();
         let epoch_changed = state.buffer_epoch() != sel.epoch;
-        let drift = if epoch_changed {
+        let Some(pers) = sel.buffer else {
+            if (epoch_changed || sb_len < sel.scrollback_len_at_start)
+                && sb_len == 0
+                && sel.scrollback_len_at_start > 0
+                && self.is_viewport_scrolled(sel.owner)
+            {
+                return None;
+            }
+            return Some(SelectionState {
+                epoch: state.buffer_epoch(),
+                evicted_at: state.scrollback_evicted_total(),
+                scrollback_len_at_start: sb_len,
+                press_epoch: state.buffer_epoch(),
+                press_evicted_at: state.scrollback_evicted_total(),
+                press_scrollback_len_at_start: sb_len,
+                ..sel
+            });
+        };
+        let evicted_since_start = usize::try_from(
+            state
+                .scrollback_evicted_total()
+                .checked_sub(sel.evicted_at)?,
+        )
+        .ok()?;
+        let old_sb_len = sel.scrollback_len_at_start;
+        let drift = if epoch_changed || sb_len < old_sb_len {
             if pers.anchor_line_id.is_some()
                 || pers.focus_line_id.is_some()
+                || pers.anchor.buffer_row < old_sb_len
+                || pers.focus.buffer_row < old_sb_len
                 || pers.anchor.buffer_row < sb_len
                 || pers.focus.buffer_row < sb_len
             {
                 return None;
             }
-            0usize
+            if sb_len < old_sb_len {
+                if (evicted_since_start == 0 || evicted_since_start == old_sb_len) && sb_len == 0 {
+                    old_sb_len
+                } else {
+                    return None;
+                }
+            } else if evicted_since_start == 0 {
+                0usize
+            } else {
+                return None;
+            }
         } else {
-            usize::try_from(
-                state
-                    .scrollback_evicted_total()
-                    .checked_sub(sel.evicted_at)?,
-            )
-            .ok()?
+            evicted_since_start
         };
         let shift = |pos: BufferPos| -> Option<BufferPos> {
             pos.buffer_row
@@ -582,20 +620,46 @@ impl Runtime {
         };
         let anchor = shift(pers.anchor)?;
         let focus = shift(pers.focus)?;
+        let adjusted_pers = PersistentSelection {
+            anchor,
+            focus,
+            ..pers
+        };
         let press_buffer = match sel.press_buffer {
             Some(press) => {
                 // A drag press is only meaningful on the identity it was
-                // captured on: a reflow/reset invalidates it, a prune rebases
-                // it with its own eviction baseline.
-                if state.buffer_epoch() != sel.press_epoch {
-                    return None;
-                }
-                let press_drift = usize::try_from(
+                // captured on: a reflow/reset or history clear invalidates a
+                // history press, while a pure `ED 3` rebases a live-grid press
+                // and a prune rebases with its own eviction baseline.
+                let press_evicted_since_start = usize::try_from(
                     state
                         .scrollback_evicted_total()
                         .checked_sub(sel.press_evicted_at)?,
                 )
                 .ok()?;
+                let press_old_sb_len = sel.press_scrollback_len_at_start;
+                let press_epoch_changed = state.buffer_epoch() != sel.press_epoch;
+                let press_drift = if press_epoch_changed || sb_len < press_old_sb_len {
+                    if press.buffer_row < press_old_sb_len || press.buffer_row < sb_len {
+                        return None;
+                    }
+                    if sb_len < press_old_sb_len {
+                        if (press_evicted_since_start == 0
+                            || press_evicted_since_start == press_old_sb_len)
+                            && sb_len == 0
+                        {
+                            press_old_sb_len
+                        } else {
+                            return None;
+                        }
+                    } else if press_evicted_since_start == 0 {
+                        0usize
+                    } else {
+                        return None;
+                    }
+                } else {
+                    press_evicted_since_start
+                };
                 Some(
                     press
                         .buffer_row
@@ -605,19 +669,23 @@ impl Runtime {
             }
             None => None,
         };
+        let selection = if sb_len < old_sb_len && self.is_viewport_scrolled(sel.owner) {
+            self.project_persistent(&adjusted_pers, sel.owner)?
+        } else {
+            sel.selection
+        };
         Some(SelectionState {
-            buffer: Some(PersistentSelection {
-                anchor,
-                focus,
-                ..pers
-            }),
+            selection,
+            buffer: Some(adjusted_pers),
             press_buffer,
             // The returned copy is current: re-basing the clocks keeps a
             // subsequent install from applying the same drift twice.
             epoch: state.buffer_epoch(),
             evicted_at: state.scrollback_evicted_total(),
+            scrollback_len_at_start: sb_len,
             press_epoch: state.buffer_epoch(),
             press_evicted_at: state.scrollback_evicted_total(),
+            press_scrollback_len_at_start: sb_len,
             ..sel
         })
     }
@@ -653,8 +721,12 @@ impl Runtime {
         anchor_press: Option<CellPos>,
         dragging: bool,
     ) {
-        let (epoch, evicted_at) = self.live_view_state(owner).map_or((0, 0), |state| {
-            (state.buffer_epoch(), state.scrollback_evicted_total())
+        let (epoch, evicted_at, sb_len) = self.live_view_state(owner).map_or((0, 0, 0), |state| {
+            (
+                state.buffer_epoch(),
+                state.scrollback_evicted_total(),
+                state.scrollback_len(),
+            )
         });
         self.selection_state = Some(SelectionState {
             owner,
@@ -665,8 +737,10 @@ impl Runtime {
             press_buffer: None,
             epoch,
             evicted_at,
+            scrollback_len_at_start: sb_len,
             press_epoch: epoch,
             press_evicted_at: evicted_at,
+            press_scrollback_len_at_start: sb_len,
             dragging,
             single_cell: false,
         });
@@ -2960,5 +3034,170 @@ impl Runtime {
     #[must_use]
     pub fn paste_truncated_pastes(&self) -> u64 {
         self.paste_truncated_pastes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RuntimeConfig;
+
+    #[test]
+    fn selection_in_scrollback_invalidated_on_ed3_3040() {
+        let mut rt = Runtime::new(RuntimeConfig {
+            scrollback: 50,
+            ..RuntimeConfig::default()
+        })
+        .expect("headless runtime");
+        rt.force_headless_clipboard();
+        for i in 0..40 {
+            rt.handle_pty_bytes(format!("ROW-{i:03}\r\n").as_bytes());
+        }
+        let owner = rt.primary_view().expect("primary view");
+        let sb_len = rt.state().scrollback_len();
+        assert!(sb_len > 5, "scrollback must be populated");
+
+        // Build a persistent selection anchored in scrollback even with line IDs
+        // stripped (`None`), proving `scrollback_len_at_start` catches `ED 3`
+        // when `sb_len` drops to 0.
+        rt.install_selection(
+            owner,
+            Selection {
+                anchor: CellPos::new(0, 0),
+                focus: CellPos::new(0, 6),
+                kind: SelectionKind::Simple,
+                active: false,
+            },
+            None,
+            false,
+        );
+        rt.restore_selection_meta(
+            None,
+            false,
+            Some(PersistentSelection {
+                anchor: BufferPos::new(0, 0),
+                anchor_line_id: None,
+                focus: BufferPos::new(0, 6),
+                focus_line_id: None,
+                kind: SelectionKind::Simple,
+                active: false,
+            }),
+            None,
+        );
+        assert_eq!(rt.selection_text().as_deref(), Some("ROW-000"));
+
+        // Clear scrollback via CSI 3 J (ED 3): `sb_len` becomes 0 and
+        // `evicted_since_start == 0`. The scrollback selection must be
+        // invalidated rather than resolving onto live grid row 0.
+        rt.handle_pty_bytes(b"\x1b[3J");
+        assert_eq!(rt.state().scrollback_len(), 0);
+        assert!(
+            !rt.has_selection(),
+            "scrollback selection must invalidate on ED 3"
+        );
+        assert_eq!(rt.selection_text(), None);
+        assert_eq!(rt.selection(), None);
+    }
+
+    #[test]
+    fn selection_in_live_grid_rebased_or_invalidated_on_ed3_3040() {
+        let mut rt = Runtime::new(RuntimeConfig {
+            scrollback: 20,
+            ..RuntimeConfig::default()
+        })
+        .expect("headless runtime");
+        rt.force_headless_clipboard();
+        for i in 0..35 {
+            rt.handle_pty_bytes(format!("LINE-{i:03}\r\n").as_bytes());
+        }
+        let owner = rt.primary_view().expect("primary view");
+        let sb_len = rt.state().scrollback_len();
+        assert!(sb_len > 0, "scrollback must be non-empty before ED 3");
+
+        // Select live-grid row 2 (combined buffer_row = sb_len + 2).
+        let live_row = 2usize;
+        let pers = PersistentSelection {
+            anchor: BufferPos::new(sb_len + live_row, 0),
+            anchor_line_id: None,
+            focus: BufferPos::new(sb_len + live_row, 7),
+            focus_line_id: None,
+            kind: SelectionKind::Simple,
+            active: false,
+        };
+        rt.install_selection(
+            owner,
+            Selection {
+                anchor: CellPos::new(live_row as u16, 0),
+                focus: CellPos::new(live_row as u16, 7),
+                kind: SelectionKind::Simple,
+                active: false,
+            },
+            None,
+            false,
+        );
+        rt.restore_selection_meta(None, false, Some(pers), None);
+        let expected = rt
+            .selection_text()
+            .expect("live selection text before ED 3");
+        assert!(
+            expected.starts_with("LINE-"),
+            "unexpected text: {expected:?}"
+        );
+
+        // Pure ED 3 (`CSI 3 J`) with no intervening scrollback eviction rebases
+        // `buffer_row` by subtracting `scrollback_len_at_start` (`sb_len`).
+        rt.handle_pty_bytes(b"\x1b[3J");
+        assert_eq!(rt.state().scrollback_len(), 0);
+        assert!(rt.has_selection(), "live selection must survive pure ED 3");
+        assert_eq!(
+            rt.selection_text().as_deref(),
+            Some(expected.as_str()),
+            "live selection must map to the same live-grid row after ED 3"
+        );
+        let rebased = rt
+            .persistent_selection()
+            .expect("rebased persistent selection");
+        assert_eq!(rebased.anchor.buffer_row, live_row);
+        assert_eq!(rebased.focus.buffer_row, live_row);
+
+        // If scrollback eviction AND ED 3 both occurred since the selection was
+        // bound, exact rebasing is ambiguous and must fail closed (`None`).
+        for i in 100..130 {
+            rt.handle_pty_bytes(format!("MORE-{i:03}\r\n").as_bytes());
+        }
+        let sb_len2 = rt.state().scrollback_len();
+        assert_eq!(sb_len2, 20);
+        rt.install_selection(
+            owner,
+            Selection {
+                anchor: CellPos::new(1, 0),
+                focus: CellPos::new(1, 7),
+                kind: SelectionKind::Simple,
+                active: false,
+            },
+            None,
+            false,
+        );
+        rt.restore_selection_meta(
+            None,
+            false,
+            Some(PersistentSelection {
+                anchor: BufferPos::new(sb_len2 + 1, 0),
+                anchor_line_id: None,
+                focus: BufferPos::new(sb_len2 + 1, 7),
+                focus_line_id: None,
+                kind: SelectionKind::Simple,
+                active: false,
+            }),
+            None,
+        );
+        // Cause eviction (>0 lines evicted) and then ED 3.
+        rt.handle_pty_bytes(b"EVICT-1\r\nEVICT-2\r\n\x1b[3J");
+        assert_eq!(rt.state().scrollback_len(), 0);
+        assert!(
+            !rt.has_selection(),
+            "selection must fail closed when eviction and ED 3 both occurred"
+        );
+        assert_eq!(rt.selection_text(), None);
     }
 }

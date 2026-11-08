@@ -850,3 +850,45 @@ fn drag_wheel_and_page_keys_scroll_the_detached_float_owner() {
         "the committed float range keeps the resolved span"
     );
 }
+
+#[test]
+fn ed3_invalidates_scrollback_selection_and_rebases_live_grid_selection_3040() {
+    let mut rt = make_runtime();
+    feed_lines(&mut rt, 0, 80);
+    rt.tick().expect("warm-up frame presents");
+    let id = view_id(&rt);
+    assert!(rt.state().scrollback_len() > 20, "scrollback must exist");
+
+    // (a) Scroll into scrollback and select a history row; ED 3 (`\x1b[3J`)
+    // must invalidate the selection so it never copies live-grid text.
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 5.0));
+    assert!(scroll_offset(&rt) > 0);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 0, 0));
+    press(&mut rt);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 1, line_edge()));
+    release(&mut rt);
+    assert!(rt.selection_text().is_some());
+    rt.handle_pty_bytes(b"\x1b[3J");
+    assert_eq!(rt.state().scrollback_len(), 0);
+    assert!(
+        !rt.has_selection(),
+        "scrollback selection must invalidate on ED 3"
+    );
+    assert_eq!(rt.selection_text(), None);
+
+    // (b) Re-populate scrollback, snap to live, and select two live-grid rows;
+    // ED 3 (`\x1b[3J`) must rebase `buffer_row` by subtracting `scrollback_len_at_start`.
+    feed_lines(&mut rt, 100, 80);
+    rt.handle_wheel(ScrollDelta::Lines(0.0, -100.0));
+    assert_eq!(scroll_offset(&rt), 0);
+    assert!(rt.state().scrollback_len() > 20);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 5, 0));
+    press(&mut rt);
+    rt.handle_cursor_moved(cell_edge(&rt, id, 6, line_edge()));
+    release(&mut rt);
+    let expected = rt.selection_text().expect("live selection before ED 3");
+    rt.handle_pty_bytes(b"\x1b[3J");
+    assert_eq!(rt.state().scrollback_len(), 0);
+    assert!(rt.has_selection(), "live selection must survive pure ED 3");
+    assert_eq!(rt.selection_text().as_deref(), Some(expected.as_str()));
+}

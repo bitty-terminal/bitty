@@ -1409,7 +1409,12 @@ mod tests {
             LayoutNode::leaf(View::new(primary, 80, 24)),
             LayoutNode::leaf(View::new(sessionless_other, 80, 24)),
         ));
-        let url = format!("file://{}", dir.to_string_lossy().replace('\\', "/"));
+        let path = dir.to_string_lossy().replace('\\', "/");
+        let url = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
         rt.handle_pty_bytes(format!("\x1b]7;{url}\x07").as_bytes());
 
         // When the primary owner is focused, a new pane inherits its OSC 7 directory.

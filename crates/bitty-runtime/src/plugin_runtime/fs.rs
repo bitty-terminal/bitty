@@ -74,6 +74,12 @@ pub struct NativeFileSystem;
 
 #[cfg(any(target_os = "macos", windows))]
 fn path_for_bounded_traversal(path: &Path) -> PathBuf {
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir) || c.as_os_str() == "..")
+    {
+        return path.to_path_buf();
+    }
     let temp_dir = std::env::temp_dir();
     if path.is_absolute() && path.starts_with(&temp_dir) {
         if let (Ok(canonical_temp), Ok(relative)) =
@@ -87,6 +93,15 @@ fn path_for_bounded_traversal(path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir) || c.as_os_str() == "..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parent or prefix path component",
+        ));
+    }
     #[cfg(target_os = "macos")]
     let path = path_for_bounded_traversal(path);
     let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })?;
@@ -168,6 +183,15 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
 fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir) || c.as_os_str() == "..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "parent or prefix path component",
+        ));
+    }
     let path = path_for_bounded_traversal(path);
     let mut accumulated = PathBuf::new();
     let mut components = path.components().peekable();
@@ -185,6 +209,15 @@ fn open_bounded_regular_file(path: &Path) -> io::Result<std::fs::File> {
                 ));
             }
             Component::Normal(name) => {
+                if name == ".." {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "parent or prefix path component",
+                    ));
+                }
+                if name == "." {
+                    continue;
+                }
                 saw_normal = true;
                 accumulated.push(name);
             }

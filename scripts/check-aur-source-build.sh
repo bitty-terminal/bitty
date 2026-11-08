@@ -146,10 +146,14 @@ if [[ "$EUID" -eq 0 && -z "${AUR_GATE_AS_BUILDER:-}" ]]; then
     die "cannot create the unprivileged 'builder' account"
   # Full mode uses makepkg --syncdeps, which installs the recipe's declared
   # dependencies through sudo. Grant the throwaway build account that one
-  # privilege inside the (ephemeral, CI-only) container; nothing is granted to
-  # it on a developer host, where the gate runs unprivileged and sudo prompts
-  # normally.
+  # privilege — but only inside a container, where the rule dies with the
+  # sandbox. Running the gate as root on a developer host must not silently
+  # leave a passwordless sudo rule behind: there, run it as your normal user
+  # and let makepkg prompt.
   if [[ "$MODE" == full ]]; then
+    if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
+      die "refusing to run --mode full as root outside a container; run it as your normal user so makepkg --syncdeps can use your sudo"
+    fi
     command -v sudo >/dev/null 2>&1 ||
       die "full mode needs sudo for makepkg --syncdeps (pacman -S --needed sudo)"
     printf 'builder ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/aur-gate-builder

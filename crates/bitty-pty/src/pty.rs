@@ -180,6 +180,9 @@ impl Pty {
     /// where there is no process-group surface at all, or a dead PTY) —
     /// callers must treat it as *not busy*, never invent a guess.
     pub fn foreground_job(&self) -> Option<ForegroundJob> {
+        if self.reaped {
+            return None;
+        }
         let child = self.pid()?;
         let fg = foreground_job_pid(Some(child), self.foreground_pgid())?;
         let name = process_name(fg);
@@ -252,6 +255,13 @@ impl Pty {
         self.wait()
     }
 
+    fn mark_reaped(&mut self) {
+        self.reaped = true;
+        if let Some(tree) = &self.tree {
+            tree.retire(|| ());
+        }
+    }
+
     /// Polls whether the child has exited without blocking.
     ///
     /// Errors with [`PtyError::ChildAlreadyReaped`] once a previous
@@ -262,7 +272,7 @@ impl Pty {
         }
         let status = self.session.try_wait()?;
         if status.is_some() {
-            self.reaped = true;
+            self.mark_reaped();
         }
         Ok(status)
     }
@@ -273,7 +283,7 @@ impl Pty {
             return Err(PtyError::ChildAlreadyReaped);
         }
         let status = self.session.wait()?;
-        self.reaped = true;
+        self.mark_reaped();
         Ok(status)
     }
 
@@ -305,7 +315,7 @@ impl Pty {
         loop {
             let status = self.session.try_wait()?;
             if status.is_some() {
-                self.reaped = true;
+                self.mark_reaped();
                 return Ok(status);
             }
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -585,6 +595,68 @@ mod tests {
         // Clean teardown: shutdown kills + reaps the shell (SIGHUP reaches
         // the foreground group as the session dies).
         pty.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn reaping_pty_retires_owned_tree_and_clears_foreground_job() {
+        bitty_test_support::require_pty!();
+        for mode in ["wait", "try_wait", "wait_timeout"] {
+            let mut pty = crate::PtyBuilder::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn sh");
+            if let Some(tree) = pty.tree() {
+                assert!(
+                    !tree.is_retired(),
+                    "tree must not be retired before reaping ({mode})"
+                );
+            }
+            match mode {
+                "wait" => {
+                    let status = pty.wait().expect("wait");
+                    assert!(status.is_success());
+                }
+                "try_wait" => {
+                    let status = wait_until(Duration::from_secs(10), || {
+                        pty.try_wait().expect("try_wait")
+                    });
+                    assert!(status.is_success());
+                }
+                "wait_timeout" => {
+                    let status = pty
+                        .wait_timeout(Duration::from_secs(10))
+                        .expect("wait_timeout")
+                        .expect("exited in time");
+                    assert!(status.is_success());
+                }
+                _ => unreachable!(),
+            }
+            assert!(pty.is_reaped());
+            assert_eq!(
+                pty.foreground_job(),
+                None,
+                "reaped pty must not report a foreground job ({mode})"
+            );
+            if let Some(tree) = pty.tree() {
+                assert!(
+                    tree.is_retired(),
+                    "reaping pty must retire its owned tree ({mode})"
+                );
+                assert_eq!(
+                    tree.signal(crate::TreeSignal::Kill)
+                        .expect_err("retired tree must refuse signals")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert_eq!(
+                    tree.leader_exit()
+                        .expect_err("retired tree must refuse leader_exit")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+        }
     }
 }
 

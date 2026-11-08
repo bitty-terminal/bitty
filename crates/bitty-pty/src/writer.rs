@@ -119,6 +119,9 @@ impl WriteQueue {
         if state.failed || state.closed {
             return Err(io::Error::from(io::ErrorKind::BrokenPipe));
         }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if state.bytes.saturating_add(buf.len()) > QUEUED_WRITE_MAX_BYTES
             || state.commands.len() >= QUEUED_WRITE_MAX_COMMANDS
         {
@@ -140,7 +143,9 @@ impl WriteQueue {
         if state.failed || state.closed {
             return Ok(());
         }
-        if state.commands.len() < QUEUED_WRITE_MAX_COMMANDS {
+        if !matches!(state.commands.back(), Some(WriteCommand::Flush))
+            && state.commands.len() < QUEUED_WRITE_MAX_COMMANDS
+        {
             state.commands.push_back(WriteCommand::Flush);
             drop(state);
             self.ready.notify_one();
@@ -818,5 +823,37 @@ mod tests {
         );
         assert!(overflowed, "queue must fail closed instead of growing");
         assert!(writer.queued_bytes() <= QUEUED_WRITE_MAX_BYTES);
+    }
+
+    #[test]
+    fn empty_writes_and_repeated_flushes_do_not_exhaust_command_slots() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut writer = PtyWriter::new_queued(Box::new(GatedWriter {
+            entered: entered_tx,
+            release: release_rx,
+            recorded,
+            gate: std::sync::atomic::AtomicBool::new(true),
+        }));
+
+        writer.write_all(b"first").expect("first write");
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer thread must enter the sink");
+
+        for _ in 0..(QUEUED_WRITE_MAX_COMMANDS * 2) {
+            assert_eq!(writer.write(b"").expect("empty write"), 0);
+            writer.flush().expect("coalesced flush");
+        }
+        assert_eq!(
+            writer.queued_bytes(),
+            0,
+            "empty writes and flushes must not accumulate queued bytes"
+        );
+        writer
+            .write_all(b"real payload")
+            .expect("command slots must remain available after empty writes and flushes");
+        assert_eq!(writer.queued_bytes(), b"real payload".len());
     }
 }

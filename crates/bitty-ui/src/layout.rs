@@ -351,14 +351,18 @@ impl LayoutNode {
                     return true;
                 }
                 if overlay.contains_leaf(id) {
-                    let max_x = container.x as i32 + container.width as i32 - 1;
-                    let max_y = container.y as i32 + container.height as i32 - 1;
-                    let nx = (bounds.x as i32 + dx)
-                        .clamp(container.x as i32, max_x.max(container.x as i32));
-                    let ny = (bounds.y as i32 + dy)
-                        .clamp(container.y as i32, max_y.max(container.y as i32));
-                    bounds.x = nx.max(0) as u16;
-                    bounds.y = ny.max(0) as u16;
+                    let min_x = i64::from(container.x);
+                    let min_y = i64::from(container.y);
+                    let max_x = (min_x + i64::from(container.width) - 1)
+                        .max(min_x)
+                        .min(i64::from(u16::MAX));
+                    let max_y = (min_y + i64::from(container.height) - 1)
+                        .max(min_y)
+                        .min(i64::from(u16::MAX));
+                    let nx = (i64::from(bounds.x) + i64::from(dx)).clamp(min_x, max_x);
+                    let ny = (i64::from(bounds.y) + i64::from(dy)).clamp(min_y, max_y);
+                    bounds.x = nx.clamp(0, i64::from(u16::MAX)) as u16;
+                    bounds.y = ny.clamp(0, i64::from(u16::MAX)) as u16;
                     return true;
                 }
                 // The leaf lives in (or below) the base: a nested float
@@ -975,7 +979,7 @@ impl LayoutNode {
         let Some(current) = self.split_ratio_at(path) else {
             return false;
         };
-        let next = current + (f32::from(delta_cells as i16) / f32::from(total_cells));
+        let next = current + ((delta_cells as f32) / f32::from(total_cells));
         self.set_split_ratio_at(path, next)
     }
 
@@ -2283,11 +2287,11 @@ pub fn balanced_bisect_choice(
 /// Helper used by `focus` for deterministic leaf adjacency.
 #[must_use]
 pub fn overlap_len(a_start: u32, a_len: u32, b_start: u32, b_len: u32) -> u32 {
-    let a_end = a_start + a_len;
-    let b_end = b_start + b_len;
-    let left = a_start.max(b_start);
+    let a_end = u64::from(a_start) + u64::from(a_len);
+    let b_end = u64::from(b_start) + u64::from(b_len);
+    let left = u64::from(a_start.max(b_start));
     let right = a_end.min(b_end);
-    right.saturating_sub(left)
+    right.saturating_sub(left) as u32
 }
 
 /// Minimum usable pane width in cells (issues #2521/#2528).
@@ -4860,5 +4864,62 @@ mod tests {
             LayoutNode::leaf(view(1, 10, 10)).leaf_parent_axis(ViewId::new(1)),
             None
         );
+    }
+
+    #[test]
+    fn resize_split_by_drag_does_not_truncate_large_delta_cells_to_i16() {
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        // `32768 as i16` would wrap to `-32768` and shrink the split instead of growing it.
+        assert!(tree.resize_split_by_drag(&[], 32_768, 65_535));
+        let ratio = tree.split_ratio_at(&[]).expect("root split");
+        assert!(
+            ratio > 0.85,
+            "positive delta > i16::MAX must grow ratio, got {ratio}"
+        );
+
+        let mut tree_neg = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::leaf(view(2, 40, 24)),
+        );
+        assert!(tree_neg.resize_split_by_drag(&[], -40_000, 65_535));
+        let neg_ratio = tree_neg.split_ratio_at(&[]).expect("root split");
+        assert!(
+            neg_ratio < 0.15,
+            "negative delta < i16::MIN must shrink ratio, got {neg_ratio}"
+        );
+    }
+
+    #[test]
+    fn move_overlay_containing_and_overlap_len_do_not_overflow_at_extremes() {
+        let mut tree = LayoutNode::overlay(
+            LayoutNode::leaf(view(1, 80, 24)),
+            LayoutNode::leaf(view(2, 20, 10)),
+            Rect::new(10, 10, 20, 10),
+        );
+        let huge_container = Rect::new(50_000, 40_000, 20_000, 30_000);
+        assert!(tree.move_overlay_containing(ViewId::new(2), i32::MAX, i32::MAX, huge_container));
+        if let LayoutNode::Overlay { bounds, .. } = &tree {
+            assert_eq!(bounds.x, u16::MAX);
+            assert_eq!(bounds.y, u16::MAX);
+        } else {
+            panic!("expected overlay");
+        }
+
+        assert!(tree.move_overlay_containing(ViewId::new(2), i32::MIN, i32::MIN, huge_container));
+        if let LayoutNode::Overlay { bounds, .. } = &tree {
+            assert_eq!(bounds.x, 50_000);
+            assert_eq!(bounds.y, 40_000);
+        } else {
+            panic!("expected overlay");
+        }
+
+        assert_eq!(overlap_len(u32::MAX - 5, 10, u32::MAX - 2, 10), 7);
     }
 }

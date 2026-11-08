@@ -125,16 +125,16 @@ impl Rect {
         }
         let x1 = self.x.max(other.x);
         let y1 = self.y.max(other.y);
-        let x2 = (self.right().min(other.right())) as u16;
-        let y2 = (self.bottom().min(other.bottom())) as u16;
-        if x2 <= x1 || y2 <= y1 {
+        let x2 = self.right().min(other.right());
+        let y2 = self.bottom().min(other.bottom());
+        if x2 <= u32::from(x1) || y2 <= u32::from(y1) {
             return None;
         }
         Some(Rect {
             x: x1,
             y: y1,
-            width: x2 - x1,
-            height: y2 - y1,
+            width: (x2 - u32::from(x1)) as u16,
+            height: (y2 - u32::from(y1)) as u16,
         })
     }
 
@@ -313,5 +313,19 @@ mod tests {
         );
         assert!(!r.contains_point(Point::new(9, 5)));
         assert!(!Rect::new(0, 0, 0, 5).contains_point(Point::new(0, 0)));
+    }
+
+    #[test]
+    fn intersection_and_clip_to_do_not_truncate_right_or_bottom_past_u16_max() {
+        let wide = Rect::new(10, 20, u16::MAX, u16::MAX);
+        assert_eq!(wide.intersection(wide), Some(wide));
+        assert_eq!(wide.clip_to(wide), Some(wide));
+
+        let a = Rect::new(50_000, 40_000, 20_000, 30_000);
+        let b = Rect::new(60_000, 50_000, 15_000, 25_000);
+        assert_eq!(
+            a.intersection(b),
+            Some(Rect::new(60_000, 50_000, 10_000, 20_000))
+        );
     }
 }

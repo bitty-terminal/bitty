@@ -1582,9 +1582,11 @@ impl Runtime {
                             self.float_offsets.get(&id).copied().unwrap_or((0, 0));
                         let bounds = UiRect::new(
                             (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             anchor.size.0,
                             anchor.size.1,
                         );
@@ -1614,9 +1616,11 @@ impl Runtime {
                             self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
                         let bounds = UiRect::new(
                             (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             anchor.size.0,
                             anchor.size.1,
                         );
@@ -3732,11 +3736,11 @@ impl Runtime {
     fn panel_split_plan_for(&self, focused: ViewId) -> Option<PanelSplitPlan> {
         let gap_in = self.gaps().inner;
         let allocations = self.layout_allocations();
-        let focused_rect = allocations
+        let focused_alloc = allocations
             .iter()
             .find(|(id, _)| *id == focused)
-            .map(|(_, rect)| *rect)
-            .unwrap_or(self.container);
+            .map(|(_, rect)| *rect);
+        let focused_rect = focused_alloc.unwrap_or(self.container);
         let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
             PanelLayoutMode::Balanced => {
                 let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
@@ -3747,30 +3751,43 @@ impl Runtime {
                 let (_, axis) = bisect_choice(&allocations, self.container);
                 (target, rect, axis, false, None)
             }
-            PanelLayoutMode::Dwindle => (
-                focused,
-                focused_rect,
-                splittable_axis(focused_rect, gap_in)?,
-                false,
-                None,
-            ),
+            PanelLayoutMode::Dwindle => {
+                if focused_alloc.is_some() {
+                    (
+                        focused,
+                        focused_rect,
+                        splittable_axis(focused_rect, gap_in)?,
+                        false,
+                        None,
+                    )
+                } else {
+                    let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                    (target, rect, axis, false, None)
+                }
+            }
             PanelLayoutMode::Spiral => {
-                let phase = self.panel_spiral_phase(focused);
-                match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
-                    Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
-                    None => {
-                        // Issue #2571 review: the focused Spiral slot can
-                        // exhaust on a normal window (80x24 stops after five
-                        // presses) long before the tiling is full. Fall back
-                        // to the deterministic Balanced target -- the
-                        // largest feasible leaf, first in solver order on ties --
-                        // so `Mod+N` keeps the 0.0.27 capacity instead of
-                        // dropping the chord. `spiral_phase: None` marks the
-                        // fallback and restarts the chain on the fresh pane;
-                        // the app logs one bounded warning for it. `None`
-                        // here now means no leaf can host two usable panes.
-                        let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
-                        (target, rect, axis, false, None)
+                if focused_alloc.is_none() {
+                    let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                    (target, rect, axis, false, None)
+                } else {
+                    let phase = self.panel_spiral_phase(focused);
+                    match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
+                        Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
+                        None => {
+                            // Issue #2571 review: the focused Spiral slot can
+                            // exhaust on a normal window (80x24 stops after five
+                            // presses) long before the tiling is full. Fall back
+                            // to the deterministic Balanced target -- the
+                            // largest feasible leaf, first in solver order on ties --
+                            // so `Mod+N` keeps the 0.0.27 capacity instead of
+                            // dropping the chord. `spiral_phase: None` marks the
+                            // fallback and restarts the chain on the fresh pane;
+                            // the app logs one bounded warning for it. `None`
+                            // here now means no leaf can host two usable panes.
+                            let (target, rect, axis) =
+                                largest_splittable_leaf(&allocations, gap_in)?;
+                            (target, rect, axis, false, None)
+                        }
                     }
                 }
             }
@@ -3961,6 +3978,16 @@ impl Runtime {
                 if leaf.fixed_size().is_none() {
                     leaf.set_fixed_size(Some(size));
                 }
+            }
+            if let Some(stored) = slot.floats.find_mut(view) {
+                if stored.fixed_size().is_none() {
+                    stored.set_fixed_size(Some(size));
+                }
+            }
+        }
+        if let Some(stored) = self.floats.find_mut(view) {
+            if stored.fixed_size().is_none() {
+                stored.set_fixed_size(Some(size));
             }
         }
         if let Some(stored) = self.pinned.find_mut(view) {

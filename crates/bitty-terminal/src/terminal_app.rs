@@ -4027,7 +4027,9 @@ impl TerminalApp {
                 if self.runtime.pinned_views().contains(&id) {
                     continue;
                 }
-                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                if self.runtime.floated_views().contains(&id)
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1)
+                {
                     self.restore_zoom();
                 }
                 if let Err(error) = self.runtime.pin_floating(id) {
@@ -4039,9 +4041,7 @@ impl TerminalApp {
                     });
                 }
             } else if self.runtime.pinned_views().contains(&id) {
-                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
-                    self.restore_zoom();
-                }
+                self.restore_zoom();
                 if let Err(error) = self.runtime.unpin_floating(id) {
                     crate::logging::warn(|| {
                         format!(
@@ -4050,7 +4050,9 @@ impl TerminalApp {
                         )
                     });
                 }
-            } else if !self.runtime.layout().leaf_ids().contains(&id) {
+            } else if !self.runtime.layout().leaf_ids().contains(&id)
+                && !self.runtime.floated_views().contains(&id)
+            {
                 crate::logging::warn(|| {
                     format!(
                         "bitty: plugin pin request dropped (unknown panel id {})",

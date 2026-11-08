@@ -275,6 +275,20 @@ impl Runtime {
                     if let Some(leaf) = self.layout.find_leaf_mut(owner) {
                         leaf.resize(w, h);
                     }
+                    if let Some(stored) = self.floats.find_mut(owner) {
+                        stored.resize(w, h);
+                    }
+                    for slot in &mut self.workspaces {
+                        if let Some(leaf) = slot.layout.find_leaf_mut(owner) {
+                            leaf.resize(w, h);
+                        }
+                        if let Some(stored) = slot.floats.find_mut(owner) {
+                            stored.resize(w, h);
+                        }
+                    }
+                    if let Some(stored) = self.pinned.find_mut(owner) {
+                        stored.resize(w, h);
+                    }
                 }
                 if let Some(target) = rule.workspace {
                     let target_idx = (target as usize).saturating_sub(1);
@@ -745,6 +759,20 @@ impl Runtime {
                     if let Some(leaf) = self.layout.find_leaf_mut(view) {
                         leaf.resize(w, h);
                     }
+                    if let Some(stored) = self.floats.find_mut(view) {
+                        stored.resize(w, h);
+                    }
+                    for slot in &mut self.workspaces {
+                        if let Some(leaf) = slot.layout.find_leaf_mut(view) {
+                            leaf.resize(w, h);
+                        }
+                        if let Some(stored) = slot.floats.find_mut(view) {
+                            stored.resize(w, h);
+                        }
+                    }
+                    if let Some(stored) = self.pinned.find_mut(view) {
+                        stored.resize(w, h);
+                    }
                     self.stamp_rule_fixed_size(view, rule, cols, rows);
                 }
             } else if rule.width.is_some() || rule.height.is_some() {
@@ -752,6 +780,20 @@ impl Runtime {
                 let h = spawn_rule_dim(rule.height).unwrap_or(rows) as usize;
                 if let Some(leaf) = self.layout.find_leaf_mut(view) {
                     leaf.resize(w, h);
+                }
+                if let Some(stored) = self.floats.find_mut(view) {
+                    stored.resize(w, h);
+                }
+                for slot in &mut self.workspaces {
+                    if let Some(leaf) = slot.layout.find_leaf_mut(view) {
+                        leaf.resize(w, h);
+                    }
+                    if let Some(stored) = slot.floats.find_mut(view) {
+                        stored.resize(w, h);
+                    }
+                }
+                if let Some(stored) = self.pinned.find_mut(view) {
+                    stored.resize(w, h);
                 }
                 self.stamp_rule_fixed_size(view, rule, cols, rows);
             }

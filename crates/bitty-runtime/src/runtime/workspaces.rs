@@ -645,6 +645,23 @@ impl Runtime {
     /// unsupported mode, or pinning the live layout's last leaf (an empty
     /// live layout would strand focus and present).
     pub fn pin_floating(&mut self, id: ViewId) -> Result<(), String> {
+        if !self.pinned.contains(id) && self.floats.contains(id) {
+            let mut view = self
+                .floats
+                .discard(id)
+                .ok_or_else(|| bitty_ui::PinnedError::LeafNotFound(id).to_string())?;
+            let _ = bitty_ui::PresentationMode::request_transition(
+                &mut view,
+                bitty_ui::PresentationMode::Floating,
+            );
+            let anchor = self.layout.leaf_ids().first().copied();
+            self.pinned.restore(view, anchor, true);
+            self.float_offsets.remove(&id);
+            self.pinned_offsets.remove(&id);
+            self.clear_anchored_overlay_size(id);
+            self.after_scratchpad_move(Some(id));
+            return Ok(());
+        }
         self.pinned
             .pin(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
@@ -1109,8 +1126,17 @@ impl Runtime {
         self.clear_hover_pending();
         if let Some(id) = hidden {
             if self.focus.focused() == Some(id) {
-                if let Some(first) = self.layout.leaf_ids().into_iter().next() {
+                if let Some(first) = self
+                    .layout
+                    .leaf_ids()
+                    .into_iter()
+                    .next()
+                    .or_else(|| self.floats.paint_ids().last().copied())
+                    .or_else(|| self.pinned.ids().last().copied())
+                {
                     self.focus = Focus::with_focus(first);
+                } else {
+                    self.focus.clear();
                 }
             }
             if follow_primary && self.primary_view == Some(id) {
@@ -5490,5 +5516,163 @@ mod tests {
         );
         assert!(!rt.scratchpad_occupied(), "no dead parked leaf may linger");
         assert_eq!(rt.layout().leaf_ids(), vec![first]);
+    }
+
+    #[test]
+    fn pin_floating_detaches_from_float_store_and_preserves_focus_on_empty_base_3074() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach into float store");
+        assert!(rt.floated_views().contains(&first));
+        assert!(rt.set_focus(first));
+
+        // Pinning a detached float moves it from `floats` to `pinned` and
+        // focuses the surviving tiled leaf.
+        rt.pin_floating(first).expect("pin detached float");
+        assert!(!rt.floated_views().contains(&first));
+        assert!(rt.pinned_views().contains(&first));
+        assert_eq!(rt.focused_view(), Some(second));
+
+        // Unpinning returns it to the layout, then detaching and emptying the
+        // tiled base still keeps focus on a surviving float/pin when pinned.
+        rt.unpin_floating(first).expect("unpin");
+        rt.float_detach(first).expect("detach again");
+        let mut empty = rt.layout().clone();
+        empty.remove_leaf(second);
+        rt.set_layout_closing(empty, second);
+        assert!(rt.set_focus(first));
+        assert_eq!(rt.layout().leaf_count(), 0);
+        assert_eq!(rt.focused_view(), Some(first));
+        rt.pin_floating(first)
+            .expect("pin detached float on empty base");
+        assert!(rt.pinned_views().contains(&first));
+        assert_eq!(
+            rt.focused_view(),
+            Some(first),
+            "pinned panel over an empty base retains focus when no tiled/float leaf remains"
+        );
+    }
+
+    #[test]
+    fn panel_split_plan_for_falls_back_when_focused_view_is_detached_float_or_pin_3074() {
+        for mode in [
+            crate::PanelLayoutMode::Spiral,
+            crate::PanelLayoutMode::Dwindle,
+            crate::PanelLayoutMode::Balanced,
+            crate::PanelLayoutMode::BisectLargest,
+        ] {
+            let mut rt = fresh();
+            rt.set_panel_layout_mode(mode);
+            let first = rt.focused_view().expect("focus");
+            let second = ViewId::new(2);
+            let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+            rt.set_layout(LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(leaf1),
+                LayoutNode::leaf(View::new(second, 40, 24)),
+            ));
+            rt.float_detach(first).expect("detach");
+            assert!(rt.set_focus(first));
+            let plan = rt
+                .panel_split_plan()
+                .expect("plan must resolve even when a detached float is focused");
+            assert_eq!(
+                plan.target, second,
+                "mode {mode:?} must target the tiled leaf, not the detached float"
+            );
+
+            rt.pin_floating(first).expect("pin");
+            assert!(rt.set_focus(first));
+            let plan_pin = rt
+                .panel_split_plan()
+                .expect("plan must resolve even when a pinned panel is focused");
+            assert_eq!(
+                plan_pin.target, second,
+                "mode {mode:?} must target the tiled leaf, not the pinned panel"
+            );
+        }
+    }
+
+    #[test]
+    fn present_frames_clamps_negative_and_overflow_float_and_pin_drag_offsets_3074() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let third = ViewId::new(3);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(second, 40, 12)),
+                LayoutNode::leaf(View::new(third, 40, 12)),
+            ),
+        ));
+        rt.float_detach(first).expect("detach");
+        rt.pin_floating(second).expect("pin");
+
+        // Negative offsets larger in magnitude than the anchor origin must clamp
+        // at 0 instead of wrapping via `as u16` to ~65500.
+        rt.float_offsets.insert(first, (-500, -500));
+        rt.pinned_offsets.insert(second, (100_000, 100_000));
+        let frames = rt.present_frames();
+        let float_frame = frames
+            .iter()
+            .find(|f| f.view == first)
+            .expect("detached float frame");
+        let pin_frame = frames
+            .iter()
+            .find(|f| f.view == second)
+            .expect("pinned frame");
+        assert!(float_frame.frame.x >= 0 && float_frame.frame.y >= 0);
+        assert!(pin_frame.frame.x >= 0 && pin_frame.frame.y >= 0);
+    }
+
+    #[test]
+    fn stamp_rule_fixed_size_propagates_dimensions_to_float_store_3074() {
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf1),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.float_detach(first).expect("detach");
+        let rule = bitty_config::panel_rules::PanelSpawnRule {
+            cmd: Some("htop".to_string()),
+            cmd_regex: None,
+            title_regex: None,
+            content: None,
+            presentation: None,
+            width: Some(64),
+            height: Some(18),
+            workspace: None,
+            centered: None,
+        };
+        rt.stamp_rule_fixed_size(first, &rule, 40, 24);
+        let floated = rt
+            .floats
+            .find_mut(first)
+            .expect("floated view stays in workspace float store");
+        assert_eq!(
+            floated.fixed_size(),
+            Some(bitty_ui::Size::new(64, 18)),
+            "stamp_rule_fixed_size must stamp fixed_size on detached floats in self.floats"
+        );
     }
 }

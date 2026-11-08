@@ -1741,6 +1741,17 @@ pub struct Runtime {
     /// or per wire id. Entries survive retire so a later leaf reusing a
     /// numeric id cannot accept a stale completion.
     kitty_local_delete_epoch: std::collections::HashMap<Option<u64>, u64>,
+    /// Spanless `a=p` placements whose pixels have not landed yet
+    /// (issue #2875).
+    ///
+    /// image.nvim's "normal" kitty backend transmits with `a=t,t=f` and
+    /// then places with `a=p` and no `c=`/`r=`: the span comes from the
+    /// image's own pixel size, which the async local-medium read has not
+    /// stored yet when the placement command drains. The request is
+    /// retained here (bounded, drop-oldest) and replayed by
+    /// `Runtime::flush_pending_kitty_places` when the store lands, so a
+    /// real client's inline image paints instead of being dropped.
+    kitty_pending_places: std::collections::VecDeque<kitty_images::PendingKittyPlace>,
     /// Test-only worker deadline override in ms (`0` = production default).
     /// Unit tests only; see `runtime::kitty_file` for the contract.
     pub(crate) kitty_local_test_timeout_ms: u64,
@@ -2413,6 +2424,7 @@ impl Runtime {
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
             kitty_local_delete_epoch: std::collections::HashMap::new(),
+            kitty_pending_places: std::collections::VecDeque::new(),
             kitty_local_test_timeout_ms: 0,
             kitty_local_test_delay_ms: 0,
             kitty_local_test_panic: false,
@@ -2739,6 +2751,7 @@ impl Runtime {
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
             kitty_local_delete_epoch: std::collections::HashMap::new(),
+            kitty_pending_places: std::collections::VecDeque::new(),
             kitty_local_test_timeout_ms: 0,
             kitty_local_test_delay_ms: 0,
             kitty_local_test_panic: false,

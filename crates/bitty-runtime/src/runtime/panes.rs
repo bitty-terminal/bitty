@@ -633,6 +633,8 @@ impl Runtime {
         if let Some(handle) = old_handle {
             let _ = super::join_forwarder_with_timeout(handle, super::FORWARDER_JOIN_TIMEOUT);
         }
+        self.presented_leaf_frames.remove(&view);
+        self.presented_scene_frames.remove(&view);
         self.pane_sessions.insert(
             view,
             PaneSession {

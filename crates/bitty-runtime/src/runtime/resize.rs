@@ -514,7 +514,9 @@ impl Runtime {
             let palette = self.surface.theme_palette();
             presenter.resize(surface_extent, opacity);
             self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
-            self.pending_present = None;
+            if self.pending_present.take().is_some() {
+                self.pending_full_redraw = true;
+            }
             // bitty#2989: the confirmation described the pre-resize frame. Its
             // repair budget goes with it, so the new surface incarnation starts
             // with the full one. The *speculation* is deliberately kept

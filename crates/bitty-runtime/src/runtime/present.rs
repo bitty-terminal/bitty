@@ -628,6 +628,18 @@ pub(super) struct ImeCaret {
 /// a pathological atlas from spinning the frame loop.
 const ATLAS_REBUILD_LIMIT: u8 = 2;
 
+/// Bounded retries when a text-bearing leaf renders an empty draw list
+/// (bitty#3032).
+///
+/// The first [`EMPTY_LEAF_RETRY_LIMIT`] consecutive empty renders of one leaf
+/// owe one from-truth rebuild each so the next tick can heal it. A lesion that
+/// outlives the bound would otherwise owe one on every tick, and `present_owed()`
+/// then drives a full-frame render forever (the live 9,421-line pane = a
+/// sustained full redraw). Past the bound the leaf is simply not retained and
+/// one rate-limited stderr line names the condition, so the failure stays
+/// visible instead of silent.
+const EMPTY_LEAF_RETRY_LIMIT: u8 = ATLAS_REBUILD_LIMIT;
+
 /// Visual bell flash accent (CTX-0577): translucent amber, painted as a
 /// one-cell-high strip on the focused view's top edge. Deliberately subtle so
 /// the flash signals without obscuring content.
@@ -664,6 +676,13 @@ pub(super) struct PresentedLeaf {
     /// live-adopt must never reuse a stale factor (DEC-0113 Fix 2a,
     /// bounded to the visible leaf set).
     pub(super) fade_factor: f32,
+    /// Monochrome glyph-atlas epoch the stored glyph UVs were normalized
+    /// against (bitty#3032). Both `Atlas::try_grow` and wholesale eviction
+    /// advance the epoch; a mismatch forces a fresh leaf render.
+    pub(super) atlas_epoch: u64,
+    /// Color glyph-atlas epoch the stored color-glyph UVs were normalized
+    /// against (bitty#3032).
+    pub(super) color_atlas_epoch: u64,
     /// Complete translated cell fills.
     pub(super) fills: Vec<bitty_render::grid::FillRect>,
     /// Complete translated glyph instances (inner-arc clip attached).
@@ -760,6 +779,9 @@ struct CombinedLeaves {
     /// leaf must plan against the same epoch or the slots already collected
     /// address dead texels.
     atlas_epoch: Option<u64>,
+    /// Color-atlas epoch the color glyph slots collected so far were placed at
+    /// (bitty#3032).
+    color_atlas_epoch: Option<u64>,
 }
 
 /// Loop-invariant inputs for the per-leaf decoration ring (CTX-0386).
@@ -1280,6 +1302,21 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
+/// True when `snapshot` carries at least one cell that must emit a visible
+/// glyph (non-whitespace, non-control, non-spacer, non-concealed, and not a
+/// Kitty Unicode image placeholder). Used by the retained-leaf and
+/// scroll-shift guards so a pane whose grid holds text can never reuse or
+/// shift into a glyph-less draw list (bitty#3032).
+fn snapshot_has_visible_text(snapshot: &Snapshot) -> bool {
+    snapshot.cells.iter().any(|cell| {
+        !cell.glyph.is_whitespace()
+            && !cell.glyph.is_control()
+            && !cell.spacer
+            && !cell.style.attributes.invisible
+            && !bitty_term_state::is_kitty_placeholder(cell.glyph)
+    })
+}
+
 /// CTX-0979: Core draws no workspace display (Hyprland-style). The former
 /// workspace bar band snapshot helpers (`band_snapshot`,
 /// `overlay_status_bar`) are deleted; plugin bands paint through
@@ -1761,6 +1798,12 @@ impl Runtime {
             return None;
         }
         let retained = self.presented_leaf_frames.get(&view_id)?;
+        if retained.atlas_epoch != self.renderer.atlas_epoch()
+            || retained.color_atlas_epoch != self.renderer.color_atlas_epoch()
+            || retained.fills.is_empty()
+        {
+            return None;
+        }
         if retained.origin != (frame.content.x, frame.content.y) {
             return None;
         }
@@ -2226,7 +2269,7 @@ impl Runtime {
         if self.pending_paint_redraw || self.coalesced_pending {
             return true;
         }
-        if self.pending_full_redraw {
+        if self.pending_full_redraw || self.empty_leaf_retry_owed {
             // A cancelled presentation or an explicit invalidation that has
             // not been consumed: a reveal that never arrives strands it.
             return true;
@@ -2662,7 +2705,26 @@ impl Runtime {
         self.coalesced_deadline = Some(now);
         self.pending_full_redraw = true;
         self.hidden_repair_at = None;
+        self.speculative_present_reopen = false;
         self.clear_present_confirmation();
+    }
+
+    /// Whether the open surface gate was reopened speculatively or holds an
+    /// overdue compositor confirmation.
+    ///
+    /// The confirmation repair reopens a hidden surface on the same
+    /// unanswered-redraw evidence a dropped frame leaves behind. Until a
+    /// commit, confirmation, or real visibility edge settles it, the gate
+    /// being open is not proof the screen is current, so an input proof must
+    /// still queue a from-truth frame (bitty#3032). A confirmation bound that
+    /// is still inside its window stays pending so normal input between commit
+    /// and vblank does not force a full redraw or drop the confirmation timer.
+    #[must_use]
+    pub fn surface_reveal_unproven(&self) -> bool {
+        self.speculative_present_reopen
+            || self
+                .present_confirm_at
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
@@ -3535,6 +3597,71 @@ impl Runtime {
         stats
     }
 
+    /// Records one empty render by `view_id` and bounds its retry (bitty#3032).
+    ///
+    /// The retained store must never keep an empty list: the reuse path is
+    /// exactly what turns one empty render into a blank frame on the next
+    /// clean tick. Alongside dropping the entry, the first
+    /// [`EMPTY_LEAF_RETRY_LIMIT`] consecutive empty renders owe a full redraw
+    /// so the next tick rebuilds the leaf from truth. Past that bound the
+    /// arming stops — a persistent lesion would otherwise re-arm on every
+    /// tick, and `present_owed()` then drives a full-frame render each time
+    /// (the live 9,421-line pane is a sustained full redraw) — and one
+    /// rate-limited stderr line reports it, so the failure is visible instead
+    /// of a silent CPU burn.
+    ///
+    /// The budget is per leaf: a different leaf rendering empty starts its own
+    /// count, and the count resets the moment the same leaf renders again.
+    fn note_empty_leaf_render(&mut self, view_id: ViewId, text_on_screen: bool) {
+        let count = if self.empty_leaf_retry.0 == Some(view_id) {
+            self.empty_leaf_retry.1.saturating_add(1)
+        } else {
+            1
+        };
+        self.empty_leaf_retry = (Some(view_id), count);
+        if count <= EMPTY_LEAF_RETRY_LIMIT {
+            self.empty_leaf_retry_owed = true;
+            return;
+        }
+        if let Some(suppressed) = self.empty_leaf_log.admit_now() {
+            eprintln!(
+                "bitty: pane {} rendered an empty draw list{}; full-redraw retry bound \
+                 exhausted, leaving the leaf unretained{}",
+                view_id.0,
+                if text_on_screen {
+                    " with text on screen"
+                } else {
+                    ""
+                },
+                super::log_throttle::suppressed_suffix(suppressed)
+            );
+        }
+    }
+
+    /// Test-only: drop one leaf's just-rendered primitives.
+    ///
+    /// Committed code has no seam that can make a text-bearing leaf render
+    /// empty — that is exactly the defect bitty#3032 reports — so the guard's
+    /// refusal is only reachable from an in-crate test that injects the empty
+    /// list here, immediately before the retained store decides.
+    #[cfg(test)]
+    fn maybe_inject_test_empty_leaf(
+        &mut self,
+        view_id: ViewId,
+        fills: &mut Vec<bitty_render::grid::FillRect>,
+        glyphs: &mut Vec<bitty_render::grid::GlyphInstance>,
+    ) {
+        let Some((target, left)) = self.test_empty_leaf else {
+            return;
+        };
+        if target != view_id || left == 0 {
+            return;
+        }
+        self.test_empty_leaf = Some((target, left - 1));
+        fills.clear();
+        glyphs.clear();
+    }
+
     /// Issue #1409 (CTX-0797): refuse to present a frame whose leaf glyph
     /// slots were placed at an older atlas epoch than the live atlas.
     ///
@@ -3559,12 +3686,13 @@ impl Runtime {
             self.stale_atlas_frame_rejects = 0;
             return false;
         }
+        self.presented_leaf_frames.clear();
+        self.presented_scene_frames.clear();
         if self.stale_atlas_frame_rejects >= ATLAS_REBUILD_LIMIT {
             self.stale_atlas_frame_rejects = 0;
             return false;
         }
         self.stale_atlas_frame_rejects = self.stale_atlas_frame_rejects.saturating_add(1);
-        self.presented_leaf_frames.clear();
         self.pending_full_redraw = true;
         true
     }
@@ -3691,6 +3819,13 @@ impl Runtime {
         self.reflow_overlay_present_layout(&frames);
 
         let mut pending_full = self.pending_full_redraw;
+        // bitty#3032: the empty-leaf guard runs inside the frame it just
+        // presented, so its one bounded rebuild has to be folded in here; the
+        // present that followed consumed every redraw flag set before it.
+        if self.empty_leaf_retry_owed {
+            self.empty_leaf_retry_owed = false;
+            pending_full = true;
+        }
         // CTX-1641 (bitty#2785): a plugin scene revision (ui.mount/update,
         // suspend, dispose) owes one frame even when the grid is quiet. The
         // shared store is the only scene owner; a borrow conflict leaves the
@@ -3889,6 +4024,16 @@ impl Runtime {
         // still committed while retained per-leaf reuse stays in effect.
         // Everything else re-renders per origin from its own damage ring, so a
         // split no longer repaints every pane just because sessions exist.
+        // Persist full/paint invalidation before `defer_coalesced_present`
+        // can drop `basis`: latch updates (`kitty_alt_screens_latched`,
+        // `advance_animations`) already ran above, so a deferred tick must
+        // carry the resulting redraw request to the next tick (bitty#3032).
+        if pending_full {
+            self.pending_full_redraw = true;
+        }
+        if paint_only {
+            self.pending_paint_redraw = true;
+        }
         let full_frame = pending_full || last == u64::MAX;
 
         // For single-window slice we need per-view scrollback viewport and cursor.
@@ -3997,6 +4142,54 @@ impl Runtime {
             pane_generations,
         })
     }
+
+    /// True when `view_id`'s current viewport holds at least one visible glyph
+    /// cell in Terminal Truth (bitty#3032).
+    fn view_viewport_has_visible_text(
+        &self,
+        view_id: ViewId,
+        frame: &layout_focus::PresentFrame,
+        view: Option<&View>,
+        primary_snapshot: &Snapshot,
+    ) -> bool {
+        let base_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
+            Some(sess) => Some(sess.state.snapshot()),
+            None if Some(view_id) == self.primary_view => Some(primary_snapshot.clone()),
+            None => None,
+        };
+        let Some(base_snap) = base_snap else {
+            return false;
+        };
+        let view_snapshot = match view {
+            Some(v) => {
+                let on_alt = match self.pane_sessions.get(&view_id) {
+                    Some(sess) => sess.state.alt_screen_active(),
+                    None => self.state.alt_screen_active(),
+                };
+                if v.scroll_offset() != 0 && !on_alt {
+                    let cells = match self.pane_sessions.get(&view_id) {
+                        Some(sess) => v.visible_cells(&sess.state),
+                        None => v.visible_cells(&self.state),
+                    };
+                    Snapshot {
+                        version: base_snap.version,
+                        generation: base_snap.generation,
+                        width: v.cols() as usize,
+                        height: v.rows() as usize,
+                        cells,
+                        cursor: base_snap.cursor,
+                        modes: base_snap.modes,
+                        title: base_snap.title,
+                    }
+                } else {
+                    viewport_snapshot(&base_snap, frame.cols, frame.rows)
+                }
+            }
+            None => viewport_snapshot(&base_snap, frame.cols, frame.rows),
+        };
+        snapshot_has_visible_text(&view_snapshot)
+    }
+
     /// Composes one leaf's attached scene into the combined frame (CTX-1630).
     ///
     /// The leaf must be a panel with an attached `Scene` in the installed
@@ -4052,6 +4245,14 @@ impl Runtime {
             }
         } else {
             built.atlas_epoch = Some(epoch);
+        }
+        let color_epoch = self.renderer.color_atlas_epoch();
+        if let Some(planned_color) = built.color_atlas_epoch {
+            if planned_color != color_epoch {
+                return true;
+            }
+        } else {
+            built.color_atlas_epoch = Some(color_epoch);
         }
         built.fills.extend(scene.fills);
         built.rounded.extend(scene.rounded);
@@ -4128,6 +4329,10 @@ impl Runtime {
             // evidence is one tree).
             let mut scene_a11y = bitty_ui::a11y_host::UiSnapshotHost::new("scene", "scene");
             let evictions_before = self.renderer.atlas_stats().2;
+            let epochs_before = (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            );
             // Issue #1409 (CTX-0797): set when a leaf planned against a newer
             // atlas epoch than the slots already collected in this attempt.
             let mut stale_epoch = false;
@@ -4172,8 +4377,9 @@ impl Runtime {
                     ),
                     None => (snapshot.generation, snapshot.generation, Vec::new()),
                 };
-                let damage_evicted = origin_gen.saturating_sub(origin_last)
-                    > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
+                let damage_evicted = origin_last > origin_gen
+                    || origin_gen.saturating_sub(origin_last)
+                        > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
                 let leaf_damaged = !leaf_damage.is_empty() || damage_evicted;
                 // CTX-1162 S3 (DEC-0113 Fix 2a): the leaf fade factor gates
                 // retained reuse. The stored fills/glyphs carry baked alpha,
@@ -4203,12 +4409,22 @@ impl Runtime {
                 // primitives, so shifting the retained list by the origin
                 // delta is bit-identical to a fresh pass. A size change
                 // (real resize or reflow) still forces a fresh render.
+                let live_atlas_epoch = self.renderer.atlas_epoch();
+                let live_color_atlas_epoch = self.renderer.color_atlas_epoch();
                 let reuse_delta = if full_frame || leaf_damaged {
                     None
                 } else {
                     self.presented_leaf_frames.get(&view_id).and_then(|leaf| {
-                        if leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
+                        if leaf.atlas_epoch != live_atlas_epoch
+                            || leaf.color_atlas_epoch != live_color_atlas_epoch
+                            || leaf.fills.is_empty()
+                            || leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
                             || leaf.fade_factor != fade
+                        {
+                            return None;
+                        }
+                        if leaf.glyphs.is_empty()
+                            && self.view_viewport_has_visible_text(view_id, frame, view, snapshot)
                         {
                             return None;
                         }
@@ -4410,6 +4626,17 @@ impl Runtime {
                         .presented_leaf_frames
                         .get(&view_id)
                         .expect("reuse requires a retained leaf");
+                    let frame_epoch = *built.atlas_epoch.get_or_insert(leaf.atlas_epoch);
+                    let frame_color_epoch = *built
+                        .color_atlas_epoch
+                        .get_or_insert(leaf.color_atlas_epoch);
+                    if (leaf.atlas_epoch != frame_epoch
+                        || leaf.color_atlas_epoch != frame_color_epoch)
+                        && attempt < ATLAS_REBUILD_LIMIT
+                    {
+                        stale_epoch = true;
+                        break;
+                    }
                     built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
                     if dx == 0 && dy == 0 {
                         built.fills.extend(leaf.fills.iter().cloned());
@@ -4632,24 +4859,52 @@ impl Runtime {
                         .into_boxed_slice(),
                     },
                 };
-                let epoch_before = self.renderer.atlas_epoch();
+                let epoch_before = (
+                    self.renderer.atlas_epoch(),
+                    self.renderer.color_atlas_epoch(),
+                );
+                let has_visible_text = snapshot_has_visible_text(&view_snapshot);
                 // CTX-1607: one entry point for every text stack. The
                 // shaped default applies `font.disable_ligatures` and
                 // `font.features`; a non-shaping rasterizer (crossfont
                 // fallback / headless) is served by the per-cell path
-                // inside the same call.
-                let mut list = match self.renderer.render_shaped_with_bidi(
-                    &view_snapshot,
-                    &damage,
-                    self.config.disable_ligatures,
-                    &self.config.font_features,
-                    view_wraps.as_deref(),
-                    view_bidi,
-                ) {
+                // inside the same call. Degrade to the unshaped per-cell
+                // path rather than dropping the leaf if shaping fails.
+                let mut list = match self
+                    .renderer
+                    .render_shaped_with_bidi(
+                        &view_snapshot,
+                        &damage,
+                        self.config.disable_ligatures,
+                        &self.config.font_features,
+                        view_wraps.as_deref(),
+                        view_bidi,
+                    )
+                    .or_else(|_| {
+                        self.renderer.render_with_bidi(
+                            &view_snapshot,
+                            &damage,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                    }) {
                     Ok(list) => list,
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.pending_full_redraw = true;
+                        continue;
+                    }
                 };
-                if shift.is_some() && self.renderer.atlas_epoch() != epoch_before {
+                if shift.is_some()
+                    && ((
+                        self.renderer.atlas_epoch(),
+                        self.renderer.color_atlas_epoch(),
+                    ) != epoch_before
+                        || (list.fills.is_empty()
+                            && shift.as_ref().is_some_and(|s| s.fills.is_empty()))
+                        || (has_visible_text
+                            && list.glyphs.is_empty()
+                            && shift.as_ref().is_some_and(|s| s.glyphs.is_empty())))
+                {
                     // Atlas growth (or reset) mid-render leaves the shifted
                     // UVs stale while the fresh list is already healed; a
                     // full re-render heals the leaf the same way. Rare and
@@ -4663,17 +4918,67 @@ impl Runtime {
                         ))]
                         .into_boxed_slice(),
                     };
-                    list = match self.renderer.render_shaped_with_bidi(
-                        &view_snapshot,
-                        &damage,
-                        self.config.disable_ligatures,
-                        &self.config.font_features,
-                        view_wraps.as_deref(),
-                        view_bidi,
-                    ) {
+                    list = match self
+                        .renderer
+                        .render_shaped_with_bidi(
+                            &view_snapshot,
+                            &damage,
+                            self.config.disable_ligatures,
+                            &self.config.font_features,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                        .or_else(|_| {
+                            self.renderer.render_with_bidi(
+                                &view_snapshot,
+                                &damage,
+                                view_wraps.as_deref(),
+                                view_bidi,
+                            )
+                        }) {
                         Ok(list) => list,
-                        Err(_) => continue,
+                        Err(_) => {
+                            self.pending_full_redraw = true;
+                            continue;
+                        }
                     };
+                }
+                if shift.is_none() && has_visible_text && list.glyphs.is_empty() {
+                    let full_damage = Damage {
+                        generation: current_gen,
+                        regions: vec![DamagedRegion::Grid(DamageRect::full(
+                            view_snapshot.height as u16,
+                            view_snapshot.width as u16,
+                        ))]
+                        .into_boxed_slice(),
+                    };
+                    #[allow(clippy::collapsible_if)]
+                    if let Ok(fallback) = self
+                        .renderer
+                        .render_shaped_with_bidi(
+                            &view_snapshot,
+                            &full_damage,
+                            self.config.disable_ligatures,
+                            &self.config.font_features,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                        .ok()
+                        .filter(|candidate| !candidate.glyphs.is_empty())
+                        .ok_or(())
+                        .or_else(|()| {
+                            self.renderer.render_with_bidi(
+                                &view_snapshot,
+                                &full_damage,
+                                view_wraps.as_deref(),
+                                view_bidi,
+                            )
+                        })
+                    {
+                        if !fallback.glyphs.is_empty() {
+                            list = fallback;
+                        }
+                    }
                 }
                 // Issue #1409 (CTX-0797): the first leaf of this attempt fixes
                 // the atlas epoch every glyph slot in the frame must resolve
@@ -4687,7 +4992,12 @@ impl Runtime {
                 // epoch must still present something (liveness over a
                 // perfectly consistent frame that never arrives).
                 let frame_epoch = *built.atlas_epoch.get_or_insert(list.atlas_epoch);
-                if !list.is_atlas_epoch_valid(frame_epoch) && attempt < ATLAS_REBUILD_LIMIT {
+                let live_color_epoch = self.renderer.color_atlas_epoch();
+                let frame_color_epoch = *built.color_atlas_epoch.get_or_insert(live_color_epoch);
+                if (!list.is_atlas_epoch_valid(frame_epoch)
+                    || live_color_epoch != frame_color_epoch)
+                    && attempt < ATLAS_REBUILD_LIMIT
+                {
                     stale_epoch = true;
                     break;
                 }
@@ -4781,17 +5091,37 @@ impl Runtime {
                 // CTX-1165 (#1993): the retained store keeps the full leaf so
                 // a moved upper float never strands a filtered reuse. Only the
                 // combined frame drops glyphs under higher floats.
-                self.presented_leaf_frames.insert(
-                    view_id,
-                    PresentedLeaf {
-                        origin: (frame.content.x, frame.content.y),
-                        content_size: (frame.content.width, frame.content.height),
-                        scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
-                        fade_factor: fade,
-                        fills: fills.clone(),
-                        glyphs: glyphs.clone(),
-                    },
-                );
+                #[cfg(test)]
+                self.maybe_inject_test_empty_leaf(view_id, &mut fills, &mut glyphs);
+                if fills.is_empty() || (has_visible_text && glyphs.is_empty()) {
+                    // bitty#3032: an empty render must never become the
+                    // retained list a later clean frame reuses. Drop the entry;
+                    // only arm the cross-frame retry when `fills.is_empty()`
+                    // because a glyphless leaf after the synchronous full-grid
+                    // shaped + unshaped pass above means the host font stack
+                    // lacks drawable glyph bitmaps for the screen's codepoints.
+                    self.presented_leaf_frames.remove(&view_id);
+                    if fills.is_empty() {
+                        self.note_empty_leaf_render(view_id, has_visible_text);
+                    }
+                } else {
+                    if self.empty_leaf_retry.0 == Some(view_id) {
+                        self.empty_leaf_retry = (None, 0);
+                    }
+                    self.presented_leaf_frames.insert(
+                        view_id,
+                        PresentedLeaf {
+                            origin: (frame.content.x, frame.content.y),
+                            content_size: (frame.content.width, frame.content.height),
+                            scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
+                            fade_factor: fade,
+                            atlas_epoch: list.atlas_epoch,
+                            color_atlas_epoch: live_color_epoch,
+                            fills: fills.clone(),
+                            glyphs: glyphs.clone(),
+                        },
+                    );
+                }
                 built.fills.extend(fills);
                 if higher_floats.is_empty() {
                     built.glyphs.extend(glyphs);
@@ -4966,11 +5296,18 @@ impl Runtime {
                 full_frame = true;
                 continue;
             }
-            if self.renderer.atlas_stats().2 == evictions_before || attempt >= ATLAS_REBUILD_LIMIT {
+            let epochs_after = (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            );
+            if (self.renderer.atlas_stats().2 == evictions_before && epochs_after == epochs_before)
+                || attempt >= ATLAS_REBUILD_LIMIT
+            {
                 break built;
             }
-            // Atlas exhaustion reset: every retained slot is dead, so drop the
-            // stores and rebuild every leaf against the fresh atlas.
+            // Atlas growth or exhaustion reset: every retained slot from the
+            // older epoch is dead, so drop the stores and rebuild every leaf
+            // against the fresh atlas.
             self.presented_leaf_frames.clear();
             self.presented_scene_frames.clear();
             full_frame = true;
@@ -7976,6 +8313,10 @@ impl Runtime {
         // rebuild. This frame stays best-effort, the same class the
         // full-render path already had.
         let evictions_before_probe = self.renderer.atlas_stats().2;
+        let epochs_before_probe = (
+            self.renderer.atlas_epoch(),
+            self.renderer.color_atlas_epoch(),
+        );
         let combined_list = {
             // We need a FramePlan; construct via a dummy damage descriptor that
             // indicates full. Simplest: reuse empty plan but set dirty_rects
@@ -8104,9 +8445,16 @@ impl Runtime {
             tmp_list
         };
 
-        // Drop retained lists if the plan probe reset the atlas above.
-        if self.renderer.atlas_stats().2 != evictions_before_probe {
+        // Drop retained lists if the plan probe grew or reset the atlas above.
+        if self.renderer.atlas_stats().2 != evictions_before_probe
+            || (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            ) != epochs_before_probe
+        {
             self.presented_leaf_frames.clear();
+            self.presented_scene_frames.clear();
+            self.pending_full_redraw = true;
         }
 
         if !combined_list.needs_draw() {
@@ -8269,7 +8617,10 @@ impl Runtime {
                         self.clear_surface_retry();
                         stats
                     }
-                    Err(_) => return None,
+                    Err(_) => {
+                        self.pending_full_redraw = true;
+                        return None;
+                    }
                 }
             }
         } else {
@@ -8282,7 +8633,10 @@ impl Runtime {
                     self.clear_surface_retry();
                     stats
                 }
-                Err(_) => return None,
+                Err(_) => {
+                    self.pending_full_redraw = true;
+                    return None;
+                }
             }
         };
         self.mark_frame_presented(snapshot.generation);
@@ -8509,6 +8863,61 @@ struct FrameLayers {
     atlas_epoch: u64,
 }
 
+/// Read-only present-path probes for the bitty#3032 regression tests.
+///
+/// They observe existing state only (the live atlas epochs, the eviction
+/// counter, and the armed retained-work flag) so an integration regression can
+/// assert its own fixture preconditions instead of trusting that a frame
+/// "would have" taken the path it is named for. A `cfg(test)` seam cannot
+/// serve that: an integration test links this crate compiled *without* the
+/// test cfg, so the probes have to exist in the normal build. Nothing here
+/// mutates state or feeds a rendering decision.
+#[doc(hidden)]
+impl Runtime {
+    /// Live glyph-atlas epoch, color-atlas epoch, and atlas evictions, in that
+    /// order. An epoch advance without an eviction is `Atlas::try_grow()`;
+    /// both moving together is a wholesale reset.
+    #[must_use]
+    pub fn probe_atlas_epochs(&self) -> (u64, u64, u64) {
+        (
+            self.renderer.atlas_epoch(),
+            self.renderer.color_atlas_epoch(),
+            self.renderer.atlas_stats().2,
+        )
+    }
+
+    /// TEMP probe.
+    #[must_use]
+    pub fn probe_atlas_raw(&self) -> (u64, u64, u64, u64, u64, (u16, u16)) {
+        let (hits, misses, evictions, inline) = self.renderer.atlas_stats();
+        let dims = self.renderer.atlas_dims();
+        (
+            self.renderer.atlas_epoch(),
+            hits,
+            misses,
+            evictions,
+            inline,
+            (dims.width, dims.height),
+        )
+    }
+
+    /// Whether the next present is currently required to be a full redraw.
+    #[must_use]
+    pub fn probe_full_redraw_armed(&self) -> bool {
+        self.pending_full_redraw
+    }
+
+    /// Consecutive empty-leaf retries recorded so far and the leaf they belong
+    /// to (bitty#3032): `(view_id, count)`.
+    #[must_use]
+    pub fn probe_empty_leaf_retries(&self) -> (Option<u64>, u8) {
+        (
+            self.empty_leaf_retry.0.map(|view| view.0),
+            self.empty_leaf_retry.1,
+        )
+    }
+}
+
 /// Issue #1409 (CTX-0797): the production guard that keeps a presented frame
 /// on one atlas epoch.
 ///
@@ -8526,6 +8935,168 @@ fn record_retained_glyph_guard_call() {}
 #[cfg(not(test))]
 #[inline]
 fn record_retained_glyph_partial_hit() {}
+
+#[cfg(test)]
+mod coalesced_deferral_tests {
+    use crate::runtime::{Runtime, RuntimeConfig};
+    use std::time::{Duration, Instant};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    /// bitty#3032: a latch update that forces a full redraw must survive
+    /// `defer_coalesced_present`.
+    ///
+    /// A PTY alt-screen switch arms `pending_full_redraw` through its own mode
+    /// hook, which hides this defect: the request is already durable before
+    /// `collect_tick_basis` runs. The invariant therefore only means something
+    /// when the request comes from `collect_tick_basis` alone, so the latch is
+    /// moved here directly (in-crate: it is private state no public input can
+    /// desynchronise).
+    #[test]
+    fn deferred_latch_change_persists_the_full_redraw_request() {
+        let mut rt = runtime();
+        let t0 = Instant::now();
+        rt.handle_pty_bytes(b"primary content\r\n");
+        rt.tick_at(t0).expect("initial frame presents");
+        assert!(!rt.pending_full_redraw, "the present consumed the request");
+
+        rt.set_min_present_interval(Duration::from_millis(16));
+        // A latched origin that the live grid no longer holds: the next tick
+        // sees an alt-screen transition with no PTY hook behind it.
+        rt.kitty_alt_screens_latched.insert(Some(u64::MAX));
+
+        assert!(
+            rt.tick_at(t0 + Duration::from_millis(2)).is_none(),
+            "the tick lands inside the cadence window and defers"
+        );
+        assert!(
+            rt.pending_full_redraw,
+            "a deferred latch update must carry its full-redraw request to the next tick"
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_leaf_guard_tests {
+    use super::EMPTY_LEAF_RETRY_LIMIT;
+    use crate::runtime::{Runtime, RuntimeConfig, ViewId};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    fn ink_pixels(rt: &Runtime) -> usize {
+        let Some(rgba) = rt.headless_rgba() else {
+            return 0;
+        };
+        rgba.chunks_exact(4)
+            .filter(|px| *px != [30, 30, 46, 255])
+            .count()
+    }
+
+    /// bitty#3032: an empty render of a text-bearing leaf must never become the
+    /// retained list a later clean frame reuses, and the armed retry must heal
+    /// the leaf on the next tick.
+    ///
+    /// The empty list is injected right before the retained store decides:
+    /// production reaches this state through the reported defect, not through
+    /// a reachable API, so there is no other way to pin the refusal.
+    #[test]
+    fn empty_render_is_never_retained_and_the_retry_paints() {
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"pane text\r\n");
+        rt.tick().expect("initial frame presents");
+        let view = rt.focused_view().expect("focused view");
+        assert!(
+            rt.presented_leaf_frames.contains_key(&view),
+            "the text-bearing leaf is retained"
+        );
+
+        rt.arm_test_empty_leaf(view, 1);
+        rt.handle_pty_bytes(b"more text\r\n");
+        rt.tick().expect("the empty frame still presents");
+        assert!(
+            !rt.presented_leaf_frames.contains_key(&view),
+            "an empty list must never be stored for reuse"
+        );
+        assert!(
+            rt.empty_leaf_retry_owed,
+            "the guard owes one rebuild from truth"
+        );
+        assert_eq!(
+            rt.probe_empty_leaf_retries(),
+            (Some(view.0), 1),
+            "the retry belongs to the leaf that rendered empty"
+        );
+        assert!(
+            rt.present_owed(),
+            "the owed rebuild must keep the loop asking for a frame"
+        );
+
+        rt.tick().expect("the rebuild frame presents");
+        assert!(
+            rt.presented_leaf_frames.contains_key(&view),
+            "the healed leaf is retained again"
+        );
+        assert!(
+            !rt.empty_leaf_retry_owed,
+            "the rebuild consumed the owed retry"
+        );
+        assert_eq!(
+            rt.probe_empty_leaf_retries(),
+            (None, 0),
+            "a good render clears the retry budget"
+        );
+        assert!(
+            ink_pixels(&rt) > 0,
+            "the rebuilt frame carries the pane's text"
+        );
+    }
+
+    /// bitty#3032: the retry must stop at the bound.
+    ///
+    /// Without it every tick re-arms `pending_full_redraw`, `present_owed()`
+    /// keeps asking for a frame, and a persistent lesion turns the whole window
+    /// into a sustained full redraw.
+    #[test]
+    fn empty_leaf_retry_is_bounded_and_per_leaf() {
+        let mut rt = runtime();
+        let view = ViewId::new(7);
+        for expected in 1..=EMPTY_LEAF_RETRY_LIMIT {
+            rt.empty_leaf_retry_owed = false;
+            rt.note_empty_leaf_render(view, true);
+            assert!(
+                rt.empty_leaf_retry_owed,
+                "retry {expected} must still owe a rebuild"
+            );
+            assert!(rt.probe_empty_leaf_retries() == (Some(view.0), expected));
+        }
+        rt.empty_leaf_retry_owed = false;
+        rt.note_empty_leaf_render(view, true);
+        assert!(
+            !rt.empty_leaf_retry_owed,
+            "past the bound the runtime must stop asking for full redraws"
+        );
+        assert_eq!(
+            rt.probe_empty_leaf_retries().1,
+            EMPTY_LEAF_RETRY_LIMIT + 1,
+            "the count keeps climbing so the log stays one line"
+        );
+
+        // Another leaf rendering empty starts its own budget.
+        let other = ViewId::new(8);
+        rt.note_empty_leaf_render(other, false);
+        assert!(
+            rt.empty_leaf_retry_owed,
+            "a different leaf gets its own bounded retry"
+        );
+        assert_eq!(rt.probe_empty_leaf_retries(), (Some(other.0), 1));
+    }
+}
 
 #[cfg(test)]
 mod atlas_epoch_guard_tests {
@@ -12834,6 +13405,12 @@ impl Runtime {
             failures_left: failures,
             attempts: 0,
         });
+    }
+
+    /// Test-only: make `view`'s next `frames` renders come back empty while
+    /// its grid still holds text (bitty#3032 empty-leaf guard).
+    pub(crate) fn arm_test_empty_leaf(&mut self, view: ViewId, frames: u32) {
+        self.test_empty_leaf = Some((view, frames));
     }
 
     /// Test-only: number of present attempts observed after the backoff gate.

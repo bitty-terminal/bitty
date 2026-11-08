@@ -423,31 +423,44 @@ pub(crate) fn init_shell_candidates(
 /// without invoking `platform_default`. When `shell_env` is `None` or blank,
 /// `platform_default` supplies the host fallback (on Windows, the resolved
 /// `pwsh.exe` / `powershell.exe` / `cmd.exe` from
-/// [`crate::spawn::resolve_default_shell`]; on Unix, `None` so
+/// [`crate::spawn::resolve_default_shell`]; on Unix, `Ok(None)` so
 /// [`init_shell_candidates`] keeps its existing common-shells + `/bin/sh`
-/// menu).
+/// menu). The unresolved Windows arm is returned instead of swallowed, so the
+/// caller can warn instead of silently re-offering `/bin/sh` (bitty#3048).
 pub(crate) fn init_effective_shell_env_for_host(
     shell_env: Option<&str>,
-    platform_default: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+    platform_default: impl FnOnce() -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell>,
+) -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
     if let Some(trimmed) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
-        return Some(trimmed.to_string());
+        return Ok(Some(trimmed.to_string()));
     }
-    platform_default()
+    Ok(platform_default()?
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty()))
+}
+
+/// One-line stderr warning for an unresolved platform default (CTX-1755).
+///
+/// Mirrors the unusable-`$SHELL` warning: names the candidates that were
+/// probed (through [`crate::spawn::UnresolvedDefaultShell`]'s `Display`) and
+/// states that the profile is written with no `shell`, so the fallback is
+/// never silent again (bitty#3048).
+pub(crate) fn init_unresolved_platform_shell_warning(
+    err: &crate::spawn::UnresolvedDefaultShell,
+) -> String {
+    format!("bitty init: {err}; leaving shell unset")
 }
 
 #[cfg(windows)]
-fn init_platform_default_shell() -> Option<String> {
-    crate::spawn::resolve_default_shell(None, None)
-        .ok()
-        .map(|resolved| resolved.program)
+pub(crate) fn init_platform_default_shell()
+-> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
+    crate::spawn::resolve_default_shell(None, None).map(|resolved| Some(resolved.program))
 }
 
 #[cfg(not(windows))]
-fn init_platform_default_shell() -> Option<String> {
-    None
+pub(crate) fn init_platform_default_shell()
+-> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
+    Ok(None)
 }
 
 /// Parses one shell-step answer: empty takes the menu default (index 0), a
@@ -719,23 +732,25 @@ pub(crate) fn init_shell_name_hint(init_args: &[String]) -> Option<String> {
 }
 
 /// Detects the shell name for the handoff (CTX-1132, #1913): the wizard's
-/// chosen shell wins, else `$SHELL`, else `bash` fallback. Never reads the
-/// environment itself (pure over injected values, English-only).
+/// chosen shell wins, else `$SHELL`. Returns `None` when neither maps to a
+/// supported `shell-init` shell (`cmd.exe` has no `CompletionShell`), so the
+/// caller suppresses the hint instead of printing a wrong bash line. Never
+/// reads the environment itself (pure over injected values, English-only).
 pub(crate) fn init_detect_shell_for_handoff(
     chosen_shell: Option<&str>,
     shell_env: Option<&str>,
-) -> String {
+) -> Option<String> {
     if let Some(chosen) = chosen_shell {
         if let Some(name) = init_shell_name_from_path(chosen) {
-            return name;
+            return Some(name);
         }
     }
     if let Some(env) = shell_env {
         if let Some(name) = init_shell_name_from_path(env) {
-            return name;
+            return Some(name);
         }
     }
-    "bash".to_string()
+    None
 }
 
 /// Renders the exact shell-integration handoff line for a shell name
@@ -5305,6 +5320,12 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) home: Option<&'a str>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,
+    /// Stands in for the host platform default-shell probe (CTX-1755).
+    /// `None` uses the real [`init_platform_default_shell`]; tests inject a
+    /// resolver here so the dispatch path is exercised hermetically (the
+    /// same seam style as the injected `shell_exists` predicate).
+    pub(crate) platform_shell:
+        Option<&'a dyn Fn() -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell>>,
 }
 
 /// Runs `bitty init`; returns the process exit code.
@@ -5339,6 +5360,7 @@ pub(crate) fn run_init_subcommand_with_env(
         xdg_data_home: data_home.as_deref(),
         home: home.as_deref(),
         stdin_is_tty: std::io::stdin().is_terminal(),
+        platform_shell: None,
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -5767,8 +5789,19 @@ pub(crate) fn run_init_subcommand_with_io(
         } else {
             None
         };
-        let effective_shell =
-            init_effective_shell_env_for_host(env.shell, init_platform_default_shell);
+        // The host platform default (Windows only) is the last seed before
+        // the menu's POSIX fallback; an unresolved probe is warned about, not
+        // swallowed, so the /bin/sh default (#3048) is never silent here.
+        let platform_default = env
+            .platform_shell
+            .unwrap_or(&init_platform_default_shell as &dyn Fn() -> _);
+        let effective_shell = match init_effective_shell_env_for_host(env.shell, platform_default) {
+            Ok(shell) => shell,
+            Err(err) => {
+                eprintln!("{}", init_unresolved_platform_shell_warning(&err));
+                None
+            }
+        };
         match run_init_interactive_with_preview(
             input,
             output,
@@ -6147,60 +6180,18 @@ pub(crate) fn run_init_subcommand_with_io(
             let _ = output.flush();
         }
         if print_shell_init {
-            let detected = init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell);
-            let line = init_shell_init_line(&detected);
-            let source_hint = init_shell_source_hint(&detected);
-            println!(
-                "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
-            );
+            // Unsupported shells (e.g. cmd.exe) print no hint: the installer
+            // has no line for them and the old bash fallback was wrong.
+            if let Some(detected) =
+                init_detect_shell_for_handoff(answers.shell.as_deref(), env.shell)
+            {
+                let line = init_shell_init_line(&detected);
+                let source_hint = init_shell_source_hint(&detected);
+                println!(
+                    "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
+                );
+            }
         }
         0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn init_effective_shell_prefers_explicit_env_and_falls_back_when_unset_or_blank() {
-        let mut called = false;
-        let explicit = init_effective_shell_env_for_host(Some(" /usr/bin/fish "), || {
-            called = true;
-            Some(String::from("C:\\Windows\\System32\\cmd.exe"))
-        });
-        assert_eq!(explicit.as_deref(), Some("/usr/bin/fish"));
-        assert!(
-            !called,
-            "platform_default must not run when $SHELL is present"
-        );
-
-        let fallback_from_none = init_effective_shell_env_for_host(None, || {
-            Some(String::from("C:\\Program Files\\PowerShell\\7\\pwsh.exe"))
-        });
-        assert_eq!(
-            fallback_from_none.as_deref(),
-            Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe")
-        );
-
-        let fallback_from_blank = init_effective_shell_env_for_host(Some("   "), || {
-            Some(String::from(
-                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-            ))
-        });
-        assert_eq!(
-            fallback_from_blank.as_deref(),
-            Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-        );
-
-        let candidates = init_shell_candidates(fallback_from_none.as_deref(), &|_| false);
-        assert_eq!(
-            candidates.first().map(String::as_str),
-            Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
-            "Windows interactive wizard must offer the resolved Windows shell as candidate #1 (default)"
-        );
-
-        let unix_unset = init_effective_shell_env_for_host(None, || None);
-        assert_eq!(unix_unset, None);
     }
 }

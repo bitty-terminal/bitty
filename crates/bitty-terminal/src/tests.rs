@@ -9359,6 +9359,7 @@ fn init_preview_baseline_prefers_loaded_config() {
         xdg_data_home: None,
         home: None,
         stdin_is_tty: true,
+        platform_shell: None,
     };
     let env_prof = crate::init::init_preview_baseline(&Args::new(), &bitty_env);
     assert_eq!(
@@ -10733,6 +10734,7 @@ fn init_env<'a>(
         xdg_data_home: None,
         home,
         stdin_is_tty,
+        platform_shell: None,
     }
 }
 
@@ -11019,6 +11021,133 @@ fn init_dispatch_interactive_tty_prompts_and_writes_answers() {
     assert!(printed.contains("Welcome to bitty"));
     assert!(printed.contains("Close confirm"));
     let _ = std::fs::remove_dir_all(&xdg);
+}
+
+#[test]
+fn init_dispatch_interactive_platform_default_shell_seeds_profile() {
+    // R2 pin (CTX-1755): $SHELL unset, the host probe injected as a Windows
+    // PowerShell path. The dispatch — not just the helper — must seed the
+    // wizard menu and the written profile from it. Reverting the call site to
+    // `env.shell` leaves every other test green and fails here.
+    let xdg = init_test_dir("tty-platform-shell");
+    let xdg_s = xdg.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    let mut env = init_env(None, None, Some(&xdg_s), None, true);
+    let windows_default = || {
+        Ok(Some(String::from(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        )))
+    };
+    env.platform_shell = Some(&windows_default);
+    // Eleven Enters take every lua default (the shell step takes the
+    // injected platform default) plus one Enter for the plugin follow-up.
+    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\n\n";
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        printed.contains("> 1) C:\\Program Files\\PowerShell\\7\\pwsh.exe (default)"),
+        "resolved platform default must be menu entry 1: {printed}"
+    );
+    let profile = xdg.join("bitty").join("profiles").join("default.lua");
+    let written = std::fs::read_to_string(&profile).expect("profile written");
+    assert!(
+        written.contains("shell = \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\""),
+        "written profile must carry the resolved platform default: {written}"
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
+}
+
+#[test]
+fn init_effective_shell_prefers_explicit_env_and_falls_back_when_unset_or_blank() {
+    let mut called = false;
+    let explicit = crate::init::init_effective_shell_env_for_host(Some(" /usr/bin/fish "), || {
+        called = true;
+        Ok(Some(String::from("C:\\Windows\\System32\\cmd.exe")))
+    })
+    .expect("an explicit $SHELL never consults the platform probe");
+    assert_eq!(explicit.as_deref(), Some("/usr/bin/fish"));
+    assert!(
+        !called,
+        "platform_default must not run when $SHELL is present"
+    );
+
+    let fallback_from_none = crate::init::init_effective_shell_env_for_host(None, || {
+        Ok(Some(String::from(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        )))
+    })
+    .expect("injected probe resolves");
+    assert_eq!(
+        fallback_from_none.as_deref(),
+        Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe")
+    );
+
+    let fallback_from_blank = crate::init::init_effective_shell_env_for_host(Some("   "), || {
+        Ok(Some(String::from(
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        )))
+    })
+    .expect("blank $SHELL falls through to the probe");
+    assert_eq!(
+        fallback_from_blank.as_deref(),
+        Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+    );
+
+    let candidates = init_shell_candidates(fallback_from_none.as_deref(), &|_| false);
+    assert_eq!(
+        candidates.first().map(String::as_str),
+        Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+        "Windows interactive wizard must offer the resolved Windows shell as candidate #1 (default)"
+    );
+
+    let unix_unset = crate::init::init_effective_shell_env_for_host(None, || Ok(None))
+        .expect("a Unix host probe is infallible");
+    assert_eq!(unix_unset, None);
+}
+
+#[test]
+fn init_effective_shell_surfaces_unresolved_platform_default() {
+    // R1 pin (CTX-1755): the unresolved Windows probe must not be swallowed
+    // into `None` silently; the caller warns with the tried candidates.
+    let err = crate::init::init_effective_shell_env_for_host(None, || {
+        Err(crate::spawn::UnresolvedDefaultShell {
+            tried: vec!["pwsh.exe", "powershell.exe", "cmd.exe"],
+        })
+    })
+    .expect_err("an unresolved platform default must reach the caller");
+    assert_eq!(err.tried, vec!["pwsh.exe", "powershell.exe", "cmd.exe"]);
+    let warning = crate::init::init_unresolved_platform_shell_warning(&err);
+    for candidate in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+        assert!(
+            warning.contains(candidate),
+            "warning must name tried candidate {candidate}: {warning}"
+        );
+    }
+    assert!(warning.starts_with("bitty init: "), "prefixed: {warning}");
+    assert!(
+        warning.contains("set terminal.shell"),
+        "actionable: {warning}"
+    );
+    assert!(
+        warning.ends_with("; leaving shell unset"),
+        "mirrors the unusable-$SHELL warning: {warning}"
+    );
+}
+
+#[test]
+fn init_platform_default_shell_is_none_off_windows() {
+    #[cfg(not(windows))]
+    assert_eq!(
+        crate::init::init_platform_default_shell().expect("Unix probe is infallible"),
+        None,
+        "non-Windows hosts keep the existing common-shells + /bin/sh menu"
+    );
 }
 
 #[test]
@@ -11760,19 +11889,29 @@ fn init_yes_no_and_shell_handoff_helpers() {
     assert!(init_shell_name_from_path("tcl").is_none());
     assert!(init_shell_name_from_path("").is_none());
 
-    // Detection prefers the chosen shell, then $SHELL, then bash fallback.
+    // Detection prefers the chosen shell, then $SHELL. Unsupported shells
+    // (cmd.exe) and a completely unset pair suppress the hint (None) instead
+    // of printing a wrong bash line.
     assert_eq!(
-        init_detect_shell_for_handoff(Some("/bin/zsh"), Some("/bin/bash")),
-        "zsh"
+        init_detect_shell_for_handoff(Some("/bin/zsh"), Some("/bin/bash")).as_deref(),
+        Some("zsh")
     );
     assert_eq!(
-        init_detect_shell_for_handoff(None, Some("/usr/bin/fish")),
-        "fish"
+        init_detect_shell_for_handoff(None, Some("/usr/bin/fish")).as_deref(),
+        Some("fish")
     );
-    assert_eq!(init_detect_shell_for_handoff(None, None), "bash");
+    assert_eq!(init_detect_shell_for_handoff(None, None), None);
     assert_eq!(
-        init_detect_shell_for_handoff(Some("/bin/unknown-shell"), Some("/bin/bash")),
-        "bash"
+        init_detect_shell_for_handoff(Some("/bin/unknown-shell"), Some("/bin/bash")).as_deref(),
+        Some("bash")
+    );
+    assert_eq!(
+        init_detect_shell_for_handoff(
+            Some("C:\\Windows\\System32\\cmd.exe"),
+            Some("C:\\Windows\\System32\\cmd.exe")
+        ),
+        None,
+        "cmd.exe has no shell-init line; the hint must be suppressed"
     );
 
     // Handoff lines are exact and shell-appropriate (PRINT, never eval).

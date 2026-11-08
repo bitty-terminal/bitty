@@ -498,7 +498,15 @@ impl View {
                     for c in 0..cols {
                         let src_col = self.col_offset as usize + c;
                         if src_col < src.len() {
-                            out.push(src[src_col]);
+                            let mut cloned = src[src_col];
+                            if c + 1 == cols && cloned.width == 2 && !cloned.spacer {
+                                cloned.width = 1;
+                            }
+                            if cloned.spacer && c == 0 {
+                                out.push(blank);
+                            } else {
+                                out.push(cloned);
+                            }
                         } else {
                             out.push(blank);
                         }
@@ -874,5 +882,41 @@ mod tests {
         v.clear_fixed_size();
         assert_eq!(v.fixed_size(), None);
         assert!(!v.is_fixed());
+    }
+
+    #[test]
+    fn visible_cells_clips_wide_pairs_at_viewport_edges_in_scrollback() {
+        use bitty_vt::{ControlChar, GraphemeCell, TerminalAction};
+
+        let mut state = State::new();
+        // Scrollback line 0: "中好B" (wide '中' at 0..=1, wide '好' at 2..=3, 'B' at 4)
+        for ch in "中好B".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        for _ in 0..state.height() {
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        }
+        let sb_len = state.scrollback_len();
+        assert!(sb_len >= 1);
+
+        // Viewport of width 2 scrolled to top of scrollback with col_offset = 1:
+        // - col 0 of viewport lands on src_col 1 (spacer of '中') -> must be replaced by blank, not orphan spacer.
+        // - col 1 of viewport lands on src_col 2 (lead of '好' at right edge) -> width must be demoted to 1.
+        let mut view = View::new(ViewId::new(1), 2, state.height());
+        view.set_scroll_offset(sb_len, sb_len);
+        view.set_col_offset(1);
+        let cells = view.visible_cells(&state);
+        assert!(
+            !cells[0].spacer,
+            "viewport col 0 must not be an orphan spacer"
+        );
+        assert!(cells[0].is_blank());
+        assert_eq!(cells[1].glyph, '好');
+        assert_eq!(
+            cells[1].width, 1,
+            "trailing wide leader at viewport right edge must demote to width 1"
+        );
     }
 }

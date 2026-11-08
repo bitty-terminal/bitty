@@ -416,6 +416,40 @@ pub(crate) fn init_shell_candidates(
     out
 }
 
+/// Resolves the effective `$SHELL` seed for interactive `bitty init` on the
+/// current host (CTX-1755, bitty#3048).
+///
+/// When `shell_env` carries a non-blank value, it wins verbatim (trimmed)
+/// without invoking `platform_default`. When `shell_env` is `None` or blank,
+/// `platform_default` supplies the host fallback (on Windows, the resolved
+/// `pwsh.exe` / `powershell.exe` / `cmd.exe` from
+/// [`crate::spawn::resolve_default_shell`]; on Unix, `None` so
+/// [`init_shell_candidates`] keeps its existing common-shells + `/bin/sh`
+/// menu).
+pub(crate) fn init_effective_shell_env_for_host(
+    shell_env: Option<&str>,
+    platform_default: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(trimmed) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(trimmed.to_string());
+    }
+    platform_default()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
+fn init_platform_default_shell() -> Option<String> {
+    crate::spawn::resolve_default_shell(None, None)
+        .ok()
+        .map(|resolved| resolved.program)
+}
+
+#[cfg(not(windows))]
+fn init_platform_default_shell() -> Option<String> {
+    None
+}
+
 /// Parses one shell-step answer: empty takes the menu default (index 0), a
 /// `1`-based number picks a menu entry, anything else is a custom path
 /// through [`init_clean_shell`]. Total: every input maps to a value or a
@@ -5733,10 +5767,12 @@ pub(crate) fn run_init_subcommand_with_io(
         } else {
             None
         };
+        let effective_shell =
+            init_effective_shell_env_for_host(env.shell, init_platform_default_shell);
         match run_init_interactive_with_preview(
             input,
             output,
-            env.shell,
+            effective_shell.as_deref(),
             &|path| std::path::Path::new(path).exists(),
             &overrides,
             color,
@@ -6119,5 +6155,52 @@ pub(crate) fn run_init_subcommand_with_io(
             );
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_effective_shell_prefers_explicit_env_and_falls_back_when_unset_or_blank() {
+        let mut called = false;
+        let explicit = init_effective_shell_env_for_host(Some(" /usr/bin/fish "), || {
+            called = true;
+            Some(String::from("C:\\Windows\\System32\\cmd.exe"))
+        });
+        assert_eq!(explicit.as_deref(), Some("/usr/bin/fish"));
+        assert!(
+            !called,
+            "platform_default must not run when $SHELL is present"
+        );
+
+        let fallback_from_none = init_effective_shell_env_for_host(None, || {
+            Some(String::from("C:\\Program Files\\PowerShell\\7\\pwsh.exe"))
+        });
+        assert_eq!(
+            fallback_from_none.as_deref(),
+            Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe")
+        );
+
+        let fallback_from_blank = init_effective_shell_env_for_host(Some("   "), || {
+            Some(String::from(
+                "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            ))
+        });
+        assert_eq!(
+            fallback_from_blank.as_deref(),
+            Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+        );
+
+        let candidates = init_shell_candidates(fallback_from_none.as_deref(), &|_| false);
+        assert_eq!(
+            candidates.first().map(String::as_str),
+            Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            "Windows interactive wizard must offer the resolved Windows shell as candidate #1 (default)"
+        );
+
+        let unix_unset = init_effective_shell_env_for_host(None, || None);
+        assert_eq!(unix_unset, None);
     }
 }

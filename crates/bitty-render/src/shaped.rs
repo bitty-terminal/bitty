@@ -391,6 +391,43 @@ impl SwashSingle {
         Self::empty_with_database(db)
     }
 
+    /// Builds a session over the host stack plus caller-supplied in-memory
+    /// faces (bitty#3021).
+    ///
+    /// `extra` faces join a *private* copy of the host database, so the
+    /// per-scalar fallback walk
+    /// ([`GlyphRasterizer::dynamic_face_for`]) can resolve scalars no host
+    /// face covers. The process-wide `system_db` is untouched, so other
+    /// sessions in the process are unaffected and a fixture registered here
+    /// can never shadow a real host face ordering.
+    ///
+    /// The seam exists for the mixed-script regression: it registers
+    /// [`crate::embedded::HAN_TEST_BYTES`] so the Han half of the reported
+    /// line resolves from a vendored subset instead of the host font stack.
+    /// A CI image with no CJK face must then still fail the test when the
+    /// per-cluster retry regresses, rather than skip it. Bytes are parsed by
+    /// the same bounded `fontdb`/`swash` path as every other face and never
+    /// touch the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`SwashSingle::new`]: [`RenderError::FontNotFound`] when the
+    /// host exposes no text face.
+    pub fn with_extra_faces(extra: &[&[u8]]) -> Result<Self, RenderError> {
+        if extra.is_empty() {
+            return Self::new();
+        }
+        let mut db = crate::font_index::system_database();
+        // Same registration order as `system_db`, then the caller's faces:
+        // the fallback walk's candidate sort (family name) decides among
+        // them, so append-only is unambiguous.
+        crate::embedded::register_face(&mut db);
+        for bytes in extra {
+            db.load_font_data((*bytes).to_vec());
+        }
+        Ok(Self::empty_with_database(Arc::new(db)))
+    }
+
     /// Test-only loaded-face count (lazy-loading assertions).
     #[cfg(test)]
     pub(crate) fn loaded_face_count(&self) -> usize {
@@ -2187,67 +2224,133 @@ impl SwashSingle {
             // Outer-run column where the cluster starts (the first member
             // carries the group's prefix-derived column).
             let col_base = clusters[index].cells.0;
-            let mut covered = false;
-            for tail in tails {
-                let tail_face = self.stored(*tail)?.clone();
-                let tail_input = ShapeInput {
-                    face: &tail_face,
-                    id: *tail,
-                    text: gap,
-                    base_offset: byte_start,
-                    col_base,
-                    px,
-                    features: &features,
-                    validated: &attrs.features,
-                    direction: attrs.direction,
-                };
-                let reshaped = self.shape_with(tail_input)?;
-                if reshaped.iter().all(|c| !c.uncovered) {
-                    let inserted = reshaped.len();
-                    clusters.splice(index..end, reshaped);
-                    end = index + inserted;
-                    covered = true;
-                    break;
-                }
+            if let Some(reshaped) =
+                self.cover_gap(gap, byte_start, col_base, tails, px, &features, attrs)?
+            {
+                let inserted = reshaped.len();
+                clusters.splice(index..end, reshaped);
+                index += inserted;
+                continue;
             }
-            // Dynamic fallback beyond the pinned chain (CTX-0961): the
-            // first gap scalar names a system face; a fully-covering
-            // reshape wins the same way a tail does. Gaps with mixed
-            // scripts may stay partially uncovered (tofu) — the pinned
-            // CJK tail keeps the common Han path off this slower scan.
-            if !covered {
-                if let Some(first) = gap.chars().next() {
-                    // Trait-qualified: `shape_run_uncached` lives in the
-                    // inherent impl, so the `GlyphRasterizer` override
-                    // needs its full path (also caches hit/miss per
-                    // scalar, so repeated gaps never rescan).
-                    if let Some(dynamic) =
-                        <Self as GlyphRasterizer>::dynamic_face_for(self, first, attrs.point_size)
+            // No single face covers every cluster of the coalesced gap
+            // (mixed scripts, for example Han text followed by an emoji).
+            // Retry each cluster on its own so one unsupported scalar costs
+            // that cluster only: leaving the coalesced gap uncovered marks
+            // every cluster of the stretch missing, which paints the whole
+            // run as tofu (bitty#2994 class). Bounded by one extra reshape
+            // per cluster of a failed gap, and the whole run stays cached.
+            if end > index + 1 {
+                let mut resolved: Vec<ShapedCluster> = Vec::with_capacity(end - index);
+                let mut cursor = index;
+                while cursor < end {
+                    let mut single_end = cursor + 1;
+                    while single_end < end
+                        && clusters[single_end].byte_offset == clusters[cursor].byte_offset
                     {
-                        let dynamic_face = self.stored(dynamic)?.clone();
-                        let dynamic_input = ShapeInput {
-                            face: &dynamic_face,
-                            id: dynamic,
-                            text: gap,
-                            base_offset: byte_start,
-                            col_base,
-                            px,
-                            features: &features,
-                            validated: &attrs.features,
-                            direction: attrs.direction,
-                        };
-                        let reshaped = self.shape_with(dynamic_input)?;
-                        if reshaped.iter().all(|c| !c.uncovered) {
-                            let inserted = reshaped.len();
-                            clusters.splice(index..end, reshaped);
-                            end = index + inserted;
-                        }
+                        single_end += 1;
                     }
+                    let single_start = clusters[cursor].byte_offset;
+                    let single_byte_end = clusters[single_end..]
+                        .iter()
+                        .map(|c| c.byte_offset)
+                        .find(|&offset| offset > single_start)
+                        .unwrap_or(text.len());
+                    let single_gap = text.get(single_start..single_byte_end).ok_or_else(|| {
+                        RenderError::UpstreamRasterizer(
+                            "shaper returned an out-of-range gap".to_string(),
+                        )
+                    })?;
+                    let single = self.cover_gap(
+                        single_gap,
+                        single_start,
+                        clusters[cursor].cells.0,
+                        tails,
+                        px,
+                        &features,
+                        attrs,
+                    )?;
+                    match single {
+                        Some(reshaped) => resolved.extend(reshaped),
+                        None => resolved.extend_from_slice(&clusters[cursor..single_end]),
+                    }
+                    cursor = single_end;
                 }
+                let inserted = resolved.len();
+                clusters.splice(index..end, resolved);
+                index += inserted;
+                continue;
             }
+            // A single cluster no face covers stays uncovered: the grid
+            // paints its tofu box and Terminal Truth is unchanged.
             index = end;
         }
         Ok(clusters)
+    }
+
+    /// Reshapes one uncovered gap with the tail chain, then with the dynamic
+    /// face named by its first scalar (CTX-0961).
+    ///
+    /// Returns the covering clusters only when one face covers every scalar
+    /// of `gap`; a partially covering reshape is discarded so the caller can
+    /// retry the gap cluster by cluster instead of splicing a face that
+    /// would strand its neighbours. `None` means no face covered the whole
+    /// gap.
+    #[allow(clippy::too_many_arguments)]
+    fn cover_gap(
+        &mut self,
+        gap: &str,
+        byte_start: usize,
+        col_base: usize,
+        tails: &[FontId],
+        px: f32,
+        features: &[harfrust::Feature],
+        attrs: &RunAttrs,
+    ) -> Result<Option<Vec<ShapedCluster>>, RenderError> {
+        for tail in tails {
+            let tail_face = self.stored(*tail)?.clone();
+            let tail_input = ShapeInput {
+                face: &tail_face,
+                id: *tail,
+                text: gap,
+                base_offset: byte_start,
+                col_base,
+                px,
+                features,
+                validated: &attrs.features,
+                direction: attrs.direction,
+            };
+            let reshaped = self.shape_with(tail_input)?;
+            if reshaped.iter().all(|c| !c.uncovered) {
+                return Ok(Some(reshaped));
+            }
+        }
+        // The first gap scalar names a system face; a fully-covering
+        // reshape wins the same way a tail does. Trait-qualified:
+        // `shape_run_uncached` lives in the inherent impl, so the
+        // `GlyphRasterizer` override needs its full path (also caches
+        // hit/miss per scalar, so repeated gaps never rescan).
+        let Some(first) = gap.chars().next() else {
+            return Ok(None);
+        };
+        let Some(dynamic) =
+            <Self as GlyphRasterizer>::dynamic_face_for(self, first, attrs.point_size)
+        else {
+            return Ok(None);
+        };
+        let dynamic_face = self.stored(dynamic)?.clone();
+        let dynamic_input = ShapeInput {
+            face: &dynamic_face,
+            id: dynamic,
+            text: gap,
+            base_offset: byte_start,
+            col_base,
+            px,
+            features,
+            validated: &attrs.features,
+            direction: attrs.direction,
+        };
+        let reshaped = self.shape_with(dynamic_input)?;
+        Ok(reshaped.iter().all(|c| !c.uncovered).then_some(reshaped))
     }
 
     /// Shapes `text` with one face, tagging clusters with `face`.

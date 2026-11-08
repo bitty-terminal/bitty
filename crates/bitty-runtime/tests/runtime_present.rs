@@ -135,6 +135,105 @@ fn deterministic_cjk_cursor_paints_two_cells_and_preserves_spacer() {
     assert_eq!(pixel(&rgba, 22), pixel(&hidden, 22));
 }
 
+/// bitty#3021: the caret immediately before a wide glyph must paint at that
+/// glyph's lead cell, not one glyph earlier.
+///
+/// Live report (0.0.36): the prompt `> 请问饿七五二二头痛医头用` with the
+/// caret before 用 painted the block over 头. 用 is a width-2 lead at cell
+/// column 24 (`>` and the space are cells 0-1, each Han glyph owns two), so a
+/// caret on 用 must paint `x = 24 * cell_width` and cover two cells.
+///
+/// The differential below pins that contract on the real present path
+/// (state -> shaped runs -> draw list -> cursor overlay). It also pins the
+/// only input that reproduces the reported geometry: a cursor column on 头's
+/// continuation cell (23), which Terminal Truth steps back to 头's lead (22)
+/// in `enforce_cursor_invariants`. That is a property of the cursor column
+/// the terminal received, not of the paint: any column on 用's lead paints
+/// 用.
+#[test]
+fn cursor_before_a_wide_glyph_paints_at_that_glyphs_column() {
+    const PROMPT: &str = "> 请问饿七五二二头痛医头用";
+    /// Cell column of 用: 2 prefix cells + 11 Han glyphs at 2 cells each.
+    const USE_COL: u16 = 24;
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(PROMPT.as_bytes());
+    rt.tick().expect("first frame");
+    // CUP is 1-based: column 25 targets 0-based cell 24 (用's lead).
+    rt.handle_pty_bytes(b"\x1b[1;25H");
+    rt.tick().expect("cursor frame");
+    assert_eq!(
+        rt.snapshot().cursor.position.col,
+        USE_COL,
+        "Terminal Truth keeps the caret on 用's lead cell"
+    );
+
+    let visible = rt.headless_rgba().expect("visible-cursor pixels");
+    let width = usize::try_from(rt.surface_extent().expect("extent").width()).expect("usize");
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    rt.tick().expect("hidden-cursor frame");
+    let hidden = rt.headless_rgba().expect("hidden-cursor pixels");
+    let (min, max) = changed_columns(&visible, &hidden, width);
+    let cell_width = usize::try_from(RuntimeConfig::default().cell_width).expect("cell width");
+    // Self-calibrate the content origin from the same path: a block cursor on
+    // cell 0 paints exactly its cell, so its left edge is the origin.
+    let mut origin_rt = make_runtime();
+    origin_rt.handle_pty_bytes(PROMPT.as_bytes());
+    origin_rt.tick().expect("first frame");
+    origin_rt.handle_pty_bytes(b"\x1b[1;1H");
+    origin_rt.tick().expect("cell-zero cursor frame");
+    let origin_visible = origin_rt.headless_rgba().expect("cell-zero pixels");
+    origin_rt.handle_pty_bytes(b"\x1b[?25l");
+    origin_rt.tick().expect("cell-zero hidden frame");
+    let origin_hidden = origin_rt.headless_rgba().expect("cell-zero hidden pixels");
+    let (origin, origin_max) = changed_columns(&origin_visible, &origin_hidden, width);
+    assert_eq!(
+        origin_max - origin + 1,
+        cell_width,
+        "a block cursor on cell 0 covers exactly one cell"
+    );
+    assert_eq!(
+        (min, max),
+        (
+            origin + usize::from(USE_COL) * cell_width,
+            origin + usize::from(USE_COL + 2) * cell_width - 1,
+        ),
+        "the block starts at 用's lead cell and covers both of its cells"
+    );
+
+    // The reported geometry is the continuation-cell input: CUP column 24 is
+    // 0-based cell 23, 头's trailing half. Terminal Truth normalizes it to
+    // 头's lead, so the block paints 头. This is why the live report needs
+    // the column the application actually sent before any paint change.
+    let mut rt = make_runtime();
+    rt.handle_pty_bytes(PROMPT.as_bytes());
+    rt.tick().expect("first frame");
+    rt.handle_pty_bytes(b"\x1b[1;24H");
+    rt.tick().expect("continuation-cursor frame");
+    assert_eq!(
+        rt.snapshot().cursor.position.col,
+        USE_COL - 2,
+        "a continuation-cell column steps back to the wide glyph's lead"
+    );
+}
+
+/// Inclusive `(min, max)` columns whose pixels differ between two frames.
+fn changed_columns(before: &[u8], after: &[u8], width: usize) -> (usize, usize) {
+    let mut min = usize::MAX;
+    let mut max = 0usize;
+    for (index, (a, b)) in before
+        .chunks_exact(4)
+        .zip(after.chunks_exact(4))
+        .enumerate()
+    {
+        if a != b {
+            let x = index % width;
+            min = min.min(x);
+            max = max.max(x);
+        }
+    }
+    (min, max)
+}
+
 #[test]
 fn cold_queue_is_bounded_and_observable() {
     let cfg = RuntimeConfig {

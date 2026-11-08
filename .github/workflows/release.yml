@@ -1514,10 +1514,13 @@ jobs:
           pacman-key --init
           pacman -Syu --noconfirm git openssh pacman-contrib base-devel
       # bitty#3011: publishing must not be the first real build of this recipe.
-      # Full mode runs the unmodified packaging/PKGBUILD through
-      # `makepkg --syncdeps --nocheck`, so prepare()/build()/package() really
-      # execute: the workspace compiles, every declared dependency must install,
-      # and the produced package must contain usr/bin/bitty and usr/bin/bittyd.
+      # Full mode installs the recipe's declared dependencies as root, then
+      # runs the unmodified packaging/PKGBUILD through `makepkg --nodeps
+      # --nocheck`, so prepare()/build()/package() really execute: the workspace
+      # compiles, every declared dependency must install, and the produced
+      # package must contain usr/bin/bitty and usr/bin/bittyd. The build account
+      # never holds a privilege escalation (bitty#3027): this container later
+      # holds the publish key.
       # Bounded by the gate's 45m wall clock and the 75m job timeout.
       - name: Gate — build the source package with makepkg
         env:

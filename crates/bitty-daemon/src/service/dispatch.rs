@@ -1425,12 +1425,19 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// A refusal here is an invariant failure; the process still exits.
+    /// Returns [`RefusalCode::DaemonStopping`] when the daemon is already
+    /// stopping, so a second signal or a signal after `daemon.stop` cannot
+    /// clobber the recorded stop mode, drain deadline, or unverified worker
+    /// flag.
     pub fn signal_stop(&mut self, now: MonotonicMs) -> Result<Value, Refusal> {
+        if self.state == DaemonState::Stopping {
+            return Err(Refusal::denied(RefusalCode::DaemonStopping));
+        }
         self.state = DaemonState::Stopping;
         let deadline = now
             .as_millis()
             .saturating_add(self.limits.effective(LimitId::DrainGraceMs));
+        self.drain_deadline_ms = Some(deadline);
         self.publish_daemon_stopping(deadline, now);
         let terminated = self.terminate_all(DaemonStopCause::HostShutdown, now);
         self.stop_unverified = terminated.unverified > 0;
@@ -1441,6 +1448,7 @@ impl Service {
             "mode": "drain",
             "terminated": terminated.terminated,
             "reason": "host_shutdown",
+            "drain_deadline_ms": self.drain_deadline_ms,
         }))
     }
 
@@ -9351,5 +9359,41 @@ mod tests {
             )
             .expect("own session");
         assert_eq!(own["session_id"], first_id);
+    }
+
+    #[test]
+    fn signal_stop_records_drain_deadline_and_refuses_repeat_without_clobbering_state() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+
+        let first = service
+            .signal_stop(MonotonicMs::from_millis(100))
+            .expect("first signal_stop succeeds");
+        let expected_deadline = 100 + service.limits().effective(LimitId::DrainGraceMs);
+        assert_eq!(first["drain_deadline_ms"], json!(expected_deadline));
+        assert_eq!(service.drain_deadline_ms(), Some(expected_deadline));
+        assert_eq!(service.daemon_state(), DaemonState::Stopping);
+        assert_eq!(service.stop_requested(), Some(StopMode::Drain));
+
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStatus,
+                &json!({}),
+                MonotonicMs::from_millis(110),
+            )
+            .expect("status during drain");
+        assert_eq!(status["drain_deadline_ms"], json!(expected_deadline));
+
+        // Simulate an unverified worker recorded by the first stop and verify
+        // a repeat signal does not overwrite `stop_unverified` or `drain_deadline_ms`.
+        service.stop_unverified = true;
+        let repeat = service
+            .signal_stop(MonotonicMs::from_millis(500))
+            .expect_err("second signal_stop must refuse");
+        assert_eq!(repeat.denied_code(), Some(RefusalCode::DaemonStopping));
+        assert_eq!(service.drain_deadline_ms(), Some(expected_deadline));
+        assert!(service.stop_unverified());
     }
 }

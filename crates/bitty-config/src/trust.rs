@@ -502,6 +502,36 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare profile_name".into(),
         });
     }
+    if plan.selector.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare selector".into(),
+        });
+    }
+    if plan.history.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare history".into(),
+        });
+    }
+    if plan.session.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare session".into(),
+        });
+    }
+    if plan.panel_rules.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare panel_rules".into(),
+        });
+    }
+    if plan.chrome.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare chrome".into(),
+        });
+    }
+    if plan.workspace.is_some() {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare workspace".into(),
+        });
+    }
     if !plan.undeclared_fields.is_empty() {
         return Err(ConfigError::UndeclaredField {
             field: plan.undeclared_fields[0].clone(),
@@ -1235,5 +1265,73 @@ mod tests {
         std::fs::write(&big_path, vec![b'x'; MAX_TRUST_FILE_BYTES + 1]).expect("write big");
         assert!(TrustStore::load_from_path(&big_path).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn project_plan_rejects_non_allowlisted_top_level_sections() {
+        use crate::panel_rules::{PanelPresentation, PanelSpawnRule};
+        use crate::plan::{HistoryCaptureConfigPlan, HistoryConfigPlan, ProfileSelector};
+        use crate::types::{ChromeConfig, SessionConfig, WorkspaceConfig};
+
+        let history_plan = ConfigPlan {
+            history: Some(HistoryConfigPlan {
+                capture: HistoryCaptureConfigPlan {
+                    transcript: Some(true),
+                    commands: Some(true),
+                },
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&history_plan).expect_err("history must be rejected");
+        assert!(err.to_string().contains("history"), "{err}");
+
+        let session_plan = ConfigPlan {
+            session: Some(SessionConfig {
+                restore_on_startup: Some(true),
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&session_plan).expect_err("session must be rejected");
+        assert!(err.to_string().contains("session"), "{err}");
+
+        let rules_plan = ConfigPlan {
+            panel_rules: Some(vec![PanelSpawnRule {
+                cmd: Some("btop".into()),
+                cmd_regex: None,
+                title_regex: None,
+                content: None,
+                presentation: Some(PanelPresentation::Floating),
+                width: None,
+                height: None,
+                workspace: None,
+                centered: None,
+            }]),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&rules_plan).expect_err("panel_rules must be rejected");
+        assert!(err.to_string().contains("panel_rules"), "{err}");
+
+        let chrome_plan = ConfigPlan {
+            chrome: Some(ChromeConfig::default()),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&chrome_plan).expect_err("chrome must be rejected");
+        assert!(err.to_string().contains("chrome"), "{err}");
+
+        let workspace_plan = ConfigPlan {
+            workspace: Some(WorkspaceConfig::default()),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&workspace_plan).expect_err("workspace must be rejected");
+        assert!(err.to_string().contains("workspace"), "{err}");
+
+        let selector_plan = ConfigPlan {
+            selector: Some(ProfileSelector {
+                profile: "work".into(),
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&selector_plan).expect_err("selector must be rejected");
+        assert!(err.to_string().contains("selector"), "{err}");
     }
 }

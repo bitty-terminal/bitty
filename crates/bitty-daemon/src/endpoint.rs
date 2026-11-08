@@ -762,7 +762,7 @@ fn open_endpoint_for_cell(
         return Err(EndpointError::UnsupportedPlatform { cell });
     }
     match cell.transport() {
-        EndpointTransport::UnixSocket => open_unix(env),
+        EndpointTransport::UnixSocket => open_unix(cell, env),
         EndpointTransport::WindowsNamedPipe | EndpointTransport::Unsupported => {
             Err(EndpointError::UnsupportedPlatform { cell })
         }
@@ -770,8 +770,8 @@ fn open_endpoint_for_cell(
 }
 
 #[cfg(unix)]
-fn open_unix(env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
-    prepare_endpoint_for_cell(PlatformCell::current(), env)?.bind()
+fn open_unix(cell: PlatformCell, env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
+    prepare_endpoint_for_cell(cell, env)?.bind()
 }
 
 #[cfg(unix)]
@@ -800,10 +800,8 @@ fn prepare_endpoint_for_cell(
 }
 
 #[cfg(not(unix))]
-fn open_unix(_env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
-    Err(EndpointError::UnsupportedPlatform {
-        cell: PlatformCell::current(),
-    })
+fn open_unix(cell: PlatformCell, _env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
+    Err(EndpointError::UnsupportedPlatform { cell })
 }
 
 #[cfg(unix)]
@@ -848,7 +846,7 @@ fn prepare_runtime_dir(
 /// directory that is attested directly instead.
 #[cfg(unix)]
 fn attest_runtime_root(root: &Path, uid: u32) -> Result<(), EndpointError> {
-    let metadata = match std::fs::metadata(root) {
+    let metadata = match std::fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(EndpointError::NoEndpoint {
@@ -863,6 +861,9 @@ fn attest_runtime_root(root: &Path, uid: u32) -> Result<(), EndpointError> {
             });
         }
     };
+    if metadata.file_type().is_symlink() {
+        return Err(tampered(root, TamperKind::Symlink));
+    }
     if !metadata.is_dir() {
         return Err(EndpointError::NoEndpoint {
             reason: format!("the runtime root {} is not a directory", root.display()),
@@ -1559,6 +1560,32 @@ mod tests {
         assert_eq!(paths.socket(), socket);
         assert_eq!(paths.runtime_dir(), root);
         assert_eq!(paths.lock(), root.join(LOCK_FILE_NAME));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_runtime_root_is_refused() {
+        let root = scratch_dir("rt-sym");
+        let target = root.join("real");
+        let link = root.join("link");
+        std::fs::create_dir(&target).expect("create target dir");
+        std::fs::set_permissions(&target, Permissions::from_mode(RUNTIME_DIR_MODE))
+            .expect("set target mode");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink root");
+
+        let err = attest_runtime_root(&link, getuid().as_raw())
+            .expect_err("symlinked runtime root must be refused");
+        assert!(
+            matches!(
+                err,
+                EndpointError::Tampered {
+                    kind: TamperKind::Symlink,
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

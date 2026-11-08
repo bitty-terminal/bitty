@@ -770,42 +770,164 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Extract a flat `"key": "string"` field from a params object (bounded).
-/// Servo-side only (unix IPC handlers).
+/// Parse a JSON string literal starting at `rest` (which must begin with `"`),
+/// advancing `*rest` past the closing quote.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn extract_string_param(params_raw: Option<&str>, key: &str) -> Option<String> {
-    let raw = params_raw?;
-    let needle = format!("\"{key}\"");
-    let pos = raw.find(&needle)?;
-    let after = &raw[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let mut rest = after[colon + 1..].trim_start();
-    if !rest.starts_with('"') {
-        return None;
-    }
-    rest = &rest[1..];
+fn parse_json_string(rest: &mut &str, max_bytes: usize) -> Option<String> {
+    let s = rest.strip_prefix('"')?;
     let mut out = String::new();
-    let mut chars = rest.chars();
-    loop {
-        let ch = chars.next()?;
+    let mut chars = s.char_indices();
+    while let Some((_, ch)) = chars.next() {
         match ch {
-            '"' => break,
-            '\\' => match chars.next()? {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                _ => return None,
-            },
+            '"' => {
+                let consumed = chars.next().map_or(s.len(), |(idx, _)| idx);
+                *rest = &s[consumed..];
+                return Some(out);
+            }
+            '\\' => {
+                let (_, esc) = chars.next()?;
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let mut hex = 0u32;
+                        for _ in 0..4 {
+                            let (_, h) = chars.next()?;
+                            hex = (hex << 4) | h.to_digit(16)?;
+                        }
+                        let decoded = char::from_u32(hex)?;
+                        if (decoded as u32) < 0x20 && !matches!(decoded, '\n' | '\r' | '\t') {
+                            return None;
+                        }
+                        out.push(decoded);
+                    }
+                    _ => return None,
+                }
+            }
             ch if (ch as u32) < 0x20 => return None,
             ch => out.push(ch),
         }
-        if out.len() > MAX_CONSENT_PARAM_BYTES {
+        if out.len() > max_bytes {
             return None;
         }
     }
-    Some(out)
+    None
+}
+
+/// Skip one JSON value (string, number, boolean, null, object, or array) at the
+/// front of `rest`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn skip_json_value(rest: &mut &str) -> Option<()> {
+    *rest = rest.trim_start();
+    let first = rest.chars().next()?;
+    match first {
+        '"' => {
+            let s = rest.strip_prefix('"')?;
+            let mut chars = s.char_indices();
+            while let Some((_, ch)) = chars.next() {
+                match ch {
+                    '"' => {
+                        let consumed = chars.next().map_or(s.len(), |(idx, _)| idx);
+                        *rest = &s[consumed..];
+                        return Some(());
+                    }
+                    '\\' => {
+                        chars.next()?;
+                    }
+                    ch if (ch as u32) < 0x20 => return None,
+                    _ => {}
+                }
+            }
+            None
+        }
+        '{' | '[' => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let s = *rest;
+            let mut chars = s.char_indices();
+            while let Some((_, ch)) = chars.next() {
+                if in_string {
+                    match ch {
+                        '"' => in_string = false,
+                        '\\' => {
+                            chars.next()?;
+                        }
+                        ch if (ch as u32) < 0x20 => return None,
+                        _ => {}
+                    }
+                } else {
+                    match ch {
+                        '"' => in_string = true,
+                        '{' | '[' => {
+                            depth = depth.checked_add(1)?;
+                            if depth > 32 {
+                                return None;
+                            }
+                        }
+                        '}' | ']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                let consumed = chars.next().map_or(s.len(), |(idx, _)| idx);
+                                *rest = &s[consumed..];
+                                return Some(());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            *rest = &rest[end..];
+            Some(())
+        }
+    }
+}
+
+/// Extract a flat `"key": "string"` field from a top-level JSON params object (bounded).
+/// Servo-side only (unix IPC handlers).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn extract_string_param(params_raw: Option<&str>, key: &str) -> Option<String> {
+    let mut rest = params_raw?.trim();
+    rest = rest.strip_prefix('{')?.trim_start();
+    if rest.strip_prefix('}').is_some() {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    loop {
+        rest = rest.trim_start();
+        let field_key = parse_json_string(&mut rest, MAX_CONSENT_PARAM_BYTES)?;
+        rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        if field_key == key {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(parse_json_string(&mut rest, MAX_CONSENT_PARAM_BYTES)?);
+        } else {
+            skip_json_value(&mut rest)?;
+        }
+        rest = rest.trim_start();
+        if let Some(after_comma) = rest.strip_prefix(',') {
+            rest = after_comma;
+        } else {
+            let after_brace = rest.strip_prefix('}')?;
+            if !after_brace.trim().is_empty() {
+                return None;
+            }
+            return found;
+        }
+    }
 }
 
 /// Live connection authority behind a request, or fail closed.
@@ -1526,5 +1648,29 @@ mod tests {
             .snapshot(context.session_id())
             .expect("live session");
         assert_eq!(snapshot.identity.session_id, context.session_id());
+    }
+
+    #[test]
+    fn extract_string_param_ignores_nested_and_string_embedded_keys_and_rejects_duplicates() {
+        // Key-like text inside an earlier string value must never shadow the
+        // real top-level key.
+        let raw = r#"{"note":"\"scope\":\"debug.trace\"","nested":{"scope":"debug.trace"},"scope":"debug\u002econtrol","confirm":"ALLOW debug.control"}"#;
+        assert_eq!(
+            extract_string_param(Some(raw), "scope").as_deref(),
+            Some("debug.control")
+        );
+        assert_eq!(
+            extract_string_param(Some(raw), "confirm").as_deref(),
+            Some("ALLOW debug.control")
+        );
+
+        // Key-like text inside a string value must not satisfy a missing top-level key.
+        let spoofed = r#"{"scope":"debug.control","note":"\"confirm\":\"ALLOW debug.control\""}"#;
+        assert_eq!(extract_string_param(Some(spoofed), "confirm"), None);
+
+        // Duplicate top-level keys fail closed.
+        let duplicate =
+            r#"{"scope":"debug.control","scope":"debug.trace","confirm":"ALLOW debug.control"}"#;
+        assert_eq!(extract_string_param(Some(duplicate), "scope"), None);
     }
 }

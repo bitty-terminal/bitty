@@ -727,7 +727,13 @@ fn as_string_array(value: &LuaValue) -> Option<Vec<String>> {
     match value {
         LuaValue::Table(pairs) => pairs
             .iter()
-            .map(|(_, child)| as_str(child).map(str::to_string))
+            .enumerate()
+            .map(|(idx, (key, child))| match key {
+                LuaValue::Integer(k) if *k == i64::try_from(idx + 1).ok()? => {
+                    as_str(child).map(str::to_string)
+                }
+                _ => None,
+            })
             .collect(),
         _ => None,
     }
@@ -931,6 +937,15 @@ mod tests {
         assert!(parse_index("{\"state_version\":1}").is_err());
         assert!(parse_index("{\"state_version\":1,\"plugins\":\"x\"}").is_err());
         assert!(parse_index("not json").is_err());
+        let bad_granted = format!(
+            "{{\"state_version\":1,\"plugins\":{{\"bitty.alpha\":{{\"source_class\":\"registry\",\"plugin_id\":\"bitty.alpha\",\"version\":\"1.0.0\",\"root\":\"packages/bitty.alpha/1.0.0\",\"manifest_hash\":\"{}\",\"content_digest\":\"{}\",\"enabled\":true,\"granted\":{{\"k\":\"terminal.semantic-read\"}}}}}}}}",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(
+            parse_index(&bad_granted).is_err(),
+            "object for `granted` must be rejected as non-array"
+        );
     }
 
     #[test]

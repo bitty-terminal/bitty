@@ -1033,6 +1033,9 @@ pub fn set_enabled(
     plugin_id: &str,
     enabled: bool,
 ) -> Result<bool, PackageOpError> {
+    bitty_plugin_host::manifest::PluginId::new(plugin_id).map_err(|error| {
+        PackageOpError::Store(format!("invalid plugin id '{plugin_id}': {error}"))
+    })?;
     let _lock = STORE_MUTEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1070,6 +1073,9 @@ pub fn set_enabled(
 /// [`PackageOpError::Store`] when neither a record nor a package directory
 /// exists, or the index cannot be rewritten/deleted.
 pub fn uninstall(store_root: &Path, plugin_id: &str) -> Result<UninstallReport, PackageOpError> {
+    bitty_plugin_host::manifest::PluginId::new(plugin_id).map_err(|error| {
+        PackageOpError::Store(format!("invalid plugin id '{plugin_id}': {error}"))
+    })?;
     let _lock = STORE_MUTEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1087,7 +1093,7 @@ pub fn uninstall(store_root: &Path, plugin_id: &str) -> Result<UninstallReport, 
         None => None,
     };
     let package_dir = store_root.join(PACKAGES_DIR).join(plugin_id);
-    let tree_removed = if package_dir.exists() {
+    let tree_removed = if std::fs::symlink_metadata(&package_dir).is_ok() {
         remove_path(&package_dir).map_err(|error| {
             PackageOpError::Store(format!(
                 "record removed but '{}' could not be deleted: {error}",
@@ -4747,6 +4753,53 @@ mod tests {
                 .join(format!("packages/xuepoo.bulk{REPAIR_MAX_PLUGINS}/1.0.0"))
                 .is_dir()
         );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn uninstall_and_set_enabled_reject_invalid_or_traversal_plugin_ids() {
+        let scratch = scratch("uninstall-validate-id");
+        let store = scratch.join("store");
+        let packages_dir = store.join(PACKAGES_DIR);
+        let quarantine_dir = store.join(QUARANTINE_DIR);
+        std::fs::create_dir_all(packages_dir.join("xuepoo.keep/1.0.0")).expect("packages dir");
+        std::fs::create_dir_all(&quarantine_dir).expect("quarantine dir");
+
+        for bad_id in ["", ".", "..", "../quarantine", "xuepoo.keep/1.0.0", "/abs"] {
+            let err = uninstall(&store, bad_id).expect_err("invalid plugin id must fail");
+            assert!(
+                format!("{err}").contains("invalid plugin id"),
+                "expected invalid plugin id error for {bad_id:?}, got: {err}"
+            );
+            let err = set_enabled(&store, bad_id, false).expect_err("invalid plugin id must fail");
+            assert!(
+                format!("{err}").contains("invalid plugin id"),
+                "expected invalid plugin id error for {bad_id:?}, got: {err}"
+            );
+        }
+
+        assert!(
+            packages_dir.join("xuepoo.keep/1.0.0").is_dir(),
+            "packages/ must not be deleted by traversal plugin_id"
+        );
+        assert!(
+            quarantine_dir.is_dir(),
+            "quarantine/ must not be deleted by traversal plugin_id"
+        );
+
+        #[cfg(unix)]
+        {
+            let link_path = packages_dir.join("xuepoo.dangling");
+            std::os::unix::fs::symlink(scratch.join("nonexistent-target"), &link_path)
+                .expect("create dangling symlink");
+            assert!(std::fs::symlink_metadata(&link_path).is_ok());
+            let report =
+                uninstall(&store, "xuepoo.dangling").expect("uninstall removes dangling link");
+            assert!(report.tree_removed);
+            assert!(!report.record_removed);
+            assert!(std::fs::symlink_metadata(&link_path).is_err());
+        }
+
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

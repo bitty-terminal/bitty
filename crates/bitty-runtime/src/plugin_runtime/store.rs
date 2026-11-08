@@ -155,6 +155,9 @@ impl PluginStore {
         let value = parse_json(text).map_err(|e| format!("store parse: {e}"))?;
         let mut entries = BTreeMap::new();
         if let LuaValue::Table(pairs) = value {
+            if pairs.is_empty() && !text.trim_start().starts_with('{') {
+                return Err("store root must be an object".to_string());
+            }
             for (key, entry) in pairs {
                 let LuaValue::String(key) = key else {
                     return Err("store keys must be strings".to_string());
@@ -1038,6 +1041,12 @@ mod tests {
         let err = load_with_stub(path.clone(), &backend);
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("store keys must be strings"));
+
+        // Non-object root (empty array)
+        backend.seed(&path, b"[]".to_vec());
+        let err = load_with_stub(path.clone(), &backend);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("store root must be an object"));
     }
 
     #[test]

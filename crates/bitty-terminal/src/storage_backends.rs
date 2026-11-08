@@ -397,7 +397,7 @@ fn encode_v3_snapshot(snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
         .collect();
     validate_pinned_for_file(&snap.pinned, &layout_leaves)?;
     let layout_panes: usize = snap.workspaces.iter().map(|ws| ws.panes.len()).sum();
-    if layout_panes + snap.pinned.len() > MAX_SESSION_PANES_TOTAL {
+    if layout_panes.saturating_add(snap.pinned.len()) > MAX_SESSION_PANES_TOTAL {
         return Err(SessionError::Corrupt("too many panes"));
     }
     let body = session_codec::encode_session(&core_snapshot_to_storage(snap))
@@ -674,6 +674,9 @@ fn decode_v3_snapshot(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
         .ok_or(SessionError::Corrupt("marker"))?
         .parse()
         .map_err(|_| SessionError::Corrupt("marker"))?;
+    if pinned_count > MAX_SESSION_PANES_TOTAL {
+        return Err(SessionError::Corrupt("too many panes"));
+    }
     // Delegate the workspace blocks as a v2-shaped body: the v3 magic
     // rewrites to v2 and the pinned block swaps for the session trailer.
     let mut body = vec![session_magic(
@@ -685,6 +688,10 @@ fn decode_v3_snapshot(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
     let storage_snap =
         session_codec::decode_session(body.join("\n").as_bytes()).map_err(map_session_error)?;
     let mut snap = storage_snapshot_to_core(&storage_snap);
+    let layout_panes: usize = snap.workspaces.iter().map(|ws| ws.panes.len()).sum();
+    if layout_panes.saturating_add(pinned_count) > MAX_SESSION_PANES_TOTAL {
+        return Err(SessionError::Corrupt("too many panes"));
+    }
     // Parse the pinned records between the `pinned <n>` header and the
     // `end-session` trailer.
     let mut pos = pinned_at + 1;
@@ -709,10 +716,6 @@ fn decode_v3_snapshot(bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
         .flat_map(|ws| ws.layout.leaf_ids())
         .collect();
     validate_pinned_for_file(&pinned, &layout_leaves)?;
-    let layout_panes: usize = snap.workspaces.iter().map(|ws| ws.panes.len()).sum();
-    if layout_panes + pinned.len() > MAX_SESSION_PANES_TOTAL {
-        return Err(SessionError::Corrupt("too many panes"));
-    }
     snap.pinned = pinned;
     Ok(snap)
 }
@@ -1462,6 +1465,25 @@ mod tests {
         // A v3 file without the pinned block is corrupt.
         let no_block = "bitty-session v3\nworkspaces 1 active 0 mru 0\nworkspace 1 1\nname ws1\nlayout (leaf 1 80 24)\npane 1 80 24 0 0 session terminal tiled\nend-pane\nend-workspace\nend-session\n";
         assert!(backend().decode_snapshot(no_block.as_bytes()).is_err());
+        // An untrusted huge `pinned <n>` header must be rejected before
+        // `Vec::with_capacity` rather than panicking on capacity overflow.
+        let huge_pinned = format!(
+            "bitty-session v3\nworkspaces 1 active 0 mru 0\nworkspace 1 1\nname ws1\nlayout (leaf 1 80 24)\npane 1 80 24 0 0 session terminal tiled\nend-pane\nend-workspace\npinned {}\nend-session\n",
+            usize::MAX
+        );
+        let err = backend()
+            .decode_snapshot(huge_pinned.as_bytes())
+            .expect_err("unbounded pinned count must fail before allocation");
+        assert_eq!(format!("{err}"), "session file corrupt (too many panes)");
+        // Combined layout_panes + pinned_count > MAX_SESSION_PANES_TOTAL must
+        // also fail before allocating/walking pinned records.
+        let over_combined = format!(
+            "bitty-session v3\nworkspaces 1 active 0 mru 0\nworkspace 1 1\nname ws1\nlayout (leaf 1 80 24)\npane 1 80 24 0 0 session terminal tiled\nend-pane\nend-workspace\npinned {MAX_SESSION_PANES_TOTAL}\nend-session\n"
+        );
+        let err = backend()
+            .decode_snapshot(over_combined.as_bytes())
+            .expect_err("layout_panes + pinned_count > MAX_SESSION_PANES_TOTAL must fail");
+        assert_eq!(format!("{err}"), "session file corrupt (too many panes)");
     }
 
     #[test]

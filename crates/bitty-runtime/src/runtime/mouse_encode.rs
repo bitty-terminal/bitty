@@ -182,9 +182,9 @@ fn push_slice(out: &mut MouseBytes, bytes: &[u8]) {
     }
 }
 
-/// Writes unsigned decimal, returning bytes written. Bounded by `u16`.
+/// Writes unsigned decimal, returning bytes written. Bounded by `u32` (up to 10 digits).
 fn push_decimal(out: &mut MouseBytes, mut value: u32) -> usize {
-    let mut digits = [0u8; 5];
+    let mut digits = [0u8; 10];
     let mut n = 0;
     loop {
         digits[n] = b'0' + (value % 10) as u8;
@@ -414,10 +414,25 @@ mod tests {
             MouseFormat::X10,
             MouseFormat::Utf8,
             MouseFormat::Sgr,
+            MouseFormat::SgrPixels,
             MouseFormat::Urxvt,
         ] {
             let bytes = encode_mouse(format, report(67, u16::MAX, u16::MAX));
             assert!(bytes.as_slice().len() <= MOUSE_REPORT_MAX_BYTES);
         }
+    }
+
+    #[test]
+    fn sgr_pixels_large_coordinates_encode_without_panic_3060() {
+        // row = 5000 -> 5000 * 20 + 1 = 100001 (6 digits)
+        // col = u16::MAX, row = u16::MAX -> 655351 and 1310701 (6 and 7 digits)
+        assert_eq!(
+            encode_mouse(MouseFormat::SgrPixels, report(0, 10_000, 5_000)).as_slice(),
+            b"\x1b[<0;100001;100001M"
+        );
+        assert_eq!(
+            encode_mouse(MouseFormat::SgrPixels, report(0, u16::MAX, u16::MAX)).as_slice(),
+            b"\x1b[<0;655351;1310701M"
+        );
     }
 }

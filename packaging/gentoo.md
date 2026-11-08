@@ -91,6 +91,17 @@ Rust toolchain (`virtual/rust`) plus `tic`, which ships in `sys-libs/ncurses`
 not a reproducible package: use it to track development, not for a
 bit-reproducible install.
 
+## Session daemon (`bittyd`)
+
+Both ebuilds install the daemon: `bitty-bin` copies `bin/bittyd` from the
+release bundle, and the live ebuild compiles and installs
+`-p bitty-daemon --bin bittyd`.
+
+The per-user unit is gated on `USE=systemd`, because OpenRC is the default
+profile and has no systemd user manager. Without the flag, supervise
+`bittyd start` yourself or write an OpenRC service; the daemon stays in the
+foreground and drains `SIGHUP`.
+
 ## Runtime dependencies
 
 `RDEPEND` declares only the direct `NEEDED` sonames from

@@ -53,6 +53,14 @@ manifests/b/BittyTerminal/Bitty/<version>/
 - **ProductCode**: `{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1` (declared in `packaging/windows/bitty.iss`)
 - **Silent Flags**: `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`
 
+## No session daemon on Windows
+
+Windows artifacts carry no `bittyd`: the release job copies the daemon into
+`dist/` for `*-linux-*` targets only, so the setup installer and the portable
+ZIP contain `bitty.exe` alone. A source build does not help either — the crate
+has no ConPTY backend, so the served spawn path refuses the Windows cell
+(tracked in #2985). There is no daemon support to install on Windows.
+
 ## Automation and Release Updates
 
 Manifests can be generated automatically via `scripts/generate-winget-manifest.sh`:

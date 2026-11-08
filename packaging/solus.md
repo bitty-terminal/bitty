@@ -51,6 +51,13 @@ sha256 digest, never `SKIP`; the in-tree copy is a draft until then.
 sudo eopkg install bitty-0.0.31-1-1-x86_64.eopkg
 ```
 
+## Session daemon (`bittyd`)
+
+The recipe installs both binaries (`%cargo_install bitty bittyd`) and ships the
+per-user unit at `/usr/lib/systemd/user/bittyd.service`. Users enable it
+themselves with `systemctl --user enable --now bittyd`; the package never
+enables or starts it.
+
 ## Features
 
 - Uses Solus `%cargo_build` and `%cargo_install` macros targeting both the

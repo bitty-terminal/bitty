@@ -44,6 +44,17 @@ carry that digest, never `SKIP`; the in-tree copy is a draft until then.
 xi bitty # or xbps-install --repository hostdir/binpkgs bitty
 ```
 
+## Session daemon (`bittyd`)
+
+The template ships both binaries. `make_build_args` selects
+`-p bitty-terminal -p bitty-daemon`; `make_install_args` covers the terminal
+only, so `post_install` cargo-installs the daemon with the same flags to
+`/usr/bin/bittyd`.
+
+No systemd unit is installed: Void's default init is runit. Supervise
+`bittyd start` with a runit service (or run it in the foreground); the daemon
+does not fork.
+
 ## Features
 
 - Supports both `glibc` and `musl` libc variants across `x86_64` and `aarch64`.

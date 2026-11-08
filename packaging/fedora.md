@@ -47,6 +47,14 @@ are installed on the runner:
 copr-cli build -r <chroot> ... xuepoo/bitty-terminal <path-to-srpm>
 ```
 
+## Session daemon (`bittyd`)
+
+Both Fedora paths carry the daemon: the `nfpm` `.rpm` installs
+`/usr/bin/bittyd` plus `/usr/lib/systemd/user/bittyd.service`, and
+`packaging/bitty.spec` — the recipe Copr builds from the published bundle —
+installs the same two files. Enable the unit per user with
+`systemctl --user enable --now bittyd`; the package never enables or starts it.
+
 ## Enabled chroots
 
 Copr receives a single SRPM and rebuilds it per enabled chroot. As of the

@@ -59,6 +59,15 @@ sudo apt update
 sudo apt install -y bitty
 ```
 
+## Session daemon (`bittyd`)
+
+The published `.deb` carries both binaries: `nfpm.yaml` installs
+`target/release/bittyd` as `/usr/bin/bittyd` and ships the per-user unit at
+`/usr/lib/systemd/user/bittyd.service`. `apt install bitty` therefore gives you
+`bittyd` too; enable it per user with `systemctl --user enable --now bittyd`
+(optionally `loginctl enable-linger "$USER"`). The package never enables or
+starts it.
+
 ## Security and Verification
 
 The repository metadata (`InRelease` and `Release.gpg`) is signed on every release with

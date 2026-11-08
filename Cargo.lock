@@ -353,6 +353,7 @@ dependencies = [
  "arboard",
  "clipboard-win",
  "nix 0.31.3",
+ "png",
  "raw-window-handle",
  "winit",
  "wl-clipboard-rs",

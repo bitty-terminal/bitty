@@ -6501,6 +6501,17 @@ fn window_title_carries_theme_and_source() {
 }
 
 #[test]
+fn startup_window_config_attaches_embedded_window_icon() {
+    let config = bitty_platform::WindowConfig::new()
+        .with_title(window_title_for_theme("bitty-dark", "default"))
+        .with_visible(true);
+    assert!(
+        config.has_window_icon(),
+        "startup WindowConfig must attach the embedded runtime window icon"
+    );
+}
+
+#[test]
 fn parse_config_subcommands() {
     let p = parse_args(&args_of(&["bitty", "config", "check"]));
     assert!(p.config_word);

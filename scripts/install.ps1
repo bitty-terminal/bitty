@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   First-class Bitty installer for Windows (CTX-1047, #1847, #2926).
 
@@ -136,6 +136,89 @@ function Get-BittyStartMenuDir {
   return Join-Path $appData 'Microsoft\Windows\Start Menu\Programs'
 }
 
+function Send-BittyShellIconChange {
+  # Notify the Windows Shell (SHCNE_ASSOCCHANGED = 0x08000000, SHCNF_IDLIST = 0x0000)
+  # via shell32.dll so Explorer and Windows Search immediately invalidate any cached
+  # blank or stale shortcut icon (CTX-1750, bitty#3038).
+  try {
+    if (-not ('Bitty.ShellNativeMethods' -as [type])) {
+      Add-Type -Namespace 'Bitty' -Name 'ShellNativeMethods' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll")]
+public static extern void SHChangeNotify(
+    int wEventId, uint uFlags, System.IntPtr dwItem1, System.IntPtr dwItem2);
+'@
+    }
+    [Bitty.ShellNativeMethods]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
+  } catch {
+    Write-BittyLog "warning: could not refresh shell icon cache via SHChangeNotify: $($_.Exception.Message)"
+  }
+}
+
+function Remove-BittyLegacyInnoSetup {
+  param([string]$CurrentInstallDir)
+  # CTX-1750 (bitty#3038): per-user Inno Setup (packaging/windows/bitty.iss)
+  # installs to %LOCALAPPDATA%\Programs\Bitty, writes its Start Menu group to
+  # %AppData%\Microsoft\Windows\Start Menu\Programs\Bitty (Bitty.lnk and
+  # Uninstall Bitty.lnk), and registers the per-user uninstall key
+  # HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1.
+  # Clean up any stale per-user Inno Setup artifacts so Windows Search never
+  # launches an older setup binary over the fresh install.ps1 binary.
+  $removedAny = $false
+  $startMenuDir = Get-BittyStartMenuDir
+  if ($startMenuDir -ne '') {
+    $legacyGroupDir = Join-Path $startMenuDir 'Bitty'
+    foreach ($legacyLeaf in @('Bitty.lnk', 'Uninstall Bitty.lnk')) {
+      $legacyShortcut = Join-Path $legacyGroupDir $legacyLeaf
+      if (Test-Path -LiteralPath $legacyShortcut) {
+        try {
+          Remove-Item -LiteralPath $legacyShortcut -Force
+          Write-BittyLog "removed legacy Inno Setup shortcut: $legacyShortcut"
+          $removedAny = $true
+        } catch {
+          Write-BittyLog "warning: could not remove legacy Inno Setup shortcut ${legacyShortcut}: $($_.Exception.Message)"
+        }
+      }
+    }
+    if (Test-Path -LiteralPath $legacyGroupDir) {
+      try {
+        Remove-Item -LiteralPath $legacyGroupDir -Recurse -Force
+        Write-BittyLog "removed legacy Inno Setup Start Menu folder: $legacyGroupDir"
+        $removedAny = $true
+      } catch {
+        Write-BittyLog "warning: could not remove legacy Inno Setup Start Menu folder ${legacyGroupDir}: $($_.Exception.Message)"
+      }
+    }
+  }
+  $localAppData = "$env:LocalAppData"
+  if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+    $legacyInstallDir = Join-Path $localAppData 'Programs\Bitty'
+    $normLegacy = $legacyInstallDir.TrimEnd([char[]]@('\', '/'))
+    $normCurrent = "$CurrentInstallDir".TrimEnd([char[]]@('\', '/'))
+    if (-not $normLegacy.Equals($normCurrent, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $legacyInstallDir)) {
+      try {
+        Remove-Item -LiteralPath $legacyInstallDir -Recurse -Force
+        Write-BittyLog "removed legacy Inno Setup directory: $legacyInstallDir"
+        $removedAny = $true
+      } catch {
+        Write-BittyLog "warning: could not remove legacy Inno Setup directory ${legacyInstallDir} (close any running Bitty window from that path): $($_.Exception.Message)"
+      }
+    }
+  }
+  $legacyUninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1'
+  if (Test-Path -LiteralPath $legacyUninstallKey) {
+    try {
+      Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force
+      Write-BittyLog "removed legacy Inno Setup uninstall entry: $legacyUninstallKey"
+      $removedAny = $true
+    } catch {
+      Write-BittyLog "warning: could not remove legacy Inno Setup uninstall entry ${legacyUninstallKey}: $($_.Exception.Message)"
+    }
+  }
+  if ($removedAny) {
+    Send-BittyShellIconChange
+  }
+}
+
 function New-BittyShortcut {
   param([string]$TargetExe, [string]$WorkingDirectory, [string]$IconSource)
   $startMenuDir = Get-BittyStartMenuDir
@@ -155,14 +238,17 @@ function New-BittyShortcut {
     if (-not (Test-Path $startMenuDir)) {
       New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
     }
+    if (Test-Path -LiteralPath $shortcutPath) {
+      Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+    }
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $TargetExe
     $shortcut.WorkingDirectory = $WorkingDirectory
     $shortcut.IconLocation = "$IconSource,0"
     $shortcut.Description = 'Bitty terminal'
-    # Save() writes in place, so a re-run replaces the existing shortcut.
     $shortcut.Save()
+    Send-BittyShellIconChange
     Write-BittyLog "created Start Menu shortcut: $shortcutPath (icon: $IconSource)"
   } catch {
     Write-BittyLog "warning: could not create Start Menu shortcut ${shortcutPath}: $($_.Exception.Message)"
@@ -801,6 +887,7 @@ try {
   $markerPrefix = Split-Path -Path $InstallDir -Parent
   Write-BittyInstallMarker -Channel 'script' -Prefix $markerPrefix -BinDir $InstallDir `
     -VersionBare $versionBare -BinaryPath $destExe
+  Remove-BittyLegacyInnoSetup -CurrentInstallDir $InstallDir
   if ($NoShortcut) {
     Write-BittyLog 'skipping the Start Menu shortcut (-NoShortcut)'
     Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"

@@ -191,7 +191,11 @@ else
     'HKCU:\Environment' '-NoShortcut' '-NoPathUpdate' \
     'CurrentVersion\Uninstall\Bitty' 'DisplayIcon' 'EstimatedSize' \
     'NoModify' 'NoRepair' 'UninstallString' 'uninstall.ps1' \
-    '-NoRegistry' 'bitty.ico'; do
+    '-NoRegistry' 'bitty.ico' \
+    'Uninstall Bitty.lnk' 'Programs\Bitty' \
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1' \
+    'shell32.dll' 'SHCNE_ASSOCCHANGED' 'SHCNF_IDLIST' \
+    'SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)'; do
     if ! grep -qF -- "$needle" "$PS1_SCRIPT"; then
       echo "FAIL: install.ps1 missing '$needle'" >&2
       FAIL=1

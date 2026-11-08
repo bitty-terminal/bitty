@@ -43,6 +43,11 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 # at the GPU surface boundary (wgpu 25 consumes 0.6), so the exact version is
 # pinned and re-exported; see crate-level ownership rules and src/surface.rs.
 raw-window-handle = "=0.6.2"
+# CTX-1750 (bitty#3038): decode the embedded 64x64 application icon PNG into
+# RGBA8 for `WindowAttributes::with_window_icon` / `with_taskbar_icon`. Uses
+# the same minimal `png 0.18` codec already in the workspace lockfile via
+# `bitty-rich`.
+png = "0.18"
 
 # CTX-1315 (R-004): bounded Wayland text acquisition lives in
 # `src/clipboard_bounded.rs`. `wl-clipboard-rs` and `nix` are already in the

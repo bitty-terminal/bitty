@@ -282,3 +282,112 @@ fn spawn_for_focused_leaf_itself_does_not_self_inherit() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn workspace_new_inherits_focused_pane_cwd_issue_3020() {
+    // Issue #3020: `Mod+T` (`workspace_new`) replays the primary recipe in a
+    // fresh workspace leaf. The pane that held focus before the switch seeds
+    // that shell: the pinned kernel cwd on Linux, its `OSC 7` report where no
+    // kernel cwd query exists.
+    let dir = scratch_dir("workspace-3020");
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let mut rt = two_pane_runtime();
+    // Record the recipe the fresh workspace replays: the child prints its own
+    // physical cwd, so the grid proves where it started.
+    rt.spawn_shell_with_args(SHELL, &["-c", "pwd -P; exec sleep 30"])
+        .expect("primary shell must attach");
+    // v2 really sits in `dir` and holds focus when the workspace is created.
+    rt.spawn_shell_for_view_in(
+        ViewId::new(2),
+        SHELL,
+        &["-c", "exec sleep 30"],
+        120,
+        24,
+        Some(&dir),
+    )
+    .expect("spawn source pane shell");
+    rt.handle_pane_bytes(ViewId::new(2), &osc7(&dir));
+    assert!(rt.set_focus(ViewId::new(2)), "focus source pane");
+    assert_eq!(rt.workspace_new().expect("new workspace"), 1);
+    let fresh = rt.focused_view().expect("fresh workspace leaf");
+    assert_ne!(fresh, ViewId::new(2), "workspace_new installs a fresh leaf");
+    let marker = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name");
+    let text = {
+        assert!(
+            wait_for_pane_text(&mut rt, fresh, marker),
+            "fresh workspace pane never showed its cwd; grid={:?}",
+            pane_text(&rt, fresh)
+        );
+        pane_text(&rt, fresh)
+    };
+    assert!(
+        text.contains(marker),
+        "a new workspace must start in the focused pane's cwd: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_spawn_cwd_wins_over_the_focused_pane_cwd_issue_3020() {
+    // Issue #3020: an explicit spawn cwd (`bitty ctl terminal spawn --cwd`)
+    // replaces the inherited focused-pane cwd, never the other way around.
+    let source_dir = scratch_dir("explicit-source-3020");
+    let explicit_dir = scratch_dir("explicit-target-3020");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&explicit_dir).expect("create target dir");
+    let mut rt = three_pane_runtime();
+    rt.spawn_shell_for_view_in(
+        ViewId::new(2),
+        SHELL,
+        &["-c", "exec sleep 30"],
+        120,
+        24,
+        Some(&source_dir),
+    )
+    .expect("spawn source pane shell");
+    // The report names the same directory as the child, so the inheritance
+    // precondition holds on platforms without a kernel cwd query too.
+    rt.handle_pane_bytes(ViewId::new(2), &osc7(&source_dir));
+    assert!(rt.set_focus(ViewId::new(2)), "focus source pane");
+    assert_eq!(
+        rt.inherited_spawn_cwd(ViewId::new(3)),
+        Some(source_dir.clone()),
+        "precondition: the focused pane's cwd is the inherited value"
+    );
+    let explicit_marker = explicit_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name");
+    let source_marker = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name");
+    rt.spawn_shell_for_view_in(
+        ViewId::new(3),
+        SHELL,
+        &["-c", "pwd -P; exec sleep 30"],
+        120,
+        24,
+        Some(&explicit_dir),
+    )
+    .expect("spawn target pane shell");
+    assert!(
+        wait_for_pane_text(&mut rt, ViewId::new(3), explicit_marker),
+        "target pane never showed its cwd; grid={:?}",
+        pane_text(&rt, ViewId::new(3))
+    );
+    let text = pane_text(&rt, ViewId::new(3));
+    assert!(
+        text.contains(explicit_marker),
+        "explicit cwd must win: {text:?}"
+    );
+    assert!(
+        !text.contains(source_marker),
+        "the inherited focused-pane cwd leaked into an explicit spawn: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&explicit_dir);
+}

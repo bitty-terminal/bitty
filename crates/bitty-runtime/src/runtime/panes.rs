@@ -326,6 +326,9 @@ impl Runtime {
     /// this first: installing the layout re-homes focus to the fresh leaf
     /// ([`Self::set_layout`]), which would make `target` the focused source
     /// and drop the surviving float/pin report (CTX-1347).
+    ///
+    /// New-pane callers prefer [`Self::inherited_spawn_cwd`], which tries the
+    /// focused pane's pinned kernel cwd first and lands here as the fallback.
     #[must_use]
     pub fn inherited_cwd_for(&self, target: ViewId) -> Option<PathBuf> {
         if let Some(source) = self.focused_view() {
@@ -349,6 +352,34 @@ impl Runtime {
         // `OSC 7` report when no live pane has reported a usable directory
         // yet. Still fail-open: `None` keeps the PTY default.
         self.session_pending_cwd(&target)
+    }
+
+    /// Working directory a fresh pane or split inherits from the focused pane
+    /// (issue #3020).
+    ///
+    /// Terminal truth first: the focused pane's PTY-child kernel cwd
+    /// ([`Self::focused_pane_child_cwd`]) exists even when the shell never
+    /// emits an `OSC 7` report (no shell integration installed), which is the
+    /// reported `Mod+N`/`Mod+T` gap. The pin is re-identified before it
+    /// reaches a child (#2948): a swapped, renamed, or deleted directory is
+    /// not inherited.
+    ///
+    /// When the kernel cwd cannot be proven — no focused source, the source is
+    /// `target` itself (replacing a session never seeds from the session it
+    /// replaces), the child is gone, or the platform has no kernel cwd query —
+    /// the [`Self::inherited_cwd_for`] report/restore chain answers instead.
+    /// `None` keeps the PTY default (`$HOME`, else the process cwd), so an
+    /// unknown directory never fails the spawn.
+    #[must_use]
+    pub fn inherited_spawn_cwd(&self, target: ViewId) -> Option<PathBuf> {
+        if self.focused_view() != Some(target) {
+            if let Some(pinned) = self.focused_pane_child_cwd() {
+                if pinned.revalidate() {
+                    return Some(pinned.path().to_path_buf());
+                }
+            }
+        }
+        self.inherited_cwd_for(target)
     }
 
     /// Pinned kernel working directory of the focused pane (issue #2911).

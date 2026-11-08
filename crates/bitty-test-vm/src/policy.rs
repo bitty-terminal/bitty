@@ -371,6 +371,27 @@ pub fn qemu_img_create_args(base_image: &Path, overlay_image: &Path) -> Vec<Stri
     ]
 }
 
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn lexical_normalize(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 /// Pure policy check over an explicit layout.
 ///
 /// Rejected: ISO extensions, a missing backing file, an overlay that is the
@@ -384,6 +405,11 @@ pub fn validate_paths(paths: &RunPaths) -> Result<(), Vec<Violation>> {
 
     let base = &paths.base_image;
     let overlay = &paths.overlay_image;
+    let norm_base = lexical_normalize(base);
+    let norm_overlay = lexical_normalize(overlay);
+    let norm_run_dir = lexical_normalize(&paths.run_dir);
+    let norm_images_dir = lexical_normalize(&paths.images_dir);
+    let norm_runs_dir = lexical_normalize(&paths.runs_dir);
 
     if !has_extension(base, DISK_FORMAT) {
         push(
@@ -403,13 +429,25 @@ pub fn validate_paths(paths: &RunPaths) -> Result<(), Vec<Violation>> {
             "runs boot only qcow2 overlays; an ISO is never a run disk".to_string(),
         );
     }
-    if base == overlay {
+    if base == overlay
+        || matches!(
+            (&norm_base, &norm_overlay),
+            (Some(nb), Some(no)) if nb == no
+        )
+    {
         push(
             "overlay-not-base",
             format!("overlay equals base image {}", base.display()),
         );
     }
-    if !overlay.starts_with(&paths.run_dir) {
+    if has_parent_dir(overlay)
+        || has_parent_dir(&paths.run_dir)
+        || !overlay.starts_with(&paths.run_dir)
+        || !matches!(
+            (&norm_overlay, &norm_run_dir),
+            (Some(no), Some(nr)) if no.starts_with(nr)
+        )
+    {
         push(
             "overlay-under-run-dir",
             format!(
@@ -419,7 +457,14 @@ pub fn validate_paths(paths: &RunPaths) -> Result<(), Vec<Violation>> {
             ),
         );
     }
-    if !base.starts_with(&paths.images_dir) {
+    if has_parent_dir(base)
+        || has_parent_dir(&paths.images_dir)
+        || !base.starts_with(&paths.images_dir)
+        || !matches!(
+            (&norm_base, &norm_images_dir),
+            (Some(nb), Some(ni)) if nb.starts_with(ni)
+        )
+    {
         push(
             "base-under-images-dir",
             format!(
@@ -429,7 +474,12 @@ pub fn validate_paths(paths: &RunPaths) -> Result<(), Vec<Violation>> {
             ),
         );
     }
-    if base.starts_with(&paths.runs_dir) {
+    if base.starts_with(&paths.runs_dir)
+        || matches!(
+            (&norm_base, &norm_runs_dir),
+            (Some(nb), Some(nruns)) if nb.starts_with(nruns)
+        )
+    {
         push(
             "base-outside-runs",
             format!(
@@ -879,6 +929,30 @@ mod tests {
         );
         let found = rules(validate_paths(&shared).expect_err("overlay == base must fail"));
         assert!(found.contains(&"overlay-not-base"), "{found:?}");
+
+        let parent_escape_overlay = paths(
+            "/vm-root/images/base/arch.qcow2",
+            "/vm-root/runs/arch-1/../../images/base/arch.qcow2",
+            "/vm-root/runs/arch-1",
+        );
+        let found = rules(
+            validate_paths(&parent_escape_overlay)
+                .expect_err("parent-dir overlay escape into base must fail"),
+        );
+        assert!(found.contains(&"overlay-under-run-dir"), "{found:?}");
+        assert!(found.contains(&"overlay-not-base"), "{found:?}");
+
+        let parent_escape_base = paths(
+            "/vm-root/images/base/../../runs/arch-1/arch.qcow2",
+            "/vm-root/runs/arch-1/arch-overlay.qcow2",
+            "/vm-root/runs/arch-1",
+        );
+        let found = rules(
+            validate_paths(&parent_escape_base)
+                .expect_err("parent-dir base escape into runs must fail"),
+        );
+        assert!(found.contains(&"base-under-images-dir"), "{found:?}");
+        assert!(found.contains(&"base-outside-runs"), "{found:?}");
     }
 
     #[test]

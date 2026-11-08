@@ -178,21 +178,24 @@ impl SmokeReport {
 /// `teardown`) can execute; each requires `execute` and its prerequisites,
 /// and each reports `gated` or `dry-run` honestly otherwise.
 pub fn run_smoke(plan: RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> SmokeReport {
+    let policy = policy_stage(&plan);
+    let accel = accel_stage(&plan, caps, opts);
+    let overlay = overlay_stage(&plan, caps, opts);
     let mut stages = vec![
         StageReport {
             stage: STAGE_POLICY,
-            state: policy_stage(&plan),
+            state: policy,
         },
         StageReport {
             stage: STAGE_ACCEL,
-            state: accel_stage(&plan, caps, opts),
+            state: accel,
         },
         StageReport {
             stage: STAGE_OVERLAY,
-            state: overlay_stage(&plan, caps, opts),
+            state: overlay.clone(),
         },
     ];
-    stages.extend(guest_stages(&plan, caps, opts));
+    stages.extend(guest_stages(&plan, caps, opts, &overlay));
     SmokeReport { plan, stages }
 }
 
@@ -200,7 +203,12 @@ pub fn run_smoke(plan: RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> Smo
 /// a non-live run renders the exact commands as dry-run, a live run
 /// without every prerequisite reports the missing piece as gated, and a
 /// live run with all prerequisites present executes the real lifecycle.
-fn guest_stages(plan: &RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> Vec<StageReport> {
+fn guest_stages(
+    plan: &RunPlan,
+    caps: &Capabilities,
+    opts: &SmokeOptions,
+    overlay_state: &StageState,
+) -> Vec<StageReport> {
     if opts.force_skip {
         return guest::gated_stages(&format!(
             "forced skip: {} is set",
@@ -211,10 +219,23 @@ fn guest_stages(plan: &RunPlan, caps: &Capabilities, opts: &SmokeOptions) -> Vec
         return guest::dry_run_stages(plan);
     }
     match guest::guest_prereqs(plan, caps) {
-        Ok(tools) => {
-            guest::run_guest_lifecycle(plan, &tools, &guest::GuestOptions::default()).stages
+        Ok(tools) => match overlay_state {
+            StageState::Ok(_) => {
+                guest::run_guest_lifecycle(plan, &tools, &guest::GuestOptions::default()).stages
+            }
+            StageState::Gated(reason) => guest::gated_stages(reason),
+            StageState::Failed(reason) => {
+                let _ = guest::cleanup_run_dir(plan);
+                guest::gated_stages(&format!("overlay stage failed ({reason}); never attempted"))
+            }
+            StageState::DryRun(reason) | StageState::Deferred(reason) => {
+                guest::gated_stages(reason)
+            }
+        },
+        Err(reason) => {
+            let _ = guest::cleanup_run_dir(plan);
+            guest::gated_stages(&reason)
         }
-        Err(reason) => guest::gated_stages(&reason),
     }
 }
 
@@ -428,5 +449,58 @@ mod tests {
             .expect("accel stage");
         assert!(matches!(accel.state, StageState::DryRun(_)));
         assert!(!report.failed());
+    }
+
+    #[test]
+    fn live_run_gates_lifecycle_when_overlay_stage_is_gated_and_cleans_up_run_dir() {
+        let root =
+            std::env::temp_dir().join(format!("bitty-test-vm-smoke-gated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let guest = guest("arch").expect("arch exists");
+        let plan = RunPlan::new(guest, Cadence::Pr, "smoke-gated-1", &root).expect("plan");
+        std::fs::create_dir_all(plan.base_image().parent().expect("base dir")).expect("base dir");
+        std::fs::write(plan.base_image(), []).expect("fixture base");
+        // Pre-populate run_dir to simulate a created overlay before a gated guest stage.
+        std::fs::create_dir_all(plan.run_dir()).expect("run dir");
+
+        let opts = SmokeOptions {
+            execute: true,
+            ..SmokeOptions::default()
+        };
+        // virsh/ssh present, but qemu-img absent: overlay is gated, so guest stages
+        // must also gate (not attempt virsh define on a missing overlay).
+        let caps_no_qemu_img = Capabilities {
+            kvm_device: false,
+            qemu_system: None,
+            qemu_img: None,
+            virsh: Some(PathBuf::from("/nonexistent/virsh")),
+            ssh: Some(PathBuf::from("/nonexistent/ssh")),
+        };
+        let report = run_smoke(plan.clone(), &caps_no_qemu_img, &opts);
+        for stage in report
+            .stages
+            .iter()
+            .filter(|s| matches!(s.stage, "boot" | "ssh" | "artifacts" | "teardown"))
+        {
+            assert!(
+                matches!(&stage.state, StageState::Gated(r) if r.contains("qemu-img")),
+                "{stage:?}"
+            );
+        }
+
+        // When guest_prereqs fails (missing virsh), any pre-existing run_dir is cleaned up.
+        let caps_no_virsh = Capabilities {
+            kvm_device: false,
+            qemu_system: None,
+            qemu_img: None,
+            virsh: None,
+            ssh: None,
+        };
+        let _ = run_smoke(plan.clone(), &caps_no_virsh, &opts);
+        assert!(
+            !plan.run_dir().exists(),
+            "gated guest stages must clean up run_dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

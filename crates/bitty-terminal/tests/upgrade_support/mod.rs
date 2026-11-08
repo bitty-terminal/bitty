@@ -113,6 +113,10 @@ impl Drop for Server {
 
 /// Reads one request and writes one response, then closes.
 fn serve(mut stream: TcpStream, routes: &HashMap<String, Route>) {
+    // BSD/macOS `accept()` inherits `O_NONBLOCK` from the listener; restore
+    // blocking mode so `read` honours `set_read_timeout` instead of failing
+    // immediately with `WouldBlock` before `curl` sends the HTTP request.
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = Vec::new();
     let mut buffer = [0u8; 1024];
@@ -128,6 +132,7 @@ fn serve(mut stream: TcpStream, routes: &HashMap<String, Route>) {
                     return;
                 }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         }
     }

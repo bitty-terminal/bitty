@@ -1042,16 +1042,19 @@ fn parse_face_line<'a>(mut fields: impl Iterator<Item = &'a str>) -> Option<Inde
         _ => return None,
     };
     let families_field = fields.next()?;
-    let families = families_field
-        .split(',')
-        .map(unescape_field)
-        .collect::<Option<Vec<_>>>()?;
-    if families.is_empty()
-        || families.len() > MAX_INDEX_FAMILIES
-        || families
-            .iter()
-            .any(|family| family.len() > MAX_INDEX_FAMILY_BYTES)
-    {
+    let mut families = Vec::new();
+    for raw in families_field.split(',') {
+        let family = unescape_field(raw)?;
+        if family.is_empty() || family.len() > MAX_INDEX_FAMILY_BYTES || families.contains(&family)
+        {
+            return None;
+        }
+        families.push(family);
+        if families.len() > MAX_INDEX_FAMILIES {
+            return None;
+        }
+    }
+    if families.is_empty() {
         return None;
     }
     let post_script_name = unescape_field(fields.next()?)?;
@@ -3639,5 +3642,20 @@ mod tests {
             "the reparsed faces carry the new stat"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_face_line_rejects_empty_or_duplicate_families() {
+        let empty_family = "face\t/a.ttf\t0\t100\t1\t0\t0\t400\t5\t1\t\tPS";
+        let fields = empty_family.split('\t').skip(1);
+        assert!(parse_face_line(fields).is_none());
+
+        let trailing_comma = "face\t/a.ttf\t0\t100\t1\t0\t0\t400\t5\t1\tMono,\tPS";
+        let fields = trailing_comma.split('\t').skip(1);
+        assert!(parse_face_line(fields).is_none());
+
+        let duplicate_family = "face\t/a.ttf\t0\t100\t1\t0\t0\t400\t5\t1\tMono,Mono\tPS";
+        let fields = duplicate_family.split('\t').skip(1);
+        assert!(parse_face_line(fields).is_none());
     }
 }

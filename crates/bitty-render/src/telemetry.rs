@@ -243,6 +243,10 @@ pub(crate) fn presenter_now_ms() -> u64 {
         .min(u64::from(u32::MAX))
 }
 
+fn pack_presenter_in_flight(generation: u32, since_ms: u64) -> u64 {
+    (u64::from(generation) << 32) | (since_ms & 0xFFFF_FFFF)
+}
+
 /// Publishes one in-flight present episode.
 ///
 /// An abandoned worker can return from its driver call long after a
@@ -250,7 +254,7 @@ pub(crate) fn presenter_now_ms() -> u64 {
 /// gauge, so the stale worker cannot clobber the live episode with an old
 /// generation.
 pub(crate) fn presenter_begin(generation: u32, since_ms: u64) {
-    let packed = (u64::from(generation) << 32) | since_ms;
+    let packed = pack_presenter_in_flight(generation, since_ms);
     let mut current = PRESENT_IN_FLIGHT.load(Ordering::Relaxed);
     loop {
         let current_generation = (current >> 32) as u32;
@@ -489,5 +493,12 @@ mod tests {
             assert!(!event.as_str().is_empty());
         }
         assert_eq!(LastEvent::from_u8(u8::MAX), LastEvent::None);
+    }
+
+    #[test]
+    fn presenter_begin_masks_since_ms_to_32_bits() {
+        let packed = pack_presenter_in_flight(7, (1u64 << 40) | 42);
+        assert_eq!((packed >> 32) as u32, 7);
+        assert_eq!(packed & 0xFFFF_FFFF, 42);
     }
 }

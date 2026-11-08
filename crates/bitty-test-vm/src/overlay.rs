@@ -42,12 +42,26 @@ pub fn create_overlay(qemu_img: &Path, plan: &RunPlan) -> io::Result<PathBuf> {
         ));
     }
 
-    std::fs::create_dir_all(plan.run_dir())?;
+    let run_dir = plan.run_dir();
+    let run_dir_existed = run_dir.exists();
+    std::fs::create_dir_all(&run_dir)?;
 
-    let output = Command::new(qemu_img)
+    let output = match Command::new(qemu_img)
         .args(plan.qemu_img_create_args())
-        .output()?;
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            if !run_dir_existed {
+                let _ = std::fs::remove_dir_all(&run_dir);
+            }
+            return Err(err);
+        }
+    };
     if !output.status.success() {
+        if !run_dir_existed {
+            let _ = std::fs::remove_dir_all(&run_dir);
+        }
         return Err(io::Error::other(format!(
             "qemu-img create failed with {}: {}",
             output.status,
@@ -238,5 +252,20 @@ mod tests {
 
         let rendered = render_command("qemu-img", &["create".to_string(), "a b".to_string()]);
         assert_eq!(rendered, "qemu-img create 'a b'");
+    }
+
+    #[test]
+    fn failed_qemu_img_spawn_removes_newly_created_run_dir() {
+        let root = HermeticRoot::new("spawn-fail-cleanup");
+        let plan = hermetic_plan(&root, "spawn-fail-1");
+        let base = plan.base_image();
+        std::fs::create_dir_all(base.parent().expect("base dir")).expect("base dir");
+        std::fs::write(&base, []).expect("fixture base marker");
+
+        assert!(create_overlay(&missing_qemu_img(&root), &plan).is_err());
+        assert!(
+            !plan.run_dir().exists(),
+            "failed overlay creation must not leave an empty run directory behind"
+        );
     }
 }

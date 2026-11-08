@@ -208,7 +208,11 @@ fi
 # so compare them here. A drift silently leaves the stale Inno uninstall entry
 # (or deletes an unrelated key) and no other gate notices.
 ISS_SCRIPT=./packaging/windows/bitty.iss
-iss_appid="$(sed -n 's/^AppId={{\([0-9A-Fa-f-]\{36\}\)}$/\1/p' "$ISS_SCRIPT" 2>/dev/null | head -n 1)"
+# No `sed | head` here: the pipe races SIGPIPE against pipefail and aborts
+# under `set -e` (the same shape as the pass-through pipes above, which stay
+# safe only because their writers emit one small write).
+iss_appid="$(sed -n 's/^AppId={{\([0-9A-Fa-f-]\{36\}\)}$/\1/p' "$ISS_SCRIPT" 2>/dev/null)"
+iss_appid="${iss_appid%%$'\n'*}"
 if [[ -z "$iss_appid" ]]; then
   echo "FAIL: could not read AppId from $ISS_SCRIPT" >&2
   FAIL=1

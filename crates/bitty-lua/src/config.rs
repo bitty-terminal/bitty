@@ -144,6 +144,24 @@ pub const MAX_CONFIG_FONT_FEATURE_ENTRIES: usize = 32;
 /// downstream in `bitty-config`).
 pub const MAX_CONFIG_FONT_FEATURE_BYTES: usize = 16;
 
+/// Maximum return values captured from a configuration chunk (`bitty#3039`).
+pub const MAX_CONFIG_RETURN_VALUES: usize = 16;
+
+/// Maximum selector entries read from the `views` table (`bitty#3039`).
+pub const MAX_TABLE_ENTRIES: usize = 256;
+
+/// Maximum total nodes visited across a configuration snapshot (`bitty#3039`).
+pub const MAX_TOTAL_SNAPSHOT_NODES: usize = 4_096;
+
+/// Maximum cumulative bytes copied across a configuration snapshot (`bitty#3039`).
+pub const MAX_TOTAL_SNAPSHOT_BYTES: usize = 1_048_576;
+
+/// Maximum bytes copied for any single string in a configuration snapshot (`bitty#3039`).
+pub const MAX_SNAPSHOT_STRING_BYTES: usize = 65_536;
+
+/// Maximum table nesting depth traversed by [`ValueSnapshot::capture_table`].
+const MAX_SNAPSHOT_DEPTH: u8 = 16;
+
 /// Fields rejected until their owning follow-up accepts them (DEC-0111
 /// section 1; CTX-1160 S1).
 ///
@@ -935,6 +953,7 @@ impl ConfigEval for LuaVm {
                 }
                 enum Taken {
                     Values(Vec<ValueSnapshot>),
+                    BudgetExceeded(String),
                     LuaErr(String),
                     BadMode(String),
                 }
@@ -942,13 +961,29 @@ impl ConfigEval for LuaVm {
                     let exec = ctx.fetch(&stashed);
                     match exec.take_result::<Variadic<Vec<Value>>>(ctx) {
                         Ok(Ok(Variadic(values))) => {
-                            // Snapshot GC-bound values into owned data inside
-                            // the same enter call.
-                            let mut out = Vec::with_capacity(values.len().min(8));
-                            for v in values {
-                                out.push(ValueSnapshot::capture(ctx, v));
+                            if values.len() > MAX_CONFIG_RETURN_VALUES {
+                                return Taken::BudgetExceeded(format!(
+                                    "config must return a single table (returned {} values, max {})",
+                                    values.len(),
+                                    MAX_CONFIG_RETURN_VALUES
+                                ));
                             }
-                            Taken::Values(out)
+                            // Snapshot GC-bound values into owned data inside
+                            // the same enter call under a shared budget.
+                            let mut budget = SnapshotBudget::default();
+                            let mut out =
+                                Vec::with_capacity(values.len().min(MAX_CONFIG_RETURN_VALUES));
+                            for v in values.into_iter().take(MAX_CONFIG_RETURN_VALUES) {
+                                out.push(ValueSnapshot::capture(ctx, v, &mut budget));
+                                if budget.is_exceeded() {
+                                    break;
+                                }
+                            }
+                            if let Some(message) = budget.exceeded {
+                                Taken::BudgetExceeded(message)
+                            } else {
+                                Taken::Values(out)
+                            }
                         }
                         Ok(Err(e)) => Taken::LuaErr(crate::error::format_lua_error(ctx, &e)),
                         Err(e) => Taken::BadMode(format!("{e:?}")),
@@ -957,6 +992,7 @@ impl ConfigEval for LuaVm {
                 match taken {
                     Taken::LuaErr(message) => ConfigOutcome::LuaError { message },
                     Taken::BadMode(message) => ConfigOutcome::LuaError { message },
+                    Taken::BudgetExceeded(message) => ConfigOutcome::ShapeError { message },
                     Taken::Values(values) => match ConfigData::from_returns(&values) {
                         Ok(data) => ConfigOutcome::Completed {
                             data: Box::new(data),
@@ -1078,38 +1114,102 @@ enum ValueSnapshot {
     Opaque(&'static str),
 }
 
-impl ValueSnapshot {
-    /// Capture a GC-bound value into owned data (must run inside `enter`).
-    fn capture<'gc>(ctx: Context<'gc>, value: Value<'gc>) -> Self {
-        match value {
-            Value::Nil => Self::Nil,
-            Value::Boolean(b) => Self::Bool(b),
-            Value::Integer(i) => Self::Int(i),
-            Value::Number(f) => Self::Float(f),
-            Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-                Ok(text) => Self::Str(text.to_string()),
-                Err(_) => Self::Binary,
-            },
-            Value::Table(t) => Self::capture_table(ctx, t, 0),
-            Value::Function(f) => Self::Opaque(match f {
-                phodopus::Function::Closure(_) => "function",
-                phodopus::Function::Callback(_) => "function",
-            }),
-            Value::Thread(_) => Self::Opaque("thread"),
-            Value::UserData(_) => Self::Opaque("userdata"),
+/// Cumulative node and byte budget enforced across a configuration snapshot
+/// (`bitty#3039`).
+#[derive(Debug, Default)]
+struct SnapshotBudget {
+    nodes: usize,
+    bytes: usize,
+    exceeded: Option<String>,
+}
+
+impl SnapshotBudget {
+    fn is_exceeded(&self) -> bool {
+        self.exceeded.is_some()
+    }
+
+    fn charge_node(&mut self) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        match self.nodes.checked_add(1) {
+            Some(next) if next <= MAX_TOTAL_SNAPSHOT_NODES => {
+                self.nodes = next;
+                true
+            }
+            _ => {
+                self.exceeded = Some(format!(
+                    "config snapshot exceeds {MAX_TOTAL_SNAPSHOT_NODES} total nodes"
+                ));
+                false
+            }
         }
     }
 
-    /// Capture one table level; nested tables recurse at most three times
-    /// (`depth` 0 = top, 1 = nested, 2 = deeper table such as
-    /// `appearance.animations` / `appearance.colors`, 3 =
-    /// `duration_ms`/`easing` leaves or the `colors.ansi` array, 4 = stop
-    /// with `Nil` children). The RFC-0002 animations table was the deepest
-    /// known shape; CTX-0392 adds the `colors.ansi` string array at depth 3
-    /// (same bounded array pattern as CTX-0347
-    /// `decoration.background_image_roots` at depth 2). Deeper tables fail
-    /// closed as `Nil` and are rejected by the typed extractor.
-    fn capture_table<'gc>(ctx: Context<'gc>, table: Table<'gc>, depth: u8) -> Self {
+    fn charge_bytes(&mut self, count: usize) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        match self.bytes.checked_add(count) {
+            Some(next) if next <= MAX_TOTAL_SNAPSHOT_BYTES => {
+                self.bytes = next;
+                true
+            }
+            _ => {
+                self.exceeded = Some(format!(
+                    "config snapshot exceeds {MAX_TOTAL_SNAPSHOT_BYTES} total bytes"
+                ));
+                false
+            }
+        }
+    }
+
+    fn check_and_charge_string(&mut self, len: usize) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        if len > MAX_SNAPSHOT_STRING_BYTES {
+            self.exceeded = Some(format!(
+                "config string exceeds {MAX_SNAPSHOT_STRING_BYTES} bytes"
+            ));
+            return false;
+        }
+        self.charge_bytes(len)
+    }
+
+    fn fail_depth(&mut self) {
+        if !self.is_exceeded() {
+            self.exceeded = Some(format!(
+                "config table nesting exceeds maximum depth ({MAX_SNAPSHOT_DEPTH})"
+            ));
+        }
+    }
+}
+
+impl ValueSnapshot {
+    /// Capture a GC-bound value into owned data (must run inside `enter`).
+    fn capture<'gc>(ctx: Context<'gc>, value: Value<'gc>, budget: &mut SnapshotBudget) -> Self {
+        match value {
+            Value::Table(t) => Self::capture_table(ctx, t, 0, budget),
+            other => Self::capture_shallow(other, budget),
+        }
+    }
+
+    /// Capture one table level under the shared [`SnapshotBudget`].
+    fn capture_table<'gc>(
+        ctx: Context<'gc>,
+        table: Table<'gc>,
+        depth: u8,
+        budget: &mut SnapshotBudget,
+    ) -> Self {
+        if !budget.charge_node() || !budget.charge_bytes(1) {
+            return Self::Table {
+                pairs: Vec::new(),
+                seq: Vec::new(),
+                truncated: true,
+                has_non_string_keys: false,
+            };
+        }
         let cap = if depth == 0 {
             MAX_CONFIG_TOP_KEYS + 1
         } else {
@@ -1119,7 +1219,16 @@ impl ValueSnapshot {
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
+        let mut raw_iter_steps = 0usize;
         for (key, val) in table.iter() {
+            if budget.is_exceeded() {
+                break;
+            }
+            raw_iter_steps += 1;
+            if raw_iter_steps > MAX_CONFIG_KEYMAPS + cap + 1 {
+                truncated = true;
+                break;
+            }
             // Integer keys belong to the sequence portion; skip them here
             // (captured separately below) without spending the pair cap.
             if matches!(key, Value::Integer(_)) {
@@ -1131,23 +1240,32 @@ impl ValueSnapshot {
                 break;
             }
             match key {
-                Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-                    Ok(name) => {
-                        let child = if depth >= 4 {
-                            Self::Nil
-                        } else {
-                            match val {
-                                Value::Table(nested) if depth == 0 && name == "views" => {
-                                    Self::capture_views_table(ctx, nested)
-                                }
-                                Value::Table(nested) => Self::capture_table(ctx, nested, depth + 1),
-                                other => Self::capture_shallow(other),
-                            }
-                        };
-                        pairs.push((name.to_string(), Box::new(child)));
+                Value::String(s) => {
+                    let bytes = s.as_bytes();
+                    if !budget.check_and_charge_string(bytes.len()) {
+                        break;
                     }
-                    Err(_) => has_non_string_keys = true,
-                },
+                    match std::str::from_utf8(bytes) {
+                        Ok(name) => {
+                            let child = if depth >= MAX_SNAPSHOT_DEPTH {
+                                budget.fail_depth();
+                                Self::Nil
+                            } else {
+                                match val {
+                                    Value::Table(nested) if depth == 0 && name == "views" => {
+                                        Self::capture_views_table(ctx, nested, budget)
+                                    }
+                                    Value::Table(nested) => {
+                                        Self::capture_table(ctx, nested, depth + 1, budget)
+                                    }
+                                    other => Self::capture_shallow(other, budget),
+                                }
+                            };
+                            pairs.push((name.to_string(), Box::new(child)));
+                        }
+                        Err(_) => has_non_string_keys = true,
+                    }
+                }
                 _ => has_non_string_keys = true,
             }
         }
@@ -1156,10 +1274,13 @@ impl ValueSnapshot {
         // depth 2 and CTX-0392 `appearance.colors.ansi` at depth 3, bounded
         // the same way).
         let mut seq = Vec::new();
-        if depth <= 3 {
+        if depth <= 3 && !budget.is_exceeded() {
             let len = table.length().max(0) as usize;
             let want = len.min(MAX_CONFIG_KEYMAPS + 1);
             for i in 1..=(want as i64) {
+                if budget.is_exceeded() {
+                    break;
+                }
                 let v = table.get_value(ctx, i);
                 if matches!(v, Value::Nil) {
                     break;
@@ -1168,10 +1289,10 @@ impl ValueSnapshot {
                     // Depth 0: general nested table. Depth 1: keymap entry
                     // whose scalar fields are captured as leaves.
                     Value::Table(nested) if depth == 0 => {
-                        Self::capture_table(ctx, nested, depth + 1)
+                        Self::capture_table(ctx, nested, depth + 1, budget)
                     }
-                    Value::Table(nested) => Self::capture_entry_table(ctx, nested),
-                    other => Self::capture_shallow(other),
+                    Value::Table(nested) => Self::capture_entry_table(ctx, nested, budget),
+                    other => Self::capture_shallow(other, budget),
                 });
             }
             if len > want {
@@ -1186,49 +1307,94 @@ impl ValueSnapshot {
         }
     }
 
-    /// Capture the `views` selector map.
-    ///
-    /// RFC-0001/OQ-041 states the `views` table adds no whole-table cap: the
-    /// closed selector grammar bounds the live-match set, and the aggregate
-    /// parse is bounded by the Config VM RC-1/RC-2 budgets. Entry tables are
-    /// captured one level deep (their leaves are scalars).
-    fn capture_views_table<'gc>(ctx: Context<'gc>, table: Table<'gc>) -> Self {
+    /// Capture the `views` selector map bounded by [`MAX_TABLE_ENTRIES`] and
+    /// [`SnapshotBudget`].
+    fn capture_views_table<'gc>(
+        ctx: Context<'gc>,
+        table: Table<'gc>,
+        budget: &mut SnapshotBudget,
+    ) -> Self {
+        if !budget.charge_node() || !budget.charge_bytes(1) {
+            return Self::Table {
+                pairs: Vec::new(),
+                seq: Vec::new(),
+                truncated: true,
+                has_non_string_keys: false,
+            };
+        }
         let mut pairs = Vec::new();
         let mut has_non_string_keys = false;
+        let mut truncated = false;
+        let mut count = 0usize;
         for (key, val) in table.iter() {
+            if budget.is_exceeded() {
+                break;
+            }
+            count += 1;
+            if count > MAX_TABLE_ENTRIES {
+                truncated = true;
+                break;
+            }
             if matches!(key, Value::Integer(_)) {
                 continue;
             }
             match key {
-                Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-                    Ok(name) => {
-                        let child = match val {
-                            Value::Table(nested) => Self::capture_table(ctx, nested, 2),
-                            other => Self::capture_shallow(other),
-                        };
-                        pairs.push((name.to_string(), Box::new(child)));
+                Value::String(s) => {
+                    let bytes = s.as_bytes();
+                    if !budget.check_and_charge_string(bytes.len()) {
+                        break;
                     }
-                    Err(_) => has_non_string_keys = true,
-                },
+                    match std::str::from_utf8(bytes) {
+                        Ok(name) => {
+                            let child = match val {
+                                Value::Table(nested) => Self::capture_table(ctx, nested, 2, budget),
+                                other => Self::capture_shallow(other, budget),
+                            };
+                            pairs.push((name.to_string(), Box::new(child)));
+                        }
+                        Err(_) => has_non_string_keys = true,
+                    }
+                }
                 _ => has_non_string_keys = true,
             }
         }
         Self::Table {
             pairs,
             seq: Vec::new(),
-            truncated: false,
+            truncated,
             has_non_string_keys,
         }
     }
 
     /// Capture a keymap entry table: string-keyed scalar fields only, no
     /// further nesting and no sequence (entries are flat records).
-    fn capture_entry_table(ctx: Context<'_>, table: Table<'_>) -> Self {
+    fn capture_entry_table(
+        ctx: Context<'_>,
+        table: Table<'_>,
+        budget: &mut SnapshotBudget,
+    ) -> Self {
+        if !budget.charge_node() || !budget.charge_bytes(1) {
+            return Self::Table {
+                pairs: Vec::new(),
+                seq: Vec::new(),
+                truncated: true,
+                has_non_string_keys: false,
+            };
+        }
         let mut pairs = Vec::new();
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
+        let mut raw_iter_steps = 0usize;
         for (key, val) in table.iter() {
+            if budget.is_exceeded() {
+                break;
+            }
+            raw_iter_steps += 1;
+            if raw_iter_steps > MAX_CONFIG_KEYMAPS + MAX_CONFIG_NESTED_KEYS + 1 {
+                truncated = true;
+                break;
+            }
             if matches!(key, Value::Integer(_)) {
                 continue;
             }
@@ -1238,17 +1404,23 @@ impl ValueSnapshot {
                 break;
             }
             match key {
-                Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-                    Ok(name) => {
-                        // Entries are flat: any table value opaqued.
-                        let child = Self::capture_shallow(val);
-                        // Silence unused-ctx without recursion: ctx unused here
-                        // by construction (leaves only).
-                        let _ = ctx;
-                        pairs.push((name.to_string(), Box::new(child)));
+                Value::String(s) => {
+                    let bytes = s.as_bytes();
+                    if !budget.check_and_charge_string(bytes.len()) {
+                        break;
                     }
-                    Err(_) => has_non_string_keys = true,
-                },
+                    match std::str::from_utf8(bytes) {
+                        Ok(name) => {
+                            // Entries are flat: any table value opaqued.
+                            let child = Self::capture_shallow(val, budget);
+                            // Silence unused-ctx without recursion: ctx unused here
+                            // by construction (leaves only).
+                            let _ = ctx;
+                            pairs.push((name.to_string(), Box::new(child)));
+                        }
+                        Err(_) => has_non_string_keys = true,
+                    }
+                }
                 _ => has_non_string_keys = true,
             }
         }
@@ -1261,28 +1433,55 @@ impl ValueSnapshot {
     }
 
     /// Capture a leaf value (never recursing into tables).
-    fn capture_shallow(value: Value<'_>) -> Self {
+    fn capture_shallow(value: Value<'_>, budget: &mut SnapshotBudget) -> Self {
+        if !budget.charge_node() {
+            return Self::Nil;
+        }
         match value {
-            Value::Table(_) => Self::Opaque("table"),
-            other => {
-                // Reuse the leaf arms of capture without table recursion.
-                match other {
-                    Value::Nil => Self::Nil,
-                    Value::Boolean(b) => Self::Bool(b),
-                    Value::Integer(i) => Self::Int(i),
-                    Value::Number(f) => Self::Float(f),
-                    Value::String(s) => match std::str::from_utf8(s.as_bytes()) {
-                        Ok(text) => Self::Str(text.to_string()),
-                        Err(_) => Self::Binary,
-                    },
-                    Value::Function(f) => Self::Opaque(match f {
-                        phodopus::Function::Closure(_) => "function",
-                        phodopus::Function::Callback(_) => "function",
-                    }),
-                    Value::Thread(_) => Self::Opaque("thread"),
-                    Value::UserData(_) => Self::Opaque("userdata"),
-                    Value::Table(_) => Self::Opaque("table"),
+            Value::Nil => {
+                let _ = budget.charge_bytes(1);
+                Self::Nil
+            }
+            Value::Boolean(b) => {
+                let _ = budget.charge_bytes(1);
+                Self::Bool(b)
+            }
+            Value::Integer(i) => {
+                let _ = budget.charge_bytes(std::mem::size_of::<i64>());
+                Self::Int(i)
+            }
+            Value::Number(f) => {
+                let _ = budget.charge_bytes(std::mem::size_of::<f64>());
+                Self::Float(f)
+            }
+            Value::String(s) => {
+                let bytes = s.as_bytes();
+                if !budget.check_and_charge_string(bytes.len()) {
+                    return Self::Nil;
                 }
+                match std::str::from_utf8(bytes) {
+                    Ok(text) => Self::Str(text.to_string()),
+                    Err(_) => Self::Binary,
+                }
+            }
+            Value::Function(f) => {
+                let _ = budget.charge_bytes(1);
+                Self::Opaque(match f {
+                    phodopus::Function::Closure(_) => "function",
+                    phodopus::Function::Callback(_) => "function",
+                })
+            }
+            Value::Thread(_) => {
+                let _ = budget.charge_bytes(1);
+                Self::Opaque("thread")
+            }
+            Value::UserData(_) => {
+                let _ = budget.charge_bytes(1);
+                Self::Opaque("userdata")
+            }
+            Value::Table(_) => {
+                let _ = budget.charge_bytes(1);
+                Self::Opaque("table")
             }
         }
     }
@@ -2185,16 +2384,20 @@ impl ConfigData {
                     // unknown fields rejected by path), leaf types are never
                     // coerced, and the selector grammar plus every field bound
                     // is validated fail-closed downstream in `bitty-config`.
-                    let (pairs, has_non_string_keys) = match val.as_ref() {
+                    let (pairs, truncated, has_non_string_keys) = match val.as_ref() {
                         ValueSnapshot::Table {
                             pairs,
+                            truncated,
                             has_non_string_keys,
                             ..
-                        } => (pairs.as_slice(), *has_non_string_keys),
+                        } => (pairs.as_slice(), *truncated, *has_non_string_keys),
                         other => {
                             return Err(format!("views: expected table (found {})", other.kind()));
                         }
                     };
+                    if truncated {
+                        return Err(format!("views: exceeds {MAX_TABLE_ENTRIES} entries"));
+                    }
                     if has_non_string_keys {
                         return Err("views: selector keys must be strings".to_string());
                     }
@@ -2202,6 +2405,11 @@ impl ConfigData {
                     for (selector, entry) in pairs {
                         if selector.is_empty() {
                             return Err("views: selector keys must be non-empty".to_string());
+                        }
+                        if selector.len() > MAX_CONFIG_STRING_BYTES {
+                            return Err(format!(
+                                "views: selector key exceeds {MAX_CONFIG_STRING_BYTES} bytes"
+                            ));
                         }
                         let entry_path = format!("views[{selector}]");
                         let (entry_pairs, entry_truncated, entry_non_string) = match entry.as_ref()
@@ -4399,5 +4607,65 @@ mod tests {
         let a = eval_ok(code);
         let b = eval_ok(code);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rejects_16_level_dag_table_without_exponential_expansion() {
+        let err = eval_err(
+            r#"
+            local t = { a = "leaf", b = "leaf" }
+            for i = 1, 16 do
+                t = { a = t, b = t }
+            end
+            return t
+            "#,
+        );
+        assert!(
+            err.contains("total nodes") || err.contains("maximum depth"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_snapshot_string() {
+        let err = eval_err(&format!(
+            "return {{ theme = string.rep('x', {}) }}",
+            MAX_SNAPSHOT_STRING_BYTES + 1
+        ));
+        assert!(
+            err.contains("config string exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_views_table() {
+        let err = eval_err(&format!(
+            r#"
+            local v = {{}}
+            for i = 1, {} do
+                v["ws:" .. tostring(i)] = {{ border_width = 1 }}
+            end
+            return {{ views = v }}
+            "#,
+            MAX_TABLE_ENTRIES + 1
+        ));
+        assert!(
+            err.contains(&format!("views: exceeds {MAX_TABLE_ENTRIES} entries")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_excessive_return_values() {
+        let returns = (1..=(MAX_CONFIG_RETURN_VALUES + 1))
+            .map(|_| "{}")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = eval_err(&format!("return {returns}"));
+        assert!(
+            err.contains("config must return a single table"),
+            "unexpected error: {err}"
+        );
     }
 }

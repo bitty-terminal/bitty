@@ -519,12 +519,30 @@ struct CaptureState<'gc> {
 }
 
 impl<'gc> CaptureState<'gc> {
+    fn max_values(&self) -> usize {
+        self.limits
+            .max_values
+            .min(crate::config::MAX_TOTAL_SNAPSHOT_NODES)
+    }
+
+    fn max_aggregate_bytes(&self) -> usize {
+        self.limits
+            .max_aggregate_bytes
+            .min(crate::config::MAX_TOTAL_SNAPSHOT_BYTES)
+    }
+
+    fn max_string_bytes(&self) -> usize {
+        self.limits
+            .max_string_bytes
+            .min(crate::config::MAX_SNAPSHOT_STRING_BYTES)
+    }
+
     fn charge(&mut self, bytes: usize) -> Result<(), PlainConfigError> {
         self.aggregate_bytes = self
             .aggregate_bytes
             .checked_add(bytes)
             .ok_or_else(|| PlainConfigError::Limit("aggregate output overflow".to_string()))?;
-        if self.aggregate_bytes > self.limits.max_aggregate_bytes {
+        if self.aggregate_bytes > self.max_aggregate_bytes() {
             return Err(PlainConfigError::Limit(
                 "aggregate output exceeds limit".to_string(),
             ));
@@ -543,7 +561,7 @@ impl<'gc> CaptureState<'gc> {
                 "configuration nesting exceeds depth limit".to_string(),
             ));
         }
-        if self.values >= self.limits.max_values {
+        if self.values >= self.max_values() {
             return Err(PlainConfigError::Limit(
                 "configuration value count exceeds limit".to_string(),
             ));
@@ -569,7 +587,7 @@ impl<'gc> CaptureState<'gc> {
             )),
             Value::String(value) => {
                 let bytes = value.as_bytes();
-                if bytes.len() > self.limits.max_string_bytes {
+                if bytes.len() > self.max_string_bytes() {
                     return Err(PlainConfigError::Limit(
                         "configuration string exceeds limit".to_string(),
                     ));
@@ -602,6 +620,11 @@ impl<'gc> CaptureState<'gc> {
         if table.metatable().is_some() {
             return Err(PlainConfigError::Shape(
                 "configuration tables may not have metatables".to_string(),
+            ));
+        }
+        if self.values > self.max_values() {
+            return Err(PlainConfigError::Limit(
+                "configuration value count exceeds limit".to_string(),
             ));
         }
         self.charge(1)?;
@@ -673,7 +696,7 @@ impl<'gc> CaptureState<'gc> {
                     unreachable!()
                 };
                 let bytes = key.as_bytes();
-                if bytes.len() > self.limits.max_string_bytes {
+                if bytes.len() > self.max_string_bytes() {
                     return Err(PlainConfigError::Limit(
                         "configuration key exceeds string limit".to_string(),
                     ));
@@ -939,5 +962,33 @@ mod tests {
             vm.eval_plain_config("return { outer = { inner = true } }")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rejects_dag_table_and_overlong_string_under_hard_snapshot_caps() {
+        let limits = PlainConfigLimits {
+            max_depth: 32,
+            max_values: usize::MAX,
+            max_string_bytes: usize::MAX,
+            max_aggregate_bytes: usize::MAX,
+            ..PlainConfigLimits::default()
+        };
+        let mut vm = ConfigLuaVm::with_limits("test.config.dag", limits).expect("valid limits");
+        assert!(matches!(
+            vm.eval_plain_config(
+                "local t = { a = 'leaf', b = 'leaf' }; for i = 1, 16 do t = { a = t, b = t } end; return t"
+            ),
+            Err(PlainConfigError::Limit(_))
+        ));
+
+        let mut vm = ConfigLuaVm::with_limits("test.config.str", limits).expect("valid limits");
+        let code = format!(
+            "return {{ value = string.rep('x', {}) }}",
+            crate::config::MAX_SNAPSHOT_STRING_BYTES + 1
+        );
+        assert!(matches!(
+            vm.eval_plain_config(&code),
+            Err(PlainConfigError::Limit(_))
+        ));
     }
 }

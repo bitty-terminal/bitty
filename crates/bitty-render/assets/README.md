@@ -51,3 +51,39 @@ Re-run it only when bumping the pinned Nerd Fonts release, then re-run
 `cargo test -p bitty-render` (the `embedded` tests assert PUA, box, block, and
 braille coverage) and `bitty doctor` (the `font-chain` row reports the
 resolved face and PUA coverage).
+
+## `bitty-han-test.ttf`
+
+Tiny CJK test fixture for the mixed-script fallback regression (bitty#3021,
+`tests/shaped_mixed_script_fallback.rs`). **Test-only:** it is compiled in by
+`src/embedded.rs` as `HAN_TEST_BYTES`, is not a member of any font fallback
+chain, and no production path loads it. It exists so the Han half of the
+regression resolves on a host that ships no CJK face — a CI image without one
+must fail the test when the per-cluster retry regresses, instead of skipping
+the reported bug.
+
+| Property         | Value                                                                 |
+| ---------------- | --------------------------------------------------------------------- |
+| Source           | Noto Sans CJK SC Regular 2.004 (`.ttc` member index 2)                |
+| Tool             | `pyftsubset` (fonttools) plus a fontTools name-table rename           |
+| Family name      | `Bitty Han Test` (OFL 1.1 section 3 rename)                           |
+| Codepoints       | `U+0020-U+007E`, `U+4E03 U+4E8C U+4E94 U+533B U+5934 U+7528 U+75DB U+8BF7 U+95EE U+997F` |
+| Glyphs           | 105                                                                   |
+| Size             | 9,092 bytes                                                           |
+| SHA-256          | `938210454facad6522bd287a2622d223723849bad5052a2dfc620d6ed0ed3e55`    |
+| Licence          | SIL OFL 1.1, see `LICENSES/bitty-han-test.txt`                         |
+
+Twelve Han scalars are the reported line `> 请问饿七五二二头痛医头用`; the ASCII
+range carries its `>` prompt prefix and digits. Regeneration:
+
+```sh
+crates/bitty-render/assets/generate-han-test-font.sh
+```
+
+The script resolves the face with `fc-match 'Noto Sans CJK SC'` (override with
+`BITTY_HAN_TEST_SOURCE`), pins `head` timestamps, and is byte-reproducible. It
+needs `pyftsubset` on `PATH` (`uv tool install fonttools` on a host without a
+system fontTools). Extend the `--unicodes` list when the regression line grows,
+then re-run `cargo test -p bitty-render --test shaped_mixed_script_fallback`
+and `cargo test -p bitty-render embedded` (the fixture coverage test parses the
+compiled-in bytes).

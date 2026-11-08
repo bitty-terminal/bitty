@@ -2710,6 +2710,45 @@ fn kitty_delete_selectors_and_full_clear() {
 }
 
 #[test]
+fn kitty_derived_place_records_a_spanless_command_at_the_supplied_anchor() {
+    // Issue #2875: the wire seam refuses a spanless `a=p` (truth holds no
+    // pixels), so the runtime resolves `ceil(pixels / cell)` and records it
+    // through the derived seam. The deferred replay form takes the anchor
+    // captured when the command drained, because the live cursor has moved
+    // on by the time an async local-medium transmit completes.
+    let mut s = State::new();
+    let keys = place_keys(11, 3);
+    // Wire form: refused, counted, nothing stored.
+    let refused = s.telemetry().kitty_refused;
+    s.apply(&kitty_graphics(Some('p'), 0, 0, 0, keys));
+    assert!(s.kitty_placements().get(11, 3).is_none());
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    // Derived form at an explicit drain-time anchor (row 6, col 2), with
+    // `C=1` so the live cursor must not move.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(2),
+        col: Col(2),
+    });
+    assert!(s.apply_kitty_place_derived_at(Some((2, 6)), 3, 2, 1, keys));
+    let placed = s.kitty_placements().get(11, 3).expect("placement recorded");
+    assert_eq!((placed.anchor_col, placed.anchor_row), (2, 6));
+    assert_eq!((placed.cols, placed.rows), (3, 2));
+    let cursor = s.cursor().position;
+    assert_eq!(
+        (cursor.col, cursor.row),
+        (1, 1),
+        "the deferred replay never moves the live cursor"
+    );
+    // A zero span still refuses: there is no rectangle to anchor or scale
+    // into.
+    let refused = s.telemetry().kitty_refused;
+    assert!(!s.apply_kitty_place_derived_at(None, 0, 0, 1, place_keys(12, 1)));
+    assert!(s.kitty_placements().get(12, 1).is_none());
+    assert_eq!(s.telemetry().kitty_refused, refused + 1);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn kitty_relative_placement_needs_parent() {
     let mut s = State::new();
     // Missing parent: refused, counted, nothing stored.

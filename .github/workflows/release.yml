@@ -302,7 +302,11 @@ jobs:
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         env:
-          RUSTFLAGS: ${{ steps.release-flags.outputs.flags }}
+          # Windows ships a GUI-subsystem executable and a portable ZIP, so it
+          # must not depend on the Visual C++ Redistributable: a clean Windows
+          # install has no VCRUNTIME140.dll and refuses to start the process
+          # (bitty#3007). Static CRT keeps the ZIP and the setup self-contained.
+          RUSTFLAGS: ${{ contains(matrix.target, 'windows') && format('{0} -C target-feature=+crt-static', steps.release-flags.outputs.flags) || steps.release-flags.outputs.flags }}
         run: cargo build --release --locked -p bitty-terminal -p bitty-daemon --target ${{ matrix.target }}
 
       # CTX-2402: the fail-closed builder-path gate. Stripping cannot remove

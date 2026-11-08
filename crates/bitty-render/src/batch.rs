@@ -192,10 +192,19 @@ pub fn rgba8_to_float4(color: Rgba8) -> [f32; 4] {
 /// pixels and up in NDC, hence the flip.
 #[must_use]
 pub fn pixel_to_ndc(x: f32, y: f32, w: f32, h: f32) -> [f32; 2] {
-    if w <= 0.0 || h <= 0.0 {
+    if !w.is_finite() || w <= 0.0 || !h.is_finite() || h <= 0.0 || !x.is_finite() || !y.is_finite()
+    {
         return [-1.0, 1.0];
     }
     [(x / w) * 2.0 - 1.0, 1.0 - (y / h) * 2.0]
+}
+
+fn sanitize_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
 }
 
 /// Recovers the DPI scale factor for one frame.
@@ -203,12 +212,12 @@ pub fn pixel_to_ndc(x: f32, y: f32, w: f32, h: f32) -> [f32; 2] {
 /// The runtime builds the [`DrawList`](crate::grid::DrawList) at cell
 /// metrics while the surface extent is physical pixels, so
 /// `surface / plan` is the effective scale (1.0 on standard displays).
-/// Returns 1.0 when the plan extent is zero (no information) and clamps to
-/// `[0.25, 4.0]` so stale or hostile extents cannot produce degenerate or
-/// gigantic vertices.
+/// Returns 1.0 when the plan extent or surface extent is zero (no information)
+/// and clamps to `[0.25, 4.0]` so stale or hostile extents cannot produce
+/// degenerate or gigantic vertices.
 #[must_use]
 pub fn derive_scale(surface_w: u32, surface_h: u32, plan: ExtentPx) -> f32 {
-    if plan.width == 0 || plan.height == 0 {
+    if surface_w == 0 || surface_h == 0 || plan.width == 0 || plan.height == 0 {
         return 1.0;
     }
     let sx = surface_w as f32 / plan.width as f32;
@@ -304,6 +313,7 @@ fn fill_quad_bytes(
     if rect.width == 0 || rect.height == 0 {
         return None;
     }
+    let scale = sanitize_scale(scale);
     let x0 = rect.x as f32 * scale;
     let y0 = rect.y as f32 * scale;
     let x1 = (rect.x as f32 + rect.width as f32) * scale;
@@ -334,6 +344,7 @@ fn rounded_fill_quad_bytes(
     if fill.frame.width == 0 || fill.frame.height == 0 {
         return None;
     }
+    let scale = sanitize_scale(scale);
     let x0 = fill.frame.x as f32 * scale;
     let y0 = fill.frame.y as f32 * scale;
     let x1 = (fill.frame.x as f32 + fill.frame.width as f32) * scale;
@@ -375,6 +386,7 @@ fn glyph_quad_bytes(
     if size[0] == 0 || size[1] == 0 {
         return None;
     }
+    let scale = sanitize_scale(scale);
     let w = surface_w as f32;
     let h = surface_h as f32;
     let c = rgba8_to_float4(color);
@@ -990,6 +1002,7 @@ pub fn image_quad_bytes(
     if dest.width == 0 || dest.height == 0 || surface_w == 0 || surface_h == 0 {
         return None;
     }
+    let scale = sanitize_scale(scale);
     let w = surface_w as f32;
     let h = surface_h as f32;
     let x0 = dest.x as f32 * scale;
@@ -1830,5 +1843,33 @@ mod tests {
         let quad0 = quad_indices_for(1).expect("quad 0 builds");
         assert_eq!(quad0, vec![0, 1, 2, 0, 2, 3]);
         assert_eq!(indices_to_le_bytes(&quad0).len(), (end - start) as usize);
+    }
+
+    #[test]
+    fn pixel_to_ndc_and_derive_scale_handle_non_finite_and_zero_surface() {
+        assert_eq!(pixel_to_ndc(10.0, 20.0, f32::NAN, 100.0), [-1.0, 1.0]);
+        assert_eq!(pixel_to_ndc(10.0, 20.0, 100.0, f32::INFINITY), [-1.0, 1.0]);
+        assert_eq!(pixel_to_ndc(f32::NAN, 20.0, 100.0, 100.0), [-1.0, 1.0]);
+        assert_eq!(derive_scale(0, 600, ExtentPx::new(800, 600)), 1.0);
+        assert_eq!(derive_scale(800, 0, ExtentPx::new(800, 600)), 1.0);
+        let fill_nan = chunk_fills(
+            &[FillRect {
+                rect: RectPx::new(0, 0, 8, 8),
+                color: [1, 2, 3, 255],
+            }],
+            64,
+            64,
+            f32::NAN,
+        );
+        let fill_unit = chunk_fills(
+            &[FillRect {
+                rect: RectPx::new(0, 0, 8, 8),
+                color: [1, 2, 3, 255],
+            }],
+            64,
+            64,
+            1.0,
+        );
+        assert_eq!(fill_nan, fill_unit);
     }
 }

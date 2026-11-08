@@ -101,13 +101,16 @@ impl AtlasSlot {
     /// for texture coordinates sampled from `texture_2d` without flips).
     #[must_use]
     pub fn uv(&self, dims: AtlasDims) -> [f32; 4] {
+        if dims.width == 0 || dims.height == 0 {
+            return [0.0; 4];
+        }
         let w = f32::from(dims.width);
         let h = f32::from(dims.height);
         [
             f32::from(self.x) / w,
             f32::from(self.y) / h,
-            f32::from(self.x + self.width) / w,
-            f32::from(self.y + self.height) / h,
+            (f32::from(self.x) + f32::from(self.width)) / w,
+            (f32::from(self.y) + f32::from(self.height)) / h,
         ]
     }
 }
@@ -815,5 +818,35 @@ mod tests {
                 "HiDPI LCD scale {scale} must stay grayscale"
             );
         }
+    }
+
+    #[test]
+    fn slot_uv_handles_u16_edge_sum_and_zero_dimensions() {
+        let slot = AtlasSlot {
+            x: u16::MAX,
+            y: 40_000,
+            width: 100,
+            height: 30_000,
+        };
+        let uv = slot.uv(AtlasDims {
+            width: 100,
+            height: 100,
+        });
+        assert!(uv.iter().all(|v| v.is_finite()));
+        assert!((uv[2] - (f32::from(u16::MAX) + 100.0) / 100.0).abs() < 1e-3);
+        assert_eq!(
+            slot.uv(AtlasDims {
+                width: 0,
+                height: 64
+            }),
+            [0.0; 4]
+        );
+        assert_eq!(
+            slot.uv(AtlasDims {
+                width: 64,
+                height: 0
+            }),
+            [0.0; 4]
+        );
     }
 }

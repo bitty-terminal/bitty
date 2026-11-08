@@ -298,10 +298,14 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
                     None => CachedGlyphRef::Blank,
                 });
             }
-            while self.entries.len() >= self.capacity
-                || self.retained_bytes.saturating_add(bitmap_bytes) > self.byte_capacity
+            while !self.entries.is_empty()
+                && (self.entries.len() >= self.capacity
+                    || self.retained_bytes.saturating_add(bitmap_bytes) > self.byte_capacity)
             {
                 self.evict_lru();
+            }
+            if self.entries.is_empty() {
+                self.retained_bytes = 0;
             }
             self.retained_bytes = self.retained_bytes.saturating_add(bitmap_bytes);
             self.entries.insert(
@@ -788,5 +792,24 @@ mod tests {
         let id = dyn_ref.load_font(&font_query()).unwrap();
         let k = RasterKey::new('q', id, 9.0).unwrap();
         assert!(dyn_ref.rasterize(k).unwrap().is_some());
+    }
+
+    #[test]
+    fn empty_entries_with_stale_retained_bytes_terminates_and_resets_accounting() {
+        let mut cache = GlyphCache::with_coverage_policy_and_byte_capacity(
+            FakeRasterizer::default(),
+            4,
+            1024,
+            CoveragePolicy::Grayscale,
+        )
+        .unwrap();
+        // Simulate drifted retained_bytes while entries is empty: lookup must
+        // not spin in `evict_lru()` and must reset accounting to the inserted glyph.
+        cache.retained_bytes = 2048;
+        let font = cache.load_font(&font_query()).unwrap();
+        let key = RasterKey::new('x', font, 12.0).unwrap();
+        assert!(cache.glyph(key).is_ok());
+        assert_eq!(cache.len(), 1);
+        assert!(cache.retained_bytes() <= 1024);
     }
 }

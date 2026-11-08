@@ -508,6 +508,61 @@ fn rollback_restores_the_previous_bytes() {
     assert!(stderr_text(&output).contains("nothing to roll back"));
 }
 
+/// A symlinked install directory is refused before anything is fetched or
+/// written: detection follows the link to the running exe, so the guard sees
+/// the link and no download is staged next to it.
+#[test]
+fn script_channel_refuses_symlinked_install_directory() {
+    let scratch = Scratch::new("symlink-bin");
+    let real_bin = scratch.join("real/bin");
+    std::fs::create_dir_all(&real_bin).expect("real bin dir");
+    let binary = real_bin.join("bitty");
+    std::fs::copy(BITTY_BIN, &binary).expect("copy binary under test");
+    let original = std::fs::read(&binary).expect("read original");
+    let link_bin = scratch.join("prefix/bin");
+    std::fs::create_dir_all(link_bin.parent().expect("prefix")).expect("prefix dir");
+    std::os::unix::fs::symlink(&real_bin, &link_bin).expect("symlink bin dir");
+    let data_home = scratch.join("data");
+    write_marker(
+        &data_home,
+        &link_bin,
+        env!("CARGO_PKG_VERSION"),
+        &sha256_hex(&original),
+    );
+    let tmp = scratch.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+
+    let server = Server::start(pointer_route());
+    let envs = vec![
+        ("HOME", scratch.join("home").display().to_string()),
+        ("TMPDIR", tmp.display().to_string()),
+        ("XDG_DATA_HOME", data_home.display().to_string()),
+        ("BITTY_CDN_BASE", server.base()),
+    ];
+    let output = run(&link_bin.join("bitty"), &["upgrade"], &host_path(), &envs);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "a symlinked install directory must be refused with the permission code: {}",
+        stderr_text(&output)
+    );
+    assert!(
+        stderr_text(&output).contains("refusing to write into symlink install directory"),
+        "{}",
+        stderr_text(&output)
+    );
+    assert_eq!(
+        std::fs::read(&binary).expect("binary"),
+        original,
+        "the installed binary must stay byte-identical"
+    );
+    assert!(
+        !link_bin.join("bitty.prev").exists(),
+        "no backup may be created"
+    );
+    assert_no_staging(&real_bin);
+}
+
 /// System-owned installs print the command, execute nothing, exit 7.
 #[test]
 fn system_owned_channel_prints_command_and_exits_permission() {

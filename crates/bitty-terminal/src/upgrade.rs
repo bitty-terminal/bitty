@@ -2686,4 +2686,95 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  bitty-aarch64-
             .expect_err("rollback_install must refuse symlinked backup");
         assert_eq!(err.code, EXIT_PERM);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_update_and_rollback_refuse_symlinked_install_paths() {
+        let scratch = Scratch::new("self-update-symlinks");
+        let empty_env: HashMap<String, String> = HashMap::new();
+        let lookup = |key: &str| empty_env.get(key).cloned();
+
+        // 1. `self_update` must refuse a symlinked install directory before
+        //    fetching anything, so nothing is ever written into the link
+        //    target's directory.
+        let real_bin = scratch.join("real-bin");
+        std::fs::create_dir_all(&real_bin).expect("real bin");
+        let link_bin = scratch.join("link-bin");
+        std::os::unix::fs::symlink(&real_bin, &link_bin).expect("symlink bin dir");
+        let binary = link_bin.join("bitty");
+        let probe = Probe {
+            exe: binary.clone(),
+            path_dirs: Vec::new(),
+            env: &lookup,
+        };
+        let detection = Detection {
+            channel: Channel::Script,
+            evidence: "test".to_string(),
+            location: Some(Location::for_binary(binary)),
+            helper: None,
+        };
+        let running = Semver::parse("1.0.0").expect("running version");
+        let latest = Semver::parse("2.0.0").expect("latest version");
+        let err = self_update(
+            &probe,
+            &detection,
+            "https://cdn.invalid",
+            "v2.0.0",
+            running,
+            latest,
+            false,
+        )
+        .expect_err("self_update must refuse symlinked bin dir");
+        assert_eq!(err.code, EXIT_PERM);
+        assert!(
+            err.message.contains("symlink install directory"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            std::fs::read_dir(&real_bin).expect("read real bin").count(),
+            0,
+            "nothing may be written into the real install directory"
+        );
+
+        // 2. `rollback_install` must refuse a symlinked current binary; the
+        //    backup stays in place and the link target keeps its bytes.
+        let rollback_bin = scratch.join("rollback-bin");
+        std::fs::create_dir_all(&rollback_bin).expect("rollback bin");
+        let victim = scratch.join("victim-binary");
+        std::fs::write(&victim, b"victim-binary-bytes").expect("write victim");
+        let linked_binary = rollback_bin.join("bitty");
+        std::os::unix::fs::symlink(&victim, &linked_binary).expect("symlink binary");
+        let prev = rollback_bin.join("bitty.prev");
+        std::fs::write(&prev, b"#!/bin/sh\nprintf 'bitty 0.0.1 (mut test)\\n'\n")
+            .expect("write backup");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&prev, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod backup");
+        }
+        let detection = Detection {
+            channel: Channel::Script,
+            evidence: "test".to_string(),
+            location: Some(Location::for_binary(linked_binary.clone())),
+            helper: None,
+        };
+        let err = rollback_install(&probe, &detection, false)
+            .expect_err("rollback_install must refuse symlinked binary");
+        assert_eq!(err.code, EXIT_PERM);
+        assert!(err.message.contains("symlink binary"), "{}", err.message);
+        assert_eq!(
+            std::fs::read(&victim).expect("victim bytes"),
+            b"victim-binary-bytes",
+            "the symlink target must not be replaced"
+        );
+        assert!(prev.exists(), "the backup must not be consumed");
+        assert!(
+            std::fs::symlink_metadata(&linked_binary)
+                .expect("stat binary")
+                .file_type()
+                .is_symlink(),
+            "the symlink must still be there"
+        );
+    }
 }

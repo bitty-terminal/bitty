@@ -1961,19 +1961,63 @@ fn terminfo_entry_candidates(dir: &Path, term: &str) -> Vec<PathBuf> {
     out
 }
 
+/// Whether `path` is a regular file that is not itself a symlink.
+///
+/// `is_file()` follows symlinks, so a dangling or attacker-planted link would
+/// read as "installed" and a repair that writes through it would report
+/// success. Both terminfo probes below must not follow.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_file())
+}
+
 /// Whether `term` is already installed in the user terminfo database `dir`.
 #[must_use]
 pub fn terminfo_entry_installed(dir: &Path, term: &str) -> bool {
     terminfo_entry_candidates(dir, term)
         .iter()
-        .any(|path| path.is_file())
+        .any(|path| is_regular_file(path))
 }
 
 /// First installed path for `term` in `dir` (evidence for receipts).
 fn installed_terminfo_path(dir: &Path, term: &str) -> Option<PathBuf> {
     terminfo_entry_candidates(dir, term)
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| is_regular_file(path))
+}
+
+/// Refuses when `tic` would write `term` through a symlink.
+///
+/// `tic` writes `dir/62/bitty` (hex of `b`), older trees use `dir/b/bitty`,
+/// and the flat `dir/bitty` is a valid location too, so every candidate path
+/// and the subdirectory that must hold it are checked before `tic` runs. The
+/// root `dir` check in [`install_bundled_terminfo`] cannot cover these: a
+/// pre-planted `dir/62` symlink or `dir/62/bitty` symlink redirects the
+/// write to an attacker-chosen file.
+fn ensure_terminfo_write_targets_are_regular(dir: &Path, term: &str) -> Result<(), (i32, String)> {
+    for candidate in terminfo_entry_candidates(dir, term) {
+        if std::fs::symlink_metadata(&candidate).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err((
+                EXIT_PERM,
+                format!(
+                    "refusing to write terminfo entry through symlink {}",
+                    candidate.display()
+                ),
+            ));
+        }
+        if let Some(parent) = candidate.parent() {
+            if std::fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Err((
+                    EXIT_PERM,
+                    format!(
+                        "refusing to write into symlink terminfo directory {}",
+                        parent.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Maps a filesystem failure to its exit class: permission is `7`, anything
@@ -2028,6 +2072,7 @@ fn install_bundled_terminfo(dir: &Path) -> Result<PathBuf, (i32, String)> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    ensure_terminfo_write_targets_are_regular(dir, "bitty")?;
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -2178,6 +2223,27 @@ fn terminfo_install_detail(dir: &Path) -> String {
     }
 }
 
+/// Whether a rewritten selector re-parses as a `default` profile selector.
+///
+/// Fail-closed invariant: [`crate::profile::rewrite_selector_profile`] only
+/// substitutes the bytes inside the quoted literal the parser already read,
+/// so a successful rewrite cannot currently produce an unparsable selector.
+/// The check stays so a future rewrite strategy cannot write a file the next
+/// start would reject; `selector_rewrite_validation_rejects_non_default_profiles`
+/// pins the predicate itself, since the production path cannot reach a
+/// negative verdict today.
+fn selector_rewrite_selects_default(
+    rewritten: &str,
+    source: &bitty_config::plan::ConfigSource,
+) -> bool {
+    bitty_config::file::parse_lua_config(rewritten, source).is_ok_and(|validated| {
+        validated
+            .selector
+            .as_ref()
+            .is_some_and(|sel| sel.profile == "default")
+    })
+}
+
 /// Resets a persisted profile selector that points at a missing profile.
 ///
 /// The rewrite goes through [`crate::init::write_init_config`], which backs
@@ -2287,12 +2353,7 @@ pub fn fix_profile_selector(
             "no single top-level `profile = \"...\"` assignment to rewrite".to_string(),
         ));
     };
-    if !bitty_config::file::parse_lua_config(&rewritten, &source).is_ok_and(|validated| {
-        validated
-            .selector
-            .as_ref()
-            .is_some_and(|sel| sel.profile == "default")
-    }) {
+    if !selector_rewrite_selects_default(&rewritten, &source) {
         return Some(FixReceipt::hint(
             "profile-selector",
             format!(
@@ -4851,7 +4912,51 @@ mod tests {
         assert_eq!(code, EXIT_PERM);
         assert!(detail.contains("symlink"), "{detail}");
 
-        // 2. Symlinked `profiles/default.lua` must stay a hint without rewriting `init.lua`.
+        // 2. A pre-planted symlink at the entry `tic` writes must be refused
+        //    before `tic` runs: the root-directory check does not see it, so
+        //    without this guard `tic` truncates the link target with ncurses
+        //    data and the repair reports success.
+        let entry_terminfo = root.join("entry-terminfo");
+        std::fs::create_dir_all(entry_terminfo.join("62")).expect("mkdir entry-terminfo");
+        let victim = root.join("victim-file");
+        std::fs::write(&victim, b"victim-original-bytes").expect("write victim");
+        let linked_entry = entry_terminfo.join("62").join("bitty");
+        std::os::unix::fs::symlink(&victim, &linked_entry).expect("symlink entry");
+        assert!(
+            !terminfo_entry_installed(&entry_terminfo, "bitty"),
+            "a symlinked entry must not read as installed"
+        );
+        assert_eq!(installed_terminfo_path(&entry_terminfo, "bitty"), None);
+        let (code, detail) =
+            install_bundled_terminfo(&entry_terminfo).expect_err("refuse symlinked terminfo entry");
+        assert_eq!(code, EXIT_PERM, "{detail}");
+        assert!(detail.contains("symlink"), "{detail}");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim-original-bytes",
+            "the symlink target must not be written through"
+        );
+        std::fs::remove_file(&linked_entry).expect("remove link");
+
+        // 3. A symlinked subdirectory that holds the entry must be refused too.
+        let victim_dir = root.join("victim-dir");
+        std::fs::create_dir_all(&victim_dir).expect("mkdir victim-dir");
+        std::fs::write(victim_dir.join("bitty"), b"victim-entry-bytes")
+            .expect("write victim entry");
+        let dir_terminfo = root.join("dir-terminfo");
+        std::fs::create_dir_all(&dir_terminfo).expect("mkdir dir-terminfo");
+        std::os::unix::fs::symlink(&victim_dir, dir_terminfo.join("62")).expect("symlink subdir");
+        let (code, detail) =
+            install_bundled_terminfo(&dir_terminfo).expect_err("refuse symlinked subdirectory");
+        assert_eq!(code, EXIT_PERM, "{detail}");
+        assert!(detail.contains("symlink"), "{detail}");
+        assert_eq!(
+            std::fs::read(victim_dir.join("bitty")).expect("read victim entry"),
+            b"victim-entry-bytes",
+            "the symlinked subdirectory must not receive the entry"
+        );
+
+        // 4. Symlinked `profiles/default.lua` must stay a hint without rewriting `init.lua`.
         let config = root.join("config").join("init.lua");
         let selector_body = "return { format = \"bitty-profile-v1\", profile = \"work\" }\n";
         write_file(&config, selector_body);
@@ -4864,21 +4969,100 @@ mod tests {
         let receipt =
             fix_profile_selector(&config, &profiles, false).expect("symlink default.lua hint");
         assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
-        assert!(receipt.detail.contains("symlink"), "{receipt:?}");
+        assert!(
+            receipt.detail.contains("profiles/default.lua is a symlink"),
+            "{receipt:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(&config).expect("read config"),
             selector_body,
             "selector must not be rewritten when default.lua is a symlink"
         );
 
-        // 3. Symlinked `profiles/` directory must also stay a hint without rewriting `init.lua`.
+        // 5. Symlinked `profiles/` directory must also stay a hint without
+        //    rewriting `init.lua`. The directory holds a *regular*
+        //    `default.lua`, so only the directory guard can refuse; with it
+        //    removed the rewrite applies instead of hinting.
+        let real_profiles = root.join("config").join("real-profiles");
+        std::fs::create_dir_all(&real_profiles).expect("mkdir real-profiles");
+        write_file(
+            &real_profiles.join("default.lua"),
+            "return { format = \"bitty-profile-v1\" }\n",
+        );
         let symlink_profiles = root.join("config").join("symlink-profiles");
-        std::os::unix::fs::symlink(&profiles, &symlink_profiles).expect("symlink profiles dir");
+        std::os::unix::fs::symlink(&real_profiles, &symlink_profiles)
+            .expect("symlink profiles dir");
         let receipt = fix_profile_selector(&config, &symlink_profiles, false)
             .expect("symlink profiles dir hint");
         assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
-        assert!(receipt.detail.contains("symlink"), "{receipt:?}");
+        assert!(
+            receipt.detail.contains("profiles directory is a symlink"),
+            "{receipt:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read config"),
+            selector_body,
+            "selector must not be rewritten when the profiles directory is a symlink"
+        );
+
+        // 6. A symlinked `profiles/<selected>.lua` must stay a hint before the
+        //    `default.lua` fallback is considered, so nothing is rewritten.
+        let selected_profiles = root.join("config").join("selected-profiles");
+        std::fs::create_dir_all(&selected_profiles).expect("mkdir selected-profiles");
+        let real_work = root.join("real-work.lua");
+        write_file(&real_work, "return { format = \"bitty-profile-v1\" }\n");
+        std::os::unix::fs::symlink(&real_work, selected_profiles.join("work.lua"))
+            .expect("symlink work.lua");
+        write_file(
+            &selected_profiles.join("default.lua"),
+            "return { format = \"bitty-profile-v1\" }\n",
+        );
+        let receipt = fix_profile_selector(&config, &selected_profiles, false)
+            .expect("symlink selected profile hint");
+        assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
+        assert!(
+            receipt.detail.contains("`work` is a symlink"),
+            "{receipt:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read config"),
+            selector_body,
+            "selector must not be rewritten when the selected profile is a symlink"
+        );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn selector_rewrite_validation_rejects_non_default_profiles() {
+        let source = bitty_config::plan::ConfigSource::new(
+            bitty_config::plan::LayerKind::User,
+            Some("init.lua".to_string()),
+        );
+        assert!(
+            selector_rewrite_selects_default(
+                "return { format = \"bitty-profile-v1\", profile = \"default\" }\n",
+                &source
+            ),
+            "a `default` selector must validate"
+        );
+        assert!(
+            !selector_rewrite_selects_default(
+                "return { format = \"bitty-profile-v1\", profile = \"work\" }\n",
+                &source
+            ),
+            "a rewrite that still names another profile must be rejected"
+        );
+        assert!(
+            !selector_rewrite_selects_default("return { profile = ", &source),
+            "an unparsable rewrite must be rejected"
+        );
+        assert!(
+            !selector_rewrite_selects_default(
+                "return { format = \"bitty-profile-v1\" }\n",
+                &source
+            ),
+            "a rewrite with no selector must be rejected"
+        );
     }
 }

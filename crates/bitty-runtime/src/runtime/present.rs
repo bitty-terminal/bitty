@@ -4952,6 +4952,7 @@ impl Runtime {
                         ))]
                         .into_boxed_slice(),
                     };
+                    #[allow(clippy::collapsible_if)]
                     if let Ok(fallback) = self
                         .renderer
                         .render_shaped_with_bidi(
@@ -4973,9 +4974,10 @@ impl Runtime {
                                 view_bidi,
                             )
                         })
-                        && !fallback.glyphs.is_empty()
                     {
-                        list = fallback;
+                        if !fallback.glyphs.is_empty() {
+                            list = fallback;
+                        }
                     }
                 }
                 // Issue #1409 (CTX-0797): the first leaf of this attempt fixes

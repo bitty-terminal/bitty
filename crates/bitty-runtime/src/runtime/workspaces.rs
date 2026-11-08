@@ -1498,6 +1498,11 @@ impl Runtime {
         if let Err(err) = self.validate_view_target_at("empty", new_label, fresh_id) {
             return Err(err.to_string());
         }
+        // Issue #3020: a fresh workspace (`Mod+T`) inherits the cwd of the
+        // pane that held focus before the switch. Capture it here: the focus
+        // moves to the fresh leaf below, so a later read would see the target
+        // itself. `None` keeps the PTY default (fail-open).
+        let inherited_cwd = self.inherited_spawn_cwd(fresh_id);
         // CTX-0334: creating/switching workspace is an explicit focus change.
         self.clear_hover_pending();
         self.stash_active_slot();
@@ -1564,7 +1569,14 @@ impl Runtime {
                     self.rows.min(u16::MAX as usize) as u16,
                 ));
             let tail: Vec<&str> = args.iter().map(String::as_str).collect();
-            if let Err(err) = self.spawn_shell_for_view(fresh_id, &program, &tail, cols, rows) {
+            if let Err(err) = self.spawn_shell_for_view_in(
+                fresh_id,
+                &program,
+                &tail,
+                cols,
+                rows,
+                inherited_cwd.as_deref(),
+            ) {
                 // Rate-limited (CTX-0473): a broken recipe must not flood stderr
                 // as workspaces are created in a loop.
                 if let Some(suppressed) = self.spawn_log.admit_now() {

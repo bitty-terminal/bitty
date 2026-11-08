@@ -14597,8 +14597,11 @@ fn wait_for_pane_text_ctx1347(app: &mut TerminalApp, view: ViewId, needle: &str)
 
 /// Issue #2240 / CTX-1347: `new_panel` materializing a tiled base over an
 /// empty workspace must let the fresh shell inherit the surviving float's
-/// `OSC 7` cwd. `set_layout` re-homes focus to the fresh leaf, so the
-/// inheritance source has to be captured before the install.
+/// cwd. `set_layout` re-homes focus to the fresh leaf, so the inheritance
+/// source has to be captured before the install. The float's child really
+/// sits in `/tmp` and its `OSC 7` report names the same directory, so the
+/// assertion holds for both inheritance sources (issue #3020: the pinned
+/// kernel cwd on Linux, the report where no kernel cwd is provable).
 #[test]
 #[cfg(unix)]
 fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
@@ -14607,7 +14610,14 @@ fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
-        .spawn_shell_for_view_in(float, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .spawn_shell_for_view_in(
+            float,
+            "/bin/sh",
+            &["-c", "exec sleep 30"],
+            80,
+            24,
+            Some(std::path::Path::new("/tmp")),
+        )
         .expect("spawn float shell");
     app.runtime
         .handle_pane_bytes(float, b"\x1b]7;file:///tmp\x07");
@@ -14637,12 +14647,13 @@ fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
     let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
     assert!(
         text.contains("/tmp"),
-        "new panel must inherit the surviving float's OSC 7 cwd (/tmp): {text:?}"
+        "new panel must inherit the surviving float's cwd (/tmp): {text:?}"
     );
 }
 
 /// Issue #2240 / CTX-1347: the same empty-base path with a pinned survivor
-/// must inherit the pin's `OSC 7` cwd too.
+/// must inherit the pin's cwd too (pinned kernel cwd on Linux, `OSC 7`
+/// report where no kernel cwd is provable; both name `/tmp` here).
 #[test]
 #[cfg(unix)]
 fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
@@ -14651,7 +14662,14 @@ fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
     let host = ViewId::new(1);
     let pin = ViewId::new(2);
     app.runtime
-        .spawn_shell_for_view_in(pin, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
+        .spawn_shell_for_view_in(
+            pin,
+            "/bin/sh",
+            &["-c", "exec sleep 30"],
+            80,
+            24,
+            Some(std::path::Path::new("/tmp")),
+        )
         .expect("spawn pin shell");
     app.runtime
         .handle_pane_bytes(pin, b"\x1b]7;file:///tmp\x07");
@@ -14684,7 +14702,231 @@ fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
     let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
     assert!(
         text.contains("/tmp"),
-        "new panel must inherit the surviving pin's OSC 7 cwd (/tmp): {text:?}"
+        "new panel must inherit the surviving pin's cwd (/tmp): {text:?}"
+    );
+}
+
+/// Unique scratch directory for the issue #3020 cwd tests. The name embeds
+/// the test process id and a monotonic stamp so parallel test binaries never
+/// collide.
+#[cfg(unix)]
+fn cwd_scratch_dir_3020(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let dir = std::env::temp_dir().join(format!(
+        "bitty-ctx3020-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Physical default cwd a child gets when nothing is inherited: `$HOME`,
+/// else the process cwd (the PTY layer's fail-open default).
+#[cfg(unix)]
+fn default_spawn_cwd_3020() -> String {
+    let cwd = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .expect("home or process cwd");
+    std::fs::canonicalize(&cwd)
+        .unwrap_or(cwd)
+        .display()
+        .to_string()
+}
+
+/// `OSC 7` report bytes for `dir` (spaces percent-encoded like real shell
+/// integration reports).
+#[cfg(unix)]
+fn osc7_report_3020(dir: &std::path::Path) -> Vec<u8> {
+    let url = dir.display().to_string().replace(' ', "%20");
+    format!("\x1b]7;file://{url}\x07").into_bytes()
+}
+
+/// Focused pane whose shell really sits in `dir`. The pane also reports the
+/// same directory over `OSC 7`, so the source resolves on platforms without a
+/// kernel cwd query; on Linux the pinned kernel cwd is the value under test.
+#[cfg(unix)]
+fn focus_source_pane_in_3020(app: &mut TerminalApp, dir: &std::path::Path) -> ViewId {
+    let source = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(
+            source,
+            "/bin/sh",
+            &["-c", "exec sleep 30"],
+            80,
+            24,
+            Some(dir),
+        )
+        .expect("spawn source pane shell");
+    app.runtime
+        .handle_pane_bytes(source, &osc7_report_3020(dir));
+    assert!(app.runtime.set_focus(source), "source pane must hold focus");
+    assert_eq!(
+        app.runtime.inherited_spawn_cwd(ViewId::new(3)),
+        Some(dir.to_path_buf()),
+        "precondition: the focused pane's cwd is inheritable"
+    );
+    source
+}
+
+/// Issue #3020: `Mod+N` (`new_panel`) must start the fresh panel in the
+/// focused pane's cwd. The source pane sits in a scratch directory the fresh
+/// shell reports with its own `pwd -P`.
+#[test]
+#[cfg(unix)]
+fn new_panel_inherits_focused_pane_cwd_issue_3020() {
+    require_pty!();
+    let dir = cwd_scratch_dir_3020("panel");
+    let marker = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name")
+        .to_string();
+    let mut app = cwd_probe_app();
+    focus_source_pane_in_3020(&mut app, &dir);
+
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    assert!(
+        app.runtime.has_pane_session(&panel),
+        "the fresh panel must own its shell"
+    );
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, &marker);
+    assert!(
+        text.contains(&marker),
+        "new panel must start in the focused pane's cwd: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #3020: `Mod+Shift+<dir>` (`new_split:<dir>`) inherits the focused
+/// pane's cwd exactly like `new_panel`.
+#[test]
+#[cfg(unix)]
+fn new_split_inherits_focused_pane_cwd_issue_3020() {
+    require_pty!();
+    let dir = cwd_scratch_dir_3020("split");
+    let marker = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name")
+        .to_string();
+    let mut app = cwd_probe_app();
+    focus_source_pane_in_3020(&mut app, &dir);
+
+    assert!(
+        !app.apply_chrome_action(bitty_config::ChromeAction::NewSplit(
+            bitty_config::SplitDir::Right
+        ))
+    );
+    let split = app.runtime.focused_view().expect("fresh split focus");
+    assert!(
+        app.runtime.has_pane_session(&split),
+        "the fresh split must own its shell"
+    );
+    let text = wait_for_pane_text_ctx1347(&mut app, split, &marker);
+    assert!(
+        text.contains(&marker),
+        "new split must start in the focused pane's cwd: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #3020: the focused pane's pinned kernel cwd wins over a contradicting
+/// `OSC 7` report — terminal truth, not untrusted pane output, decides where
+/// the fresh shell starts. The pin is Linux-only, hence the platform gate.
+#[test]
+#[cfg(target_os = "linux")]
+fn new_panel_inherits_pinned_kernel_cwd_over_osc7_report_issue_3020() {
+    require_pty!();
+    let dir = cwd_scratch_dir_3020("pinned");
+    let marker = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 scratch dir name")
+        .to_string();
+    let mut app = cwd_probe_app();
+    let source = ViewId::new(2);
+    app.runtime
+        .spawn_shell_for_view_in(
+            source,
+            "/bin/sh",
+            &["-c", "exec sleep 30"],
+            80,
+            24,
+            Some(&dir),
+        )
+        .expect("spawn source pane shell");
+    // The pane claims the filesystem root; the kernel says `dir`.
+    app.runtime
+        .handle_pane_bytes(source, b"\x1b]7;file:///\x07");
+    assert!(app.runtime.set_focus(source), "source pane must hold focus");
+    assert_eq!(
+        app.runtime
+            .focused_pane_child_cwd()
+            .map(|cwd| cwd.path().to_path_buf()),
+        Some(dir.clone()),
+        "precondition: the focused pane's kernel cwd is pinned"
+    );
+
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, &marker);
+    assert!(
+        text.contains(&marker),
+        "the pinned kernel cwd must win over the OSC 7 report: {text:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #3020: with no provable focused-pane cwd (a session-less leaf and no
+/// report) the spawn must still succeed and keep the PTY default instead of
+/// failing or landing somewhere invented.
+#[test]
+#[cfg(unix)]
+fn new_panel_without_a_focused_cwd_falls_back_to_default_issue_3020() {
+    require_pty!();
+    let mut app = cwd_probe_app();
+    assert!(
+        app.runtime.focused_pane_child_cwd().is_none(),
+        "precondition: the focused leaf is session-less"
+    );
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    assert!(
+        app.runtime.has_pane_session(&panel),
+        "a missing inherited cwd must not fail the spawn"
+    );
+    let default = default_spawn_cwd_3020();
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, &default);
+    assert!(
+        text.contains(&default),
+        "a pane with no provable cwd must fall back to the PTY default: {text:?}"
+    );
+}
+
+/// Issue #3020: where the kernel cwd cannot be proven, the focused pane's
+/// `OSC 7` report still seeds the fresh pane (parity with the pre-#3020
+/// chain and the only source on platforms without a kernel cwd query).
+#[test]
+#[cfg(unix)]
+fn new_panel_falls_back_to_focused_osc7_report_issue_3020() {
+    require_pty!();
+    let mut app = cwd_probe_app();
+    assert!(
+        app.runtime.focused_pane_child_cwd().is_none(),
+        "precondition: the focused leaf owns no PTY child"
+    );
+    app.runtime.handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
+    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
+    assert!(
+        text.contains("/tmp"),
+        "the focused pane's OSC 7 report must seed the fresh panel: {text:?}"
     );
 }
 

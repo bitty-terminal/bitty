@@ -1017,6 +1017,66 @@ fn control_terminal_spawn_applies_cwd_and_names_it() {
 
 #[cfg(unix)]
 #[test]
+fn control_terminal_spawn_explicit_cwd_wins_over_focused_pane_cwd_issue_3020() {
+    // Issue #3020: the focused pane's inheritable cwd is a default only; an
+    // explicit `--cwd` still decides where the new shell starts.
+    bitty_test_support::require_pty!();
+    let source_dir = unique_temp_dir("bitty-3020-source");
+    let explicit_dir = unique_temp_dir("bitty-3020-explicit");
+    let explicit_marker = explicit_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 temp dir name")
+        .to_string();
+    let mut rt = headless_runtime();
+    // The recorded primary recipe replays for the spawned pane: it prints
+    // the basename of its working directory, then echoes input.
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "basename \"$PWD\"; cat"])
+        .expect("primary shell must attach headless");
+    let all = bitty_ipc::ScopeSet::all();
+    // Make the focused pane's cwd `source_dir`: split once, then respawn that
+    // leaf's shell in the directory.
+    let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
+    let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &all);
+    assert!(done.ok, "split must succeed: {done:?}");
+    let source = rt.focused_view().expect("split pane focus");
+    rt.spawn_shell_for_view_in(
+        source,
+        "/bin/sh",
+        &["-c", "exec sleep 30"],
+        80,
+        24,
+        Some(&source_dir),
+    )
+    .expect("respawn source pane in the source directory");
+    // The report names the same directory, so the inheritable value resolves
+    // on platforms without a kernel cwd query too.
+    rt.handle_pane_bytes(
+        source,
+        format!("\x1b]7;file://{}\x07", source_dir.display()).as_bytes(),
+    );
+    assert_eq!(
+        rt.inherited_spawn_cwd(bitty_runtime::ViewId::new(3)),
+        Some(source_dir.clone()),
+        "precondition: the focused pane's cwd is inheritable"
+    );
+    let explicit_str = explicit_dir.to_str().expect("utf-8 temp dir");
+    let spawn = ipc_ctl::params_spawn(Some(explicit_str));
+    let spawned =
+        apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPAWN_TERMINAL, Some(&spawn), &all);
+    assert!(spawned.ok, "spawn with --cwd must succeed: {spawned:?}");
+    let spawned_view = rt.focused_view().expect("spawned pane focus");
+    assert_ne!(spawned_view, source, "spawn must create a fresh leaf");
+    assert!(
+        wait_for_pane_text(&mut rt, spawned_view, &explicit_marker),
+        "explicit --cwd must win over the focused pane's cwd"
+    );
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&explicit_dir);
+}
+
+#[cfg(unix)]
+#[test]
 fn control_terminal_spawn_rejects_missing_or_relative_cwd_without_a_leaf() {
     let mut rt = headless_runtime();
     let all = bitty_ipc::ScopeSet::all();

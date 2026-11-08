@@ -1281,7 +1281,10 @@ impl TerminalApp {
         // layout. `set_layout` re-homes focus to the fresh leaf, so a
         // post-install read would see the target itself and miss the
         // surviving float/pin that held focus on the empty-base path.
-        let inherited_cwd = self.runtime.inherited_cwd_for(new_id);
+        // Issue #3020: the focused pane's pinned kernel cwd seeds the fresh
+        // shell (Ghostty/kitty/WezTerm parity), with the `OSC 7` report as the
+        // fallback when the kernel cwd cannot be proven.
+        let inherited_cwd = self.runtime.inherited_spawn_cwd(new_id);
         self.runtime.set_layout(layout);
         // CTX-0176: the fresh leaf gets its own shell/PTY sized to the
         // decorated content frame it is painted in — best-effort (startup

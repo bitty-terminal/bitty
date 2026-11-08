@@ -2530,14 +2530,19 @@ impl Service {
                 return self.spawn_failed(session_id, cleanup, failure, now);
             }
         };
-        if self.orphans.commit(session_id, identity).is_err() {
-            let cleanup = self
-                .workers
-                .terminate(session_id)
-                .unwrap_or(CleanupClass::Unverified);
-            let _ = self.workers.forget(session_id);
-            let _ = self.orphans.settle(session_id, cleanup, now);
-            return self.spawn_failed(session_id, cleanup, SpawnFailure::PostSpawnRefusal, now);
+        // A plan that records no durable identity (the FreeBSD reaper and the
+        // macOS process group) commits nothing: the orphan verifier is
+        // unserved on those cells, so the earlier reserve was a no-op too.
+        if let Some(identity) = identity {
+            if self.orphans.commit(session_id, identity).is_err() {
+                let cleanup = self
+                    .workers
+                    .terminate(session_id)
+                    .unwrap_or(CleanupClass::Unverified);
+                let _ = self.workers.forget(session_id);
+                let _ = self.orphans.settle(session_id, cleanup, now);
+                return self.spawn_failed(session_id, cleanup, SpawnFailure::PostSpawnRefusal, now);
+            }
         }
         match self.host.bind(session_id, now) {
             Ok(snapshot) => Ok(snapshot),

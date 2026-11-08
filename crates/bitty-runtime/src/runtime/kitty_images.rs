@@ -1967,7 +1967,7 @@ impl Runtime {
     /// (anonymous), no stored image for this origin, or a placement-quota
     /// refusal. Every refusal paints nothing and evicts nothing; the caller
     /// retains a spanless request whose pixels are still in flight
-    /// ([`Self::stash_pending_kitty_place`]).
+    /// (`stash_pending_kitty_place`).
     #[allow(clippy::too_many_arguments)]
     pub fn kitty_place_stored(
         &mut self,

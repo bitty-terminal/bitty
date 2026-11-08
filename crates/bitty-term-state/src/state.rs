@@ -2333,7 +2333,7 @@ impl State {
     /// Kitty's rule for a placement without `c=`/`r=` is "display at the
     /// image's natural size in cells" (`ceil(pixels / cell)`), but terminal
     /// truth holds no decoded pixels, so it cannot compute that span and
-    /// refuses a spanless place ([`Self::kitty_place`]). The runtime owns
+    /// refuses a spanless place. The runtime owns
     /// both the decoded image and the live cell metrics, so it resolves the
     /// span and records the placement through this seam; anchor, parent
     /// link, `z`, cursor advance and damage are exactly `kitty_place`'s.

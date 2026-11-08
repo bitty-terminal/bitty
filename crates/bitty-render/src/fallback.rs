@@ -332,7 +332,8 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         // Fast path (CTX-1026): the requested face first, with no tail
         // loading — the common primary-covered case stays a single call.
         let first = RasterKey::new(key.character, key.font, key.point_size)
-            .map_err(|_| RenderError::UnknownFontHandle)?;
+            .map_err(|_| RenderError::UnknownFontHandle)?
+            .with_presentation(key.presentation);
         match self.inner.rasterize(first) {
             Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                 return Ok(ResolvedGlyph {
@@ -363,7 +364,8 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         self.ensure_tails_loaded();
         for font in Self::tail_order(&self.fonts, key.font) {
             let attempt = RasterKey::new(key.character, font, key.point_size)
-                .map_err(|_| RenderError::UnknownFontHandle)?;
+                .map_err(|_| RenderError::UnknownFontHandle)?
+                .with_presentation(key.presentation);
             match self.inner.rasterize(attempt) {
                 Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                     return Ok(ResolvedGlyph {
@@ -395,7 +397,8 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         // tail hit would (first drawable bitmap wins).
         if let Some(dynamic) = self.inner.dynamic_face_for(key.character, key.point_size) {
             let attempt = RasterKey::new(key.character, dynamic, key.point_size)
-                .map_err(|_| RenderError::UnknownFontHandle)?;
+                .map_err(|_| RenderError::UnknownFontHandle)?
+                .with_presentation(key.presentation);
             match self.inner.rasterize(attempt) {
                 Ok(Some(bitmap)) if !skip_blank || !bitmap.is_blank() => {
                     return Ok(ResolvedGlyph {
@@ -1392,6 +1395,98 @@ mod tests {
         assert_eq!(
             renderer.counters().blank_cells_skipped,
             (state.width() * state.height() - 4) as u64
+        );
+    }
+
+    #[test]
+    fn resolve_preserves_emoji_presentation_across_primary_tail_and_dynamic() {
+        use crate::glyph::{BitmapFormat, GlyphMetrics};
+        use bitty_term_state::EmojiPresentation;
+
+        #[derive(Default)]
+        struct PresentationRecorder {
+            next_id: u64,
+            primary: Option<FontId>,
+            tail: Option<FontId>,
+            dynamic: Option<FontId>,
+            seen: Vec<(FontId, EmojiPresentation)>,
+        }
+
+        impl GlyphRasterizer for PresentationRecorder {
+            fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
+                let id = FontId::next(&mut self.next_id);
+                if query.family == "Primary" {
+                    self.primary = Some(id);
+                } else if self.tail.is_none() {
+                    self.tail = Some(id);
+                }
+                Ok(id)
+            }
+
+            fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+                self.seen.push((key.font, key.presentation));
+                let hit = match key.character {
+                    '\u{2705}' => Some(key.font) == self.primary,
+                    '\u{1F600}' => Some(key.font) == self.tail,
+                    '\u{1F680}' => Some(key.font) == self.dynamic,
+                    _ => false,
+                };
+                if !hit {
+                    return Ok(None);
+                }
+                let metrics = GlyphMetrics {
+                    left: 0,
+                    top: 4,
+                    width: 2,
+                    height: 2,
+                    advance: [8, 0],
+                };
+                let (format, data) = if key.wants_color() {
+                    (BitmapFormat::Rgba, vec![0xFF; 16])
+                } else {
+                    (BitmapFormat::Rgb, vec![0xFF; 12])
+                };
+                Ok(Some(GlyphBitmap::try_new(metrics, format, data).unwrap()))
+            }
+
+            fn dynamic_face_for(&mut self, c: char, _point_size: f32) -> Option<FontId> {
+                if c == '\u{1F680}' {
+                    let id = *self
+                        .dynamic
+                        .get_or_insert_with(|| FontId::next(&mut self.next_id));
+                    Some(id)
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mut raster = FallbackRasterizer::new(
+            PresentationRecorder::default(),
+            vec!["Tail Emoji".to_string()],
+        );
+        let primary = raster.load_font(&query("Primary", 12.0)).unwrap();
+
+        for ch in ['\u{2705}', '\u{1F600}', '\u{1F680}'] {
+            let key = RasterKey::new(ch, primary, 12.0)
+                .unwrap()
+                .with_presentation(EmojiPresentation::Emoji);
+            let resolved = raster.resolve(key).unwrap();
+            assert!(resolved.covered, "{ch:?} must resolve");
+            assert_eq!(
+                resolved.bitmap.unwrap().format,
+                BitmapFormat::Rgba,
+                "{ch:?} must preserve EmojiPresentation::Emoji and return RGBA"
+            );
+        }
+        assert!(
+            raster
+                .inner()
+                .seen
+                .iter()
+                .all(|(_, pres)| *pres == EmojiPresentation::Emoji),
+            "every primary, tail, and dynamic lookup must preserve EmojiPresentation::Emoji: {:?}",
+            raster.inner().seen
         );
     }
 }

@@ -877,6 +877,7 @@ impl SwashSingle {
     /// face) even though its face is still resident.
     fn scan_dynamic_face(&mut self, c: char, point_size: f32) -> Option<FontId> {
         let px = Self::px(point_size);
+        let emoji = bitty_term_state::is_emoji_presentation(c);
         // Already-resident dynamic faces first: preserves coverage across
         // outcome-cache evictions without spending quota or loading bytes.
         // Deterministic order (by handle) so repeated rescans agree.
@@ -894,7 +895,7 @@ impl SwashSingle {
                 continue;
             }
             let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
-            if Self::probe_source(&mut scaler, glyph_id, false).is_some() {
+            if Self::probe_source(&mut scaler, glyph_id, emoji).is_some() {
                 return Some(font);
             }
         }
@@ -943,7 +944,7 @@ impl SwashSingle {
                 continue;
             }
             let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
-            if Self::probe_source(&mut scaler, glyph_id, false).is_none() {
+            if Self::probe_source(&mut scaler, glyph_id, emoji).is_none() {
                 continue;
             }
             // Drawable coverage: retain under the session bounds.
@@ -2435,7 +2436,7 @@ impl SwashSingle {
                 "shaper returned ragged infos/positions".to_string(),
             ));
         }
-        let mut clusters = Vec::with_capacity(infos.len());
+        let mut entries: Vec<(ShapedCluster, bool)> = Vec::with_capacity(infos.len());
         // CTX-1612: cluster byte ranges come from the sorted set of shaper
         // offsets, never from the next entry. HarfBuzz emits an RTL run in
         // visual (descending-offset) order, where `infos[i + 1].cluster` is
@@ -2454,7 +2455,6 @@ impl SwashSingle {
         // Draft flags for the scaffold pass below: a visible scalar shaped
         // to a blank outline is the first half of a programming ligature
         // (the font draws the wide outline from the following cell).
-        let mut scaffolds = Vec::with_capacity(infos.len());
         for (info, pos) in infos.iter().zip(positions.iter()) {
             let start = info.cluster as usize;
             let end = offsets
@@ -2490,41 +2490,48 @@ impl SwashSingle {
                 .flatten();
             let covered = probe.is_some();
             let blank_outline = probe.is_some_and(|(_, blank)| blank);
-            scaffolds.push(blank_outline && slice.chars().any(|ch| !ch.is_whitespace()));
-            clusters.push(ShapedCluster {
-                cells: (col, cells),
-                glyph_id: glyph_id as u16,
-                face: id,
-                x_advance_px: pos.x_advance as f32 / UNITS_PER_PX,
-                x_offset_px: pos.x_offset as f32 / UNITS_PER_PX,
-                uncovered: !covered,
-                ligature_part: cells > 1,
-                byte_offset: base_offset + start,
-                presentation,
-            });
+            let scaffold = blank_outline && slice.chars().any(|ch| !ch.is_whitespace());
+            entries.push((
+                ShapedCluster {
+                    cells: (col, cells),
+                    glyph_id: glyph_id as u16,
+                    face: id,
+                    x_advance_px: pos.x_advance as f32 / UNITS_PER_PX,
+                    x_offset_px: pos.x_offset as f32 / UNITS_PER_PX,
+                    uncovered: !covered,
+                    ligature_part: cells > 1,
+                    byte_offset: base_offset + start,
+                    presentation,
+                },
+                scaffold,
+            ));
         }
-        // CTX-1612: keep shaper output in logical byte order so downstream
-        // grouping (grapheme clusters, ligature spans, cursor overlap) sees
-        // ascending offsets for both directions. The stable sort preserves
-        // HarfBuzz's member order inside one cluster, which is the order
-        // its advances and GPOS offsets were computed in.
-        if direction == RunDirection::Rtl {
-            clusters.sort_by_key(|cluster| cluster.byte_offset);
-        }
-        // Scaffold pass (CTX-1607): a blank left half owns its own one-cell
-        // cluster, so mark it and the following body cluster as one
-        // ligature span. Cursor un-shaping then sees the whole visual
-        // extent even though no single cluster spans two cells.
-        for (index, scaffold) in scaffolds.into_iter().enumerate() {
-            if scaffold {
-                clusters[index].ligature_part = true;
-                if let Some(next) = clusters.get_mut(index + 1) {
-                    next.ligature_part = true;
-                }
+        Ok(finalize_shaped_clusters(entries, direction))
+    }
+}
+
+/// Orders shaped entries into ascending logical byte order and marks
+/// two-cluster ligature scaffolds (CTX-1607, CTX-1612).
+///
+/// Pairing the scaffold flag with each [`ShapedCluster`] before the RTL sort
+/// ensures the scaffold flag travels with its cluster instead of indexing
+/// post-sort logical clusters with pre-sort visual indices.
+fn finalize_shaped_clusters(
+    mut entries: Vec<(ShapedCluster, bool)>,
+    direction: RunDirection,
+) -> Vec<ShapedCluster> {
+    if direction == RunDirection::Rtl {
+        entries.sort_by_key(|(cluster, _)| cluster.byte_offset);
+    }
+    for index in 0..entries.len() {
+        if entries[index].1 {
+            entries[index].0.ligature_part = true;
+            if let Some((next, _)) = entries.get_mut(index + 1) {
+                next.ligature_part = true;
             }
         }
-        Ok(clusters)
     }
+    entries.into_iter().map(|(cluster, _)| cluster).collect()
 }
 
 #[cfg(test)]
@@ -3086,6 +3093,48 @@ mod tests {
         assert!(
             !ascii_fast_path_eligible(&marked_runs[0], &always),
             "combining mark must stay shaped"
+        );
+    }
+
+    #[test]
+    fn rtl_finalize_shaped_clusters_keeps_scaffold_aligned_with_logical_order() {
+        let mut counter = 0;
+        let face = FontId::next(&mut counter);
+        let mk_cluster = |byte_offset: usize, col: usize| ShapedCluster {
+            cells: (col, 1),
+            glyph_id: 1,
+            face,
+            x_advance_px: 8.0,
+            x_offset_px: 0.0,
+            uncovered: false,
+            ligature_part: false,
+            byte_offset,
+            presentation: bitty_term_state::EmojiPresentation::Text,
+        };
+        // HarfBuzz emits RTL runs in descending byte-offset order:
+        // byte 4 (not a scaffold), byte 2 (scaffold lead), byte 0 (not a scaffold).
+        // After sorting into logical order [0, 2, 4], the scaffold at byte 2 (index 1)
+        // must mark logical index 1 and 2 as `ligature_part`, NOT logical index 0!
+        let entries = vec![
+            (mk_cluster(4, 2), false),
+            (mk_cluster(2, 1), true),
+            (mk_cluster(0, 0), false),
+        ];
+        let finalized = finalize_shaped_clusters(entries, RunDirection::Rtl);
+        assert_eq!(finalized[0].byte_offset, 0);
+        assert!(
+            !finalized[0].ligature_part,
+            "logical cluster 0 must not inherit a scaffold flag from pre-sort visual order"
+        );
+        assert_eq!(finalized[1].byte_offset, 2);
+        assert!(
+            finalized[1].ligature_part,
+            "scaffold cluster at byte 2 must be marked ligature_part"
+        );
+        assert_eq!(finalized[2].byte_offset, 4);
+        assert!(
+            finalized[2].ligature_part,
+            "cluster following scaffold in logical order must be marked ligature_part"
         );
     }
 }

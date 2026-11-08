@@ -435,18 +435,18 @@ fn detached_floats_stay_with_their_workspace() {
 
 #[test]
 fn pinned_interplay_is_unchanged_and_justified() {
-    // A detached float is not in any layout: pinning it fails closed (pin
-    // through untoggle-then-pin), and detaching a pinned leaf fails closed
-    // (restore through unpin first). Unpin still returns the floating panel
-    // to the active workspace tree.
+    // Issue #3074: a detached float in `self.floats` can be pinned directly
+    // into `self.pinned` (moving out of `floated_views()`), while detaching
+    // an already-pinned leaf still fails closed (restore through unpin first).
+    // Unpin still returns the floating panel to the active workspace tree.
     let mut rt = make_runtime();
     install(&mut rt, two_pane());
     rt.float_detach(ViewId::new(1)).expect("detach must apply");
-    assert!(
-        rt.pin_floating(ViewId::new(1)).is_err(),
-        "a detached float is not pinnable until restored"
-    );
     assert_eq!(rt.floated_views(), vec![ViewId::new(1)]);
+    rt.pin_floating(ViewId::new(1))
+        .expect("detached float is pinnable");
+    assert!(rt.floated_views().is_empty());
+    assert_eq!(rt.pinned_views(), vec![ViewId::new(1)]);
 
     let mut rt = make_runtime();
     install(&mut rt, two_pane());

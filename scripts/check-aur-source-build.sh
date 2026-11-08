@@ -29,10 +29,15 @@
 #     install-vs-build-selection consistency), not that the Rust tree compiles.
 #
 #   --mode full       (release / on demand)
-#     * runs the unmodified recipe end to end: `makepkg --force --nocheck
-#       dependencies installed, so cargo fetch/build really happen and every declared
-#       dependency must exist in the pacman repos;
+#     * installs the recipe's declared depends/makedepends with pacman as root
+#       first (every declared dependency must exist in the pacman repos), then
+#       runs the unmodified recipe end to end as the unprivileged builder:
+#       `makepkg --force --nocheck --nodeps`, so cargo fetch/build really
+#       happen;
 #     * same package-content assertions on the real binary package.
+#     Started as root it installs those packages unprompted (--noconfirm), so
+#     on a developer host run it as your normal user with the dependencies
+#     already installed; its names are still resolved against the repos.
 #     Ceiling: `--nocheck` skips the recipe's `check()` smoke test (project CI
 #     owns the test matrix); only the Linux x86_64/aarch64 package is built.
 #
@@ -62,6 +67,9 @@ WALL_TIMEOUT=900
 EXPECT_VERSION=""
 SRCDEST_OPT=""
 KEEP=0
+# A declared dependency handed to pacman as root: an Arch package name (may not
+# start with '-' or '.') with an optional version constraint (bitty#3027).
+DEP_NAME_RE='^[A-Za-z0-9@_+][A-Za-z0-9@._+-]*([<>]=?[A-Za-z0-9._+:~-]+|=[A-Za-z0-9._+:~-]+)?$'
 
 usage() {
   sed -n '/^# Usage:/,/^# Exit status:/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -154,15 +162,28 @@ if [[ "$EUID" -eq 0 && -z "${AUR_GATE_AS_BUILDER:-}" ]]; then
   #
   # The declarations are enumerated as `builder`, never as root: a PKGBUILD is
   # untrusted code, so sourcing it may not run with root's authority. The
-  # resulting names are validated before pacman sees them.
+  # resulting names are validated before pacman sees them: every entry must
+  # match DEP_NAME_RE (no leading '-', so nothing can be read as a pacman
+  # option) or the gate fails, and `--` ends option parsing regardless. The
+  # names travel over a pipe, never a builder-writable file.
   if [[ "$MODE" == full ]]; then
-    deps_file="$WORKROOT/declared-deps.txt"
-    su builder -s /bin/bash -c "bash -c 'source \"\$1\" >/dev/null 2>&1; printf \"%s\\n\" \"\${depends[@]}\" \"\${makedepends[@]}\"' _ '$RECIPE'" >"$deps_file" ||
-      die "cannot enumerate the recipe's declared dependencies"
-    mapfile -t root_deps < <(grep -E '^[A-Za-z0-9@._+<>=:-]+$' "$deps_file" | sort -u)
+    printf -v enum_cmd 'bash -c %q _ %q' \
+      'source "$1" >/dev/null || exit 1; printf "%s\n" "${depends[@]}" "${makedepends[@]}"' \
+      "$RECIPE"
+    # Options precede the user: newer util-linux su hands anything after the
+    # user name to the login shell instead of parsing it.
+    declared="$(su -s /bin/bash -c "$enum_cmd" builder)" ||
+      die "cannot enumerate the recipe's declared dependencies (sourcing $RECIPE as builder failed)"
+    root_deps=()
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      [[ "$dep" =~ $DEP_NAME_RE ]] ||
+        die "declared dependency '$dep' is not a valid package name; refusing to pass it to pacman as root"
+      root_deps+=("$dep")
+    done <<<"$declared"
     ((${#root_deps[@]})) || die "full mode found no declared dependencies to install"
     echo "gate: installing ${#root_deps[@]} declared dependenc(y/ies) as root before the unprivileged build"
-    pacman -S --needed --noconfirm "${root_deps[@]}" ||
+    pacman -S --needed --noconfirm -- "${root_deps[@]}" ||
       die "a declared dependency could not be installed (a wrong or missing makedepends must fail CI, not the next release)"
   fi
   reexec=("$REPO_ROOT/scripts/check-aur-source-build.sh")
@@ -384,6 +405,9 @@ else
   # Full mode builds the recipe as written: real source download, real cargo,
   # real dependency install. The copy is still used so makepkg runs in a
   # writable dir owned by builder and never dirties the checkout.
+  # Root already installed the declared dependencies; resolving the names here
+  # too keeps a typo'd makedepends fatal when full mode is started unprivileged.
+  check_dep_names "$RECIPE_COPY"
   cp "$RECIPE_COPY" "$BUILD_DIR/PKGBUILD"
   echo "gate: full build of the unmodified recipe (--nodeps --nocheck); this compiles the workspace"
   run_makepkg "$BUILD_DIR" --nodeps --cleanbuild

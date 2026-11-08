@@ -180,6 +180,30 @@ else
   pass "full mode runs makepkg without --syncdeps"
 fi
 
+# bitty#3027: root hands recipe-declared names to pacman, so the name filter
+# is a privilege boundary. Exercise the gate's own pattern: anything pacman
+# could read as an option, or any shell metacharacter, must be rejected.
+dep_re_line="$(grep -m1 '^DEP_NAME_RE=' "$GATE" || true)"
+if [[ -z "$dep_re_line" ]]; then
+  fail "gate declares no DEP_NAME_RE package-name filter"
+else
+  eval "$dep_re_line"
+  for good in cargo freetype2 gcc-libs pkgconf lib32-glibc 'python>=3.11' 'foo=1:2.0-1' 'qt6-base<7'; do
+    [[ "$good" =~ $DEP_NAME_RE ]] || fail "DEP_NAME_RE rejects valid dependency '$good'"
+  done
+  for bad in '--hookdir=x' '-Syu' '--overwrite=foo' '.hidden' 'foo;id' 'foo bar' '$(id)' 'a/b' ''; do
+    if [[ "$bad" =~ $DEP_NAME_RE ]]; then
+      fail "DEP_NAME_RE accepts unsafe dependency '$bad'"
+    fi
+  done
+  pass "DEP_NAME_RE accepts package names and rejects option-shaped or shell-shaped entries"
+fi
+if grep -qF -- 'pacman -S --needed --noconfirm -- ' "$GATE"; then
+  pass "root pacman install ends option parsing before the declared names"
+else
+  fail "root pacman install does not end option parsing with -- before the declared names"
+fi
+
 if ! command -v makepkg >/dev/null 2>&1 || ! command -v tic >/dev/null 2>&1 ||
   ! command -v fakeroot >/dev/null 2>&1; then
   echo "SKIP: makepkg/tic/fakeroot missing; mutation cases run in the archlinux CI job"

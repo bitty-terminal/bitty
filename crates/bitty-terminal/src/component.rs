@@ -2412,6 +2412,25 @@ fn load_staged_dir(dir: &Path) -> Result<StagedSource, ComponentFailure> {
     // silently. Native-binary-only sources (no Lua files) are unaffected.
     check_staged_lua_readability(dir)?;
     let descriptor_path = dir.join(COMPONENT_DESCRIPTOR_FILE);
+    let descriptor_meta = std::fs::symlink_metadata(&descriptor_path).map_err(|error| {
+        ComponentFailure::component(format!(
+            "bitty extension: cannot read '{}': {error} (a source directory must hold \
+             bitty-component.toml plus the executable)",
+            descriptor_path.display()
+        ))
+    })?;
+    if descriptor_meta.file_type().is_symlink() {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: refusing symlink descriptor '{}'",
+            descriptor_path.display()
+        )));
+    }
+    if !descriptor_meta.file_type().is_file() {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: descriptor '{}' is not a regular file",
+            descriptor_path.display()
+        )));
+    }
     let bytes = std::fs::read(&descriptor_path).map_err(|error| {
         ComponentFailure::component(format!(
             "bitty extension: cannot read '{}': {error} (a source directory must hold \
@@ -2547,6 +2566,24 @@ fn load_staged_file(
 }
 
 fn read_executable(path: &Path) -> Result<Vec<u8>, ComponentFailure> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        ComponentFailure::component(format!(
+            "bitty extension: cannot read executable '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: refusing symlink executable '{}'",
+            path.display()
+        )));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(ComponentFailure::component(format!(
+            "bitty extension: executable '{}' is not a regular file",
+            path.display()
+        )));
+    }
     let bytes = std::fs::read(path).map_err(|error| {
         ComponentFailure::component(format!(
             "bitty extension: cannot read executable '{}': {error}",
@@ -2811,12 +2848,29 @@ fn op_remove(
         ));
     };
     let component_dir = user.join(name);
-    let user_has_component = component_dir.is_dir();
+    let user_has_component = match std::fs::symlink_metadata(&component_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => true,
+        Ok(_) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: refusing symlink or non-directory '{}'",
+                component_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: cannot inspect '{}': {error}",
+                component_dir.display()
+            )));
+        }
+    };
     if !user_has_component {
         // Soft-fail with an actionable diagnostic; name the system tier
         // when the component lives there (removal needs a package manager).
         if let Some(system) = system_root {
-            if system.join(name).is_dir() {
+            if std::fs::symlink_metadata(system.join(name))
+                .is_ok_and(|meta| meta.file_type().is_dir())
+            {
                 return Err(ComponentFailure::component(format!(
                     "bitty extension: '{}' is installed system-wide at {} (`bitty extension remove` only removes user-installed extensions; use your system package manager)",
                     name,
@@ -2835,11 +2889,26 @@ fn op_remove(
     match version {
         Some(version) => {
             let version_dir = component_dir.join(version);
-            if !version_dir.is_dir() {
-                return Err(ComponentFailure::component(format!(
-                    "bitty extension: version {version} of '{name}' is not installed in the user tier ({})",
-                    version_dir.display()
-                )));
+            match std::fs::symlink_metadata(&version_dir) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(ComponentFailure::generic(format!(
+                        "bitty extension: refusing symlink or non-directory '{}'",
+                        version_dir.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ComponentFailure::component(format!(
+                        "bitty extension: version {version} of '{name}' is not installed in the user tier ({})",
+                        version_dir.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(ComponentFailure::generic(format!(
+                        "bitty extension: cannot inspect '{}': {error}",
+                        version_dir.display()
+                    )));
+                }
             }
             std::fs::remove_dir_all(&version_dir).map_err(|error| {
                 ComponentFailure::generic(format!(
@@ -2849,9 +2918,12 @@ fn op_remove(
             })?;
             // Removing the version named by `current` also removes `current`.
             let current_path = component_dir.join("current");
-            if let Ok(current) = std::fs::read_to_string(&current_path) {
-                if current.trim_end_matches(['\n', '\r']).trim() == version {
-                    let _ = std::fs::remove_file(&current_path);
+            if std::fs::symlink_metadata(&current_path).is_ok_and(|meta| meta.file_type().is_file())
+            {
+                if let Ok(current) = std::fs::read_to_string(&current_path) {
+                    if current.trim_end_matches(['\n', '\r']).trim() == version {
+                        let _ = std::fs::remove_file(&current_path);
+                    }
                 }
             }
             // Prune the component dir when the last version is gone and no
@@ -2882,7 +2954,11 @@ fn op_remove(
 /// writers from older builds.
 fn prune_component_dir(component_dir: &Path) {
     let has_versions = std::fs::read_dir(component_dir)
-        .map(|entries| entries.flatten().any(|entry| entry.path().is_dir()))
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        })
         .unwrap_or(true);
     if has_versions {
         return;
@@ -3181,14 +3257,35 @@ fn check_staged_lua_readability(dir: &Path) -> Result<(), ComponentFailure> {
             }
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "lua")
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
             {
                 out.push(path);
             }
         }
     };
     collect_lua(dir, &mut candidates);
-    collect_lua(&dir.join("lua"), &mut candidates);
+    let lua_dir = dir.join("lua");
+    match std::fs::symlink_metadata(&lua_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: refusing symlink Lua directory '{}'",
+                lua_dir.display()
+            )));
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            collect_lua(&lua_dir, &mut candidates);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ComponentFailure::component(format!(
+                "bitty extension: cannot inspect '{}': {error}",
+                lua_dir.display()
+            )));
+        }
+    }
     for path in &candidates {
         let metadata = std::fs::symlink_metadata(path).map_err(|error| {
             ComponentFailure::component(format!(
@@ -6085,6 +6182,114 @@ mod tests {
         .expect("minified lua subdir");
         let (code, _) = run_with(&context, &["add", &source3.display().to_string()]);
         assert_eq!(code, EXIT_COMPONENT);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_refuses_symlinks_inside_staged_source_dir() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("staged-dir-symlinks");
+        let (context, _, _) = context_for(&base.join("user"), &base.join("system"));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+
+        // 1. Symlinked `.lua` file inside source dir must be caught by
+        // `check_staged_lua_readability` (not skipped by `DirEntry::file_type().is_file()`).
+        let source_lua = write_source_dir(&base.join("source-lua"), "net", "0.0.1", "[1, 1]");
+        let external_lua = outside.join("external.lua");
+        std::fs::write(&external_lua, "-- readable\nreturn {}\n").expect("external lua");
+        symlink(&external_lua, source_lua.join("linked.lua")).expect("symlink lua");
+        let (code, _) = run_with(&context, &["add", &source_lua.display().to_string()]);
+        assert_eq!(code, EXIT_COMPONENT, "symlinked .lua file must fail closed");
+
+        // 2. Symlinked `lua/` subdirectory must be refused.
+        let source_luadir = write_source_dir(&base.join("source-luadir"), "net", "0.0.1", "[1, 1]");
+        symlink(&outside, source_luadir.join("lua")).expect("symlink lua dir");
+        let (code, _) = run_with(&context, &["add", &source_luadir.display().to_string()]);
+        assert_eq!(
+            code, EXIT_COMPONENT,
+            "symlinked lua/ directory must fail closed"
+        );
+
+        // 3. Symlinked `bitty-component.toml` inside source dir must be refused.
+        let source_desc = write_source_dir(&base.join("source-desc"), "net", "0.0.1", "[1, 1]");
+        let external_desc = outside.join("external-descriptor.toml");
+        std::fs::copy(source_desc.join(COMPONENT_DESCRIPTOR_FILE), &external_desc)
+            .expect("copy descriptor");
+        std::fs::remove_file(source_desc.join(COMPONENT_DESCRIPTOR_FILE))
+            .expect("remove descriptor");
+        symlink(&external_desc, source_desc.join(COMPONENT_DESCRIPTOR_FILE))
+            .expect("symlink descriptor");
+        let (code, _) = run_with(&context, &["add", &source_desc.display().to_string()]);
+        assert_eq!(
+            code, EXIT_COMPONENT,
+            "symlinked descriptor inside source dir must fail closed"
+        );
+
+        // 4. Symlinked executable inside source dir must be refused.
+        let source_exe = write_source_dir(&base.join("source-exe"), "net", "0.0.1", "[1, 1]");
+        let exe_name = executable_file_name(&format!("{COMPONENT_EXECUTABLE_PREFIX}net"));
+        let external_exe = outside.join("external-exe");
+        std::fs::copy(source_exe.join(&exe_name), &external_exe).expect("copy exe");
+        std::fs::remove_file(source_exe.join(&exe_name)).expect("remove exe");
+        symlink(&external_exe, source_exe.join(&exe_name)).expect("symlink exe");
+        let (code, _) = run_with(&context, &["add", &source_exe.display().to_string()]);
+        assert_eq!(
+            code, EXIT_COMPONENT,
+            "symlinked executable inside source dir must fail closed"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_symlinked_component_and_version_dirs() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("remove-symlink");
+        let user = base.join("user");
+        let system = base.join("system");
+        std::fs::create_dir_all(&user).expect("user");
+        let (context, _, _) = context_for(&user, &system);
+
+        // External directory that must never be deleted by `remove`.
+        let external_target = base.join("external-net").join("0.0.1");
+        std::fs::create_dir_all(&external_target).expect("external target");
+        let sentinel = external_target.join("keep.txt");
+        std::fs::write(&sentinel, "do not delete").expect("sentinel");
+
+        // 1. Symlinked component directory (`user/net -> base/external-net`).
+        symlink(base.join("external-net"), user.join("net")).expect("symlink component dir");
+        let (code, _) = run_with(&context, &["remove", "net", "0.0.1"]);
+        assert_eq!(
+            code, EXIT_GENERIC,
+            "remove <name> <version> must refuse symlinked component dir"
+        );
+        assert!(
+            sentinel.is_file(),
+            "external version dir must not be deleted through symlinked component dir"
+        );
+        let (code, _) = run_with(&context, &["remove", "net"]);
+        assert_eq!(
+            code, EXIT_GENERIC,
+            "remove <name> must refuse symlinked component dir"
+        );
+        std::fs::remove_file(user.join("net")).expect("unlink component dir");
+
+        // 2. Real component directory with symlinked version directory (`user/net/0.0.1 -> external_target`).
+        std::fs::create_dir_all(user.join("net")).expect("real component dir");
+        symlink(&external_target, user.join("net").join("0.0.1")).expect("symlink version dir");
+        let (code, _) = run_with(&context, &["remove", "net", "0.0.1"]);
+        assert_eq!(
+            code, EXIT_GENERIC,
+            "remove <name> <version> must refuse symlinked version dir"
+        );
+        assert!(
+            sentinel.is_file(),
+            "external target must stay intact after refused version remove"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

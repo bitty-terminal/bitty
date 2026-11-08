@@ -2802,13 +2802,19 @@ fn resolve_migrate_target(args: &Args) -> Result<std::path::PathBuf, String> {
 
 /// Size-bounded read of the file about to be migrated.
 fn read_migrate_source(path: &std::path::Path) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|err| {
+    let meta = std::fs::symlink_metadata(path).map_err(|err| {
         format!(
             "bitty config migrate: no readable config file at '{}': {err}",
             path.display()
         )
     })?;
-    if !meta.is_file() {
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "bitty config migrate: refusing to migrate symlink '{}'",
+            path.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
         return Err(format!(
             "bitty config migrate: '{}' is not a regular file",
             path.display()
@@ -3232,12 +3238,24 @@ where
     F: FnOnce(&std::path::Path) -> Result<(), String>,
 {
     use std::io::Write as _;
-    let meta = std::fs::metadata(target).map_err(|err| {
+    let meta = std::fs::symlink_metadata(target).map_err(|err| {
         format!(
             "bitty config migrate: cannot inspect '{}': {err}",
             target.display()
         )
     })?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "bitty config migrate: refusing to replace symlink '{}'",
+            target.display()
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "bitty config migrate: '{}' is not a regular file",
+            target.display()
+        ));
+    }
     let name = target.file_name().map_or_else(
         || String::from("config.lua"),
         |name| name.to_string_lossy().into_owned(),
@@ -3324,30 +3342,75 @@ fn execute_config_edit(args: &Args) -> Result<(std::path::PathBuf, String), (i32
             ));
         }
     };
-    if !target.exists() {
-        // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
-        if let Some(parent) = target.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                return Err((
-                    1,
-                    format!(
-                        "bitty config edit: cannot create '{}': {err}",
-                        parent.display()
-                    ),
-                ));
-            }
-        }
-        // Starter only when missing: never clobbers existing content.
-        if let Err(err) = std::fs::write(&target, starter_init_lua()) {
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
             return Err((
                 1,
                 format!(
-                    "bitty config edit: cannot write '{}': {err}",
+                    "bitty config edit: refusing to edit symlink '{}'",
                     target.display()
                 ),
             ));
         }
-        eprintln!("bitty config edit: created '{}'", target.display());
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err((
+                1,
+                format!(
+                    "bitty config edit: '{}' is not a regular file",
+                    target.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // MSRV 1.85: no let-chains; nest instead of `if let ... && let ...`.
+            if let Some(parent) = target.parent() {
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    return Err((
+                        1,
+                        format!(
+                            "bitty config edit: cannot create '{}': {err}",
+                            parent.display()
+                        ),
+                    ));
+                }
+            }
+            // Starter only when missing: exclusive creation refuses raced
+            // symlinks and never clobbers existing content.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|err| {
+                    (
+                        1,
+                        format!(
+                            "bitty config edit: cannot write '{}': {err}",
+                            target.display()
+                        ),
+                    )
+                })?;
+            if let Err(err) = file.write_all(starter_init_lua().as_bytes()) {
+                return Err((
+                    1,
+                    format!(
+                        "bitty config edit: cannot write '{}': {err}",
+                        target.display()
+                    ),
+                ));
+            }
+            eprintln!("bitty config edit: created '{}'", target.display());
+        }
+        Err(err) => {
+            return Err((
+                1,
+                format!(
+                    "bitty config edit: cannot inspect '{}': {err}",
+                    target.display()
+                ),
+            ));
+        }
     }
     let editor = resolve_editor();
     match std::process::Command::new(&editor).arg(&target).status() {
@@ -4055,6 +4118,58 @@ mod startup_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o640, "the replacement keeps the original mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_migrate_and_edit_refuse_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = scratch_dir("migrate-edit-symlinks");
+        let real_cfg = dir.join("real-init.lua");
+        std::fs::write(&real_cfg, "return {}\n").expect("write real config");
+        let link_cfg = dir.join("link-init.lua");
+        symlink(&real_cfg, &link_cfg).expect("symlink config");
+
+        // 1. `read_migrate_source` and `replace_config_atomically` refuse symlinks.
+        let read_err =
+            read_migrate_source(&link_cfg).expect_err("read_migrate_source must refuse symlink");
+        assert!(read_err.contains("symlink"), "{read_err}");
+        let replace_err =
+            replace_config_atomically(&link_cfg, "return { config_version = 1 }\n", |_| Ok(()))
+                .expect_err("replace_config_atomically must refuse symlink");
+        assert!(replace_err.contains("symlink"), "{replace_err}");
+        assert!(
+            std::fs::symlink_metadata(&link_cfg)
+                .expect("link still exists")
+                .file_type()
+                .is_symlink(),
+            "symlink must not be replaced by a regular file"
+        );
+
+        // 2. `execute_config_edit` refuses both existing and dangling symlinks
+        // without creating the dangling target.
+        let mut edit_existing = Args::new();
+        edit_existing.config_path = Some(link_cfg.to_string_lossy().into_owned());
+        let (code, msg) =
+            execute_config_edit(&edit_existing).expect_err("existing symlink must be refused");
+        assert_eq!(code, 1);
+        assert!(msg.contains("symlink"), "{msg}");
+
+        let dangling_target = dir.join("dangling-target.lua");
+        let dangling_link = dir.join("dangling-init.lua");
+        symlink(&dangling_target, &dangling_link).expect("dangling symlink");
+        let mut edit_dangling = Args::new();
+        edit_dangling.config_path = Some(dangling_link.to_string_lossy().into_owned());
+        let (code, msg) =
+            execute_config_edit(&edit_dangling).expect_err("dangling symlink must be refused");
+        assert_eq!(code, 1);
+        assert!(msg.contains("symlink"), "{msg}");
+        assert!(
+            !dangling_target.exists(),
+            "dangling symlink target must never be created by config edit"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

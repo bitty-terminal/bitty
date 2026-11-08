@@ -1,10 +1,9 @@
 use super::apply::{apply_control_envelope, reload_config_json, snapshot_text_with_images};
 #[cfg(unix)]
 use super::apply::{drain_global_control_queue_with, drain_global_control_queue_with_barrier};
-use super::client::extract_string_from;
-#[cfg(unix)]
-use super::client::parse_ctl_response;
-use super::client::resolve_ctl_target;
+use super::client::{
+    extract_string_from, extract_top_value, parse_ctl_response, resolve_ctl_target,
+};
 use super::render::{
     class_for_server_error, exit_for_server_error, format_failure, format_panels_table,
     format_success, format_workspaces_table,
@@ -1927,6 +1926,47 @@ fn control_client_denial_envelope_maps_to_permission_exit() {
         EXIT_RUNTIME,
         "a genuine timeout stays exit {EXIT_RUNTIME}"
     );
+}
+
+#[test]
+fn parse_ctl_response_and_extract_top_value_respect_top_level_json_keys_3041() {
+    // 1. A result payload containing `"error"`, `"message"`, `"code"`, and `"ok":false`
+    // (for example, a workspace named "error" or terminal text containing `"text":`)
+    // must not be misclassified as an IPC error.
+    let envelope = br#"{"jsonrpc":"2.0","id":1,"result":{"names":["error"],"message":"not an error","code":"None","ok":false,"nested":{"text":"inner"},"text":"top-level-text"},"version":"1.0"}"#;
+    let outcome = parse_ctl_response(envelope).expect("valid result envelope");
+    assert!(
+        outcome.ok,
+        "nested 'error' string must not trigger error branch"
+    );
+    assert_eq!(
+        outcome.result_json,
+        r#"{"names":["error"],"message":"not an error","code":"None","ok":false,"nested":{"text":"inner"},"text":"top-level-text"}"#
+    );
+    // `extract_string_from` must skip `"nested":{"text":"inner"}` and extract the
+    // top-level `"text"` key at depth == 1.
+    assert_eq!(
+        extract_string_from(&outcome.result_json, "text").as_deref(),
+        Some("top-level-text")
+    );
+    assert_eq!(
+        extract_top_value(&outcome.result_json, "ok").as_deref(),
+        Some("false")
+    );
+
+    // 2. `extract_top_value` extracts top-level array values cleanly, including
+    // arrays with nested objects and escaped quotes/brackets.
+    assert_eq!(
+        extract_top_value(&outcome.result_json, "names").as_deref(),
+        Some(r#"["error"]"#)
+    );
+    let complex = r#"{"note":"fake \"arr\": [1, 2]","arr":["a]",{"k":"v}"},42],"count":7}"#;
+    assert_eq!(
+        extract_top_value(complex, "arr").as_deref(),
+        Some(r#"["a]",{"k":"v}"},42]"#)
+    );
+    assert_eq!(extract_top_value(complex, "count").as_deref(), Some("7"));
+    assert_eq!(extract_top_value(complex, "k"), None);
 }
 
 #[test]

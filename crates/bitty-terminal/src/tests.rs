@@ -1362,6 +1362,103 @@ return {}
     }
 
     #[test]
+    fn delivered_input_reveals_a_surface_the_occlusion_probe_closed() {
+        // bitty#3023: a Hyprland workspace return delivers no reveal edge at
+        // all - no `Suspended`/`Occluded(false)`, no focus change, and no
+        // frame callback while the gate is closed - so a starvation-probe
+        // hide stands forever and input is only applied, never presented.
+        // Input is deliverable only to a mapped, focused surface, so a routed
+        // key event is the reveal edge.
+        let mut fixture = Fixture::new("input-reveal");
+        // The exact runtime transition the `Occluded(true)` edge applies. The
+        // platform crash-report bookkeeping is process-global, so the test
+        // drives the gate directly instead of racing other lifecycle tests.
+        fixture.app.runtime.set_surface_visibility(false);
+        assert!(!fixture.app.runtime.is_surface_visible());
+
+        // The hidden surface retained damage and the bounded repair probe is
+        // outstanding when the key arrives; a #2989 confirmation bound is
+        // armed for the hidden incarnation too.
+        fixture.app.runtime.handle_pty_bytes(b"stale frame");
+        let probe_at = std::time::Instant::now();
+        fixture.app.repair_hidden_surface(probe_at);
+        assert!(fixture.app.hidden_repair_probe_pending());
+        assert!(fixture.app.runtime.hidden_repair_deadline().is_some());
+        fixture
+            .app
+            .runtime
+            .arm_present_confirmation_for_test(probe_at);
+        assert!(fixture.app.runtime.present_confirm_deadline().is_some());
+
+        let presented_before = fixture.app.presented_frames;
+        assert_eq!(
+            fixture.event(WindowEventKind::KeyboardInput(KeyEvent {
+                logical_key: LogicalKey::Character("a".to_string()),
+                text: Some("a".to_string()),
+                location: KeyLocation::Standard,
+                state: PressState::Pressed,
+                repeat: false,
+                is_synthetic: false,
+            })),
+            0,
+            "an unbound key must not enter a plugin VM"
+        );
+
+        assert!(
+            fixture.app.runtime.is_surface_visible(),
+            "a delivered key reopens the gate"
+        );
+        assert!(
+            !fixture.app.hidden_repair_probe_pending(),
+            "the input reveal ends the hidden-repair probe"
+        );
+        assert_eq!(
+            fixture.app.runtime.hidden_repair_deadline(),
+            None,
+            "no repair wake survives the reveal"
+        );
+        assert_eq!(
+            fixture.app.runtime.present_confirm_deadline(),
+            None,
+            "the reveal drops the hidden incarnation's confirmation bound"
+        );
+        assert!(
+            fixture.app.runtime.present_coalescing_deadline().is_some(),
+            "the reveal queues one from-truth frame"
+        );
+        assert!(
+            fixture.app.drive_tick().is_some(),
+            "the queued frame presents instead of just applying the delta"
+        );
+        assert_eq!(fixture.app.presented_frames, presented_before + 1);
+    }
+
+    #[test]
+    fn timer_and_ipc_wakes_do_not_reveal_a_closed_surface() {
+        // bitty#3023: only input the compositor could not deliver to a
+        // suspended surface is visibility proof. A timer wake and the
+        // IPC/PTY wake (the control-queue waker reuses `PtyReadable`) must
+        // leave the gate exactly where the occlusion edge left it.
+        let mut fixture = Fixture::new("input-reveal-negative");
+        // Same runtime transition as the `Occluded(true)` edge (see the
+        // positive case: the crash-report sentinel is process-global).
+        fixture.app.runtime.set_surface_visibility(false);
+        assert!(!fixture.app.runtime.is_surface_visible());
+
+        fixture.platform_event(PlatformEvent::AboutToWait);
+        fixture.platform_event(PlatformEvent::PtyReadable);
+
+        assert!(
+            !fixture.app.runtime.is_surface_visible(),
+            "a wake is not a reveal edge"
+        );
+        assert!(
+            fixture.app.drive_tick().is_none(),
+            "a hidden surface still presents nothing"
+        );
+    }
+
+    #[test]
     fn hidden_surface_with_retained_damage_arms_the_repair_wake() {
         // bitty#2830 hypothesis 2: the occlusion gate retains damage but used
         // to arm no timed wake, so a lost reveal parked the loop forever. The

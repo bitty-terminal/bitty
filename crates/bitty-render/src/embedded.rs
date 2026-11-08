@@ -58,6 +58,29 @@ pub const PUA_FIRST: char = '\u{E000}';
 /// bound is what callers reason about.
 pub const PUA_LAST: char = '\u{F8FF}';
 
+/// Family name of the CJK regression fixture (bitty#3021).
+///
+/// Deliberately distinct from [`EMBEDDED_SYMBOLS_FAMILY`] and from the host
+/// CJK families: the fixture must be reachable only through the per-scalar
+/// fallback scan, never as a pinned chain tail, or the regression test would
+/// no longer exercise the dynamic face walk.
+pub const HAN_TEST_FAMILY: &str = "Bitty Han Test";
+
+/// Raw bytes of the CJK regression fixture (bitty#3021).
+///
+/// `assets/bitty-han-test.ttf` is a 9 KiB Noto Sans CJK SC subset renamed to
+/// [`HAN_TEST_FAMILY`] (OFL section 3). It carries the reported line
+/// `> 请问饿七五二二头痛医头用` plus printable ASCII and nothing else.
+///
+/// It is **not** part of any production fallback chain and no production path
+/// loads it: `tests/shaped_mixed_script_fallback.rs` registers it through
+/// [`SwashSingle::with_extra_faces`](crate::shaped::SwashSingle::with_extra_faces)
+/// so the Han half of the mixed-script regression resolves on a host with no
+/// CJK face instead of skipping. Regeneration lives in
+/// `assets/generate-han-test-font.sh`; licensing in
+/// `LICENSES/bitty-han-test.txt` at the repository root.
+pub const HAN_TEST_BYTES: &[u8] = include_bytes!("../assets/bitty-han-test.ttf");
+
 /// Registers the embedded face in `db`.
 ///
 /// `fontdb` records it as a `Source::Binary` face, so
@@ -86,6 +109,40 @@ pub fn embedded_face_covers(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True when `bytes` maps `c` to a glyph, through the same parser the
+    /// rasterizer uses.
+    fn covers(bytes: &[u8], c: char) -> bool {
+        let Some(font) = swash::FontRef::from_index(bytes, 0) else {
+            return false;
+        };
+        swash::Charmap::from_font(&font).map(c) != 0
+    }
+
+    #[test]
+    fn han_fixture_covers_the_reported_line_and_ascii() {
+        // Reason the fixture exists (bitty#3021): on a CI image with no CJK
+        // face the Han regression must still be exercised, so the fixture
+        // has to carry every scalar of the reported line plus the `>`
+        // prompt prefix on its own. Host-independent: parses the compiled-in
+        // bytes only.
+        for c in "> 请问饿七五二二头痛医头用".chars() {
+            assert!(
+                covers(HAN_TEST_BYTES, c),
+                "fixture must cover U+{:04X} ({c})",
+                u32::from(c)
+            );
+        }
+        for c in "0123456789".chars() {
+            assert!(covers(HAN_TEST_BYTES, c), "fixture must cover {c}");
+        }
+        // It stays a fallback: neither the emoji nor an unmapped scalar.
+        assert!(
+            !covers(HAN_TEST_BYTES, '\u{1F600}'),
+            "fixture carries no emoji"
+        );
+        assert!(!covers(HAN_TEST_BYTES, '\u{4E2D}'), "fixture stays minimal");
+    }
 
     #[test]
     fn embedded_face_covers_the_icon_and_graph_ranges() {

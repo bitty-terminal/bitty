@@ -391,6 +391,43 @@ impl SwashSingle {
         Self::empty_with_database(db)
     }
 
+    /// Builds a session over the host stack plus caller-supplied in-memory
+    /// faces (bitty#3021).
+    ///
+    /// `extra` faces join a *private* copy of the host database, so the
+    /// per-scalar fallback walk
+    /// ([`GlyphRasterizer::dynamic_face_for`]) can resolve scalars no host
+    /// face covers. The process-wide [`system_db`] is untouched, so other
+    /// sessions in the process are unaffected and a fixture registered here
+    /// can never shadow a real host face ordering.
+    ///
+    /// The seam exists for the mixed-script regression: it registers
+    /// [`crate::embedded::HAN_TEST_BYTES`] so the Han half of the reported
+    /// line resolves from a vendored subset instead of the host font stack.
+    /// A CI image with no CJK face must then still fail the test when the
+    /// per-cluster retry regresses, rather than skip it. Bytes are parsed by
+    /// the same bounded `fontdb`/`swash` path as every other face and never
+    /// touch the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`SwashSingle::new`]: [`RenderError::FontNotFound`] when the
+    /// host exposes no text face.
+    pub fn with_extra_faces(extra: &[&[u8]]) -> Result<Self, RenderError> {
+        if extra.is_empty() {
+            return Self::new();
+        }
+        let mut db = crate::font_index::system_database();
+        // Same registration order as `system_db`, then the caller's faces:
+        // the fallback walk's candidate sort (family name) decides among
+        // them, so append-only is unambiguous.
+        crate::embedded::register_face(&mut db);
+        for bytes in extra {
+            db.load_font_data((*bytes).to_vec());
+        }
+        Ok(Self::empty_with_database(Arc::new(db)))
+    }
+
     /// Test-only loaded-face count (lazy-loading assertions).
     #[cfg(test)]
     pub(crate) fn loaded_face_count(&self) -> usize {

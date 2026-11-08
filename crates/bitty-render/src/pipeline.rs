@@ -84,6 +84,7 @@ use crate::batch::{
     MAX_FILL_QUADS_PER_BATCH, MAX_GLYPH_QUADS_PER_BATCH, VERTICES_PER_QUAD,
 };
 use crate::error::RenderError;
+use crate::gpu::validate_draw_list_atlas_sources;
 use crate::grid::DrawList;
 
 /// Solid-fill WGSL: NDC position, straight color, and rounded-box SDF data.
@@ -1545,19 +1546,10 @@ impl GpuResources {
         // atlas slot is copied into one blit per instance and painted at the
         // glyph position of the pass order, so no second glyph shader or
         // texture format exists. A color instance without a color atlas is a
-        // wiring bug, refused before any GPU work.
-        let needs_color = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color {
-            let Some((texels, dims)) = color_atlas else {
-                return Err(RenderError::InvalidInput {
-                    reason: "color atlas instance requires color atlas texels",
-                });
-            };
-            crate::gpu::validate_color_atlas_payload(texels, dims)?;
-        }
+        // wiring bug, refused before any GPU work (bitty#3055: the payload
+        // length is validated by the same shared contract as the present paths,
+        // `validate_draw_list_atlas_sources`).
+        validate_draw_list_atlas_sources(draw_list, atlas, color_atlas)?;
         let (color_blits, color_glyphs_skipped) = color_atlas
             .map(|(texels, dims)| color_glyph_blits(draw_list, texels, dims))
             .unwrap_or_default();
@@ -2109,6 +2101,40 @@ mod tests {
         let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
         assert_eq!(blits.len(), 1);
         assert_eq!(skipped, 0);
+    }
+
+    /// `draw_frame` is device-gated, so no CI job can call it; the atlas-source
+    /// contract it applies before any GPU work is the shared
+    /// `validate_draw_list_atlas_sources` (bitty#3055). A truncated color atlas
+    /// must be refused with the reason the headless entries report — otherwise
+    /// `color_glyph_blits` silently skips every glyph and the frame paints
+    /// backgrounds only.
+    #[test]
+    fn draw_frame_refuses_a_short_color_atlas_payload() {
+        let dims = AtlasDims {
+            width: 4,
+            height: 4,
+        };
+        let list = draw_list(vec![color_glyph([0, 0], color_slot(0, 0, 4, 4))]);
+        let exact = vec![0u8; 4 * 4 * 4];
+        validate_draw_list_atlas_sources(&list, None, Some((&exact, dims)))
+            .expect("an exact-length payload is accepted");
+        let short = &exact[..exact.len() - 4];
+        match validate_draw_list_atlas_sources(&list, None, Some((short, dims))) {
+            Err(RenderError::InvalidInput { reason }) => assert_eq!(
+                reason, "color atlas payload is shorter than its dimensions",
+                "the GPU frame path must name the truncated payload"
+            ),
+            other => panic!("a short color atlas must be refused, got {other:?}"),
+        }
+        // A color glyph with no color atlas at all is a wiring bug, refused
+        // before the GPU sees the frame.
+        assert!(matches!(
+            validate_draw_list_atlas_sources(&list, None, None),
+            Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels"
+            })
+        ));
     }
 
     /// bitty#3055: a frame whose only primitives are `ColorAtlas` glyphs still

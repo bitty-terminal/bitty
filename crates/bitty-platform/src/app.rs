@@ -734,6 +734,12 @@ impl OcclusionProbe {
             return None;
         }
         let requested_at = self.last_request?;
+        // `Instant::duration_since` has saturated to zero since Rust 1.60 and
+        // still does on this crate's MSRV (1.85), so this is not a panic guard.
+        // `saturating_duration_since` is kept as intent-explicit defense: a
+        // `now` that precedes `requested_at` (clock step, cross-thread stamp)
+        // compares as zero elapsed, so the gate simply stays closed until the
+        // clock catches up — bounded by one `OCCLUSION_STARVE`.
         if now.saturating_duration_since(requested_at) < OCCLUSION_STARVE {
             return None;
         }
@@ -1112,13 +1118,16 @@ mod tests {
             None,
             "a fresh request inside the starve span is healthy"
         );
-        // bitty#3055: an out-of-order Instant (e.g. a cross-thread
-        // `WindowHandle::request_redraw` stamped slightly after the caller's
-        // `now` snapshot) must saturate to zero rather than panicking.
+        // bitty#3055: an `Instant` that precedes the pending request (clock
+        // step, cross-thread `request_redraw` stamped after the caller's `now`
+        // snapshot) compares as zero elapsed, so the edge stays closed. Both
+        // `duration_since` and `saturating_duration_since` saturate here at
+        // MSRV 1.85; the assertion locks the "no edge, no panic" behavior, not
+        // a panic that those toolchains could have raised.
         assert_eq!(
             probe.starvation_edge(t0),
             None,
-            "now < requested_at must saturate to zero and return None"
+            "now < requested_at must compare as zero elapsed and return None"
         );
         assert_eq!(
             probe.starvation_edge(pending + OCCLUSION_STARVE),

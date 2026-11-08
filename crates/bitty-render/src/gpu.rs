@@ -1106,6 +1106,43 @@ fn headless_present_stats(frame: u64, draw_list: &DrawList) -> PresentStats {
     }
 }
 
+/// Refuses a draw list whose glyph sources need atlas texels the caller did not
+/// supply, and validates a supplied color-atlas payload against its declared
+/// dimensions (bitty#3055).
+///
+/// This is the single validation contract shared by every present path — the
+/// classified and clearing headless entries and the real-GPU `draw_frame` — so
+/// a truncated color atlas is refused identically before any compositing or
+/// GPU submission happens.
+pub(crate) fn validate_draw_list_atlas_sources(
+    draw_list: &DrawList,
+    atlas: Option<(&[u8], AtlasDims)>,
+    color_atlas: Option<(&[u8], AtlasDims)>,
+) -> Result<(), RenderError> {
+    let needs_atlas = draw_list
+        .glyphs
+        .iter()
+        .any(|g| matches!(g.source, crate::grid::GlyphSource::Atlas { .. }));
+    if needs_atlas && atlas.is_none() {
+        return Err(RenderError::InvalidInput {
+            reason: "atlas instance requires atlas texels",
+        });
+    }
+    let needs_color = draw_list
+        .glyphs
+        .iter()
+        .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
+    if needs_color {
+        let Some((texels, dims)) = color_atlas else {
+            return Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels",
+            });
+        };
+        validate_color_atlas_payload(texels, dims)?;
+    }
+    Ok(())
+}
+
 /// Refuses a color-atlas payload shorter than its declared dimensions
 /// (bitty#3005 / bitty#3055).
 pub(crate) fn validate_color_atlas_payload(
@@ -1722,75 +1759,40 @@ impl Surface {
         atlas: Option<(&[u8], AtlasDims)>,
         color_atlas: Option<(&[u8], AtlasDims)>,
     ) -> Result<PresentStats, PresentFailure> {
-        // Shared validation: configured?
-        let config = {
-            let state = self.state.lock().expect("surface state poisoned");
-            state
-                .config
-                .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))
-                .map_err(PresentFailure::Error)?
-        };
-        // CTX-0290: effective opacity (1.0 when the platform cannot blend
-        // premultiplied alpha, so an unsupported surface stays opaque).
-        let opacity = self.effective_opacity();
-
-        // Validate atlas requirement: any Atlas-sourced glyph needs atlas.
-        let needs_atlas = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::Atlas { .. }));
-        if needs_atlas && atlas.is_none() {
-            return Err(PresentFailure::Error(RenderError::InvalidInput {
-                reason: "atlas instance requires atlas texels",
-            }));
-        }
-        let needs_color = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color {
-            let Some((texels, dims)) = color_atlas else {
-                return Err(PresentFailure::Error(RenderError::InvalidInput {
-                    reason: "color atlas instance requires color atlas texels",
-                }));
-            };
-            validate_color_atlas_payload(texels, dims).map_err(PresentFailure::Error)?;
+        // A headless surface needs no `GpuContext`, and this is the product's
+        // default present path (bitty#3055). Keep the whole arm — validation
+        // included — in an adapter-free function so unit tests can exercise it
+        // on a CI runner with no GPU.
+        if self.is_headless() {
+            return self.present_headless_classified(draw_list, atlas, color_atlas);
         }
 
         match &self.kind {
-            SurfaceKind::Headless => {
-                telemetry::headless_present();
-                // Headless composite onto CPU buffer — delegates to the shared
-                // `composite_headless_draw_list` helper so `ImagePaintLayer::BelowText`
-                // z-ordering matches `headless_present_color`, `software::draw_list_onto`,
-                // and the real-GPU pipeline (bitty#3055).
-                let width = config.extent.width();
-                let height = config.extent.height();
-                // CR-RENDER-01: fail closed before allocating; extreme extents
-                // must not reach `vec!` unchecked.
-                let len = headless_buffer_len(width, height).map_err(PresentFailure::Error)?;
-                let mut rgba = vec![0u8; len];
-                clear_headless_rgba(&mut rgba, self.theme_palette().background);
-                self.composite_headless_draw_list(
-                    &mut rgba,
-                    width,
-                    height,
-                    draw_list,
-                    atlas,
-                    color_atlas,
-                );
-                // CTX-0290: apply the window opacity to the finished
-                // premultiplied buffer, the CPU equivalent of the GPU
-                // alpha-pinning blend below. No-op at opacity 1.0.
-                scale_premultiplied_rgba(&mut rgba, opacity);
-                let mut state = self.state.lock().expect("surface state poisoned");
-                state.frame += 1;
-                state.headless_rgba = Some(rgba);
-                state.headless_rgba_extent = Some(config.extent);
-                state.headless_rgba_opacity = Some(opacity);
-                Ok(headless_present_stats(state.frame, draw_list))
-            }
+            SurfaceKind::Headless => Err(PresentFailure::Error(RenderError::SurfaceConfigure(
+                "headless surface reached the GPU present branch".into(),
+            ))),
             SurfaceKind::Gpu { surface, .. } => {
+                // Shared validation: configured?
+                let config = {
+                    let state = self.state.lock().expect("surface state poisoned");
+                    state
+                        .config
+                        .ok_or_else(|| {
+                            RenderError::SurfaceConfigure("surface not configured".into())
+                        })
+                        .map_err(PresentFailure::Error)?
+                };
+                // CTX-0290: effective opacity (1.0 when the platform cannot
+                // blend premultiplied alpha, so an unsupported surface stays
+                // opaque).
+                let opacity = self.effective_opacity();
+                // bitty#3055: refuse a draw list that needs atlas texels it was
+                // not given, and a color-atlas payload shorter than its declared
+                // dimensions, before any GPU work. Same contract as the
+                // headless entries (`validate_draw_list_atlas_sources`).
+                validate_draw_list_atlas_sources(draw_list, atlas, color_atlas)
+                    .map_err(PresentFailure::Error)?;
+
                 // Real GPU path: validate, then draw the DrawList through
                 // the fill + glyph pipelines and present. Resources are
                 // created lazily and recreated when the surface format or
@@ -1964,6 +1966,68 @@ impl Surface {
                 })
             }
         }
+    }
+
+    /// Presents one frame on a headless surface through the classified entry
+    /// point without requiring a [`GpuContext`].
+    ///
+    /// This is the same validation and composition as the headless arm of
+    /// [`Self::present_draw_list_color_classified`] — which is the product's
+    /// default present path, since [`Runtime`](crate::Runtime) keeps
+    /// `gpu: None` — factored out so a unit test can drive it on a CI runner
+    /// with no adapter. Real surfaces return
+    /// [`RenderError::SurfaceConfigure`].
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceConfigure`] when the surface is not a headless
+    ///   fake or has not been configured.
+    /// - [`RenderError::InvalidInput`] for atlas mismatches, a color-atlas
+    ///   payload shorter than its declared dimensions, or buffer-cap overflows.
+    fn present_headless_classified(
+        &self,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
+    ) -> Result<PresentStats, PresentFailure> {
+        if !self.is_headless() {
+            return Err(PresentFailure::Error(RenderError::SurfaceConfigure(
+                "present_headless_classified called on a real surface".into(),
+            )));
+        }
+        let config = {
+            let state = self.state.lock().expect("surface state poisoned");
+            state
+                .config
+                .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))
+                .map_err(PresentFailure::Error)?
+        };
+        let opacity = self.effective_opacity();
+        validate_draw_list_atlas_sources(draw_list, atlas, color_atlas)
+            .map_err(PresentFailure::Error)?;
+        telemetry::headless_present();
+        // Headless composite onto the CPU buffer — `composite_headless_draw_list`
+        // is the shared helper, so `ImagePaintLayer::BelowText` z-ordering
+        // matches `headless_present_color`, `software::draw_list_onto`, and the
+        // real-GPU pipeline (bitty#3055).
+        let width = config.extent.width();
+        let height = config.extent.height();
+        // CR-RENDER-01: fail closed before allocating; extreme extents must not
+        // reach `vec!` unchecked.
+        let len = headless_buffer_len(width, height).map_err(PresentFailure::Error)?;
+        let mut rgba = vec![0u8; len];
+        clear_headless_rgba(&mut rgba, self.theme_palette().background);
+        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas, color_atlas);
+        // CTX-0290: apply the window opacity to the finished premultiplied
+        // buffer, the CPU equivalent of the GPU alpha-pinning blend. No-op at
+        // opacity 1.0.
+        scale_premultiplied_rgba(&mut rgba, opacity);
+        let mut state = self.state.lock().expect("surface state poisoned");
+        state.frame += 1;
+        state.headless_rgba = Some(rgba);
+        state.headless_rgba_extent = Some(config.extent);
+        state.headless_rgba_opacity = Some(opacity);
+        Ok(headless_present_stats(state.frame, draw_list))
     }
 
     /// Returns a clone of the last headless RGBA buffer (premultiplied,
@@ -2213,27 +2277,10 @@ impl Surface {
                 .config
                 .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))?
         };
-        let needs_atlas = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::Atlas { .. }));
-        if needs_atlas && atlas.is_none() {
-            return Err(RenderError::InvalidInput {
-                reason: "atlas instance requires atlas texels",
-            });
-        }
-        let needs_color = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color {
-            let Some((texels, dims)) = color_atlas else {
-                return Err(RenderError::InvalidInput {
-                    reason: "color atlas instance requires color atlas texels",
-                });
-            };
-            validate_color_atlas_payload(texels, dims)?;
-        }
+        // bitty#3055: the same atlas-source contract the classified entry point
+        // and `draw_frame` apply — a truncated color atlas is refused before
+        // compositing.
+        validate_draw_list_atlas_sources(draw_list, atlas, color_atlas)?;
         let width = config.extent.width();
         let height = config.extent.height();
         // CR-RENDER-01: fail closed before allocating; extreme extents must
@@ -3636,18 +3683,12 @@ mod tests {
         // bitty#3055: a short color-atlas payload is a caller wiring bug and
         // must be refused before painting on the headless path too.
         let short_texels = [0x00u8, 0x00, 0xFF, 0xFF].repeat(15);
+        let short_dims = crate::atlas::AtlasDims {
+            width: 4,
+            height: 4,
+        };
         let err = surface
-            .headless_present_color(
-                &color_glyph_only(),
-                None,
-                Some((
-                    &short_texels,
-                    crate::atlas::AtlasDims {
-                        width: 4,
-                        height: 4,
-                    },
-                )),
-            )
+            .headless_present_color(&color_glyph_only(), None, Some((&short_texels, short_dims)))
             .expect_err("a short color-atlas payload must be refused");
         assert!(
             matches!(
@@ -3657,6 +3698,30 @@ mod tests {
                 }
             ),
             "unexpected error: {err:?}"
+        );
+        // The classified entry point's headless arm runs the same guard before
+        // compositing. It needs no adapter, so this assertion runs in CI rather
+        // than behind `BITTY_RENDER_GPU_TESTS`.
+        let classified = Surface::headless(PhysicalSize::new(8, 4)).expect("valid extent");
+        let classified_err = classified
+            .present_headless_classified(
+                &color_glyph_only(),
+                None,
+                Some((&short_texels, short_dims)),
+            )
+            .expect_err("the classified headless arm must refuse a short color-atlas payload");
+        assert!(
+            matches!(
+                classified_err,
+                PresentFailure::Error(RenderError::InvalidInput {
+                    reason: "color atlas payload is shorter than its dimensions"
+                })
+            ),
+            "unexpected error: {classified_err:?}"
+        );
+        assert!(
+            classified.headless_rgba().is_none(),
+            "a refused classified present must not publish a frame"
         );
     }
 
@@ -4253,10 +4318,13 @@ mod tests {
     fn headless_present_honors_below_text_image_layer() {
         // Issue #2875: the CPU present path splits kitty blits by paint
         // layer around the glyph pass, exactly like `software::draw_list_onto`.
+        // bitty#3055: the classified entry point's headless arm is the
+        // product's default present path (`Runtime` keeps `gpu: None`), and it
+        // needs no adapter, so the comparison runs unconditionally instead of
+        // behind `BITTY_RENDER_GPU_TESTS`.
         use crate::geometry::RectPx;
         use crate::grid::{GlyphInstance, GlyphSource, ImageBlit, ImagePaintLayer};
-        let composite = |layer| -> [u8; 4] {
-            let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+        let layered_list = |layer| {
             let mut list = image_test_list(vec![
                 ImageBlit::try_new_in(RectPx::new(2, 2, 2, 2), [0xFF, 0, 0, 0xFF].repeat(4), layer)
                     .unwrap(),
@@ -4273,24 +4341,33 @@ mod tests {
                     height: 2,
                 },
             });
-            surface.headless_present(&list, None).expect("present");
-            let rgba = surface.headless_rgba().expect("rgba");
-            if gpu_tests_enabled() {
-                if let Ok(ctx) = block_on(GpuContext::initialize()) {
-                    let via_present =
-                        Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
-                    via_present
-                        .present_draw_list(&ctx, &list, None)
-                        .expect("present_draw_list on headless surface");
-                    assert_eq!(
-                        via_present.headless_rgba().expect("rgba"),
-                        rgba,
-                        "present_draw_list and headless_present must composite BelowText/AboveText identically"
-                    );
-                }
-            }
+            list
+        };
+        let composite = |layer| -> [u8; 4] {
+            let list = layered_list(layer);
+            let clearing = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+            clearing.headless_present(&list, None).expect("present");
+            let via_headless_present = clearing.headless_rgba().expect("cleared rgba");
+            let classified = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+            let stats = classified
+                .present_headless_classified(&list, None, None)
+                .expect("classified present on a headless surface");
+            assert!(
+                stats.headless,
+                "the classified headless arm must report a headless frame"
+            );
+            let via_classified = classified.headless_rgba().expect("classified rgba");
+            assert_eq!(
+                via_classified, via_headless_present,
+                "headless_present and the classified headless arm must composite identically"
+            );
             let idx = (2 * 8 + 2) * 4;
-            [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+            [
+                via_classified[idx],
+                via_classified[idx + 1],
+                via_classified[idx + 2],
+                via_classified[idx + 3],
+            ]
         };
         assert_eq!(
             composite(ImagePaintLayer::BelowText),

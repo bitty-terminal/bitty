@@ -129,6 +129,37 @@ The full detection table, trust model, and rollback rules are in
   repository, source recipe in `packaging/opensuse/bitty.spec`; see
   `packaging/opensuse.md`.
 
+## Session daemon (`bittyd`)
+
+`bittyd` is a separate workspace package (`crates/bitty-daemon`) and a separate
+binary, so every recipe has to say whether it carries it. For a packager the
+contract is:
+
+- **Binary.** Install it to `/usr/bin/bittyd` next to `/usr/bin/bitty`. A recipe
+  that selects only `-p bitty-terminal` silently drops it; the workspace default
+  set does not include the daemon, so name both packages (or both `--bin`
+  targets) in the build and install steps.
+- **Unit.** `packaging/systemd/bittyd.service` goes to
+  `/usr/lib/systemd/user/bittyd.service` (mode `0644`), and only on a systemd
+  user manager. The `.apk`, the Void template, and the Gentoo OpenRC default
+  deliberately skip it.
+- **Operator file.** Nothing to package. The daemon mints
+  `$XDG_RUNTIME_DIR/bitty/bittyd.operator` itself on every start: `0600` in a
+  `0700` directory, refused if either half is a symlink, foreign-owned, or
+  wrongly permissioned. Never pre-create, template, or ship it — a packaged
+  bearer would be a shared secret across every install. Details are in
+  [`packaging/README.md`](README.md#operator-capability-file-bittydoperator).
+- **Activation.** No recipe enables or starts the unit. A user unit is
+  per-user; document `systemctl --user enable --now bittyd` (and optionally
+  `loginctl enable-linger "$USER"`) and leave it to the user. On runit/OpenRC
+  systems the guidance is to supervise `bittyd start`, which stays in the
+  foreground and drains `SIGHUP`.
+
+Which channel ships what — including the deliberate omissions (AppImage,
+Flathub, Homebrew, Scoop, the BSD ports) — is the per-channel table in
+[`packaging/README.md`](README.md#systemd-user-unit-packagingsystemdbittydservice).
+Do not restate it per distro: link to it.
+
 ## Windows channel parity
 
 All three Windows channels create a Start Menu entry, so Windows app search

@@ -68,6 +68,14 @@ StartupWMClass=run.bitty.Bitty
 StartupNotify=true
 ```
 
+## Session daemon (`bittyd`)
+
+**Not shipped.** The AppImage packs one executable:
+`scripts/make-appimage.sh` copies the `--binary` input to `usr/bin/bitty` and
+nothing else, so the image carries no `bittyd`. Install the release `.tar.zst`
+bundle, a distro package, or the Nix companion package when you need the session
+host; the per-channel table in `packaging/README.md` lists which ones carry it.
+
 ## Build and Assembly
 
 AppImage artifacts are assembled during the Linux `build` workflow in

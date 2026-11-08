@@ -128,6 +128,50 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
 - **NetBSD pkgsrc**:
   pkgsrc recipe in `packaging/netbsd/x11/bitty/`. _(See [`packaging/netbsd.md`](packaging/netbsd.md))_
 
+### Session daemon (`bittyd`)
+
+`bitty` is the terminal. `bittyd` is the optional per-user session host that owns
+PTY sessions for it; it is a separate workspace package (`crates/bitty-daemon`),
+so a channel can ship the terminal without it.
+
+Channels that ship `bittyd`:
+
+- the one-line Linux installer (the release `.tar.zst` bundle),
+- AUR `bitty` and `bitty-bin`,
+- the nfpm `.deb`, `.rpm`, `.pkg.tar.zst`, and native musl `.apk`,
+- the openSUSE OBS RPM, Solus, both Gentoo ebuilds, and the Void template,
+- the Nix flake's companion package (`nix build .#bittyd`).
+
+Channels that do not: AppImage, Flathub, Homebrew, Scoop, winget/`setup.exe`, and
+the FreeBSD, NetBSD, and OpenBSD ports (the daemon refuses those cells). The
+per-channel matrix with the reason for each is in
+[`packaging/README.md`](packaging/README.md#systemd-user-unit-packagingsystemdbittydservice).
+
+Where the package ships the unit (`/usr/lib/systemd/user/bittyd.service`), enable
+it per user — it is not a system service, and no package starts it for you:
+
+```sh
+systemctl --user enable --now bittyd
+loginctl enable-linger "$USER"   # optional: keep it running without a login session
+```
+
+Without systemd (Alpine, Void, Gentoo's OpenRC profile, Nix, or a source build)
+run the daemon in the foreground under your own supervisor. `bittyd start` does
+not fork and drains `SIGHUP` without stopping, so `runsv`, `supervisord`, a
+home-manager `systemd.user.services` unit, or a tmux pane all work:
+
+```sh
+bittyd start
+```
+
+The daemon mints an operator capability on every start and writes it to
+`$XDG_RUNTIME_DIR/bitty/bittyd.operator`: a fresh 64-character hex bearer in a
+`0700` directory, as a `0600` file. It refuses a symlinked, foreign-owned, or
+wrongly-permissioned directory or file, and it needs an absolute
+`XDG_RUNTIME_DIR` (there is no `/tmp` fallback), so the start fails instead of
+running without a capability. The file is an intent gate, not a privilege
+boundary: any process running as the same user can read it.
+
 ### Release binary (manual download)
 
 Download a platform package or archive from the R2-backed CDN at

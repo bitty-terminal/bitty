@@ -140,6 +140,27 @@ mkdir -p "$daemon_dir"
 chmod 700 "$daemon_dir"
 BITTYD_ENDPOINT="$daemon_dir/bittyd.sock"
 export BITTYD_ENDPOINT
+# reap_daemon LABEL — bounded wait for the backgrounded daemon. An unbounded
+# `wait` hangs the whole smoke when a daemon ignores the signal, so poll for at
+# most 5s and then fail naming the PID the shell recorded; the PID is never
+# looked up by name (bitty#3010).
+reap_daemon() {
+  _waited=0
+  while kill -0 "$daemon_pid" 2>/dev/null; do
+    # A child the shell has reaped but not collected is already dead.
+    if [ -r "/proc/$daemon_pid/status" ] &&
+      grep -q "^State:[[:space:]]*Z" "/proc/$daemon_pid/status"; then
+      break
+    fi
+    _waited=$((_waited + 1))
+    if [ "$_waited" -gt 50 ]; then
+      echo "$1: bittyd (pid $daemon_pid) still running 5s after kill" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  wait "$daemon_pid"
+}
 bittyd start &
 daemon_pid=$!
 tries=0
@@ -148,7 +169,7 @@ while [ ! -S "$BITTYD_ENDPOINT" ]; do
   if [ "$tries" -gt 100 ]; then
     echo "bittyd did not bind $BITTYD_ENDPOINT" >&2
     kill "$daemon_pid" 2>/dev/null || true
-    wait "$daemon_pid" || true
+    reap_daemon "bittyd did not bind $BITTYD_ENDPOINT" || true
     exit 1
   fi
   sleep 0.1
@@ -161,12 +182,14 @@ while ! bittyd stop; do
   if [ "$tries" -gt 50 ]; then
     echo "bittyd stop did not succeed" >&2
     kill "$daemon_pid" 2>/dev/null || true
-    wait "$daemon_pid" || true
+    reap_daemon "bittyd stop did not succeed" || true
     exit 1
   fi
   sleep 0.1
 done
-wait "$daemon_pid"
+# The daemon exits on a successful stop; bound that wait too, and let the
+# daemon exit status still decide the step.
+reap_daemon "bittyd did not exit after stop"
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty doctor
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty --headless'
 

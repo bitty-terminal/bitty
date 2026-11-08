@@ -33,6 +33,13 @@ comments (and this file) already document.
   entry with `ncurses` `tic -x -o /app/share/terminfo terminfo/bitty.ti`
   (the same pattern PKGBUILD/bitty.spec use).
 
+## Session daemon (`bittyd`)
+
+**daemon: no — deliberate, tracked in #3004.** The manifest installs `bin/bitty`
+only (`run.bitty.Bitty.yaml`, `build-commands`), so the Flatpak ships the
+terminal without the session host. `#3004` owns both the decision and the
+manifest change; do not add the daemon here as a drive-by edit.
+
 ## Submission checklist (owner)
 
 1. Create the Flathub repository `flathub/run.bitty.Bitty` and copy `run.bitty.Bitty.yaml`

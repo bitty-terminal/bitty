@@ -66,6 +66,14 @@ Both the repository package and the manual RPM install the binary, the
 `.desktop` launcher, AppStream metainfo, the hicolor icon set, and the compiled
 terminfo entry (`infocmp -x bitty`). Install one, not both.
 
+## Session daemon (`bittyd`)
+
+`packaging/opensuse/bitty.spec` builds and installs both binaries and ships the
+per-user unit at `/usr/lib/systemd/user/bittyd.service`, so `zypper install bitty`
+gives you `bittyd` as well. The `nfpm` RPM in the release assets carries the same
+two files. Enable the unit per user with `systemctl --user enable --now bittyd`;
+the package never enables or starts it.
+
 ## Build from source
 
 The source recipe used by OBS is `packaging/opensuse/bitty.spec`, with the

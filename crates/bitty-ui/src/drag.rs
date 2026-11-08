@@ -662,12 +662,13 @@ pub fn resize_floating_rect(
             _ => y1 = y0 + min_h as i32,
         }
     }
+    let u16_max = i32::from(u16::MAX);
     let cx0 = i32::from(container.x);
     let cy0 = i32::from(container.y);
     let cx1 = cx0 + i32::from(container.width);
     let cy1 = cy0 + i32::from(container.height);
-    x0 = x0.clamp(cx0, cx1);
-    y0 = y0.clamp(cy0, cy1);
+    x0 = x0.clamp(cx0, cx1).clamp(0, u16_max);
+    y0 = y0.clamp(cy0, cy1).clamp(0, u16_max);
     x1 = x1.clamp(cx0, cx1);
     y1 = y1.clamp(cy0, cy1);
     if x1 < x0 {
@@ -676,7 +677,9 @@ pub fn resize_floating_rect(
     if y1 < y0 {
         y1 = y0;
     }
-    Rect::new(x0 as u16, y0 as u16, (x1 - x0) as u16, (y1 - y0) as u16)
+    let width = (x1 - x0).min(u16_max) as u16;
+    let height = (y1 - y0).min(u16_max) as u16;
+    Rect::new(x0 as u16, y0 as u16, width, height)
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,5 +1662,14 @@ mod tests {
         );
         session.clear_preview();
         assert_eq!(session.preview_target(), None, "leave clears the preview");
+    }
+
+    #[test]
+    fn resize_floating_rect_clamps_origin_when_container_exceeds_u16_max() {
+        let container = Rect::new(60_000, 60_000, 10_000, 10_000);
+        let current = Rect::new(65_500, 65_500, 1_000, 1_000);
+        let resized = resize_floating_rect(current, ResizeEdge::TopLeft, 500, 500, container);
+        assert_eq!(resized.x, u16::MAX);
+        assert_eq!(resized.y, u16::MAX);
     }
 }

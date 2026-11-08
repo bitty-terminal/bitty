@@ -1328,8 +1328,12 @@ impl Runtime {
             self.pinned.restore(pin.view.clone(), pin.anchor, pin.after);
         }
         // Issue #3074: a restore installs a whole new world, so any pre-restore
-        // parked scratchpad leaf and its primary-ownership handoff must be
-        // cleared (the high-water raise above already accounted for its id).
+        // parked scratchpad leaf, its live pane session, and its
+        // primary-ownership handoff must be cleared (the high-water raise above
+        // already accounted for its id).
+        if let Some(parked_id) = self.scratchpad.peek().map(View::id) {
+            self.close_pane_session(&parked_id);
+        }
         self.scratchpad = ScratchpadSlot::new();
         self.scratchpad_primary_owner = None;
         // CTX-0536 (#923): a restored snapshot installs ids directly; raise
@@ -2576,6 +2580,40 @@ mod tests {
         assert_eq!(
             summary.panes, 2,
             "SessionSaveSummary.panes must include detached floats alongside tiled and pinned panes"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn apply_session_snapshot_closes_parked_scratchpad_pane_session_3074() {
+        bitty_test_support::require_pty!();
+        let mut rt = Runtime::with_defaults().expect("defaults build");
+        let first = rt.focused_view().expect("seed focus");
+        let parked_session_view = ViewId::new(99);
+        let active_leaf = rt.layout().find_leaf(first).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(active_leaf),
+            LayoutNode::leaf(View::new(parked_session_view, 40, 24)),
+        ));
+        rt.spawn_shell_for_view(parked_session_view, "/bin/sh", &[], 40, 24)
+            .expect("spawn parked pane session");
+        assert!(rt.pane_sessions.contains_key(&parked_session_view));
+        rt.scratchpad_hide(parked_session_view)
+            .expect("park non-primary pane session in scratchpad");
+        assert!(rt.scratchpad_occupied());
+
+        let snap = two_pane_snapshot(Some(PaneAttachment::Primary));
+        rt.apply_session_snapshot(&snap)
+            .expect("apply snapshot with non-colliding parked pane session");
+        assert!(
+            !rt.scratchpad_occupied(),
+            "apply_session_snapshot must clear the parked scratchpad slot"
+        );
+        assert!(
+            !rt.pane_sessions.contains_key(&parked_session_view),
+            "apply_session_snapshot must tear down the parked scratchpad view's pane_session"
         );
     }
 }

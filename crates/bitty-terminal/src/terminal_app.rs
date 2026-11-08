@@ -2558,10 +2558,13 @@ impl TerminalApp {
         // source, so handlers running on this tick validate against the
         // state this tick applied.
         if let Some(pin_state) = self.live_pin_state.as_ref() {
-            pin_state.publish(
-                &self.runtime.layout().leaf_ids(),
-                &self.runtime.pinned_views(),
-            );
+            let mut live_leaves = self.runtime.layout().leaf_ids();
+            for id in self.runtime.floated_views() {
+                if !live_leaves.contains(&id) {
+                    live_leaves.push(id);
+                }
+            }
+            pin_state.publish(&live_leaves, &self.runtime.pinned_views());
         }
         // One bounded snapshot pass serves the whole state diff (issue
         // #1828): terminals, per-terminal cwds, the observed-`BEL` counter,
@@ -4081,7 +4084,10 @@ impl TerminalApp {
         let requests = plugin_runtime.drain_fx_pulses();
         for queued in requests {
             let id = ViewId::new(queued.view);
-            if !self.runtime.layout().leaf_ids().contains(&id) {
+            let is_live_view = self.runtime.layout().leaf_ids().contains(&id)
+                || self.runtime.floated_views().contains(&id)
+                || self.runtime.pinned_views().contains(&id);
+            if !is_live_view {
                 crate::logging::warn(|| {
                     format!(
                         "bitty: plugin fx request dropped (unknown view id {})",
@@ -6277,6 +6283,67 @@ bitty.commands.register({
                 "trace must record {kind}; drained: {drained}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detached_float_and_pinned_views_publish_to_pin_state_and_accept_fx_pulse() {
+        use bitty_runtime::runtime::fx::QueuedFxPulse;
+        use bitty_runtime::{LayoutNode, SplitAxis, View};
+
+        let (mut app, _, root) = tracer_app();
+        let pin_state = std::rc::Rc::new(crate::plugin_runtime::LivePinState::default());
+        app = app.with_live_pin_state(Some(std::rc::Rc::clone(&pin_state)));
+
+        let tree = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            ),
+        );
+        app.runtime.set_layout(tree);
+        app.runtime
+            .float_detach(ViewId::new(1))
+            .expect("detach view 1 must succeed");
+        app.runtime
+            .float_detach(ViewId::new(2))
+            .expect("detach view 2 must succeed");
+        app.runtime
+            .pin_floating(ViewId::new(2))
+            .expect("pinning detached float view 2 must succeed");
+
+        let _ = app.drive_tick();
+        assert!(
+            pin_state.is_live_leaf(ViewId::new(1)),
+            "detached floating panel must remain published as a live leaf in pin_state"
+        );
+        assert!(
+            pin_state.is_pinned(ViewId::new(2)),
+            "pinned panel must be published in pin_state"
+        );
+
+        {
+            let pr = app.plugin_runtime.as_ref().expect("plugin runtime");
+            let mut q = pr.fx_queue().borrow_mut();
+            assert!(q.push(QueuedFxPulse { view: 1 }));
+            assert!(q.push(QueuedFxPulse { view: 2 }));
+        }
+        app.apply_plugin_fx_requests();
+        let now = std::time::Instant::now();
+        assert!(
+            app.runtime.fx_progress(ViewId::new(1), now).is_some(),
+            "apply_plugin_fx_requests must arm fx pulse on detached floating view"
+        );
+        assert!(
+            app.runtime.fx_progress(ViewId::new(2), now).is_some(),
+            "apply_plugin_fx_requests must arm fx pulse on pinned view"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

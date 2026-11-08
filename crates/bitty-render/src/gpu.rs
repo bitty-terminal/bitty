@@ -1759,10 +1759,12 @@ impl Surface {
         atlas: Option<(&[u8], AtlasDims)>,
         color_atlas: Option<(&[u8], AtlasDims)>,
     ) -> Result<PresentStats, PresentFailure> {
-        // A headless surface needs no `GpuContext`, and this is the product's
-        // default present path (bitty#3055). Keep the whole arm — validation
-        // included — in an adapter-free function so unit tests can exercise it
-        // on a CI runner with no GPU.
+        // A headless surface needs no `GpuContext`, so keep the whole arm —
+        // validation included — in an adapter-free function (bitty#3055). The
+        // runtime's own headless present goes through `headless_present_color`
+        // (`Runtime` keeps `gpu: None`); this classified arm is the surface-level
+        // seam that duplicated the CPU composer, and it is kept testable on a CI
+        // runner with no GPU so the two cannot drift apart again.
         if self.is_headless() {
             return self.present_headless_classified(draw_list, atlas, color_atlas);
         }
@@ -1972,10 +1974,12 @@ impl Surface {
     /// point without requiring a [`GpuContext`].
     ///
     /// This is the same validation and composition as the headless arm of
-    /// [`Self::present_draw_list_color_classified`] — which is the product's
-    /// default present path, since [`Runtime`](crate::Runtime) keeps
-    /// `gpu: None` — factored out so a unit test can drive it on a CI runner
-    /// with no adapter. Real surfaces return
+    /// [`Self::present_draw_list_color_classified`], which duplicated the CPU
+    /// composer and drifted from it before bitty#3055. That arm never used its
+    /// `GpuContext`, so factoring it out here keeps the dedup regression-tested
+    /// on a CI runner with no adapter. The runtime's default headless present
+    /// is [`Self::headless_present_color`] (`Runtime` keeps `gpu: None`), not
+    /// this entry point. Real surfaces return
     /// [`RenderError::SurfaceConfigure`].
     ///
     /// # Errors
@@ -4318,10 +4322,10 @@ mod tests {
     fn headless_present_honors_below_text_image_layer() {
         // Issue #2875: the CPU present path splits kitty blits by paint
         // layer around the glyph pass, exactly like `software::draw_list_onto`.
-        // bitty#3055: the classified entry point's headless arm is the
-        // product's default present path (`Runtime` keeps `gpu: None`), and it
-        // needs no adapter, so the comparison runs unconditionally instead of
-        // behind `BITTY_RENDER_GPU_TESTS`.
+        // bitty#3055: the classified entry point's headless arm duplicated the
+        // CPU composer and drifted from it (it painted images after the glyph
+        // passes). It needs no adapter, so the comparison runs unconditionally
+        // instead of behind `BITTY_RENDER_GPU_TESTS`.
         use crate::geometry::RectPx;
         use crate::grid::{GlyphInstance, GlyphSource, ImageBlit, ImagePaintLayer};
         let layered_list = |layer| {

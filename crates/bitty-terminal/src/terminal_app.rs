@@ -297,6 +297,27 @@ fn log_window_focus(focused: bool) {
     });
 }
 
+/// Whether a delivered window event proves the surface is mapped and focused
+/// (bitty#3023).
+///
+/// A compositor delivers key, pointer-button, pointer-motion, and scroll
+/// events only to a surface it has mapped and given the relevant focus; a
+/// suspended xdg surface receives none of them. Focus gain is the same proof
+/// by definition. Deliberately excluded: `ModifiersChanged` (a compositor can
+/// update the modifier snapshot while the window is unfocused), IME
+/// enable/disable bookkeeping, and every non-input event - timer wakes,
+/// PTY/IPC wakes, and lifecycle edges must never open the gate.
+fn is_input_visibility_proof(kind: &WindowEventKind) -> bool {
+    matches!(
+        kind,
+        WindowEventKind::KeyboardInput(_)
+            | WindowEventKind::MouseInput(_)
+            | WindowEventKind::MouseWheel(_)
+            | WindowEventKind::CursorMoved(_)
+            | WindowEventKind::Focused(true)
+    )
+}
+
 /// Stderr class for one exit-save outcome (issue #2415).
 ///
 /// The close-to-empty skip is an expected close path, so it reports at
@@ -1434,6 +1455,30 @@ impl TerminalApp {
         self.hidden_repair_probe_at = None;
         self.runtime.set_surface_visibility(visible);
         log_surface_gate(visible, reason);
+    }
+
+    /// Reopens the occlusion gate on input-delivery proof (bitty#3023).
+    ///
+    /// A compositor delivers key, pointer, and scroll events only to a mapped,
+    /// focused surface, so routed input is a reveal edge that does not depend
+    /// on the redraw-starvation probe or on a native `Occluded(false)` -
+    /// exactly the edge a Hyprland workspace return omits. The runtime's
+    /// reveal transition queues one from-truth frame, so the next loop turn
+    /// repaints the stale screen instead of only applying this event's delta.
+    fn reveal_surface_from_input(&mut self) {
+        if self.runtime.is_surface_visible() {
+            return;
+        }
+        self.set_surface_gate(true, "input");
+    }
+
+    /// Whether a hidden-surface repair probe is still outstanding.
+    ///
+    /// bitty#3023 regression seam: an input-driven reveal must end the probe
+    /// armed for the hidden incarnation, like every other real edge.
+    #[cfg(all(test, feature = "input-vm-test-support"))]
+    pub(crate) fn hidden_repair_probe_pending(&self) -> bool {
+        self.hidden_repair_probe_at.is_some()
     }
 
     /// Runs one bounded hidden-surface repair probe (bitty#2830 hypothesis 2).
@@ -4912,6 +4957,19 @@ impl TerminalApp {
                 _ => {}
             },
             _ => {}
+        }
+        // bitty#3023: a delivered input event is proof the compositor has the
+        // surface mapped and focused, and on a Hyprland workspace return it is
+        // the *only* proof (no `Suspended`/`Occluded(false)`/focus edge, and
+        // no frame callback while the gate is closed). Reopen before the
+        // intercept or the runtime consumes the event, so the from-truth frame
+        // it produces is presented instead of retained. A wake (timer, PTY,
+        // IPC) is deliberately not in this set: only input the compositor
+        // could not deliver to a suspended surface may open the gate.
+        if let PlatformEvent::Window { kind, .. } = &event {
+            if is_input_visibility_proof(kind) {
+                self.reveal_surface_from_input();
+            }
         }
         // Bounded PTY pump: drain before handling the event so fresh bytes are
         // visible to the state machine before the tick.

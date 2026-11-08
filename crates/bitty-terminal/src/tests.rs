@@ -1180,6 +1180,82 @@ return {}
         );
     }
 
+    /// bitty#3032: input delivered while a speculative reopen holds the gate
+    /// open is proof the surface is mapped, so it queues a from-truth frame
+    /// even though the gate is already open.
+    ///
+    /// The alt-screen report is the motivating shape: the alt-entry frame is
+    /// correctly blank, the app's first alt content frame is committed but
+    /// never sampled, and the gate is open (speculatively, or because the
+    /// confirmation callback was served for an older frame). Input is the
+    /// only remaining proof, and it must not be dropped just because
+    /// `surface_visible` already reads true.
+    #[test]
+    fn input_proof_during_a_speculative_reopen_queues_a_from_truth_frame() {
+        let t0 = std::time::Instant::now();
+        let mut fixture = Fixture::new("input-proof-reopen");
+        // The fixture may have presented its startup frame already; one extra
+        // tick drains any remaining damage so the runtime is idle below.
+        let _ = fixture.app.drive_tick();
+        assert!(fixture.app.drive_tick().is_none(), "the runtime is idle");
+        assert!(fixture.app.runtime.is_surface_visible());
+
+        // A hide that retained nothing keeps the confirmation bound armed;
+        // its expiry while hidden reopens the gate speculatively and presents
+        // one blind repair. The gate is open, but nothing has proven the
+        // surface visible.
+        fixture.app.runtime.set_surface_visibility_at(t0, false);
+        fixture.app.runtime.arm_present_confirmation_for_test(t0);
+        assert!(
+            fixture
+                .app
+                .runtime
+                .tick_at(t0 + std::time::Duration::from_millis(800))
+                .is_some(),
+            "the blind repair presents"
+        );
+        assert!(fixture.app.runtime.is_surface_visible());
+        assert!(
+            fixture.app.runtime.surface_reveal_unproven(),
+            "a headless repair cannot prove the surface visible"
+        );
+        assert!(
+            !fixture.app.runtime.present_owed(),
+            "the repair consumed the frame"
+        );
+
+        fixture.app.reveal_surface_from_input();
+        assert!(
+            fixture.app.runtime.present_owed(),
+            "input proof must queue a from-truth frame with the gate open"
+        );
+        assert!(
+            fixture.app.drive_tick().is_some(),
+            "the from-truth frame presents"
+        );
+        assert!(
+            !fixture.app.runtime.surface_reveal_unproven(),
+            "the input reveal settled the speculative reopen"
+        );
+
+        // Once settled, normal input inside a fresh confirmation window must
+        // neither queue a redundant full redraw nor drop the confirmation
+        // timer before the compositor serves the frame callback.
+        fixture
+            .app
+            .runtime
+            .arm_present_confirmation_for_test(std::time::Instant::now());
+        fixture.app.reveal_surface_from_input();
+        assert!(
+            !fixture.app.runtime.present_owed(),
+            "settled input inside a live confirmation window must stay frame-on-demand"
+        );
+        assert!(
+            fixture.app.runtime.present_confirm_deadline().is_some(),
+            "settled input must not cancel an active compositor confirmation timer"
+        );
+    }
+
     /// One `AboutToWait` turn on the real handler, returning the recorded
     /// loop-control operations (bitty#2830 wiring tests).
     fn about_to_wait_operations(fixture: &mut Fixture) -> Vec<RecordingOperation> {

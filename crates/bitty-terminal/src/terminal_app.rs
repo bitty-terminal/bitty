@@ -1475,8 +1475,17 @@ impl TerminalApp {
     /// exactly the edge a Hyprland workspace return omits. The runtime's
     /// reveal transition queues one from-truth frame, so the next loop turn
     /// repaints the stale screen instead of only applying this event's delta.
-    fn reveal_surface_from_input(&mut self) {
-        if self.runtime.is_surface_visible() {
+    ///
+    /// An already-open gate is not proof the screen is current: the #2989
+    /// confirmation repair reopens it speculatively while the surface is still
+    /// occluded, and a committed frame the compositor never confirmed leaves
+    /// the gate open with stale pixels. Input delivery is the stronger proof,
+    /// so it queues the same from-truth frame a transition does instead of
+    /// waiting for the confirmation bound (bitty#3032). A settled surface owes
+    /// nothing and stays frame-on-demand.
+    pub(crate) fn reveal_surface_from_input(&mut self) {
+        // A settled, visible surface owes nothing: keep frame-on-demand.
+        if self.runtime.is_surface_visible() && !self.runtime.surface_reveal_unproven() {
             return;
         }
         self.set_surface_gate(true, "input");

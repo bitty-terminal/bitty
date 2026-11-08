@@ -3035,7 +3035,9 @@ impl Runtime {
             let bound = presenter.shutdown_bound();
             let _ = presenter.shutdown_bounded(bound);
         }
-        self.pending_present = None;
+        if self.pending_present.take().is_some() {
+            self.pending_full_redraw = true;
+        }
         self.presenter_retry_at = None;
         self.abandoned_workers_alive = 0;
         self.abandoned_check_at = None;

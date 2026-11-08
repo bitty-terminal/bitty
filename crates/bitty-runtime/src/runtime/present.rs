@@ -664,6 +664,13 @@ pub(super) struct PresentedLeaf {
     /// live-adopt must never reuse a stale factor (DEC-0113 Fix 2a,
     /// bounded to the visible leaf set).
     pub(super) fade_factor: f32,
+    /// Monochrome glyph-atlas epoch the stored glyph UVs were normalized
+    /// against (bitty#3032). Both `Atlas::try_grow` and wholesale eviction
+    /// advance the epoch; a mismatch forces a fresh leaf render.
+    pub(super) atlas_epoch: u64,
+    /// Color glyph-atlas epoch the stored color-glyph UVs were normalized
+    /// against (bitty#3032).
+    pub(super) color_atlas_epoch: u64,
     /// Complete translated cell fills.
     pub(super) fills: Vec<bitty_render::grid::FillRect>,
     /// Complete translated glyph instances (inner-arc clip attached).
@@ -760,6 +767,9 @@ struct CombinedLeaves {
     /// leaf must plan against the same epoch or the slots already collected
     /// address dead texels.
     atlas_epoch: Option<u64>,
+    /// Color-atlas epoch the color glyph slots collected so far were placed at
+    /// (bitty#3032).
+    color_atlas_epoch: Option<u64>,
 }
 
 /// Loop-invariant inputs for the per-leaf decoration ring (CTX-0386).
@@ -1280,6 +1290,21 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
     }
 }
 
+/// True when `snapshot` carries at least one cell that must emit a visible
+/// glyph (non-whitespace, non-control, non-spacer, non-concealed, and not a
+/// Kitty Unicode image placeholder). Used by the retained-leaf and
+/// scroll-shift guards so a pane whose grid holds text can never reuse or
+/// shift into a glyph-less draw list (bitty#3032).
+fn snapshot_has_visible_text(snapshot: &Snapshot) -> bool {
+    snapshot.cells.iter().any(|cell| {
+        !cell.glyph.is_whitespace()
+            && !cell.glyph.is_control()
+            && !cell.spacer
+            && !cell.style.attributes.invisible
+            && !bitty_term_state::is_kitty_placeholder(cell.glyph)
+    })
+}
+
 /// CTX-0979: Core draws no workspace display (Hyprland-style). The former
 /// workspace bar band snapshot helpers (`band_snapshot`,
 /// `overlay_status_bar`) are deleted; plugin bands paint through
@@ -1761,6 +1786,12 @@ impl Runtime {
             return None;
         }
         let retained = self.presented_leaf_frames.get(&view_id)?;
+        if retained.atlas_epoch != self.renderer.atlas_epoch()
+            || retained.color_atlas_epoch != self.renderer.color_atlas_epoch()
+            || retained.fills.is_empty()
+        {
+            return None;
+        }
         if retained.origin != (frame.content.x, frame.content.y) {
             return None;
         }
@@ -2662,7 +2693,26 @@ impl Runtime {
         self.coalesced_deadline = Some(now);
         self.pending_full_redraw = true;
         self.hidden_repair_at = None;
+        self.speculative_present_reopen = false;
         self.clear_present_confirmation();
+    }
+
+    /// Whether the open surface gate was reopened speculatively or holds an
+    /// overdue compositor confirmation.
+    ///
+    /// The confirmation repair reopens a hidden surface on the same
+    /// unanswered-redraw evidence a dropped frame leaves behind. Until a
+    /// commit, confirmation, or real visibility edge settles it, the gate
+    /// being open is not proof the screen is current, so an input proof must
+    /// still queue a from-truth frame (bitty#3032). A confirmation bound that
+    /// is still inside its window stays pending so normal input between commit
+    /// and vblank does not force a full redraw or drop the confirmation timer.
+    #[must_use]
+    pub fn surface_reveal_unproven(&self) -> bool {
+        self.speculative_present_reopen
+            || self
+                .present_confirm_at
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
@@ -3559,12 +3609,13 @@ impl Runtime {
             self.stale_atlas_frame_rejects = 0;
             return false;
         }
+        self.presented_leaf_frames.clear();
+        self.presented_scene_frames.clear();
         if self.stale_atlas_frame_rejects >= ATLAS_REBUILD_LIMIT {
             self.stale_atlas_frame_rejects = 0;
             return false;
         }
         self.stale_atlas_frame_rejects = self.stale_atlas_frame_rejects.saturating_add(1);
-        self.presented_leaf_frames.clear();
         self.pending_full_redraw = true;
         true
     }
@@ -3889,6 +3940,16 @@ impl Runtime {
         // still committed while retained per-leaf reuse stays in effect.
         // Everything else re-renders per origin from its own damage ring, so a
         // split no longer repaints every pane just because sessions exist.
+        // Persist full/paint invalidation before `defer_coalesced_present`
+        // can drop `basis`: latch updates (`kitty_alt_screens_latched`,
+        // `advance_animations`) already ran above, so a deferred tick must
+        // carry the resulting redraw request to the next tick (bitty#3032).
+        if pending_full {
+            self.pending_full_redraw = true;
+        }
+        if paint_only {
+            self.pending_paint_redraw = true;
+        }
         let full_frame = pending_full || last == u64::MAX;
 
         // For single-window slice we need per-view scrollback viewport and cursor.
@@ -3997,6 +4058,54 @@ impl Runtime {
             pane_generations,
         })
     }
+
+    /// True when `view_id`'s current viewport holds at least one visible glyph
+    /// cell in Terminal Truth (bitty#3032).
+    fn view_viewport_has_visible_text(
+        &self,
+        view_id: ViewId,
+        frame: &layout_focus::PresentFrame,
+        view: Option<&View>,
+        primary_snapshot: &Snapshot,
+    ) -> bool {
+        let base_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
+            Some(sess) => Some(sess.state.snapshot()),
+            None if Some(view_id) == self.primary_view => Some(primary_snapshot.clone()),
+            None => None,
+        };
+        let Some(base_snap) = base_snap else {
+            return false;
+        };
+        let view_snapshot = match view {
+            Some(v) => {
+                let on_alt = match self.pane_sessions.get(&view_id) {
+                    Some(sess) => sess.state.alt_screen_active(),
+                    None => self.state.alt_screen_active(),
+                };
+                if v.scroll_offset() != 0 && !on_alt {
+                    let cells = match self.pane_sessions.get(&view_id) {
+                        Some(sess) => v.visible_cells(&sess.state),
+                        None => v.visible_cells(&self.state),
+                    };
+                    Snapshot {
+                        version: base_snap.version,
+                        generation: base_snap.generation,
+                        width: v.cols() as usize,
+                        height: v.rows() as usize,
+                        cells,
+                        cursor: base_snap.cursor,
+                        modes: base_snap.modes,
+                        title: base_snap.title,
+                    }
+                } else {
+                    viewport_snapshot(&base_snap, frame.cols, frame.rows)
+                }
+            }
+            None => viewport_snapshot(&base_snap, frame.cols, frame.rows),
+        };
+        snapshot_has_visible_text(&view_snapshot)
+    }
+
     /// Composes one leaf's attached scene into the combined frame (CTX-1630).
     ///
     /// The leaf must be a panel with an attached `Scene` in the installed
@@ -4052,6 +4161,14 @@ impl Runtime {
             }
         } else {
             built.atlas_epoch = Some(epoch);
+        }
+        let color_epoch = self.renderer.color_atlas_epoch();
+        if let Some(planned_color) = built.color_atlas_epoch {
+            if planned_color != color_epoch {
+                return true;
+            }
+        } else {
+            built.color_atlas_epoch = Some(color_epoch);
         }
         built.fills.extend(scene.fills);
         built.rounded.extend(scene.rounded);
@@ -4128,6 +4245,10 @@ impl Runtime {
             // evidence is one tree).
             let mut scene_a11y = bitty_ui::a11y_host::UiSnapshotHost::new("scene", "scene");
             let evictions_before = self.renderer.atlas_stats().2;
+            let epochs_before = (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            );
             // Issue #1409 (CTX-0797): set when a leaf planned against a newer
             // atlas epoch than the slots already collected in this attempt.
             let mut stale_epoch = false;
@@ -4172,8 +4293,9 @@ impl Runtime {
                     ),
                     None => (snapshot.generation, snapshot.generation, Vec::new()),
                 };
-                let damage_evicted = origin_gen.saturating_sub(origin_last)
-                    > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
+                let damage_evicted = origin_last > origin_gen
+                    || origin_gen.saturating_sub(origin_last)
+                        > bitty_term_state::damage::DAMAGE_HISTORY_BATCHES as u64;
                 let leaf_damaged = !leaf_damage.is_empty() || damage_evicted;
                 // CTX-1162 S3 (DEC-0113 Fix 2a): the leaf fade factor gates
                 // retained reuse. The stored fills/glyphs carry baked alpha,
@@ -4203,12 +4325,22 @@ impl Runtime {
                 // primitives, so shifting the retained list by the origin
                 // delta is bit-identical to a fresh pass. A size change
                 // (real resize or reflow) still forces a fresh render.
+                let live_atlas_epoch = self.renderer.atlas_epoch();
+                let live_color_atlas_epoch = self.renderer.color_atlas_epoch();
                 let reuse_delta = if full_frame || leaf_damaged {
                     None
                 } else {
                     self.presented_leaf_frames.get(&view_id).and_then(|leaf| {
-                        if leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
+                        if leaf.atlas_epoch != live_atlas_epoch
+                            || leaf.color_atlas_epoch != live_color_atlas_epoch
+                            || leaf.fills.is_empty()
+                            || leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
                             || leaf.fade_factor != fade
+                        {
+                            return None;
+                        }
+                        if leaf.glyphs.is_empty()
+                            && self.view_viewport_has_visible_text(view_id, frame, view, snapshot)
                         {
                             return None;
                         }
@@ -4410,6 +4542,17 @@ impl Runtime {
                         .presented_leaf_frames
                         .get(&view_id)
                         .expect("reuse requires a retained leaf");
+                    let frame_epoch = *built.atlas_epoch.get_or_insert(leaf.atlas_epoch);
+                    let frame_color_epoch = *built
+                        .color_atlas_epoch
+                        .get_or_insert(leaf.color_atlas_epoch);
+                    if (leaf.atlas_epoch != frame_epoch
+                        || leaf.color_atlas_epoch != frame_color_epoch)
+                        && attempt < ATLAS_REBUILD_LIMIT
+                    {
+                        stale_epoch = true;
+                        break;
+                    }
                     built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
                     if dx == 0 && dy == 0 {
                         built.fills.extend(leaf.fills.iter().cloned());
@@ -4632,24 +4775,52 @@ impl Runtime {
                         .into_boxed_slice(),
                     },
                 };
-                let epoch_before = self.renderer.atlas_epoch();
+                let epoch_before = (
+                    self.renderer.atlas_epoch(),
+                    self.renderer.color_atlas_epoch(),
+                );
+                let has_visible_text = snapshot_has_visible_text(&view_snapshot);
                 // CTX-1607: one entry point for every text stack. The
                 // shaped default applies `font.disable_ligatures` and
                 // `font.features`; a non-shaping rasterizer (crossfont
                 // fallback / headless) is served by the per-cell path
-                // inside the same call.
-                let mut list = match self.renderer.render_shaped_with_bidi(
-                    &view_snapshot,
-                    &damage,
-                    self.config.disable_ligatures,
-                    &self.config.font_features,
-                    view_wraps.as_deref(),
-                    view_bidi,
-                ) {
+                // inside the same call. Degrade to the unshaped per-cell
+                // path rather than dropping the leaf if shaping fails.
+                let mut list = match self
+                    .renderer
+                    .render_shaped_with_bidi(
+                        &view_snapshot,
+                        &damage,
+                        self.config.disable_ligatures,
+                        &self.config.font_features,
+                        view_wraps.as_deref(),
+                        view_bidi,
+                    )
+                    .or_else(|_| {
+                        self.renderer.render_with_bidi(
+                            &view_snapshot,
+                            &damage,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                    }) {
                     Ok(list) => list,
-                    Err(_) => continue,
+                    Err(_) => {
+                        self.pending_full_redraw = true;
+                        continue;
+                    }
                 };
-                if shift.is_some() && self.renderer.atlas_epoch() != epoch_before {
+                if shift.is_some()
+                    && ((
+                        self.renderer.atlas_epoch(),
+                        self.renderer.color_atlas_epoch(),
+                    ) != epoch_before
+                        || (list.fills.is_empty()
+                            && shift.as_ref().is_some_and(|s| s.fills.is_empty()))
+                        || (has_visible_text
+                            && list.glyphs.is_empty()
+                            && shift.as_ref().is_some_and(|s| s.glyphs.is_empty())))
+                {
                     // Atlas growth (or reset) mid-render leaves the shifted
                     // UVs stale while the fresh list is already healed; a
                     // full re-render heals the leaf the same way. Rare and
@@ -4663,17 +4834,42 @@ impl Runtime {
                         ))]
                         .into_boxed_slice(),
                     };
-                    list = match self.renderer.render_shaped_with_bidi(
+                    list = match self
+                        .renderer
+                        .render_shaped_with_bidi(
+                            &view_snapshot,
+                            &damage,
+                            self.config.disable_ligatures,
+                            &self.config.font_features,
+                            view_wraps.as_deref(),
+                            view_bidi,
+                        )
+                        .or_else(|_| {
+                            self.renderer.render_with_bidi(
+                                &view_snapshot,
+                                &damage,
+                                view_wraps.as_deref(),
+                                view_bidi,
+                            )
+                        }) {
+                        Ok(list) => list,
+                        Err(_) => {
+                            self.pending_full_redraw = true;
+                            continue;
+                        }
+                    };
+                }
+                if shift.is_none() && has_visible_text && list.glyphs.is_empty() {
+                    if let Ok(fallback) = self.renderer.render_with_bidi(
                         &view_snapshot,
                         &damage,
-                        self.config.disable_ligatures,
-                        &self.config.font_features,
                         view_wraps.as_deref(),
                         view_bidi,
                     ) {
-                        Ok(list) => list,
-                        Err(_) => continue,
-                    };
+                        if !fallback.glyphs.is_empty() {
+                            list = fallback;
+                        }
+                    }
                 }
                 // Issue #1409 (CTX-0797): the first leaf of this attempt fixes
                 // the atlas epoch every glyph slot in the frame must resolve
@@ -4687,7 +4883,12 @@ impl Runtime {
                 // epoch must still present something (liveness over a
                 // perfectly consistent frame that never arrives).
                 let frame_epoch = *built.atlas_epoch.get_or_insert(list.atlas_epoch);
-                if !list.is_atlas_epoch_valid(frame_epoch) && attempt < ATLAS_REBUILD_LIMIT {
+                let live_color_epoch = self.renderer.color_atlas_epoch();
+                let frame_color_epoch = *built.color_atlas_epoch.get_or_insert(live_color_epoch);
+                if (!list.is_atlas_epoch_valid(frame_epoch)
+                    || live_color_epoch != frame_color_epoch)
+                    && attempt < ATLAS_REBUILD_LIMIT
+                {
                     stale_epoch = true;
                     break;
                 }
@@ -4781,17 +4982,24 @@ impl Runtime {
                 // CTX-1165 (#1993): the retained store keeps the full leaf so
                 // a moved upper float never strands a filtered reuse. Only the
                 // combined frame drops glyphs under higher floats.
-                self.presented_leaf_frames.insert(
-                    view_id,
-                    PresentedLeaf {
-                        origin: (frame.content.x, frame.content.y),
-                        content_size: (frame.content.width, frame.content.height),
-                        scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
-                        fade_factor: fade,
-                        fills: fills.clone(),
-                        glyphs: glyphs.clone(),
-                    },
-                );
+                if fills.is_empty() || (has_visible_text && glyphs.is_empty()) {
+                    self.presented_leaf_frames.remove(&view_id);
+                    self.pending_full_redraw = true;
+                } else {
+                    self.presented_leaf_frames.insert(
+                        view_id,
+                        PresentedLeaf {
+                            origin: (frame.content.x, frame.content.y),
+                            content_size: (frame.content.width, frame.content.height),
+                            scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
+                            fade_factor: fade,
+                            atlas_epoch: list.atlas_epoch,
+                            color_atlas_epoch: live_color_epoch,
+                            fills: fills.clone(),
+                            glyphs: glyphs.clone(),
+                        },
+                    );
+                }
                 built.fills.extend(fills);
                 if higher_floats.is_empty() {
                     built.glyphs.extend(glyphs);
@@ -4966,11 +5174,18 @@ impl Runtime {
                 full_frame = true;
                 continue;
             }
-            if self.renderer.atlas_stats().2 == evictions_before || attempt >= ATLAS_REBUILD_LIMIT {
+            let epochs_after = (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            );
+            if (self.renderer.atlas_stats().2 == evictions_before && epochs_after == epochs_before)
+                || attempt >= ATLAS_REBUILD_LIMIT
+            {
                 break built;
             }
-            // Atlas exhaustion reset: every retained slot is dead, so drop the
-            // stores and rebuild every leaf against the fresh atlas.
+            // Atlas growth or exhaustion reset: every retained slot from the
+            // older epoch is dead, so drop the stores and rebuild every leaf
+            // against the fresh atlas.
             self.presented_leaf_frames.clear();
             self.presented_scene_frames.clear();
             full_frame = true;
@@ -7976,6 +8191,10 @@ impl Runtime {
         // rebuild. This frame stays best-effort, the same class the
         // full-render path already had.
         let evictions_before_probe = self.renderer.atlas_stats().2;
+        let epochs_before_probe = (
+            self.renderer.atlas_epoch(),
+            self.renderer.color_atlas_epoch(),
+        );
         let combined_list = {
             // We need a FramePlan; construct via a dummy damage descriptor that
             // indicates full. Simplest: reuse empty plan but set dirty_rects
@@ -8104,9 +8323,16 @@ impl Runtime {
             tmp_list
         };
 
-        // Drop retained lists if the plan probe reset the atlas above.
-        if self.renderer.atlas_stats().2 != evictions_before_probe {
+        // Drop retained lists if the plan probe grew or reset the atlas above.
+        if self.renderer.atlas_stats().2 != evictions_before_probe
+            || (
+                self.renderer.atlas_epoch(),
+                self.renderer.color_atlas_epoch(),
+            ) != epochs_before_probe
+        {
             self.presented_leaf_frames.clear();
+            self.presented_scene_frames.clear();
+            self.pending_full_redraw = true;
         }
 
         if !combined_list.needs_draw() {
@@ -8269,7 +8495,10 @@ impl Runtime {
                         self.clear_surface_retry();
                         stats
                     }
-                    Err(_) => return None,
+                    Err(_) => {
+                        self.pending_full_redraw = true;
+                        return None;
+                    }
                 }
             }
         } else {
@@ -8282,7 +8511,10 @@ impl Runtime {
                     self.clear_surface_retry();
                     stats
                 }
-                Err(_) => return None,
+                Err(_) => {
+                    self.pending_full_redraw = true;
+                    return None;
+                }
             }
         };
         self.mark_frame_presented(snapshot.generation);

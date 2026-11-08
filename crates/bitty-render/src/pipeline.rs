@@ -84,6 +84,7 @@ use crate::batch::{
     MAX_FILL_QUADS_PER_BATCH, MAX_GLYPH_QUADS_PER_BATCH, VERTICES_PER_QUAD,
 };
 use crate::error::RenderError;
+use crate::gpu::validate_draw_list_atlas_sources;
 use crate::grid::DrawList;
 
 /// Solid-fill WGSL: NDC position, straight color, and rounded-box SDF data.
@@ -904,6 +905,27 @@ fn color_glyph_blits(
     (blits, skipped)
 }
 
+/// Returns the shared quad-index count a frame needs uploaded before drawing
+/// (bitty#3055).
+///
+/// Image, background, and color-glyph layers all draw through
+/// [`submit_image_batch_parts`], which binds `index_buf` for up to
+/// [`batch::MAX_IMAGE_QUADS_PER_BATCH`] quads, so any non-empty image/color
+/// pass requires the index buffer even when every fill and coverage-glyph
+/// chunk is empty.
+fn frame_required_index_quads(
+    max_chunk_quads: usize,
+    has_images: bool,
+    has_backgrounds: bool,
+    has_color_blits: bool,
+) -> usize {
+    max_chunk_quads.max(if has_images || has_backgrounds || has_color_blits {
+        batch::MAX_IMAGE_QUADS_PER_BATCH
+    } else {
+        0
+    })
+}
+
 impl GpuResources {
     /// Creates all GPU objects for `format` + `atlas_dims`.
     pub(crate) fn create(
@@ -1524,16 +1546,10 @@ impl GpuResources {
         // atlas slot is copied into one blit per instance and painted at the
         // glyph position of the pass order, so no second glyph shader or
         // texture format exists. A color instance without a color atlas is a
-        // wiring bug, refused before any GPU work.
-        let needs_color = draw_list
-            .glyphs
-            .iter()
-            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
-        if needs_color && color_atlas.is_none() {
-            return Err(RenderError::InvalidInput {
-                reason: "color atlas instance requires color atlas texels",
-            });
-        }
+        // wiring bug, refused before any GPU work (bitty#3055: the payload
+        // length is validated by the same shared contract as the present paths,
+        // `validate_draw_list_atlas_sources`).
+        validate_draw_list_atlas_sources(draw_list, atlas, color_atlas)?;
         let (color_blits, color_glyphs_skipped) = color_atlas
             .map(|(texels, dims)| color_glyph_blits(draw_list, texels, dims))
             .unwrap_or_default();
@@ -1574,9 +1590,10 @@ impl GpuResources {
         let inline_chunks = batch::chunk_inline_glyphs(&inline_plan, surface_w, surface_h, scale);
 
         // Index buffer covers the largest single chunk this frame. Image
-        // batches hold up to MAX_IMAGE_QUADS_PER_BATCH quads in one submit,
-        // so an image-only frame still needs the shared indices uploaded.
-        let max_quads = fill_chunks
+        // batches (including color-glyph blits, bitty#3055) hold up to
+        // MAX_IMAGE_QUADS_PER_BATCH quads in one submit, so an image-only or
+        // color-glyph-only frame still needs the shared indices uploaded.
+        let max_chunk_quads = fill_chunks
             .iter()
             .map(|c| c.quad_count)
             .chain(rounded_chunks.iter().map(|c| c.quad_count))
@@ -1587,14 +1604,13 @@ impl GpuResources {
             .chain(atlas_chunks.iter().map(|c| c.quad_count))
             .chain(inline_chunks.iter().map(|c| c.quad_count))
             .max()
-            .unwrap_or(0)
-            .max(
-                if draw_list.images.is_empty() && draw_list.backgrounds.is_empty() {
-                    0
-                } else {
-                    batch::MAX_IMAGE_QUADS_PER_BATCH
-                },
-            );
+            .unwrap_or(0);
+        let max_quads = frame_required_index_quads(
+            max_chunk_quads,
+            !draw_list.images.is_empty(),
+            !draw_list.backgrounds.is_empty(),
+            !color_blits.is_empty(),
+        );
         if max_quads > 0 {
             self.ensure_indices(queue, max_quads)?;
         }
@@ -2085,5 +2101,61 @@ mod tests {
         let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
         assert_eq!(blits.len(), 1);
         assert_eq!(skipped, 0);
+    }
+
+    /// `draw_frame` is device-gated, so no CI job can call it; the atlas-source
+    /// contract it applies before any GPU work is the shared
+    /// `validate_draw_list_atlas_sources` (bitty#3055). A truncated color atlas
+    /// must be refused with the reason the headless entries report — otherwise
+    /// `color_glyph_blits` silently skips every glyph and the frame paints
+    /// backgrounds only.
+    #[test]
+    fn draw_frame_refuses_a_short_color_atlas_payload() {
+        let dims = AtlasDims {
+            width: 4,
+            height: 4,
+        };
+        let list = draw_list(vec![color_glyph([0, 0], color_slot(0, 0, 4, 4))]);
+        let exact = vec![0u8; 4 * 4 * 4];
+        validate_draw_list_atlas_sources(&list, None, Some((&exact, dims)))
+            .expect("an exact-length payload is accepted");
+        let short = &exact[..exact.len() - 4];
+        match validate_draw_list_atlas_sources(&list, None, Some((short, dims))) {
+            Err(RenderError::InvalidInput { reason }) => assert_eq!(
+                reason, "color atlas payload is shorter than its dimensions",
+                "the GPU frame path must name the truncated payload"
+            ),
+            other => panic!("a short color atlas must be refused, got {other:?}"),
+        }
+        // A color glyph with no color atlas at all is a wiring bug, refused
+        // before the GPU sees the frame.
+        assert!(matches!(
+            validate_draw_list_atlas_sources(&list, None, None),
+            Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels"
+            })
+        ));
+    }
+
+    /// bitty#3055: a frame whose only primitives are `ColorAtlas` glyphs still
+    /// draws through `submit_image_batch_parts`, so it must request the shared
+    /// quad index buffer instead of leaving `max_quads == 0`.
+    #[test]
+    fn color_glyph_only_frame_requests_shared_index_buffer() {
+        assert_eq!(
+            frame_required_index_quads(0, false, false, false),
+            0,
+            "an empty frame needs no index upload"
+        );
+        assert_eq!(
+            frame_required_index_quads(0, false, false, true),
+            batch::MAX_IMAGE_QUADS_PER_BATCH,
+            "a color-glyph-only frame must upload the shared quad indices"
+        );
+        assert_eq!(
+            frame_required_index_quads(128, false, false, true),
+            128,
+            "larger fill/glyph chunks still govern the index upload count"
+        );
     }
 }

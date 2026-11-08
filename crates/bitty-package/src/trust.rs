@@ -298,14 +298,16 @@ pub const SIGNING_DOMAIN: &str = "bitty-package-v1";
 /// enrolled in the [`KeyStore`] under the record's `key_id`.
 #[must_use]
 pub fn signing_message(manifest_digest: &str, artifact_digest: &str) -> Vec<u8> {
+    let manifest_lower = manifest_digest.to_ascii_lowercase();
+    let artifact_lower = artifact_digest.to_ascii_lowercase();
     let mut msg = Vec::with_capacity(
-        SIGNING_DOMAIN.len() + 1 + manifest_digest.len() + 1 + artifact_digest.len(),
+        SIGNING_DOMAIN.len() + 1 + manifest_lower.len() + 1 + artifact_lower.len(),
     );
     msg.extend_from_slice(SIGNING_DOMAIN.as_bytes());
     msg.push(b':');
-    msg.extend_from_slice(manifest_digest.as_bytes());
+    msg.extend_from_slice(manifest_lower.as_bytes());
     msg.push(b':');
-    msg.extend_from_slice(artifact_digest.as_bytes());
+    msg.extend_from_slice(artifact_lower.as_bytes());
     msg
 }
 
@@ -368,8 +370,12 @@ pub fn verify_signature(
 
     // The record must speak for exactly the expected release: otherwise a
     // valid signature could be replayed across digests.
-    if sig.manifest_digest != expected_manifest_digest
-        || sig.artifact_digest != expected_artifact_digest
+    if !sig
+        .manifest_digest
+        .eq_ignore_ascii_case(expected_manifest_digest)
+        || !sig
+            .artifact_digest
+            .eq_ignore_ascii_case(expected_artifact_digest)
     {
         return Err(PackageError::signature(
             "signature digests do not match the expected release digests",
@@ -610,5 +616,22 @@ mod tests {
         assert!(keys.is_trusted("k2"));
         assert!(verify_signature(&sig_k1, &keys, &m, &a).is_err());
         assert!(verify_signature(&sig_k2, &keys, &m, &a).is_ok());
+    }
+
+    #[test]
+    fn signature_verifies_across_uppercase_and_lowercase_hex_digests() {
+        let signing = test_signing_key(0x88);
+        let mut keys = KeyStore::new();
+        enroll(&mut keys, "k1", &signing);
+        let m_lower = sha256_hex(b"manifest");
+        let a_lower = sha256_hex(b"artifact");
+        let m_upper = m_lower.to_ascii_uppercase();
+        let a_upper = a_lower.to_ascii_uppercase();
+
+        let mut sig = sign_record(&signing, "k1", &m_upper, &a_upper);
+        sig.manifest_digest = m_upper.clone();
+        sig.artifact_digest = a_upper.clone();
+        assert!(verify_signature(&sig, &keys, &m_lower, &a_lower).is_ok());
+        assert!(verify_signature(&sig, &keys, &m_upper, &a_upper).is_ok());
     }
 }

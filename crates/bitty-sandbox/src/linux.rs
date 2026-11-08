@@ -198,11 +198,22 @@ pub(crate) fn probe_supported() -> Result<(), SandboxError> {
 
 /// Open one rule target `O_PATH` (safe; no read permission needed, the fd
 /// only names the inode for `add_exec_rule`).
+///
+/// Verifies via `fstat` on the opened descriptor that the target is a regular
+/// file: `LANDLOCK_RULE_PATH_BENEATH` on a directory descriptor would grant
+/// `EXECUTE` to the entire subtree beneath that directory.
 fn open_rule_file(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
-        .open(path)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "confinement rule target must be a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 // ── ELF interpreter discovery ─────────────────────────────────────────────
@@ -309,6 +320,12 @@ pub(crate) fn elf_interp(path: &Path) -> Option<std::path::PathBuf> {
         let interp = std::ffi::OsString::from_vec(bytes);
         let path = std::path::PathBuf::from(interp);
         if !path.is_absolute() {
+            return None;
+        }
+        if !std::fs::metadata(&path)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+        {
             return None;
         }
         return Some(path);

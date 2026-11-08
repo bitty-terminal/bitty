@@ -68,9 +68,9 @@ impl LockedPackage {
                 self.id, self.version
             )));
         }
-        // Basic semver sanity (reuse manifest's validate_semver logic via re-check).
-        // For draft, just check contains dot and valid chars.
-        if !self.version.contains('.') {
+        // Strict SemVer validation prevents malformed versions or delimiter
+        // injection (`:`, `\n`) into `Lockfile::digest()`.
+        if crate::version::Version::parse(&self.version).is_err() {
             return Err(PackageError::lockfile(format!(
                 "locked package {} version '{}' malformed",
                 self.id, self.version
@@ -306,5 +306,17 @@ mod tests {
     #[test]
     fn valid_hex_helper() {
         assert!(is_valid_hex_digest(&sha256_hex(b"x")));
+    }
+
+    #[test]
+    fn non_semver_locked_version_rejected() {
+        for bad in ["..", "1.0", "1.0.0:injected\nxuepoo.b@0.1.0", "1.0.0-"] {
+            let mut p = locked_pkg("xuepoo.a");
+            p.version = bad.to_string();
+            assert!(
+                p.validate().is_err(),
+                "non-SemVer locked version '{bad}' must be rejected"
+            );
+        }
     }
 }

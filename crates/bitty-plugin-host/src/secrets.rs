@@ -363,12 +363,15 @@ impl SecretError {
 }
 
 /// Clamp a name/reason to a bounded length (fail-closed at the call site).
-fn bounded_name(name: String) -> String {
+fn bounded_name(mut name: String) -> String {
     if name.len() > MAX_SECRET_FILE_LINE_BYTES {
-        name[..MAX_SECRET_FILE_LINE_BYTES].to_string()
-    } else {
-        name
+        let mut end = MAX_SECRET_FILE_LINE_BYTES;
+        while end > 0 && !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
     }
+    name
 }
 
 impl fmt::Display for SecretError {
@@ -2174,6 +2177,14 @@ mod tests {
         let long_value = format!("secret://{}", "x".repeat(5000));
         let err = SecretHandle::parse(&long_value).unwrap_err();
         assert!(err.to_string().len() < 1000);
+
+        // Multi-byte UTF-8 straddling `MAX_SECRET_FILE_LINE_BYTES` must truncate
+        // cleanly on a char boundary without panicking.
+        let prefix = "a".repeat(MAX_SECRET_FILE_LINE_BYTES - 1);
+        let non_ascii = format!("{prefix}é{}", "b".repeat(32));
+        assert!(!non_ascii.is_char_boundary(MAX_SECRET_FILE_LINE_BYTES));
+        let err = SecretError::invalid_request(non_ascii);
+        assert!(err.to_string().len() <= MAX_SECRET_FILE_LINE_BYTES + 64);
     }
 
     #[test]

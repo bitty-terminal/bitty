@@ -742,43 +742,65 @@ pub fn resolve_git_repository(
                 &git_dir,
             ));
         }
+        // Metadata pointer files: git follows them to the real git dir or
+        // object store, so their targets are exactly as sensitive as a
+        // gitfile target. When `commondir` is present (linked worktrees), git
+        // also reads `<commondir>/config` and `<commondir>/objects/info/*`.
+        let common_dirs = resolve_commondir_targets(
+            &git_dir.join("commondir"),
+            &git_dir,
+            authorized_cwd,
+            grant_roots,
+        )?;
+        let mut common_configs = Vec::with_capacity(common_dirs.len());
+        for common_dir in &common_dirs {
+            let cfg = read_core_config(&common_dir.join("config"))?;
+            common_configs.push((common_dir.as_path(), cfg));
+            check_metadata_pointer(
+                &common_dir.join("objects").join("info").join("alternates"),
+                &common_dir.join("objects"),
+                authorized_cwd,
+                grant_roots,
+                GitMetadataRefusalKind::ObjectStoreOutsideGrant,
+            )?;
+            reject_http_alternates(common_dir)?;
+        }
         // Both config files git may read: the repository config and, when
         // `extensions.worktreeConfig` is on, `config.worktree`. `core.worktree`
-        // in either one selects the tree the child reads, so both are checked.
+        // in any of `commondir/config`, `config`, or `config.worktree` selects
+        // the tree the child reads, so all are checked.
         let config = read_core_config(&git_dir.join("config"))?;
         let worktree_config = read_core_config(&git_dir.join("config.worktree"))?;
-        for config in [&config, &worktree_config] {
-            if let Some(include) = config.include.as_deref() {
+        let all_configs = common_configs
+            .iter()
+            .map(|(base, cfg)| (*base, cfg))
+            .chain([
+                (git_dir.as_path(), &config),
+                (git_dir.as_path(), &worktree_config),
+            ]);
+        let mut work_tree = None;
+        let mut bare = false;
+        for (cfg_base, cfg) in all_configs {
+            if let Some(include) = cfg.include.as_deref() {
                 return Err(GitMetadataRefusal::new(
                     GitMetadataRefusalKind::ConfigIncludeRefused,
                     std::path::Path::new(include),
                 ));
             }
-        }
-        let mut work_tree = None;
-        for config in [&config, &worktree_config] {
-            if let Some(raw) = config.worktree.as_deref() {
-                let resolved = resolve_worktree(&git_dir, raw);
+            if let Some(raw) = cfg.worktree.as_deref() {
+                let resolved = resolve_worktree(cfg_base, raw);
                 if !path_within_grant(authorized_cwd, grant_roots, &resolved) {
                     return Err(GitMetadataRefusal::new(
                         GitMetadataRefusalKind::WorktreeOutsideGrant,
                         &resolved,
                     ));
                 }
-                // `config.worktree` wins over `config`, matching git.
+                // Later config (`config` over `commondir/config`,
+                // `config.worktree` over `config`) wins, matching git.
                 work_tree = Some(resolved);
             }
+            bare |= cfg.bare;
         }
-        // Metadata pointer files: git follows them to the real git dir or
-        // object store, so their targets are exactly as sensitive as a
-        // gitfile target.
-        check_metadata_pointer(
-            &git_dir.join("commondir"),
-            &git_dir,
-            authorized_cwd,
-            grant_roots,
-            GitMetadataRefusalKind::GitDirOutsideGrant,
-        )?;
         check_metadata_pointer(
             &git_dir.join("objects").join("info").join("alternates"),
             &git_dir.join("objects"),
@@ -791,7 +813,7 @@ pub fn resolve_git_repository(
             repo_root: dir.to_path_buf(),
             git_dir,
             work_tree,
-            bare: config.bare || worktree_config.bare,
+            bare,
         }));
     }
     Ok(None)
@@ -806,6 +828,46 @@ fn resolve_worktree(git_dir: &std::path::Path, raw: &str) -> std::path::PathBuf 
     } else {
         git_dir.join(candidate)
     }
+}
+
+/// Resolve and validate `commondir` pointer targets inside the grant.
+fn resolve_commondir_targets(
+    pointer: &std::path::Path,
+    base: &std::path::Path,
+    authorized_cwd: &std::path::Path,
+    grant_roots: &[std::path::PathBuf],
+) -> Result<Vec<std::path::PathBuf>, GitMetadataRefusal> {
+    let text = match read_bounded_text(pointer, MAX_GIT_CONFIG_BYTES) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(Vec::new()),
+        Err(()) => {
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::MetadataUnreadable,
+                pointer,
+            ));
+        }
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let entry = line.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(entry);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            base.join(candidate)
+        };
+        if !path_within_grant(authorized_cwd, grant_roots, &resolved) {
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::GitDirOutsideGrant,
+                &resolved,
+            ));
+        }
+        out.push(resolved);
+    }
+    Ok(out)
 }
 
 /// Refuse a metadata pointer file (`commondir`, `objects/info/alternates`)
@@ -964,18 +1026,17 @@ fn parse_core_config(text: &str) -> CoreConfig {
     let mut config = CoreConfig::default();
     let mut section = String::new();
     for line in text.lines() {
-        let line = line.trim();
+        let mut line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some(rest) = line.strip_prefix('[') {
-            let name = rest
-                .split([']', ' ', '\t'])
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let (name, trailing) = parse_section_header(rest);
             section = name;
-            continue;
+            line = trailing.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -1004,6 +1065,31 @@ fn parse_core_config(text: &str) -> CoreConfig {
         }
     }
     config
+}
+
+/// Parse `[section]` or `[section "subsection"]`, returning the lowercased
+/// section name and any inline `key = value` tail after the unquoted `]`.
+fn parse_section_header(rest: &str) -> (String, &str) {
+    let name = rest
+        .split([']', ' ', '\t', '"'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (idx, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ']' if !quoted => return (name, &rest[idx + 1..]),
+            _ => {}
+        }
+    }
+    (name, "")
 }
 
 /// Parse one config value: trim, cut a trailing comment, unquote.
@@ -1074,11 +1160,35 @@ fn path_within_grant(
         .any(|root| candidate.starts_with(resolve_for_compare(root)))
 }
 
-/// Compare-ready form of a path: lexical normalisation, then canonicalisation
-/// when possible.
+/// Compare-ready form of a path: canonicalise existing prefixes before
+/// collapsing `..`, so `<symlink_to_outside>/..` cannot lexically collapse
+/// back into the grant while the OS resolves it outside.
 fn resolve_for_compare(path: &std::path::Path) -> std::path::PathBuf {
-    let lexical = normalize_lexically(path);
-    std::fs::canonicalize(&lexical).unwrap_or(lexical)
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Ok(canon) = std::fs::canonicalize(&out) {
+                    out = canon;
+                }
+                if !out.pop() && !path.is_absolute() {
+                    out.push("..");
+                }
+            }
+            other => {
+                out.push(other.as_os_str());
+                if let Ok(canon) = std::fs::canonicalize(&out) {
+                    out = canon;
+                }
+            }
+        }
+    }
+    normalize_lexically(&out)
 }
 
 /// Resolve `.` and `..` without touching the filesystem.
@@ -3129,5 +3239,67 @@ mod tests {
             entry.detail
         );
         assert!(!entry.detail.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn inline_section_worktree_and_include_are_enforced() {
+        let cfg = parse_core_config("[core] worktree = /outside/tree\n");
+        assert_eq!(cfg.worktree.as_deref(), Some("/outside/tree"));
+
+        let inc = parse_core_config("[includeIf \"gitdir:/repo/a]b/\"] path = /outside/inc\n");
+        assert_eq!(inc.include.as_deref(), Some("/outside/inc"));
+    }
+
+    #[test]
+    fn commondir_config_escape_is_refused() {
+        let root = scratch("commondir-config-escape");
+        let grant = root.join("grant");
+        let outside = root.join("outside");
+        let common = grant.join("common-git");
+        let wt_git = grant.join("wt-git");
+        let pane = grant.join("pane");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::create_dir_all(common.join("objects/info")).expect("common");
+        std::fs::create_dir_all(&wt_git).expect("wt_git");
+        std::fs::create_dir_all(&pane).expect("pane");
+        std::fs::write(pane.join(".git"), format!("gitdir: {}\n", wt_git.display()))
+            .expect("gitfile");
+        std::fs::write(wt_git.join("commondir"), "../common-git\n").expect("commondir");
+        std::fs::write(wt_git.join("config"), "[core]\n\tbare = false\n").expect("wt config");
+        std::fs::write(
+            common.join("config"),
+            format!("[core] worktree = {}\n", outside.display()),
+        )
+        .expect("common config");
+
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[grant])
+                .expect_err("commondir config worktree outside grant must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::WorktreeOutsideGrant);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_dotdot_escape_is_refused() {
+        let root = scratch("symlink-dotdot-escape");
+        let grant = root.join("grant");
+        let outside_parent = root.join("outside-parent");
+        let outside_leaf = outside_parent.join("leaf");
+        let pane = grant.join("pane");
+        std::fs::create_dir_all(&pane).expect("pane");
+        std::fs::create_dir_all(&outside_leaf).expect("outside_leaf");
+        std::os::unix::fs::symlink(&outside_leaf, pane.join("escape_link")).expect("symlink");
+        std::fs::write(
+            pane.join(".git"),
+            format!("gitdir: {}\n", pane.join("escape_link/..").display()),
+        )
+        .expect("gitfile");
+
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[grant])
+                .expect_err("symlink/.. escape outside grant must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
     }
 }

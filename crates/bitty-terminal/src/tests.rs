@@ -1434,6 +1434,40 @@ return {}
     }
 
     #[test]
+    fn reveal_edge_while_the_gate_is_open_still_presents() {
+        // bitty#3030: the #2989 confirmation repair can reopen the gate
+        // speculatively while the surface is still occluded, so the native
+        // reveal on the workspace return arrives with the gate already open.
+        // Before this fix the duplicate edge was filtered end to end and no
+        // frame presented: nothing was owed, no wake was armed, and the screen
+        // kept the last sampled frame - which can predate output (the owner's
+        // `aws configure` prompt lines) written while the surface was away.
+        let mut fixture = Fixture::new("open-gate-reveal");
+        assert!(
+            fixture.app.drive_tick().is_none(),
+            "the baseline mount frame is already committed"
+        );
+        assert!(fixture.app.runtime.is_surface_visible(), "gate starts open");
+        let presented_before = fixture.app.presented_frames;
+
+        fixture.event(WindowEventKind::Occluded(false));
+
+        assert!(
+            fixture.app.runtime.is_surface_visible(),
+            "the redundant reveal must not change the gate"
+        );
+        assert!(
+            fixture.app.runtime.present_coalescing_deadline().is_some(),
+            "a reveal proof queues one from-truth frame even with the gate open"
+        );
+        assert!(
+            fixture.app.drive_tick().is_some(),
+            "the queued frame presents instead of keeping the stale screen"
+        );
+        assert_eq!(fixture.app.presented_frames, presented_before + 1);
+    }
+
+    #[test]
     fn timer_and_ipc_wakes_do_not_reveal_a_closed_surface() {
         // bitty#3023: only input the compositor could not deliver to a
         // suspended surface is visibility proof. A timer wake and the

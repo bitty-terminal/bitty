@@ -2533,8 +2533,14 @@ impl Runtime {
     /// terminated by) the driver's swap-chain wait while hidden, and a
     /// present failure inside this transition cannot recurse into handlers.
     ///
-    /// Superfluuous deliveries are no-ops (same visibility, no transition),
-    /// including the startup `Resumed` before the first window exists.
+    /// A redundant hide is a no-op (same visibility, no transition). A
+    /// redundant reveal is not: it is still a reveal proof, and the frame on
+    /// screen can predate output that arrived while the surface was suspended
+    /// without a gate-closing edge (a speculative #2989 repair reopens the
+    /// gate while occluded, so the native reveal arrives with the gate
+    /// already open). It therefore queues the same one-frame from-truth
+    /// repaint a transition does, without changing the gate or the presenter
+    /// state.
     ///
     /// - **Hide** (visible → hidden): the compositor may stop releasing
     ///   swap-chain buffers, so every future acquire would park the present
@@ -2556,6 +2562,16 @@ impl Runtime {
     #[doc(hidden)]
     pub fn set_surface_visibility_at(&mut self, now: std::time::Instant, visible: bool) {
         if self.surface_visible == visible {
+            if visible {
+                // A reveal proof owes one from-truth frame even when the
+                // gate is already open: the surface may have been suspended
+                // without a gate-closing edge (or the gate may have been
+                // reopened speculatively by a repair the compositor never
+                // sampled), so the frame on screen can be stale even though
+                // nothing is owed. Queueing is idempotent with an already
+                // armed wake.
+                self.queue_reveal_repaint(now);
+            }
             return;
         }
         // bitty#2830: remember what the transition cancels *before* the hide
@@ -2584,18 +2600,7 @@ impl Runtime {
             // task. The deadline is already open, so the embedder's wake
             // (`present_coalescing_deadline`) presents it on the very next
             // loop turn rather than inside this transition handler.
-            self.coalesced_pending = true;
-            self.coalesced_deadline = Some(now);
-            // The reveal owns a from-truth repaint; the repair timer has
-            // done its job and must never wake a visible surface.
-            self.pending_full_redraw = true;
-            self.hidden_repair_at = None;
-            // bitty#3023: a confirmation bound armed for a hide that retained
-            // nothing belongs to the hidden incarnation. The reveal frame is
-            // the stronger evidence and re-arms the bound when it commits, so
-            // keeping the old deadline would only force a duplicate corrective
-            // repaint for a frame the reveal already supersedes.
-            self.clear_present_confirmation();
+            self.queue_reveal_repaint(now);
         } else {
             // Hide: cancel the pending presentation without consuming
             // anything. `mark_frame_presented` is deliberately *not* called:
@@ -2635,6 +2640,29 @@ impl Runtime {
             // anything about this surface.
             self.speculative_present_reopen = false;
         }
+    }
+
+    /// Queues one from-truth frame for a reveal proof (bitty#3030).
+    ///
+    /// Shared by the hide → reveal transition and by a redundant reveal
+    /// delivery: both prove the surface is mapped again, and both owe one
+    /// full-redraw presentation as a next-frame task. The deadline is open
+    /// (`Some(now)`), so the embedder's `present_coalescing_deadline` wake
+    /// presents it on the next loop turn rather than inside the transition
+    /// handler. The repair timer has done its job and must never wake a
+    /// visible surface.
+    ///
+    /// A confirmation bound armed for a hide that retained nothing belongs
+    /// to the hidden incarnation (bitty#3023). The reveal frame is the
+    /// stronger evidence and re-arms the bound when it commits, so keeping
+    /// the old deadline would only force a duplicate corrective repaint for
+    /// a frame the reveal already supersedes.
+    fn queue_reveal_repaint(&mut self, now: std::time::Instant) {
+        self.coalesced_pending = true;
+        self.coalesced_deadline = Some(now);
+        self.pending_full_redraw = true;
+        self.hidden_repair_at = None;
+        self.clear_present_confirmation();
     }
 
     /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
@@ -12264,12 +12292,16 @@ mod surface_visibility_tests {
     }
 
     #[test]
-    fn repeated_same_visibility_deliveries_are_no_ops() {
+    fn repeated_hides_are_no_ops_and_repeated_reveals_repaint() {
         let t0 = std::time::Instant::now();
         let mut rt = runtime();
-        rt.set_surface_visibility_at(t0, true); // startup Resumed: visible already
+        // A startup `Resumed` before the first frame is still a reveal proof:
+        // it queues one from-truth frame (bitty#3030). The first frame is
+        // full anyway, so this costs no extra work.
+        rt.set_surface_visibility_at(t0, true);
         assert!(rt.is_surface_visible());
-        assert_eq!(rt.present_coalescing_deadline(), None);
+        assert_eq!(rt.present_coalescing_deadline(), Some(t0));
+        assert!(rt.pending_full_redraw);
         rt.set_surface_visibility_at(t0, false);
         assert!(!rt.is_surface_visible());
         assert!(rt.pending_full_redraw, "the hide arms one full redraw");
@@ -12279,20 +12311,61 @@ mod surface_visibility_tests {
         rt.set_surface_visibility_at(t0, false);
         assert!(!rt.is_surface_visible());
         assert!(!rt.pending_full_redraw);
-        // And a second Resumed before reality (still hidden in between) is a
-        // no-op too.
-        rt.set_surface_visibility_at(t0, false);
-        assert!(!rt.is_surface_visible());
+        // A redundant reveal does not change the gate; it queues the same
+        // one-frame from-truth repaint (idempotent with the armed wake).
         rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(1), true);
+        assert!(rt.is_surface_visible());
         assert_eq!(
             rt.present_coalescing_deadline(),
             Some(t0 + std::time::Duration::from_millis(1))
         );
         rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(1), true);
+        assert!(rt.is_surface_visible());
         assert_eq!(
             rt.present_coalescing_deadline(),
-            Some(t0 + std::time::Duration::from_millis(1))
+            Some(t0 + std::time::Duration::from_millis(1)),
+            "a redundant reveal keeps the armed wake"
         );
+    }
+
+    /// bitty#3030: a reveal proof that arrives while the gate is already open
+    /// still owes one from-truth frame.
+    ///
+    /// The #2989 confirmation repair can reopen the gate speculatively while
+    /// the surface is still occluded, so the native reveal on a workspace
+    /// return arrives with `surface_visible == true`. Before this fix the
+    /// duplicate delivery was a complete no-op: nothing was owed, no wake was
+    /// armed, and the screen kept whatever frame the compositor last sampled -
+    /// a frame that can predate output (the owner's `aws configure` prompt
+    /// lines) written while the surface was away.
+    #[test]
+    fn redundant_reveal_queues_a_from_truth_frame() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"line one\r\n");
+        assert!(rt.tick_at(t0).is_some(), "the first frame presents");
+        assert!(rt.tick_at(t0).is_none(), "and then the runtime idles");
+        assert!(!rt.pending_full_redraw);
+
+        // The surface was suspended without a gate-closing edge; the gate is
+        // still open. The compositor's reveal proof arrives.
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(10), true);
+        assert!(rt.is_surface_visible(), "the gate state is unchanged");
+        assert!(
+            rt.pending_full_redraw,
+            "a reveal proof owes a from-truth frame even with the gate open"
+        );
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            Some(t0 + std::time::Duration::from_millis(10)),
+            "the reveal proof arms the next-frame wake"
+        );
+        assert!(
+            rt.tick_at(t0 + std::time::Duration::from_millis(10))
+                .is_some(),
+            "the from-truth frame presents on the next loop turn"
+        );
+        assert!(!rt.pending_full_redraw);
     }
 
     #[test]
@@ -14984,5 +15057,420 @@ mod async_present_tests {
             "the requirement survives until a successful attach clears it"
         );
         let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+}
+
+/// bitty#3030: a hide/reveal must keep a live-tail prompt that has no
+/// trailing newline.
+///
+/// The owner's repro is a line-oriented prompt (`aws configure`) that writes
+/// its last line without a newline, so the newest rows are exactly the rows a
+/// stale frame loses while the rest of the pane's output stays. These tests
+/// drive the real runtime through the production switch shape - hide +
+/// focus-out, then focus-in + reveal - and pin that the from-truth rebuild
+/// paints the same prompt row for every pane shape the report could be:
+/// the primary view, a split pane that is not the primary view, and a pane
+/// living in a second workspace. They also pin that output arriving while the
+/// surface is hidden still lands after the reveal, and that the switch itself
+/// writes no PTY bytes and issues no grid or surface resize.
+#[cfg(test)]
+mod prompt_reveal_tests {
+    use super::*;
+    use crate::AnimationPolicy;
+    use crate::runtime::RuntimeConfig;
+
+    /// The exact shape the owner reported: `aws configure` writes the `Tip:`
+    /// line, a blank line, and then the prompt without a trailing newline.
+    const AWS_PROMPT: &str = "AWS Access Key ID [None]: ";
+    const AWS_TIP: &str = "Tip: You can deliver temporary credentials to the AWS CLI using your AWS Console session by running the command 'aws login'.";
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig {
+            animations: AnimationPolicy {
+                enabled: false,
+                ..AnimationPolicy::default()
+            },
+            ..RuntimeConfig::default()
+        })
+        .expect("deterministic runtime must build")
+    }
+
+    fn transcript(prefix: &str, lines: usize) -> Vec<String> {
+        let mut rows: Vec<String> = (0..lines)
+            .map(|index| format!("{prefix} line {index:02}\r\n"))
+            .collect();
+        rows.push(format!("{AWS_TIP}\r\n"));
+        rows.push(String::from("\r\n"));
+        rows
+    }
+
+    fn feed_primary(rt: &mut Runtime, rows: &[String]) {
+        for row in rows {
+            rt.handle_pty_bytes(row.as_bytes());
+        }
+        rt.handle_pty_bytes(AWS_PROMPT.as_bytes());
+    }
+
+    fn feed_pane(rt: &mut Runtime, view: ViewId, rows: &[String]) {
+        for row in rows {
+            rt.handle_pane_bytes(view, row.as_bytes());
+        }
+        rt.handle_pane_bytes(view, AWS_PROMPT.as_bytes());
+    }
+
+    fn split_rt(pane: ViewId) -> Runtime {
+        let mut rt = runtime();
+        rt.set_layout(LayoutNode::split(
+            bitty_ui::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(pane, 40, 24)),
+        ));
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("pane frame");
+        rt.spawn_shell_for_view(pane, "/bin/cat", &[], frame.cols, frame.rows)
+            .expect("pane spawns");
+        rt
+    }
+
+    fn second_workspace_rt(pane: &mut ViewId) -> Runtime {
+        let mut rt = runtime();
+        rt.workspace_new().expect("ws2");
+        *pane = rt.focused_view().expect("ws2 focus");
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == *pane)
+            .expect("pane frame");
+        rt.spawn_shell_for_view(*pane, "/bin/cat", &[], frame.cols, frame.rows)
+            .expect("pane spawns");
+        rt
+    }
+
+    /// The production switch shape: hide, lose focus, regain focus, reveal.
+    fn hide_and_reveal(rt: &mut Runtime, t0: std::time::Instant) {
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        rt.set_focused(false);
+        rt.set_focused(true);
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(20), true);
+        assert!(
+            rt.tick_at(t0 + std::time::Duration::from_millis(20))
+                .is_some(),
+            "the reveal frame presents"
+        );
+    }
+
+    fn prompt_row_has_ink(rt: &Runtime, view: ViewId) -> bool {
+        let rgba = rt.headless_rgba().expect("presented headless frame");
+        let extent = rt.present_plan_extent();
+        let (width, height) = (extent.width as usize, extent.height as usize);
+        assert_eq!(rgba.len(), width * height * 4);
+        let background = [rgba[0], rgba[1], rgba[2], rgba[3]];
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("view frame");
+        let pad = rt.window_padding_physical() as usize;
+        let cell = rt.live_cell_metrics();
+        let x0 = pad.saturating_add(frame.content.x.max(0) as usize);
+        let y0 = pad
+            .saturating_add(frame.content.y.max(0) as usize)
+            .saturating_add(usize::from(frame.rows.saturating_sub(1)) * cell.height as usize);
+        let x1 = (x0 + frame.content.width as usize).min(width);
+        let y1 = (y0 + cell.height as usize).min(height);
+        y0 < y1
+            && (y0..y1).any(|y| {
+                (x0..x1).any(|x| rgba[(y * width + x) * 4..(y * width + x) * 4 + 4] != background)
+            })
+    }
+
+    fn assert_same_frame(actual: &Runtime, expected: &Runtime) {
+        assert_eq!(
+            actual.headless_rgba(),
+            expected.headless_rgba(),
+            "the reveal frame must be byte-identical to the pre-hide frame"
+        );
+    }
+
+    fn assert_switch_wrote_nothing(
+        rt: &Runtime,
+        input_before: usize,
+        grid_before: (usize, usize),
+        extent_before: Option<bitty_platform::PhysicalSize>,
+    ) {
+        assert_eq!(
+            rt.pending_input_len(),
+            input_before,
+            "a pure hide/reveal must write no PTY bytes"
+        );
+        assert_eq!(
+            (rt.state().width(), rt.state().height()),
+            grid_before,
+            "a pure hide/reveal must not resize the primary grid"
+        );
+        assert_eq!(
+            rt.surface_extent(),
+            extent_before,
+            "a pure hide/reveal must not resize the surface"
+        );
+    }
+
+    #[test]
+    fn reveal_keeps_the_unterminated_prompt_primary() {
+        let rows = transcript("output", 20);
+        let mut expected = runtime();
+        feed_primary(&mut expected, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the pre-hide frame presents"
+        );
+        let view = expected.focused_view().expect("focused view");
+        assert!(
+            prompt_row_has_ink(&expected, view),
+            "fixture must paint the prompt before the switch"
+        );
+
+        let mut actual = runtime();
+        feed_primary(&mut actual, &rows);
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        let input_before = actual.pending_input_len();
+        let grid_before = (actual.state().width(), actual.state().height());
+        let extent_before = actual.surface_extent();
+
+        hide_and_reveal(&mut actual, t0);
+
+        assert_same_frame(&actual, &expected);
+        assert!(
+            prompt_row_has_ink(&actual, view),
+            "the prompt row must survive the reveal"
+        );
+        assert_switch_wrote_nothing(&actual, input_before, grid_before, extent_before);
+    }
+
+    #[test]
+    fn reveal_keeps_the_unterminated_prompt_split_pane() {
+        bitty_test_support::require_pty!();
+        let pane = ViewId::new(2);
+        let rows = transcript("pane", 18);
+        let mut expected = split_rt(pane);
+        feed_pane(&mut expected, pane, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the pre-hide frame presents"
+        );
+        assert!(
+            prompt_row_has_ink(&expected, pane),
+            "fixture must paint the pane prompt before the switch"
+        );
+
+        let mut actual = split_rt(pane);
+        feed_pane(&mut actual, pane, &rows);
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        let input_before = actual.pending_input_len();
+        let primary_grid_before = (actual.state().width(), actual.state().height());
+        let pane_grid_before = (
+            actual.pane_sessions[&pane].state.width(),
+            actual.pane_sessions[&pane].state.height(),
+        );
+        let extent_before = actual.surface_extent();
+
+        hide_and_reveal(&mut actual, t0);
+
+        assert_same_frame(&actual, &expected);
+        assert!(
+            prompt_row_has_ink(&actual, pane),
+            "the pane prompt row must survive the reveal"
+        );
+        assert_switch_wrote_nothing(&actual, input_before, primary_grid_before, extent_before);
+        assert_eq!(
+            (
+                actual.pane_sessions[&pane].state.width(),
+                actual.pane_sessions[&pane].state.height(),
+            ),
+            pane_grid_before,
+            "a pure hide/reveal must not resize the pane grid"
+        );
+    }
+
+    #[test]
+    fn reveal_keeps_the_unterminated_prompt_second_workspace() {
+        bitty_test_support::require_pty!();
+        let mut pane = ViewId::new(0);
+        let rows = transcript("ws2", 18);
+        let mut expected = second_workspace_rt(&mut pane);
+        feed_pane(&mut expected, pane, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the pre-hide frame presents"
+        );
+        assert!(
+            prompt_row_has_ink(&expected, pane),
+            "fixture must paint the workspace pane prompt before the switch"
+        );
+
+        let mut actual = second_workspace_rt(&mut pane);
+        feed_pane(&mut actual, pane, &rows);
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        let input_before = actual.pending_input_len();
+        let primary_grid_before = (actual.state().width(), actual.state().height());
+        let pane_grid_before = (
+            actual.pane_sessions[&pane].state.width(),
+            actual.pane_sessions[&pane].state.height(),
+        );
+        let extent_before = actual.surface_extent();
+
+        hide_and_reveal(&mut actual, t0);
+
+        assert_same_frame(&actual, &expected);
+        assert!(
+            prompt_row_has_ink(&actual, pane),
+            "the second-workspace prompt row must survive the reveal"
+        );
+        assert_switch_wrote_nothing(&actual, input_before, primary_grid_before, extent_before);
+        assert_eq!(
+            (
+                actual.pane_sessions[&pane].state.width(),
+                actual.pane_sessions[&pane].state.height(),
+            ),
+            pane_grid_before,
+            "a pure hide/reveal must not resize the pane grid"
+        );
+    }
+
+    /// Output written while the surface is hidden must land in the reveal
+    /// frame (the owner's prompt can arrive after the switch-away).
+    #[test]
+    fn reveal_shows_the_prompt_that_arrived_while_hidden() {
+        let rows = transcript("output", 20);
+        let mut expected = runtime();
+        feed_primary(&mut expected, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the reference frame presents"
+        );
+
+        let mut actual = runtime();
+        for row in &rows {
+            actual.handle_pty_bytes(row.as_bytes());
+        }
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        actual.handle_pty_bytes(AWS_PROMPT.as_bytes());
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(6))
+                .is_none(),
+            "no frame presents while hidden"
+        );
+        actual.set_focused(false);
+        actual.set_focused(true);
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(20), true);
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(20))
+                .is_some(),
+            "the reveal frame presents"
+        );
+
+        assert_same_frame(&actual, &expected);
+        let view = actual.focused_view().expect("focused view");
+        assert!(
+            prompt_row_has_ink(&actual, view),
+            "the prompt written while hidden must be painted after the reveal"
+        );
+    }
+
+    #[test]
+    fn reveal_shows_the_split_pane_prompt_that_arrived_while_hidden() {
+        bitty_test_support::require_pty!();
+        let pane = ViewId::new(2);
+        let rows = transcript("pane", 18);
+        let mut expected = split_rt(pane);
+        feed_pane(&mut expected, pane, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the reference frame presents"
+        );
+
+        let mut actual = split_rt(pane);
+        for row in &rows {
+            actual.handle_pane_bytes(pane, row.as_bytes());
+        }
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        actual.handle_pane_bytes(pane, AWS_PROMPT.as_bytes());
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(6))
+                .is_none(),
+            "no frame presents while hidden"
+        );
+        actual.set_focused(false);
+        actual.set_focused(true);
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(20), true);
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(20))
+                .is_some(),
+            "the reveal frame presents"
+        );
+
+        assert_same_frame(&actual, &expected);
+        assert!(
+            prompt_row_has_ink(&actual, pane),
+            "the pane prompt written while hidden must be painted after the reveal"
+        );
+    }
+
+    #[test]
+    fn reveal_shows_the_second_workspace_prompt_that_arrived_while_hidden() {
+        bitty_test_support::require_pty!();
+        let mut pane = ViewId::new(0);
+        let rows = transcript("ws2", 18);
+        let mut expected = second_workspace_rt(&mut pane);
+        feed_pane(&mut expected, pane, &rows);
+        let t0 = std::time::Instant::now();
+        assert!(
+            expected.tick_at(t0).is_some(),
+            "the reference frame presents"
+        );
+
+        let mut actual = second_workspace_rt(&mut pane);
+        for row in &rows {
+            actual.handle_pane_bytes(pane, row.as_bytes());
+        }
+        assert!(actual.tick_at(t0).is_some(), "the pre-hide frame presents");
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        actual.handle_pane_bytes(pane, AWS_PROMPT.as_bytes());
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(6))
+                .is_none(),
+            "no frame presents while hidden"
+        );
+        actual.set_focused(false);
+        actual.set_focused(true);
+        actual.set_surface_visibility_at(t0 + std::time::Duration::from_millis(20), true);
+        assert!(
+            actual
+                .tick_at(t0 + std::time::Duration::from_millis(20))
+                .is_some(),
+            "the reveal frame presents"
+        );
+
+        assert_same_frame(&actual, &expected);
+        assert!(
+            prompt_row_has_ink(&actual, pane),
+            "the workspace prompt written while hidden must be painted after the reveal"
+        );
     }
 }

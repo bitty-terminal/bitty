@@ -1444,10 +1444,20 @@ impl TerminalApp {
 
     /// Applies one embedder surface-visibility edge (issues #2589/#2570).
     ///
-    /// The runtime treats a duplicate edge as a no-op; filtering here keeps
-    /// the bounded lifecycle log free of repeated deliveries.
+    /// A redundant hide is a no-op, so the bounded lifecycle log stays free
+    /// of repeated deliveries. A redundant reveal is not: it is still a
+    /// reveal proof, and the frame on screen can predate output written while
+    /// the surface was suspended without a gate-closing edge (bitty#3030).
+    /// The runtime queues one from-truth frame for it without changing the
+    /// gate, so a native reveal the #2989 repair pre-empted is never lost.
     fn set_surface_gate(&mut self, visible: bool, reason: &'static str) {
         if self.runtime.is_surface_visible() == visible {
+            if visible {
+                // A repair probe belongs to the hidden incarnation; a real
+                // reveal edge ends it even when the gate is already open.
+                self.hidden_repair_probe_at = None;
+                self.runtime.set_surface_visibility(true);
+            }
             return;
         }
         // A repair probe belongs to the hidden surface incarnation that armed

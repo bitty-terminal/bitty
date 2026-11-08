@@ -443,7 +443,12 @@ impl Runtime {
         }
         let grid = grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
             .ok_or_else(|| HostOpError::Unavailable("bound view owns no live grid".to_string()))?;
-        let Some(leaf) = self.layout.find_leaf_mut(view) else {
+        let Some(leaf) = self
+            .layout
+            .find_leaf_mut(view)
+            .or_else(|| self.floats.find_mut(view))
+            .or_else(|| self.pinned.find_mut(view))
+        else {
             return Err(HostOpError::Unavailable(
                 "bound view left the active layout".to_string(),
             ));
@@ -1174,5 +1179,50 @@ mod tests {
             rt.search_host_install_selection(ghost, sel, None, false),
             Err(HostOpError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn scroll_to_current_works_on_detached_float_and_pinned_view() {
+        use bitty_ui::SplitAxis;
+        let mut rt = headless_runtime();
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let float = ViewId::new(1);
+        rt.float_detach(float).expect("float detaches");
+        assert!(rt.set_focus(float));
+        feed_text(&mut rt, "top-needle\r\n");
+        for i in 0..40 {
+            feed_text(&mut rt, &format!("filler-{i:02}\r\n"));
+        }
+        let query = rt
+            .search_host_set_query(float, "top-needle", SearchOptions::default())
+            .expect("detached float binds search");
+        assert_eq!(query.match_count, 1);
+        assert_eq!(rt.view_scroll_offset(float), 0);
+        let scrolled = rt
+            .search_host_scroll_to_current(float, &query.handle)
+            .expect("detached float scrolls to current match");
+        assert!(scrolled, "detached float must scroll into history");
+        assert!(rt.view_scroll_offset(float) > 0);
+
+        // Restore and pin the view, then verify scrolling works on pinned views.
+        if let Some(leaf) = rt.find_view_mut(float) {
+            leaf.scroll_to_live();
+        }
+        rt.float_restore(float).expect("float restores");
+        rt.pin_floating(float).expect("float pins");
+        rt.primary_view = Some(float);
+        let query = rt
+            .search_host_set_query(float, "top-needle", SearchOptions::default())
+            .expect("pinned view binds search");
+        let scrolled = rt
+            .search_host_scroll_to_current(float, &query.handle)
+            .expect("pinned view scrolls to current match");
+        assert!(scrolled, "pinned view must scroll into history");
+        assert!(rt.view_scroll_offset(float) > 0);
     }
 }

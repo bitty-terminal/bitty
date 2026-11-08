@@ -125,6 +125,18 @@ pub struct FsPowerSupply {
     root: PathBuf,
 }
 
+/// Maximum power-supply entries scanned per poll (bounded enumeration).
+const POWER_SUPPLY_MAX_DEVICES: usize = 64;
+
+fn is_valid_supply_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 impl FsPowerSupply {
     /// Reader over the contract root.
     #[must_use]
@@ -142,6 +154,9 @@ impl FsPowerSupply {
 
     /// Read one supply file; absent/unreadable stays `None` (fail-closed).
     fn read_entry(&self, name: &str, file: &str) -> Option<String> {
+        if !is_valid_supply_name(name) {
+            return None;
+        }
         std::fs::read_to_string(self.root.join(name).join(file)).ok()
     }
 }
@@ -151,11 +166,16 @@ impl SysfsBatterySource for FsPowerSupply {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new();
         };
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
+        let mut names: Vec<String> = entries
+            .take(POWER_SUPPLY_MAX_DEVICES + 1)
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                is_valid_supply_name(&name).then_some(name)
+            })
+            .collect();
         names.sort();
+        names.truncate(POWER_SUPPLY_MAX_DEVICES);
         names
             .into_iter()
             .map(|name| SysfsBatteryRaw {
@@ -743,6 +763,9 @@ mod tests {
         let snapshot = provider.get(0, true).expect("fixture serves");
         assert!((snapshot.capacity_pct - 42.0).abs() < 1e-9);
         assert_eq!(snapshot.state, BatteryState::Charging);
+        assert_eq!(reader.read_entry("..", "capacity"), None);
+        assert_eq!(reader.read_entry(".hidden", "capacity"), None);
+        assert_eq!(reader.read_entry("BAT\\0", "capacity"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

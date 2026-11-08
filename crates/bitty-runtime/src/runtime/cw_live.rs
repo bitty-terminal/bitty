@@ -682,7 +682,7 @@ impl Runtime {
         if query.label.chars().count() > usize::from(frame.cols) {
             return None;
         }
-        let view = self.layout.find_leaf(owner)?;
+        let view = self.find_view(owner)?;
         let frame_rows = usize::from(frame.rows);
         let row = if view.scroll_offset() != 0 {
             let total = query.sb_len.saturating_add(query.screen_height);
@@ -757,7 +757,7 @@ impl Runtime {
         if col >= snapshot.width {
             return None;
         }
-        let view = self.layout.find_leaf(owner)?;
+        let view = self.find_view(owner)?;
         let frame_rows = usize::from(frame.rows);
         let sb_len = self.state.scrollback_len();
         let screen_height = self.state.height();
@@ -866,5 +866,62 @@ impl std::error::Error for HintLinkOpenError {
             Self::Denied(err) => Some(err),
             Self::NotALink { .. } | Self::GestureMismatch => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_ui::{LayoutNode, SplitAxis, View};
+
+    #[test]
+    fn command_and_link_hint_cells_resolve_when_primary_owner_is_detached_float() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let primary = ViewId::new(1);
+        assert_eq!(rt.primary_view(), Some(primary));
+        rt.float_detach(primary).expect("primary detaches to float");
+
+        // Feed OSC 133 prompt + command and a link on the primary state.
+        rt.handle_pty_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07https://example.com\r\n");
+        let frames = rt.present_frames();
+        assert!(
+            frames.iter().any(|f| f.view == primary),
+            "detached float must be in present_frames"
+        );
+
+        let prompt_rows: Vec<(CommandId, usize)> = blocks(&rt.state)
+            .iter()
+            .filter_map(|block| block.region.prompt_row.map(|row| (block.id, row)))
+            .collect();
+        assert!(!prompt_rows.is_empty(), "OSC 133 must record a prompt row");
+        let cmd_id = prompt_rows[0].0;
+
+        let cmd_cell = rt
+            .hint_command_cell(HintCommandQuery {
+                frames: &frames,
+                prompt_rows: &prompt_rows,
+                on_alt: false,
+                sb_len: rt.state.scrollback_len(),
+                screen_height: rt.state.height(),
+                cursor_row: usize::from(rt.state.cursor().position.row),
+                owner: Some(primary),
+                id: cmd_id,
+                label: "a",
+            })
+            .expect("command hint cell must resolve for detached float owner");
+        assert_eq!(cmd_cell.view, primary);
+
+        let link_payload =
+            (rt.state.scrollback_len() as u64) * bitty_rich::hints::LINK_ANCHOR_STRIDE + 2;
+        let link_cell = rt
+            .hint_link_cell(&frames, link_payload, "s")
+            .expect("link hint cell must resolve for detached float owner");
+        assert_eq!(link_cell.view, primary);
     }
 }

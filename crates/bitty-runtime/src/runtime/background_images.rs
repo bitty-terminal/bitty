@@ -290,15 +290,20 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         let active = self.active_workspace_index();
         for (index, slot) in self.workspaces.iter().enumerate() {
-            let layout = if index == active {
-                &self.layout
+            let (layout, floats) = if index == active {
+                (&self.layout, &self.floats)
             } else {
-                &slot.layout
+                (&slot.layout, &slot.floats)
             };
             let label = u8::try_from(index + 1)
                 .unwrap_or(u8::MAX)
                 .clamp(1, crate::runtime::workspaces::MAX_WORKSPACES as u8);
-            for view_id in layout.leaf_ids() {
+            let mut ids = layout.leaf_ids();
+            ids.extend(floats.ids());
+            ids.extend(self.pinned.ids());
+            ids.sort_unstable();
+            ids.dedup();
+            for view_id in ids {
                 let target = crate::config::RuntimeViewTarget {
                     content: self.view_content_kind(view_id),
                     workspace_label: label,
@@ -310,5 +315,65 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ViewAppearanceRule;
+    use bitty_ui::{LayoutNode, SplitAxis, View};
+
+    #[test]
+    fn set_background_appearance_validates_detached_float_and_pinned_views() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let float = ViewId::new(1);
+        rt.float_detach(float).expect("float detaches");
+
+        // An outline rule targeting `view:1` with focused color matching the
+        // background (1.0:1 contrast) violates RFC-0001 AC-1 and must be
+        // rejected even though View 1 is a detached float rather than a layout leaf.
+        let bg = rt.config().theme.background;
+        let invalid_rule = ViewAppearanceRule {
+            selector: "view:1".to_string(),
+            border_color_focused: Some([bg[0], bg[1], bg[2], 0xFF]),
+            ..ViewAppearanceRule::default()
+        };
+        let err = rt
+            .set_background_appearance(
+                vec![invalid_rule.clone()],
+                None,
+                "fit".to_string(),
+                Vec::new(),
+                None,
+                "fit".to_string(),
+                1.0,
+                "center".to_string(),
+            )
+            .expect_err("detached float with violating outline rule must be rejected");
+        assert!(matches!(err, RuntimeError::ViewAppearance(_)));
+
+        // Restore and pin the view, then verify pinned views are also validated.
+        rt.float_restore(float).expect("float restores");
+        rt.pin_floating(float).expect("float pins");
+        let err = rt
+            .set_background_appearance(
+                vec![invalid_rule],
+                None,
+                "fit".to_string(),
+                Vec::new(),
+                None,
+                "fit".to_string(),
+                1.0,
+                "center".to_string(),
+            )
+            .expect_err("pinned view with violating outline rule must be rejected");
+        assert!(matches!(err, RuntimeError::ViewAppearance(_)));
     }
 }

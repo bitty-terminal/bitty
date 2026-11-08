@@ -28,6 +28,10 @@ use phodopus::{
 
 /// Maximum bytes produced by one `table.concat` call.
 const TABLE_CONCAT_MAX_BYTES: usize = 64 * 1024;
+/// Maximum elements visited by one `table.concat` call.
+const TABLE_CONCAT_MAX_ELEMENTS: i64 = 4_096;
+/// Maximum number of byte values returned by one `string.byte` call.
+const STRING_BYTE_MAX_RESULTS: i64 = 8_192;
 
 /// Install the retained stdlib functions into `lua`.
 pub(crate) fn install_retained_stdlib(lua: &mut Lua) {
@@ -351,25 +355,29 @@ fn install_string<'gc>(ctx: Context<'gc>) {
                         .into());
                 };
                 let bytes = text.as_bytes();
-                let length = bytes.len() as i64;
+                let length = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
                 let start = stack.get(1).to_integer().unwrap_or(1);
                 let end = stack.get(2).to_integer().unwrap_or(start);
                 let normalize = |index: i64| -> i64 {
                     if index < 0 {
-                        length + index + 1
+                        length.saturating_add(index).saturating_add(1)
                     } else if index == 0 {
                         1
                     } else {
                         index
                     }
                 };
-                let start = normalize(start).clamp(1, length.max(1));
-                let end = normalize(end).clamp(start, length.max(1));
-                let values: Vec<Value> = if length == 0 || start > length {
+                let start = normalize(start).max(1);
+                let end = normalize(end).min(length);
+                let values: Vec<Value> = if length == 0 || start > end {
                     Vec::new()
                 } else {
+                    let count = end.saturating_sub(start).saturating_add(1);
+                    if count > STRING_BYTE_MAX_RESULTS {
+                        return Err("string slice too long".into_value(ctx).into());
+                    }
                     (start..=end)
-                        .map(|index| Value::Integer(bytes[(index - 1) as usize] as i64))
+                        .map(|index| Value::Integer(i64::from(bytes[(index - 1) as usize])))
                         .collect()
                 };
                 stack.replace(ctx, Variadic(values));
@@ -420,7 +428,14 @@ fn install_table<'gc>(ctx: Context<'gc>) {
                 };
                 let separator = match stack.get(1) {
                     Value::Nil => String::new(),
-                    Value::String(s) => String::from_utf8_lossy(s.as_bytes()).into_owned(),
+                    Value::String(s) => {
+                        if s.as_bytes().len() > TABLE_CONCAT_MAX_BYTES {
+                            return Err("concat result exceeds the byte ceiling"
+                                .into_value(ctx)
+                                .into());
+                        }
+                        String::from_utf8_lossy(s.as_bytes()).into_owned()
+                    }
                     _ => {
                         return Err("bad argument #2 to 'concat' (string expected)"
                             .into_value(ctx)
@@ -430,23 +445,63 @@ fn install_table<'gc>(ctx: Context<'gc>) {
                 let length = list.length();
                 let start = stack.get(2).to_integer().unwrap_or(1);
                 let end = stack.get(3).to_integer().unwrap_or(length);
+                if start > end {
+                    stack.replace(ctx, ctx.intern(b""));
+                    return Ok(CallbackReturn::Return);
+                }
+                let count = end.saturating_sub(start).saturating_add(1);
+                if count > TABLE_CONCAT_MAX_ELEMENTS {
+                    return Err("concat range exceeds the element ceiling"
+                        .into_value(ctx)
+                        .into());
+                }
                 let mut out = String::new();
                 let mut first = true;
                 for index in start..=end {
                     if !first {
+                        if out.len().saturating_add(separator.len()) > TABLE_CONCAT_MAX_BYTES {
+                            return Err("concat result exceeds the byte ceiling"
+                                .into_value(ctx)
+                                .into());
+                        }
                         out.push_str(&separator);
                     }
                     first = false;
                     match list.get_value(ctx, index) {
-                        Value::String(s) => out.push_str(&String::from_utf8_lossy(s.as_bytes())),
-                        Value::Integer(i) => out.push_str(&i.to_string()),
-                        Value::Number(n) => out.push_str(&n.to_string()),
+                        Value::String(s) => {
+                            if out.len().saturating_add(s.as_bytes().len()) > TABLE_CONCAT_MAX_BYTES
+                            {
+                                return Err("concat result exceeds the byte ceiling"
+                                    .into_value(ctx)
+                                    .into());
+                            }
+                            let piece = String::from_utf8_lossy(s.as_bytes());
+                            if out.len().saturating_add(piece.len()) > TABLE_CONCAT_MAX_BYTES {
+                                return Err("concat result exceeds the byte ceiling"
+                                    .into_value(ctx)
+                                    .into());
+                            }
+                            out.push_str(&piece);
+                        }
+                        Value::Integer(i) => {
+                            let piece = i.to_string();
+                            if out.len().saturating_add(piece.len()) > TABLE_CONCAT_MAX_BYTES {
+                                return Err("concat result exceeds the byte ceiling"
+                                    .into_value(ctx)
+                                    .into());
+                            }
+                            out.push_str(&piece);
+                        }
+                        Value::Number(n) => {
+                            let piece = n.to_string();
+                            if out.len().saturating_add(piece.len()) > TABLE_CONCAT_MAX_BYTES {
+                                return Err("concat result exceeds the byte ceiling"
+                                    .into_value(ctx)
+                                    .into());
+                            }
+                            out.push_str(&piece);
+                        }
                         _ => return Err("invalid value in 'concat' list".into_value(ctx).into()),
-                    }
-                    if out.len() > TABLE_CONCAT_MAX_BYTES {
-                        return Err("concat result exceeds the byte ceiling"
-                            .into_value(ctx)
-                            .into());
                     }
                 }
                 stack.replace(ctx, ctx.intern(out.as_bytes()));
@@ -784,5 +839,63 @@ mod tests {
             matches!(outcome, ExecuteOutcome::Completed { .. }),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn string_byte_out_of_bounds_and_empty_intervals_return_nil_and_cap_results_3069() {
+        let mut vm = LuaVm::new("string-byte-3069");
+        let outcome = vm
+            .execute(
+                r#"
+                past_end = (string.byte("abc", 4) == nil)
+                empty_range = (string.byte("abc", 3, 2) == nil)
+                neg_before = (string.byte("abc", -5, -4) == nil)
+                clamped_prefix_a, clamped_prefix_b, clamped_prefix_c = string.byte("abc", -5, 2)
+                clamped_prefix_ok = (clamped_prefix_a == 97 and clamped_prefix_b == 98 and clamped_prefix_c == nil)
+                truncated_utf8_cont = (string.byte("\xE2\x80", 3) == nil)
+                local big = string.rep("a", 9000)
+                local ok, err = pcall(string.byte, big, 1, 9000)
+                slice_cap_ok = (not ok) and (string.find(tostring(err), "slice too long", 1, true) ~= nil)
+            "#,
+            )
+            .expect("execute");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.test_global("past_end"), Some(1.0));
+        assert_eq!(vm.test_global("empty_range"), Some(1.0));
+        assert_eq!(vm.test_global("neg_before"), Some(1.0));
+        assert_eq!(vm.test_global("clamped_prefix_ok"), Some(1.0));
+        assert_eq!(vm.test_global("truncated_utf8_cont"), Some(1.0));
+        assert_eq!(vm.test_global("slice_cap_ok"), Some(1.0));
+    }
+
+    #[test]
+    fn table_concat_bounds_element_count_and_oversized_inputs_3069() {
+        let mut vm = LuaVm::new("table-concat-3069");
+        let outcome = vm
+            .execute(
+                r#"
+                empty_range_ok = (table.concat({ "a", "b" }, ",", 3, 2) == "")
+                local t = {}
+                local ok_elem, err_elem = pcall(table.concat, t, "", 1, 5000)
+                elem_cap_ok = (not ok_elem) and (string.find(tostring(err_elem), "element ceiling", 1, true) ~= nil)
+                local huge = string.rep("x", 70000)
+                local ok_sep, err_sep = pcall(table.concat, { "a", "b" }, huge)
+                sep_cap_ok = (not ok_sep) and (string.find(tostring(err_sep), "byte ceiling", 1, true) ~= nil)
+                local ok_val, err_val = pcall(table.concat, { huge })
+                val_cap_ok = (not ok_val) and (string.find(tostring(err_val), "byte ceiling", 1, true) ~= nil)
+            "#,
+            )
+            .expect("execute");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.test_global("empty_range_ok"), Some(1.0));
+        assert_eq!(vm.test_global("elem_cap_ok"), Some(1.0));
+        assert_eq!(vm.test_global("sep_cap_ok"), Some(1.0));
+        assert_eq!(vm.test_global("val_cap_ok"), Some(1.0));
     }
 }

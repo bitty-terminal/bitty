@@ -2572,6 +2572,17 @@ impl PluginRuntime {
         self.timer_fired.retain(|(plugin, _)| plugin != id);
     }
 
+    /// Synchronize host-owned timer deadlines after a non-timer VM callback
+    /// (`dispatch_command`, `pump_parked_commands`, `deliver_event`).
+    ///
+    /// Timers created (`bitty.timers.create`) or cancelled (`bitty.timers.cancel`)
+    /// inside a command or event handler must update `timer_deadlines` before
+    /// the caller queries `timer_deadline()` for idle wake arming.
+    fn sync_callback_timers(&mut self, now: Instant) {
+        self.sync_timer_cancels();
+        self.sync_new_timers(now);
+    }
+
     /// Scan the configured roots and register every valid package.
     ///
     /// Order is fixed so provenance is deterministic: first-party `bundled`
@@ -3818,6 +3829,7 @@ impl PluginRuntime {
                 )));
             }
         };
+        self.sync_callback_timers(Instant::now());
         let result = match result {
             Ok(InvocationOutcome::Completed(value)) => value,
             Ok(InvocationOutcome::Parked) => {
@@ -4114,6 +4126,7 @@ impl PluginRuntime {
                 }
             }
         }
+        self.sync_callback_timers(Instant::now());
         self.publish_hang_command_gauges();
         completed
     }
@@ -4281,7 +4294,9 @@ impl PluginRuntime {
             // One mutable borrow per plugin per event: a handler that
             // re-enters this same VM through services fails closed host-side
             // (`E_SERVICE_FAILED`) instead of aliasing it.
-            let mut vm = vm.borrow_mut();
+            let Ok(mut vm) = vm.try_borrow_mut() else {
+                continue;
+            };
             for handler in handlers {
                 if vm
                     .call_function(&handler, std::slice::from_ref(envelope))
@@ -4291,6 +4306,7 @@ impl PluginRuntime {
                 }
             }
         }
+        self.sync_callback_timers(Instant::now());
         delivered
     }
 

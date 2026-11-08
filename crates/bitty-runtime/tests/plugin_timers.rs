@@ -1040,3 +1040,83 @@ fn at_cap_repeating_chain_reuses_freed_slot() {
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn command_and_event_timer_creates_and_cancels_sync_deadline_immediately_3069() {
+    let data = temp_dir("cmd-evt-sync-3069");
+    let root = temp_dir("cmd-evt-sync-3069-root");
+    let id = PluginId::new("bitty-featured.cmdevtsync").expect("id");
+    write_full_plugin(
+        &root,
+        "bitty-featured.cmdevtsync",
+        &[],
+        &["arm", "cancel"],
+        &["terminal.opened"],
+        "",
+        r#"
+        bitty.commands.register({
+          id = "arm",
+          title = "arm",
+          run = function()
+            local h = bitty.timers.create(100, function()
+              bitty.store.set("cmd_fired", true)
+            end)
+            bitty.store.set("cmd_h", h)
+            return h
+          end,
+        })
+        bitty.commands.register({
+          id = "cancel",
+          title = "cancel",
+          run = function()
+            local h = bitty.store.get("cmd_h")
+            return bitty.timers.cancel(h)
+          end,
+        })
+        bitty.events.subscribe("terminal.opened", function()
+          bitty.timers.create(50, function()
+            bitty.store.set("evt_fired", true)
+          end)
+        end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert_eq!(rt.timer_deadline(), None, "initially unarmed");
+
+    // Creating a timer inside a command immediately arms `timer_deadline()`
+    // without requiring a prior `pump_due_timers()` call.
+    common::settle_dispatch(&mut rt, &id, "arm", &[]).expect_value("arm");
+    assert!(
+        rt.timer_deadline().is_some(),
+        "timer created in command must arm timer_deadline() immediately"
+    );
+
+    // Cancelling that timer inside a command immediately clears `timer_deadline()`.
+    common::settle_dispatch(&mut rt, &id, "cancel", &[]).expect_value("cancel");
+    assert_eq!(
+        rt.timer_deadline(),
+        None,
+        "timer cancelled in command must clear timer_deadline() immediately"
+    );
+
+    // Creating a timer inside an event callback also arms `timer_deadline()` immediately.
+    assert_eq!(
+        rt.deliver_event(
+            "terminal.opened",
+            &LuaValue::table([("terminal_id", LuaValue::Integer(1))])
+        ),
+        1
+    );
+    let evt_deadline = rt
+        .timer_deadline()
+        .expect("timer created in event callback must arm timer_deadline() immediately");
+    assert_eq!(rt.pump_due_timers_at(evt_deadline), 1);
+    assert_eq!(store_get(&rt, &id, "evt_fired"), Some(LuaValue::Bool(true)));
+    assert_eq!(rt.timer_deadline(), None);
+
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}

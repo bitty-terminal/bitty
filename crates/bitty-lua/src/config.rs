@@ -164,7 +164,7 @@ pub const MAX_SNAPSHOT_STRING_BYTES: usize = 65_536;
 /// Counts every `Table::iter` step, including keys the snapshot never captures
 /// (integer keys, keys past a per-table pair cap). This is what keeps the scan
 /// bounded when a table is mostly keys the pair cap would drop: the counter
-/// trips [`SnapshotBudget::fail_iteration_cap`], so an oversized table refuses
+/// trips `SnapshotBudget::fail_iteration_cap`, so an oversized table refuses
 /// the configuration instead of silently losing everything past the cap.
 ///
 /// Sized at four times [`MAX_TOTAL_SNAPSHOT_NODES`]: a legitimate array-heavy
@@ -174,7 +174,7 @@ pub const MAX_SNAPSHOT_STRING_BYTES: usize = 65_536;
 /// each bound can be raised on its own when testing that a test discriminates.
 pub const MAX_TOTAL_SNAPSHOT_SCAN_STEPS: usize = 16_384;
 
-/// Maximum table nesting depth traversed by [`ValueSnapshot::capture_table`].
+/// Maximum table nesting depth traversed by `ValueSnapshot::capture_table`.
 pub const MAX_SNAPSHOT_DEPTH: u8 = 16;
 
 /// Fields rejected until their owning follow-up accepts them (DEC-0111

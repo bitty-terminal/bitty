@@ -456,13 +456,14 @@ impl Runtime {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use bitty_ui::{LayoutNode, SplitAxis};
 
     /// Seeds two leaves and gives `pane` its own `PaneSession`, so the pane's
     /// grid can differ from the primary grid.
+    #[cfg(unix)]
     fn runtime_with_pane(pane: ViewId) -> Runtime {
         let mut rt = Runtime::with_defaults().expect("runtime builds");
         rt.set_layout(LayoutNode::split(
@@ -476,6 +477,7 @@ mod tests {
         rt
     }
 
+    #[cfg(unix)]
     #[test]
     fn unbound_search_refresh_reads_focused_detached_float_grid() {
         bitty_test_support::require_pty!();
@@ -511,6 +513,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn unbound_search_refresh_reads_focused_pinned_grid() {
         bitty_test_support::require_pty!();

@@ -8267,7 +8267,11 @@ mod tests {
         #[cfg(unix)]
         {
             let target_file = root.join("foreign.lua");
-            std::fs::write(&target_file, "return { profile = \"old\" }\n").expect("foreign");
+            std::fs::write(
+                &target_file,
+                "return { format = \"bitty-profile-v1\", profile = \"old\" }\n",
+            )
+            .expect("foreign");
             std::os::unix::fs::symlink(&target_file, &selector_path).expect("symlink selector");
             assert_eq!(selector_profile_from_path(&selector_path), None);
             assert!(

@@ -16,8 +16,12 @@
 #     `.SRCINFO` via `makepkg --printsrcinfo`
 #   - `package()` installs the exact artifact declared by `[[bin]]` in
 #     `crates/bitty-terminal/Cargo.toml`, at `/usr/bin/bitty`
-#   - `package()` installs `bittyd` only when `build()` selects the separate
-#     `bitty-daemon` workspace package (bitty#2999, bitty#3002)
+#   - `package()` installs `bittyd` at `/usr/bin/bittyd` and `build()` selects
+#     the separate `bitty-daemon` workspace package, so the install can never
+#     copy an artifact the build did not produce (bitty#2999, bitty#3002)
+#   - both assertions read only the packing/build bodies, with comments
+#     stripped, so a `check()` probe or a commented-out invocation cannot
+#     satisfy them (bitty#3010)
 #   - the recipe no longer references the retired `bitty-terminal` artifact path
 #   - every desktop/icon source referenced by `package()` exists
 #
@@ -66,21 +70,39 @@ PACKAGE_NAME="$(awk '
 ' "$APP_MANIFEST")"
 [[ -n "$PACKAGE_NAME" ]] || fail "could not read package name from $APP_MANIFEST"
 
-grep -Fq "install -Dm755 \"$INSTALL_SRC\" \"\$pkgdir/usr/bin/bitty\"" "$RECIPE" ||
+# strip_comments — drop trailing `#` comments and whole comment lines, so a
+# recipe that only *mentions* an invocation in a comment cannot satisfy a gate
+# (bitty#3010 hole 2: `# future: -p bitty-daemon` passed the build selection).
+strip_comments() {
+  sed -E 's/[[:space:]]#.*$//' | grep -Ev '^[[:space:]]*#'
+}
+
+# package()/build() bodies, comments stripped. The install needle is matched
+# only in package(), never over the whole recipe: `check()` runs
+# `./target/release/bittyd --version`, which proves the binary was built but not
+# that the package ships it (bitty#3010 hole 1).
+PACKAGE_BODY="$(awk '/^package\(\)/,/^}/' "$RECIPE" | strip_comments || true)"
+BUILD_BODY="$(awk '/^build\(\)/,/^}/' "$RECIPE" | strip_comments || true)"
+
+grep -Fq "install -Dm755 \"$INSTALL_SRC\" \"\$pkgdir/usr/bin/bitty\"" <<<"$PACKAGE_BODY" ||
   fail "package() must install \"$INSTALL_SRC\" to /usr/bin/bitty (declared artifact: $EXPECTED_BIN)"
 
 # Guard against the crate-named (un-renamed) artifact returning in package().
-if awk '/^package\(\)/,/^}/' "$RECIPE" | grep -Fq "target/release/$PACKAGE_NAME"; then
+if grep -Fq "target/release/$PACKAGE_NAME" <<<"$PACKAGE_BODY"; then
   fail "package() references the crate-named target/release/$PACKAGE_NAME artifact"
 fi
 
-# `bittyd` is a separate workspace package (crates/bitty-daemon). When
-# package() installs it, build() must select it: `-p bitty-terminal` alone
-# never produces target/release/bittyd (bitty#2999 shipped green because no
-# gate compared the install list with the build selection).
-if awk '/^package\(\)/,/^}/' "$RECIPE" | grep -Fq 'target/release/bittyd'; then
-  awk '/^build\(\)/,/^}/' "$RECIPE" | grep -Eq -- '-p[[:space:]]+bitty-daemon' ||
+# `bittyd` is a separate workspace package (crates/bitty-daemon), so package()
+# must install it *and* build() must select it: `-p bitty-terminal` alone never
+# produces target/release/bittyd (bitty#2999 shipped green because no gate
+# compared the install list with the build selection). A missing install is a
+# failure, not a pass: without this branch, deleting the install line left both
+# recipes green while the package stopped shipping the daemon (bitty#3010).
+if grep -Fq 'target/release/bittyd' <<<"$PACKAGE_BODY"; then
+  grep -Eq -- '-p[[:space:]]+bitty-daemon' <<<"$BUILD_BODY" ||
     fail "package() installs bittyd but build() does not select -p bitty-daemon"
+else
+  fail "package() must install target/release/bittyd to /usr/bin/bittyd (the source recipe ships the daemon; bitty#3002)"
 fi
 
 # `test "$(./target/release/<bin> --version)" = "$pkgver"` must reference the

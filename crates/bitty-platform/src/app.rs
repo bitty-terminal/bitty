@@ -580,6 +580,13 @@ impl WindowConfig {
         self.blur_radius
     }
 
+    /// Whether the embedded Bitty application icon decodes into a valid
+    /// runtime window icon (`CTX-1750`, `bitty#3038`).
+    #[must_use]
+    pub fn has_window_icon(&self) -> bool {
+        embedded_window_icon().is_some()
+    }
+
     fn into_attributes(self) -> WindowAttributes {
         let transparent = opacity_requests_transparency(self.opacity);
         let mut attributes = WinitWindow::default_attributes()
@@ -591,8 +598,103 @@ impl WindowConfig {
         attributes = apply_optional_size(attributes, self.min_inner_size, SizeKind::Min);
         attributes = apply_optional_size(attributes, self.max_inner_size, SizeKind::Max);
         attributes = apply_app_id(attributes);
+        attributes = apply_window_icon(attributes);
         attributes
     }
+}
+
+/// Embedded 64x64 application icon (`packaging/icons/hicolor/64x64/apps/bitty.png`).
+///
+/// `crates/bitty-terminal/build.rs` embeds `packaging/icons/bitty.ico` into
+/// `bitty.exe` as PE icon resource ID 1, which Windows Explorer reads for the
+/// file/shortcut icon, but `winit` registers `WNDCLASSEXW` with
+/// `hIcon: 0, hIconSm: 0` unless `WindowAttributes::with_window_icon` (and
+/// `WindowAttributesExtWindows::with_taskbar_icon` on Windows) is populated.
+/// Decoding and attaching this icon at window creation sets the runtime
+/// titlebar (`ICON_SMALL`) and taskbar (`ICON_BIG`) icon on Windows as well as
+/// `_NET_WM_ICON` on X11 (`CTX-1750`, `bitty#3038`).
+const EMBEDDED_WINDOW_ICON_PNG: &[u8] =
+    include_bytes!("../../../packaging/icons/hicolor/64x64/apps/bitty.png");
+
+/// Decodes [`EMBEDDED_WINDOW_ICON_PNG`] into `(rgba, width, height)` in RGBA8
+/// format. Cached after the first call so repeated window attribute
+/// construction does not re-run the PNG decoder.
+fn decode_embedded_window_icon_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    static DECODED: std::sync::OnceLock<Option<(Vec<u8>, u32, u32)>> = std::sync::OnceLock::new();
+    DECODED
+        .get_or_init(|| {
+            let mut decoder = png::Decoder::new(std::io::Cursor::new(EMBEDDED_WINDOW_ICON_PNG));
+            decoder.set_ignore_text_chunk(true);
+            decoder.set_transformations(
+                png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+            );
+            let mut reader = decoder.read_info().ok()?;
+            let mut buf = vec![0_u8; reader.output_buffer_size()?];
+            let info = reader.next_frame(&mut buf).ok()?;
+            if info.width == 0 || info.height == 0 {
+                return None;
+            }
+            buf.truncate(info.buffer_size().min(buf.len()));
+            let (color_type, bit_depth) = reader.output_color_type();
+            if bit_depth != png::BitDepth::Eight {
+                return None;
+            }
+            let pixel_count = usize::try_from(info.width)
+                .ok()?
+                .checked_mul(usize::try_from(info.height).ok()?)?;
+            let expected_rgba = pixel_count.checked_mul(4)?;
+            let rgba = match color_type {
+                png::ColorType::Rgba => {
+                    if buf.len() != expected_rgba {
+                        return None;
+                    }
+                    buf
+                }
+                png::ColorType::Rgb => {
+                    if buf.len() != pixel_count.checked_mul(3)? {
+                        return None;
+                    }
+                    let mut out = Vec::with_capacity(expected_rgba);
+                    for px in buf.chunks_exact(3) {
+                        out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+                    }
+                    out
+                }
+                _ => return None,
+            };
+            Some((rgba, info.width, info.height))
+        })
+        .clone()
+}
+
+/// Builds a [`winit::window::Icon`] from the embedded Bitty PNG.
+fn embedded_window_icon() -> Option<winit::window::Icon> {
+    let (rgba, width, height) = decode_embedded_window_icon_rgba()?;
+    winit::window::Icon::from_rgba(rgba, width, height).ok()
+}
+
+/// Attaches the runtime window icon (`with_window_icon`) and, on Windows, the
+/// `ICON_BIG` taskbar icon (`with_taskbar_icon`).
+fn apply_window_icon(attributes: WindowAttributes) -> WindowAttributes {
+    let Some(icon) = embedded_window_icon() else {
+        return attributes;
+    };
+    let attributes = attributes.with_window_icon(Some(icon.clone()));
+    apply_taskbar_icon(attributes, icon)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_taskbar_icon(attributes: WindowAttributes, icon: winit::window::Icon) -> WindowAttributes {
+    use winit::platform::windows::WindowAttributesExtWindows as WindowsExt;
+    WindowsExt::with_taskbar_icon(attributes, Some(icon))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_taskbar_icon(
+    attributes: WindowAttributes,
+    _icon: winit::window::Icon,
+) -> WindowAttributes {
+    attributes
 }
 
 /// The fixed Linux application ID (CTX-0452 / 034 item 7): Wayland `app_id`,
@@ -1235,6 +1337,42 @@ mod tests {
             probe.reveal_edge(&winit::event::WindowEvent::Focused(true)),
             None,
             "an un-occluded probe has no reveal edge to deliver"
+        );
+    }
+
+    #[test]
+    fn embedded_window_icon_decodes_to_valid_non_transparent_icon() {
+        let (rgba, width, height) =
+            decode_embedded_window_icon_rgba().expect("embedded window icon PNG must decode");
+        assert!(width > 0 && height > 0, "icon dimensions must be non-zero");
+        assert_eq!(
+            rgba.len(),
+            (width as usize) * (height as usize) * 4,
+            "decoded icon must be tightly packed RGBA8"
+        );
+        assert!(
+            rgba.chunks_exact(4)
+                .any(|px| px[3] > 0 && (px[0] > 0 || px[1] > 0 || px[2] > 0)),
+            "embedded window icon must contain visible non-transparent pixels"
+        );
+        assert!(
+            winit::window::Icon::from_rgba(rgba, width, height).is_ok(),
+            "decoded RGBA must construct a valid winit::window::Icon"
+        );
+        assert!(
+            embedded_window_icon().is_some(),
+            "embedded_window_icon() must return Some(Icon)"
+        );
+    }
+
+    #[test]
+    fn window_config_into_attributes_attaches_window_icon() {
+        let config = WindowConfig::new().with_title("bitty");
+        assert!(config.has_window_icon());
+        let attributes = config.into_attributes();
+        assert!(
+            attributes.window_icon.is_some(),
+            "WindowConfig::into_attributes must attach window_icon"
         );
     }
 }

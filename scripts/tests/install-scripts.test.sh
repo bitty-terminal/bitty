@@ -191,12 +191,34 @@ else
     'HKCU:\Environment' '-NoShortcut' '-NoPathUpdate' \
     'CurrentVersion\Uninstall\Bitty' 'DisplayIcon' 'EstimatedSize' \
     'NoModify' 'NoRepair' 'UninstallString' 'uninstall.ps1' \
-    '-NoRegistry' 'bitty.ico'; do
+    '-NoRegistry' 'bitty.ico' \
+    'Uninstall Bitty.lnk' 'Programs\Bitty' \
+    'LegacyInnoAppId' 'Uninstall\$($script:LegacyInnoAppId)_is1' \
+    'shell32.dll' 'SHCNE_ASSOCCHANGED' 'SHCNF_IDLIST' \
+    'SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)'; do
     if ! grep -qF -- "$needle" "$PS1_SCRIPT"; then
       echo "FAIL: install.ps1 missing '$needle'" >&2
       FAIL=1
     fi
   done
+fi
+
+# 7b. The legacy Inno Setup cleanup keys off an AppId that install.ps1 has to
+# spell itself: nothing else ties the copy to packaging/windows/bitty.iss:51,
+# so compare them here. A drift silently leaves the stale Inno uninstall entry
+# (or deletes an unrelated key) and no other gate notices.
+ISS_SCRIPT=./packaging/windows/bitty.iss
+# No `sed | head` here: the pipe races SIGPIPE against pipefail and aborts
+# under `set -e` (the same shape as the pass-through pipes above, which stay
+# safe only because their writers emit one small write).
+iss_appid="$(sed -n 's/^AppId={{\([0-9A-Fa-f-]\{36\}\)}$/\1/p' "$ISS_SCRIPT" 2>/dev/null)"
+iss_appid="${iss_appid%%$'\n'*}"
+if [[ -z "$iss_appid" ]]; then
+  echo "FAIL: could not read AppId from $ISS_SCRIPT" >&2
+  FAIL=1
+elif ! grep -qF -- "LegacyInnoAppId = '{$iss_appid}'" "$PS1_SCRIPT"; then
+  echo "FAIL: install.ps1 legacy AppId does not match $ISS_SCRIPT ('{$iss_appid}')" >&2
+  FAIL=1
 fi
 
 # 8. macOS /bin/bash is 3.2: pin install.sh free of bash4-isms.

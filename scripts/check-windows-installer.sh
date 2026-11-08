@@ -54,7 +54,8 @@ fi
 for needle in '[Setup]' '[Files]' '[Icons]' '[Tasks]' '[Languages]' '[Run]' \
   'AppId={' 'DefaultDirName={autopf}' 'WizardStyle=modern' \
   'PrivilegesRequired=lowest' 'ArchitecturesAllowed=x64compatible' \
-  'MinVersion=10.0' 'desktopicon' '{group}' '{autodesktop}' '{uninstallexe}' \
+  'MinVersion=10.0' 'SetupIconFile=..\icons\bitty.ico' \
+  'desktopicon' '{group}' '{autodesktop}' '{uninstallexe}' \
   'MessagesFile: "compiler:Default.isl"'; do
   grep -qF -- "$needle" "$ISS" || fail "missing required token: $needle"
 done

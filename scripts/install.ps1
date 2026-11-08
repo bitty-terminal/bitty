@@ -121,6 +121,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# CTX-1750 (bitty#3038): the legacy Inno Setup AppId. packaging/windows/
+# bitty.iss:51 is the single source of truth (Inno's "{{<guid>}" spelling is
+# the escaped form of "<guid>"); install.ps1 spells it once here and
+# scripts/tests/install-scripts.test.sh asserts the two files agree, because
+# nothing else ties them together.
+$script:LegacyInnoAppId = '{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}'
+
 function Write-BittyLog {
   param([string]$Message)
   Write-Host "install.ps1: $Message"
@@ -134,6 +141,188 @@ function Get-BittyStartMenuDir {
     return ''
   }
   return Join-Path $appData 'Microsoft\Windows\Start Menu\Programs'
+}
+
+function Send-BittyShellIconChange {
+  # Notify the Windows Shell (SHCNE_ASSOCCHANGED = 0x08000000, SHCNF_IDLIST = 0x0000)
+  # via shell32.dll so Explorer and Windows Search immediately invalidate any cached
+  # blank or stale shortcut icon (CTX-1750, bitty#3038).
+  try {
+    if (-not ('Bitty.ShellNativeMethods' -as [type])) {
+      Add-Type -Namespace 'Bitty' -Name 'ShellNativeMethods' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("shell32.dll")]
+public static extern void SHChangeNotify(
+    int wEventId, uint uFlags, System.IntPtr dwItem1, System.IntPtr dwItem2);
+'@
+    }
+    [Bitty.ShellNativeMethods]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
+  } catch {
+    Write-BittyLog "warning: could not refresh shell icon cache via SHChangeNotify: $($_.Exception.Message)"
+  }
+}
+
+function Test-BittyPathWithin {
+  param([string]$Candidate, [string]$Root)
+  # Containment, not equality: a -InstallDir at any descendant of a directory
+  # lives inside it, so a recursive delete of that directory removes the
+  # binary this run just installed. Separator normalization keeps both
+  # spellings comparable and the trailing-separator check keeps
+  # C:\...\Bitty2 from looking like a child of C:\...\Bitty.
+  if ([string]::IsNullOrWhiteSpace($Candidate) -or [string]::IsNullOrWhiteSpace($Root)) {
+    return $false
+  }
+  $rootPath = $Root.Trim().TrimEnd([char[]]@('\', '/')).Replace('/', '\')
+  $candidatePath = $Candidate.Trim().TrimEnd([char[]]@('\', '/')).Replace('/', '\')
+  if ($rootPath -eq '' -or $candidatePath -eq '') {
+    return $false
+  }
+  if ($candidatePath.Equals($rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  return $candidatePath.StartsWith($rootPath + '\', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-BittyLegacyInnoUninstallKey {
+  # Inno derives "<AppId>_is1" from its AppId; packaging/windows/bitty.iss:51
+  # is the single source of truth for the GUID and
+  # scripts/tests/install-scripts.test.sh asserts this copy agrees with it.
+  return "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$($script:LegacyInnoAppId)_is1"
+}
+
+function Remove-BittyLegacyDesktopShortcut {
+  param([string]$LegacyInstallDir, [string]$DesktopDir = '')
+  # packaging/windows/bitty.iss:96 creates {autodesktop}\Bitty under the
+  # opt-in desktopicon task, so a legacy Inno install leaves Bitty.lnk on the
+  # desktop pointing at the binary this run deletes -- the dead shortcut
+  # bitty#3038 reports. Remove it only when its target resolves into the
+  # legacy install directory; any shortcut the user pointed elsewhere stays.
+  if ([string]::IsNullOrWhiteSpace($DesktopDir)) {
+    $DesktopDir = [Environment]::GetFolderPath('Desktop')
+  }
+  if ([string]::IsNullOrWhiteSpace($DesktopDir)) {
+    return $false
+  }
+  # DesktopDir is a test seam: the cleanup fixture points it at a temp
+  # directory so the test never reads or writes a real desktop.
+  $shortcutPath = Join-Path $DesktopDir 'Bitty.lnk'
+  if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+    return $false
+  }
+  try {
+    $shell = New-Object -ComObject WScript.Shell
+    $link = $shell.CreateShortcut($shortcutPath)
+    $target = "$($link.TargetPath)".Trim().Trim([char]'"')
+    if (-not (Test-BittyPathWithin -Candidate $target -Root $LegacyInstallDir)) {
+      return $false
+    }
+    Remove-Item -LiteralPath $shortcutPath -Force
+    Write-BittyLog "removed legacy Inno Setup desktop shortcut: $shortcutPath (target $target)"
+    return $true
+  } catch {
+    Write-BittyLog "warning: could not inspect or remove the legacy desktop shortcut ${shortcutPath}: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Remove-BittyLegacyInnoSetup {
+  param([string]$CurrentInstallDir, [string]$DesktopDir = '')
+  # CTX-1750 (bitty#3038): per-user Inno Setup (packaging/windows/bitty.iss)
+  # installs to %LOCALAPPDATA%\Programs\Bitty, writes its Start Menu group to
+  # %AppData%\Microsoft\Windows\Start Menu\Programs\Bitty (Bitty.lnk and
+  # Uninstall Bitty.lnk), registers the per-user uninstall key
+  # HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\<AppId>_is1, and
+  # optionally a desktop shortcut. Clean up any stale per-user Inno Setup
+  # artifacts so Windows Search never launches an older setup binary over the
+  # fresh install.ps1 binary.
+  #
+  # Every removal here is scoped to what Inno created: the group folder only
+  # goes when it is empty (a shortcut the user added must survive), the
+  # install directory is never touched when the current install lives inside
+  # it, and the uninstall key only goes once the directory is really gone.
+  $removedAny = $false
+  $startMenuDir = Get-BittyStartMenuDir
+  if ($startMenuDir -ne '') {
+    $legacyGroupDir = Join-Path $startMenuDir 'Bitty'
+    foreach ($legacyLeaf in @('Bitty.lnk', 'Uninstall Bitty.lnk')) {
+      $legacyShortcut = Join-Path $legacyGroupDir $legacyLeaf
+      if (Test-Path -LiteralPath $legacyShortcut) {
+        try {
+          Remove-Item -LiteralPath $legacyShortcut -Force
+          Write-BittyLog "removed legacy Inno Setup shortcut: $legacyShortcut"
+          $removedAny = $true
+        } catch {
+          Write-BittyLog "warning: could not remove legacy Inno Setup shortcut ${legacyShortcut}: $($_.Exception.Message)"
+        }
+      }
+    }
+    if (Test-Path -LiteralPath $legacyGroupDir) {
+      # Never recursive: the folder is the user's Start Menu group and may
+      # hold shortcuts they created. Drop it only once it is empty.
+      try {
+        $remaining = @(Get-ChildItem -LiteralPath $legacyGroupDir -Force)
+        if ($remaining.Count -eq 0) {
+          Remove-Item -LiteralPath $legacyGroupDir -Force
+          Write-BittyLog "removed empty legacy Inno Setup Start Menu folder: $legacyGroupDir"
+          $removedAny = $true
+        } else {
+          Write-BittyLog "kept legacy Inno Setup Start Menu folder ${legacyGroupDir}: $($remaining.Count) other item(s) remain, so they are left untouched"
+        }
+      } catch {
+        Write-BittyLog "warning: could not clean up the legacy Inno Setup Start Menu folder ${legacyGroupDir}: $($_.Exception.Message)"
+      }
+    }
+  }
+  $localAppData = "$env:LocalAppData"
+  $legacyDirAbsent = $false
+  if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+    $legacyInstallDir = Join-Path $localAppData 'Programs\Bitty'
+    $normLegacy = $legacyInstallDir.TrimEnd([char[]]@('\', '/'))
+    $normCurrent = "$CurrentInstallDir".TrimEnd([char[]]@('\', '/'))
+    if (-not $normLegacy.Equals($normCurrent, [System.StringComparison]::OrdinalIgnoreCase)) {
+      if (Test-Path -LiteralPath $legacyInstallDir) {
+        if (Test-BittyPathWithin -Candidate $normCurrent -Root $normLegacy) {
+          # -InstallDir lives under %LOCALAPPDATA%\Programs\Bitty: deleting
+          # that tree would remove the fresh install along with it.
+          Write-BittyLog "kept legacy Inno Setup directory ${legacyInstallDir}: the current install directory ${normCurrent} lives inside it"
+        } else {
+          try {
+            Remove-Item -LiteralPath $legacyInstallDir -Recurse -Force
+            Write-BittyLog "removed legacy Inno Setup directory: $legacyInstallDir"
+            $removedAny = $true
+          } catch {
+            Write-BittyLog "warning: could not remove legacy Inno Setup directory ${legacyInstallDir} (close any running Bitty window from that path): $($_.Exception.Message)"
+          }
+        }
+      }
+      try {
+        if (Remove-BittyLegacyDesktopShortcut -LegacyInstallDir $normLegacy -DesktopDir $DesktopDir) {
+          $removedAny = $true
+        }
+      } catch {
+        Write-BittyLog "warning: could not clean up the legacy desktop shortcut: $($_.Exception.Message)"
+      }
+    }
+    # Deleting the uninstall key while the directory survives (a warned-about
+    # removal, or the containment skip above) would leave files on disk with
+    # no way to uninstall them, so the key only goes once the tree is gone.
+    $legacyDirAbsent = -not (Test-Path -LiteralPath $legacyInstallDir)
+  }
+  if ($legacyDirAbsent) {
+    $legacyUninstallKey = Get-BittyLegacyInnoUninstallKey
+    if (Test-Path -LiteralPath $legacyUninstallKey) {
+      try {
+        Remove-Item -LiteralPath $legacyUninstallKey -Recurse -Force
+        Write-BittyLog "removed legacy Inno Setup uninstall entry: $legacyUninstallKey"
+        $removedAny = $true
+      } catch {
+        Write-BittyLog "warning: could not remove legacy Inno Setup uninstall entry ${legacyUninstallKey}: $($_.Exception.Message)"
+      }
+    }
+  }
+  if ($removedAny) {
+    Send-BittyShellIconChange
+  }
+  return $removedAny
 }
 
 function New-BittyShortcut {
@@ -155,14 +344,17 @@ function New-BittyShortcut {
     if (-not (Test-Path $startMenuDir)) {
       New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
     }
+    if (Test-Path -LiteralPath $shortcutPath) {
+      Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+    }
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $TargetExe
     $shortcut.WorkingDirectory = $WorkingDirectory
     $shortcut.IconLocation = "$IconSource,0"
     $shortcut.Description = 'Bitty terminal'
-    # Save() writes in place, so a re-run replaces the existing shortcut.
     $shortcut.Save()
+    Send-BittyShellIconChange
     Write-BittyLog "created Start Menu shortcut: $shortcutPath (icon: $IconSource)"
   } catch {
     Write-BittyLog "warning: could not create Start Menu shortcut ${shortcutPath}: $($_.Exception.Message)"
@@ -801,6 +993,9 @@ try {
   $markerPrefix = Split-Path -Path $InstallDir -Parent
   Write-BittyInstallMarker -Channel 'script' -Prefix $markerPrefix -BinDir $InstallDir `
     -VersionBare $versionBare -BinaryPath $destExe
+  # [void]: the cleanup reports whether it removed anything, and that return
+  # value must not leak into this script's output.
+  [void](Remove-BittyLegacyInnoSetup -CurrentInstallDir $InstallDir)
   if ($NoShortcut) {
     Write-BittyLog 'skipping the Start Menu shortcut (-NoShortcut)'
     Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"

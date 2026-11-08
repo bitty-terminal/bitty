@@ -68,6 +68,7 @@ WizardStyle=modern
 Compression=lzma2/ultra
 SolidCompression=yes
 SetupMutex=BittySetupMutex
+SetupIconFile=..\icons\bitty.ico
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 UninstallDisplayIcon={app}\bitty.exe
 OutputDir=dist

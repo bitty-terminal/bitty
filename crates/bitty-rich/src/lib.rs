@@ -170,6 +170,7 @@ pub use image::{
 };
 pub use kitty_decode::{
     KittyDecodeError, KittyDecodedImage, decode_kitty_payload, precheck_png_payload,
+    verify_png_payload,
 };
 pub use kitty_place::{
     KITTY_ANIM_MAX_BYTES_PER_IMAGE, KITTY_ANIM_MAX_FRAMES, KITTY_COMPOSE_BLEND,

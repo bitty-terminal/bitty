@@ -2590,6 +2590,12 @@ impl Runtime {
             // done its job and must never wake a visible surface.
             self.pending_full_redraw = true;
             self.hidden_repair_at = None;
+            // bitty#3023: a confirmation bound armed for a hide that retained
+            // nothing belongs to the hidden incarnation. The reveal frame is
+            // the stronger evidence and re-arms the bound when it commits, so
+            // keeping the old deadline would only force a duplicate corrective
+            // repaint for a frame the reveal already supersedes.
+            self.clear_present_confirmation();
         } else {
             // Hide: cancel the pending presentation without consuming
             // anything. `mark_frame_presented` is deliberately *not* called:

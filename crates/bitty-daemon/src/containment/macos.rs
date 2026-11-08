@@ -7,9 +7,11 @@
 //! reports the dedicated `D-05` cleanup class `group-signalled`; it never
 //! claims `swept` and never signals a pid it did not record.
 //!
-//! This plan is selected by [`probe`], but the daemon does not yet reach it:
-//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
-//! plan is implemented and unit-tested here, not enforced by `bittyd`.
+//! This plan is selected by [`probe`] and is on the served spawn path: a
+//! `bittyd` on this cell opens the PTY, spawns through [`spawn_with`], and
+//! reports the `group-signalled` class a stop can prove. It never reports
+//! `swept`, and its session records carry no durable journal identity, so the
+//! orphan verifier stays unserved here.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -18,7 +20,7 @@ use std::process::{Child, Command, ExitStatus};
 use nix::sys::signal::Signal;
 use nix::unistd::{Pid, getpgid};
 
-use crate::orphan::identity::ProcessGroupId;
+use crate::orphan::identity::{ProcessGroupId, ProcessIdentity};
 use crate::platform::PlatformCell;
 use crate::registry::CleanupClass;
 
@@ -167,6 +169,30 @@ impl ContainedChild {
         Ok(status)
     }
 
+    /// Whether the direct child has exited, without reaping it.
+    ///
+    /// macOS has no `waitid(2)` in the safe surface, so the plan peeks at the
+    /// kernel's process status instead: a zombie status means the leader
+    /// exited and stays unreaped. The probe passes the zombie-inclusive
+    /// `proc_pidinfo` selector, so an unreaped child is reported as `SZOMB`
+    /// rather than `ESRCH`. A zombie keeps its pid, and therefore the
+    /// process-group id minted from it, reserved, so the recorded group can
+    /// still be signalled after a natural exit without racing a reused id.
+    #[must_use]
+    pub fn leader_exited(&self) -> bool {
+        super::macos_sys::leader_exited(self.child.id())
+    }
+
+    /// The journal identity this plan can re-verify after a restart.
+    ///
+    /// The macOS process-group record has no observable start time in this
+    /// slice, so there is nothing the orphan verifier could re-check. The plan
+    /// returns `None`, and the journal is not served on this cell.
+    #[must_use]
+    pub const fn durable_identity(&self) -> Option<ProcessIdentity> {
+        None
+    }
+
     /// Nothing to drain beyond the recorded group.
     ///
     /// A no-op until this handle confirmed the leader reap: [`drain_group`]
@@ -284,11 +310,13 @@ impl ContainedChild {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::process::Stdio;
     use std::time::Duration;
 
     use super::*;
     use crate::containment::CLEANUP_GROUP_SIGNALLED;
+    use crate::containment::macos_sys::{observe_leader, observe_leader_with_arg};
 
     fn report() -> ContainmentReport {
         ContainmentReport::process_group(PlatformCell::current())
@@ -351,6 +379,54 @@ mod tests {
             !group_has_members(child.process_group().get()),
             "the recorded group must be observed gone"
         );
+    }
+
+    /// A zombie keeps its pid reserved, so the peek must not reap the leader.
+    ///
+    /// This is the macOS replacement for the FreeBSD `waitid(WNOWAIT)` probe:
+    /// the plan has to observe the exit before it signals the recorded group,
+    /// and the status must still be collectable afterwards. The failure message
+    /// prints the production probe and both `proc_pidinfo` `arg` values, so a
+    /// runner failure says whether the call failed, returned a live status, or
+    /// named a gone pid.
+    #[test]
+    fn a_zombie_leader_is_observed_exited_without_a_reap() {
+        let report = report();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_with(
+            &report,
+            "bittyd-test-zombie",
+            &mut command,
+            limits(),
+            SessionMode::ProcessGroup,
+        )
+        .expect("a contained spawn");
+        let pid = child.pid();
+        let last = Cell::new(observe_leader(pid));
+        let observed = wait_bounded(limits().kill_wait(), limits(), || {
+            let observation = observe_leader(pid);
+            last.set(observation);
+            observation.proved_exit(pid)
+        });
+        // XNU's `arg` is the zombie selector: `proc_find` does not return a
+        // zombie, so `arg = 0` misses it while `arg = 1` uses
+        // `proc_find_zombref`. Report both on failure.
+        let without_zombie_selector = observe_leader_with_arg(pid, 0);
+        let with_zombie_selector = observe_leader_with_arg(pid, 1);
+        assert!(
+            observed,
+            "the exited leader must read as a zombie: production probe {last}; \
+             arg=0 {without_zombie_selector}; arg=1 {with_zombie_selector}; pid {pid}",
+            last = last.get()
+        );
+        // The peek did not reap it, so the handle still collects the status.
+        let status = child.wait().expect("reap the leader");
+        assert!(status.success(), "the leader exited cleanly");
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! Status: **service loop plus the in-memory state core, the session event
 //! stream, the compiled limits with their idempotency and audit stores, the
 //! endpoint, instance-lock, and peer-trust primitives, the attach/control
-//! state machine, Linux process containment with a served orphan verifier,
-//! the process spawn/bind path, and the terminal content plane**. This crate
+//! state machine, POSIX process containment (Linux, macOS, and FreeBSD) with
+//! a Linux-served orphan verifier, the process spawn/bind path, and the
+//! terminal content plane**. This crate
 //! fixes the service version, the capability set,
 //! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
@@ -102,10 +103,9 @@
 //!   with the `PR_SET_CHILD_SUBREAPER` fallback, the Windows kill-on-close job
 //!   object, the FreeBSD `procctl(2)` reaper, and the macOS process-group plan
 //!   with its `group-signalled` cleanup class — plus typed refusals on every
-//!   other cell (`D-06`, `D-15`). The Windows, FreeBSD, and macOS plans are
-//!   implemented-only: `probe()` selects them, but the served spawn path
-//!   ([`worker::spawn_path_served`]) is Linux-only, so no product path applies
-//!   them yet.
+//!   other cell (`D-06`, `D-15`). The Linux, FreeBSD, and macOS plans are on
+//!   the served spawn path ([`worker::spawn_path_served`]); the Windows plan is
+//!   implemented-only because this crate has no ConPTY backend yet.
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
 //! - [`content`]: the bounded terminal byte buffer, the hex codec, the

@@ -34,8 +34,9 @@
 //! the environment is exactly the explicit spawn specification, stdio is the
 //! PTY slave only, and the child's descriptor table is reduced to exactly
 //! 0/1/2 before `exec` - the slave handles are close-on-exec duplicates and a
-//! `close_range(2)` sweep in the child marks everything the parent already
-//! held close-on-exec, so a harness pipe or a sibling's transient handle cannot
+//! `close_range(2)` sweep (a bounded `fcntl(2)` scan on macOS, which has no
+//! `close_range`) in the child marks everything the parent already held
+//! close-on-exec, so a harness pipe or a sibling's transient handle cannot
 //! survive the exec. The master is close-on-exec, and the listener, audit,
 //! journal, and capability descriptors are all opened close-on-exec by their
 //! owners.
@@ -50,41 +51,41 @@
 //! it. The terminal spawn path is the separately accepted 1.3 slice and keeps
 //! the containment-plan gate ([`spawn_path_served`]).
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::collections::BTreeMap;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::io::{Read as _, Write as _};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::process::{Command, ExitStatus, Stdio};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use nix::sys::signal::Signal;
 
 #[cfg(all(test, target_os = "linux"))]
 use crate::containment::ExecRefusalKind;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::containment::{ContainmentError, ContainmentLimits, SessionMode, spawn_with};
 use crate::containment::{
     ContainmentKind, ContainmentRecord, ContainmentReport, ExecRefusal, SESSION_CGROUP_PREFIX,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::content::ContentBuffer;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::lease::{ExitObservation, SessionHost, Termination};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::limits::LimitId;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::orphan::OrphanSupervisor;
 use crate::registry::{CleanupClass, DaemonInstanceId, SessionId};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::registry::{LifecycleState, MonotonicMs, SessionKind};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use crate::spawn::SpawnSpec;
 
 /// Whether the two `D-01` enablement conditions exist in this build.
@@ -118,12 +119,31 @@ pub fn sessions_served(report: &ContainmentReport) -> bool {
 /// Whether this build and plan serve the contained spawn path for terminals.
 ///
 /// This is the separately accepted 1.3 terminal-spawn slice: it depends only on
-/// the platform cell and the plan the startup probe selected, never on the
-/// reserved worker capability. A `Refused` plan returns the typed
-/// `Denied/UnsupportedCapability` before the spawn specification is parsed.
+/// the plan the startup probe selected, never on the reserved worker capability
+/// and never on the compiled cell alone. Every POSIX plan that mints a
+/// containment identity is served:
+///
+/// - `CgroupV2` and `Subreaper` (Linux) report `swept` when their verification
+///   covers the recorded tree;
+/// - `FreebsdReaper` reports `swept` when the reaper verifies the group and the
+///   recorded descendants empty;
+/// - `ProcessGroup` (macOS) is served but never advertises `swept`: it reports
+///   the dedicated `group-signalled` class because a process group cannot prove
+///   a reparented or re-sessioned descendant is gone.
+///
+/// `WindowsJob` is not served yet: this crate has no ConPTY backend, so a
+/// Windows daemon cannot own a terminal (bitty#2985). A `Refused` plan returns
+/// the typed `Denied/UnsupportedCapability` before the spawn specification is
+/// parsed.
 #[must_use]
 pub fn spawn_path_served(report: &ContainmentReport) -> bool {
-    cfg!(target_os = "linux") && report.kind() != ContainmentKind::Refused
+    matches!(
+        report.kind(),
+        ContainmentKind::CgroupV2
+            | ContainmentKind::Subreaper
+            | ContainmentKind::FreebsdReaper
+            | ContainmentKind::ProcessGroup
+    )
 }
 
 /// Bytes one worker's PTY may hand the poll loop in a single tick.
@@ -142,7 +162,7 @@ pub const DRAIN_BUDGET_BYTES: usize =
 /// An empty pool still reports the full bound so the caller never divides by
 /// zero; the clamp keeps a pool larger than the budget at one byte per worker
 /// instead of a zero-byte tick that would never make progress.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn per_worker_drain_budget(worker_count: usize) -> usize {
     DRAIN_BUDGET_BYTES
         .checked_div(worker_count.max(1))
@@ -304,7 +324,7 @@ pub fn cgroup_name(instance: DaemonInstanceId, session: SessionId) -> String {
 }
 
 /// One spawned worker and its owned PTY.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 #[derive(Debug)]
 struct Worker {
     child: crate::containment::ContainedChild,
@@ -331,15 +351,15 @@ struct Worker {
 /// The pool is metadata plus the owned child and PTY handles. It never exposes
 /// a pid, a descriptor, or caller bytes.
 pub struct WorkerPool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     workers: BTreeMap<SessionId, Worker>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     limits: ContainmentLimits,
     /// Committed `spawn_bind_timeout_ms` for the spawn+PTY handoff.
     ///
     /// Enforced by [`WorkerPool::spawn`] before the caller commits the
     /// orphan-journal identity or binds generation `1` (bitty#2790).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     bind_timeout_ms: u64,
     /// One-shot pre-bind pause used by the failure-injection tests.
     ///
@@ -364,7 +384,7 @@ impl Drop for WorkerPool {
         // A pool that is dropped while a handle is still live (an abnormal
         // service teardown, a test fixture) must not leak a child. The bounded
         // terminate path reaps the leader and drains the recorded identity.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
             for session_id in session_ids {
@@ -381,17 +401,17 @@ impl WorkerPool {
     /// An empty pool with the compiled escalation bounds.
     #[must_use]
     pub fn new(limits: &crate::limits::Limits) -> Self {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             Self {
                 workers: BTreeMap::new(),
                 limits: ContainmentLimits::for_session_stop(limits),
                 bind_timeout_ms: limits.effective(LimitId::SpawnBindTimeoutMs),
-                #[cfg(test)]
+                #[cfg(all(test, target_os = "linux"))]
                 pre_bind_delay: None,
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         {
             let _ = limits;
             Self {}
@@ -411,11 +431,11 @@ impl WorkerPool {
     /// Number of live bound workers.
     #[must_use]
     pub fn len(&self) -> usize {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             self.workers.len()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         {
             0
         }
@@ -430,11 +450,11 @@ impl WorkerPool {
     /// Whether a worker is bound to `session_id`.
     #[must_use]
     pub fn contains(&self, session_id: crate::registry::SessionId) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             self.workers.contains_key(&session_id)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         {
             let _ = session_id;
             false
@@ -451,13 +471,13 @@ impl WorkerPool {
     /// frame.
     #[must_use]
     pub fn content_ready(&self, session_id: crate::registry::SessionId) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             self.workers
                 .get(&session_id)
                 .is_some_and(Worker::content_ready)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         {
             let _ = session_id;
             false
@@ -471,17 +491,23 @@ impl WorkerPool {
     /// record is retained for reads.
     #[must_use]
     pub fn session_ids(&self) -> Vec<crate::registry::SessionId> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         {
             self.workers.keys().copied().collect()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
         {
             Vec::new()
         }
     }
 
-    /// Spawn one worker and retain its handle. Returns the observed identity.
+    /// Spawn one worker and retain its handle.
+    ///
+    /// Returns the identity the plan records for the orphan journal, or `None`
+    /// when the plan has no durable identity to re-verify after a restart. The
+    /// Linux cgroup and subreaper plans record one; the FreeBSD reaper and the
+    /// macOS process-group plan do not, so their sessions commit no journal
+    /// record and the orphan verifier stays unserved on those cells.
     ///
     /// The configured `spawn_bind_timeout_ms` bounds the whole PTY and spawn
     /// handoff, and the child must still be usable when the bind probe runs:
@@ -519,7 +545,7 @@ impl WorkerPool {
     /// [`WorkerSpawnError::BindTimeout`] when the child existed but could not
     /// bind, or [`WorkerSpawnError::Cleanup`] with the class the plan could
     /// prove after terminating a child that did exist.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn spawn(
         &mut self,
         report: &ContainmentReport,
@@ -527,7 +553,7 @@ impl WorkerPool {
         session_id: SessionId,
         spec: &SpawnSpec,
         kind: SessionKind,
-    ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
+    ) -> Result<Option<crate::orphan::identity::ProcessIdentity>, WorkerSpawnError> {
         let started = Instant::now();
         let name = cgroup_name(instance, session_id);
         let mut pty = PtyCommand::build(spec)?;
@@ -558,7 +584,7 @@ impl WorkerPool {
                 });
             }
         };
-        let identity = child.identity();
+        let identity = child.durable_identity();
         // The command owned the parent-side copies of the child's stdio. Those
         // copies must be gone before the PTY hangup probe runs, or the master
         // would still have a slave reference and a dead child would look
@@ -570,7 +596,7 @@ impl WorkerPool {
             let cleanup = child.terminate(self.limits).class();
             return Err(WorkerSpawnError::Cleanup(cleanup));
         }
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         if let Some(delay) = self.pre_bind_delay.take() {
             std::thread::sleep(delay);
         }
@@ -595,7 +621,7 @@ impl WorkerPool {
     }
 
     /// The configured bind deadline as a duration.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     fn bind_timeout(&self) -> Duration {
         Duration::from_millis(self.bind_timeout_ms)
     }
@@ -612,7 +638,7 @@ impl WorkerPool {
     /// On refusal the child is terminated through the same bounded
     /// `SIGTERM` -> `SIGKILL` escalation supervision uses, and the returned
     /// class is what the containment plan could prove.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     fn probe_bindable(
         &self,
         child: &mut crate::containment::ContainedChild,
@@ -640,7 +666,7 @@ impl WorkerPool {
     /// # Errors
     ///
     /// Always [`WorkerSpawnError::Unsupported`].
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn spawn(
         &mut self,
         _report: &crate::containment::ContainmentReport,
@@ -648,7 +674,7 @@ impl WorkerPool {
         _session_id: crate::registry::SessionId,
         _spec: &crate::spawn::SpawnSpec,
         _kind: crate::registry::SessionKind,
-    ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
+    ) -> Result<Option<crate::orphan::identity::ProcessIdentity>, WorkerSpawnError> {
         Err(WorkerSpawnError::Unsupported)
     }
 
@@ -658,7 +684,7 @@ impl WorkerPool {
     ///
     /// [`ResizeError::NotBound`] when no worker is bound, or
     /// [`ResizeError::Pty`] when the ioctl fails.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn resize(&self, session_id: SessionId, cols: u16, rows: u16) -> Result<(), ResizeError> {
         let worker = self.workers.get(&session_id).ok_or(ResizeError::NotBound)?;
         crate::containment::resize_pty(&worker.master, cols, rows).map_err(|_| ResizeError::Pty)
@@ -669,7 +695,7 @@ impl WorkerPool {
     /// # Errors
     ///
     /// Always [`ResizeError::NotBound`].
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn resize(
         &self,
         _session_id: crate::registry::SessionId,
@@ -686,7 +712,7 @@ impl WorkerPool {
     /// terminal), or a handle removed after exit. A live terminal with an empty
     /// buffer is `Some` with zero bytes, so the caller can distinguish "no data
     /// yet" from "not running".
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn read(&mut self, session_id: SessionId, max_bytes: usize) -> Option<ContentRead> {
         let worker = self.workers.get_mut(&session_id)?;
         if !worker.content_enabled || worker.exit.is_some() {
@@ -700,7 +726,7 @@ impl WorkerPool {
     }
 
     /// Non-served cells have no terminal content plane.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn read(
         &mut self,
         _session_id: crate::registry::SessionId,
@@ -715,7 +741,7 @@ impl WorkerPool {
     /// written; a partial write is [`ContentWrite::Accepted`] with the caller's
     /// remaining tail. The daemon keeps no write queue, so a slow child cannot
     /// grow memory or stall the poll loop.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn write(&mut self, session_id: SessionId, data: &[u8]) -> ContentWrite {
         let Some(worker) = self.workers.get_mut(&session_id) else {
             return ContentWrite::Closed;
@@ -727,7 +753,7 @@ impl WorkerPool {
     }
 
     /// Non-served cells have no writable content plane.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn write(&mut self, _session_id: crate::registry::SessionId, _data: &[u8]) -> ContentWrite {
         ContentWrite::Closed
     }
@@ -737,7 +763,7 @@ impl WorkerPool {
     /// Dividing the budget evenly keeps a continuously writing session from
     /// starving the rest; an unused share is not redistributed, so the total
     /// never exceeds one `max_chunk_bytes` per pass.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     fn drain_tick(&mut self) {
         let budget = per_worker_drain_budget(self.workers.len());
         for worker in self.workers.values_mut() {
@@ -756,7 +782,7 @@ impl WorkerPool {
     /// handle is never dropped while its child may still run: a session
     /// collected before its worker settled is terminated and its journal
     /// record settled first.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn supervise(
         &mut self,
         host: &mut SessionHost,
@@ -766,9 +792,12 @@ impl WorkerPool {
         let mut finished = Vec::new();
         let kill_wait_ms = u64::try_from(self.limits.kill_wait().as_millis()).unwrap_or(u64::MAX);
         // A descendant killed by the natural-exit group signal can become a
-        // zombie only after the tick that recorded the exit. The subreaper plan
-        // adopts it, so reap adopted children on every pass; the cgroup plan
-        // never adopts one and this finds nothing.
+        // zombie only after the tick that recorded the exit. The Linux
+        // subreaper plan adopts it, so reap adopted children on every pass; the
+        // cgroup plan never adopts one and this finds nothing. FreeBSD drains
+        // its adopted children inside the plan's own sweep and drain calls,
+        // and the macOS process-group plan has no reaper.
+        #[cfg(target_os = "linux")]
         crate::containment::drain_adopted_children();
         self.drain_tick();
         let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
@@ -846,7 +875,7 @@ impl WorkerPool {
     }
 
     /// Non-served cells have no workers to supervise.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn supervise(
         &mut self,
         _host: &mut crate::lease::SessionHost,
@@ -860,7 +889,7 @@ impl WorkerPool {
     ///
     /// Used when the daemon is already stopping and cannot wait for a later
     /// tick. The terminal transition is recorded by the caller.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn terminate(&mut self, session_id: SessionId) -> Option<CleanupClass> {
         self.workers.get_mut(&session_id).map(|worker| {
             worker.settled = true;
@@ -869,7 +898,7 @@ impl WorkerPool {
     }
 
     /// Non-served cells have no worker to terminate.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn terminate(&mut self, _session_id: crate::registry::SessionId) -> Option<CleanupClass> {
         None
     }
@@ -882,7 +911,7 @@ impl WorkerPool {
     /// zombie. Returns the cleanup class when this call had to settle the
     /// handle, so the caller can settle its journal record; `None` when the
     /// handle was already settled or absent.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub fn forget(&mut self, session_id: SessionId) -> Option<CleanupClass> {
         let mut worker = self.workers.remove(&session_id)?;
         if worker.settled {
@@ -896,7 +925,7 @@ impl WorkerPool {
     }
 
     /// Drop the handle of a session the registry already terminalized.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     pub fn forget(&mut self, _session_id: crate::registry::SessionId) -> Option<CleanupClass> {
         None
     }
@@ -908,7 +937,7 @@ impl WorkerPool {
 /// was accepted, so the caller gets the typed `ChannelFull` refusal and retries
 /// later. A partial `Ok(n)` is a success with the caller's tail; any other
 /// error means the PTY is gone.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn classify_write(result: io::Result<usize>, attempted: usize) -> ContentWrite {
     match result {
         Ok(0) => ContentWrite::Backpressure { attempted },
@@ -928,7 +957,7 @@ fn classify_write(result: io::Result<usize>, attempted: usize) -> ContentWrite {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 impl Worker {
     /// Whether this handle still owns a live, writable content plane.
     ///
@@ -987,16 +1016,16 @@ impl Worker {
 }
 
 /// The command plus the owned PTY master.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 struct PtyCommand {
     command: Command,
     master: Option<File>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 impl PtyCommand {
     fn build(spec: &SpawnSpec) -> Result<Self, WorkerSpawnError> {
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         if openpty_failure::take() {
             return Err(WorkerSpawnError::Pty);
         }
@@ -1060,7 +1089,7 @@ impl PtyCommand {
 /// probe never reads content: it only asks whether the terminal can still
 /// deliver a frame. `POLLIN` with buffered output is fine; `POLLHUP`, an
 /// error, or an invalid descriptor is not.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn pty_slave_open(master: &File) -> bool {
     use std::os::fd::AsFd as _;
 
@@ -1110,7 +1139,7 @@ pub(crate) mod openpty_failure {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
     // `openpty` descriptors are not close-on-exec. The child `dup2`s these
     // copies onto 0/1/2 (which clears CLOEXEC on the target), so the copies
@@ -1122,7 +1151,7 @@ fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
     crate::containment::dup_cloexec(slave).map_err(|_| WorkerSpawnError::Pty)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn signal_number(status: ExitStatus) -> Option<u32> {
     use std::os::unix::process::ExitStatusExt as _;
     status
@@ -1131,7 +1160,7 @@ fn signal_number(status: ExitStatus) -> Option<u32> {
 }
 
 /// Reduce one exit status to the observation the lease layer records.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn observation(status: ExitStatus) -> ExitObservation {
     match status.code() {
         Some(code) => ExitObservation::Exited {
@@ -1158,6 +1187,68 @@ mod tests {
 
     /// Pause between content-plane readiness polls.
     const READY_POLL: Duration = Duration::from_millis(10);
+
+    /// The spawn gate follows the selected plan, not the compiled cell.
+    ///
+    /// The macOS and FreeBSD report shapes are the ones their probes build, so
+    /// the decision is exercised on a Linux runner without either host.
+    #[test]
+    fn the_spawn_gate_serves_every_posix_plan_and_refuses_the_rest() {
+        use crate::containment::{CLEANUP_GROUP_SIGNALLED, CLEANUP_SWEPT};
+        use crate::platform::PlatformCell;
+
+        let cgroup = ContainmentReport::cgroup_v2(
+            PlatformCell::LinuxX86_64,
+            std::path::PathBuf::from("/sys/fs/cgroup/bittyd-probe"),
+        );
+        assert!(spawn_path_served(&cgroup));
+        assert_eq!(cgroup.cleanup_claim(), CLEANUP_SWEPT);
+
+        let subreaper = ContainmentReport::subreaper(PlatformCell::LinuxX86_64, None);
+        assert!(spawn_path_served(&subreaper));
+        assert_eq!(subreaper.cleanup_claim(), CLEANUP_SWEPT);
+
+        let freebsd = ContainmentReport::freebsd_reaper(PlatformCell::FreeBsdX86_64);
+        assert!(
+            spawn_path_served(&freebsd),
+            "FreeBSD must reach its reaper plan"
+        );
+        assert!(freebsd.is_enforced());
+        assert_eq!(freebsd.cleanup_claim(), CLEANUP_SWEPT);
+
+        let macos = ContainmentReport::process_group(PlatformCell::MacosArm64);
+        assert!(
+            spawn_path_served(&macos),
+            "macOS must reach its process-group plan"
+        );
+        assert!(
+            !macos.is_enforced(),
+            "a process group cannot prove a whole tree"
+        );
+        assert_eq!(
+            macos.cleanup_claim(),
+            CLEANUP_GROUP_SIGNALLED,
+            "macOS must never advertise swept"
+        );
+
+        let windows = ContainmentReport::windows_job(PlatformCell::WindowsX86_64);
+        assert!(
+            !spawn_path_served(&windows),
+            "no ConPTY backend exists in this crate yet"
+        );
+
+        let refused = ContainmentReport::refused(
+            PlatformCell::MacosArm64,
+            crate::containment::ContainmentRefusal::UnsupportedPlatform {
+                cell: PlatformCell::MacosArm64,
+            },
+        );
+        assert!(
+            !spawn_path_served(&refused),
+            "a refused plan must refuse before the spawn spec is parsed"
+        );
+        assert_eq!(refused.cleanup_claim(), "none");
+    }
 
     /// Spawn one live terminal worker through the production path.
     fn spawn_test_worker(limits: &Limits, argv: &[&str]) -> (WorkerPool, SessionId) {

@@ -302,22 +302,30 @@ loginctl enable-linger "$USER"   # optional: keep it running without a login ses
 
 Install destinations by channel:
 
-| Channel                           | Installs the unit                                        |
-| --------------------------------- | -------------------------------------------------------- |
-| `nfpm.yaml` deb/rpm               | yes, `/usr/lib/systemd/user/bittyd.service`              |
-| `nfpm.yaml` archlinux             | yes, `/usr/lib/systemd/user/bittyd.service`              |
-| `nfpm.yaml` apk                   | no: Alpine runs OpenRC and ships no systemd user manager |
-| `packaging/PKGBUILD` (AUR)        | yes, from `packaging/systemd/bittyd.service`             |
-| `packaging/PKGBUILD.bin`          | yes, from the release bundle `share/systemd/user/`       |
-| `packaging/bitty.spec` (RPM/Copr) | yes, from the release bundle `share/systemd/user/`       |
-| `packaging/alpine/APKBUILD`       | no: OpenRC only, recorded in the recipe                  |
+| Channel                              | Installs the unit                                                             |
+| ------------------------------------ | ----------------------------------------------------------------------------- |
+| `nfpm.yaml` deb/rpm                  | yes, `/usr/lib/systemd/user/bittyd.service`                                   |
+| `nfpm.yaml` archlinux                | yes, `/usr/lib/systemd/user/bittyd.service`                                   |
+| `nfpm.yaml` apk                      | no: Alpine runs OpenRC and ships no systemd user manager                      |
+| `packaging/PKGBUILD` (AUR)           | yes, from `packaging/systemd/bittyd.service`                                  |
+| `packaging/PKGBUILD.bin`             | yes, from the release bundle `share/systemd/user/`                            |
+| `packaging/bitty.spec` (RPM/Copr)    | yes, from the release bundle `share/systemd/user/`                            |
+| `packaging/opensuse/bitty.spec`      | yes, from `packaging/systemd/bittyd.service`                                  |
+| `packaging/solus/package.yml`        | yes, from `packaging/systemd/bittyd.service`                                  |
+| `packaging/gentoo/` ebuilds          | yes under `USE=systemd`; OpenRC is the default profile                        |
+| `packaging/void/` template           | no: Void's default init is runit                                              |
+| `packaging/alpine/APKBUILD`          | no: OpenRC only, recorded in the recipe                                       |
+| `packaging/{freebsd,netbsd,openbsd}` | no: the daemon refuses those cells (contract `D-15`)                          |
+| `scripts/install.sh`                 | yes, `$XDG_CONFIG_HOME/systemd/user` (falls back to `~/.config/systemd/user`) |
 
 The versioned Linux bundle carries it as
 `share/systemd/user/bittyd.service`, which is what the prebuilt recipes
 (`PKGBUILD.bin`, `bitty.spec`) install from. The local syntax gate is
-`systemd-analyze verify --user packaging/systemd/bittyd.service`; no install
-script, `systemctl` enable, or preset ships, because a user unit is enabled per
-user and never by the package.
+`systemd-analyze verify --user packaging/systemd/bittyd.service`. No package
+enables or starts the unit: a user unit is enabled per user. `scripts/install.sh`
+copies the unit into the user unit directory and reloads the user manager when
+one is reachable, but still leaves `systemctl --user enable --now bittyd` to the
+user.
 
 ## Nix Flake
 
@@ -607,9 +615,11 @@ Rationale per OS:
 - Linux fetches the versioned `.tar.zst` bundle, not the bare triple binary.
   The bundle (`scripts/make-unix-bundle.sh`, verified by `verify-unix-bundle`)
   carries `bin/bitty` and `bin/bittyd` plus the desktop entry, icons,
-  AppStream metainfo, and `LICENSE`/`README.md`/`CHANGELOG.md` under one
-  top-level directory; the bare binary has no desktop integration.
-  `install.sh` extracts both binaries and installs `share/` alongside them.
+  AppStream metainfo, the systemd user unit, and
+  `LICENSE`/`README.md`/`CHANGELOG.md` under one top-level directory; the
+  bare binary has no desktop integration. `install.sh` extracts both binaries,
+  installs the desktop integration under `share/`, and places the unit in
+  `$XDG_CONFIG_HOME/systemd/user` (fallback `~/.config/systemd/user`).
   The session host ships on Linux cells only: the macOS and Windows builds
   select the `refused` containment plan, so a daemon there could not create a
   session. Musl/Alpine uses its own native-musl bundle,

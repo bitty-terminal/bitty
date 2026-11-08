@@ -23,9 +23,11 @@
 //! descendant the daemon cannot attribute to another session stays
 //! `unverified`. No pid outside the recorded set is signalled.
 //!
-//! This plan is selected by [`probe`], but the daemon does not yet reach it:
-//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
-//! plan is implemented and unit-tested here, not enforced by `bittyd`.
+//! This plan is selected by [`probe`] and is on the served spawn path: a
+//! `bittyd` on this cell opens the PTY, spawns through [`spawn_with`], and
+//! reports the `swept` class a verified stop can prove. Its session records
+//! carry no durable journal identity, so the orphan verifier stays unserved
+//! here.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -35,7 +37,7 @@ use nix::sys::signal::Signal;
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::{Pid, getpgid};
 
-use crate::orphan::identity::ProcessGroupId;
+use crate::orphan::identity::{ProcessGroupId, ProcessIdentity};
 use crate::platform::PlatformCell;
 use crate::registry::CleanupClass;
 
@@ -220,6 +222,16 @@ impl ContainedChild {
             self.identity.note_reap();
         }
         Ok(status)
+    }
+
+    /// The journal identity this plan can re-verify after a restart.
+    ///
+    /// The FreeBSD reaper record has no observable start time in this slice,
+    /// so there is nothing the orphan verifier could re-check. The plan
+    /// returns `None`, and the journal is not served on this cell.
+    #[must_use]
+    pub const fn durable_identity(&self) -> Option<ProcessIdentity> {
+        None
     }
 
     /// Whether the direct child has exited, without reaping it.

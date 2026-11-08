@@ -29,9 +29,14 @@ builddeps:
 setup: |
   %cargo_fetch
 build: |
-  %cargo_build --package bitty-terminal
+  %cargo_build --package bitty-terminal --package bitty-daemon
 install: |
-  %cargo_install bitty-terminal
+  # The macro installs target/release/<name> for every name it is given;
+  # `bittyd` is a separate workspace package, so both binaries are named.
+  %cargo_install bitty bittyd
+
+  # Per-user systemd unit
+  install -Dm00644 packaging/systemd/bittyd.service $installdir/usr/lib/systemd/user/bittyd.service
 
   # Desktop integration
   install -Dm00644 packaging/run.bitty.Bitty.desktop $installdir/usr/share/applications/run.bitty.Bitty.desktop

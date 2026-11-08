@@ -12,8 +12,9 @@
 //! module composes its safe API and adds no FFI.
 //!
 //! This plan is selected by [`probe`], but the daemon does not yet reach it:
-//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
-//! plan is implemented and unit-tested here, not enforced by `bittyd`.
+//! `worker::spawn_path_served` refuses the Windows job plan because this crate
+//! has no ConPTY backend, so a Windows `bittyd` cannot open a PTY. Serving a
+//! Windows session needs that backend and a new dependency (bitty#2985).
 
 use std::io;
 use std::os::windows::process::CommandExt as _;

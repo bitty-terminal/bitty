@@ -57,6 +57,12 @@ USES=		cargo desktop-file-utils pkgconfig
 
 # Build only the binary; the workspace also carries test-support crates that a
 # package does not need.
+#
+# `bittyd` is deliberately not built or installed. The accepted endpoint
+# contract (D-15) refuses FreeBSD: `LOCAL_PEERCRED` exposes `xucred` without a
+# peer pid, so the daemon cannot authenticate a session host on this cell. Add
+# the daemon (build, do-install, pkg-plist) in the same change that makes the
+# cell servable; until then the runtime package ships the terminal only.
 CARGO_BUILD_ARGS+=	-p bitty-terminal --bin bitty
 
 do-install:

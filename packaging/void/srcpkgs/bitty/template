@@ -3,6 +3,10 @@ pkgname=bitty
 version=0.0.36
 revision=1
 build_style=cargo
+# Both binaries ship from this template: `bittyd` is a separate workspace
+# package (crates/bitty-daemon), so the build phase must select it explicitly
+# instead of relying on the workspace default set.
+make_build_args="-p bitty-terminal -p bitty-daemon"
 make_install_args="--path crates/bitty-terminal --bin bitty"
 hostmakedepends="pkg-config cargo ncurses"
 makedepends="fontconfig-devel freetype-devel"
@@ -20,6 +24,16 @@ distfiles="https://github.com/bitty-terminal/bitty/archive/refs/tags/v${version}
 checksum="SKIP"
 
 post_install() {
+	# `make_install_args` covers one crate; install the daemon with the same
+	# cargo-install flags the cargo build style uses. The crates metadata files
+	# are removed again because the style's cleanup ran before this install.
+	# Void's default init is runit, so no systemd unit is installed: supervise
+	# `bittyd start` with a runit service (or run it manually).
+	${make_cmd:-cargo auditable} install --target "${RUST_TARGET}" \
+		--root="${DESTDIR}/usr" --offline --locked \
+		--path crates/bitty-daemon --bin bittyd
+	rm -f "${DESTDIR}"/usr/.crates.toml "${DESTDIR}"/usr/.crates2.json
+
 	vdesk packaging/run.bitty.Bitty.desktop
 	vinstall packaging/run.bitty.Bitty.metainfo.xml 644 usr/share/metainfo
 	for size in 16 32 64 128 256 512; do

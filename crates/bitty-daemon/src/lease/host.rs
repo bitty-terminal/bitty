@@ -702,9 +702,8 @@ impl SessionHost {
     /// A no-op when the session is unknown or already terminal: supervision
     /// may observe a worker after the record was frozen, and that observation
     /// must not change the frozen record.
-    // Worker liveness is only observed by the Linux supervision pass, so the
-    // only consumer sits behind that cfg.
-    #[cfg(target_os = "linux")]
+    // Worker liveness is observed by the POSIX supervision pass.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     pub(crate) fn observe_worker(&mut self, session_id: SessionId, now: MonotonicMs) {
         let _ = self.registry.observe_worker(session_id, now);
     }

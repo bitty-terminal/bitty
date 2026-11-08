@@ -29,13 +29,14 @@
 # past 0.2.0 per #1810; Sigstore/cosign stays a follow-up).
 #
 # Rationale per OS (from the layout decision): Linux fetches the versioned
-# `.tar.zst` bundle (bin/bitty plus desktop entry, icons, AppStream metainfo),
-# not the bare triple binary; macOS fetches the bare per-arch binary (the DMG
-# is an interactive drag-to-install image, unsuitable for headless install,
-# and the bare binary is already the Homebrew fetch artifact). FreeBSD Tier 2
-# is not a bootstrap target and fails closed with manual-download guidance.
-# Windows is not served here: uname reports MINGW/MSYS/CYGWIN under Git-Bash
-# and the script fails closed pointing at install.ps1 (irm|iex entry point).
+# `.tar.zst` bundle (bin/bitty and bin/bittyd plus desktop entry, icons,
+# AppStream metainfo, and the per-user systemd unit), not the bare triple
+# binary; macOS fetches the bare per-arch binary (the DMG is an interactive
+# drag-to-install image, unsuitable for headless install, and the bare binary
+# is already the Homebrew fetch artifact). FreeBSD Tier 2 is not a bootstrap
+# target and fails closed with manual-download guidance. Windows is not served
+# here: uname reports MINGW/MSYS/CYGWIN under Git-Bash and the script fails
+# closed pointing at install.ps1 (irm|iex entry point).
 #
 # No Rust toolchain is needed: the script needs only curl, sha256sum (or
 # shasum), and tar+zstd for Linux bundles. Scoop/Homebrew/AUR manifests are
@@ -106,8 +107,9 @@ Usage: install.sh [--version VERSION] [--prefix DIR] [--bin-dir DIR] [--dry-run]
   -h, --help         show this help
 
 Installs bitty with no Rust toolchain. Linux fetches the versioned .tar.zst
-bundle; macOS fetches the bare per-arch binary. Checksums are verified and
-fail closed. FreeBSD and Windows fail closed with guidance.
+bundle (bitty and bittyd, desktop integration, and the per-user systemd unit);
+macOS fetches the bare per-arch binary. Checksums are verified and fail closed.
+FreeBSD and Windows fail closed with guidance.
 EOF
 }
 
@@ -322,6 +324,52 @@ verify_sidecar() {
   fi
 }
 
+# systemd_user_unit_dir — print the per-user systemd unit directory, or
+# nothing when neither XDG_CONFIG_HOME nor HOME yields an absolute base. The
+# XDG spec requires an absolute XDG_CONFIG_HOME, so a relative value is
+# ignored rather than resolved against an unpredictable working directory.
+systemd_user_unit_dir() {
+  if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == /* ]]; then
+    printf '%s' "${XDG_CONFIG_HOME}/systemd/user"
+  elif [[ -n "${HOME:-}" ]]; then
+    printf '%s' "${HOME}/.config/systemd/user"
+  fi
+}
+
+# install_systemd_user_unit <unit-file> — install the shipped per-user unit
+# into the systemd user unit directory. The bundle keeps it under
+# share/systemd/user for the package recipes, but that path is not on the
+# systemd user search path, so a script install must place it explicitly.
+# Best effort: without systemd the install still succeeds, because bitty runs
+# without the daemon and users can supervise `bittyd start` themselves.
+install_systemd_user_unit() {
+  local unit_src="$1" unit_dir
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log "systemd not found; skipped bittyd.service (run 'bittyd start' under your own supervisor)"
+    return 0
+  fi
+  unit_dir="$(systemd_user_unit_dir)"
+  if [[ -z "$unit_dir" ]]; then
+    log "XDG_CONFIG_HOME and HOME are unset; skipped bittyd.service"
+    return 0
+  fi
+  if ! mkdir -p "$unit_dir"; then
+    log "warning: could not create $unit_dir; skipped bittyd.service"
+    return 0
+  fi
+  if ! install -m 0644 "$unit_src" "$unit_dir/bittyd.service"; then
+    log "warning: could not install bittyd.service; skipped"
+    return 0
+  fi
+  log "installed bittyd.service to $unit_dir"
+  if systemctl --user daemon-reload >/dev/null 2>&1; then
+    log "reloaded the systemd user manager"
+  else
+    log "systemd user manager not reachable; run 'systemctl --user daemon-reload' after your next login"
+  fi
+  log "enable the session daemon with: systemctl --user enable --now bittyd"
+}
+
 # json_escape <text> — minimal JSON string escaping for marker values
 # (backslash and double quote; the scripts never emit control bytes).
 json_escape() {
@@ -426,9 +474,13 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
       log "dry-run: desktop integration skipped (custom --bin-dir without --prefix)"
     else
       log "dry-run: share dir: $SHARE_BASE"
+      unit_dir="$(systemd_user_unit_dir)"
+      if [[ -n "$unit_dir" ]]; then
+        log "dry-run: systemd user unit: ${unit_dir}/bittyd.service"
+      fi
     fi
   fi
-  log "dry-run: would download, verify sha256, and install bitty (no changes made)"
+  log "dry-run: would download, verify sha256, and install bitty + bittyd (no changes made)"
   exit 0
 fi
 
@@ -459,12 +511,27 @@ else
   [[ -f "$STAGE/$TOPDIR/bin/bitty" ]] || die "bundle missing $TOPDIR/bin/bitty"
   cp "$STAGE/$TOPDIR/bin/bitty" "$BIN_DIR/bitty"
   chmod 755 "$BIN_DIR/bitty"
+  # The daemon is part of every bundle the release job builds; tolerate an
+  # older release that predates it instead of failing a pinned install.
+  if [[ -f "$STAGE/$TOPDIR/bin/bittyd" ]]; then
+    cp "$STAGE/$TOPDIR/bin/bittyd" "$BIN_DIR/bittyd"
+    chmod 755 "$BIN_DIR/bittyd"
+  else
+    log "bundle has no bin/bittyd (older release); skipped the session daemon"
+  fi
   # A custom --bin-dir without --prefix is binary-only on purpose, so test
   # and manual binary drops never touch the shared HOME prefix.
   if [[ -n "$BIN_DIR_ARG" && -z "$PREFIX" ]]; then
     log "skipping desktop integration (custom --bin-dir without --prefix)"
   elif [[ -d "$STAGE/$TOPDIR/share" ]]; then
     mkdir -p "$SHARE_BASE"
+    if [[ -f "$STAGE/$TOPDIR/share/systemd/user/bittyd.service" ]]; then
+      install_systemd_user_unit "$STAGE/$TOPDIR/share/systemd/user/bittyd.service"
+    fi
+    # The unit is installed into the systemd user unit directory above; drop
+    # the bundle copy so it never lands under $SHARE_BASE, which is not a
+    # systemd search path.
+    rm -rf "$STAGE/$TOPDIR/share/systemd"
     cp -r "$STAGE/$TOPDIR/share/." "$SHARE_BASE/" || die "desktop integration install failed"
     log "installed desktop integration under $SHARE_BASE"
   fi
@@ -475,6 +542,22 @@ if "$BIN_DIR/bitty" --version >/dev/null 2>&1; then
   log "smoke OK: $("$BIN_DIR/bitty" --version)"
 else
   die "install smoke failed: $BIN_DIR/bitty --version did not run"
+fi
+if [[ -x "$BIN_DIR/bittyd" ]]; then
+  log "installed bittyd to $BIN_DIR/bittyd"
+  if "$BIN_DIR/bittyd" --version >/dev/null 2>&1; then
+    log "smoke OK: $("$BIN_DIR/bittyd" --version)"
+  else
+    die "install smoke failed: $BIN_DIR/bittyd --version did not run"
+  fi
+  # `bittyd stop` with no daemon is a supported exit 0. The endpoint override
+  # points inside the private staging dir, so the smoke never touches the
+  # user's default socket.
+  if BITTYD_ENDPOINT="$STAGE/bittyd-smoke.sock" "$BIN_DIR/bittyd" stop >/dev/null 2>&1; then
+    log "smoke OK: bittyd stop (no daemon)"
+  else
+    die "install smoke failed: $BIN_DIR/bittyd stop did not exit 0 with no daemon"
+  fi
 fi
 write_install_marker
 log "ensure $BIN_DIR is on PATH"

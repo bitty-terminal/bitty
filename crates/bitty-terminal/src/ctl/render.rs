@@ -837,13 +837,66 @@ fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
     Some(items)
 }
 
+/// Locate the raw value slice immediately after `"key":` at the top level of a
+/// JSON object (either a `{...}` object or an already-unwrapped object body).
+///
+/// Quote- and depth-aware: keys inside string values or nested `{}`/`[]`
+/// containers are ignored.
+fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut expect_key = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let (literal, next) = scan_string_literal(body, i)?;
+                if depth == 0 && expect_key {
+                    let after = body[next..].trim_start();
+                    if let Some(rest) = after.strip_prefix(':') {
+                        if unescape_literal(&literal).as_deref() == Some(key) {
+                            return Some(rest.trim_start());
+                        }
+                        expect_key = false;
+                        i = body.len() - rest.len();
+                        continue;
+                    }
+                }
+                i = next;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                expect_key = true;
+                i += 1;
+            }
+            b':' if depth == 0 => {
+                expect_key = false;
+                i += 1;
+            }
+            _ => {
+                let ch = body[i..].chars().next()?;
+                i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
 /// Extract a top-level `"key": <number>` as `u64` (for `active`, bounds).
 fn extract_number(text: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{key}\"");
-    let pos = text.find(&needle)?;
-    let after = &text[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = after[colon + 1..].trim_start();
+    let rest = find_top_level_key_value(text, key)?;
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
@@ -855,28 +908,28 @@ fn extract_number(text: &str, key: &str) -> Option<u64> {
 
 /// Extract a top-level `"key": true|false` as `bool`.
 fn extract_bool(text: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\"");
-    let pos = text.find(&needle)?;
-    let after = &text[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = after[colon + 1..].trim_start();
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
+    let rest = find_top_level_key_value(text, key)?;
+    if let Some(after) = rest.strip_prefix("true") {
+        if after.is_empty()
+            || after.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}')
+        {
+            return Some(true);
+        }
     }
+    if let Some(after) = rest.strip_prefix("false") {
+        if after.is_empty()
+            || after.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}')
+        {
+            return Some(false);
+        }
+    }
+    None
 }
 
 /// Extract the raw inside of a top-level `"key": [...]` array (without the
 /// outer brackets), balanced and quote-aware. Returns `None` when absent.
 fn extract_array_body(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let pos = text.find(&needle)?;
-    let after = &text[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = after[colon + 1..].trim_start();
+    let rest = find_top_level_key_value(text, key)?;
     if !rest.starts_with('[') {
         return None;
     }
@@ -923,7 +976,8 @@ fn scan_string_literal(text: &str, start: usize) -> Option<(String, usize)> {
                 return Some((text[start..i + 1].to_string(), i + 1));
             }
             b'\\' => {
-                i += 2;
+                let escaped = text.get(i + 1..)?.chars().next()?;
+                i += 1 + escaped.len_utf8();
             }
             _ => {
                 let ch = text[i..].chars().next()?;
@@ -947,9 +1001,12 @@ fn unescape_literal(literal: &str) -> Option<String> {
         match chars.next()? {
             '"' => out.push('"'),
             '\\' => out.push('\\'),
+            '/' => out.push('/'),
             'n' => out.push('\n'),
             'r' => out.push('\r'),
             't' => out.push('\t'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
             'u' => {
                 let hex: String = chars.by_ref().take(4).collect();
                 if hex.len() != 4 {
@@ -1043,11 +1100,7 @@ fn split_objects(body: &str) -> Option<Vec<String>> {
 
 /// Extract the raw inside of `"key": {...}` (without outer braces).
 fn extract_object_body(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let pos = text.find(&needle)?;
-    let after = &text[pos + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = after[colon + 1..].trim_start();
+    let rest = find_top_level_key_value(text, key)?;
     if !rest.starts_with('{') {
         return None;
     }
@@ -1121,5 +1174,35 @@ mod tests {
         );
         assert_eq!(reload_exit(&[], false), super::EXIT_OK);
         assert_eq!(crate::reload::EXIT_RESTART, 4);
+    }
+
+    #[test]
+    fn json_extractors_handle_escaped_multibyte_utf8_and_quoted_keys_3075() {
+        // A backslash followed by a multi-byte UTF-8 scalar must not leave the
+        // scanner on a non-char byte boundary and panic.
+        assert_eq!(
+            super::scan_string_literal("\"\\é\"", 0),
+            Some(("\"\\é\"".to_string(), 5))
+        );
+        assert_eq!(super::scan_string_literal("\"\\", 0), None);
+        assert_eq!(
+            super::unescape_literal("\"a\\/b\\bc\\fd\""),
+            Some("a/b\u{0008}c\u{000c}d".to_string())
+        );
+
+        // Keys embedded inside earlier string values must not shadow real
+        // top-level keys.
+        let ws_json = r#"{"names":["\"active\":2,\"workspaces\":[\"ws:99\"]"],"workspaces":["ws:1","ws:2"],"active":1,"active_id":"ws:1"}"#;
+        let table = super::format_workspaces_table(ws_json).expect("workspace table");
+        assert!(
+            table.contains("ws:1 \"active\":2,\"workspaces\":[\"ws:99\"] yes"),
+            "{table}"
+        );
+        assert!(table.contains("ws:2 - no"), "{table}");
+        assert!(!table.contains("\nws:99 "), "{table}");
+
+        let reload_json = r#"{"message":"\"reloaded\":true,\"plan_version\":99","reloaded":false,"plan_version":3}"#;
+        assert_eq!(super::extract_bool(reload_json, "reloaded"), Some(false));
+        assert_eq!(super::extract_number(reload_json, "plan_version"), Some(3));
     }
 }

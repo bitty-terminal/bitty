@@ -121,7 +121,11 @@ impl OpenError {
     fn warn(outcome: EditorOpenOutcome, warning: String) -> Self {
         let mut warning = warning;
         if warning.len() > 512 {
-            warning.truncate(512);
+            let mut end = 512;
+            while !warning.is_char_boundary(end) {
+                end -= 1;
+            }
+            warning.truncate(end);
         }
         Self { outcome, warning }
     }
@@ -616,4 +620,20 @@ impl TerminalApp {
 struct OpenedEditor {
     outcome: EditorOpenOutcome,
     program: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_error_warn_truncates_on_utf8_char_boundary_3075() {
+        // 511 ASCII bytes followed by a 3-byte UTF-8 character ('€') spans
+        // bytes 511..514, so byte index 512 is inside '€'.
+        let raw = format!("{}€trailing", "a".repeat(511));
+        assert!(!raw.is_char_boundary(512));
+        let err = OpenError::warn(EditorOpenOutcome::SpawnFailed, raw);
+        assert_eq!(err.warning.len(), 511);
+        assert!(err.warning.chars().all(|c| c == 'a'));
+    }
 }

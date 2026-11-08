@@ -184,29 +184,16 @@ fn unavailable(method: &str) -> HandlerError {
     )
 }
 
-/// Find the raw value span after a top-level `"key":` (caller decides shape).
-fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let pos = params.find(needle.as_str())?;
-    let after_key = &params[pos + needle.len()..];
-    let colon = after_key.find(':')?;
-    Some(after_key[colon + 1..].trim_start())
-}
-
-/// Extract a top-level JSON string field with escape decoding; `None` when
-/// the key is absent or the value is not a JSON string.
-fn top_string(params: &str, key: &str) -> Option<String> {
-    let mut value = top_value_span(params, key)?;
-    if !value.starts_with('"') {
-        return None;
-    }
-    value = &value[1..];
+/// Decode one JSON string literal starting at byte 0 (`"`), returning the
+/// decoded string and the byte offset immediately after the closing quote.
+fn decode_json_string(raw: &str) -> Option<(String, usize)> {
+    let inner = raw.strip_prefix('"')?;
     let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
+    let mut chars = inner.char_indices();
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
+            '"' => return Some((out, 1 + idx + 1)),
+            '\\' => match chars.next()?.1 {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
                 '/' => out.push('/'),
@@ -221,7 +208,7 @@ fn top_string(params: &str, key: &str) -> Option<String> {
                     // smaller code point.
                     let mut code: u32 = 0;
                     for _ in 0..4 {
-                        code = code * 16 + chars.next()?.to_digit(16)?;
+                        code = code * 16 + chars.next()?.1.to_digit(16)?;
                     }
                     out.push(char::from_u32(code)?);
                 }
@@ -233,15 +220,103 @@ fn top_string(params: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Skip one raw JSON string literal starting at byte `start` (`"`), returning
+/// the byte index immediately after the closing `"`.
+fn skip_json_string(raw: &str, start: usize) -> Option<usize> {
+    let inner = raw.get(start..)?.strip_prefix('"')?;
+    let mut chars = inner.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '"' => return Some(start + 1 + idx + 1),
+            '\\' => {
+                chars.next()?;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Find the raw value span after a top-level `"key":` in a JSON object
+/// (caller decides shape). Quote- and depth-aware so keys embedded inside
+/// string values or nested containers never match.
+fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
+    let trimmed = params.trim();
+    let body = trimmed.strip_prefix('{')?;
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut expect_key = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if depth == 0 && expect_key {
+                    let (decoded_key, consumed) = decode_json_string(&body[i..])?;
+                    let next = i + consumed;
+                    let after = body[next..].trim_start();
+                    if let Some(rest) = after.strip_prefix(':') {
+                        if decoded_key == key {
+                            return Some(rest.trim_start());
+                        }
+                        expect_key = false;
+                        i = body.len() - rest.len();
+                        continue;
+                    }
+                    i = next;
+                } else {
+                    i = skip_json_string(body, i)?;
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                expect_key = true;
+                i += 1;
+            }
+            b':' if depth == 0 => {
+                expect_key = false;
+                i += 1;
+            }
+            _ => {
+                let ch = body[i..].chars().next()?;
+                i += ch.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+/// Extract a top-level JSON string field with escape decoding; `None` when
+/// the key is absent or the value is not a JSON string.
+fn top_string(params: &str, key: &str) -> Option<String> {
+    let value = top_value_span(params, key)?;
+    decode_json_string(value).map(|(decoded, _)| decoded)
+}
+
+/// Whether `rest` begins at a top-level JSON value delimiter (end, whitespace,
+/// `,`, or `}`).
+fn at_json_delimiter(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}')
+}
+
 /// Extract a top-level unsigned integer field; `None` for strings/objects/
-/// arrays/non-digits.
+/// arrays/non-digits/floats/exponents.
 fn top_uint(params: &str, key: &str) -> Option<u64> {
     let value = top_value_span(params, key)?;
     if value.starts_with('"') || value.starts_with('{') || value.starts_with('[') {
         return None;
     }
     let digits_len = value.bytes().take_while(u8::is_ascii_digit).count();
-    if digits_len == 0 || digits_len > 20 {
+    if digits_len == 0 || digits_len > 20 || !at_json_delimiter(&value[digits_len..]) {
         return None;
     }
     value[..digits_len].parse().ok()
@@ -249,7 +324,9 @@ fn top_uint(params: &str, key: &str) -> Option<u64> {
 
 /// Whether `params` carries an explicit JSON `null` for `key`.
 fn top_is_null(params: &str, key: &str) -> bool {
-    top_value_span(params, key).is_some_and(|value| value.starts_with("null"))
+    top_value_span(params, key)
+        .and_then(|value| value.strip_prefix("null"))
+        .is_some_and(at_json_delimiter)
 }
 
 fn validate_plugin_id(raw: &str) -> Result<(), String> {
@@ -591,6 +668,29 @@ mod tests {
         assert_eq!(
             handle_get_plugin(&inspect, &unknown).expect("served"),
             "null"
+        );
+
+        // bitty#3075: fractional/exponent generation numbers must fail closed
+        // as InvalidParams instead of truncating to their integer prefix, and
+        // keys inside string values must never shadow top-level params.
+        let float_gen = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":1.5}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &float_gen)
+                .expect_err("float generation")
+                .code,
+            "InvalidParams"
+        );
+        let shadowed = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"note":"\"pluginId\":\"xuepoo.absent\"","pluginId":"xuepoo.one"}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_get_plugin(&inspect, &shadowed)
+                .expect("served")
+                .contains("\"id\":\"xuepoo.one\"")
         );
         publish(None);
     }

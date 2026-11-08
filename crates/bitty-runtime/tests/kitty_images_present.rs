@@ -1450,12 +1450,16 @@ fn spanless_bodiless_place_advances_the_cursor_past_the_derived_span() {
     assert_eq!((spans[0].cols, spans[0].rows), (2, 2), "footprint span");
 }
 
+#[cfg(unix)]
 #[test]
 fn spanless_place_waits_for_an_async_local_transmit_and_then_paints() {
     // image.nvim's default transmit medium is a *file* (`t=f`): the read
     // runs on the async worker, so a spanless `a=p` in the same write
     // arrives before the pixels exist. The request must be retained and
     // replayed when the store lands, not dropped forever.
+    //
+    // Unix-only: the sandboxed local-medium open (`t=f`/`t=t`/`t=s`) is a
+    // Unix feature; other platforms refuse the medium outright.
     let dir = std::env::temp_dir().join(format!("bitty-2875-replay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("inline.png");

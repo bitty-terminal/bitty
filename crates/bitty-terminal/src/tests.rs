@@ -9963,8 +9963,15 @@ fn init_pending_recap_matches_written_file() {
         printed.contains("(pending init.lua"),
         "recap header printed before write"
     );
+    // The recap is the last thing written before the file; the post-write
+    // follow-ups (shell-init hint) share the same injected writer and follow
+    // it, so compare everything up to them.
+    let recap = printed
+        .split("bitty init: wire Tab completion")
+        .next()
+        .expect("split always yields a first part");
     assert!(
-        printed.ends_with(&written),
+        recap.ends_with(&written),
         "recap is byte-identical to the written file"
     );
 
@@ -11064,6 +11071,86 @@ fn init_dispatch_interactive_platform_default_shell_seeds_profile() {
 }
 
 #[test]
+fn init_dispatch_interactive_unresolved_platform_default_leaves_shell_unset() {
+    // R1/R2 pin (CTX-1755): $SHELL unset and the host probe failing must
+    // (a) report the unresolved default at the dispatch through the injected
+    // writer, naming the tried candidates, and (b) leave `terminal.shell`
+    // unset instead of writing the menu's synthesized fallback — bitty#3048
+    // itself. Deleting the warning, or letting the menu default through,
+    // fails here.
+    let xdg = init_test_dir("tty-unresolved-shell");
+    let xdg_s = xdg.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    let mut env = init_env(None, None, Some(&xdg_s), None, true);
+    let unresolved = || {
+        Err(crate::spawn::UnresolvedDefaultShell {
+            tried: vec!["pwsh.exe", "powershell.exe", "cmd.exe"],
+        })
+    };
+    env.platform_shell = Some(&unresolved);
+    // Eleven Enters take every lua default plus one for the plugin follow-up.
+    let stdin_lines = "\n\n\n\n\n\n\n\n\n\n\n\n";
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        printed.contains(
+            "bitty init: no default child shell: none of \"pwsh.exe\", \"powershell.exe\", \"cmd.exe\" resolved on PATH"
+        ),
+        "the unresolved probe must be reported at the dispatch: {printed}"
+    );
+    assert!(
+        printed.contains("leaving shell unset unless you type a shell path"),
+        "the warning must state what the run actually writes: {printed}"
+    );
+    let profile = xdg.join("bitty").join("profiles").join("default.lua");
+    let written = std::fs::read_to_string(&profile).expect("profile written");
+    assert!(
+        !written
+            .lines()
+            .any(|line| line.trim_start().starts_with("shell =")),
+        "an unresolved probe must not write the menu default as terminal.shell: {written}"
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
+}
+
+#[test]
+fn init_dispatch_interactive_unresolved_platform_default_keeps_typed_shell_path() {
+    // R1 boundary (CTX-1755): an unresolved probe drops only the menu's own
+    // default; a path the user typed is still written.
+    let xdg = init_test_dir("tty-unresolved-shell-typed");
+    let xdg_s = xdg.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    let mut env = init_env(None, None, Some(&xdg_s), None, true);
+    let unresolved = || {
+        Err(crate::spawn::UnresolvedDefaultShell {
+            tried: vec!["pwsh.exe", "powershell.exe", "cmd.exe"],
+        })
+    };
+    env.platform_shell = Some(&unresolved);
+    let stdin_lines = "C:\\Program Files\\PowerShell\\7\\pwsh.exe\n\n\n\n\n\n\n\n\n\n\n\n";
+    let mut input = std::io::BufReader::new(stdin_lines.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let profile = xdg.join("bitty").join("profiles").join("default.lua");
+    let written = std::fs::read_to_string(&profile).expect("profile written");
+    assert!(
+        written.contains("shell = \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\""),
+        "a typed shell path survives an unresolved probe: {written}"
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
+}
+
+#[test]
 fn init_effective_shell_prefers_explicit_env_and_falls_back_when_unset_or_blank() {
     let mut called = false;
     let explicit = crate::init::init_effective_shell_env_for_host(Some(" /usr/bin/fish "), || {
@@ -11135,19 +11222,69 @@ fn init_effective_shell_surfaces_unresolved_platform_default() {
         "actionable: {warning}"
     );
     assert!(
-        warning.ends_with("; leaving shell unset"),
-        "mirrors the unusable-$SHELL warning: {warning}"
+        warning.ends_with("; leaving shell unset unless you type a shell path"),
+        "mirrors the unusable-$SHELL warning and states what is written: {warning}"
     );
 }
 
 #[test]
+#[cfg(not(windows))]
 fn init_platform_default_shell_is_none_off_windows() {
-    #[cfg(not(windows))]
     assert_eq!(
         crate::init::init_platform_default_shell().expect("Unix probe is infallible"),
         None,
         "non-Windows hosts keep the existing common-shells + /bin/sh menu"
     );
+}
+
+#[test]
+fn init_dispatch_shell_init_hint_prints_only_for_supported_shells() {
+    // R4 pin (CTX-1755): the handoff hint now goes through the injected
+    // writer, so both branches are observable from a dispatch test. A
+    // supported shell prints the install line; a shell with no
+    // `CompletionShell` (cmd.exe) prints nothing instead of a wrong bash line.
+    let dir = init_test_dir("shell-init-hint");
+    let home = dir.display().to_string();
+    let target = dir.join("init.lua");
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    args.config_path = Some(target.display().to_string());
+    let mut input: &[u8] = b"";
+
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), false);
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("follow-up output is UTF-8");
+    assert!(
+        printed.contains("wire Tab completion + prompt hooks with `")
+            && printed.contains("detected shell: bash"),
+        "a supported shell prints the handoff: {printed}"
+    );
+
+    let env = init_env(
+        None,
+        Some("C:\\Windows\\System32\\cmd.exe"),
+        None,
+        Some(&home),
+        false,
+    );
+    let mut args = args.clone();
+    args.init_force = true;
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("follow-up output is UTF-8");
+    assert!(
+        !printed.contains("wire Tab completion"),
+        "cmd.exe has no shell-init line; the hint must be suppressed: {printed}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

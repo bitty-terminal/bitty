@@ -241,6 +241,111 @@ fn layout_resize_repaints_the_image_once_at_its_centered_position() {
 }
 
 #[test]
+fn float_panel_image_is_scaled_into_and_clipped_by_its_content_rect() {
+    // Issue #2875 field evidence: a placement inside a floating/overlay
+    // panel painted, but with the wrong geometry — the image was not scaled
+    // and clipped to the panel's cell rect. The float leaf's content rect is
+    // the authority: the fitted destination rect must land inside it, and an
+    // oversized requested span must be clipped by it rather than bleed into
+    // the border ring or a neighbouring leaf.
+    let mut rt = split_runtime();
+    rt.float_detach(PANE).expect("float detach must apply");
+    rt.tick();
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == PANE)
+        .expect("float presented");
+    assert_eq!(frame.tier, Some(bitty_runtime::OverlayTier::Float));
+    rt.handle_pane_bytes(PANE, b"\x1b[?25l");
+    let pad = i64::from(rt.window_padding_physical());
+    // Content rect in surface space: the float is translated by the window
+    // padding like every leaf primitive.
+    let content_x0 = pad + i64::from(frame.content.x);
+    let content_y0 = pad + i64::from(frame.content.y);
+    let content_x1 = content_x0 + i64::from(frame.content.width);
+    let content_y1 = content_y0 + i64::from(frame.content.height);
+
+    // 8x8 square into a 10x5 cell rect: kitty preserves the aspect ratio and
+    // centers the 90x90 result inside the 90x95 box.
+    let seq = format!(
+        "\x1b_Ga=T,f=100,s=8,v=8,c=10,r=5,C=1,q=2,m=0;{}\x1b\\",
+        base64(RED_PNG)
+    );
+    rt.handle_pane_bytes(PANE, seq.as_bytes());
+    assert!(rt.tick().is_some(), "float placement presents");
+    let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("float image painted");
+    assert_eq!(x1 - x0 + 1, 90, "scaled into the requested cell rect");
+    assert_eq!(y1 - y0 + 1, 90, "letterboxed, aspect preserved");
+    assert_eq!(count, 90 * 90, "the whole fitted image is opaque");
+    let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
+    assert!(
+        x0 >= content_x0 && y0 >= content_y0 && x1 < content_x1 && y1 < content_y1,
+        "the image must stay inside the float content rect \
+         (image {x0},{y0}-{x1},{y1} vs content {content_x0},{content_y0}-{content_x1},{content_y1})"
+    );
+
+    // A span far larger than the float grid must be clipped by the same
+    // content rect: nothing may spill into the border ring or past it.
+    rt.handle_pane_bytes(PANE, b"\x1b_Ga=d,d=A\x1b\\");
+    let oversized = format!(
+        "\x1b_Ga=T,f=100,s=8,v=8,c=80,r=30,C=1,q=2,m=0;{}\x1b\\",
+        base64(RED_PNG)
+    );
+    rt.handle_pane_bytes(PANE, oversized.as_bytes());
+    assert!(rt.tick().is_some(), "oversized placement presents");
+    let (x0, y0, x1, y1, _) = red_bounds(&rt).expect("oversized image still paints");
+    let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
+    assert!(
+        x0 >= content_x0 && y0 >= content_y0 && x1 < content_x1 && y1 < content_y1,
+        "an oversized placement is clipped to the float content rect \
+         (image {x0},{y0}-{x1},{y1} vs content {content_x0},{content_y0}-{content_x1},{content_y1})"
+    );
+}
+
+#[test]
+fn float_panel_spanless_place_paints_inside_the_panel() {
+    // Same field report, first half: image.nvim's "normal" backend places
+    // with no `c=`/`r=` (`ceil(pixels / cell)` is the span). Inside a float
+    // that must paint *and* stay inside the panel — the two owner-visible
+    // symptoms in one shape.
+    let mut rt = split_runtime();
+    rt.float_detach(PANE).expect("float detach must apply");
+    rt.tick();
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == PANE)
+        .expect("float presented");
+    rt.handle_pane_bytes(PANE, b"\x1b[?25l");
+    let pad = i64::from(rt.window_padding_physical());
+    let content_x1 = pad + i64::from(frame.content.x) + i64::from(frame.content.width);
+    let content_y1 = pad + i64::from(frame.content.y) + i64::from(frame.content.height);
+
+    // 8x8 PNG: one cell in each axis at the 9x19 default metrics.
+    let transmit = format!(
+        "\x1b_Ga=t,f=100,s=8,v=8,C=1,q=2,i=21,m=0;{}\x1b\\",
+        base64(RED_PNG)
+    );
+    rt.handle_pane_bytes(PANE, transmit.as_bytes());
+    rt.handle_pane_bytes(PANE, b"\x1b_Ga=p,i=21,p=21,z=-1,C=1,q=2\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "the spanless placement inside the float must be recorded"
+    );
+    assert!(rt.tick().is_some(), "the float placement presents");
+    assert_eq!(rt.kitty_last_frame_images(), 1, "it composites a blit");
+    let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("float inline image painted");
+    assert!(count > 0);
+    assert!(
+        (x1 as i64) < content_x1 && (y1 as i64) < content_y1,
+        "the derived span stays inside the float content rect"
+    );
+    let _ = (x0, y0);
+}
+
+#[test]
 fn xtwinops_answers_the_draining_pane_not_the_focused_one() {
     let mut rt = split_runtime();
     // Asymmetric split so the pane and the focused primary answer with

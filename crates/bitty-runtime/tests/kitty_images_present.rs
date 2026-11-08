@@ -1320,3 +1320,230 @@ fn yazi_kgpold_display_paints_and_erases() {
         "erase removes placement, keeps image"
     );
 }
+
+/// Minimal standard-alphabet base64 encoder (the file has no encoder: the
+/// existing fixtures ship pre-encoded).
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(a >> 2) as usize] as char);
+        out.push(ALPHABET[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(c & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Bounding box and count of opaque red pixels in the presented frame.
+fn red_bounds(rt: &Runtime) -> Option<(usize, usize, usize, usize, usize)> {
+    let extent = rt
+        .surface_extent()
+        .unwrap_or_else(|| rt.config().window_extent());
+    let width = usize::try_from(extent.width()).ok()?;
+    let rgba = rt.headless_rgba()?;
+    let (mut min_x, mut min_y, mut max_x, mut max_y, mut count) =
+        (usize::MAX, usize::MAX, 0usize, 0usize, 0usize);
+    for y in 0..usize::try_from(extent.height()).ok()? {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if rgba[i] > 200 && rgba[i + 1] < 40 && rgba[i + 2] < 40 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then_some((min_x, min_y, max_x, max_y, count))
+}
+
+#[test]
+fn spanless_bodiless_place_paints_at_the_images_natural_cell_size() {
+    // Issue #2875 field evidence: an inline placement in the *main grid*
+    // never painted. image.nvim's "normal" kitty backend transmits with
+    // `a=t`, then displays with `a=p` and **no `c=`/`r=`** (the span is the
+    // image's natural cell size, `ceil(pixels / cell)`) plus `z=-1` and
+    // `C=1`. Terminal truth cannot derive that span (it holds no pixels)
+    // and refused the command, so nothing was painted and the concealed
+    // source text stayed visible.
+    let mut rt = make_runtime();
+    // Deterministic single-tick presents: no pacing coalescing between the
+    // cursor move and the image frame (the pixel probe needs the exact
+    // frame the blit was built for).
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    // Park the cursor inside the visible cursor-follow window: the headless
+    // default shows a 76x22 frame of an 80x24 grid, so grid row 0 is above
+    // the painted area and a placement there would clip.
+    rt.handle_pty_bytes(b"\x1b[5;3H");
+    // Hide the cursor: the focused cursor composites above images by
+    // design (#1849 S7), so it would mask one cell of the probe.
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    // 18x38 px at the headless 9x19 cell => 2 columns x 2 rows.
+    let rgba = [0xFFu8, 0x00, 0x00, 0xFF].repeat(18 * 38);
+    let encoded = base64(&rgba);
+    rt.handle_pty_bytes(
+        format!("\x1b_Ga=t,f=32,s=18,v=38,C=1,q=2,i=5,m=0;{encoded}\x1b\\").as_bytes(),
+    );
+    assert_eq!(rt.kitty_image_count(), 1, "transmit stores the pixels");
+    assert_eq!(rt.kitty_placement_count(), 0, "transmit places nothing");
+    // The placement names no span: the runtime must derive it from the
+    // pixels the transmit already stored.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=5,p=5,z=-1,C=1,q=2\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "a spanless a=p of a stored image must place, not be dropped"
+    );
+    assert!(rt.tick().is_some(), "the placement forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "the inline placement must composite a blit"
+    );
+    let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("the inline image must paint");
+    // The image is painted over the cells it names: `ceil(18 / 9)` = 2
+    // columns and `ceil(38 / 19)` = 2 rows, and an 18x38 source fills that
+    // 18x38 box exactly (no letterbox, aspect already matches).
+    assert_eq!(x1 - x0 + 1, 18, "two derived columns at 9px per cell");
+    assert_eq!(y1 - y0 + 1, 38, "two derived rows at 19px per cell");
+    assert!(
+        count >= 18 * 38,
+        "the whole fitted image is opaque: {count}"
+    );
+    // `C=1` keeps the cursor on the anchor cell (1-based row 5, col 3).
+    let cursor = rt.state().cursor().position;
+    assert_eq!((cursor.col, cursor.row), (2, 4), "C=1 keeps the cursor");
+}
+
+#[test]
+fn spanless_bodiless_place_advances_the_cursor_past_the_derived_span() {
+    // The same shape without `C=1`: kitty moves the cursor past the image,
+    // so the derived span must reach terminal truth, not only the blit.
+    let mut rt = make_runtime();
+    let rgba = [0xFFu8, 0x00, 0x00, 0xFF].repeat(18 * 38);
+    let encoded = base64(&rgba);
+    rt.handle_pty_bytes(format!("\x1b_Ga=t,f=32,s=18,v=38,q=2,i=6,m=0;{encoded}\x1b\\").as_bytes());
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=6,p=6,q=2\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 1);
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        (cursor.col, cursor.row),
+        (2, 2),
+        "the cursor advances past the derived 2x2 span"
+    );
+    // Terminal truth carries the same span, so the a11y footprint agrees.
+    let spans = rt.kitty_image_cell_spans_for_primary();
+    assert_eq!(spans.len(), 1, "one painted footprint");
+    assert_eq!((spans[0].cols, spans[0].rows), (2, 2), "footprint span");
+}
+
+#[cfg(unix)]
+#[test]
+fn spanless_place_waits_for_an_async_local_transmit_and_then_paints() {
+    // image.nvim's default transmit medium is a *file* (`t=f`): the read
+    // runs on the async worker, so a spanless `a=p` in the same write
+    // arrives before the pixels exist. The request must be retained and
+    // replayed when the store lands, not dropped forever.
+    //
+    // Unix-only: the sandboxed local-medium open (`t=f`/`t=t`/`t=s`) is a
+    // Unix feature; other platforms refuse the medium outright.
+    let dir = std::env::temp_dir().join(format!("bitty-2875-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("inline.png");
+    // 8x8 opaque red PNG fixture, 1 cell at the default metrics.
+    std::fs::write(&path, red_1x1_png()).expect("write fixture");
+
+    let mut rt = make_runtime();
+    // Deterministic single-tick presents (see the sibling spanless test).
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    // First present sizes the surface; later ticks then commit one frame
+    // per call, which the red-pixel probe needs.
+    rt.tick();
+    // Park the cursor inside the visible cursor-follow window (see the
+    // sibling test): a placement on grid row 0 clips away in the default
+    // 80x24 grid / 76x22 frame shape.
+    rt.handle_pty_bytes(b"\x1b[4;2H");
+    // The cursor composites above images; hide it so the probe sees the
+    // image itself.
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    let name = base64(path.to_string_lossy().as_bytes());
+    // Both commands in one write, exactly like the plugin's tty write.
+    rt.handle_pty_bytes(
+        format!("\x1b_Ga=t,f=100,t=f,C=1,q=2,i=9,m=0;{name}\x1b\\\x1b_Ga=p,i=9,p=9,C=1,q=2\x1b\\")
+            .as_bytes(),
+    );
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "the placement cannot be sized before the pixels land"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while rt.kitty_placement_count() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _ = rt.poll_pty();
+    }
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "the retained placement replays once the store completes"
+    );
+    assert!(rt.tick().is_some(), "the replay forces a present");
+    assert_eq!(rt.kitty_last_frame_images(), 1, "the replayed blit paints");
+    assert!(
+        red_bounds(&rt).is_some(),
+        "the inline image covers its cells after the async store"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spanless_place_uses_the_wire_display_region_as_the_span() {
+    // image.nvim's crop path sends `w=`/`h=` (the visible pixel region) and
+    // no `c=`/`r=`. Kitty sizes the placement from that region, not from the
+    // full stored image, so the cells follow the crop.
+    let mut rt = make_runtime();
+    // 18x76 px: the full image would span 2x4 cells at the 9x19 metrics.
+    let rgba = [0xFFu8, 0x00, 0x00, 0xFF].repeat(18 * 76);
+    let encoded = base64(&rgba);
+    rt.handle_pty_bytes(format!("\x1b_Ga=t,f=32,s=18,v=76,q=2,i=8,m=0;{encoded}\x1b\\").as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    // The client asks for a single 19px row of it.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=8,p=8,w=18,h=19,q=2\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 1, "the size derives from w=/h=");
+    let cursor = rt.state().cursor().position;
+    assert_eq!(
+        (cursor.col, cursor.row),
+        (2, 1),
+        "2 columns x 1 row, from the display region"
+    );
+    let spans = rt.kitty_image_cell_spans_for_primary();
+    assert_eq!(spans.len(), 1);
+    assert_eq!((spans[0].cols, spans[0].rows), (2, 1), "crop-sized span");
+}
+
+#[test]
+fn spanless_place_without_pixels_paints_nothing_and_stays_bounded() {
+    // A stream that places without ever transmitting must not paint, must
+    // not panic, and must not grow the retained queue without bound.
+    let mut rt = make_runtime();
+    for id in 1..=40u32 {
+        rt.handle_pty_bytes(format!("\x1b_Ga=p,i={id},p={id},C=1,q=2\x1b\\").as_bytes());
+    }
+    assert_eq!(rt.kitty_placement_count(), 0, "nothing to paint");
+    assert_eq!(rt.kitty_image_count(), 0, "nothing stored");
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 0);
+}

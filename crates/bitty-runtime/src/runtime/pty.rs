@@ -895,7 +895,7 @@ impl Runtime {
         let mut xtwinops = crate::queries::find_xtwinops(&combined, overlap_len);
         let mut actions: Vec<TerminalAction> = Vec::new();
         self.parser.advance(bytes, |action| actions.push(action));
-        for action in actions {
+        for mut action in actions {
             // Map terminal actions to cold-path observations before state
             // mutation where the payload lives on the action itself; state
             // is the authority for derived values like title after mutation.
@@ -1174,6 +1174,44 @@ impl Runtime {
                         _ => {}
                     }
                 }
+                // Issue #2875: a bodiless `a=p` without `c=`/`r=` asks for
+                // the image's natural cell size (kitty: "displayed at its
+                // natural size in cells"), which terminal truth cannot
+                // compute — it holds no pixels. The runtime resolves the
+                // span here, from the stored pixels or the wire `w=`/`h=`
+                // display region, *before* truth records the command, so
+                // the placement is not refused as spanless and its cursor
+                // advance covers the real span. image.nvim's "normal"
+                // kitty backend places exactly this shape. When the pixels
+                // are still in flight (a `t=f` transmit on the async
+                // worker) the span stays zero and the mirror below retains
+                // the request for replay.
+                if let TerminalAction::KittyGraphics {
+                    action_a: Some('p'),
+                    cols_c,
+                    rows_r,
+                    control,
+                    ..
+                } = &mut action
+                {
+                    if (*cols_c == 0 || *rows_r == 0)
+                        && control.image_id != 0
+                        && !control.has_parent()
+                        && !control.is_virtual_placement()
+                    {
+                        if let Some((cols, rows)) = self.kitty_place_span(
+                            self.kitty_origin,
+                            *cols_c,
+                            *rows_r,
+                            control,
+                            None,
+                            None,
+                        ) {
+                            *cols_c = cols;
+                            *rows_r = rows;
+                        }
+                    }
+                }
                 // Issue #2875: a bodiless `a=p` on an already-stored image is
                 // a pixel placement too. Capture the pre-apply anchor (truth
                 // advances the cursor past the span), then mirror the
@@ -1209,6 +1247,27 @@ impl Runtime {
                                 (control.parent_id, control.parent_placement_id),
                                 (control.parent_dx, control.parent_dy),
                             )),
+                            *control,
+                        ))
+                    } else if !control.is_virtual_placement()
+                        && control.image_id != 0
+                        && !control.has_parent()
+                    {
+                        // Spanless and unsized: the pixels have not landed.
+                        // Retain the request so `flush_pending_kitty_places`
+                        // can place it once the store completes.
+                        let cursor = self.state.cursor().position;
+                        Some((
+                            cursor.col,
+                            cursor.row,
+                            self.state.scrollback_len(),
+                            *cols_c,
+                            *rows_r,
+                            control.z_index,
+                            control.image_id,
+                            control.placement_id,
+                            None,
+                            *control,
                         ))
                     } else {
                         None
@@ -1278,7 +1337,8 @@ impl Runtime {
                 // pixel layer so a `t`-then-`p` client paints. Truth already
                 // refused spanless commands, missing/virtual parents, and
                 // overflow above, so this only mirrors what truth kept.
-                if let Some((col, row, base, cols, rows, z, image, pin, relative)) = bodiless_place
+                if let Some((col, row, base, cols, rows, z, image, pin, relative, keys)) =
+                    bodiless_place
                 {
                     // Mirror only what truth actually anchored at this cell
                     // (or with this parent link): a refused placement must
@@ -1306,6 +1366,27 @@ impl Runtime {
                                 );
                             }
                         }
+                    } else if relative.is_none()
+                        && self
+                            .kitty_images
+                            .find_root_for_origin(self.kitty_origin, image)
+                            .is_none()
+                    {
+                        // Issue #2875: spanless placement whose pixels have
+                        // not landed yet (a `t=f`/`t=t`/`t=s` transmit on the
+                        // async worker). Retained so the completed store can
+                        // size and replay it; bounded, drop-oldest.
+                        self.stash_pending_kitty_place(
+                            crate::runtime::kitty_images::PendingKittyPlace {
+                                origin: self.kitty_origin,
+                                anchor_col: col,
+                                anchor_row: row,
+                                scrollback_base: base,
+                                cols,
+                                rows,
+                                keys,
+                            },
+                        );
                     }
                 }
                 continue;

@@ -817,16 +817,20 @@ fn make_rgba_texture(
 ///
 /// The GPU path has no color glyph shader: color glyphs are RGBA quads, so
 /// they ride the existing image pipeline at the glyph position of the pass
-/// order. Slots that fall outside the atlas, or whose dimensions disagree
-/// with the instance, are skipped (fail-closed, never a panic).
+/// order. A slot that falls outside the atlas, or whose dimensions disagree
+/// with the instance, is skipped **alone** (fail-closed, never a panic,
+/// bitty#2994) and counted in the returned skip total so the frame reports it
+/// through [`PresentStats::images_skipped`](crate::gpu::PresentStats) instead
+/// of dropping a glyph silently.
 fn color_glyph_blits(
     draw_list: &DrawList,
     texels: &[u8],
     dims: AtlasDims,
-) -> Vec<crate::grid::ImageBlit> {
+) -> (Vec<crate::grid::ImageBlit>, usize) {
     use crate::geometry::RectPx;
     let stride = usize::from(dims.width);
     let mut blits = Vec::new();
+    let mut skipped = 0usize;
     for glyph in &draw_list.glyphs {
         let crate::grid::GlyphSource::ColorAtlas { slot } = &glyph.source else {
             continue;
@@ -837,8 +841,21 @@ fn color_glyph_blits(
             .checked_mul(slot_h)
             .and_then(|pixels| pixels.checked_mul(4))
         else {
+            skipped = skipped.saturating_add(1);
             continue;
         };
+        // Reject a slot whose right or bottom edge leaves the atlas rectangle
+        // before reading any texel. `texels` is one flat RGBA run, so the row
+        // walk below addresses `y * stride + x` and a slot that overruns the
+        // row would happily read the *next* atlas row's pixels — foreign glyph
+        // data painted into this glyph's blit, or a silent truncation once the
+        // buffer runs out. bitty#2994/#3005.
+        let overruns = usize::from(slot.x).saturating_add(slot_w) > usize::from(dims.width)
+            || usize::from(slot.y).saturating_add(slot_h) > usize::from(dims.height);
+        if overruns {
+            skipped = skipped.saturating_add(1);
+            continue;
+        }
         let mut rgba = Vec::with_capacity(bytes);
         let mut truncated = false;
         for row in 0..slot_h {
@@ -860,20 +877,31 @@ fn color_glyph_blits(
             };
             rgba.extend_from_slice(row_data);
         }
-        if truncated || rgba.len() != bytes {
+        if truncated {
+            skipped = skipped.saturating_add(1);
             continue;
         }
+        // When the walk above does not truncate, each of `slot_h` rows appends
+        // exactly `slot_w * 4` bytes, so the buffer is complete by
+        // construction; asserting it keeps the invariant checked in tests
+        // instead of reading like a guard that can fire.
+        debug_assert_eq!(
+            rgba.len(),
+            bytes,
+            "a non-truncated color-glyph walk fills exactly its slot"
+        );
         let dest = RectPx::new(
             glyph.dest[0],
             glyph.dest[1],
             u32::from(slot.width),
             u32::from(slot.height),
         );
-        if let Ok(blit) = crate::grid::ImageBlit::try_new(dest, rgba) {
-            blits.push(blit);
+        match crate::grid::ImageBlit::try_new(dest, rgba) {
+            Ok(blit) => blits.push(blit),
+            Err(_) => skipped = skipped.saturating_add(1),
         }
     }
-    blits
+    (blits, skipped)
 }
 
 impl GpuResources {
@@ -1443,7 +1471,9 @@ impl GpuResources {
     /// [`PresentStats::images_skipped`](crate::gpu::PresentStats), never
     /// dropped silently. Both the per-`View` background pass (CTX-0347) and
     /// the Kitty image pass (CTX-0291) share this count and the same
-    /// `plan_image_uploads` bounds.
+    /// `plan_image_uploads` bounds; a color glyph whose atlas slot cannot be
+    /// addressed (bitty#2994) adds to it as well, and only that glyph is
+    /// dropped.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draw_frame(
         &mut self,
@@ -1504,7 +1534,7 @@ impl GpuResources {
                 reason: "color atlas instance requires color atlas texels",
             });
         }
-        let color_blits = color_atlas
+        let (color_blits, color_glyphs_skipped) = color_atlas
             .map(|(texels, dims)| color_glyph_blits(draw_list, texels, dims))
             .unwrap_or_default();
         // Paint order mirrors both CPU compositors: fills, then rounded
@@ -1711,7 +1741,11 @@ impl GpuResources {
                 draw_list.images[index].layer == crate::grid::ImagePaintLayer::AboveText
             })
             .collect();
-        let mut images_skipped = image_plan.skipped + backgrounds_skipped;
+        // bitty#2994: a color glyph the blit builder could not address is
+        // counted with the other refused image blits, so a dropped emoji is
+        // reported through `PresentStats::images_skipped` instead of
+        // vanishing silently.
+        let mut images_skipped = image_plan.skipped + backgrounds_skipped + color_glyphs_skipped;
         images_skipped = images_skipped.saturating_add(draw_image_layer(
             &mut self.image_textures,
             &self.image_pipeline,
@@ -1890,5 +1924,166 @@ impl GpuResources {
             queue.submit(std::iter::once(encoder.finish()));
         }
         Ok(images_skipped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::atlas::AtlasSlot;
+    use crate::frame::FrameMode;
+    use crate::geometry::RectPx;
+    use crate::grid::{GlyphInstance, GlyphSource};
+
+    fn color_glyph(dest: [i32; 2], slot: AtlasSlot) -> GlyphInstance {
+        GlyphInstance {
+            dest,
+            size: [u32::from(slot.width), u32::from(slot.height)],
+            uv: [0.0; 4],
+            color: [u8::MAX; 4],
+            clip: None,
+            source: GlyphSource::ColorAtlas { slot },
+        }
+    }
+
+    fn draw_list(glyphs: Vec<GlyphInstance>) -> DrawList {
+        DrawList {
+            generation: 1,
+            atlas_epoch: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(32, 16),
+                mode: FrameMode::Full,
+                dirty_rects: vec![RectPx::new(0, 0, 32, 16)],
+            },
+            fills: Vec::new(),
+            rounded_fills: Vec::new(),
+            backgrounds: Vec::new(),
+            overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: Vec::new(),
+            overlay_content_fills: Vec::new(),
+            overlay_rounded_fills: Vec::new(),
+            glyphs,
+            images: Vec::new(),
+        }
+    }
+
+    fn color_slot(x: u16, y: u16, width: u16, height: u16) -> AtlasSlot {
+        AtlasSlot {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// bitty#2994: a color slot that falls outside the atlas drops only that
+    /// glyph, and the refusal is counted so the frame reports it. Before the
+    /// fix the skip was silent (`color_glyph_blits` returned no count).
+    #[test]
+    fn unaddressable_color_slot_is_skipped_and_counted() {
+        let dims = AtlasDims {
+            width: 8,
+            height: 8,
+        };
+        let texels = vec![0xFFu8; 8 * 8 * 4];
+        let list = draw_list(vec![
+            color_glyph(
+                [0, 0],
+                AtlasSlot {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+            ),
+            // One row past the atlas: a stale placement after a reset.
+            color_glyph(
+                [8, 0],
+                AtlasSlot {
+                    x: 4,
+                    y: 8,
+                    width: 4,
+                    height: 4,
+                },
+            ),
+            color_glyph(
+                [16, 0],
+                AtlasSlot {
+                    x: 0,
+                    y: 4,
+                    width: 4,
+                    height: 4,
+                },
+            ),
+        ]);
+        let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
+        assert_eq!(blits.len(), 2, "the addressable placements still blit");
+        assert_eq!(skipped, 1, "the unaddressable placement is counted");
+        assert_eq!(blits[0].dest, RectPx::new(0, 0, 4, 4));
+        assert_eq!(blits[1].dest, RectPx::new(16, 0, 4, 4));
+    }
+
+    /// bitty#3005: a slot whose right edge overruns the atlas is refused
+    /// outright. `texels` is a flat RGBA run addressed as `y * width + x`, so
+    /// before the bounds check such a slot read the pixels of the atlas row
+    /// below and blitted foreign data while reporting no skip.
+    #[test]
+    fn horizontally_overrunning_color_slot_is_skipped() {
+        let dims = AtlasDims {
+            width: 8,
+            height: 8,
+        };
+        let texels = vec![0xAA; 8 * 8 * 4];
+        let list = draw_list(vec![color_glyph([0, 0], color_slot(6, 0, 4, 4))]);
+        let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
+        assert!(blits.is_empty(), "a row-wrapping slot blits nothing");
+        assert_eq!(skipped, 1, "the row-wrapping placement is counted");
+    }
+
+    /// The refusal is per glyph, not per line: a valid neighbour in the same
+    /// draw list still blits, and a slot that ends exactly on the atlas edge is
+    /// addressable (no off-by-one).
+    #[test]
+    fn horizontal_overflow_skips_only_the_offending_glyph() {
+        let dims = AtlasDims {
+            width: 8,
+            height: 8,
+        };
+        let texels = vec![0xBB; 8 * 8 * 4];
+        let list = draw_list(vec![
+            color_glyph([0, 0], color_slot(0, 0, 4, 4)),
+            // Two columns past the right edge, mid-atlas vertically.
+            color_glyph([8, 0], color_slot(6, 2, 4, 4)),
+            // Ends exactly on `width`/`height`: still addressable.
+            color_glyph([16, 0], color_slot(4, 4, 4, 4)),
+        ]);
+        let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
+        assert_eq!(blits.len(), 2, "in-bounds neighbours still blit");
+        assert_eq!(blits[0].dest, RectPx::new(0, 0, 4, 4));
+        assert_eq!(blits[1].dest, RectPx::new(16, 0, 4, 4));
+        assert_eq!(skipped, 1, "only the overflowing glyph is refused");
+    }
+
+    /// The skip counter is inert on a healthy frame, so `images_skipped`
+    /// keeps meaning "refused blits" for every other layer.
+    #[test]
+    fn addressable_color_slots_report_no_skip() {
+        let dims = AtlasDims {
+            width: 4,
+            height: 4,
+        };
+        let texels = vec![0u8; 4 * 4 * 4];
+        let list = draw_list(vec![color_glyph(
+            [0, 0],
+            AtlasSlot {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+        )]);
+        let (blits, skipped) = color_glyph_blits(&list, &texels, dims);
+        assert_eq!(blits.len(), 1);
+        assert_eq!(skipped, 0);
     }
 }

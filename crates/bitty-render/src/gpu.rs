@@ -872,14 +872,17 @@ pub struct PresentStats {
     pub headless: bool,
     /// Number of Kitty image blits in the presented `DrawList`.
     pub images: usize,
-    /// Image blits the presenting path did not paint.
+    /// Image blits and color-glyph blits the presenting path did not paint.
     ///
     /// Always `0` on headless fakes (every blit is blended) and on
     /// clear-only presents. On a real surface the GPU pass uploads and
     /// paints every blit (CTX-0291); a non-zero count means individual
     /// blits were refused fail-closed (malformed bytes, over the device
-    /// texture limit, or over a per-frame bound) and the caller warned.
-    /// The refusal is counted and loud — never a silent CPU/GPU divergence.
+    /// texture limit, over a per-frame bound, or a color-atlas slot that
+    /// leaves its atlas) and the caller warned. Each refused color glyph
+    /// contributes to this count without a matching entry in `images`, so
+    /// `images_skipped` can exceed `images`. The refusal is counted and
+    /// loud — never a silent CPU/GPU divergence.
     pub images_skipped: usize,
 }
 

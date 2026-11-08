@@ -8,6 +8,14 @@
 //! per printable cell and the cursor must still paint. The deterministic
 //! color-glyph pixel assertions live in `bitty-render`'s
 //! `emoji_line_paint.rs`.
+//!
+//! **Scope:** symptom canaries, not regression tests. The present path these
+//! drive is `gpu.rs`, which never refused a whole line for one color glyph, so
+//! every case here also passes on the parent commit; `stats.glyphs` is
+//! `draw_list.glyphs.len()` and includes glyphs the compositor drops, and
+//! `painted_pixels > 0` is satisfied by pane chrome alone. The regression
+//! proof is `emoji_fail_closed.rs` (software backend, `sw-fallback`) and the
+//! `pipeline::tests` pair for the atlas-overrun refusal.
 
 use bitty_runtime::Runtime;
 

@@ -12,6 +12,14 @@
 //! when no adapter is attached) with a fake rasterizer that serves an RGBA
 //! color bitmap for emoji presentation, so the colour-glyph path runs on every
 //! host without a font stack or a GPU.
+//!
+//! **Scope:** symptom canaries, not regression tests. The headless GPU path
+//! already refused a stale or overrunning color slot before this fix, so every
+//! case here also passes on the parent commit. The regression proof is
+//! `emoji_fail_closed.rs` (the software backend that painted nothing and
+//! returned `Ok(())`) and the `pipeline::tests` pair
+//! `horizontally_overrunning_color_slot_is_skipped` /
+//! `horizontal_overflow_skips_only_the_offending_glyph`.
 
 use bitty_platform::PhysicalSize;
 use bitty_render::glyph::{AlphaMode, BitmapFormat, GlyphMetrics};

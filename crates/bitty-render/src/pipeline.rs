@@ -877,10 +877,19 @@ fn color_glyph_blits(
             };
             rgba.extend_from_slice(row_data);
         }
-        if truncated || rgba.len() != bytes {
+        if truncated {
             skipped = skipped.saturating_add(1);
             continue;
         }
+        // When the walk above does not truncate, each of `slot_h` rows appends
+        // exactly `slot_w * 4` bytes, so the buffer is complete by
+        // construction; asserting it keeps the invariant checked in tests
+        // instead of reading like a guard that can fire.
+        debug_assert_eq!(
+            rgba.len(),
+            bytes,
+            "a non-truncated color-glyph walk fills exactly its slot"
+        );
         let dest = RectPx::new(
             glyph.dest[0],
             glyph.dest[1],

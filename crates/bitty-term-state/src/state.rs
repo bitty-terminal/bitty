@@ -340,6 +340,21 @@ pub struct State {
     /// Grid-anchored display records for `a=p`/`a=T` and virtual
     /// (`U=1`) prototypes for `U+10EEEE` runs; pixels live downstream.
     kitty_placements: PlacementStore,
+    /// Topmost primary-grid row of an active inline TUI viewport (issue #3103).
+    ///
+    /// Inline primary-screen TUIs (such as `agy`, BubbleTea, or Ink rendering
+    /// inside DECSET 2026 synchronized updates with `CUU`, `ED 0`, and `CR`)
+    /// address rows in `inline_top_row..height` as 1-to-1 physical lines and
+    /// redraw them on `SIGWINCH` by stepping up by their logical widget height.
+    /// Keeping those active widget rows 1-to-1 across width resizes prevents
+    /// width shrinks from splitting widget borders/status bars into extra
+    /// physical rows that strand above `CUU`, while committed history above
+    /// `inline_top_row` continues to reflow losslessly.
+    inline_top_row: Option<u16>,
+    /// Whether an unsynchronized linefeed (`LF`/`VT`/`FF`/`IND`/`NEL` outside
+    /// DECSET 2026) has advanced the primary screen since the last inline TUI
+    /// redraw, indicating normal streaming output until the next inline frame.
+    saw_unsynced_lf: bool,
 }
 
 impl Default for State {
@@ -398,6 +413,8 @@ impl State {
             telemetry: TelemetryCounters::default(),
             images: ImageStore::new(),
             kitty_placements: PlacementStore::new(),
+            inline_top_row: None,
+            saw_unsynced_lf: false,
         }
     }
 
@@ -551,11 +568,19 @@ impl State {
         // Pre-take scrollback length for cursor bookkeeping: the take below
         // drains the buffer, so the combined index must use this snapshot.
         let sb_len_before = self.scrollback.len();
+        let inline_top_grid_row: Option<usize> = if !alt_active && !self.saw_unsynced_lf {
+            self.inline_top_row
+                .map(|r| (r as usize).min(old_rows.saturating_sub(1)))
+        } else {
+            None
+        };
         let (old_logicals, row_map): (Vec<Vec<Cell>>, Vec<(usize, usize)>) = if width_changed {
             Self::take_logical_lines(&self.screens.main, &mut self.scrollback, old_rows)
         } else {
             (Vec::new(), Vec::new())
         };
+        let inline_top_logical_idx: Option<usize> =
+            inline_top_grid_row.and_then(|gr| row_map.get(sb_len_before + gr).map(|&(li, _)| li));
         let cursor_logical: Option<(usize, usize)> = if !alt_active && width_changed {
             let crow = self.cursor.position.row as usize;
             let ccol = self.cursor.position.col as usize;
@@ -589,6 +614,11 @@ impl State {
             // which truncates/pads in place; the primary shift is invisible.
             if !alt_active {
                 report.row_shift = shift;
+                if let Some(top) = self.inline_top_row {
+                    let max_row = (rows - 1) as u16;
+                    self.inline_top_row =
+                        Some((i32::from(top) + shift).clamp(0, i32::from(max_row)) as u16);
+                }
             }
             (Vec::new(), None)
         } else {
@@ -606,6 +636,7 @@ impl State {
                 &mut self.screens.main,
                 &mut self.scrollback,
                 old_logicals,
+                inline_top_logical_idx,
                 cols,
                 rows,
                 &erase,
@@ -635,14 +666,28 @@ impl State {
         // place the cursor: logical mapping after a width reflow, else clamp.
         self.scroll_region_top = 0;
         self.scroll_region_bottom = (rows - 1) as u16;
+        if let Some(top_li) = inline_top_logical_idx {
+            let inline_total_idx: usize = reflow_counts.iter().take(top_li).sum();
+            let new_sb_len = self.scrollback.len();
+            let new_inline_row = inline_total_idx
+                .saturating_sub(new_sb_len)
+                .min(rows.saturating_sub(1));
+            self.inline_top_row = Some(new_inline_row as u16);
+        }
         if let Some((line_idx, unit_offset)) = cursor_logical {
             // Map the saved logical position through the new width. Find
             // where logical `line_idx` starts in the new combined order and
             // offset within it. Uses the single retained clone: the full
             // logical list was consumed by the reflow above.
             if let Some(logical) = cursor_cells.as_deref() {
-                // Rewrap just this logical to locate the target row/col.
-                let (row_off, col) = map_unit_to_rewrapped(logical, unit_offset, cols, &erase);
+                // Active inline TUI widget rows resize 1-to-1 in place (#3103),
+                // so their row offset is 0 and column 0 stays anchored at 0.
+                let (row_off, col) =
+                    if inline_top_logical_idx.is_some_and(|top_li| line_idx >= top_li) {
+                        (0, (self.cursor.position.col as usize).min(cols - 1))
+                    } else {
+                        map_unit_to_rewrapped(logical, unit_offset, cols, &erase)
+                    };
                 // This logical's start in the new total order is the prefix
                 // sum of the reflow's per-logical row counts (no second
                 // rewrapping pass, CTX-0469).
@@ -960,6 +1005,7 @@ impl State {
         grid: &mut crate::grid::Grid,
         scrollback: &mut crate::scrollback::Scrollback,
         logicals: Vec<Vec<Cell>>,
+        inline_top_logical_idx: Option<usize>,
         new_cols: usize,
         new_rows: usize,
         erase: &Style,
@@ -971,13 +1017,20 @@ impl State {
         // Each logical is consumed in turn (`ll` drops at the end of its
         // iteration) so only the current logical plus the growing physical
         // output are live — never the whole taken set alongside its
-        // rewrapped twin.
+        // rewrapped twin. Active inline TUI rows at or below
+        // `inline_top_logical_idx` resize 1-to-1 in place (#3103).
         let mut physical: Vec<(Vec<Cell>, bool)> = Vec::new();
         let mut row_counts: Vec<usize> = Vec::with_capacity(logicals.len());
-        for ll in logicals {
-            let rewrapped = rewrap_one_logical(&ll, new_cols, erase);
-            row_counts.push(rewrapped.len());
-            physical.extend(rewrapped);
+        for (idx, ll) in logicals.into_iter().enumerate() {
+            if inline_top_logical_idx.is_some_and(|top_li| idx >= top_li) {
+                let row = truncate_or_pad_one_logical(&ll, new_cols, erase);
+                row_counts.push(1);
+                physical.push(row);
+            } else {
+                let rewrapped = rewrap_one_logical(&ll, new_cols, erase);
+                row_counts.push(rewrapped.len());
+                physical.extend(rewrapped);
+            }
         }
         // CTX-0312: when the height shrinks in the same call as a width
         // change, trailing blank viewport rows absorb the reduction first.
@@ -2046,12 +2099,23 @@ impl State {
             // text is never silently dropped.
         }
         let cols = self.width as u16;
+        let suppress_autowrap = self.in_inline_tui_sync_frame();
         // Consume a pending wrap before placing the glyph (DECAWM).
         // This is a soft wrap: the row we leave continues onto the next.
         // Mark it BEFORE `index_linefeed` so a scroll carries the flag with
         // the row (the scrolled-off top keeps its own flag; the wrapping
         // row shifts but retains `true`).
+        //
+        // Issue #3103: inside an active primary-screen synchronized TUI frame
+        // (`?2026h`), horizontal overflow past `self.width` comes from an
+        // in-flight frame formatted for an older, wider viewport before a
+        // border-drag shrink. Clipping at the right margin keeps the TUI's
+        // physical row count 1-to-1 with its internal `y` cursor instead of
+        // scrolling the viewport and stranding status bars/borders above `CUU`.
         if self.modes.auto_wrap && self.cursor.pending_wrap {
+            if suppress_autowrap {
+                return;
+            }
             let old_row = self.cursor.position.row as usize;
             self.screens_active_mut().set_wrapped(old_row, true);
             self.index_linefeed();
@@ -2065,7 +2129,7 @@ impl State {
             return;
         }
         if glyph_width == 2 && self.cursor.position.col + 1 >= cols {
-            if self.modes.auto_wrap {
+            if self.modes.auto_wrap && !suppress_autowrap {
                 // Single documented rule for a wide character at the final
                 // column: wrap, then place on the next line (also soft).
                 let old_row = self.cursor.position.row as usize;
@@ -2073,6 +2137,9 @@ impl State {
                 self.index_linefeed();
                 self.cursor.position.col = 0;
             } else {
+                if suppress_autowrap {
+                    self.cursor.pending_wrap = self.modes.auto_wrap;
+                }
                 return;
             }
         }
@@ -3211,19 +3278,45 @@ impl State {
             }
             0x09 => self.tab_forward_steps(1),
             0x0A..=0x0C => {
+                if !self.alt_screen_active() && !self.modes.synchronized_update {
+                    self.saw_unsynced_lf = true;
+                }
                 if self.modes.line_feed_new_line {
                     self.cursor.position.col = 0;
                 }
                 self.index_linefeed();
             }
             0x0D => {
+                if !self.alt_screen_active() && self.cursor.position.col > 0 {
+                    let mut top = self.cursor.position.row as usize;
+                    while top > 0 && self.screens.main.wrapped(top - 1) {
+                        top -= 1;
+                    }
+                    let top_u16 = top as u16;
+                    self.inline_top_row =
+                        Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
+                            top_u16
+                        } else {
+                            self.inline_top_row
+                                .map_or(top_u16, |prev| prev.min(top_u16))
+                        });
+                    self.saw_unsynced_lf = false;
+                }
                 self.cursor.position.col = 0;
                 self.cursor.pending_wrap = false;
             }
             0x0E => self.charsets.lock(bitty_vt::CharsetSlot::G1),
             0x0F => self.charsets.lock(bitty_vt::CharsetSlot::G0),
-            0x84 => self.index_linefeed(),
+            0x84 => {
+                if !self.alt_screen_active() && !self.modes.synchronized_update {
+                    self.saw_unsynced_lf = true;
+                }
+                self.index_linefeed();
+            }
             0x85 => {
+                if !self.alt_screen_active() && !self.modes.synchronized_update {
+                    self.saw_unsynced_lf = true;
+                }
                 self.cursor.position.col = 0;
                 self.index_linefeed();
             }
@@ -3285,6 +3378,18 @@ impl State {
             }
         }
         self.cursor.pending_wrap = false;
+        if !self.alt_screen_active()
+            && (self.modes.synchronized_update || matches!(dir, Direction::Up))
+        {
+            let new_row = self.cursor.position.row;
+            self.inline_top_row =
+                Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
+                    new_row
+                } else {
+                    self.inline_top_row.map_or(new_row, |top| top.min(new_row))
+                });
+            self.saw_unsynced_lf = false;
+        }
     }
 
     fn cursor_position(&mut self, row: Row, col: Col) {
@@ -3302,6 +3407,10 @@ impl State {
             self.cursor.position.col = raw.min(self.width as u16 - 1);
         }
         self.cursor.pending_wrap = false;
+        if !self.alt_screen_active() && self.modes.synchronized_update {
+            let new_row = self.cursor.position.row;
+            self.inline_top_row = Some(self.inline_top_row.map_or(new_row, |top| top.min(new_row)));
+        }
     }
 
     fn cursor_save(&mut self) {
@@ -3374,6 +3483,16 @@ impl State {
             self.cursor.position.row = row.saturating_sub(1);
         }
         self.cursor.pending_wrap = false;
+        if !self.alt_screen_active() {
+            let new_row = self.cursor.position.row;
+            self.inline_top_row =
+                Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
+                    new_row
+                } else {
+                    self.inline_top_row.map_or(new_row, |top| top.min(new_row))
+                });
+            self.saw_unsynced_lf = false;
+        }
     }
 
     /// Mechanical post-action normalization guaranteeing invariant 1
@@ -3397,6 +3516,19 @@ impl State {
     fn erase_in_display(&mut self, mode: EraseDisplayMode) {
         match mode {
             EraseDisplayMode::Below => {
+                if !self.alt_screen_active() && self.modes.synchronized_update {
+                    if self.cursor.position.col == 0 && !self.cursor.pending_wrap {
+                        let mut r = self.cursor.position.row as usize;
+                        while r > 0 && self.screens.main.wrapped(r - 1) {
+                            r -= 1;
+                            self.screens.main.set_wrapped(r, false);
+                        }
+                        self.cursor.position.row = r as u16;
+                    }
+                    let r = self.cursor.position.row;
+                    self.inline_top_row = Some(self.inline_top_row.map_or(r, |top| top.min(r)));
+                    self.saw_unsynced_lf = false;
+                }
                 let (row, col) = self.cursor_xy();
                 let last_row = self.height as u16 - 1;
                 let last_col = self.width as u16 - 1;
@@ -3438,6 +3570,10 @@ impl State {
                 }
             }
             EraseDisplayMode::All => {
+                if !self.alt_screen_active() {
+                    self.inline_top_row = None;
+                    self.saw_unsynced_lf = false;
+                }
                 let erase = self.bce_style();
                 let (last_row_u, last_col_u) = (self.height as u16 - 1, self.width as u16 - 1);
                 self.screens_active_mut()
@@ -3454,6 +3590,10 @@ impl State {
                 self.buffer_epoch += 1;
             }
             EraseDisplayMode::ScrollAndClear => {
+                if !self.alt_screen_active() {
+                    self.inline_top_row = None;
+                    self.saw_unsynced_lf = false;
+                }
                 // `ED 22` (kitty scroll-and-clear, adopted by ghostty): the
                 // visible screen scrolls into the scrollback and the screen
                 // is then cleared. Retained scrollback content is preserved
@@ -3562,6 +3702,11 @@ impl State {
         // discarded, never appended to primary history (#2133). Wrap flags
         // travel with their rows so reflow can unwrap logical lines later.
         if !self.alt_screen_active() && self.scroll_region_bottom as usize == self.height - 1 {
+            if self.scroll_region_top == 0 {
+                if let Some(top) = self.inline_top_row {
+                    self.inline_top_row = Some(top.saturating_sub(n));
+                }
+            }
             for (line, wrapped) in removed {
                 let (id, evicted) = self.scrollback.push_with_wrap(line, wrapped);
                 self.batch_scroll_events.push((id, 1));
@@ -3715,7 +3860,18 @@ impl State {
             Mode::BracketedPaste => self.modes.bracketed_paste = enabled,
             Mode::FocusEvents => self.modes.focus_events = enabled,
             Mode::AlternateScroll => self.modes.alternate_scroll = enabled,
-            Mode::SynchronizedUpdate => self.modes.synchronized_update = enabled,
+            Mode::SynchronizedUpdate => {
+                if enabled && !self.alt_screen_active() {
+                    let row = self.cursor.position.row;
+                    self.inline_top_row = Some(if self.saw_unsynced_lf {
+                        row
+                    } else {
+                        self.inline_top_row.map_or(row, |top| top.min(row))
+                    });
+                    self.saw_unsynced_lf = false;
+                }
+                self.modes.synchronized_update = enabled;
+            }
             Mode::KittyKeyboard(flags) => {
                 if enabled {
                     // Legacy `?7727 h/l` alias: OR in bounded bits.
@@ -4068,6 +4224,16 @@ impl State {
         // Reset clears every visible image (specification): placements,
         // prototypes, animations, and number mappings all go.
         self.kitty_placements.clear_all();
+        self.inline_top_row = None;
+        self.saw_unsynced_lf = false;
+    }
+
+    /// Whether the state machine is currently applying a primary-screen
+    /// DECSET 2026 synchronized update frame from an inline TUI (#3103).
+    fn in_inline_tui_sync_frame(&self) -> bool {
+        !self.alt_screen_active()
+            && self.modes.synchronized_update
+            && (!self.cursor.visible || self.inline_top_row.is_some())
     }
 
     // ------------------------------------------------------------------
@@ -4293,6 +4459,45 @@ fn rewrap_one_logical(logical: &[Cell], new_cols: usize, erase: &Style) -> Vec<(
     }
     flush_row(&mut cur, &mut used, false);
     out
+}
+
+/// Packs one logical line (leads, no spacers, layout-padding trimmed) into a
+/// single physical row of `new_cols` columns without soft-wrapping
+/// (`wrapped == false`), truncating any leads past `new_cols` and padding the
+/// remainder with [`Cell::erased`]. Wide leads (`width == 2`) remain atomic:
+/// when only one column remains (`used + 1 == new_cols`), the row pads that
+/// column with a blank rather than emitting an unpaired lead (#3103).
+fn truncate_or_pad_one_logical(
+    logical: &[Cell],
+    new_cols: usize,
+    erase: &Style,
+) -> (Vec<Cell>, bool) {
+    let new_cols = new_cols.max(1);
+    let mut cur: Vec<Cell> = Vec::with_capacity(new_cols);
+    let mut used = 0usize;
+    for lead in logical {
+        let w = usize::from(lead.width.clamp(1, 2));
+        if used + w > new_cols {
+            if w == 2 && new_cols == 1 && used == 0 {
+                let mut narrow = *lead;
+                narrow.width = 1;
+                cur.push(narrow);
+                used += 1;
+            }
+            break;
+        }
+        cur.push(*lead);
+        used += 1;
+        if w == 2 {
+            cur.push(Cell::wide_spacer(lead.style));
+            used += 1;
+        }
+    }
+    while used < new_cols {
+        cur.push(Cell::erased(*erase));
+        used += 1;
+    }
+    (cur, false)
 }
 
 /// Maps a cursor unit offset within one logical line to its rewrapped

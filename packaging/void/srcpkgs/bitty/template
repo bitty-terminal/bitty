@@ -1,6 +1,6 @@
 # Template file for 'bitty'
 pkgname=bitty
-version=0.0.36
+version=0.0.37
 revision=1
 build_style=cargo
 # Both binaries ship from this template: `bittyd` is a separate workspace

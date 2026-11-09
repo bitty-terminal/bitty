@@ -88,7 +88,7 @@ libc = { workspace = true }
 # containment identity. The reviewed Win32 FFI stays in `bitty-winjob`; the
 # daemon only composes its safe API (probe, assign-before-resume, terminate,
 # and the active-process count that backs the `swept` claim).
-bitty-winjob = { version = "0.0.36", path = "../bitty-winjob" }
+bitty-winjob = { version = "0.0.37", path = "../bitty-winjob" }
 
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The

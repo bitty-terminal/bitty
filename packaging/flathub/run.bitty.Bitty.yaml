@@ -63,14 +63,14 @@ modules:
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-x86_64-unknown-linux-gnu.tar.zst
-        sha256: d9a464c793073ce6ac1dacde03a35898d54e1f4e394bbc0e919e0fea392d55e9
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.36/bitty-0.0.36-x86_64-unknown-linux-gnu.tar.zst
+        sha256: 1194734e308a4975f4d73bb938e8064cd2eb2bbbcc8fda2dd62870c063124666
         only-arches:
           - x86_64
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-aarch64-unknown-linux-gnu.tar.zst
-        sha256: 17de6d881bccb9a3de1857c3ce7519158aec96a203b85e7e64cc6bdfdb31a14d
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.36/bitty-0.0.36-aarch64-unknown-linux-gnu.tar.zst
+        sha256: 1b835a7d147dd62daa952468e63b2dc92be4988ce012131c8c50ee9af4e73e5b
         only-arches:
           - aarch64

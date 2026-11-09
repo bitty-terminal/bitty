@@ -545,10 +545,10 @@ impl Runtime {
         if self.ime_owns_key_press(&event, is_modifier, now) {
             return None;
         }
-        // CTX-0243: any non-modifier press snaps to live (covers Esc-cancel
+        // CTX-0243: any real non-modifier press snaps to live (covers Esc-cancel
         // with no bytes and unmapped keys with no encoding; normal typing
         // also snaps via `push_input_bytes` below — idempotent).
-        if event.state == PressState::Pressed && !is_modifier {
+        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
             self.snap_focused_to_live();
         }
         // CTX-0166: any real non-modifier key press clears the selection
@@ -682,8 +682,8 @@ impl Runtime {
         if self.ime_owns_key_press(event, is_modifier, std::time::Instant::now()) {
             return None;
         }
-        // CTX-0243: any non-modifier press snaps to live (see owned path).
-        if event.state == PressState::Pressed && !is_modifier {
+        // CTX-0243: any real non-modifier press snaps to live (see owned path).
+        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
             self.snap_focused_to_live();
         }
         // CTX-0166: any real non-modifier key press clears the selection
@@ -782,19 +782,33 @@ impl Runtime {
         self.push_input_bytes_multipane(bytes)
     }
 
-    /// Routes one encoded key frame, snapping on press/repeat only
-    /// (issue #1394).
+    /// Routes one encoded key frame, snapping on real non-modifier press/repeat
+    /// only (issue #1394, bitty#3096).
     ///
     /// Under Kitty `report event types` a key *release* is encoded as input
-    /// bytes too (`CSI ...:3 u`), so routing it through
-    /// [`Self::push_input_bytes`] snapped a scrolled viewport back to the
-    /// live bottom even though no new input was produced (upstream
-    /// precedent: ghostty #13026 — `scroll-to-bottom=keystroke` must not
-    /// fire on release events). A release frame is still delivered to the
-    /// shell; only the CTX-0243 snap is skipped. Press and repeat
+    /// bytes too (`CSI ...:3 u`), and under `report all keys` a modifier press
+    /// (such as `Super` on a Hyprland workspace switch) is encoded as a
+    /// dedicated `CSI u` frame (`CSI 57444 u`). Neither produces new terminal
+    /// output, so routing them through [`Self::push_input_bytes`] snapped a
+    /// scrolled viewport back to the live bottom (upstream precedent: ghostty
+    /// #13026 — `scroll-to-bottom=keystroke` must not fire on release or
+    /// modifier-only events). Those frames are still delivered to the shell;
+    /// only the CTX-0243 snap is skipped. Real non-modifier press and repeat
     /// (`event.repeat`) keep snapping.
     fn push_encoded_key_bytes(&mut self, event: &KeyEvent, bytes: &[u8]) {
-        if event.state == PressState::Released {
+        let is_modifier = matches!(
+            &event.logical_key,
+            bitty_platform::LogicalKey::Named(
+                bitty_platform::NamedKey::Shift
+                    | bitty_platform::NamedKey::Control
+                    | bitty_platform::NamedKey::Alt
+                    | bitty_platform::NamedKey::AltGraph
+                    | bitty_platform::NamedKey::Super
+                    | bitty_platform::NamedKey::Hyper
+                    | bitty_platform::NamedKey::Meta
+            )
+        );
+        if event.state == PressState::Released || event.is_synthetic || is_modifier {
             if !bytes.is_empty() {
                 self.route_input_bytes(bytes);
             }
@@ -2288,10 +2302,12 @@ impl Runtime {
         cursor: Option<usize>,
         now: std::time::Instant,
     ) {
-        // CTX-0243: preedit is typing — snap to live so the overlay lands on
-        // the visible window instead of a scrolled history viewport.
-        self.snap_focused_to_live();
-        if let Some(t) = text {
+        if let Some(t) = text.filter(|t| !t.is_empty()) {
+            // CTX-0243: non-empty preedit is active typing — snap to live so
+            // the overlay lands on the visible window instead of a scrolled
+            // history viewport. Empty preedit clears (`Done`/focus changes on
+            // Wayland) are not typing and fall through to the clearing branch.
+            self.snap_focused_to_live();
             let truncated = truncate_chars(t, IME_PREEDIT_MAX_CHARS);
             let char_len = truncated.chars().count();
             let cur = cursor
@@ -2312,6 +2328,8 @@ impl Runtime {
             self.ime_key_claim = ImeKeyClaim::Composing;
             self.pending_full_redraw = true;
         } else {
+            let had_preedit =
+                self.ime_preedit.is_some() || self.ime_key_claim == ImeKeyClaim::Composing;
             self.ime_preedit = None;
             self.ime_cursor = 0;
             // CTX-0783: the empty preedit is the *front* of a commit (winit
@@ -2327,7 +2345,9 @@ impl Runtime {
                     echo_by: now + IME_COMMIT_ECHO_WINDOW,
                 };
             }
-            self.pending_full_redraw = true;
+            if had_preedit {
+                self.pending_full_redraw = true;
+            }
         }
     }
 
@@ -2418,10 +2438,23 @@ impl Runtime {
                 echo_by: now + IME_COMMIT_ECHO_WINDOW,
             },
         };
+        let had_overlay = self.ime_preedit.is_some();
         self.ime_preedit = None;
         self.ime_cursor = 0;
+        if bounded.is_empty() && !was_armed {
+            // bitty#3096: an unsolicited empty commit (e.g. a stray Wayland
+            // `zwp_text_input_v3::done` on focus/workspace change) carries no
+            // composition and no text, so it must not snap a scrolled viewport
+            // or clear selection; only schedule a redraw if clearing preedit
+            // dismissed a live overlay.
+            if had_overlay {
+                self.pending_full_redraw = true;
+            }
+            return;
+        }
         // CTX-0243: IME commit is typing — snap to live (also snaps via
-        // `push_input_bytes` below; explicit for empty commits with no bytes).
+        // `push_input_bytes` below; explicit for empty commits closing an
+        // armed composition).
         self.snap_focused_to_live();
         // CTX-0166: IME commit is typing — dismiss the highlight first so the
         // rect never lingers a frame past the state. `clear_selection` forces

@@ -293,3 +293,46 @@ fn key_release_does_not_snap_but_press_and_repeat_do() {
     );
     assert_eq!(focused_offset(&rt), 0, "repeat must still snap");
 }
+
+#[test]
+fn kitty_report_all_modifier_and_empty_ime_do_not_snap_on_workspace_switch() {
+    // bitty#3096: when a TUI enables Kitty `report all keys` (`=8u`), pressing
+    // `Super` to switch workspaces in Hyprland encodes `CSI 57444 u`, and
+    // Wayland `zwp_text_input_v3::done` emits empty preedit/commit on focus
+    // transitions. Neither is typing, so neither may snap a scrolled viewport.
+    let mut rt = Runtime::with_defaults().expect("build");
+    rt.handle_pty_bytes(b"\x1b[=8u"); // assign: report all keys as escape codes
+    assert_eq!(rt.enhanced_keyboard_flags(), 8);
+    fill_with_scrollback(&mut rt);
+    scroll_up(&mut rt, 2.0);
+    let before = focused_offset(&rt);
+
+    let super_frame = rt
+        .handle_key_event(modifier_key(bitty_platform::NamedKey::Super))
+        .expect("Super must encode under report-all-keys");
+    assert!(!super_frame.is_empty());
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "Super press under report-all-keys must not snap the viewport"
+    );
+
+    rt.handle_ime_preedit(Some(String::new()), None);
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "empty IME preedit clear must not snap the viewport"
+    );
+    rt.handle_ime_preedit(None, None);
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "None IME preedit clear must not snap the viewport"
+    );
+    rt.handle_ime_commit(String::new());
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "unsolicited empty IME commit must not snap the viewport"
+    );
+}

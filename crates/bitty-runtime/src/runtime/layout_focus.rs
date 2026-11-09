@@ -90,7 +90,7 @@ pub(super) struct PinnedAnchor {
 pub struct HoveredHyperlink {
     /// View owning the grid the span was resolved in.
     pub view: ViewId,
-    /// Safe target URI (`http`/`https`/`mailto` only).
+    /// Safe target URI (`http`/`https`/`mailto` or authority-free local `file:///`).
     pub uri: String,
     /// Owner-grid row of the span.
     pub row: usize,
@@ -2688,6 +2688,26 @@ impl Runtime {
             .unwrap_or_else(|| self.cursor_to_cell(pos))
     }
 
+    /// Resolves the OSC 8 [`HyperlinkId`](bitty_term_state::HyperlinkId) for
+    /// `(row, col)` in `snapshot`, resolving a wide-character trailing `.spacer`
+    /// cell through its width-2 leading cell at `col - 1` (bitty#3096).
+    fn cell_hyperlink_id(
+        snapshot: &bitty_term_state::Snapshot,
+        row: usize,
+        col: usize,
+    ) -> Option<bitty_term_state::HyperlinkId> {
+        let row_base = row.checked_mul(snapshot.width)?;
+        let target = snapshot.cells.get(row_base.checked_add(col)?)?;
+        if let Some(id) = target.hyperlink {
+            Some(id)
+        } else if target.spacer && col > 0 {
+            let lead = snapshot.cells.get(row_base.checked_add(col - 1)?)?;
+            (lead.width == 2).then_some(lead.hyperlink).flatten()
+        } else {
+            None
+        }
+    }
+
     /// URI of the OSC 8 hyperlink under `pos`, resolved in the grid of the
     /// View under the pointer (CTX-0804, #1477; CTX-0808 fail-closed padding).
     ///
@@ -2712,11 +2732,22 @@ impl Runtime {
         }
         let state = self.live_view_state(view)?;
         let snapshot = state.snapshot();
-        let index = usize::from(cell.row)
-            .checked_mul(snapshot.width)?
-            .checked_add(usize::from(cell.col))?;
-        let id = snapshot.cells.get(index)?.hyperlink?;
+        let row = usize::from(cell.row);
+        let col = usize::from(cell.col);
+        let id = Self::cell_hyperlink_id(&snapshot, row, col)?;
         state.hyperlink_entry(id).map(|(_, uri)| uri.to_owned())
+    }
+
+    /// Whether `uri` passes the runtime OSC 8 scheme and structure gate
+    /// (`http`/`https`/`mailto` via [`validate_url`](bitty_platform::validate_url),
+    /// or authority-free local `file:///` via
+    /// [`validate_file_url`](bitty_platform::validate_file_url)).
+    pub(super) fn is_safe_osc8_uri(uri: &str) -> bool {
+        if uri.starts_with("file:") {
+            bitty_platform::validate_file_url(uri).is_ok()
+        } else {
+            bitty_platform::validate_url(uri).is_ok()
+        }
     }
 
     /// Whether the Ctrl (Linux/Windows) or Cmd (macOS) hyperlink gesture
@@ -2738,23 +2769,17 @@ impl Runtime {
     /// local `file:` through `validate_file_url`, everything else `None`.
     pub(super) fn safe_hyperlink_uri_at(&self, pos: CursorPosition) -> Option<String> {
         let uri = self.hyperlink_uri_at(pos)?;
-        let is_safe = if uri.starts_with("file:") {
-            bitty_platform::validate_file_url(&uri).is_ok()
-        } else {
-            bitty_platform::validate_url(&uri).is_ok()
-        };
-        is_safe.then_some(uri)
+        Self::is_safe_osc8_uri(&uri).then_some(uri)
     }
 
     /// Full owner-grid span of the safe OSC 8 hyperlink under `pos`
     /// (issue #1759, R-005 hover resolution).
     ///
-    /// Same hit-test rule as [`Self::hyperlink_uri_at`] (in-frame only,
-    /// fail-closed on history scroll), but resolves through
-    /// [`hyperlink_spans`](bitty_rich::hyperlink::hyperlink_spans) so the
-    /// span carries its row/column run for the underline highlight. Unsafe
-    /// schemes (`javascript:`, `file:`, …) never resolve to a span because
-    /// the presentation layer refuses to present them.
+    /// Same hit-test rule as [`Self::safe_hyperlink_uri_at`] (in-frame only,
+    /// fail-closed on history scroll, and accepting both validated web/mailto
+    /// URLs and authority-free `file:///` URLs), and expands across the full
+    /// contiguous row run (including wide-character trailing `.spacer` cells)
+    /// that shares the resolved hyperlink identity.
     fn hovered_hyperlink_at(&self, pos: CursorPosition) -> Option<HoveredHyperlink> {
         let frames = self.present_frames();
         let (view, local) = self.present_cell_in(&frames, pos)?;
@@ -2768,18 +2793,34 @@ impl Runtime {
         }
         let state = self.live_view_state(view)?;
         let snapshot = state.snapshot();
-        let spans = bitty_rich::hyperlink::hyperlink_spans(&snapshot, state);
         let (row, col) = (usize::from(cell.row), usize::from(cell.col));
-        spans
-            .into_iter()
-            .find(|span| span.row == row && col >= span.col_start && col <= span.col_end)
-            .map(|span| HoveredHyperlink {
-                view,
-                uri: span.uri,
-                row: span.row,
-                col_start: span.col_start,
-                col_end: span.col_end,
-            })
+        if row >= snapshot.height || col >= snapshot.width {
+            return None;
+        }
+        let id = Self::cell_hyperlink_id(&snapshot, row, col)?;
+        let (id_param, uri) = state.hyperlink_entry(id)?;
+        if !Self::is_safe_osc8_uri(uri)
+            || id_param.is_some_and(|value| value.len() > bitty_rich::hyperlink::HYPERLINK_ID_MAX)
+        {
+            return None;
+        }
+        let mut col_start = col;
+        while col_start > 0 && Self::cell_hyperlink_id(&snapshot, row, col_start - 1) == Some(id) {
+            col_start -= 1;
+        }
+        let mut col_end = col;
+        while col_end + 1 < snapshot.width
+            && Self::cell_hyperlink_id(&snapshot, row, col_end + 1) == Some(id)
+        {
+            col_end += 1;
+        }
+        Some(HoveredHyperlink {
+            view,
+            uri: uri.to_owned(),
+            row,
+            col_start,
+            col_end,
+        })
     }
 
     /// Refreshes the hover state from `pos` (issue #1759, R-005).
@@ -2859,7 +2900,7 @@ impl Runtime {
     #[must_use]
     pub fn hovered_hyperlink_preview(&self) -> Option<String> {
         let uri = self.hovered_hyperlink_uri()?;
-        if !bitty_rich::hyperlink::is_safe_hyperlink_uri(uri) {
+        if !Self::is_safe_osc8_uri(uri) {
             return None;
         }
         let mut preview: String = uri.chars().take(HYPERLINK_PREVIEW_MAX_CHARS).collect();

@@ -1,0 +1,39 @@
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
+index f7e20c19..2157924a 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
+@@ -356,6 +356,23 @@ impl<T: 'static> EventLoop<T> {
+             callback(Event::UserEvent(user_event), &self.window_target);
+         }
+ 
++        // Dispatch any Wayland protocol events that were already read from the
++        // shared display socket into `wayland_dispatcher`'s queue by another
++        // thread (such as Vulkan's `vkAcquireNextImageKHR` / `vkQueuePresentKHR`
++        // polling the same `wl_display`), even when `calloop::poll` woke on the
++        // user-event channel rather than on the Wayland socket fd.
++        {
++            let state = match &mut self.window_target.p {
++                PlatformActiveEventLoop::Wayland(window_target) => window_target.state.get_mut(),
++                #[cfg(x11_platform)]
++                _ => unreachable!(),
++            };
++            let mut wayland_source = self.wayland_dispatcher.as_source_mut();
++            if let Err(err) = wayland_source.queue().dispatch_pending(state) {
++                tracing::warn!("Error dispatching pending Wayland events: {err}");
++            }
++        }
++
+         // Drain the pending compositor updates.
+         self.with_state(|state| compositor_updates.append(&mut state.window_compositor_updates));
+ 
+@@ -563,6 +580,10 @@ impl<T: 'static> EventLoop<T> {
+         std::mem::swap(&mut self.compositor_updates, &mut compositor_updates);
+         std::mem::swap(&mut self.buffer_sink, &mut buffer_sink);
+         std::mem::swap(&mut self.window_ids, &mut window_ids);
++
++        // Flush any outgoing Wayland requests queued during `single_iteration`
++        // (such as `xdg_wm_base.pong` responses to compositor pings) immediately.
++        let _ = self.connection.flush();
+     }
+ 
+     #[inline]

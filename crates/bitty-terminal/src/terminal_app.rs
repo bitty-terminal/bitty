@@ -2414,6 +2414,19 @@ impl TerminalApp {
         // the runtime's tick consumes snapshot+damage and composites. Issue
         // #2483 deliberately leaves this whole call under one phase: a stall
         // inside compose/present reports as `runtime-tick`, the ANR shape.
+        //
+        // bitty#3096: arm the compositor frame callback for the frame this
+        // tick is about to submit. On Wayland winit only throttles
+        // `RedrawRequested` to the compositor's present cadence while a frame
+        // callback is in flight, so without this call a high-rate PTY stream
+        // spins the loop and starves main-queue dispatch. Gated on a visible
+        // surface and a live presenter: a callback armed for a frame that
+        // never commits would suppress the redraw that delivers it.
+        if self.present_owed() && self.runtime.has_gpu() {
+            if let Some(win) = self.window.handle.as_ref() {
+                win.pre_present_notify();
+            }
+        }
         self.watchdog_phase(Phase::RuntimeTick);
         let stats = self.runtime.tick();
         // bitty#2859: opt-in idle-RSS attribution. Off by default; when armed
@@ -5372,7 +5385,20 @@ impl TerminalApp {
                         // repair probe asked for this frame. The compositor
                         // serving it proves the surface is mapped again even
                         // when the reveal edge itself never arrived.
-                        if self.hidden_repair_probe_at.is_some()
+                        //
+                        // bitty#3096: on Wayland, winit dispatches a queued
+                        // `RedrawRequested` in the same iteration right after
+                        // `Occluded(true)` when no frame callback is pending.
+                        // Do not treat `RedrawRequested` as a repair reveal
+                        // while the platform occlusion probe still reports the
+                        // surface as occluded.
+                        let surface_occluded = self
+                            .window
+                            .handle
+                            .as_ref()
+                            .is_some_and(|win| win.occlusion_snapshot().occluded);
+                        if !surface_occluded
+                            && self.hidden_repair_probe_at.is_some()
                             && self.apply_hidden_repair_probe(true, std::time::Instant::now())
                         {
                             crate::logging::info(|| {

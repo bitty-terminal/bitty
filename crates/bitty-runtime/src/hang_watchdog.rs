@@ -31,10 +31,10 @@ use std::sync::atomic::{AtomicU64, Ordering, fence};
 /// Number of completed tick records retained for the hang watchdog.
 ///
 /// The monitor drains the ring every poll (100 ms at the default bound), so
-/// sixteen slots cover a burst of ordinary frames after a slow tick. Records
-/// overwritten before a drain are surfaced as a [`TickGap`] instead of being
-/// dropped silently.
-pub const TICK_RING_CAPACITY: usize = 16;
+/// 256 slots cover a high-rate burst of ordinary frames after a slow tick.
+/// Records overwritten before a drain are surfaced as a [`TickGap`] instead of
+/// being dropped silently.
+pub const TICK_RING_CAPACITY: usize = 256;
 
 /// One completed tick retained in the bounded ring.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -91,12 +91,23 @@ impl TickGap {
 /// seqlock stamp still matches the expected sequence *before and after* the
 /// duration read, so a slot overwritten by a newer tick is rejected and named
 /// as a gap instead of pairing a stale sequence with a newer duration.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TickRingDrain {
     records: [TickRecord; TICK_RING_CAPACITY],
     len: usize,
     last_seq: u64,
     gap: Option<TickGap>,
+}
+
+impl Default for TickRingDrain {
+    fn default() -> Self {
+        Self {
+            records: [TickRecord::default(); TICK_RING_CAPACITY],
+            len: 0,
+            last_seq: 0,
+            gap: None,
+        }
+    }
 }
 
 impl TickRingDrain {
@@ -312,7 +323,7 @@ hidden_damage={}",
 /// with `Release` before the counter that announces the sequence, so the
 /// monitor never pairs a sequence with another tick's duration. See
 /// [`Self::drain_ticks_since`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct HangGauges {
     tick_count: AtomicU64,
     last_tick_ns: AtomicU64,
@@ -341,6 +352,40 @@ pub struct HangGauges {
     pending_exits: AtomicU64,
     pending_replies: AtomicU64,
     hidden_damage: AtomicU64,
+}
+
+impl Default for HangGauges {
+    fn default() -> Self {
+        Self {
+            tick_count: AtomicU64::new(0),
+            last_tick_ns: AtomicU64::new(0),
+            max_tick_ns: AtomicU64::new(0),
+            tick_ring: std::array::from_fn(|_| TickRingSlot::default()),
+            pending_input_bytes: AtomicU64::new(0),
+            pending_input_dropped: AtomicU64::new(0),
+            cold_queue_len: AtomicU64::new(0),
+            cold_queue_dropped: AtomicU64::new(0),
+            plugin_events_queued: AtomicU64::new(0),
+            plugin_events_bytes: AtomicU64::new(0),
+            plugin_side_queued: AtomicU64::new(0),
+            plugin_side_dropped: AtomicU64::new(0),
+            plugin_parked_commands: AtomicU64::new(0),
+            plugin_active_commands: AtomicU64::new(0),
+            plugin_workers: AtomicU64::new(0),
+            component_events: AtomicU64::new(0),
+            component_events_dropped: AtomicU64::new(0),
+            pane_count: AtomicU64::new(0),
+            leaf_count: AtomicU64::new(0),
+            content_bytes: AtomicU64::new(0),
+            panel_leases: AtomicU64::new(0),
+            band_bindings: AtomicU64::new(0),
+            input_commands: AtomicU64::new(0),
+            input_commands_dropped: AtomicU64::new(0),
+            pending_exits: AtomicU64::new(0),
+            pending_replies: AtomicU64::new(0),
+            hidden_damage: AtomicU64::new(0),
+        }
+    }
 }
 
 impl HangGauges {
@@ -679,15 +724,16 @@ mod tests {
     #[test]
     fn completed_tick_ring_names_the_overwritten_span() {
         let gauges = HangGauges::new();
-        for seq in 1..=20u64 {
+        let total = (TICK_RING_CAPACITY as u64) + 4;
+        for seq in 1..=total {
             gauges.finish_tick(seq * 1_000);
         }
         let drain = gauges.drain_ticks_since(0);
         assert_eq!(drain.gap(), Some(TickGap { from: 1, to: 4 }));
         assert_eq!(drain.gap().expect("gap").missed(), 4);
         let seqs: Vec<u64> = drain.records().iter().map(|record| record.seq).collect();
-        assert_eq!(seqs, (5..=20).collect::<Vec<_>>());
-        assert_eq!(drain.last_seq(), 20);
+        assert_eq!(seqs, (5..=total).collect::<Vec<_>>());
+        assert_eq!(drain.last_seq(), total);
     }
 
     /// The ring keeps the `(seq, duration)` pair intact while a producer

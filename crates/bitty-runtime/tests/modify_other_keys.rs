@@ -161,8 +161,8 @@ fn legacy_bytes_are_unchanged_when_neither_protocol_is_negotiated() {
     let enter = named_key(NamedKey::Enter, PressState::Pressed);
     assert_eq!(
         encode_with_modifier(&mut rt, NamedKey::Shift, &enter),
-        Some(b"\r".to_vec()),
-        "legacy Shift+Enter stays CR"
+        Some(b"\x1b[27;2;13~".to_vec()),
+        "legacy Shift+Enter emits CSI 27;2;13~"
     );
     let ctrl_a = char_key("a", None);
     assert_eq!(

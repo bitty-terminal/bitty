@@ -499,8 +499,8 @@ impl State {
     /// history rows on grow (bottom-anchored when the cursor is on the last
     /// row), so a width-preserving shrink/grow round-trip restores content
     /// (#2529). The alternate grid keeps the application-owned truncate/pad
-    /// path. Scroll region resets to full screen and the cursor is stepped
-    /// off spacers (RFC invariants 1-6). This is the environment-declared
+    /// path. Scroll region resets to full screen and saved/active cursors are
+    /// clamped to the new bounds. This is the environment-declared
     /// resize path (RFC "Environment declaration"). Returns full-grid plus
     /// scrollback-reflow damage tagged with the new generation. Headless:
     /// pure in-memory, no I/O, deterministic.
@@ -668,39 +668,13 @@ impl State {
         }
         self.cursor.pending_wrap = false;
         self.enforce_cursor_invariants();
-        for (slot, saved) in self.saved_cursors.iter_mut().enumerate() {
-            if let Some(s) = saved {
-                s.position.row = s.position.row.min((rows - 1) as u16);
-                s.position.col = s.position.col.min((cols - 1) as u16);
-                let grid = if slot == 0 {
-                    &self.screens.main
-                } else {
-                    &self.screens.alt
-                };
-                if grid
-                    .get(s.position.row as usize, s.position.col as usize)
-                    .spacer
-                    && s.position.col > 0
-                {
-                    s.position.col -= 1;
-                }
-            }
+        for s in self.saved_cursors.iter_mut().flatten() {
+            s.position.row = s.position.row.min((rows - 1) as u16);
+            s.position.col = s.position.col.min((cols - 1) as u16);
         }
         if let Some(save) = &mut self.primary_save {
             save.cursor_position.row = save.cursor_position.row.min((rows - 1) as u16);
             save.cursor_position.col = save.cursor_position.col.min((cols - 1) as u16);
-            if self
-                .screens
-                .main
-                .get(
-                    save.cursor_position.row as usize,
-                    save.cursor_position.col as usize,
-                )
-                .spacer
-                && save.cursor_position.col > 0
-            {
-                save.cursor_position.col -= 1;
-            }
         }
         // Damage for resize: full grid plus scrollback reflow range when
         // scrollback non-empty (RFC damage model). Coalesce ordering is grid
@@ -3290,39 +3264,23 @@ impl State {
                 // CUF from untrusted input is O(1) instead of a 65k grid
                 // scan. CUF/CUB counts are *columns*, not character
                 // positions: a wide pair's trailing spacer is not an extra
-                // step. The destination is therefore exactly `col + n`
-                // (clamped), snapped back to the leading half only when it
-                // lands on a spacer (invariant 3: the cursor never rests on
-                // one). Counting spacers as extra columns made shell redraws
-                // (`CR`, absolute CUF, then CUB) land past their intended
-                // column and repaint over stale cells (issue #2261).
+                // step, and it is a legal cursor column (bitty#3096), so the
+                // destination is exactly `col + n` clamped at the last
+                // column. Counting spacers as extra columns made shell
+                // redraws (`CR`, absolute CUF, then CUB) land past their
+                // intended column and repaint over stale cells (issue #2261).
                 let last = last_col as usize;
                 let c = (col as usize).saturating_add(usize::from(n)).min(last);
-                let c = if self
-                    .screens_active()
-                    .get(self.cursor.position.row as usize, c)
-                    .spacer
-                {
-                    c.saturating_sub(1)
-                } else {
-                    c
-                };
                 self.cursor.position.col = c as u16;
             }
             Direction::Left => {
-                // CR-TERM-02: symmetric O(1) left-margin clamp. A spacer
-                // destination snaps to its leading half; the step count is
-                // never inflated by the pair it traverses.
+                // CR-TERM-02: symmetric O(1) left-margin clamp. Cursor column
+                // coordinates address exact grid columns without snapping off
+                // spacer cells so multi-byte backspace sequences (`\x08\x08`)
+                // move by exact column count; visual cursor rendering
+                // normalizes spacer cells onto their leading wide cell at
+                // present time (`normalize_cursor_cell`).
                 let c = (col as usize).saturating_sub(usize::from(n));
-                let c = if self
-                    .screens_active()
-                    .get(self.cursor.position.row as usize, c)
-                    .spacer
-                {
-                    c.saturating_sub(1)
-                } else {
-                    c
-                };
                 self.cursor.position.col = c as u16;
             }
         }
@@ -3418,19 +3376,16 @@ impl State {
         self.cursor.pending_wrap = false;
     }
 
-    /// Mechanical post-action normalization guaranteeing invariants 1 and
-    /// 3 regardless of which handler ran: clamp to the screen, honor
-    /// origin-mode region bounds, and step off any spacer half.
+    /// Mechanical post-action normalization guaranteeing invariant 1
+    /// regardless of which handler ran: clamp to the screen and honor
+    /// origin-mode region bounds.
     fn enforce_cursor_invariants(&mut self) {
         let last_row = self.height as u16 - 1;
         let last_col = self.width as u16 - 1;
         let mut row = self.cursor.position.row.min(last_row);
-        let mut col = self.cursor.position.col.min(last_col);
+        let col = self.cursor.position.col.min(last_col);
         if self.modes.origin {
             row = row.clamp(self.scroll_region_top, self.scroll_region_bottom);
-        }
-        if self.screens_active().get(row as usize, col as usize).spacer && col > 0 {
-            col -= 1;
         }
         self.cursor.position = CursorPosition { row, col };
     }

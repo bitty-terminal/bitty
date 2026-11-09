@@ -36,6 +36,27 @@ fn zero_resize_is_skipped_honestly() {
 }
 
 #[test]
+fn repeated_identical_resize_still_repaints() {
+    // bitty#3096: Hyprland re-delivers `Resized` with the same extent on a
+    // workspace switch. The reflow and repaint must still run (a resize always
+    // owes a frame), but `resize_primary_pty` skips the redundant
+    // `TIOCSWINSZ`, which is what emitted `SIGWINCH` and reset a full-screen
+    // TUI's scroll position.
+    let mut rt = make_runtime();
+    rt.handle_resize(PhysicalSize::new(800, 600))
+        .expect("valid resize");
+    assert!(rt.tick().is_some(), "the first resize forces a frame");
+    assert_eq!(rt.tick(), None, "idle after the resize frame");
+    rt.handle_resize(PhysicalSize::new(800, 600))
+        .expect("identical resize must not error");
+    assert!(
+        rt.tick().is_some(),
+        "a repeated Resized still repaints the surface"
+    );
+    assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
+}
+
+#[test]
 fn handle_platform_event_close_semantics() {
     let mut rt = make_runtime();
     let close = rt.handle_platform_event(PlatformEvent::Exiting);

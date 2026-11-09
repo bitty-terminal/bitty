@@ -8253,7 +8253,7 @@ claims = []
         // Modified Enter never confirms. The table covers the legacy
         // fallback and both Kitty disambiguation/report-events paths.
         for (name, negotiation, expected) in [
-            ("legacy", None, b"\r".as_slice()),
+            ("legacy", None, b"\x1b[27;2;13~".as_slice()),
             (
                 "kitty disambiguation",
                 Some(b"\x1b[>1u".as_slice()),

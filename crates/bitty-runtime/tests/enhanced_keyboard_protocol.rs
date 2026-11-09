@@ -523,14 +523,14 @@ fn unnegotiated_enter_tab_backspace_keep_legacy_bytes() {
 fn shift_enter_is_distinct_only_after_kitty_negotiation() {
     let mut rt = make_runtime();
 
-    // Without an application opt-in, legacy Enter remains CR and Shift+Enter
-    // fails closed to the same legacy byte: no guessed escape sequence is sent
-    // to applications that did not negotiate one.
+    // Without Kitty disambiguation opt-in, modified Enter uses xterm
+    // modifyOtherKeys format (`CSI 27;2;13~`) so TUI editors distinguish
+    // Shift+Enter (insert newline) from plain Enter (submit).
     press_shift(&mut rt);
     assert_eq!(
         rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
-        Some(b"\r".to_vec()),
-        "unnegotiated Shift+Enter must stay legacy CR"
+        Some(b"\x1b[27;2;13~".to_vec()),
+        "unnegotiated Shift+Enter must emit modifyOtherKeys CSI 27;2;13~"
     );
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
 
@@ -599,7 +599,7 @@ fn shift_enter_is_not_encoded_by_an_unrelated_alternate_flag() {
     press_shift(&mut rt);
     assert_eq!(
         rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
-        Some(b"\r".to_vec()),
+        Some(b"\x1b[27;2;13~".to_vec()),
         "Shift+Enter must not emit CSI-u without disambiguation or all-keys"
     );
     rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));

@@ -852,11 +852,25 @@ impl Runtime {
     }
 
     /// Resizes the primary PTY winsize to the primary grid (`cols`/`rows`).
+    ///
+    /// bitty#3096: an unchanged winsize is not re-sent. `TIOCSWINSZ` always
+    /// delivers `SIGWINCH` to the foreground process group, and Hyprland
+    /// re-delivers `Resized` with identical geometry on a workspace switch, so
+    /// re-sending it makes a full-screen TUI (rmpc, htop) repaint from the
+    /// bottom and drop the scroll position the user was reading. The reflow
+    /// and repaint still run — only the redundant ioctl is skipped. A failed
+    /// size query fails open to the resize.
     pub(super) fn resize_primary_pty(&mut self) -> Result<(), RuntimeError> {
         let pty_cols = self.cols.min(u16::MAX as usize) as u16;
         let pty_rows = self.rows.min(u16::MAX as usize) as u16;
         let (pixel_width, pixel_height) = self.pty_pixel_span(pty_cols, pty_rows);
         if let Some(pty) = self.pty.as_mut() {
+            let unchanged = pty
+                .size_pixels()
+                .is_ok_and(|current| current == (pty_cols, pty_rows, pixel_width, pixel_height));
+            if unchanged {
+                return Ok(());
+            }
             pty.resize_pixels(pty_cols, pty_rows, pixel_width, pixel_height)
                 .map_err(RuntimeError::from)?;
         }

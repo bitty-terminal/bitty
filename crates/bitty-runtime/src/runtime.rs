@@ -1906,6 +1906,14 @@ pub struct FileUrlActivation {
     uri: String,
 }
 
+impl FileUrlActivation {
+    /// The validated local-file URI this authorization binds to.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+}
+
 impl std::fmt::Debug for Runtime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Runtime")

@@ -710,6 +710,7 @@ impl Runtime {
             }
             drain_fair(&mut budget, first, &mut sources)
         };
+        let budget_exhausted = !budget.allows_another();
         let mut pane_chunks: Vec<(ViewId, Vec<u8>)> = Vec::new();
         for (source, chunk) in drained {
             match source.checked_sub(1) {
@@ -744,6 +745,15 @@ impl Runtime {
         let writer_pending = self.pending_writer_bytes();
         self.hang_gauges
             .set_pending_input(writer_pending, self.pending_input_dropped);
+        // bitty#3096: when the bounded drain stops at the CTX-0476 chunk/byte/time
+        // budget while coalesced wakes are active, schedule a follow-up wake so
+        // any remaining queued PTY chunks continue draining without waiting for
+        // unrelated activity.
+        if budget_exhausted {
+            if let Some(waker) = self.pty_waker.as_ref() {
+                (waker)();
+            }
+        }
         count
     }
 

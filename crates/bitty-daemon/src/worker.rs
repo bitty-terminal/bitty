@@ -2245,6 +2245,10 @@ mod tests {
     fn a_non_executable_program_is_a_typed_exec_refusal_and_creates_no_handle() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // The fixture is never executed, but the pool allocates a PTY before
+        // `exec`: without that allocation the refusal is the PTY class, not
+        // the `EACCES` class this test pins.
+        bitty_test_support::require_pty!();
         let limits = Limits::default();
         let mut pool = WorkerPool::new(&limits);
         let dir = tempfile::tempdir().expect("a temporary directory");

@@ -324,6 +324,15 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/check-test-support-gate.sh
 
+      # CTX-1778 (bitty#3095): the pty-gate lint is what keeps a live-spawn
+      # test from silently landing ungated and then failing on a host without
+      # a PTY backend. It ran only through `just check`, which PR CI never
+      # invoked, so five sites rotted in at once; run it here so the gate
+      # cannot regress again.
+      - name: Check PTY gating of live-spawn tests
+        if: matrix.shard == 1
+        run: bash scripts/check-pty-gated-tests.sh
+
       # CTX-0847: cargo-nextest isolates every test in its own process, caps
       # the real-process `live-pty` group so system suites cannot starve each
       # other on small runners, bounds each test with a timeout, and reports

@@ -2169,16 +2169,17 @@ impl State {
                 .set(row, col + 1, Cell::wide_spacer(style));
         }
         let write_erase = self.bce_style();
-        if self.screens_active_mut().repair_row(row, &write_erase) {
+        if self.screens_active_mut().repair_row(row, &write_erase) || self.modes.insert {
             let last_col = self.width as u16 - 1;
             self.damage_grid_rect(row as u16, col as u16, row as u16, last_col);
+        } else {
+            self.damage_grid_rect(
+                row as u16,
+                col as u16,
+                row as u16,
+                (col + glyph_width as usize - 1) as u16,
+            );
         }
-        self.damage_grid_rect(
-            row as u16,
-            col as u16,
-            row as u16,
-            (col + glyph_width as usize - 1) as u16,
-        );
         // CTX-0996: every placed glyph marks its row as holding command
         // output (resolved later against the last `OutputStart`). Dropped
         // wide chars return early above and never reach here.
@@ -2250,11 +2251,12 @@ impl State {
             },
         );
         let write_erase = self.bce_style();
-        if self.screens_active_mut().repair_row(row, &write_erase) {
+        if self.screens_active_mut().repair_row(row, &write_erase) || self.modes.insert {
             let last_col = self.width as u16 - 1;
             self.damage_grid_rect(row as u16, col as u16, row as u16, last_col);
+        } else {
+            self.damage_grid_rect(row as u16, col as u16, row as u16, col as u16);
         }
-        self.damage_grid_rect(row as u16, col as u16, row as u16, col as u16);
         // CTX-0996: placeholder cells are ordinary width-1 output.
         self.note_output_print();
         let advanced = col + 1;
@@ -3135,7 +3137,12 @@ impl State {
         self.screens_active_mut().set(row, col, cell);
         self.screens_active_mut()
             .set(row, col + 1, Cell::wide_spacer(style));
-        self.damage_grid_rect(row as u16, col as u16, row as u16, (col + 1) as u16);
+        let end_col = if self.modes.insert {
+            self.width - 1
+        } else {
+            col + 1
+        };
+        self.damage_grid_rect(row as u16, col as u16, row as u16, end_col as u16);
         // The cluster completed at the cell immediately before the cursor,
         // so the cursor advances over the new spacer.
         let advanced = col + 2;
@@ -4376,4 +4383,105 @@ fn map_unit_to_rewrapped(
 /// Parser-resolved counts are guaranteed positive; defensive floor at one.
 fn effective_count(n: Count) -> u16 {
     n.0.max(1)
+}
+
+#[cfg(test)]
+mod insert_mode_damage_tests {
+    use super::*;
+    use crate::damage::DamagedRegion;
+    use bitty_vt::{GraphemeCell, Mode, TerminalAction};
+
+    #[test]
+    fn insert_mode_print_damages_shifted_row_tail() {
+        let mut state = State::new();
+        for ch in ['a', 'b', 'c'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(1),
+            col: bitty_vt::Col(1),
+        });
+        state.apply(&TerminalAction::SetMode {
+            mode: Mode::Insert,
+            enabled: true,
+        });
+        let dmg = state.apply(&TerminalAction::Print(GraphemeCell::from('x')));
+        assert!(
+            dmg.regions.iter().any(|region| matches!(
+                region,
+                DamagedRegion::Grid(r)
+                    if r.top == 0 && r.left == 0 && r.right == (GRID_COLUMNS as u16 - 1)
+            )),
+            "insert-mode print must damage the full shifted row tail, got {:?}",
+            dmg.regions
+        );
+    }
+
+    /// A `U+10EEEE` placeholder is a width-1 print, so `IRM` shifts the row
+    /// tail exactly like any other glyph: the damage must cover it.
+    #[test]
+    fn insert_mode_placeholder_print_damages_shifted_row_tail() {
+        let mut state = State::new();
+        for ch in ['a', 'b', 'c', 'd'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(1),
+            col: bitty_vt::Col(2),
+        });
+        state.apply(&TerminalAction::SetMode {
+            mode: Mode::Insert,
+            enabled: true,
+        });
+        let dmg = state.apply(&TerminalAction::Print(GraphemeCell::from('\u{10EEEE}')));
+        assert!(
+            dmg.regions.iter().any(|region| matches!(
+                region,
+                DamagedRegion::Grid(r)
+                    if r.top == 0 && r.left <= 1 && r.right == (GRID_COLUMNS as u16 - 1)
+            )),
+            "insert-mode placeholder print must damage the shifted row tail, got {:?}",
+            dmg.regions
+        );
+    }
+
+    /// An emoji-presentation selector widens a committed one-cell cluster to
+    /// two cells; under `IRM` the inserted spacer shifts the row tail, so the
+    /// damage must reach the row end rather than stopping at the spacer.
+    #[test]
+    fn insert_mode_wide_cluster_growth_damages_shifted_row_tail() {
+        let mut state = State::new();
+        // `U+2764` is text-presentation width 1; `U+FE0F` grows it to 2.
+        state.apply(&TerminalAction::Print(GraphemeCell::from('\u{2764}')));
+        for ch in ['a', 'b', 'c'] {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row(1),
+            col: bitty_vt::Col(2),
+        });
+        state.apply(&TerminalAction::SetMode {
+            mode: Mode::Insert,
+            enabled: true,
+        });
+        let dmg = state.apply(&TerminalAction::Print(GraphemeCell::from('\u{FE0F}')));
+        assert!(
+            dmg.regions.iter().any(|region| matches!(
+                region,
+                DamagedRegion::Grid(r)
+                    if r.top == 0 && r.left == 0 && r.right == (GRID_COLUMNS as u16 - 1)
+            )),
+            "insert-mode cluster growth must damage the shifted row tail, got {:?}",
+            dmg.regions
+        );
+        assert_eq!(
+            state.screens_active().get(0, 0).width,
+            2,
+            "the selector-16 cluster must commit as two cells"
+        );
+        assert!(
+            state.screens_active().get(0, 1).spacer,
+            "column 1 holds the wide spacer"
+        );
+    }
 }

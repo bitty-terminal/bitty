@@ -190,6 +190,12 @@ fn validate_semver(raw: &str, field: &str) -> Result<(), PackageError> {
             ));
         }
     }
+    if crate::version::Version::parse(raw).is_err() {
+        return Err(PackageError::manifest(
+            field,
+            format!("version '{raw}' must be SemVer X.Y.Z"),
+        ));
+    }
     Ok(())
 }
 
@@ -238,6 +244,12 @@ fn validate_version_req(raw: &str, field: &str) -> Result<(), PackageError> {
     }
     if raw.contains('&') {
         return Err(PackageError::manifest(field, "operator '&' is not allowed"));
+    }
+    if crate::requirement::VersionReq::parse(raw).is_err() {
+        return Err(PackageError::manifest(
+            field,
+            format!("version requirement '{raw}' is malformed"),
+        ));
     }
     Ok(())
 }
@@ -1302,5 +1314,30 @@ mod tests {
         let fresh = CapabilityCatalog::core();
         assert!(!fresh.contains_family("ai"));
         assert!(CapabilityId::parse_with(&fresh, "ai.provider").is_err());
+    }
+
+    #[test]
+    fn validate_semver_and_version_req_enforce_strict_grammar() {
+        for bad_ver in [
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0+a+b",
+            "1.0.0-01",
+            "4294967296.0.0",
+        ] {
+            assert!(
+                validate_semver(bad_ver, "version").is_err(),
+                "malformed semver '{bad_ver}' must be rejected"
+            );
+        }
+        assert!(validate_semver("1.2.3-alpha.1+build.7", "version").is_ok());
+
+        for bad_req in ["   ", ",,,", ">=", "^", "^1.0, <2.0.0", ">=1.2.3.4"] {
+            assert!(
+                validate_version_req(bad_req, "engine.bitty").is_err(),
+                "malformed version_req '{bad_req}' must be rejected"
+            );
+        }
+        assert!(validate_version_req(">=0.1.0, <0.2.0", "engine.bitty").is_ok());
     }
 }

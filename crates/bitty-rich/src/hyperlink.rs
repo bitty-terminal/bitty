@@ -270,11 +270,16 @@ pub fn hyperlink_overlay_rects(
     let mut rects = Vec::with_capacity(spans.len());
     for span in spans {
         let cols = (span.col_end - span.col_start + 1) as u64;
-        let width = (cols * u64::from(metrics.width)) as u32;
-        let x = (span.col_start as u64 * u64::from(metrics.width)) as i32;
-        let y = (span.row as u64 * u64::from(metrics.height)
-            + u64::from(metrics.height).saturating_sub(u64::from(thickness) * 2))
-            as i32;
+        let width_u64 = cols.saturating_mul(u64::from(metrics.width));
+        let width = u32::try_from(width_u64).unwrap_or(u32::MAX);
+        let x_u64 = (span.col_start as u64).saturating_mul(u64::from(metrics.width));
+        let x = i32::try_from(x_u64).unwrap_or(i32::MAX);
+        let y_u64 = (span.row as u64)
+            .saturating_mul(u64::from(metrics.height))
+            .saturating_add(
+                u64::from(metrics.height).saturating_sub(u64::from(thickness).saturating_mul(2)),
+            );
+        let y = i32::try_from(y_u64).unwrap_or(i32::MAX);
         rects.push(RectPx::new(x, y, width, thickness));
     }
     rects
@@ -551,5 +556,27 @@ mod tests {
             ..State::new().snapshot()
         };
         assert!(hyperlink_at(&snapshot, &state, usize::MAX, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn hyperlink_overlay_rects_saturate_on_huge_metrics() {
+        let mut state = State::new();
+        state.apply(&TerminalAction::OscHyperlink {
+            link: Some(Hyperlink {
+                id: None,
+                uri: BoundedString::new("https://example.com"),
+            }),
+        });
+        print(&mut state, "ab");
+        let snapshot = state.snapshot();
+        let rects = hyperlink_overlay_rects(
+            &snapshot,
+            &state,
+            CellMetrics::new(u32::MAX, u32::MAX).expect("valid metrics"),
+        );
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].width, u32::MAX);
+        assert!(rects[0].x >= 0);
+        assert!(rects[0].y >= 0);
     }
 }

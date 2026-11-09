@@ -360,7 +360,12 @@ fn validate_tool_name(tool: &str) -> Result<(), SandboxError> {
             "tool name must be 1..=64 bytes",
         ));
     }
-    if tool.contains('/') || tool.contains('\\') || tool.contains('\0') {
+    if tool == "."
+        || tool == ".."
+        || tool.contains('/')
+        || tool.contains('\\')
+        || tool.contains('\0')
+    {
         return Err(SandboxError::new(
             SandboxErrorKind::InvalidInput,
             "tool name must be a bare file name",
@@ -491,6 +496,8 @@ mod tests {
     fn resolve_rejects_non_bare_names() {
         for bad in [
             "",
+            ".",
+            "..",
             "/usr/bin/git",
             "./git",
             "../evil",
@@ -700,5 +707,43 @@ mod tests {
         let error = confine_command_to_execs(&mut command, &[missing])
             .expect_err("unopenable exec target must deny at setup");
         assert_eq!(error.kind(), SandboxErrorKind::SetupFailed);
+
+        // Directory targets must be rejected before adding a Landlock
+        // PATH_BENEATH rule (which would otherwise grant EXECUTE on the
+        // entire subtree).
+        let dir_target = std::env::temp_dir();
+        let error = confine_command_to_execs(&mut command, &[dir_target])
+            .expect_err("directory exec target must deny at setup");
+        assert_eq!(error.kind(), SandboxErrorKind::SetupFailed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn elf_interp_rejects_directory_interpreter_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-sandbox-dir-interp-{}-{}",
+            std::process::id(),
+            "probe"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir must build");
+        let elf_path = dir.join("dir_interp.elf");
+        // Craft a minimal 64-bit little-endian ELF header with 1 program header
+        // of type PT_INTERP (3) pointing at "/\0" (a directory, not a regular file).
+        let mut bytes = vec![0u8; 128];
+        bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        bytes[4] = 2; // 64-bit
+        bytes[5] = 1; // little-endian
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff = 64
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize = 56
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1
+        // Program header at offset 64: p_type = 3 (PT_INTERP), p_offset = 120, p_filesz = 2
+        bytes[64..68].copy_from_slice(&3u32.to_le_bytes());
+        bytes[72..80].copy_from_slice(&120u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&2u64.to_le_bytes());
+        bytes[120] = b'/';
+        bytes[121] = 0;
+        std::fs::write(&elf_path, &bytes).expect("fixture must write");
+        assert_eq!(linux::elf_interp(&elf_path), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

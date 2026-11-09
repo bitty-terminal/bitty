@@ -230,9 +230,17 @@ impl ResourcePolicy {
 
 fn is_forbidden_prefix(path: &Path) -> Option<String> {
     let s = path.to_string_lossy();
-    // Exact match or prefix with `/`
+    let trimmed = s.trim_start_matches('/');
+    // Exact match or prefix with `/`, including paths with multiple leading
+    // slashes (`//proc/...`, `///dev/...`) that the kernel collapses to `/`.
     for prefix in FORBIDDEN_PREFIXES {
-        if s == *prefix || s.starts_with(&format!("{prefix}/")) {
+        let bare = prefix.trim_start_matches('/');
+        if s == *prefix
+            || s.starts_with(&format!("{prefix}/"))
+            || (!bare.is_empty()
+                && s.starts_with('/')
+                && (trimmed == bare || trimmed.starts_with(&format!("{bare}/"))))
+        {
             return Some((*prefix).to_string());
         }
     }
@@ -810,5 +818,15 @@ mod tests {
         let policy = ResourcePolicy::new(vec![approved]).unwrap();
         assert!(!policy.is_allowed(Path::new("")));
         assert!(!policy.is_allowed(Path::new("relative/path")));
+    }
+
+    #[test]
+    fn double_leading_slash_forbidden_prefix_rejected() {
+        for raw in ["//proc/self/environ", "///sys/kernel", "//dev/null"] {
+            assert!(
+                is_forbidden_prefix(Path::new(raw)).is_some(),
+                "multi-slash forbidden path '{raw}' must be detected"
+            );
+        }
     }
 }

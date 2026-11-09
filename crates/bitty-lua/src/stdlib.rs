@@ -358,7 +358,10 @@ fn install_string<'gc>(ctx: Context<'gc>) {
                 let length = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
                 let start = stack.get(1).to_integer().unwrap_or(1);
                 let end = stack.get(2).to_integer().unwrap_or(start);
-                let normalize = |index: i64| -> i64 {
+                // Lua 5.4 `posrelatI`: the start position. Negative indices
+                // count back from the end; 0 and anything before the first
+                // byte clamp to 1.
+                let start_pos = |index: i64| -> i64 {
                     if index < 0 {
                         length.saturating_add(index).saturating_add(1)
                     } else if index == 0 {
@@ -367,8 +370,24 @@ fn install_string<'gc>(ctx: Context<'gc>) {
                         index
                     }
                 };
-                let start = normalize(start).max(1);
-                let end = normalize(end).min(length);
+                // Lua 5.4 `getendpos`: the end position, which is *not*
+                // symmetric with the start. Position 0 stays 0 - there is no
+                // byte at 0 - so `byte(s, 0)`, `byte(s, 0, 0)` and
+                // `byte(s, 1, 0)` must return no values, and a negative index
+                // before the first byte clamps to 0 (not 1).
+                let end_pos = |index: i64| -> i64 {
+                    if index > length {
+                        length
+                    } else if index >= 0 {
+                        index
+                    } else if index < length.saturating_neg() {
+                        0
+                    } else {
+                        length.saturating_add(index).saturating_add(1)
+                    }
+                };
+                let start = start_pos(start).max(1);
+                let end = end_pos(end);
                 let values: Vec<Value> = if length == 0 || start > end {
                     Vec::new()
                 } else {
@@ -846,17 +865,22 @@ mod tests {
         let mut vm = LuaVm::new("string-byte-3069");
         let outcome = vm
             .execute(
-                r#"
+                r##"
                 past_end = (string.byte("abc", 4) == nil)
                 empty_range = (string.byte("abc", 3, 2) == nil)
                 neg_before = (string.byte("abc", -5, -4) == nil)
                 clamped_prefix_a, clamped_prefix_b, clamped_prefix_c = string.byte("abc", -5, 2)
                 clamped_prefix_ok = (clamped_prefix_a == 97 and clamped_prefix_b == 98 and clamped_prefix_c == nil)
                 truncated_utf8_cont = (string.byte("\xE2\x80", 3) == nil)
+                -- Lua's getendpos keeps an explicit 0 end at 0, so these
+                -- three calls select an empty interval and return no values.
+                zero_index = (select("#", string.byte("abc", 0)) == 0)
+                zero_range = (select("#", string.byte("abc", 0, 0)) == 0)
+                start_one_end_zero = (select("#", string.byte("abc", 1, 0)) == 0)
                 local big = string.rep("a", 9000)
                 local ok, err = pcall(string.byte, big, 1, 9000)
                 slice_cap_ok = (not ok) and (string.find(tostring(err), "slice too long", 1, true) ~= nil)
-            "#,
+            "##,
             )
             .expect("execute");
         assert!(
@@ -868,7 +892,108 @@ mod tests {
         assert_eq!(vm.test_global("neg_before"), Some(1.0));
         assert_eq!(vm.test_global("clamped_prefix_ok"), Some(1.0));
         assert_eq!(vm.test_global("truncated_utf8_cont"), Some(1.0));
+        assert_eq!(vm.test_global("zero_index"), Some(1.0));
+        assert_eq!(vm.test_global("zero_range"), Some(1.0));
+        assert_eq!(vm.test_global("start_one_end_zero"), Some(1.0));
         assert_eq!(vm.test_global("slice_cap_ok"), Some(1.0));
+    }
+
+    #[test]
+    fn string_byte_end_positions_match_lua_5_4_over_the_full_index_grid_3069() {
+        // Expected value counts measured on lua5.4 (5.4.9) with
+        // `select("#", string.byte("abc", start, end))`; one digit per end
+        // position, columns left to right are end = -6, -5, ..., 6.
+        // Lua's `getendpos` clamps a too-large end to `#s`, keeps an end of 0
+        // at 0 (no value at position 0), clamps an end before the first byte
+        // to 0, and otherwise resolves negatives; the interval is empty
+        // whenever the resolved end is below the resolved start.
+        const GRID: [(i64, &str); 13] = [
+            (-6, "0001230123333"),
+            (-5, "0001230123333"),
+            (-4, "0001230123333"),
+            (-3, "0001230123333"),
+            (-2, "0000120012222"),
+            (-1, "0000010001111"),
+            (0, "0001230123333"),
+            (1, "0001230123333"),
+            (2, "0000120012222"),
+            (3, "0000010001111"),
+            (4, "0000000000000"),
+            (5, "0000000000000"),
+            (6, "0000000000000"),
+        ];
+        let mut rows = String::new();
+        for (start, expected) in GRID {
+            rows.push_str(&format!("{{ {start}, \"{expected}\" }},\n"));
+        }
+        let mut vm = LuaVm::new("string-byte-grid-3069");
+        let outcome = vm
+            .execute(&format!(
+                r##"
+                local rows = {{
+                {rows}
+                }}
+                local failures = 0
+                local first_failure = ""
+                for row = 1, #rows do
+                  local start_pos = rows[row][1]
+                  local expected = rows[row][2]
+                  for column = 1, #expected do
+                    local end_pos = column - 7
+                    local want = string.sub(expected, column, column)
+                    local got = tostring(select("#", string.byte("abc", start_pos, end_pos)))
+                    if got ~= want then
+                      failures = failures + 1
+                      if first_failure == "" then
+                        first_failure = "start=" .. start_pos .. " end=" .. end_pos
+                          .. " returned " .. got .. " values, lua5.4 returns " .. want
+                      end
+                    end
+                  end
+                end
+                -- Single-argument calls default the end to the *raw* start
+                -- argument, so an explicit 0 start is an empty interval too.
+                local single = {{ [-6] = "0", [-5] = "0", [-4] = "0", [-3] = "1", [-2] = "1", [-1] = "1", [0] = "0", [1] = "1", [2] = "1", [3] = "1", [4] = "0", [5] = "0", [6] = "0" }}
+                for start_pos = -6, 6 do
+                  local want = single[start_pos]
+                  local got = tostring(select("#", string.byte("abc", start_pos)))
+                  if got ~= want then
+                    failures = failures + 1
+                    if first_failure == "" then
+                      first_failure = "start=" .. start_pos .. " (no end) returned "
+                        .. got .. " values, lua5.4 returns " .. want
+                    end
+                  end
+                end
+                -- Saturation at the integer limits must not wrap or panic.
+                local extreme_ok =
+                  select("#", string.byte("abc", math.mininteger)) == 0
+                  and select("#", string.byte("abc", math.maxinteger)) == 0
+                  and select("#", string.byte("abc", math.mininteger, math.maxinteger)) == 3
+                  and select("#", string.byte("abc", math.maxinteger, math.mininteger)) == 0
+                  and select("#", string.byte("abc", 1, math.maxinteger)) == 3
+                  and select("#", string.byte("abc", math.mininteger, 2)) == 2
+                -- The empty string has no byte at any position.
+                local empty_ok =
+                  select("#", string.byte("", 1)) == 0
+                  and select("#", string.byte("", 0)) == 0
+                  and select("#", string.byte("", -1)) == 0
+                byte_grid_failures = failures
+                byte_extreme_ok = extreme_ok
+                byte_empty_ok = empty_ok
+                if failures > 0 then
+                  error(first_failure)
+                end
+            "##
+            ))
+            .expect("execute");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(vm.test_global("byte_grid_failures"), Some(0.0));
+        assert_eq!(vm.test_global("byte_extreme_ok"), Some(1.0));
+        assert_eq!(vm.test_global("byte_empty_ok"), Some(1.0));
     }
 
     #[test]
@@ -886,6 +1011,14 @@ mod tests {
                 sep_cap_ok = (not ok_sep) and (string.find(tostring(err_sep), "byte ceiling", 1, true) ~= nil)
                 local ok_val, err_val = pcall(table.concat, { huge })
                 val_cap_ok = (not ok_val) and (string.find(tostring(err_val), "byte ceiling", 1, true) ~= nil)
+                -- The ceilings are inclusive: exactly 4096 elements, a 65536
+                -- byte separator (with one element, so it is never copied) and
+                -- a 65536 byte value are all accepted.
+                local many = {}
+                for index = 1, 4096 do many[index] = "a" end
+                elem_cap_edge_ok = (#table.concat(many) == 4096)
+                sep_cap_edge_ok = (table.concat({ "a" }, string.rep("x", 65536)) == "a")
+                val_cap_edge_ok = (#table.concat({ string.rep("x", 65536) }) == 65536)
             "#,
             )
             .expect("execute");
@@ -897,5 +1030,8 @@ mod tests {
         assert_eq!(vm.test_global("elem_cap_ok"), Some(1.0));
         assert_eq!(vm.test_global("sep_cap_ok"), Some(1.0));
         assert_eq!(vm.test_global("val_cap_ok"), Some(1.0));
+        assert_eq!(vm.test_global("elem_cap_edge_ok"), Some(1.0));
+        assert_eq!(vm.test_global("sep_cap_edge_ok"), Some(1.0));
+        assert_eq!(vm.test_global("val_cap_edge_ok"), Some(1.0));
     }
 }

@@ -411,8 +411,9 @@ pub(crate) mod fixture {
     /// bitty#2800), not the production RC-1 slice: these fixtures assert
     /// capability wiring, and activation is slice-only, so one descheduled
     /// 50 ms slice on a loaded test runner leaves a correct plugin inactive
-    /// with no resume signal that could recover it. Instruction, memory, and
-    /// cumulative-callback budgets keep their production values.
+    /// with no resume signal that could recover it. Instruction and memory
+    /// budgets keep their production values; raising the VM wall budget to
+    /// 5,450 ms also raises `LuaVm::callback_ceiling_ms()` accordingly.
     pub(crate) fn runtime_for(third_party_roots: Vec<std::path::PathBuf>) -> PluginRuntime {
         let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
             safe_mode: false,

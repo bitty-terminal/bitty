@@ -844,9 +844,9 @@ fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
 /// containers are ignored.
 ///
 /// Duplicate top-level `key` entries are refused (`None`): the two scanners in
-/// this workspace (here and `plugin_ipc::top_value_span`) both fail closed
-/// rather than pick a winner, because a first-wins reader facing a last-wins
-/// parser is exactly the ambiguity a hostile payload needs.
+/// this workspace (here and `plugin_ipc::top_key`) both fail closed rather
+/// than pick a winner, because a first-wins reader facing a last-wins parser
+/// is exactly the ambiguity a hostile payload needs.
 fn find_top_level_key_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let trimmed = text.trim();
     let body = trimmed

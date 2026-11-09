@@ -275,9 +275,12 @@ fn top_key<'a>(params: &'a str, key: &str) -> TopKey<'a> {
         match bytes[i] {
             b'"' => {
                 if depth == 0 && expect_key {
-                    let Some((decoded_key, consumed)) = decode_json_string(&body[i..]) else {
-                        return TopKey::Absent;
+                    let Some(end) = skip_json_string(body, i) else {
+                        return TopKey::Ambiguous;
                     };
+                    // An undecodable key cannot match the current ASCII keys.
+                    let (decoded_key, consumed) =
+                        decode_json_string(&body[i..]).unwrap_or_else(|| (String::new(), end - i));
                     let next = i + consumed;
                     let after = body[next..].trim_start();
                     if let Some(rest) = after.strip_prefix(':') {
@@ -861,5 +864,13 @@ mod tests {
             "InvalidParams"
         );
         publish(None);
+    }
+
+    #[test]
+    fn top_key_skips_surrogate_pair_key_before_generation() {
+        assert_eq!(
+            list_generation(r#"{"\ud83d\ude00":1,"generation":2}"#).expect("generation"),
+            Some(2)
+        );
     }
 }

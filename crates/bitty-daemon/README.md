@@ -617,21 +617,22 @@ Containment is a whole-tree identity, not a pid and not a process-group
 convention. `containment::ContainmentReport::probe()` returns a typed plan for
 the compiled cell; there is no silent fallback and no weaker transport:
 
-| Plan                 | Selection                                                                                                      | Cleanup claim         | Signals                                                                            | Reachable from the served spawn path |
-| -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- | ------------------------------------ |
-| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    | yes                                  |
-| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop | yes                                  |
-| `windows_job`        | `CreateJobObject` + ConPTY child assigned at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`                     | `swept` when verified | `TerminateJobObject`, then a bounded `ActiveProcesses` wait                        | yes                                  |
-| `freebsd_reaper`     | `procctl(PROC_REAP_ACQUIRE)` reaper + the recorded process group                                               | `swept` when verified | the recorded group (`SIGTERM`, then `SIGKILL`)                                     | yes                                  |
-| `process_group`      | macOS only: the recorded process group, no reaper                                                              | `group-signalled`     | the recorded group                                                                 | yes                                  |
-| `none`               | no mechanism on the compiled cell, or the probe refused                                                        | none                  | no spawn; typed refusal                                                            | yes (it refuses)                     |
+| Plan                 | Selection                                                                                                      | Cleanup claim         | Signals                                                                            | Wired into `worker::spawn_path_served`                  |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    | yes (served over the Linux IPC listener loop)           |
+| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop | yes (served over the Linux IPC listener loop)           |
+| `windows_job`        | `CreateJobObject` + ConPTY child assigned at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`                     | `swept` when verified | `TerminateJobObject`, then a bounded `ActiveProcesses` wait                        | yes (spawn backend wired; `server::run` not yet served) |
+| `freebsd_reaper`     | `procctl(PROC_REAP_ACQUIRE)` reaper + the recorded process group                                               | `swept` when verified | the recorded group (`SIGTERM`, then `SIGKILL`)                                     | yes (spawn backend wired; `server::run` not yet served) |
+| `process_group`      | macOS only: the recorded process group, no reaper                                                              | `group-signalled`     | the recorded group                                                                 | yes (spawn backend wired; `server::run` not yet served) |
+| `none`               | no mechanism on the compiled cell, or the probe refused                                                        | none                  | no spawn; typed refusal                                                            | refuses (`UnsupportedCapability` before any spawn)      |
 
 Every probed plan (`cgroup_v2`, `subreaper_fallback`, `windows_job`,
-`freebsd_reaper`, `process_group`) is wired into `worker::spawn_path_served`.
-`service::dispatch` refuses `session.create` with `UnsupportedCapability`
-before any spawn when `probe()` returns a refused plan (`none`), while
-`service::server` exports the `unix` listener loop on Linux and a stub on
-platforms whose IPC listener loop is not yet wired.
+`freebsd_reaper`, `process_group`) is wired into `worker::spawn_path_served`,
+`worker::WorkerPool`, and `service::dispatch`. `service::dispatch` refuses
+`session.create` with `UnsupportedCapability` before any spawn when `probe()`
+returns a refused plan (`none`), while `service::server::run` serves the IPC
+listener loop on Linux and returns `UnsupportedPlatform` on Windows, macOS, and
+FreeBSD until their IPC listener loops are wired.
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`
@@ -700,15 +701,19 @@ and is retried by the next call.
 `daemon.orphans.verify` stays Linux-only: only the cgroup and subreaper plans
 record a durable identity (boot id, start time, process group read from
 `/proc`) the journal can re-check after a restart
-(`ContainmentKind::verifies_orphans`). Every other cell returns
-`Denied/UnsupportedCapability`, and `daemon.status` reports
-`orphans: {verify: "unsupported_capability"}`. Windows, FreeBSD, and macOS
-serve their live session trees through `windows_job` + ConPTY, `freebsd_reaper`,
-and `process_group`, which record no durable restart identity (`WindowsJob`
-tears down in the kernel via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` when the
-daemon handle closes; `FreebsdReaper` and `ProcessGroup` have no restart
-re-verification identity), so the orphan journal and verifier remain unserved
-on those cells.
+(`ContainmentKind::verifies_orphans`). In `service::dispatch`, any plan where
+`verifies_orphans` is false returns `Denied/UnsupportedCapability` for
+`daemon.orphans.verify` and reports `orphans: {verify: "unsupported_capability"}`
+in `daemon.status`. On Windows, FreeBSD, and macOS, the spawn backends
+(`windows_job` + ConPTY, `freebsd_reaper`, and `process_group`) are wired into
+`worker::WorkerPool` and `service::dispatch`, while `service::server::run` still
+returns `UnsupportedPlatform` until their IPC listener loops are wired (so
+clients cannot yet connect or call `daemon.status` over the wire on those
+platforms). None of those three plans records a durable restart identity
+(`WindowsJob` tears down in the kernel via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+when the daemon handle closes; `FreebsdReaper` and `ProcessGroup` have no
+restart re-verification identity), so the orphan journal and verifier remain
+unsupported on those cells.
 
 Threat-model and evidence references: `T-21` (orphan reaping through a
 containment identity), `P0-AC-023` (child scope limitation), and `ME-05`

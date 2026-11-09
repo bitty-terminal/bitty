@@ -1394,56 +1394,103 @@ impl PtyMaster {
     }
 }
 
-/// Owned Windows ConPTY master, input writer, and bounded reader queue.
+/// ConPTY cursor-query request (`DSR`, Device Status Report).
 ///
-/// Win32 anonymous pipes do not participate in a POSIX `poll(2)` loop, so one
-/// dedicated reader thread per worker drains `ConPtyMaster::take_reader()` into
-/// a queue capped at [`DRAIN_BUDGET_BYTES`]. When the queue is full the reader
-/// thread parks on [`WindowsPtyQueue::space_available`], leaving unread output
-/// in the kernel ConPTY pipe as backpressure so the reader thread cannot outrun
-/// [`Worker::drain`].
+/// `bitty_winjob::ConPtyMaster::spawn_in_job` creates the pseudoconsole with
+/// `PSEUDOCONSOLE_INHERIT_CURSOR`, which makes `conhost.exe` emit `ESC[6n` on
+/// the output pipe and block console clients (even `cmd.exe /C exit 0`) until
+/// the host answers with [`CPR_REPLY`] on the input pipe.
+#[cfg(any(target_os = "windows", test))]
+const DSR_REQUEST: &[u8] = b"\x1b[6n";
+
+/// Origin cursor-position report (`CPR`, row 1, column 1) answering [`DSR_REQUEST`].
+#[cfg(any(target_os = "windows", test))]
+const CPR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Count completed [`DSR_REQUEST`] occurrences across arbitrary read chunks.
+///
+/// `progress` holds the matched prefix length (`0..DSR_REQUEST.len()`) across
+/// calls so a request split across two pipe reads is still answered exactly once.
+#[cfg(any(target_os = "windows", test))]
+fn count_dsr_requests(progress: &mut usize, chunk: &[u8]) -> usize {
+    let mut matches = 0;
+    for &byte in chunk {
+        if byte == DSR_REQUEST[*progress] {
+            *progress += 1;
+            if *progress == DSR_REQUEST.len() {
+                matches += 1;
+                *progress = 0;
+            }
+        } else if byte == DSR_REQUEST[0] {
+            *progress = 1;
+        } else {
+            *progress = 0;
+        }
+    }
+    matches
+}
+
+/// Owned Windows ConPTY master and bounded non-blocking reader/writer queues.
+///
+/// Win32 anonymous pipes do not participate in a POSIX `poll(2)` loop, and
+/// synchronous `WriteFile` on a full ConPTY pipe would block the single-threaded
+/// service loop. Each worker therefore owns:
+/// - a reader thread draining `ConPtyMaster::take_reader()` into a
+///   [`WindowsPtyQueue`] capped at [`DRAIN_BUDGET_BYTES`]; and
+/// - a writer thread draining a [`WindowsPtyWriterQueue`] capped at
+///   [`DRAIN_BUDGET_BYTES`] into `ConPtyMaster::take_writer()`, so
+///   [`PtyMaster::write`] never blocks and returns `WouldBlock` when full.
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
 struct PtyMaster {
     conpty: Option<bitty_winjob::ConPtyMaster>,
-    writer: Option<File>,
+    writer_queue: Arc<WindowsPtyWriterQueue>,
     queue: Arc<WindowsPtyQueue>,
 }
 
 #[cfg(target_os = "windows")]
 impl PtyMaster {
+    /// Wrap a newly spawned [`bitty_winjob::ConPtyMaster`] and start its bounded
+    /// reader and writer threads.
     fn from_conpty(mut conpty: bitty_winjob::ConPtyMaster) -> Result<Self, WorkerSpawnError> {
         let reader = File::from(conpty.take_reader().map_err(|_| WorkerSpawnError::Pty)?);
         let writer = File::from(conpty.take_writer().map_err(|_| WorkerSpawnError::Pty)?);
         let queue = WindowsPtyQueue::new();
+        let writer_queue = WindowsPtyWriterQueue::new();
         let master = Self {
             conpty: Some(conpty),
-            writer: Some(writer),
+            writer_queue: Arc::clone(&writer_queue),
             queue: Arc::clone(&queue),
         };
-        if let Err(error) = spawn_conpty_reader(reader, queue) {
+        if let Err(error) = spawn_conpty_writer(writer, Arc::clone(&writer_queue)) {
+            drop(master);
+            return Err(error);
+        }
+        if let Err(error) = spawn_conpty_reader(reader, queue, writer_queue) {
             drop(master);
             return Err(error);
         }
         Ok(master)
     }
 
+    /// Read buffered terminal output without blocking.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.queue.read(buf)
     }
 
+    /// Enqueue terminal input without blocking; returns `WouldBlock` when the
+    /// bounded writer queue is full.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let Some(writer) = self.writer.as_mut() else {
-            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
-        };
-        writer.write(buf)
+        self.writer_queue.write(buf)
     }
 
+    /// Resize the ConPTY pseudoconsole viewport.
     fn resize(&self, cols: u16, rows: u16) -> Result<(), ResizeError> {
         let conpty = self.conpty.as_ref().ok_or(ResizeError::NotBound)?;
         conpty.resize(cols, rows).map_err(|_| ResizeError::Pty)
     }
 
+    /// Whether the ConPTY output pipe is still open.
     fn slave_open(&self) -> bool {
         !self.queue.is_eof()
     }
@@ -1452,10 +1499,11 @@ impl PtyMaster {
 #[cfg(target_os = "windows")]
 impl Drop for PtyMaster {
     fn drop(&mut self) {
-        // Close the input pipe and wake the reader thread before tearing down
-        // the pseudoconsole so any final VT flush from `conhost.exe` during
-        // `ClosePseudoConsole` is discarded instead of blocking on backpressure.
-        drop(self.writer.take());
+        // Close both bounded queues before tearing down the pseudoconsole so
+        // the writer thread drops the input pipe and the reader thread discards
+        // any final VT flush from `conhost.exe` during `ClosePseudoConsole`
+        // instead of blocking on backpressure.
+        self.writer_queue.close();
         self.queue.close();
         if let Some(conpty) = self.conpty.take() {
             // `ClosePseudoConsole` is synchronous inside Win32 while
@@ -1469,6 +1517,118 @@ impl Drop for PtyMaster {
                 .name("bittyd-conpty-close".to_owned())
                 .spawn(move || drop(conpty));
         }
+    }
+}
+
+/// Bounded queue between [`PtyMaster::write`] and the Windows ConPTY writer thread.
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WindowsPtyWriterQueue {
+    state: Mutex<WindowsPtyWriterState>,
+    data_available: Condvar,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+struct WindowsPtyWriterState {
+    buf: VecDeque<u8>,
+    closed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsPtyWriterQueue {
+    /// Allocate an empty writer queue capped at [`DRAIN_BUDGET_BYTES`].
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WindowsPtyWriterState {
+                buf: VecDeque::with_capacity(DRAIN_BUDGET_BYTES),
+                closed: false,
+            }),
+            data_available: Condvar::new(),
+        })
+    }
+
+    /// Enqueue up to the remaining capacity without blocking.
+    ///
+    /// Returns `WouldBlock` when the queue is at [`DRAIN_BUDGET_BYTES`] and
+    /// `BrokenPipe` once closed.
+    fn write(&self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.closed {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        let room = DRAIN_BUDGET_BYTES.saturating_sub(guard.buf.len());
+        if room == 0 {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let accepted = bytes.len().min(room);
+        guard.buf.extend(&bytes[..accepted]);
+        self.data_available.notify_one();
+        Ok(accepted)
+    }
+
+    /// Prepend `count` [`CPR_REPLY`] sequences to unblock `conhost.exe` cursor
+    /// inheritance (`PSEUDOCONSOLE_INHERIT_CURSOR`).
+    fn push_cpr_replies(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.closed {
+            return;
+        }
+        let max_cpr_bytes = DRAIN_BUDGET_BYTES + CPR_REPLY.len() * 4;
+        for _ in 0..count {
+            if guard.buf.len() + CPR_REPLY.len() > max_cpr_bytes {
+                break;
+            }
+            for &byte in CPR_REPLY.iter().rev() {
+                guard.buf.push_front(byte);
+            }
+        }
+        self.data_available.notify_one();
+    }
+
+    /// Pop the next chunk for the writer thread, parking while empty and open.
+    fn take_chunk(&self, out: &mut [u8]) -> usize {
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !guard.closed && guard.buf.is_empty() {
+            guard = match self.data_available.wait(guard) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        if guard.closed && guard.buf.is_empty() {
+            return 0;
+        }
+        let take = out.len().min(guard.buf.len());
+        for slot in &mut out[..take] {
+            *slot = guard.buf.pop_front().unwrap_or(0);
+        }
+        take
+    }
+
+    /// Mark the writer queue closed, discard queued bytes, and wake the writer thread.
+    fn close(&self) {
+        let mut guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.closed = true;
+        guard.buf.clear();
+        self.data_available.notify_all();
     }
 }
 
@@ -1490,6 +1650,7 @@ struct WindowsPtyQueueState {
 
 #[cfg(target_os = "windows")]
 impl WindowsPtyQueue {
+    /// Allocate an empty reader queue capped at [`DRAIN_BUDGET_BYTES`].
     fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(WindowsPtyQueueState {
@@ -1501,6 +1662,8 @@ impl WindowsPtyQueue {
         })
     }
 
+    /// Push all `bytes` from the ConPTY reader thread, parking on
+    /// [`Self::space_available`] while the queue is full.
     fn push_all(&self, mut bytes: &[u8]) {
         let mut guard = match self.state.lock() {
             Ok(guard) => guard,
@@ -1525,6 +1688,7 @@ impl WindowsPtyQueue {
         }
     }
 
+    /// Record that the ConPTY output pipe reached EOF or an unrecoverable read error.
     fn mark_eof(&self) {
         let mut guard = match self.state.lock() {
             Ok(guard) => guard,
@@ -1533,6 +1697,7 @@ impl WindowsPtyQueue {
         guard.eof = true;
     }
 
+    /// Mark the reader queue closed, discard buffered bytes, and wake any parked reader.
     fn close(&self) {
         let mut guard = match self.state.lock() {
             Ok(guard) => guard,
@@ -1543,6 +1708,7 @@ impl WindowsPtyQueue {
         self.space_available.notify_all();
     }
 
+    /// Whether the ConPTY output pipe has reached EOF or been closed.
     fn is_eof(&self) -> bool {
         let guard = match self.state.lock() {
             Ok(guard) => guard,
@@ -1551,6 +1717,8 @@ impl WindowsPtyQueue {
         guard.eof || guard.closed
     }
 
+    /// Pop up to `out.len()` bytes without blocking; returns `WouldBlock` when
+    /// empty and still open.
     fn read(&self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -1574,15 +1742,45 @@ impl WindowsPtyQueue {
     }
 }
 
+/// Spawn the background thread that drains [`WindowsPtyWriterQueue`] into the
+/// ConPTY input pipe.
+#[cfg(target_os = "windows")]
+fn spawn_conpty_writer(
+    mut writer: File,
+    queue: Arc<WindowsPtyWriterQueue>,
+) -> Result<(), WorkerSpawnError> {
+    std::thread::Builder::new()
+        .name("bittyd-conpty-write".to_owned())
+        .spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let len = queue.take_chunk(&mut chunk);
+                if len == 0 {
+                    break;
+                }
+                if writer.write_all(&chunk[..len]).is_err() || writer.flush().is_err() {
+                    queue.close();
+                    break;
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|_| WorkerSpawnError::Pty)
+}
+
+/// Spawn the background thread that drains the ConPTY output pipe into
+/// [`WindowsPtyQueue`] and answers `conhost.exe` cursor-status requests.
 #[cfg(target_os = "windows")]
 fn spawn_conpty_reader(
     mut reader: File,
     queue: Arc<WindowsPtyQueue>,
+    writer_queue: Arc<WindowsPtyWriterQueue>,
 ) -> Result<(), WorkerSpawnError> {
     std::thread::Builder::new()
         .name("bittyd-conpty-read".to_owned())
         .spawn(move || {
             let mut chunk = [0u8; 4096];
+            let mut dsr_progress = 0usize;
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => {
@@ -1590,6 +1788,10 @@ fn spawn_conpty_reader(
                         break;
                     }
                     Ok(read) => {
+                        let dsrs = count_dsr_requests(&mut dsr_progress, &chunk[..read]);
+                        if dsrs > 0 {
+                            writer_queue.push_cpr_replies(dsrs);
+                        }
                         queue.push_all(&chunk[..read]);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1621,6 +1823,7 @@ struct WindowsSpawnBuffers {
 
 #[cfg(target_os = "windows")]
 impl WindowsSpawnBuffers {
+    /// Build the owned argument and environment buffers from a validated [`SpawnSpec`].
     fn build(spec: &SpawnSpec) -> Result<Self, WorkerSpawnError> {
         let argv = spec.argv();
         let program = argv.first().ok_or(WorkerSpawnError::Spawn)?;
@@ -1639,6 +1842,7 @@ impl WindowsSpawnBuffers {
         })
     }
 
+    /// Borrow the owned buffers as a [`bitty_winjob::ChildSpec`].
     fn as_child_spec(&self) -> bitty_winjob::ChildSpec<'_> {
         bitty_winjob::ChildSpec {
             program: &self.program,
@@ -1651,6 +1855,7 @@ impl WindowsSpawnBuffers {
     }
 }
 
+/// Insert or replace `key=value` in `env` using ASCII case-insensitive key matching.
 #[cfg(target_os = "windows")]
 fn set_windows_env(env: &mut Vec<(OsString, OsString)>, key: &str, value: &str) {
     if let Some((_, existing)) = env.iter_mut().find(|(existing_key, _)| {
@@ -2967,6 +3172,21 @@ mod portable_tests {
         );
         assert_eq!(clamp_windows_exit_code(-1), 255);
     }
+
+    #[test]
+    fn conpty_dsr_scanner_counts_split_and_repeated_requests() {
+        assert_eq!(DSR_REQUEST, b"\x1b[6n");
+        assert_eq!(CPR_REPLY, b"\x1b[1;1R");
+        let mut progress = 0;
+        assert_eq!(count_dsr_requests(&mut progress, b"hello "), 0);
+        assert_eq!(count_dsr_requests(&mut progress, b"\x1b["), 0);
+        assert_eq!(progress, 2);
+        assert_eq!(count_dsr_requests(&mut progress, b"6nworld\x1b[6n"), 2);
+        assert_eq!(progress, 0);
+        // A partial prefix restarted by another ESC still matches.
+        assert_eq!(count_dsr_requests(&mut progress, b"\x1b[\x1b[6n"), 1);
+        assert_eq!(progress, 0);
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -2987,9 +3207,20 @@ mod windows_tests {
         SessionKind,
     };
 
+    fn system_root() -> String {
+        std::env::var_os("SystemRoot")
+            .unwrap_or_else(|| OsString::from(r"C:\Windows"))
+            .to_str()
+            .expect("a UTF-8 SystemRoot path")
+            .to_owned()
+    }
+
+    fn system_root_env() -> String {
+        format!("SystemRoot={}", system_root())
+    }
+
     fn system_program(name: &str) -> String {
-        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
-        PathBuf::from(root)
+        PathBuf::from(system_root())
             .join("System32")
             .join(name)
             .to_str()
@@ -3085,6 +3316,31 @@ mod windows_tests {
     }
 
     #[test]
+    fn windows_pty_writer_queue_enforces_backpressure_and_cpr_preemption() {
+        let queue = WindowsPtyWriterQueue::new();
+        let accepted = queue
+            .write(&vec![b'x'; DRAIN_BUDGET_BYTES])
+            .expect("fill writer queue");
+        assert_eq!(accepted, DRAIN_BUDGET_BYTES);
+        let would_block = queue
+            .write(b"overflow")
+            .expect_err("full queue must not block");
+        assert_eq!(would_block.kind(), io::ErrorKind::WouldBlock);
+
+        // A CPR reply still prepends ahead of queued client bytes so `conhost.exe`
+        // can unblock and drain the input pipe.
+        queue.push_cpr_replies(1);
+        let mut head = [0u8; CPR_REPLY.len()];
+        assert_eq!(queue.take_chunk(&mut head), CPR_REPLY.len());
+        assert_eq!(&head, CPR_REPLY);
+
+        queue.close();
+        let closed = queue.write(b"after close").expect_err("closed queue");
+        assert_eq!(closed.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(queue.take_chunk(&mut head), 0);
+    }
+
+    #[test]
     fn a_missing_program_is_a_typed_exec_refusal_and_creates_no_handle() {
         let _lock = crate::containment::test_lock::lock();
         let limits = Limits::default();
@@ -3116,10 +3372,15 @@ mod windows_tests {
         let _lock = crate::containment::test_lock::lock();
         let limits = Limits::default();
         let mut pool = WorkerPool::new(&limits);
-        pool.delay_bind_probe_for_test(Duration::from_millis(500));
+        pool.delay_bind_probe_for_test(Duration::from_secs(1));
         let report = ContainmentReport::probe();
         let cmd = system_program("cmd.exe");
-        let spec = test_spec(&limits, &[cmd.as_str(), "/C", "exit 0"], &[]);
+        let sys_root = system_root_env();
+        let spec = test_spec(
+            &limits,
+            &[cmd.as_str(), "/D", "/C", "exit 0"],
+            &[sys_root.as_str()],
+        );
         let session = SessionId::parse("0000000000000000000000000000c4d3").expect("session id");
         let error = pool
             .spawn(
@@ -3143,7 +3404,12 @@ mod windows_tests {
         pool.delay_bind_probe_for_test(Duration::from_millis(500));
         let report = ContainmentReport::probe();
         let ping = system_program("ping.exe");
-        let spec = test_spec(&limits, &[ping.as_str(), "-n", "60", "127.0.0.1"], &[]);
+        let sys_root = system_root_env();
+        let spec = test_spec(
+            &limits,
+            &[ping.as_str(), "-n", "60", "127.0.0.1"],
+            &[sys_root.as_str()],
+        );
         let session = SessionId::parse("0000000000000000000000000000c4d4").expect("session id");
         let error = pool
             .spawn(
@@ -3165,7 +3431,8 @@ mod windows_tests {
         let mut pool = WorkerPool::new(&limits);
         let report = ContainmentReport::probe();
         let cmd = system_program("cmd.exe");
-        let spec = test_spec(&limits, &[cmd.as_str(), "/Q"], &[]);
+        let sys_root = system_root_env();
+        let spec = test_spec(&limits, &[cmd.as_str(), "/D", "/Q"], &[sys_root.as_str()]);
         let session = SessionId::parse("0000000000000000000000000000c4d5").expect("session id");
         let identity = pool
             .spawn(
@@ -3232,10 +3499,13 @@ mod windows_tests {
         let session = created.session.session_id;
         let cmd = system_program("cmd.exe");
         let ping = system_program("ping.exe");
-        let script = format!(
-            "start /B \"\" \"{ping}\" -n 60 127.0.0.1 >NUL 2>&1 & \"{ping}\" -n 2 127.0.0.1 >NUL 2>&1 & exit /B 7"
+        let sys_root = system_root_env();
+        let script = format!("start /B {ping} -n 60 127.0.0.1 >NUL 2>&1 & exit /B 7");
+        let spec = test_spec(
+            &limits,
+            &[cmd.as_str(), "/D", "/C", script.as_str()],
+            &[sys_root.as_str()],
         );
-        let spec = test_spec(&limits, &[cmd.as_str(), "/C", script.as_str()], &[]);
         pool.spawn(
             &report,
             host.instance_id(),
@@ -3296,7 +3566,12 @@ mod windows_tests {
             .expect("create session");
         let session = created.session.session_id;
         let ping = system_program("ping.exe");
-        let spec = test_spec(&limits, &[ping.as_str(), "-n", "60", "127.0.0.1"], &[]);
+        let sys_root = system_root_env();
+        let spec = test_spec(
+            &limits,
+            &[ping.as_str(), "-n", "60", "127.0.0.1"],
+            &[sys_root.as_str()],
+        );
         pool.spawn(
             &report,
             host.instance_id(),

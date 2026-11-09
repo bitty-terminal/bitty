@@ -329,6 +329,9 @@ pub enum PluginVerb {
     Disable,
     /// `info <id>`: explain one plugin's static manifest + state.
     Info,
+    /// `show-source <id>`: print the verified module tree of an installed
+    /// package (bitty#2069).
+    ShowSource,
     /// `explain <id> <capability>`: read-only capability decision chain.
     Explain,
     /// `revoke <id> [--cap <capability>]`: drop grants (durable denial).
@@ -374,6 +377,7 @@ impl PluginVerb {
         ("enable", Self::Enable),
         ("disable", Self::Disable),
         ("info", Self::Info),
+        ("show-source", Self::ShowSource),
         ("explain", Self::Explain),
         ("revoke", Self::Revoke),
         ("grant", Self::Grant),
@@ -400,6 +404,7 @@ impl PluginVerb {
             Self::Enable => "enable",
             Self::Disable => "disable",
             Self::Info => "info",
+            Self::ShowSource => "show-source",
             Self::Explain => "explain",
             Self::Revoke => "revoke",
             Self::Grant => "grant",
@@ -855,6 +860,7 @@ pub fn plugin_usage() -> String {
      \x20      bitty plugin grant <id> --profile <name> [--yes]\n\
      \x20      bitty plugin grant <id> --cap <capability> [--yes]\n\
      \x20      bitty plugin info <id> [--format table|json|jsonl] [--no-color]\n\
+     \x20      bitty plugin show-source <id>\n\
      \x20      bitty plugin explain <id> <capability> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config show <id> [--format table|json|jsonl] [--no-color]\n\
      \x20      bitty plugin config scaffold <id> [--force]\n\
@@ -985,6 +991,13 @@ pub fn plugin_help_text() -> String {
      \x20                             (re-run `install` to re-consent).\n\
      \x20 info <id>                   Manifest + recorded state, with the plain-\
      \x20                             language effect per capability.\n\
+     \x20 show-source <id>            Print the verified module tree of one\n\
+     \x20                             store-installed package: the recorded\n\
+     \x20                             content digest is recomputed first, and a\n\
+     \x20                             mismatch fails closed (exit 4) with nothing\n\
+     \x20                             on stdout. Each file prints a\n\
+     \x20                             `-- <path> sha256 <digest>` header then\n\
+     \x20                             its exact bytes; provenance goes to stderr.\n\
      \x20 explain <id> <capability>    Read-only capability decision chain for one\n\
      \x20                             declared capability: every layer\n\
      \x20                             (host/user/project/parent/task/request)\n\
@@ -3257,6 +3270,208 @@ pub(crate) fn store_discovery_rows_at(store_root: Option<&Path>) -> Vec<StoreDis
         .collect();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows
+}
+
+/// Print the verified module tree of one store-installed package
+/// (bitty#2069).
+///
+/// The Lua counterpart of `bitty extension show-source`: the recorded
+/// `content_digest` is recomputed over the installed tree and must match before
+/// a single byte reaches stdout, so a tampered store fails closed (exit 4)
+/// instead of printing untrusted bytes. Output is a deterministic stream:
+/// `-- <path> sha256 <file digest>` header, then the file's exact bytes. The
+/// tree digest, plugin id, version, and package root go to stderr so stdout
+/// stays pipe-friendly. Read-only: no execution, no network, no mutation.
+fn op_show_source(
+    store_root: Option<&Path>,
+    id: &str,
+    output: &mut dyn std::io::Write,
+) -> Result<(), PluginFailure> {
+    resolve_plugin_id(id)?;
+    let Some(store_root) = store_root else {
+        return Err(PluginFailure::plugin(
+            "PluginNotFound",
+            format!("bitty plugin: no plugin store is available to read '{id}' from"),
+        ));
+    };
+    let records = load_store_index(store_root)?;
+    let Some(record) = records.iter().find(|record| record.plugin_id == id) else {
+        return Err(PluginFailure::plugin(
+            "PluginNotFound",
+            format!(
+                "bitty plugin: '{id}' is not installed from the store (bundled plugins ship \
+                 compiled into bitty, so they have no store source; see `bitty plugin list`)"
+            ),
+        ));
+    };
+    let Some(root) =
+        bitty_runtime::plugin_runtime::resolution::store_package_root(store_root, record)
+    else {
+        return Err(PluginFailure::plugin(
+            "StoreInvalid",
+            format!(
+                "bitty plugin: recorded package root '{}' for '{id}' is missing or escapes the \
+                 store; run `bitty plugin doctor --repair`",
+                record.root
+            ),
+        ));
+    };
+    let actual =
+        bitty_runtime::plugin_runtime::resolution::content_digest(&root).map_err(|error| {
+            PluginFailure::plugin(
+                "StoreInvalid",
+                format!(
+                    "bitty plugin: cannot digest '{id}' at '{}': {error}",
+                    root.display()
+                ),
+            )
+        })?;
+    if !actual.eq_ignore_ascii_case(&record.content_digest) {
+        return Err(PluginFailure::plugin(
+            "StoreIntegrity",
+            format!(
+                "bitty plugin: content digest mismatch for '{id}' version {}: recorded {} but \
+                 the installed tree hashes {actual} (refusing to print untrusted bytes)",
+                record.version, record.content_digest
+            ),
+        ));
+    }
+    let files = read_module_tree_for_display(&root, id)?;
+    eprintln!(
+        "bitty plugin: show-source '{}' version {} from {} source at {} (content sha256 {})",
+        id,
+        record.version,
+        record.source_class.as_str(),
+        root.display(),
+        actual
+    );
+    for (path, bytes) in files {
+        let digest = bitty_package::integrity::sha256_hex(&bytes);
+        if let Err(error) = writeln!(output, "-- {path} sha256 {digest}") {
+            return Err(PluginFailure::generic(
+                "Output",
+                format!("bitty plugin: cannot write source bytes: {error}"),
+            ));
+        }
+        if let Err(error) = output.write_all(&bytes) {
+            return Err(PluginFailure::generic(
+                "Output",
+                format!("bitty plugin: cannot write source bytes: {error}"),
+            ));
+        }
+        if !bytes.ends_with(b"\n") {
+            let _ = writeln!(output);
+        }
+    }
+    Ok(())
+}
+
+/// Maximum files read by `plugin show-source` (matches the store module bound).
+const SHOW_SOURCE_MAX_FILES: usize = 4096;
+
+/// Maximum bytes read by `plugin show-source` (matches the store module bound).
+const SHOW_SOURCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read one installed module tree as sorted `(relative path, bytes)` pairs.
+///
+/// The tree was already bounded and digest-verified by the caller; this walk
+/// re-applies the same file and byte bounds so a tree that grew after the
+/// digest check cannot make the command read without bound.
+fn read_module_tree_for_display(
+    package_root: &Path,
+    id: &str,
+) -> Result<Vec<(String, Vec<u8>)>, PluginFailure> {
+    let module_root = if package_root.join("lua").is_dir() {
+        package_root.join("lua")
+    } else {
+        package_root.to_path_buf()
+    };
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut stack = vec![module_root.clone()];
+    let mut total: u64 = 0;
+    while let Some(directory) = stack.pop() {
+        let listing = std::fs::read_dir(&directory).map_err(|error| {
+            PluginFailure::plugin(
+                "StoreInvalid",
+                format!(
+                    "bitty plugin: cannot read '{}' for '{id}': {error}",
+                    directory.display()
+                ),
+            )
+        })?;
+        for entry in listing {
+            let entry = entry.map_err(|error| {
+                PluginFailure::plugin(
+                    "StoreInvalid",
+                    format!(
+                        "bitty plugin: cannot read '{}': {error}",
+                        directory.display()
+                    ),
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                PluginFailure::plugin(
+                    "StoreInvalid",
+                    format!("bitty plugin: cannot inspect '{}': {error}", path.display()),
+                )
+            })?;
+            if file_type.is_symlink() {
+                return Err(PluginFailure::plugin(
+                    "StoreIntegrity",
+                    format!(
+                        "bitty plugin: '{id}' contains a symlinked entry '{}' (refusing to print \
+                         untrusted bytes)",
+                        path.display()
+                    ),
+                ));
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if files.len() >= SHOW_SOURCE_MAX_FILES {
+                return Err(PluginFailure::plugin(
+                    "StoreIntegrity",
+                    format!(
+                        "bitty plugin: '{id}' has more than {SHOW_SOURCE_MAX_FILES} source files \
+                         (refusing to print)"
+                    ),
+                ));
+            }
+            let relative = path
+                .strip_prefix(&module_root)
+                .map(|tail| tail.to_string_lossy().replace('\\', "/"))
+                .map_err(|_| {
+                    PluginFailure::plugin(
+                        "StoreIntegrity",
+                        format!("bitty plugin: '{}' escapes '{id}'", path.display()),
+                    )
+                })?;
+            let bytes = std::fs::read(&path).map_err(|error| {
+                PluginFailure::plugin(
+                    "StoreInvalid",
+                    format!("bitty plugin: cannot read '{}': {error}", path.display()),
+                )
+            })?;
+            total = total.saturating_add(bytes.len() as u64);
+            if total > SHOW_SOURCE_MAX_BYTES {
+                return Err(PluginFailure::plugin(
+                    "StoreIntegrity",
+                    format!(
+                        "bitty plugin: '{id}' exceeds {SHOW_SOURCE_MAX_BYTES} source bytes \
+                         (refusing to print)"
+                    ),
+                ));
+            }
+            files.push((relative, bytes));
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
 }
 
 /// Read the store index, mapping any failure to a read-only plugin error.
@@ -5603,6 +5818,13 @@ pub fn run_plugin_subcommand(
                     }
                     EXIT_OK
                 }
+                Err(failure) => fail_read_only(&request, &failure, output),
+            }
+        }
+        PluginVerb::ShowSource => {
+            let id = request.id.as_deref().expect("show-source requires an id");
+            match op_show_source(store_root.as_deref(), id, output) {
+                Ok(()) => EXIT_OK,
                 Err(failure) => fail_read_only(&request, &failure, output),
             }
         }
@@ -12625,6 +12847,64 @@ mod tests {
             out.contains(&format!("update for '{id}' 1.0.0 -> 2.0.0")),
             "--yes must still show the diff: {out}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_source_prints_verified_tree_and_refuses_tampering() {
+        let dir = scratch_dir("show-source");
+        let config = dir.join("init.lua").display().to_string();
+        let data_home = dir.join("data");
+        std::fs::create_dir_all(&data_home).expect("data home");
+        let data_home_text = data_home.display().to_string();
+        let id = "xuepoo.showsrc";
+        let body = "return \"pinned\"\n";
+        let source = write_store_plugin(&dir, id, "1.0.0", body);
+        let (code, out) = run_store(
+            &["install", &source.display().to_string(), "--yes"],
+            &config,
+            &data_home_text,
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        // Verified tree: the file header carries the per-file digest and the
+        // body is the exact installed bytes.
+        let (code, out) = run_store(&["show-source", id], &config, &data_home_text, "");
+        assert_eq!(code, EXIT_OK, "{out}");
+        let expected = bitty_package::integrity::sha256_hex(body.as_bytes());
+        assert!(
+            out.contains(&format!("-- init.lua sha256 {expected}")),
+            "the per-file digest header must print: {out}"
+        );
+        assert!(out.contains("return \"pinned\""), "{out}");
+
+        // Tampering with the installed tree must fail closed with nothing on
+        // stdout: show-source never prints bytes the record does not pin.
+        let installed = data_home
+            .join("bitty")
+            .join("plugins")
+            .join("packages")
+            .join(id)
+            .join("1.0.0")
+            .join("lua")
+            .join("init.lua");
+        std::fs::write(&installed, "return \"tampered\"\n").expect("tamper");
+        let (code, out) = run_store(&["show-source", id], &config, &data_home_text, "");
+        assert_eq!(code, EXIT_PLUGIN, "{out}");
+        assert!(
+            out.is_empty(),
+            "a digest mismatch must print nothing on stdout: {out}"
+        );
+
+        // Unknown ids fail closed too (no bundled fallback).
+        let (code, _) = run_store(
+            &["show-source", "xuepoo.absent"],
+            &config,
+            &data_home_text,
+            "",
+        );
+        assert_eq!(code, EXIT_PLUGIN);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

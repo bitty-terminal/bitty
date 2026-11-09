@@ -346,6 +346,26 @@ impl WindowHandle {
         self.window.request_redraw();
     }
 
+    /// Requests the compositor's frame callback for the frame about to be
+    /// presented (bitty#3096).
+    ///
+    /// Wraps winit's `Window::pre_present_notify`. On Wayland this arms
+    /// `wl_surface.frame` for the next commit, which puts winit's
+    /// `FrameCallbackState` into `Requested`; while it is `Requested` the
+    /// backend defers `RedrawRequested` until the compositor has sampled the
+    /// committed frame. Without the call the state stays `None`, so every
+    /// `request_redraw()` is dispatched on the very next loop iteration and a
+    /// high-rate PTY stream turns the event loop into a redraw spin that
+    /// starves main-queue dispatch (the Wayland ANR in bitty#3096).
+    ///
+    /// Callers must only arm it for a frame that will actually commit (a live
+    /// presenter on a visible surface): a callback requested on a surface that
+    /// never commits stays `Requested` and suppresses redraws. Platforms
+    /// without frame callbacks implement it as a no-op.
+    pub fn pre_present_notify(&self) {
+        self.window.pre_present_notify();
+    }
+
     /// Samples the redraw-starvation probe for diagnostics (issue #2570).
     ///
     /// Read-only: the snapshot never mutates probe state and never affects

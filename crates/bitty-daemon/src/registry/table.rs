@@ -800,9 +800,14 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Refuses on an unknown or terminal session.
-    // The POSIX supervision pass observes worker liveness through the lease
-    // host, so the sole caller is behind that cfg.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    // The supervision pass observes worker liveness through the lease host, so
+    // the sole caller is behind that cfg.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
     pub(crate) fn observe_worker(
         &mut self,
         session_id: SessionId,

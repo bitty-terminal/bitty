@@ -528,9 +528,12 @@ fn capture_identity<S: AsFd>(
         PeerMechanism::LinuxPeerCred => linux::capture(socket, expected_uid),
         #[cfg(target_os = "macos")]
         PeerMechanism::AppleLocalPeer => apple::capture(socket, expected_uid),
-        _ => Err(PeerCause::Unavailable {
-            reason: format!("peer mechanism {mechanism:?} is unavailable on this build"),
-        }),
+        _ => {
+            let _ = (socket, expected_uid);
+            Err(PeerCause::Unavailable {
+                reason: format!("peer mechanism {mechanism:?} is unavailable on this build"),
+            })
+        }
     }
 }
 

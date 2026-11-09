@@ -9,7 +9,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | `ContainmentKind::CgroupV2` | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` | yes |
 //! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded group empty, leader pidfd exited, every pre-signal descendant pidfd exited | `swept` when verified, else `unverified` | yes |
-//! | `ContainmentKind::WindowsJob` | one kill-on-close job object per session | every member assigned before it runs; `ActiveProcesses` zero after termination | `swept` when verified | no: no ConPTY backend |
+//! | `ContainmentKind::WindowsJob` | one kill-on-close job object per session | every member assigned before it runs; `ActiveProcesses` zero after termination | `swept` when verified | yes |
 //! | `ContainmentKind::FreebsdReaper` | `procctl(PROC_REAP_ACQUIRE)` reaper + recorded process group | recorded group empty, no live recorded descendant, and no live descendant the session cannot attribute elsewhere | `swept` when verified | yes |
 //! | `ContainmentKind::ProcessGroup` | recorded process group only (macOS) | the group is signalled and observed gone; a reparented or re-sessioned descendant is not covered | `group-signalled` (`D-05`) | yes (never `swept`) |
 //! | `ContainmentKind::Refused` | none | none | no spawn, typed refusal | yes (it refuses) |
@@ -17,19 +17,18 @@
 //! # Reachability
 //!
 //! [`crate::worker::spawn_path_served`] follows the selected plan, not the
-//! compiled cell: every POSIX plan that mints a containment identity is on the
-//! served spawn path, and `crate::service::dispatch` refuses `session.create`
-//! with `UnsupportedCapability` before any spawn only for a `Refused` plan or
-//! the Windows job plan. The Windows plan is **implemented-only (unwired)**:
-//! this crate has no ConPTY backend, so no Windows daemon can own a PTY yet
-//! (bitty#2985). `is_enforced()` describes the mechanism, not reachability: the
-//! macOS process-group plan is served but cannot prove a whole tree, which is
-//! why it reports `group-signalled` instead of `swept`.
+//! compiled cell: every plan that mints a containment identity (`cgroup_v2`,
+//! `subreaper_fallback`, `windows_job`, `freebsd_reaper`, `process_group`) is
+//! on the served spawn path, and `crate::service::dispatch` refuses
+//! `session.create` with `UnsupportedCapability` before any spawn only for a
+//! `Refused` plan. `is_enforced()` describes the mechanism, not reachability:
+//! the macOS process-group plan is served but cannot prove a whole tree, which
+//! is why it reports `group-signalled` instead of `swept`.
 //!
 //! The served service loop (`crate::service::server`) still exports its `unix`
-//! module only on Linux, so on macOS and FreeBSD the pool, spawn, and cleanup
-//! path is compiled and unit-tested but the wire loop that would reach it is a
-//! typed stub.
+//! module only on Linux, so on Windows, macOS, and FreeBSD the pool, spawn, and
+//! cleanup path is compiled and unit-tested while the wire loop that would
+//! reach it is a typed stub.
 //!
 //! The fallback plans are deliberately weaker and say so. A process group
 //! alone can never prove a whole tree (`setsid`/`setpgid` escapes it), so the
@@ -48,8 +47,8 @@
 //!
 //! - Linux: delegated cgroup v2, falling back to the subreaper plan.
 //! - Windows: one job object per session, created before the spawn, with the
-//!   child assigned while suspended (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
-//!   Implemented-only: not on the served spawn path.
+//!   ConPTY child assigned at creation time via `PROC_THREAD_ATTRIBUTE_JOB_LIST`
+//!   (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
 //! - FreeBSD: the daemon acquires the `procctl(2)` reaper role so orphaned
 //!   descendants reparent to it, and records the child's process group.
 //! - macOS: the recorded process group only; it must not claim `swept`.
@@ -125,6 +124,8 @@ pub(crate) use self::posix_sys::{
 };
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
+#[cfg(target_os = "windows")]
+pub use self::windows::spawn_conpty;
 
 /// Test-only serialization for PTY creation and spawn.
 ///
@@ -133,7 +134,7 @@ pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 /// flagged or dropped. Tests that create a PTY and then spawn hold this lock,
 /// so an exact child-descriptor assertion cannot observe another test's
 /// transient handles.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
 pub(crate) mod test_lock {
     use std::sync::{Mutex, MutexGuard};
 

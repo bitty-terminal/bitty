@@ -621,19 +621,17 @@ the compiled cell; there is no silent fallback and no weaker transport:
 | -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- | ------------------------------------ |
 | `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    | yes                                  |
 | `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop | yes                                  |
-| `windows_job`        | `CreateJobObject` + a suspended child assigned before it resumes; `ActiveProcesses` zero ends the tree         | `swept` when verified | `TerminateJobObject`, then a bounded `ActiveProcesses` wait                         | no — implemented-only (unwired)      |
-| `freebsd_reaper`     | `procctl(PROC_REAP_ACQUIRE)` reaper + the recorded process group                                              | `swept` when verified | the recorded group (`SIGTERM`, then `SIGKILL`)                                     | no — implemented-only (unwired)      |
-| `process_group`      | macOS only: the recorded process group, no reaper                                                              | `group-signalled`     | the recorded group                                                                 | no — implemented-only (unwired)      |
+| `windows_job`        | `CreateJobObject` + ConPTY child assigned at creation via `PROC_THREAD_ATTRIBUTE_JOB_LIST`                     | `swept` when verified | `TerminateJobObject`, then a bounded `ActiveProcesses` wait                        | yes                                  |
+| `freebsd_reaper`     | `procctl(PROC_REAP_ACQUIRE)` reaper + the recorded process group                                               | `swept` when verified | the recorded group (`SIGTERM`, then `SIGKILL`)                                     | yes                                  |
+| `process_group`      | macOS only: the recorded process group, no reaper                                                              | `group-signalled`     | the recorded group                                                                 | yes                                  |
 | `none`               | no mechanism on the compiled cell, or the probe refused                                                        | none                  | no spawn; typed refusal                                                            | yes (it refuses)                     |
 
-The three non-Linux plans are **implemented-only (unwired)**: `probe()` selects
-them so the cell reports what its mechanism can prove, and each plan has unit
-tests, but the daemon does not yet spawn through them. The served spawn path is
-`worker::spawn_path_served`, which is `cfg!(target_os = "linux")`, and
+Every probed plan (`cgroup_v2`, `subreaper_fallback`, `windows_job`,
+`freebsd_reaper`, `process_group`) is wired into `worker::spawn_path_served`.
 `service::dispatch` refuses `session.create` with `UnsupportedCapability`
-before any spawn on a cell it does not serve; `service::server` exports the
-Linux-only `unix` module and a stub elsewhere. Porting the PTY spawn path to
-those cells is the follow-up that makes them reachable.
+before any spawn when `probe()` returns a refused plan (`none`), while
+`service::server` exports the `unix` listener loop on Linux and a stub on
+platforms whose IPC listener loop is not yet wired.
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`
@@ -704,11 +702,13 @@ record a durable identity (boot id, start time, process group read from
 `/proc`) the journal can re-check after a restart
 (`ContainmentKind::verifies_orphans`). Every other cell returns
 `Denied/UnsupportedCapability`, and `daemon.status` reports
-`orphans: {verify: "unsupported_capability"}`. Windows, FreeBSD, and macOS now
-have real containment plans (`windows_job`, `freebsd_reaper`, `process_group`)
-that the startup probe selects and that are unit-tested on their own cells, but
-none of them is on the served spawn path yet, so no orphan record of theirs is
-served either.
+`orphans: {verify: "unsupported_capability"}`. Windows, FreeBSD, and macOS
+serve their live session trees through `windows_job` + ConPTY, `freebsd_reaper`,
+and `process_group`, which record no durable restart identity (`WindowsJob`
+tears down in the kernel via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` when the
+daemon handle closes; `FreebsdReaper` and `ProcessGroup` have no restart
+re-verification identity), so the orphan journal and verifier remain unserved
+on those cells.
 
 Threat-model and evidence references: `T-21` (orphan reaping through a
 containment identity), `P0-AC-023` (child scope limitation), and `ME-05`
@@ -1298,7 +1298,7 @@ working.
 
 | Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only in an ordinary view: the controller's `attach_id` is never served there, while the operator all-session view's `attached_leases` (service 1.4) names live leases separately. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                                                                                                                                                                                               |
+| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only in an ordinary view: the controller's `attach_id` is never served there, while the operator all-session view's `attached_leases` (service 1.4) names live leases separately. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                                                                 |
 | every method returning a `session` object | `spawn_failure` (string)                                                      | present exactly when `terminal_reason` is `spawn_failed` (bitty#2790). A static class, never a message and never an errno number: `pty_allocation`, `exec_permission_denied`, `exec_not_executable`, `exec_not_found`, `spawn_error`, `bind_deadline`, `not_bindable`, `bind_timeout`, or `post_spawn_refusal`. `cleanup` still carries what the plan could prove; the pair is what tells an `exec` refusal from a PTY allocation failure. The pushed `session_terminal` marker keeps its frozen envelope and does not carry the class, so a client that needs it reads the session object. |
 | `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.                                                                                                                                                                                                                                                                                                                                                          |
 | `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1658,7 +1658,7 @@ and a channel this account may not use), and `0` (no daemon, and a clean drain).
 Dated notes (2026-11-07, bitty#2957):
 
 - **Exit `7` is not a `bittyd` code.** The only `7 = permission denied` row in
-  the documentation belongs to the `bitty` CLI's *candidate* table in
+  the documentation belongs to the `bitty` CLI's _candidate_ table in
   `interfaces/cli.md`, whose remaining rows (`3` configuration, `4` plugin, `5`
   compatibility, `6` IPC/runtime unavailable) contradict `D-05`'s numbering, so
   it does not describe this binary. The accepted session-host contract closes

@@ -8,7 +8,7 @@
 //! supplies the already-bounded bytes.
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
-//! `[limits]`, `[dependencies]`, `[settings]`, `[hints]`,
+//! `[limits]`, `[dependencies]`, `[settings]`, `[hints]`, `[source]`,
 //! `[services.provided]`, `[services.required]`, `[tools.git]` (accepted
 //! Layer-2 v1, CTX-0425), `[[capabilities.filesystem]]` and
 //! `[[network.egress]]` (array-of-tables).
@@ -105,6 +105,10 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // post-install onboarding lines. Bounded count/bytes and validated in
     // [`PluginManifest::validate`]; never part of the grant-binding hash.
     let mut next_steps: Vec<String> = Vec::new();
+    // `[source] sha256` (bitty#2069): the manifest-side pin of the module-tree
+    // digest. Shape-validated by [`PluginManifest::validate`]; the installer
+    // verifies it against the staged tree.
+    let mut source_sha256: Option<String> = None;
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
@@ -237,7 +241,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             }
             match inner.as_str() {
                 "plugin" | "compat" | "capabilities" | "lazy" | "limits" | "dependencies"
-                | "services.provided" | "services.required" | "settings" | "hints" => {
+                | "services.provided" | "services.required" | "settings" | "hints" | "source" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
@@ -456,6 +460,15 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     other => return Err(format!("unsupported [hints] key '{other}'")),
                 }
             }
+            "source" => {
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate key '{key}' in [{section}]"));
+                }
+                match key.as_str() {
+                    "sha256" => source_sha256 = Some(parse_string(&value)?),
+                    other => return Err(format!("unsupported [source] key '{other}'")),
+                }
+            }
             "dependencies" | "services.provided" | "services.required" | "settings" => {
                 if !seen_keys.insert(section_key) {
                     return Err(format!("duplicate key '{key}' in [{section}]"));
@@ -578,6 +591,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
         },
         settings,
         next_steps,
+        source_sha256,
         raw_bytes_len: bytes.len(),
     };
     manifest
@@ -2220,5 +2234,44 @@ mod tests {
             strip_comment("'process.spawn:git#1' = true # trailing comment"),
             "'process.spawn:git#1' = true "
         );
+    }
+
+    // ── `[source] sha256` pin (bitty#2069) ────────────────────────────────
+
+    #[test]
+    fn source_pin_parses_and_is_optional() {
+        let body = minimal_body("xuepoo.pin");
+        let manifest = parse_manifest(body.as_bytes()).expect("unpinned manifest parses");
+        assert_eq!(manifest.source_sha256, None);
+
+        let pin = "a".repeat(64);
+        let body = format!(
+            "{}\n[source]\nsha256 = \"{pin}\"\n",
+            minimal_body("xuepoo.pin")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("pinned manifest parses");
+        assert_eq!(manifest.source_sha256.as_deref(), Some(pin.as_str()));
+    }
+
+    #[test]
+    fn source_pin_rejects_unknown_keys_and_bad_shapes() {
+        // Unknown `[source]` key fails closed (closed subset).
+        let body = format!(
+            "{}\n[source]\nurl = \"https://example.invalid/x\"\n",
+            minimal_body("xuepoo.pinbad")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+
+        // Uppercase hex and wrong length are rejected by manifest validation.
+        for bad in ["A".repeat(64), "a".repeat(63), "z".repeat(64)] {
+            let body = format!(
+                "{}\n[source]\nsha256 = \"{bad}\"\n",
+                minimal_body("xuepoo.pinbad")
+            );
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "bad pin {bad:?} must fail closed"
+            );
+        }
     }
 }

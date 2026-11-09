@@ -107,6 +107,7 @@ fn lazy_manifest(id: &str) -> PluginManifest {
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 512,
+        source_sha256: None,
     }
 }
 

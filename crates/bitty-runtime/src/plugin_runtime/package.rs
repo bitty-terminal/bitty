@@ -8,6 +8,8 @@
 //! validate source (manifest, entry point, bounds)
 //!   -> compatibility check (compat.bitty / compat.plugin-api)
 //!   -> capability diff (added capabilities need explicit approval)
+//!   -> Lua readability gate + optional `[source] sha256` pin check
+//!   -> update preview (a content-changing update always needs approval)
 //!   -> quarantine copy under packages/<id>/.tmp-*
 //!   -> content digest of the staged module tree
 //!   -> replace/rename to packages/<id>/<version> (old tree kept as .tmp-*)
@@ -264,6 +266,70 @@ impl OrphanKind {
     }
 }
 
+/// Maximum changed files rendered in one update preview.
+///
+/// The preview is a review aid, not a full dump: an update touching more files
+/// than this reports the remainder as a count so the reviewer still sees that
+/// the snapshot changed wholesale.
+pub const UPDATE_DIFF_MAX_FILES: usize = 32;
+
+/// Maximum changed lines rendered per file in one update preview.
+pub const UPDATE_DIFF_MAX_LINES_PER_FILE: usize = 80;
+
+/// Maximum bytes read from one file while building an update preview.
+pub const UPDATE_DIFF_MAX_FILE_BYTES: u64 = 256 * 1024;
+
+/// Maximum bytes rendered for one line in an update preview.
+///
+/// A single very long line cannot smuggle an unreadable blob into the review
+/// output; the tail is replaced with an explicit truncation marker.
+pub const UPDATE_DIFF_MAX_LINE_BYTES: usize = 400;
+
+/// Maximum files read while building one update preview.
+pub const UPDATE_DIFF_MAX_SCAN_FILES: usize = 1024;
+
+/// Bounded old-vs-new line preview of one changed file (bitty#2069).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFileDiff {
+    /// Module-tree-relative path (`init.lua`, `lua/util.lua`, ...).
+    pub path: String,
+    /// Lines present only in the new tree.
+    pub added: usize,
+    /// Lines present only in the old tree.
+    pub removed: usize,
+    /// Rendered diff body: `-` removed lines, then `+` added lines, each
+    /// already bounded by [`UPDATE_DIFF_MAX_LINE_BYTES`].
+    pub lines: Vec<String>,
+    /// Whether the rendered body was cut at [`UPDATE_DIFF_MAX_LINES_PER_FILE`].
+    pub truncated: bool,
+}
+
+/// Bounded source preview of an update, shown before any approval (bitty#2069).
+///
+/// An update that keeps the recorded capability set used to commit silently:
+/// only added capabilities or a same-version content conflict asked for
+/// consent, so a version bump with identical capabilities replaced running
+/// code without the human seeing a byte of it. This preview is computed from
+/// the same staged snapshot that the transaction commits (never re-read from
+/// the source afterwards) and is attached to [`ConsentRequest`], so every
+/// content-changing update is reviewed before approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePreview {
+    /// Version recorded before this transaction.
+    pub previous_version: String,
+    /// Content digest recorded before this transaction.
+    pub previous_content_digest: String,
+    /// Content digest of the staged snapshot.
+    pub content_digest: String,
+    /// Changed files, sorted by path, bounded by [`UPDATE_DIFF_MAX_FILES`].
+    pub files: Vec<UpdateFileDiff>,
+    /// Changed files that did not fit in [`Self::files`].
+    pub omitted_files: usize,
+    /// Whether the previously installed tree could not be read, so only the
+    /// digest change is known (never silently reported as "no changes").
+    pub digest_only: bool,
+}
+
 /// The exact staged snapshot a human reviewer is asked to approve.
 ///
 /// It carries the canonical manifest hash and content digest of the quarantine
@@ -292,6 +358,14 @@ pub struct ConsentRequest {
     /// present the caller must confirm the replacement before returning
     /// `true`; declining commits nothing.
     pub replacement: Option<ReplacementRequest>,
+    /// Source preview of the update (bitty#2069).
+    ///
+    /// Present exactly when this transaction changes the installed source:
+    /// a version change or a same-version content change. The caller renders
+    /// it and asks for approval even when no capability is added, so an update
+    /// can never install unseen Lua. `None` for a fresh install and for an
+    /// idempotent reinstall of the identical snapshot.
+    pub update: Option<UpdatePreview>,
 }
 
 /// Outcome of one successful install/update transaction.
@@ -431,6 +505,18 @@ pub enum PackageOpError {
     },
     /// Capability consent was aborted (for example the input stream ended).
     ConsentAborted(String),
+    /// The manifest's declared `[source] sha256` does not match the staged tree.
+    ///
+    /// The pin is a claim about bytes; a mismatch means the tree beside the
+    /// manifest is not the tree the publisher pinned, so nothing is committed.
+    SourcePinMismatch {
+        /// Plugin id.
+        plugin: String,
+        /// Digest declared by the manifest.
+        declared: String,
+        /// Digest computed over the staged module tree.
+        actual: String,
+    },
     /// The store could not be read or written safely.
     Store(String),
     /// An authoritative repair scan exceeded its safe bound.
@@ -471,6 +557,14 @@ impl std::fmt::Display for PackageOpError {
                 "'{plugin}' declares {field} = '{requested}', which does not include host version {host}"
             ),
             Self::ConsentAborted(detail) => write!(f, "consent aborted: {detail}"),
+            Self::SourcePinMismatch {
+                plugin,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "module tree for '{plugin}': the manifest pins source sha256 {declared} but the staged tree hashes {actual} (refusing to install bytes the manifest does not pin)"
+            ),
             Self::Store(detail) => write!(f, "plugin store: {detail}"),
             Self::StoreTooLarge {
                 scope,
@@ -498,12 +592,18 @@ impl From<super::PluginRuntimeError> for PackageOpError {
 /// module tree is `lua/` when present, else the package root. The verified
 /// manifest body and module tree are copied into a quarantine directory and
 /// digested first. If that snapshot adds capabilities over the recorded grant,
-/// or an existing version directory has to be replaced, `consent` is asked to
-/// approve **that snapshot** (its canonical `manifest_hash` and
-/// `content_digest`), and the same snapshot is committed. The source is never
+/// if an existing version directory has to be replaced, or if it replaces
+/// installed source with different bytes (a version bump or a same-version
+/// content change), `consent` is asked to approve **that snapshot** (its
+/// canonical `manifest_hash`, its `content_digest`, and the bounded update
+/// preview), and the same snapshot is committed. The source is never
 /// re-read after consent, so a manifest swapped while the prompt is open can
 /// never widen the installed grant; the staged body is re-verified against the
 /// reviewed hash before commit as defense in depth.
+///
+/// The staged snapshot also passes two content gates before any prompt: the
+/// no-obfuscation rule (minified Lua is refused) and, when the manifest
+/// declares `[source] sha256`, the source pin (a mismatch is refused).
 ///
 /// Returns `Ok(None)` when consent is denied (nothing is committed).
 ///
@@ -642,6 +742,27 @@ fn install_local_dir_with_index_writer(
                 });
             }
         };
+    // Readability gate (bitty#2069): refuse minified/obfuscated Lua in the
+    // staged snapshot before any consent prompt or commit, so an unreadable
+    // distribution can never become a reviewable-looking artifact.
+    let staged_module_root = resolution::module_root_for(&staging);
+    if let Err(error) = check_readable_lua(&plugin_id, &staged_module_root) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    // Source pin (bitty#2069): a manifest that declares `[source] sha256` pins
+    // the exact module tree it ships with. A mismatch means the tree beside the
+    // manifest is not the tree the publisher pinned, so nothing is committed.
+    if let Some(declared) = manifest.source_sha256.as_deref() {
+        if !declared.eq_ignore_ascii_case(&content_digest) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(PackageOpError::SourcePinMismatch {
+                plugin: plugin_id,
+                declared: declared.to_string(),
+                actual: content_digest,
+            });
+        }
+    }
 
     // Existing target inspection is bound into the consent request so the
     // human approves the same snapshot and the same replacement. The source
@@ -668,7 +789,17 @@ fn install_local_dir_with_index_writer(
         None
     };
     let repair_needs_consent = replacement.is_some() && !options.force_repair;
-    let consent_needed = !added.is_empty() || repair_needs_consent;
+    // Update preview (bitty#2069): a version change or a same-version content
+    // change replaces installed code, so it always needs approval even when the
+    // capability set is unchanged. The preview is built from the staged
+    // snapshot the transaction commits, never from the source again.
+    let update_preview = existing.as_ref().and_then(|record| {
+        let changed = record.version != version
+            || !record.content_digest.eq_ignore_ascii_case(&content_digest);
+        changed
+            .then(|| build_update_preview(store_root, record, &staged_module_root, &content_digest))
+    });
+    let consent_needed = !added.is_empty() || repair_needs_consent || update_preview.is_some();
     if consent_needed {
         let request = ConsentRequest {
             plugin_id: plugin_id.clone(),
@@ -678,6 +809,7 @@ fn install_local_dir_with_index_writer(
             added: added.clone(),
             granted: granted.iter().cloned().collect(),
             replacement: replacement.clone().filter(|_| repair_needs_consent),
+            update: update_preview,
         };
         match consent(&request) {
             Ok(true) => {}
@@ -1020,6 +1152,284 @@ fn replacement_request(
         root: format!("{PACKAGES_DIR}/{plugin_id}/{version}"),
         detail,
     }
+}
+
+/// Read one module tree into `relative path -> bytes` for an update preview.
+///
+/// Bounded and fail-soft: returns `None` when the root cannot be walked or the
+/// walk exceeds [`UPDATE_DIFF_MAX_SCAN_FILES`], so the caller reports a
+/// digest-only preview instead of claiming there were no changes. Symlinks are
+/// skipped (the installer rejects them on the staged side), and a file over
+/// [`UPDATE_DIFF_MAX_FILE_BYTES`] is represented by a size marker so it still
+/// counts as changed content.
+fn read_preview_tree(root: &Path) -> Option<BTreeMap<String, Vec<u8>>> {
+    let mut out: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = 0usize;
+    while let Some(directory) = stack.pop() {
+        let listing = std::fs::read_dir(&directory).ok()?;
+        for entry in listing {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            files += 1;
+            if files > UPDATE_DIFF_MAX_SCAN_FILES {
+                return None;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = entry.metadata().ok()?;
+            if metadata.len() > UPDATE_DIFF_MAX_FILE_BYTES {
+                out.insert(
+                    relative,
+                    format!("<{} byte file, not previewed>", metadata.len()).into_bytes(),
+                );
+                continue;
+            }
+            out.insert(relative, std::fs::read(&path).ok()?);
+        }
+    }
+    Some(out)
+}
+
+/// Bound one rendered diff line so a long line cannot flood the review output.
+fn bounded_diff_line(line: &str) -> String {
+    if line.len() <= UPDATE_DIFF_MAX_LINE_BYTES {
+        return line.to_string();
+    }
+    let mut end = UPDATE_DIFF_MAX_LINE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes truncated)", &line[..end], line.len() - end)
+}
+
+/// Line preview of one changed file: common prefix/suffix are trimmed, then
+/// every removed line renders with `-` and every added line with `+`.
+///
+/// Returns `(added, removed, rendered lines, truncated)`.
+fn diff_text_lines(old: &str, new: &str) -> (usize, usize, Vec<String>, bool) {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let removed = &old_lines[prefix..old_lines.len() - suffix];
+    let added = &new_lines[prefix..new_lines.len() - suffix];
+    let mut lines: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for line in removed {
+        if lines.len() >= UPDATE_DIFF_MAX_LINES_PER_FILE {
+            truncated = true;
+            break;
+        }
+        lines.push(format!("-{}", bounded_diff_line(line)));
+    }
+    if !truncated {
+        for line in added {
+            if lines.len() >= UPDATE_DIFF_MAX_LINES_PER_FILE {
+                truncated = true;
+                break;
+            }
+            lines.push(format!("+{}", bounded_diff_line(line)));
+        }
+    }
+    (added.len(), removed.len(), lines, truncated)
+}
+
+/// Build the bounded source preview of one update (bitty#2069).
+///
+/// Compares the recorded installed tree against the staged module tree. The
+/// recorded root is resolved through [`resolution::store_package_root`] — the
+/// same guard every other reader uses — so an absolute (`local-path`
+/// development checkout) root, a crafted `../..` root, or an unreadable tree
+/// yields `digest_only`, never a false "no changes" and never a read outside
+/// the plugin store.
+fn build_update_preview(
+    store_root: &Path,
+    record: &PluginRecord,
+    staged_module_root: &Path,
+    content_digest: &str,
+) -> UpdatePreview {
+    let mut preview = UpdatePreview {
+        previous_version: record.version.clone(),
+        previous_content_digest: record.content_digest.clone(),
+        content_digest: content_digest.to_string(),
+        files: Vec::new(),
+        omitted_files: 0,
+        digest_only: true,
+    };
+    let Some(package_root) = resolution::store_package_root(store_root, record) else {
+        return preview;
+    };
+    let previous_module_root = resolution::module_root_for(&package_root);
+    let Some(old_tree) = read_preview_tree(&previous_module_root) else {
+        return preview;
+    };
+    let Some(new_tree) = read_preview_tree(staged_module_root) else {
+        return preview;
+    };
+    preview.digest_only = false;
+    let mut changed: Vec<UpdateFileDiff> = Vec::new();
+    let mut paths: BTreeSet<&String> = old_tree.keys().collect();
+    paths.extend(new_tree.keys());
+    for path in paths {
+        let old_bytes = old_tree.get(path).map(Vec::as_slice).unwrap_or(b"");
+        let new_bytes = new_tree.get(path).map(Vec::as_slice).unwrap_or(b"");
+        if old_bytes == new_bytes {
+            continue;
+        }
+        let file = match (
+            std::str::from_utf8(old_bytes),
+            std::str::from_utf8(new_bytes),
+        ) {
+            (Ok(old_text), Ok(new_text)) => {
+                let (added, removed, lines, truncated) = diff_text_lines(old_text, new_text);
+                UpdateFileDiff {
+                    path: path.clone(),
+                    added,
+                    removed,
+                    lines,
+                    truncated,
+                }
+            }
+            // Non-UTF-8 content (or a size marker) cannot be shown line by
+            // line; the change is still reported so it is never invisible.
+            _ => UpdateFileDiff {
+                path: path.clone(),
+                added: 0,
+                removed: 0,
+                lines: vec!["(binary or non-UTF-8 content changed)".to_string()],
+                truncated: false,
+            },
+        };
+        if changed.len() >= UPDATE_DIFF_MAX_FILES {
+            preview.omitted_files += 1;
+            continue;
+        }
+        changed.push(file);
+    }
+    preview.files = changed;
+    preview
+}
+
+/// Maximum Lua files inspected by the readability gate in one staged tree.
+const READABLE_LUA_MAX_FILES: usize = 1024;
+
+/// Maximum bytes read per Lua file by the readability gate.
+const READABLE_LUA_MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Refuse minified/obfuscated Lua in a staged plugin tree (bitty#2069).
+///
+/// Applies the shared no-obfuscation rule
+/// ([`crate::component::is_obfuscated_source_text`]) to every `*.lua` file in
+/// the staged module tree, so a plugin distribution cannot ship unreadable
+/// source through the store even when no publish-side gate saw it. The check
+/// runs on the staged copy, which is exactly what the transaction commits.
+fn check_readable_lua(plugin: &str, module_root: &Path) -> Result<(), PackageOpError> {
+    let mut stack = vec![module_root.to_path_buf()];
+    let mut inspected = 0usize;
+    while let Some(directory) = stack.pop() {
+        let listing =
+            std::fs::read_dir(&directory).map_err(|error| PackageOpError::ModuleTree {
+                plugin: plugin.to_string(),
+                detail: format!("cannot inspect '{}': {error}", directory.display()),
+            })?;
+        for entry in listing {
+            let entry = entry.map_err(|error| PackageOpError::ModuleTree {
+                plugin: plugin.to_string(),
+                detail: format!("cannot inspect '{}': {error}", directory.display()),
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| PackageOpError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!("cannot inspect '{}': {error}", path.display()),
+                })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "lua") {
+                continue;
+            }
+            inspected += 1;
+            if inspected > READABLE_LUA_MAX_FILES {
+                return Err(PackageOpError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!(
+                        "more than {READABLE_LUA_MAX_FILES} Lua files (refusing to install unreadable source)"
+                    ),
+                });
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| PackageOpError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!("cannot inspect '{}': {error}", path.display()),
+                })?;
+            if metadata.len() > READABLE_LUA_MAX_FILE_BYTES {
+                return Err(PackageOpError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!(
+                        "Lua source '{}' exceeds {READABLE_LUA_MAX_FILE_BYTES} bytes (refusing to install unreadable source)",
+                        path.display()
+                    ),
+                });
+            }
+            let bytes = std::fs::read(&path).map_err(|error| PackageOpError::ModuleTree {
+                plugin: plugin.to_string(),
+                detail: format!("cannot read Lua source '{}': {error}", path.display()),
+            })?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| PackageOpError::ModuleTree {
+                plugin: plugin.to_string(),
+                detail: format!(
+                    "Lua source '{}' is not UTF-8 (refusing to install unreadable source)",
+                    path.display()
+                ),
+            })?;
+            if crate::component::is_obfuscated_source_text(text) {
+                return Err(PackageOpError::ModuleTree {
+                    plugin: plugin.to_string(),
+                    detail: format!(
+                        "Lua source '{}' looks minified/obfuscated (readability rule: max {} bytes per line, {} average; refusing to install)",
+                        path.display(),
+                        crate::component::READABLE_SOURCE_MAX_LINE_BYTES,
+                        crate::component::READABLE_SOURCE_MAX_AVG_LINE_BYTES,
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Set the desired load state of one stored record (atomic index write).
@@ -3028,7 +3438,8 @@ mod tests {
         assert_ne!(records[0].manifest_hash, original_hash);
         resolution::resolve_record(&store, &records[0]).expect("replaced tree resolves");
 
-        // `--force` (force_repair) replaces without a prompt.
+        // `--force` (force_repair) skips the repair prompt but never the source
+        // approval: changed bytes are approved (or refused) explicitly.
         let source_alt2 = write_plugin_alt_compat(&scratch, "xuepoo.plug007rej", "1.0.0");
         std::fs::write(source_alt2.join("lua/forced.lua"), b"return {}\n").expect("force diff");
         let forced = install_local_dir(
@@ -3038,11 +3449,288 @@ mod tests {
                 force_repair: true,
                 ..LocalInstallOptions::default()
             },
-            &mut |_| panic!("force_repair must not prompt"),
+            &mut |request| {
+                assert!(
+                    request.replacement.is_none(),
+                    "--force bypasses the repair prompt"
+                );
+                assert!(
+                    request.update.is_some(),
+                    "--force never bypasses the source update approval"
+                );
+                Ok(true)
+            },
         )
         .expect("force replace")
         .expect("approved");
         assert!(forced.content_replaced);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // ── Source transparency (bitty#2069) ──────────────────────────────────
+
+    /// A capability-neutral version bump must still be approved, and the
+    /// request must carry the rendered old-vs-new Lua diff (bitty#2069).
+    #[test]
+    fn update_with_unchanged_capabilities_requires_approval_and_shows_diff() {
+        let scratch = scratch("update-diff");
+        let store = scratch.join("store");
+        let source_v1 = write_plugin(&scratch, "xuepoo.diff", "1.0.0", None);
+        install(&store, &source_v1);
+
+        // v2 keeps the identical (empty) capability set and only changes Lua.
+        let source_v2 = write_plugin(&scratch, "xuepoo.diff", "2.0.0", None);
+        std::fs::write(
+            source_v2.join("lua/init.lua"),
+            "bitty.commands.register({ id = \"xuepoo.diff:greet\", run = function() return \"changed\" end })\n",
+        )
+        .expect("changed lua");
+
+        let mut prompts = 0usize;
+        let mut seen: Option<UpdatePreview> = None;
+        let report = install_local_dir(
+            &store,
+            &source_v2,
+            &LocalInstallOptions::default(),
+            &mut |request| {
+                prompts += 1;
+                assert!(
+                    request.added.is_empty(),
+                    "the fixture adds no capability: only the source changed"
+                );
+                assert!(request.replacement.is_none(), "new version dir: no repair");
+                seen = request.update.clone();
+                Ok(true)
+            },
+        )
+        .expect("update")
+        .expect("approved");
+
+        assert_eq!(
+            prompts, 1,
+            "a content-changing update must always ask for approval"
+        );
+        let preview = seen.expect("update preview must be attached to the request");
+        assert_eq!(preview.previous_version, "1.0.0");
+        assert_eq!(preview.content_digest, report.content_digest);
+        assert!(!preview.digest_only, "both trees are readable");
+        let file = preview
+            .files
+            .iter()
+            .find(|file| file.path == "init.lua")
+            .expect("init.lua must appear in the preview");
+        assert!(file.added >= 1 && file.removed >= 1, "{file:?}");
+        assert!(
+            file.lines
+                .iter()
+                .any(|line| line.starts_with('+') && line.contains("return \"changed\"")),
+            "the added line must be rendered: {:?}",
+            file.lines
+        );
+        assert!(
+            file.lines
+                .iter()
+                .any(|line| line.starts_with('-') && line.contains("return \"hi\"")),
+            "the removed line must be rendered: {:?}",
+            file.lines
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A crafted `current.json` root that escapes the plugin store must never be
+    /// read for consent output: the preview falls back to `digest_only` instead
+    /// of rendering files the user never installed (bitty#2069 review D3).
+    #[test]
+    fn update_preview_falls_back_to_digest_only_for_escaping_record_root() {
+        let scratch = scratch("preview-escape");
+        let store = scratch.join("store");
+        std::fs::create_dir_all(store.join("packages/xuepoo.escape/1.0.0/lua"))
+            .expect("store tree");
+
+        // An outside tree the crafted root reaches through `..`, holding source
+        // the user never installed. The old `is_absolute`-only check would have
+        // rendered this into the consent preview.
+        let outside = scratch.join("outside");
+        std::fs::create_dir_all(outside.join("lua")).expect("outside tree");
+        std::fs::write(
+            outside.join("lua/init.lua"),
+            b"-- source outside the plugin store\nreturn {}\n",
+        )
+        .expect("outside lua");
+
+        let staged = scratch.join("staged");
+        std::fs::create_dir_all(staged.join("lua")).expect("staged tree");
+        std::fs::write(staged.join("lua/init.lua"), b"-- new body\nreturn {}\n")
+            .expect("staged lua");
+
+        let crafted = PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "xuepoo.escape".to_string(),
+            version: "1.0.0".to_string(),
+            root: "../outside".to_string(),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        };
+        let preview = build_update_preview(&store, &crafted, &staged, &"c".repeat(64));
+        assert!(
+            preview.digest_only,
+            "an escaping record root must fall back to digest_only"
+        );
+        assert!(
+            preview.files.is_empty(),
+            "nothing outside the store may be rendered: {:?}",
+            preview.files
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn declined_update_commits_nothing() {
+        let scratch = scratch("update-decline");
+        let store = scratch.join("store");
+        let source_v1 = write_plugin(&scratch, "xuepoo.decline", "1.0.0", None);
+        let first = install(&store, &source_v1);
+        let source_v2 = write_plugin(&scratch, "xuepoo.decline", "2.0.0", None);
+
+        let declined = install_local_dir(
+            &store,
+            &source_v2,
+            &LocalInstallOptions::default(),
+            &mut |request| {
+                assert!(request.update.is_some(), "the update prompt must fire");
+                Ok(false)
+            },
+        )
+        .expect("decline is not an error");
+        assert!(declined.is_none(), "declining commits nothing");
+        let records = resolution::load_index(&store).expect("index");
+        assert_eq!(records[0].version, "1.0.0");
+        assert_eq!(records[0].content_digest, first.content_digest);
+        assert!(
+            !store.join("packages/xuepoo.decline/2.0.0").exists(),
+            "the staged tree is discarded"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn idempotent_reinstall_does_not_prompt() {
+        let scratch = scratch("update-idempotent");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.same", "1.0.0", None);
+        install(&store, &source);
+        let again = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| panic!("an identical reinstall must not prompt"),
+        )
+        .expect("reinstall")
+        .expect("approved");
+        assert!(again.updated);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Fixture manifest with an explicit `[source] sha256` pin.
+    fn write_plugin_with_source_pin(root: &Path, id: &str, version: &str, pin: &str) -> PathBuf {
+        let package = write_plugin(root, id, version, None);
+        let mut manifest =
+            std::fs::read_to_string(package.join(MANIFEST_FILE_NAME)).expect("manifest");
+        manifest.push_str(&format!("\n[source]\nsha256 = \"{pin}\"\n"));
+        std::fs::write(package.join(MANIFEST_FILE_NAME), manifest).expect("pinned manifest");
+        package
+    }
+
+    #[test]
+    fn source_pin_mismatch_fails_closed() {
+        let scratch = scratch("source-pin-bad");
+        let store = scratch.join("store");
+        let source =
+            write_plugin_with_source_pin(&scratch, "xuepoo.pinned", "1.0.0", &"0".repeat(64));
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| panic!("a pin mismatch must fail before any consent prompt"),
+        )
+        .expect_err("a mismatched source pin must fail closed");
+        assert!(
+            matches!(error, PackageOpError::SourcePinMismatch { .. }),
+            "expected SourcePinMismatch, got: {error}"
+        );
+        assert!(
+            resolution::load_index(&store).expect("index").is_empty(),
+            "nothing may be recorded"
+        );
+        assert!(
+            !store.join("packages/xuepoo.pinned/1.0.0").exists(),
+            "the staged tree must be discarded"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(store.join("packages/xuepoo.pinned"))
+            .map(|dir| dir.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "no staging dir may remain: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn source_pin_matching_tree_installs_and_records_digest() {
+        let scratch = scratch("source-pin-ok");
+        let store = scratch.join("store");
+        // Learn the canonical module-tree digest from an unpinned install of
+        // the identical bytes, then pin exactly that value.
+        let source = write_plugin(&scratch, "xuepoo.pinok", "1.0.0", None);
+        let first = install(&store, &source);
+        let pinned =
+            write_plugin_with_source_pin(&scratch, "xuepoo.pinok", "1.0.0", &first.content_digest);
+        let fresh_store = scratch.join("store-pinned");
+        let report = install(&fresh_store, &pinned);
+        assert_eq!(report.content_digest, first.content_digest);
+        let records = resolution::load_index(&fresh_store).expect("index");
+        assert_eq!(records[0].content_digest, first.content_digest);
+        let manifest = super::super::manifest_toml::parse_manifest(
+            &std::fs::read(pinned.join(MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("pinned manifest parses");
+        assert_eq!(
+            manifest.source_sha256.as_deref(),
+            Some(first.content_digest.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn minified_lua_in_staged_tree_is_refused() {
+        let scratch = scratch("minified-lua");
+        let store = scratch.join("store");
+        let source = write_plugin(&scratch, "xuepoo.minified", "1.0.0", None);
+        // One 5000-byte line: minified output, refused by the shared rule.
+        std::fs::write(
+            source.join("lua/init.lua"),
+            format!("local x={};", "a".repeat(5000)),
+        )
+        .expect("minified lua");
+        let error = install_local_dir(
+            &store,
+            &source,
+            &LocalInstallOptions::default(),
+            &mut |_| panic!("unreadable source must be refused before any consent prompt"),
+        )
+        .expect_err("minified Lua must be refused");
+        let message = format!("{error}");
+        assert!(
+            message.contains("minified/obfuscated"),
+            "expected the readability refusal, got: {message}"
+        );
+        assert!(
+            resolution::load_index(&store).expect("index").is_empty(),
+            "nothing may be recorded"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

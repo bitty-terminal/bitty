@@ -59,6 +59,7 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
         },
         settings: Vec::new(),
         next_steps: Vec::new(),
+        source_sha256: None,
         raw_bytes_len: 256,
     }
 }

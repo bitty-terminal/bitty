@@ -72,6 +72,7 @@ fn minimal_manifest(id: &str, events: Vec<&str>) -> bitty_plugin_host::PluginMan
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 256,
+        source_sha256: None,
     }
 }
 

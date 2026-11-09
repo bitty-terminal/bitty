@@ -2515,6 +2515,16 @@ pub struct PluginManifest {
     /// [`PluginManifest::canonical_bytes`]: adding or changing a hint
     /// never invalidates the grant pin bound to the hash.
     pub next_steps: Vec<String>,
+    /// Declared source pin (`[source] sha256`, bitty#2069).
+    ///
+    /// Lowercase-hex SHA-256 of the plugin's module tree, computed exactly like
+    /// the store's `content_digest`. When declared, the installer recomputes the
+    /// digest of the staged tree and refuses a mismatch, so the manifest itself
+    /// pins the source bytes a reviewer approved instead of trusting whatever
+    /// tree happens to sit beside it. It enters [`Self::canonical_bytes`] when
+    /// declared (and only then), so adding, changing, or dropping a pin re-binds
+    /// the grant record to the new manifest.
+    pub source_sha256: Option<String>,
     /// Raw manifest byte length (for the 256 KiB size check).
     pub raw_bytes_len: usize,
 }
@@ -2704,6 +2714,13 @@ impl PluginManifest {
                 Some(v) => buf.push_str(&format!("{key}={v},")),
                 None => buf.push_str(&format!("{key}=,")),
             }
+        }
+        // Source pin (bitty#2069): appended only when declared, so manifests
+        // without a pin keep their exact pre-existing bytes and hash. Declaring
+        // a pin binds the approved source digest into the grant hash.
+        if let Some(pin) = &self.source_sha256 {
+            buf.push_str("|source-sha256=");
+            buf.push_str(pin);
         }
         // RC-1/RC-2 budget declarations (bitty#2304) are appended only when
         // at least one key is present. Manifests that declare no budget keep
@@ -2924,6 +2941,22 @@ impl PluginManifest {
                         value: step.clone(),
                     });
                 }
+            }
+        }
+
+        // Source pin (`[source] sha256`, bitty#2069): exactly one lowercase-hex
+        // SHA-256. Shape is validated here; the value is verified against the
+        // staged module tree by the installer, never trusted as a claim.
+        if let Some(pin) = &self.source_sha256 {
+            let shaped = pin.len() == 64
+                && pin
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !shaped {
+                return Err(PluginError::manifest(
+                    "source.sha256",
+                    "must be 64 lowercase hexadecimal characters",
+                ));
             }
         }
 
@@ -3191,6 +3224,7 @@ mod tests {
             settings: Vec::new(),
             next_steps: Vec::new(),
             raw_bytes_len: 512,
+            source_sha256: None,
         }
     }
 
@@ -4697,6 +4731,59 @@ mod tests {
         m3.limits.wall_ms = Some(20);
         assert_ne!(m2.manifest_hash(), m3.manifest_hash());
         assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
+    }
+
+    // ── `[source] sha256` pin (bitty#2069) ────────────────────────────────
+
+    #[test]
+    fn source_pin_is_hashed_only_when_declared() {
+        let unpinned = minimal_manifest("xuepoo.srchash");
+        let bytes = String::from_utf8(unpinned.canonical_bytes()).expect("canonical bytes");
+        assert!(
+            !bytes.contains("source-sha256"),
+            "an absent pin must not change the pre-existing canonical bytes"
+        );
+
+        let mut pinned = unpinned.clone();
+        pinned.source_sha256 = Some("a".repeat(64));
+        assert!(pinned.validate().is_ok());
+        assert_ne!(
+            unpinned.manifest_hash(),
+            pinned.manifest_hash(),
+            "declaring a pin must re-bind the grant hash"
+        );
+
+        let mut changed = pinned.clone();
+        changed.source_sha256 = Some("b".repeat(64));
+        assert_ne!(
+            pinned.manifest_hash(),
+            changed.manifest_hash(),
+            "changing the pin must change the hash"
+        );
+    }
+
+    #[test]
+    fn source_pin_shape_is_validated() {
+        for bad in [
+            String::new(),
+            "A".repeat(64),
+            "a".repeat(63),
+            "g".repeat(64),
+            format!("{}0", "a".repeat(64)),
+        ] {
+            let mut manifest = minimal_manifest("xuepoo.srcshape");
+            manifest.source_sha256 = Some(bad.clone());
+            let error = manifest
+                .validate()
+                .expect_err(&format!("pin {bad:?} must be refused"));
+            assert!(
+                format!("{error}").contains("source.sha256"),
+                "expected a source.sha256 diagnostic, got: {error}"
+            );
+        }
+        let mut manifest = minimal_manifest("xuepoo.srcshape");
+        manifest.source_sha256 = Some("0123456789abcdef".repeat(4));
+        assert!(manifest.validate().is_ok());
     }
 }
 

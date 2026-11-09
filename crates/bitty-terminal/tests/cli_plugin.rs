@@ -2712,11 +2712,13 @@ fn plugin_same_version_content_change_prompts_and_honors_force() {
     let source_arg = source.display().to_string();
     let store = data_store(&home);
     let index = store.join("current.json");
+    let installed_init = store.join("packages/xuepoo.external/1.0.0/lua/init.lua");
 
     let output = run_in(&home, &["plugin", "install", &source_arg, "--yes"], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let before = std::fs::read_to_string(&index).expect("index");
     let digest_before = load_index(&store).expect("index")[0].content_digest.clone();
+    let tree_before = std::fs::read_to_string(&installed_init).expect("installed init");
 
     // Same manifest version, new Lua body.
     std::fs::write(
@@ -2734,25 +2736,93 @@ fn plugin_same_version_content_change_prompts_and_honors_force() {
         stderr(&output)
     );
     assert_eq!(std::fs::read_to_string(&index).expect("index"), before);
+    assert_eq!(
+        std::fs::read_to_string(&installed_init).expect("installed init"),
+        tree_before,
+        "a declined repair leaves the installed tree unchanged"
+    );
 
-    // Approve interactively.
-    let output = run_in(&home, &["plugin", "install", &source_arg], Some("y\n"));
+    // Approve interactively: the repair prompt, then the mandatory source
+    // update prompt that shows the rendered diff.
+    let output = run_in(&home, &["plugin", "install", &source_arg], Some("y\ny\n"));
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("update for 'xuepoo.external' 1.0.0 -> 1.0.0"),
+        "the update preview must render: {text}"
+    );
+    assert!(
+        text.contains("Install this update?"),
+        "the update prompt must fire: {text}"
+    );
     let records = load_index(&store).expect("index");
     assert_ne!(records[0].content_digest, digest_before);
+    let digest_after_interactive = records[0].content_digest.clone();
+    let tree_after_interactive = std::fs::read_to_string(&installed_init).expect("installed init");
 
-    // `--force` replaces without a prompt.
+    // `--force` no longer replaces content non-interactively: consent stays
+    // mandatory on a content-changing update, and `--force` only skips the
+    // repair prompt. Declining the update prompt changes nothing.
     std::fs::write(
         source.join("lua/init.lua"),
         "bitty.commands.register({ id = \"greet\", title = \"Greet\", run = function() return \"hello v3\" end })\nreturn {}\n",
     )
     .expect("rewrite init again");
-    let output = run_in(&home, &["plugin", "install", &source_arg, "--force"], None);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source_arg, "--force"],
+        Some("n\n"),
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let text = stdout(&output);
     assert!(
-        stdout(&output).contains("replaced the existing package content"),
+        !text.contains("Replace it?"),
+        "--force still skips the repair prompt: {text}"
+    );
+    assert!(
+        text.contains("Install this update?"),
+        "the update prompt fires even with --force: {text}"
+    );
+    assert!(
+        stderr(&output).contains("install was not approved"),
         "{}",
-        stdout(&output)
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&installed_init).expect("installed init"),
+        tree_after_interactive,
+        "a declined update leaves the installed tree unchanged"
+    );
+    assert_eq!(
+        load_index(&store).expect("index")[0].content_digest,
+        digest_after_interactive,
+        "a declined update leaves the index unchanged"
+    );
+
+    // `--yes` approves the rendered preview; `--force` only skips repair.
+    let output = run_in(
+        &home,
+        &["plugin", "install", &source_arg, "--force", "--yes"],
+        None,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("update for 'xuepoo.external' 1.0.0 -> 1.0.0"),
+        "the update preview still prints under --yes: {text}"
+    );
+    assert!(
+        text.contains("init.lua (+"),
+        "the rendered diff still prints under --yes: {text}"
+    );
+    assert!(
+        text.contains("replaced the existing package content"),
+        "the in-place replace is still reported: {text}"
+    );
+    assert_ne!(
+        load_index(&store).expect("index")[0].content_digest,
+        digest_after_interactive,
+        "the approved update commits the new content"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

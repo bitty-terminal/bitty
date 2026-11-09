@@ -1123,6 +1123,7 @@ mod tests {
             settings: Vec::new(),
             next_steps: Vec::new(),
             raw_bytes_len: 256,
+            source_sha256: None,
         };
         rt.register_plugin(manifest).expect("fixture registers");
         let mut granted = BTreeSet::new();

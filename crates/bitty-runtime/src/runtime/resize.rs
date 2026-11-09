@@ -499,7 +499,9 @@ impl Runtime {
         // the layout container is that grid minus the Core-owned chrome
         // band (workspace bar), so every leaf, the primary grid, and every
         // PTY winsize exclude the band through this one reflow path.
-        self.window_cells = default_container(cols, rows);
+        let next_window_cells = default_container(cols, rows);
+        let grid_changed = self.window_cells != next_window_cells;
+        self.window_cells = next_window_cells;
         self.reflow_content_to_chrome();
         // Surface resize: real GPU path when attached, else headless.
         // bitty#2830: with the off-thread presenter, the extent change is a
@@ -511,7 +513,9 @@ impl Runtime {
         // bitty#3099: skip reconfiguring the surface and worker swapchain when
         // `surface_extent` is already the configured extent (e.g. Hyprland
         // workspace-switch `Resized` deliveries with unchanged geometry, or
-        // padding/font reflows at fixed window size).
+        // padding/font reflows at fixed window size). If the grid cell count
+        // changed at fixed extent (padding/font/DPI reflow), still invalidate
+        // `pending_present` so a pre-reflow ack cannot commit stale allocations.
         let extent_changed = self.surface.extent() != Some(surface_extent);
         if let Some(presenter) = self.presenter.as_mut() {
             if extent_changed {
@@ -521,9 +525,6 @@ impl Runtime {
                 let palette = self.surface.theme_palette();
                 presenter.resize(surface_extent, opacity);
                 self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
-                if self.pending_present.take().is_some() {
-                    self.pending_full_redraw = true;
-                }
                 // bitty#2989: the confirmation described the pre-resize frame. Its
                 // repair budget goes with it, so the new surface incarnation starts
                 // with the full one. The *speculation* is deliberately kept
@@ -535,6 +536,9 @@ impl Runtime {
                 // gate through `restore_hidden_after_blind_repair`.
                 self.present_confirm_at = None;
                 self.present_confirm_misses = 0;
+            }
+            if (extent_changed || grid_changed) && self.pending_present.take().is_some() {
+                self.pending_full_redraw = true;
             }
         } else if let Some(gpu) = self.gpu.as_ref() {
             if extent_changed {

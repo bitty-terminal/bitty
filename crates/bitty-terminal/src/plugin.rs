@@ -640,7 +640,7 @@ pub fn parse_plugin_request(
                 None => {
                     return Err(PluginParseError::Usage(format!(
                         "bitty plugin: unknown verb {token:?} \
-                         (want list|install|remove|enable|disable|info|explain|revoke|grant|config|doctor)"
+                         (want list|install|remove|enable|disable|info|show-source|explain|revoke|grant|config|doctor)"
                     )));
                 }
             }
@@ -671,7 +671,7 @@ pub fn parse_plugin_request(
 
     let verb = verb.ok_or_else(|| {
         PluginParseError::Usage(
-            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|explain|revoke|grant|config|doctor)"
+            "bitty plugin: missing verb (want list|install|remove|enable|disable|info|show-source|explain|revoke|grant|config|doctor)"
                 .to_string(),
         )
     })?;

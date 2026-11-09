@@ -1263,9 +1263,12 @@ fn diff_text_lines(old: &str, new: &str) -> (usize, usize, Vec<String>, bool) {
 
 /// Build the bounded source preview of one update (bitty#2069).
 ///
-/// Compares the recorded installed tree against the staged module tree. A
-/// recorded root that is absolute (a `local-path` development checkout, not a
-/// store tree) or unreadable yields `digest_only`, never a false "no changes".
+/// Compares the recorded installed tree against the staged module tree. The
+/// recorded root is resolved through [`resolution::store_package_root`] — the
+/// same guard every other reader uses — so an absolute (`local-path`
+/// development checkout) root, a crafted `../..` root, or an unreadable tree
+/// yields `digest_only`, never a false "no changes" and never a read outside
+/// the plugin store.
 fn build_update_preview(
     store_root: &Path,
     record: &PluginRecord,
@@ -1280,11 +1283,10 @@ fn build_update_preview(
         omitted_files: 0,
         digest_only: true,
     };
-    let recorded_root = Path::new(&record.root);
-    if recorded_root.is_absolute() {
+    let Some(package_root) = resolution::store_package_root(store_root, record) else {
         return preview;
-    }
-    let previous_module_root = resolution::module_root_for(&store_root.join(recorded_root));
+    };
+    let previous_module_root = resolution::module_root_for(&package_root);
     let Some(old_tree) = read_preview_tree(&previous_module_root) else {
         return preview;
     };
@@ -3531,6 +3533,55 @@ mod tests {
                 .any(|line| line.starts_with('-') && line.contains("return \"hi\"")),
             "the removed line must be rendered: {:?}",
             file.lines
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A crafted `current.json` root that escapes the plugin store must never be
+    /// read for consent output: the preview falls back to `digest_only` instead
+    /// of rendering files the user never installed (bitty#2069 review D3).
+    #[test]
+    fn update_preview_falls_back_to_digest_only_for_escaping_record_root() {
+        let scratch = scratch("preview-escape");
+        let store = scratch.join("store");
+        std::fs::create_dir_all(store.join("packages/xuepoo.escape/1.0.0/lua"))
+            .expect("store tree");
+
+        // An outside tree the crafted root reaches through `..`, holding source
+        // the user never installed. The old `is_absolute`-only check would have
+        // rendered this into the consent preview.
+        let outside = scratch.join("outside");
+        std::fs::create_dir_all(outside.join("lua")).expect("outside tree");
+        std::fs::write(
+            outside.join("lua/init.lua"),
+            b"-- source outside the plugin store\nreturn {}\n",
+        )
+        .expect("outside lua");
+
+        let staged = scratch.join("staged");
+        std::fs::create_dir_all(staged.join("lua")).expect("staged tree");
+        std::fs::write(staged.join("lua/init.lua"), b"-- new body\nreturn {}\n")
+            .expect("staged lua");
+
+        let crafted = PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "xuepoo.escape".to_string(),
+            version: "1.0.0".to_string(),
+            root: "../outside".to_string(),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        };
+        let preview = build_update_preview(&store, &crafted, &staged, &"c".repeat(64));
+        assert!(
+            preview.digest_only,
+            "an escaping record root must fall back to digest_only"
+        );
+        assert!(
+            preview.files.is_empty(),
+            "nothing outside the store may be rendered: {:?}",
+            preview.files
         );
         let _ = std::fs::remove_dir_all(&scratch);
     }

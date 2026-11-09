@@ -194,6 +194,8 @@ cmd_run() {
   local entry suite pkg min log rc passed failed ignored status
   local failures=0 table
   table="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- $(printf '%q' "$table")" EXIT
   {
     printf '### Compat release matrix — `%s`\n\n' "$platform"
     printf '| Suite | Package | Result | Passed | Failed | Ignored |\n'
@@ -245,7 +247,8 @@ cmd_run() {
   if [ -n "$summary" ]; then
     cat "$table" >>"$summary"
   fi
-  rm -f "$table"
+  rm -f -- "$table"
+  trap - EXIT
   if ((failures > 0)); then
     printf 'compat-matrix: %s FAIL (%s/%s suites failed)\n' "$platform" "$failures" "$((${#COMPAT_SUITES[@]} + 1))" >&2
     return 1
@@ -277,6 +280,8 @@ cmd_aggregate() {
 
   local combined problems=""
   combined="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- $(printf '%q' "$combined")" EXIT
   local f
   for f in "$dir"/*.tsv; do
     [ -e "$f" ] || continue
@@ -369,7 +374,8 @@ cmd_aggregate() {
 	' "$combined")"
 
   printf '%s\n' "$table"
-  rm -f "$combined"
+  rm -f -- "$combined"
+  trap - EXIT
 
   if [ -n "$summary" ]; then
     printf '%s\n' "$table" >>"$summary"

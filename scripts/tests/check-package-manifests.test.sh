@@ -223,6 +223,12 @@ if [[ -x "$WINGET_GEN" ]]; then
     pass "winget generator rejects non-CDN base URL"
   fi
 
+  if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "$SETUP_SHA" --base-url "https://cdn.bitty.run/releases/v${VERSION}0" --output-dir "$TMP/rejected-prefix" >/dev/null 2>&1; then
+    fail "winget generator accepted version-prefix collision base URL"
+  else
+    pass "winget generator rejects version-prefix collision base URL"
+  fi
+
   if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "INVALID" >/dev/null 2>&1; then
     fail "winget generator accepted invalid sha256"
   else
@@ -311,6 +317,18 @@ if GOT="$("$VERIFIER" "file://$SIDE_CDN" "$INTEL_ASSET" "$TMP/dl-ok" 2>"$TMP/ok.
   fi
 else
   fail "verifier rejected a matching sidecar: $(tail -n 1 "$TMP/ok.err")"
+fi
+
+# When <dest-dir> is omitted, verify-cdn-sidecar.sh must remove its own mktemp
+# scratch directory on exit (bitty#3089).
+ISO_TMP="$TMP/iso-tmp"
+mkdir -p "$ISO_TMP"
+if GOT="$(TMPDIR="$ISO_TMP" "$VERIFIER" "file://$SIDE_CDN" "$INTEL_ASSET" 2>"$TMP/iso.err")" &&
+  [[ "$GOT" == "$SIDE_SHA" ]] &&
+  [[ -z "$(find "$ISO_TMP" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+  pass "verifier cleans up its default mktemp directory on exit"
+else
+  fail "verifier leaked its default mktemp directory in TMPDIR"
 fi
 
 # A digest of some other local file (the classic self-referential hash) must

@@ -82,11 +82,14 @@ fi
 
 if [[ -z "$BASE_URL" ]]; then
   BASE_URL="https://cdn.bitty.run/releases/v${VERSION}"
+else
+  BASE_URL="${BASE_URL%/}"
 fi
 
-# Ensure base URL matches expected CDN host
-if [[ "$BASE_URL" != "https://cdn.bitty.run/releases/v${VERSION}"* ]]; then
-  die "base URL must start with https://cdn.bitty.run/releases/v${VERSION}"
+# Ensure base URL matches expected CDN release path without prefix collision
+EXPECTED_BASE="https://cdn.bitty.run/releases/v${VERSION}"
+if [[ "$BASE_URL" != "$EXPECTED_BASE" && "$BASE_URL" != "${EXPECTED_BASE}/"* ]]; then
+  die "base URL must be ${EXPECTED_BASE} (or a subpath under it)"
 fi
 
 if [[ -z "$OUTPUT_DIR" ]]; then

@@ -405,8 +405,17 @@ pub(crate) mod fixture {
     /// Test-only plugin runtime over explicit discovery roots (no store, no
     /// backend: `open_store` serves `in_memory` with `data_dir: None`, and
     /// the version-mismatch path rolls back before any store work).
+    ///
+    /// The VM wall window is the documented harness window
+    /// (`crate::test_support::HARNESS_ACTIVATION_WALL_MS`, bitty#2781 /
+    /// bitty#2800), not the production RC-1 slice: these fixtures assert
+    /// capability wiring, and activation is slice-only, so one descheduled
+    /// 50 ms slice on a loaded test runner leaves a correct plugin inactive
+    /// with no resume signal that could recover it. Instruction and memory
+    /// budgets keep their production values; raising the VM wall budget to
+    /// 5,450 ms also raises `LuaVm::callback_ceiling_ms()` accordingly.
     pub(crate) fn runtime_for(third_party_roots: Vec<std::path::PathBuf>) -> PluginRuntime {
-        PluginRuntime::new(PluginRuntimeConfig {
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
             safe_mode: false,
             data_dir: None,
             store_root: None,
@@ -414,7 +423,9 @@ pub(crate) mod fixture {
             third_party_roots,
             settings: Rc::new(EmptySettings),
             snapshot: Rc::new(UnavailableSnapshot),
-        })
+        });
+        runtime.set_vm_wall_budget_ms(Some(crate::test_support::HARNESS_ACTIVATION_WALL_MS));
+        runtime
     }
 
     pub(crate) fn temp_dir(tag: &str) -> std::path::PathBuf {

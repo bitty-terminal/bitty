@@ -353,6 +353,12 @@ fn tighter_wall_and_memory_are_observed_by_the_vm() {
         "xuepoo.memory",
         Some(VmBudgets {
             memory_limit: 64 * 1024,
+            // The verdict under test is the memory ceiling, so the wall window
+            // must not decide it first: a loaded runner can spend >50 ms of
+            // wall clock on this allocation loop and suspend with
+            // `WallClockExceeded` before the heap ever crosses 64 KiB. Same
+            // widening as the instruction-budget case above.
+            wall_budget_ms: 60_000,
             ..VmBudgets::default()
         }),
     )

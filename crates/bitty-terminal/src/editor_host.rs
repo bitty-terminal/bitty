@@ -117,11 +117,26 @@ struct OpenError {
 }
 
 impl OpenError {
+    /// Byte cap for a loud warning. Big enough for a full OS error plus the
+    /// actionable tail, small enough that a hostile path cannot flood the log.
+    const WARNING_CAP: usize = 512;
+
+    /// Marker appended *inside* [`OpenError::WARNING_CAP`] when the input was
+    /// cut, so a reader can tell the message is incomplete instead of losing
+    /// the actionable tail silently (house precedent: `doctor::truncate`,
+    /// `crash_report::truncate`).
+    const TRUNCATION_MARKER: &str = "…";
+
     #[allow(dead_code)]
     fn warn(outcome: EditorOpenOutcome, warning: String) -> Self {
         let mut warning = warning;
-        if warning.len() > 512 {
-            warning.truncate(512);
+        if warning.len() > Self::WARNING_CAP {
+            let mut end = Self::WARNING_CAP - Self::TRUNCATION_MARKER.len();
+            while end > 0 && !warning.is_char_boundary(end) {
+                end -= 1;
+            }
+            warning.truncate(end);
+            warning.push_str(Self::TRUNCATION_MARKER);
         }
         Self { outcome, warning }
     }
@@ -616,4 +631,45 @@ impl TerminalApp {
 struct OpenedEditor {
     outcome: EditorOpenOutcome,
     program: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_error_warn_truncates_on_utf8_char_boundary_3075() {
+        // 511 ASCII bytes followed by a 3-byte UTF-8 character ('€') spans
+        // bytes 511..514, so the cap can only be honoured by cutting before
+        // the character.
+        let raw = format!("{}€trailing", "a".repeat(511));
+        assert!(!raw.is_char_boundary(512));
+        let err = OpenError::warn(EditorOpenOutcome::SpawnFailed, raw);
+        assert!(
+            err.warning.len() <= OpenError::WARNING_CAP,
+            "warning must stay inside the cap, got {}",
+            err.warning.len()
+        );
+        assert!(
+            err.warning.ends_with(OpenError::TRUNCATION_MARKER),
+            "a cut warning must say so, got {:?}",
+            err.warning
+        );
+        let (body, marker) = err
+            .warning
+            .split_at(err.warning.len() - OpenError::TRUNCATION_MARKER.len());
+        assert_eq!(marker, OpenError::TRUNCATION_MARKER);
+        assert!(body.chars().all(|c| c == 'a'), "got {body:?}");
+        assert_eq!(body.len(), 509, "marker is sized inside the cap");
+    }
+
+    #[test]
+    fn open_error_warn_keeps_a_short_warning_verbatim() {
+        // The marker only appears when something was actually cut.
+        let err = OpenError::warn(EditorOpenOutcome::SpawnFailed, "boom".to_string());
+        assert_eq!(err.warning, "boom");
+        let exact = "x".repeat(OpenError::WARNING_CAP);
+        let err = OpenError::warn(EditorOpenOutcome::SpawnFailed, exact.clone());
+        assert_eq!(err.warning, exact, "a warning at the cap is not truncated");
+    }
 }

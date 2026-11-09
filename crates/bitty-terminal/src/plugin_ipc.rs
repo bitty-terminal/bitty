@@ -184,29 +184,16 @@ fn unavailable(method: &str) -> HandlerError {
     )
 }
 
-/// Find the raw value span after a top-level `"key":` (caller decides shape).
-fn top_value_span<'a>(params: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let pos = params.find(needle.as_str())?;
-    let after_key = &params[pos + needle.len()..];
-    let colon = after_key.find(':')?;
-    Some(after_key[colon + 1..].trim_start())
-}
-
-/// Extract a top-level JSON string field with escape decoding; `None` when
-/// the key is absent or the value is not a JSON string.
-fn top_string(params: &str, key: &str) -> Option<String> {
-    let mut value = top_value_span(params, key)?;
-    if !value.starts_with('"') {
-        return None;
-    }
-    value = &value[1..];
+/// Decode one JSON string literal starting at byte 0 (`"`), returning the
+/// decoded string and the byte offset immediately after the closing quote.
+fn decode_json_string(raw: &str) -> Option<(String, usize)> {
+    let inner = raw.strip_prefix('"')?;
     let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
+    let mut chars = inner.char_indices();
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
+            '"' => return Some((out, 1 + idx + 1)),
+            '\\' => match chars.next()?.1 {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
                 '/' => out.push('/'),
@@ -221,7 +208,7 @@ fn top_string(params: &str, key: &str) -> Option<String> {
                     // smaller code point.
                     let mut code: u32 = 0;
                     for _ in 0..4 {
-                        code = code * 16 + chars.next()?.to_digit(16)?;
+                        code = code * 16 + chars.next()?.1.to_digit(16)?;
                     }
                     out.push(char::from_u32(code)?);
                 }
@@ -233,15 +220,147 @@ fn top_string(params: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Skip one raw JSON string literal starting at byte `start` (`"`), returning
+/// the byte index immediately after the closing `"`.
+fn skip_json_string(raw: &str, start: usize) -> Option<usize> {
+    let inner = raw.get(start..)?.strip_prefix('"')?;
+    let mut chars = inner.char_indices();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '"' => return Some(start + 1 + idx + 1),
+            '\\' => {
+                chars.next()?;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Outcome of a top-level object key lookup.
+///
+/// `Ambiguous` is not the same as `Absent`: callers that treat "absent" as
+/// "no filter" or "use the default" must fail closed on an ambiguous key
+/// rather than silently dropping the caller's restriction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopKey<'a> {
+    /// The key does not appear at the top level.
+    Absent,
+    /// The key appears exactly once; this is the raw value span after `:`
+    /// (caller decides the shape).
+    Value(&'a str),
+    /// The key appears more than once at the top level.
+    Ambiguous,
+}
+
+/// Find the raw value span after a top-level `"key":` in a JSON object.
+/// Quote- and depth-aware so keys embedded inside string values or nested
+/// containers never match.
+///
+/// Duplicate top-level `key` entries are reported as [`TopKey::Ambiguous`]
+/// instead of resolving to the first or last occurrence: the envelope is
+/// parsed upstream with last-wins semantics (`bitty-ipc-devtools` `json.rs`),
+/// so a params scanner that picked the first occurrence would hand two layers
+/// of the same request two different values.
+fn top_key<'a>(params: &'a str, key: &str) -> TopKey<'a> {
+    let Some(body) = params.trim().strip_prefix('{') else {
+        return TopKey::Absent;
+    };
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut expect_key = true;
+    let mut found: Option<&'a str> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                if depth == 0 && expect_key {
+                    let Some(end) = skip_json_string(body, i) else {
+                        return TopKey::Ambiguous;
+                    };
+                    // An undecodable key cannot match the current ASCII keys.
+                    let (decoded_key, consumed) =
+                        decode_json_string(&body[i..]).unwrap_or_else(|| (String::new(), end - i));
+                    let next = i + consumed;
+                    let after = body[next..].trim_start();
+                    if let Some(rest) = after.strip_prefix(':') {
+                        if decoded_key == key {
+                            if found.is_some() {
+                                return TopKey::Ambiguous;
+                            }
+                            found = Some(rest.trim_start());
+                        }
+                        expect_key = false;
+                        i = body.len() - rest.len();
+                        continue;
+                    }
+                    i = next;
+                } else {
+                    match skip_json_string(body, i) {
+                        Some(next) => i = next,
+                        None => return TopKey::Absent,
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                expect_key = true;
+                i += 1;
+            }
+            b':' if depth == 0 => {
+                expect_key = false;
+                i += 1;
+            }
+            _ => {
+                let Some(ch) = body[i..].chars().next() else {
+                    return TopKey::Absent;
+                };
+                i += ch.len_utf8();
+            }
+        }
+    }
+    match found {
+        Some(value) => TopKey::Value(value),
+        None => TopKey::Absent,
+    }
+}
+
+/// Extract a top-level JSON string field with escape decoding; `None` when
+/// the key is absent, ambiguous, or the value is not a JSON string.
+fn top_string(params: &str, key: &str) -> Option<String> {
+    match top_key(params, key) {
+        TopKey::Value(value) => decode_json_string(value).map(|(decoded, _)| decoded),
+        TopKey::Absent | TopKey::Ambiguous => None,
+    }
+}
+
+/// Whether `rest` begins at a top-level JSON value delimiter (end, whitespace,
+/// `,`, or `}`).
+fn at_json_delimiter(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '}')
+}
+
 /// Extract a top-level unsigned integer field; `None` for strings/objects/
-/// arrays/non-digits.
+/// arrays/non-digits/floats/exponents/ambiguous keys.
 fn top_uint(params: &str, key: &str) -> Option<u64> {
-    let value = top_value_span(params, key)?;
+    let TopKey::Value(value) = top_key(params, key) else {
+        return None;
+    };
     if value.starts_with('"') || value.starts_with('{') || value.starts_with('[') {
         return None;
     }
     let digits_len = value.bytes().take_while(u8::is_ascii_digit).count();
-    if digits_len == 0 || digits_len > 20 {
+    if digits_len == 0 || digits_len > 20 || !at_json_delimiter(&value[digits_len..]) {
         return None;
     }
     value[..digits_len].parse().ok()
@@ -249,7 +368,10 @@ fn top_uint(params: &str, key: &str) -> Option<u64> {
 
 /// Whether `params` carries an explicit JSON `null` for `key`.
 fn top_is_null(params: &str, key: &str) -> bool {
-    top_value_span(params, key).is_some_and(|value| value.starts_with("null"))
+    let TopKey::Value(value) = top_key(params, key) else {
+        return false;
+    };
+    value.strip_prefix("null").is_some_and(at_json_delimiter)
 }
 
 fn validate_plugin_id(raw: &str) -> Result<(), String> {
@@ -269,6 +391,10 @@ fn validate_generation(value: u64) -> Result<(), String> {
 }
 
 /// Parse the optional `generation` filter for `listPlugins`.
+///
+/// Every non-`null`, non-integer shape fails closed with `InvalidParams` — a
+/// duplicated key included, because treating an ambiguous key as "absent"
+/// would silently widen the listing the caller asked to narrow.
 fn list_generation(params: &str) -> Result<Option<u64>, HandlerError> {
     if !params.trim_start().starts_with('{') {
         return Err(HandlerError::new(
@@ -277,22 +403,30 @@ fn list_generation(params: &str) -> Result<Option<u64>, HandlerError> {
             "listPlugins requires an object params".to_string(),
         ));
     }
-    if top_is_null(params, "generation") {
-        return Ok(None);
-    }
-    if let Some(generation) = top_uint(params, "generation") {
-        validate_generation(generation)
-            .map_err(|reason| HandlerError::new("usage", "InvalidParams", reason))?;
-        return Ok(Some(generation));
-    }
-    if top_value_span(params, "generation").is_some() {
-        return Err(HandlerError::new(
+    let invalid = || {
+        HandlerError::new(
             "usage",
             "InvalidParams",
             "generation must be null or an integer >= 1".to_string(),
-        ));
+        )
+    };
+    match top_key(params, "generation") {
+        TopKey::Absent => Ok(None),
+        TopKey::Ambiguous => Err(invalid()),
+        TopKey::Value(_) => {
+            if top_is_null(params, "generation") {
+                return Ok(None);
+            }
+            match top_uint(params, "generation") {
+                Some(generation) => {
+                    validate_generation(generation)
+                        .map_err(|reason| HandlerError::new("usage", "InvalidParams", reason))?;
+                    Ok(Some(generation))
+                }
+                None => Err(invalid()),
+            }
+        }
     }
-    Ok(None)
 }
 
 /// Map the runtime's stable lowercase lifecycle label to the accepted
@@ -414,6 +548,63 @@ mod tests {
             manifest_hash: "a".repeat(64),
             capabilities: vec!["ui.rich".to_string()],
         }
+    }
+
+    #[test]
+    fn top_level_scanners_ignore_nested_and_duplicate_keys_3075() {
+        // A nested object carrying the same key names *before* the real
+        // top-level entries is the input a raw `params.find` reader gets
+        // wrong; it must not shadow them.
+        let nested = r#"{"outer":{"generation":99,"pluginId":"xuepoo.nested"},"generation":3,"pluginId":"xuepoo.one"}"#;
+        assert_eq!(super::top_uint(nested, "generation"), Some(3));
+        assert_eq!(
+            super::top_string(nested, "pluginId").as_deref(),
+            Some("xuepoo.one")
+        );
+        // A nested array is skipped just the same.
+        assert_eq!(
+            super::top_uint(r#"{"outer":["generation",5],"generation":2}"#, "generation"),
+            Some(2)
+        );
+        // A nested null is not a top-level null.
+        assert!(!super::top_is_null(
+            r#"{"outer":{"generation":null},"generation":1}"#,
+            "generation"
+        ));
+
+        // Duplicate top-level keys are refused rather than resolved
+        // first-wins: the envelope layer is last-wins, so two readers of one
+        // request must not disagree.
+        assert_eq!(
+            super::top_uint(r#"{"generation":1,"generation":2}"#, "generation"),
+            None
+        );
+        assert_eq!(
+            super::top_string(r#"{"pluginId":"a.b","pluginId":"c.d"}"#, "pluginId"),
+            None
+        );
+        assert!(!super::top_is_null(
+            r#"{"generation":null,"generation":null}"#,
+            "generation"
+        ));
+
+        // Null boundary: the literal `null` is a value, an identifier prefix
+        // is not.
+        assert!(super::top_is_null(r#"{"generation":null}"#, "generation"));
+        assert!(super::top_is_null(r#"{"generation": null }"#, "generation"));
+        assert!(!super::top_is_null(
+            r#"{"generation":nullable}"#,
+            "generation"
+        ));
+        assert!(!super::top_is_null(r#"{"generation":nulls}"#, "generation"));
+
+        // Numeric prefixes stay refused.
+        assert_eq!(super::top_uint(r#"{"generation":1.5}"#, "generation"), None);
+        assert_eq!(super::top_uint(r#"{"generation":1e2}"#, "generation"), None);
+        assert_eq!(
+            super::top_uint(r#"{"generation":1abc}"#, "generation"),
+            None
+        );
     }
 
     #[test]
@@ -592,6 +783,94 @@ mod tests {
             handle_get_plugin(&inspect, &unknown).expect("served"),
             "null"
         );
+
+        // bitty#3075: fractional/exponent generation numbers must fail closed
+        // as InvalidParams instead of truncating to their integer prefix, and
+        // keys inside string values must never shadow top-level params.
+        let float_gen = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":1.5}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &float_gen)
+                .expect_err("float generation")
+                .code,
+            "InvalidParams"
+        );
+        let shadowed = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"note":"\"pluginId\":\"xuepoo.absent\"","pluginId":"xuepoo.one"}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_get_plugin(&inspect, &shadowed)
+                .expect("served")
+                .contains("\"id\":\"xuepoo.one\"")
+        );
+
+        // bitty#3075: a nested object carrying the same key name must not
+        // shadow the real top-level one at the handler boundary either.
+        let nested_shadow = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"meta":{"pluginId":"xuepoo.absent"},"pluginId":"xuepoo.one"}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_get_plugin(&inspect, &nested_shadow)
+                .expect("served")
+                .contains("\"id\":\"xuepoo.one\"")
+        );
+
+        // `null` generation means "no filter"; an identifier prefix does not.
+        let null_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":null}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_list_plugins(&inspect, &null_generation)
+                .expect("null generation is no filter")
+                .contains("xuepoo.one")
+        );
+        let identifier_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":nullable}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &identifier_generation)
+                .expect_err("identifier generation")
+                .code,
+            "InvalidParams"
+        );
+
+        // Duplicate top-level params keys are ambiguous, so they fail closed
+        // instead of letting this scanner and the last-wins envelope parser
+        // read different values out of one request.
+        let duplicate_generation = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":1,"generation":2}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_list_plugins(&inspect, &duplicate_generation)
+                .expect_err("duplicate generation")
+                .code,
+            "InvalidParams"
+        );
+        let duplicate_plugin_id = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/getPlugin","version":"1.0","params":{"pluginId":"xuepoo.one","pluginId":"xuepoo.absent"}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_get_plugin(&inspect, &duplicate_plugin_id)
+                .expect_err("duplicate pluginId")
+                .code,
+            "InvalidParams"
+        );
         publish(None);
+    }
+
+    #[test]
+    fn top_key_skips_surrogate_pair_key_before_generation() {
+        assert_eq!(
+            list_generation(r#"{"\ud83d\ude00":1,"generation":2}"#).expect("generation"),
+            Some(2)
+        );
     }
 }

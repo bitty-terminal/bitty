@@ -1139,6 +1139,36 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
+                if out.config_word {
+                    out.config_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.init_word {
+                    out.init_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.doctor_word {
+                    out.doctor_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.upgrade_word {
+                    out.upgrade_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.show_font {
+                    if !program_set {
+                        out.program = Some(token.clone());
+                        program_set = true;
+                    } else {
+                        out.program_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
                 after_double_dash = true;
                 i += 1;
             }
@@ -1742,6 +1772,83 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
+                if out.config_word {
+                    // Verb may follow flags (`config --config X check`): take
+                    // the first bare token as the verb when none is set yet.
+                    if out.config_cmd.is_none() && out.config_args.is_empty() {
+                        if let Some(cmd) = ConfigCommand::parse(token) {
+                            out.config_cmd = Some(cmd);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    // Extra positionals in subcommand mode fail closed.
+                    out.config_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.init_word {
+                    // Extra positionals in init mode fail closed at dispatch.
+                    out.init_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.doctor_word {
+                    // Doctor takes no positionals: fail closed at dispatch.
+                    out.doctor_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.upgrade_word {
+                    // Upgrade takes no positionals: fail closed at dispatch.
+                    out.upgrade_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+                if out.list_word {
+                    // Kind is the first bare token after `list`; the rest
+                    // fail closed at dispatch (including stray `--`, which
+                    // was recorded above as a list arg).
+                    if out.list_kind.is_none() {
+                        // Allow `-h/--help` after `list` to flow to the
+                        // global help path (main shows list help when both
+                        // are set); any other flag-looking token was already
+                        // captured as a list arg above.
+                        out.list_kind = Some(token.clone());
+                    } else {
+                        out.list_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if out.inspect_word {
+                    // Target is the first bare token after `inspect`, value
+                    // the second; the rest fail closed at dispatch (including
+                    // stray `--`, which was recorded above as an inspect arg).
+                    if out.inspect_target.is_none() {
+                        // Allow `-h/--help` after `inspect` to flow to the
+                        // global help path (main shows inspect help when both
+                        // are set); any other flag-looking token was already
+                        // captured as an inspect arg above.
+                        out.inspect_target = Some(token.clone());
+                    } else if out.inspect_value.is_none() {
+                        out.inspect_value = Some(token.clone());
+                    } else {
+                        out.inspect_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if out.show_font {
+                    if !program_set {
+                        out.program = Some(token.clone());
+                        program_set = true;
+                    } else {
+                        out.program_args.push(token.clone());
+                    }
+                    i += 1;
+                    continue;
+                }
                 if !program_set
                     && !out.config_word
                     && !out.init_word
@@ -1842,21 +1949,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     }
                     continue;
                 }
-                if out.config_word {
-                    // Verb may follow flags (`config --config X check`): take
-                    // the first bare token as the verb when none is set yet.
-                    if out.config_cmd.is_none() && out.config_args.is_empty() {
-                        if let Some(cmd) = ConfigCommand::parse(token) {
-                            out.config_cmd = Some(cmd);
-                            i += 1;
-                            continue;
-                        }
-                    }
-                    // Extra positionals in subcommand mode fail closed.
-                    out.config_args.push(token.clone());
-                    i += 1;
-                    continue;
-                }
 
                 // Ghostty-style `+<action>` helper aliases (CTX-1467, issue
                 // #2464). Each alias maps onto the canonical `list`, `config`,
@@ -1933,12 +2025,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
-                if out.init_word {
-                    // Extra positionals in init mode fail closed at dispatch.
-                    out.init_args.push(token.clone());
-                    i += 1;
-                    continue;
-                }
                 // `bitty doctor` diagnosis (first positional only; CTX-0175).
                 // `--` escape hatch bypasses this via after_double_dash.
                 // A program literally named `doctor` needs `bitty -- doctor`.
@@ -1959,12 +2045,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && token == "doctor"
                 {
                     out.doctor_word = true;
-                    i += 1;
-                    continue;
-                }
-                if out.doctor_word {
-                    // Doctor takes no positionals: fail closed at dispatch.
-                    out.doctor_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -1995,12 +2075,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && token == "upgrade"
                 {
                     out.upgrade_word = true;
-                    i += 1;
-                    continue;
-                }
-                if out.upgrade_word {
-                    // Upgrade takes no positionals: fail closed at dispatch.
-                    out.upgrade_args.push(token.clone());
                     i += 1;
                     continue;
                 }
@@ -2057,22 +2131,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     i += 1;
                     continue;
                 }
-                if out.list_word {
-                    // Kind is the first bare token after `list`; the rest
-                    // fail closed at dispatch (including stray `--`, which
-                    // was recorded above as a list arg).
-                    if out.list_kind.is_none() {
-                        // Allow `-h/--help` after `list` to flow to the
-                        // global help path (main shows list help when both
-                        // are set); any other flag-looking token was already
-                        // captured as a list arg above.
-                        out.list_kind = Some(token.clone());
-                    } else {
-                        out.list_args.push(token.clone());
-                    }
-                    i += 1;
-                    continue;
-                }
                 // `bitty inspect <target> <value>` state and ownership (first
                 // positional only; CTX-0173). A program literally named
                 // `inspect` needs `bitty -- inspect ...` (or
@@ -2089,24 +2147,6 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     && token == "inspect"
                 {
                     out.inspect_word = true;
-                    i += 1;
-                    continue;
-                }
-                if out.inspect_word {
-                    // Target is the first bare token after `inspect`, value
-                    // the second; the rest fail closed at dispatch (including
-                    // stray `--`, which was recorded above as an inspect arg).
-                    if out.inspect_target.is_none() {
-                        // Allow `-h/--help` after `inspect` to flow to the
-                        // global help path (main shows inspect help when both
-                        // are set); any other flag-looking token was already
-                        // captured as an inspect arg above.
-                        out.inspect_target = Some(token.clone());
-                    } else if out.inspect_value.is_none() {
-                        out.inspect_value = Some(token.clone());
-                    } else {
-                        out.inspect_args.push(token.clone());
-                    }
                     i += 1;
                     continue;
                 }
@@ -2844,4 +2884,55 @@ pub(crate) fn help_help_text() -> String {
         help_valid_commands(),
         crate::version::version_semver(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    #[test]
+    fn loop_resident_subcommands_own_subsequent_subcommand_words_and_separators_3075() {
+        let p = parse_args(&argv(&["bitty", "upgrade", "help"]));
+        assert!(p.upgrade_word);
+        assert!(!p.help_word);
+        assert_eq!(p.upgrade_args, vec!["help".to_string()]);
+
+        let p = parse_args(&argv(&["bitty", "upgrade", "version"]));
+        assert!(p.upgrade_word);
+        assert!(!p.version_word);
+        assert_eq!(p.upgrade_args, vec!["version".to_string()]);
+
+        let p = parse_args(&argv(&["bitty", "doctor", "run"]));
+        assert!(p.doctor_word);
+        assert!(!p.run_word);
+        assert_eq!(p.doctor_args, vec!["run".to_string()]);
+
+        let p = parse_args(&argv(&["bitty", "init", "config"]));
+        assert!(p.init_word);
+        assert!(!p.config_word);
+        assert_eq!(p.init_args, vec!["config".to_string()]);
+
+        let p = parse_args(&argv(&["bitty", "doctor", "+show-font"]));
+        assert!(p.doctor_word);
+        assert!(!p.show_font);
+        assert_eq!(p.doctor_args, vec!["+show-font".to_string()]);
+
+        let p = parse_args(&argv(&["bitty", "+show-font", "doctor"]));
+        assert!(p.show_font);
+        assert!(!p.doctor_word);
+        assert_eq!(p.program.as_deref(), Some("doctor"));
+
+        let p = parse_args(&argv(&["bitty", "doctor", "--", "extra"]));
+        assert!(p.doctor_word);
+        assert_eq!(p.doctor_args, vec!["--".to_string(), "extra".to_string()]);
+        assert_eq!(p.program, None);
+
+        let p = parse_args(&argv(&["bitty", "upgrade", "--"]));
+        assert!(p.upgrade_word);
+        assert_eq!(p.upgrade_args, vec!["--".to_string()]);
+    }
 }

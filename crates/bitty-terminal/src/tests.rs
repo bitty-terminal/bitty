@@ -10155,10 +10155,40 @@ fn init_render_default_and_vim() {
     }
 }
 
+/// Parse a rendered template config, retrying only an RC-1 wall-clock
+/// suspension.
+///
+/// The configuration VM runs under the production 50 ms RC-1 slice, which
+/// bounds untrusted Lua; it is not a verdict on template validity. The VM
+/// charges *wall* time, so a test thread that is descheduled for one slice on a
+/// loaded runner turns a correct template into
+/// `suspended: WallClockExceeded` — the same hazard the activation probes
+/// answer with `test_support::HARNESS_ACTIVATION_WALL_MS`. The config path has
+/// no scoped seam yet, so this retries exactly that verdict a bounded number of
+/// times; every other error (including a genuine schema refusal) fails on the
+/// first attempt.
+fn parse_rendered_config(
+    text: &str,
+    source: &bitty_config::plan::ConfigSource,
+) -> Result<bitty_config::plan::ConfigPlan, bitty_config::ConfigError> {
+    let mut attempt = 0;
+    loop {
+        match bitty_config::file::parse_lua_config(text, source) {
+            Err(bitty_config::ConfigError::InvalidInput { message })
+                if attempt < 4 && message.contains("WallClockExceeded") =>
+            {
+                attempt += 1;
+                std::thread::yield_now();
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 #[test]
 fn init_rendered_config_parses_and_merges_to_effective() {
     use bitty_config::CloseConfirm;
-    use bitty_config::file::{CliOverrides, parse_lua_config, resolve_effective_full};
+    use bitty_config::file::{CliOverrides, resolve_effective_full};
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     // Every preset x shell combination must parse with values intact and
@@ -10179,7 +10209,7 @@ fn init_rendered_config_parses_and_merges_to_effective() {
                 ..init_yes_defaults(None)
             };
             let lua = render_init_lua(&answers);
-            let plan = parse_lua_config(&lua, &src).expect("wizard output parses");
+            let plan = parse_rendered_config(&lua, &src).expect("wizard output parses");
             assert_eq!(
                 plan.appearance.as_ref().unwrap().theme.as_deref(),
                 Some("dark")
@@ -10376,7 +10406,6 @@ fn generated_templates_are_nested_and_documented() {
 
 #[test]
 fn generated_commented_blocks_parse_when_uncommented() {
-    use bitty_config::file::parse_lua_config;
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let templates = [
@@ -10421,7 +10450,7 @@ fn generated_commented_blocks_parse_when_uncommented() {
             }
             let uncommented = uncomment_lua_block(&text, marker);
             assert_ne!(uncommented, text, "{name} uncomments {marker}");
-            parse_lua_config(&uncommented, &src).unwrap_or_else(|err| {
+            parse_rendered_config(&uncommented, &src).unwrap_or_else(|err| {
                 panic!("{name} {marker} block parses after uncommenting: {err}\n{uncommented}")
             });
         }

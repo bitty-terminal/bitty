@@ -3473,6 +3473,9 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
 #[test]
 #[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_non_executable_worker_program_is_an_exec_refusal_and_leaves_no_record() {
+    // The daemon allocates the PTY before `exec`: without a live allocation
+    // the refusal would be the PTY class instead of the `EACCES` class.
+    bitty_test_support::require_pty!();
     let root = TempRoot::new("worker-eacces");
     let daemon = Daemon::start(&root);
     let capability = read_capability(&root);

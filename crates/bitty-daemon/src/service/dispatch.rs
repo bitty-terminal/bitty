@@ -5785,6 +5785,9 @@ mod tests {
     fn an_exec_refusal_and_a_pty_allocation_failure_have_distinct_wire_classes() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        // Both halves need a live PTY: the `EACCES` class is only observable
+        // once the allocation succeeds and `exec` is the step that refuses.
+        bitty_test_support::require_pty!();
         let (mut service, _dir) = served_worker_service(Limits::default());
         let mut operator = operator_connection(&mut service);
 

@@ -95,3 +95,8 @@ bitty-winjob = { version = "0.0.37", path = "../bitty-winjob" }
 # 3.27.0 line is already in the workspace lockfile (through `proptest`), so
 # this adds no package version and stays out of the shipped daemon.
 tempfile = "3"
+# CTX-1778 (bitty#3095): the live-spawn tests that allocate a real PTY before
+# `exec` gate themselves with `require_pty!()` (the repo-wide pty-gate lint
+# contract). Workspace path crate, `publish = false`, no dependencies, and a
+# dev-only edge: the shipped `bittyd` graph is unchanged.
+bitty-test-support = { path = "../bitty-test-support" }

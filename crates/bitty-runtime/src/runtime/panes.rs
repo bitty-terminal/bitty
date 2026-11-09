@@ -1495,6 +1495,7 @@ mod tests {
         // resolved directory must be the child's kernel cwd. Revert proof: the
         // pre-fix resolver returned the report, so this assert sees `reported`
         // instead of `real` and fails.
+        bitty_test_support::require_pty!();
         let root = std::env::temp_dir().join(format!(
             "bitty-pane-truth-{}-{}",
             std::process::id(),

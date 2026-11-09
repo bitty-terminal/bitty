@@ -223,6 +223,7 @@ version = "0.0.37"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-core",
+ "bitty-test-support",
  "bitty-winjob",
  "getrandom 0.4.3",
  "libc",

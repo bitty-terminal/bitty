@@ -329,6 +329,7 @@ fn raw_osc7_pane_report_cannot_select_the_spawn_cwd() {
     // path. The child must still start in the real PTY child's directory.
     // Revert proof: the pre-fix resolver read the report, so the git toplevel
     // below is the reported repository instead of the real one.
+    bitty_test_support::require_pty!();
     let root = scratch("osc7-inert");
     let real = git_repo(&root.join("real"), "real", "real.txt");
     let reported = git_repo(&root.join("reported"), "reported", "reported.txt");

@@ -178,6 +178,21 @@ pub fn encode_key_event_with_terminal_modes(
                 }
                 return Some(vec![0x00]);
             }
+            // Issue #3096: match Ghostty/foot by encoding Shift+Enter and
+            // Ctrl+Enter (with optional Alt/Super) as `\x1b[27;<mod>;13~` even
+            // when neither Kitty keyboard protocol nor xterm modifyOtherKeys
+            // was negotiated, while keeping bare Enter as `\r` and pure
+            // Alt+Enter as `\x1b\r`.
+            if *named == NamedKey::Enter
+                && event.location != KeyLocation::Numpad
+                && (modifiers.shift || modifiers.control)
+            {
+                let mask = u8::from(modifiers.shift)
+                    | (u8::from(modifiers.alt) << 1)
+                    | (u8::from(modifiers.control) << 2)
+                    | (u8::from(modifiers.super_pressed) << 3);
+                return Some(format!("\x1b[27;{};13~", 1 + mask).into_bytes());
+            }
             if let Some(seq) = encode_named_key(*named, application_cursor_keys) {
                 if modifiers.alt {
                     return Some(esc_prefix(seq));
@@ -1667,6 +1682,68 @@ mod tests {
         assert_eq!(
             encode_key_event_with_modifiers(&char_event("x", Some("x")), &no_mods()),
             Some(b"x".to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_modified_enter_matches_ghostty_and_foot() {
+        // bitty#3096: a TUI that never negotiated the kitty keyboard protocol
+        // (`CSI > 1 u`) or xterm `modifyOtherKeys` (`CSI > 4 ; 2 m`) still
+        // needs to tell "insert newline" from "submit". Ghostty and foot
+        // encode Shift/Ctrl+Enter as xterm modifyOtherKeys `CSI 27;<mod>;13~`
+        // unconditionally, so bitty does the same. Bare Enter stays CR,
+        // Super+Enter stays CR (a compositor chord, not a terminal one), and
+        // pure Alt+Enter keeps xterm `metaSendsEscape` (ESC CR).
+        let shift_mods = ModifiersState {
+            shift: true,
+            ..ModifiersState::NONE
+        };
+        let shift_alt_mods = ModifiersState {
+            shift: true,
+            alt: true,
+            ..ModifiersState::NONE
+        };
+        let super_mods = ModifiersState {
+            super_pressed: true,
+            ..ModifiersState::NONE
+        };
+        let enter = make_named(NamedKey::Enter, None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &shift_mods),
+            Some(b"\x1b[27;2;13~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &ctrl_mods()),
+            Some(b"\x1b[27;5;13~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &shift_alt_mods),
+            Some(b"\x1b[27;4;13~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &no_mods()),
+            Some(b"\r".to_vec()),
+            "bare Enter must stay CR"
+        );
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &alt_mods()),
+            Some(b"\x1b\r".to_vec()),
+            "Alt+Enter keeps xterm metaSendsEscape"
+        );
+        assert_eq!(
+            encode_key_event_with_modifiers(&enter, &super_mods),
+            Some(b"\r".to_vec()),
+            "Super+Enter is a compositor chord and stays legacy CR"
+        );
+        // Numpad Enter is the keypad's Enter, not the modified main Enter.
+        let numpad_enter = KeyEvent {
+            location: KeyLocation::Numpad,
+            ..make_named(NamedKey::Enter, None, PressState::Pressed, false)
+        };
+        assert_eq!(
+            encode_key_event_with_modifiers(&numpad_enter, &shift_mods),
+            Some(b"\r".to_vec()),
+            "numpad Enter stays legacy CR"
         );
     }
 

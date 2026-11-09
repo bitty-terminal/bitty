@@ -196,8 +196,8 @@ fn legacy_modified_enter_never_confirms_and_keeps_identity() {
     // byte-for-byte, exactly once. (Alt+Enter is ESC-prefixed by xterm
     // metaSendsEscape semantics.)
     for (key, name, expected) in [
-        (NamedKey::Shift, "shift", &b"\r"[..]),
-        (NamedKey::Control, "ctrl", &b"\r"[..]),
+        (NamedKey::Shift, "shift", &b"\x1b[27;2;13~"[..]),
+        (NamedKey::Control, "ctrl", &b"\x1b[27;5;13~"[..]),
         (NamedKey::Alt, "alt", &b"\x1b\r"[..]),
         (NamedKey::Super, "super", &b"\r"[..]),
     ] {

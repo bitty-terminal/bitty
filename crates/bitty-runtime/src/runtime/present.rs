@@ -8131,8 +8131,6 @@ impl Runtime {
         self.hidden_repair_at = None;
         self.coalesced_pending = false;
         self.coalesced_deadline = None;
-        self.settle_input_at = None;
-        self.settle_burst_at = None;
         self.publish_presented_allocations(pending.allocations, pending.focused);
         self.scene_frame = pending.scene_report;
         self.last_presented_bands = pending.band_identity;
@@ -8507,6 +8505,8 @@ impl Runtime {
             // the loop until the ack.
             self.coalesced_pending = false;
             self.coalesced_deadline = None;
+            self.settle_input_at = None;
+            self.settle_burst_at = None;
             // Consume the corrective request only after the frame actually
             // reached the worker; a refused submit retains it with the damage.
             let corrective_repaint = std::mem::take(&mut self.forced_repaint_owed);

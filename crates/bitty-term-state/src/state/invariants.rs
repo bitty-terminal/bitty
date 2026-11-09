@@ -47,13 +47,6 @@ pub enum InvariantViolation {
         /// Region bottom row.
         region_bottom: u16,
     },
-    /// Invariant 3: cursor rests on a wide-character spacer half.
-    CursorOnSpacer {
-        /// Cursor row.
-        row: u16,
-        /// Cursor column.
-        col: u16,
-    },
     /// Invariant 2: trailing spacer without a wide leading half before it.
     OrphanSpacer {
         /// Spacer row.
@@ -224,16 +217,6 @@ impl State {
                 row: crow,
                 region_top: self.scroll_region_top,
                 region_bottom: self.scroll_region_bottom,
-            });
-        }
-        if self
-            .screens_active()
-            .get(crow as usize, ccol as usize)
-            .spacer
-        {
-            return Err(InvariantViolation::CursorOnSpacer {
-                row: crow,
-                col: ccol,
             });
         }
         let scrollback_cap = self.scrollback.max_lines();

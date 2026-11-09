@@ -40,12 +40,18 @@ pub enum WakeEvent {
 #[derive(Clone, Debug)]
 pub struct EventWaker {
     proxy: winit::event_loop::EventLoopProxy<WakeEvent>,
+    queued: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl EventWaker {
-    /// Wakes the loop with a PTY-readability signal (best-effort).
+    /// Wakes the loop with a PTY-readability signal (best-effort, coalesced).
     pub fn wake_pty(&self) {
-        let _ = self.proxy.send_event(WakeEvent::PtyReadable);
+        if !self.queued.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && self.proxy.send_event(WakeEvent::PtyReadable).is_err()
+        {
+            self.queued
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Alias for readability wakeup.
@@ -98,11 +104,13 @@ impl App {
         // Hand the cross-thread waker to the handler before the loop starts
         // so a PTY forwarder thread can wake on readability. Handlers that
         // ignore it keep the previous incidental-wakeup behavior.
+        let pty_wake_queued = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waker = EventWaker {
             proxy: event_loop.create_proxy(),
+            queued: Arc::clone(&pty_wake_queued),
         };
         handler.set_event_waker(waker);
-        let mut adapter = Adapter::new(handler);
+        let mut adapter = Adapter::new(handler, pty_wake_queued);
         event_loop
             .run_app(&mut adapter)
             .map_err(|error| PlatformError::EventLoopRun(error.to_string()))?;
@@ -779,6 +787,12 @@ struct OcclusionProbe {
     redraw_seen: bool,
     /// Whether the occluded edge is the currently delivered state.
     occluded: bool,
+    /// Whether the current occlusion came from a native `Occluded(true)`
+    /// delivery (e.g. Wayland xdg-shell v6 `suspended`). While natively
+    /// occluded, a queued `RedrawRequested` or `Resized` in the same winit
+    /// iteration must not synthesize a reveal before `Occluded(false)` or
+    /// `Focused(true)` arrives (bitty#3096).
+    native_occluded: bool,
 }
 
 /// Redraw starvation beyond this span names an occluded surface.
@@ -824,6 +838,7 @@ impl OcclusionProbe {
     /// imply that a redraw was delivered, so `redraw_seen` is left untouched.
     fn note_occluded_state(&mut self, occluded: bool) {
         self.occluded = occluded;
+        self.native_occluded = occluded;
         if !occluded {
             self.last_request = None;
         }
@@ -858,18 +873,29 @@ impl OcclusionProbe {
         if !self.occluded {
             return None;
         }
-        let reveals = match event {
-            winit::event::WindowEvent::RedrawRequested => {
-                self.note_redraw_delivered();
-                true
+        let reveals = if self.native_occluded {
+            // bitty#3096: when the compositor natively signaled `suspended`
+            // (`Occluded(true)`), winit can still emit `RedrawRequested` or
+            // `Resized` in the same iteration before the frame callback state
+            // transitions to `Requested`. Only a native `Occluded(false)` or
+            // explicit keyboard focus regain (`Focused(true)`) may clear a
+            // native occlusion.
+            matches!(event, winit::event::WindowEvent::Focused(true))
+        } else {
+            match event {
+                winit::event::WindowEvent::RedrawRequested => {
+                    self.note_redraw_delivered();
+                    true
+                }
+                winit::event::WindowEvent::Focused(true)
+                | winit::event::WindowEvent::Resized(_)
+                | winit::event::WindowEvent::ScaleFactorChanged { .. } => true,
+                _ => false,
             }
-            winit::event::WindowEvent::Focused(true)
-            | winit::event::WindowEvent::Resized(_)
-            | winit::event::WindowEvent::ScaleFactorChanged { .. } => true,
-            _ => false,
         };
         if reveals {
             self.occluded = false;
+            self.native_occluded = false;
             Some(false)
         } else {
             None
@@ -919,18 +945,22 @@ impl Registry {
 struct Adapter<H: AppHandler> {
     handler: H,
     registry: Registry,
+    pty_wake_queued: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<H: AppHandler> Adapter<H> {
-    fn new(handler: H) -> Self {
+    fn new(handler: H, pty_wake_queued: Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             handler,
             registry: Registry::default(),
+            pty_wake_queued,
         }
     }
 
     fn dispatch(&mut self, event_loop: &ActiveEventLoop, event: PlatformEvent) {
-        let Self { handler, registry } = self;
+        let Self {
+            handler, registry, ..
+        } = self;
         let mut ctx = EventContext {
             backend: EventContextBackend::Live {
                 event_loop,
@@ -984,6 +1014,8 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WakeEvent) {
         match event {
             WakeEvent::PtyReadable => {
+                self.pty_wake_queued
+                    .store(false, std::sync::atomic::Ordering::Release);
                 self.dispatch(event_loop, PlatformEvent::PtyReadable);
             }
         }

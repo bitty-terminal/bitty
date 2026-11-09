@@ -69,19 +69,7 @@ fn validate_uri_common(uri: &str, scheme: &str) -> Result<ValidatedUrl, Platform
     let forbidden = |byte| {
         matches!(
             byte,
-            b'\''
-                | b'"'
-                | b'`'
-                | b';'
-                | b'&'
-                | b'|'
-                | b'<'
-                | b'>'
-                | b'$'
-                | b'('
-                | b')'
-                | b'!'
-                | b'\\'
+            b'\'' | b'"' | b'`' | b';' | b'|' | b'<' | b'>' | b'$' | b'\\'
         )
     };
     let bytes = uri.as_bytes();
@@ -200,6 +188,7 @@ mod tests {
     fn supported_uri_corpus_is_accepted() {
         for uri in [
             "https://example.test/path?q=a%20b",
+            "https://example.test/search?a=1&b=2#section!(paren)",
             "http://127.0.0.1:8080/",
             "mailto:user@example.test",
         ] {
@@ -244,6 +233,7 @@ mod tests {
         assert!(is_local_file_url("file:///tmp/report.txt"));
         assert!(is_local_file_url("file:///tmp/report%2c1%5e2%5f3.txt"));
         assert!(validate_file_url("file:///tmp/report%2c1%5e2%5f3.txt").is_ok());
+        assert!(validate_file_url("file:///tmp/src/lib(test).rs#L10-L20").is_ok());
         for uri in [
             "file://attacker/share",
             "file://server/share",

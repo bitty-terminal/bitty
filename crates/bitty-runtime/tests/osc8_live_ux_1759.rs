@@ -460,3 +460,38 @@ fn ctrl_press_and_release_on_same_link_mints_singly() {
     );
     assert!(!rt.has_pending_hyperlink_activation());
 }
+
+#[test]
+fn hover_supports_local_file_osc8_links_and_wide_cells() {
+    let (mut rt, _) = runtime_with_recorder();
+    rt.handle_pty_bytes(
+        "\x1b]8;;file:///tmp/workspace/src/main.rs#L10-L20\x07源码\x1b]8;;\x07".as_bytes(),
+    );
+
+    // Leading wide cell (col 0) and trailing spacer cell (col 1) both resolve
+    // the local file URI, set CursorIcon::Pointer, and span cols 0..=3 ("源码" = 2 wide chars = 4 cols).
+    for col in [0u16, 1, 2, 3] {
+        let pos = container_cell_pixels(col, 0);
+        move_to(&mut rt, pos);
+        assert_eq!(
+            rt.hovered_hyperlink_uri(),
+            Some("file:///tmp/workspace/src/main.rs#L10-L20"),
+            "col {col} must resolve local file OSC 8 URI"
+        );
+        assert_eq!(
+            rt.hyperlink_cursor_icon(),
+            CursorIcon::Pointer,
+            "col {col} must set pointer cursor icon"
+        );
+        assert_eq!(
+            rt.hovered_hyperlink_preview().as_deref(),
+            Some("file:///tmp/workspace/src/main.rs#L10-L20"),
+            "col {col} must preview local file OSC 8 URI"
+        );
+        let span = rt
+            .hovered_hyperlink_span()
+            .expect("local file OSC 8 span must resolve");
+        assert_eq!(span.col_start, 0);
+        assert_eq!(span.col_end, 3);
+    }
+}

@@ -1217,10 +1217,9 @@ fn cursor_move_counts_columns_across_wide_spacers() {
 }
 
 #[test]
-fn cursor_move_snaps_off_a_spacer_without_extra_steps() {
-    // Landing on a trailing half snaps to its lead (invariant 3) but the
-    // requested count is never inflated: CUF 2 over a wide pair lands on the
-    // pair's lead, not two columns beyond it.
+fn cursor_move_addresses_exact_columns_across_wide_pairs() {
+    // Requested count is never inflated and consecutive BS bytes step one
+    // column at a time without double-stepping across wide spacer cells.
     let mut s = State::new();
     prints(&mut s, "中中");
     s.apply(&TerminalAction::CursorPosition {
@@ -1233,19 +1232,18 @@ fn cursor_move_snaps_off_a_spacer_without_extra_steps() {
     });
     // Target column 2 is the second pair's lead: exact.
     assert_eq!(s.cursor().position.col, 2);
-    s.apply(&TerminalAction::CursorMove {
-        dir: Direction::Right,
-        n: Count(1),
-    });
-    // Target column 3 is its spacer: snap back to the lead at 2.
-    assert_eq!(s.cursor().position.col, 2);
-    s.apply(&TerminalAction::CursorMove {
-        dir: Direction::Left,
-        n: Count(1),
-    });
-    // Target column 1 is the first pair's spacer: snap to the lead at 0.
-    assert_eq!(s.cursor().position.col, 0);
-    assert!(s.check_invariants().is_ok());
+
+    // Issue #3096: two consecutive 0x08 (BS) bytes after printing four CJK
+    // characters (columns 0..8) must land on column 6 (the last CJK character's
+    // leading cell), not column 4 (the second-to-last CJK character).
+    let mut s2 = State::new();
+    prints(&mut s2, "你好世界");
+    assert_eq!(s2.cursor().position.col, 8);
+    s2.apply(&TerminalAction::PrintControl(ControlChar(0x08)));
+    assert_eq!(s2.cursor().position.col, 7);
+    s2.apply(&TerminalAction::PrintControl(ControlChar(0x08)));
+    assert_eq!(s2.cursor().position.col, 6);
+    assert!(s2.check_invariants().is_ok());
 }
 
 #[test]
@@ -1267,8 +1265,8 @@ fn ctx_0205_large_cursor_left_stops_at_zero() {
 
 #[test]
 fn ctx_0205_wide_pair_at_margin_right_is_stable() {
-    // A wide pair ending at the last column is the Right fixed point:
-    // stepping right returns to the leading half and must terminate.
+    // A wide pair ending at the last column: stepping right to u16::MAX clamps
+    // at the right margin (`GRID_COLUMNS - 1`) and terminates cleanly (#3096).
     let mut s = State::new();
     prints(&mut s, &"a".repeat(GRID_COLUMNS - 2));
     prints(&mut s, "中");
@@ -1281,7 +1279,7 @@ fn ctx_0205_wide_pair_at_margin_right_is_stable() {
         dir: Direction::Right,
         n: Count(u16::MAX),
     });
-    assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 2);
+    assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
     assert!(s.check_invariants().is_ok());
 }
 

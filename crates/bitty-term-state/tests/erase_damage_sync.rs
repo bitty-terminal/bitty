@@ -163,19 +163,18 @@ fn print_over_wide_spacer_damages_correct_row_and_cleared_lead() {
     set_cursor(&mut state, 5, 10);
     print_str(&mut state, "中");
 
-    // Move cursor to col 11 (the spacer half, 0-based col 10)
-    // Invariant 1 steps the cursor back to the leading half at col 9.
+    // Move cursor to col 11 (the spacer half, 0-based col 10).
     set_cursor(&mut state, 5, 11);
 
-    // Print ASCII 'x' over the leading half; the trailing spacer at col 10 must be blanked
+    // Print ASCII 'x' over the spacer half; the leading half at col 9 must be blanked.
     let damage = state.apply(&TerminalAction::Print(GraphemeCell::from('x')));
 
-    // Row 4 (0-based) col 9 has 'x', col 10 was the trailing spacer and must be blanked
-    assert_eq!(get_cell(&state, 4, 9).glyph, 'x');
+    // Row 4 (0-based) col 9 was the leading half and must be blanked; col 10 has 'x'.
     assert!(
-        get_cell(&state, 4, 10).is_blank(),
-        "trailing spacer at col 10 must be blanked"
+        get_cell(&state, 4, 9).is_blank(),
+        "leading half at col 9 must be blanked"
     );
+    assert_eq!(get_cell(&state, 4, 10).glyph, 'x');
 
     // The damaged rect must cover row 4 cols 9..=10, NOT row 10!
     let covers_row4_and_spacer = damage.regions.iter().any(|r| match r {

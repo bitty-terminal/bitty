@@ -88,12 +88,11 @@ fn ich_left_of_wide_pair_pushes_the_following_tail() {
 }
 
 #[test]
-fn cursor_on_spacer_snaps_to_the_lead_then_ich_shifts_the_pair() {
-    // Invariant 3: the cursor never rests on a spacer half, so `CSI 1;2H`
-    // over the pair's trailing half normalizes onto the lead at col 0. ICH
-    // there moves both halves together. The split-pair path (ICH at a cell
-    // the cursor cannot occupy) is exercised directly in the `grid` unit
-    // tests.
+fn cursor_on_spacer_splits_the_wide_pair_on_ich() {
+    // `CSI 1;2H` places the cursor on 1-based col 2 (0-based col 1, the
+    // trailing spacer half of '中'). ICH at a spacer cell clears both halves
+    // of the split wide pair before shifting the tail right, preserving
+    // wide-pair integrity across the row.
     let mut state = State::new();
     state.resize(20, 3);
 
@@ -101,12 +100,18 @@ fn cursor_on_spacer_snaps_to_the_lead_then_ich_shifts_the_pair() {
     // 1-based col 2 is the spacer half of the pair.
     feed(&mut state, b"\x1b[1;2H\x1b[1@");
 
-    assert!(cell(&state, 0, 0).is_blank(), "inserted column is blank");
-    assert_eq!(cell(&state, 0, 1).glyph, '中', "pair shifts one right");
-    assert!(cell(&state, 0, 2).spacer, "spacer travels with its lead");
+    assert!(
+        cell(&state, 0, 0).is_blank(),
+        "split leading half is cleared"
+    );
+    assert!(cell(&state, 0, 1).is_blank(), "inserted column is blank");
+    assert!(
+        cell(&state, 0, 2).is_blank(),
+        "shifted cleared spacer is blank"
+    );
     assert_eq!(cell(&state, 0, 3).glyph, 'a');
     assert_eq!(cell(&state, 0, 4).glyph, 'b');
-    assert_pairs_intact(&state, 0, "ICH after a spacer snap");
+    assert_pairs_intact(&state, 0, "ICH on a spacer cell");
 }
 
 #[test]

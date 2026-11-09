@@ -201,9 +201,12 @@ fn cursor_before_a_wide_glyph_paints_at_that_glyphs_column() {
     );
 
     // The reported geometry is the continuation-cell input: CUP column 24 is
-    // 0-based cell 23, 头's trailing half. Terminal Truth normalizes it to
-    // 头's lead, so the block paints 头. This is why the live report needs
-    // the column the application actually sent before any paint change.
+    // 0-based cell 23, 头's trailing half. bitty#3096: Terminal Truth keeps
+    // that exact column (relative movement counts columns one-for-one across
+    // wide pairs, so `BS BS` after a CJK line steps two columns, not four),
+    // and presentation resolves the trailing coordinate onto the pair's lead
+    // (`normalize_cursor_cell`) so the block still paints the whole 头
+    // grapheme instead of a half-cell caret on its right half.
     let mut rt = make_runtime();
     rt.handle_pty_bytes(PROMPT.as_bytes());
     rt.tick().expect("first frame");
@@ -211,8 +214,21 @@ fn cursor_before_a_wide_glyph_paints_at_that_glyphs_column() {
     rt.tick().expect("continuation-cursor frame");
     assert_eq!(
         rt.snapshot().cursor.position.col,
-        USE_COL - 2,
-        "a continuation-cell column steps back to the wide glyph's lead"
+        USE_COL - 1,
+        "a continuation-cell column stays on the column the terminal received"
+    );
+    let visible = rt.headless_rgba().expect("visible-cursor pixels");
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    rt.tick().expect("hidden-cursor frame");
+    let hidden = rt.headless_rgba().expect("hidden-cursor pixels");
+    let (min, max) = changed_columns(&visible, &hidden, width);
+    assert_eq!(
+        (min, max),
+        (
+            origin + usize::from(USE_COL - 2) * cell_width,
+            origin + usize::from(USE_COL) * cell_width - 1,
+        ),
+        "a caret on a continuation cell paints the wide glyph's two cells"
     );
 }
 

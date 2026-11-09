@@ -1,9 +1,10 @@
 //! Cursor position and saved-cursor state.
 //!
-//! RFC "Grid and state invariants", invariant 3 "Cursor integrity": the
-//! cursor always addresses a leading cell and never the trailing half of a
-//! wide character. The snap rule lives in terminal state; this module holds
-//! the data.
+//! RFC "Grid and state invariants": the cursor column addresses an exact grid
+//! column, including the trailing half of a wide character. Relative movement
+//! (`BS`, `CUB`, `CUF`) therefore counts columns one-for-one across wide pairs
+//! (bitty#3096); presentation resolves a trailing coordinate onto the pair's
+//! leading cell so the painted caret still covers the whole grapheme.
 
 use crate::cell::Style;
 use crate::charsets::Charsets;

@@ -4527,7 +4527,7 @@ mod tests {
         );
         let rendered = render_report(&report);
         assert!(
-            rendered.contains("tick-ring: capacity=16 missed_at_most=4 seq=1..4"),
+            rendered.contains("tick-ring: capacity=256 missed_at_most=4 seq=1..4"),
             "{rendered}"
         );
     }
@@ -4562,7 +4562,7 @@ mod tests {
         );
         let rendered = render_report(&report);
         assert!(
-            rendered.contains("tick-ring: capacity=16 missed_at_most=10 seq=3..12"),
+            rendered.contains("tick-ring: capacity=256 missed_at_most=10 seq=3..12"),
             "{rendered}"
         );
     }
@@ -4683,7 +4683,7 @@ mod tests {
             .expect("a ring gap must be delivered without a stall report");
         assert!(line.starts_with(STALL_REPORT_PREFIX), "{line}");
         assert!(line.contains("completed-tick ring gap"), "{line}");
-        assert!(line.contains("capacity=16"), "{line}");
+        assert!(line.contains("capacity=256"), "{line}");
         assert!(line.contains("missed_at_most=4"), "{line}");
         assert!(line.contains("seq=1..4"), "{line}");
         assert!(line.contains("phase=idle"), "{line}");

@@ -5372,7 +5372,20 @@ impl TerminalApp {
                         // repair probe asked for this frame. The compositor
                         // serving it proves the surface is mapped again even
                         // when the reveal edge itself never arrived.
-                        if self.hidden_repair_probe_at.is_some()
+                        //
+                        // bitty#3096: on Wayland, winit dispatches a queued
+                        // `RedrawRequested` in the same iteration right after
+                        // `Occluded(true)` when no frame callback is pending.
+                        // Do not treat `RedrawRequested` as a repair reveal
+                        // while the platform occlusion probe still reports the
+                        // surface as occluded.
+                        let surface_occluded = self
+                            .window
+                            .handle
+                            .as_ref()
+                            .is_some_and(|win| win.occlusion_snapshot().occluded);
+                        if !surface_occluded
+                            && self.hidden_repair_probe_at.is_some()
                             && self.apply_hidden_repair_probe(true, std::time::Instant::now())
                         {
                             crate::logging::info(|| {

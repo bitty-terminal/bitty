@@ -156,6 +156,8 @@ impl PanelLifecycle {
                 | (Self::Focused, Self::Suspended)
                 | (Self::Suspended, Self::Mounted)
                 | (Self::Closed, Self::Mounted)
+                | (Self::Created, Self::Disposed)
+                | (Self::Focused, Self::Disposed)
                 | (Self::Suspended, Self::Disposed)
                 | (Self::Closed, Self::Disposed)
                 | (Self::Mounted, Self::Disposed)
@@ -692,6 +694,36 @@ mod tests {
         s.set_lifecycle(PanelLifecycle::Mounted).unwrap();
         s.set_lifecycle(PanelLifecycle::Disposed).unwrap();
         assert_eq!(s.close(), Err(PanelStateError::AlreadyDisposed));
+    }
+
+    /// OQ-084 C.8: a `Created` panel that never mounted can still be disposed
+    /// (a rolled-back create or a container retired before its first mount).
+    #[test]
+    fn created_disposes_without_a_mount() {
+        assert!(PanelLifecycle::can_transition(
+            PanelLifecycle::Created,
+            PanelLifecycle::Disposed
+        ));
+        let mut s = state();
+        s.set_lifecycle(PanelLifecycle::Created).unwrap();
+        s.set_lifecycle(PanelLifecycle::Disposed).unwrap();
+        assert_eq!(s.lifecycle(), PanelLifecycle::Disposed);
+    }
+
+    /// OQ-084 C.8: a focused panel is disposed directly, without first
+    /// unfocusing or suspending it.
+    #[test]
+    fn focused_disposes_directly() {
+        assert!(PanelLifecycle::can_transition(
+            PanelLifecycle::Focused,
+            PanelLifecycle::Disposed
+        ));
+        let mut s = state();
+        s.set_lifecycle(PanelLifecycle::Created).unwrap();
+        s.set_lifecycle(PanelLifecycle::Mounted).unwrap();
+        s.focus_panel().unwrap();
+        s.set_lifecycle(PanelLifecycle::Disposed).unwrap();
+        assert_eq!(s.lifecycle(), PanelLifecycle::Disposed);
     }
 
     #[test]

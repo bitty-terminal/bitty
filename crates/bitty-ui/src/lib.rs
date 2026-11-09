@@ -269,9 +269,9 @@ pub use panel_lua::{
     lookup_command, validate_spellings,
 };
 pub use panel_persist::{
-    MAX_MANIFEST_LINE_LEN, MAX_PERSIST_PANELS, ManifestError, PERSIST_MANIFEST_VERSION,
-    PersistedPanel, PersistencePolicy, RestartManifest, decode_manifest, encode_manifest,
-    plan_restore,
+    MAX_MANIFEST_LINE_LEN, MAX_PERSIST_PANELS, MAX_PERSISTENT_ID_LEN, ManifestError,
+    PERSIST_MANIFEST_VERSION, PanelRestoreKey, PersistedPanel, PersistencePolicy, PersistentId,
+    RestartManifest, decode_manifest, encode_manifest, plan_restore,
 };
 pub use panel_rehydrate::{
     MAX_RECORD_LEN, MAX_SNAPSHOT_PANELS, PanelRecord, RehydrateError, RehydrateReport,

@@ -172,6 +172,7 @@ impl Scrollback {
         let removed = self.lines.len() as u64;
         let first = self.lines.front().map_or(0, |l| l.id);
         self.lines.clear();
+        self.lines.shrink_to(0);
         ClearedRange {
             first_line_id: first,
             removed_count: removed,
@@ -301,10 +302,16 @@ mod tests {
         let mut sb = Scrollback::new();
         sb.push(blank_row(1));
         sb.push(blank_row(1));
+        assert!(sb.heap_bytes() > 0);
         let cleared = sb.clear();
         assert_eq!(cleared.first_line_id, 0);
         assert_eq!(cleared.removed_count, 2);
         assert!(sb.is_empty());
+        assert_eq!(
+            sb.heap_bytes(),
+            0,
+            "clear must release ring-buffer capacity"
+        );
         // Ids keep increasing after a clear.
         assert_eq!(sb.push(blank_row(1)).0, 2);
     }

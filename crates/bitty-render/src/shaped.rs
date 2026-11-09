@@ -240,6 +240,11 @@ pub struct SwashSingle {
     /// The [`GlyphRasterizer::load_font`](crate::glyph::GlyphRasterizer::load_font)
     /// contract allows returning the same handle for a repeated query.
     by_db_id: HashMap<fontdb::ID, FontId>,
+    /// File path to weak font-byte allocation (bitty#3099): multi-face
+    /// `.ttc` collections (e.g. `NotoSerifCJK`, `mingliub.ttc`) share a single
+    /// `Arc<Vec<u8>>` across every loaded face index instead of duplicating
+    /// 25-37 MB buffers per index, while unretained probe reads drop immediately.
+    by_file_path: HashMap<std::path::PathBuf, std::sync::Weak<Vec<u8>>>,
     /// Per-scalar dynamic-fallback outcome cache (CTX-0961): `Some(face)`
     /// when a system face beyond the pinned chain covers the scalar,
     /// `None` when no system face does (cacheable tofu). Populated on
@@ -349,6 +354,7 @@ impl SwashSingle {
             db,
             faces: HashMap::new(),
             by_db_id: HashMap::new(),
+            by_file_path: HashMap::new(),
             dynamic_cache: HashMap::new(),
             dynamic_faces: HashSet::new(),
             scale_ctx: swash::scale::ScaleContext::new(),
@@ -473,14 +479,17 @@ impl SwashSingle {
     /// Loads one face's bytes, bounded by [`MAX_FACE_BYTES`].
     ///
     /// `Binary` sources are already in memory (cloned once per face load).
-    /// `File` sources stream through `take(bound + 1)` so a concurrently
-    /// growing file cannot slip past the bound (no metadata/read TOCTOU).
-    fn load_bytes(&self, id: fontdb::ID) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
+    /// `File` sources reuse an existing `Arc<Vec<u8>>` when another face
+    /// index from the same `.ttc`/`.otf`/`.ttf` file is already live in this
+    /// session, and otherwise stream through `take(bound + 1)` with a
+    /// metadata-sized buffer so `read_to_end` does not churn intermediate
+    /// heap reallocations.
+    fn load_bytes(&mut self, id: fontdb::ID) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
         let (source, index) = self
             .db
             .face_source(id)
             .ok_or_else(|| RenderError::FontNotFound("face vanished".to_string()))?;
-        let bytes = match source {
+        match source {
             Source::Binary(arc) => {
                 let bytes: &[u8] = arc.as_ref().as_ref();
                 if bytes.len() > MAX_FACE_BYTES {
@@ -488,13 +497,25 @@ impl SwashSingle {
                         reason: "font face exceeds the per-face byte bound",
                     });
                 }
-                bytes.to_vec()
+                Ok((Arc::new(bytes.to_vec()), index))
             }
             Source::File(path) => {
+                if let Some(existing) = self
+                    .by_file_path
+                    .get(&path)
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    return Ok((existing, index));
+                }
                 use std::io::Read as _;
                 let file = std::fs::File::open(&path).map_err(RenderError::flatten_rasterizer)?;
+                let cap = file
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| usize::try_from(meta.len()).ok())
+                    .map_or(0, |len| len.min(MAX_FACE_BYTES));
                 let mut bounded = file.take(MAX_FACE_BYTES as u64 + 1);
-                let mut bytes = Vec::new();
+                let mut bytes = Vec::with_capacity(cap);
                 bounded
                     .read_to_end(&mut bytes)
                     .map_err(RenderError::flatten_rasterizer)?;
@@ -503,10 +524,12 @@ impl SwashSingle {
                         reason: "font face exceeds the per-face byte bound",
                     });
                 }
-                bytes
+                bytes.shrink_to_fit();
+                let arc = Arc::new(bytes);
+                self.by_file_path.insert(path, Arc::downgrade(&arc));
+                Ok((arc, index))
             }
-        };
-        Ok((Arc::new(bytes), index))
+        }
     }
 
     /// Parses a stored face into a borrowed `swash` font reference.
@@ -928,6 +951,12 @@ impl SwashSingle {
             candidates.push((family, face.post_script_name.clone(), face.index, face.id));
         }
         candidates.sort();
+        // Hold the most recently read file buffer across adjacent collection
+        // faces (e.g. `NotoSerifCJK-*.ttc` indices 0..4 or `mingliub.ttc`
+        // indices 0..3) so `load_bytes` upgrades the `Weak` in `by_file_path`
+        // instead of re-reading 25-37 MB from disk for each index.
+        let mut last_scanned_data: Option<Arc<Vec<u8>>> = None;
+        let mut matched = None;
         for (_, _, _, id) in candidates {
             if self.faces.len() >= MAX_LOADED_FACES
                 || self.dynamic_face_count() >= MAX_DYNAMIC_FALLBACK_FACES
@@ -938,6 +967,7 @@ impl SwashSingle {
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
+            last_scanned_data = Some(Arc::clone(&data));
             let stored = StoredFace {
                 data,
                 face_index,
@@ -963,9 +993,12 @@ impl SwashSingle {
             self.faces.insert(font, stored);
             self.by_db_id.insert(id, font);
             self.dynamic_faces.insert(font);
-            return Some(font);
+            matched = Some(font);
+            break;
         }
-        None
+        drop(last_scanned_data);
+        self.by_file_path.retain(|_, weak| weak.strong_count() > 0);
+        matched
     }
 
     /// Rasterizes one shaped glyph by id (ligature spans, CJK tails).
@@ -3167,5 +3200,48 @@ mod tests {
             !finalized[2].ligature_part && !finalized[3].ligature_part,
             "clusters outside the scaffold span must stay unmarked"
         );
+    }
+
+    #[test]
+    fn load_bytes_reuses_arc_for_faces_sharing_a_font_file_3099() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-font-dedup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let font_path = dir.join("shared.ttf");
+        std::fs::write(&font_path, demo_ttf()).expect("write demo ttf");
+
+        let mut db = Database::new();
+        for index in [0, 1] {
+            db.push_face_info(fontdb::FaceInfo {
+                id: fontdb::ID::dummy(),
+                source: Source::File(font_path.clone()),
+                index,
+                families: vec![(
+                    format!("Demo {index}"),
+                    fontdb::Language::English_UnitedStates,
+                )],
+                post_script_name: format!("Demo-{index}"),
+                style: Style::Normal,
+                weight: Weight::NORMAL,
+                stretch: fontdb::Stretch::Normal,
+                monospaced: true,
+            });
+        }
+        let ids: Vec<fontdb::ID> = db.faces().map(|f| f.id).collect();
+        assert_eq!(ids.len(), 2);
+
+        let mut shaper = SwashSingle::with_database(Arc::new(db));
+        let (first_bytes, _) = shaper.load_bytes(ids[0]).expect("load first");
+        let (second_bytes, _) = shaper.load_bytes(ids[1]).expect("load second");
+        assert!(
+            Arc::ptr_eq(&first_bytes, &second_bytes),
+            "faces backed by the same file path must share one Arc<Vec<u8>> allocation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

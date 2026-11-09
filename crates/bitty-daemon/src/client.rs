@@ -130,7 +130,7 @@ pub fn stop(mode: StopMode) -> Result<StopReply, StopError> {
     #[cfg(not(unix))]
     {
         let _ = mode;
-        return Err(StopError::UnsupportedPlatform);
+        Err(StopError::UnsupportedPlatform)
     }
     #[cfg(unix)]
     {

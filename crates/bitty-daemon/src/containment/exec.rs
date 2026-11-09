@@ -40,11 +40,28 @@ impl ExecRefusalKind {
         }
     }
 
+    /// Classify a Windows `CreateProcessW` OS error code, or `None` when the
+    /// code is not an executable-launch refusal.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn from_errno(errno: i32) -> Option<Self> {
+        // Win32 error codes from `winerror.h`:
+        // - 2 (`ERROR_FILE_NOT_FOUND`), 3 (`ERROR_PATH_NOT_FOUND`),
+        //   267 (`ERROR_DIRECTORY`): missing executable or path component.
+        // - 5 (`ERROR_ACCESS_DENIED`): file or directory access denied.
+        // - 191 (`ERROR_INVALID_EXE_SIGNATURE`), 192 (`ERROR_EXE_MARKED_INVALID`),
+        //   193 (`ERROR_BAD_EXE_FORMAT`), 216 (`ERROR_EXE_MACHINE_TYPE_MISMATCH`):
+        //   not a valid executable image for this cell.
+        match errno {
+            5 => Some(Self::NotPermitted),
+            191..=193 | 216 => Some(Self::NotExecutable),
+            2 | 3 | 267 => Some(Self::NotFound),
+            _ => None,
+        }
+    }
+
     /// Classify an `exec` errno, or `None` when `exec` does not report it.
-    ///
-    /// A Windows cell never reaches an `exec` refusal: the spawn path answers
-    /// the typed `UnsupportedCapability` instead, so no errno class applies.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     #[must_use]
     pub fn from_errno(_errno: i32) -> Option<Self> {
         None
@@ -154,6 +171,40 @@ mod tests {
         assert_eq!(
             ExecRefusal::new(ExecRefusalKind::NotFound, nix::libc::ENOENT).to_string(),
             "exec refused the program: not_found (errno 2)"
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_create_process_errors_are_classified_and_others_are_not() {
+        for (code, kind) in [
+            (2, ExecRefusalKind::NotFound),
+            (3, ExecRefusalKind::NotFound),
+            (267, ExecRefusalKind::NotFound),
+            (5, ExecRefusalKind::NotPermitted),
+            (191, ExecRefusalKind::NotExecutable),
+            (192, ExecRefusalKind::NotExecutable),
+            (193, ExecRefusalKind::NotExecutable),
+            (216, ExecRefusalKind::NotExecutable),
+        ] {
+            let refusal = ExecRefusal::from_spawn_error(&io::Error::from_raw_os_error(code))
+                .expect("a CreateProcessW exec error is classified");
+            assert_eq!(refusal.kind(), kind);
+            assert_eq!(refusal.errno(), code);
+        }
+        for code in [8, 87, 109] {
+            assert!(
+                ExecRefusal::from_spawn_error(&io::Error::from_raw_os_error(code)).is_none(),
+                "Win32 error {code} is not an exec refusal"
+            );
+        }
+        assert!(
+            ExecRefusal::from_spawn_error(&io::Error::from(io::ErrorKind::NotFound)).is_none(),
+            "a synthetic error carries no OS error code to classify"
         );
     }
 }

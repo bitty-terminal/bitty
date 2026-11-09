@@ -101,11 +101,16 @@
 //!   [`orphan::OrphanReaper`] seam (`D-06`).
 //! - [`containment`]: the typed platform probes and plans — Linux cgroup v2
 //!   with the `PR_SET_CHILD_SUBREAPER` fallback, the Windows kill-on-close job
-//!   object, the FreeBSD `procctl(2)` reaper, and the macOS process-group plan
-//!   with its `group-signalled` cleanup class — plus typed refusals on every
-//!   other cell (`D-06`, `D-15`). The Linux, FreeBSD, and macOS plans are on
-//!   the served spawn path ([`worker::spawn_path_served`]); the Windows plan is
-//!   implemented-only because this crate has no ConPTY backend yet.
+//!   object with ConPTY pseudoconsole hosting, the FreeBSD `procctl(2)` reaper,
+//!   and the macOS process-group plan with its `group-signalled` cleanup class
+//!   — plus typed refusals on every other cell (`D-06`, `D-15`). Every probed
+//!   plan (`cgroup_v2`, `subreaper_fallback`, `windows_job`, `freebsd_reaper`,
+//!   `process_group`) is wired into the terminal spawn backend
+//!   ([`worker::spawn_path_served`], [`worker::WorkerPool`], and
+//!   [`service::dispatch`]), while the IPC listener loop
+//!   ([`service::server::run`]) is served on Linux today and returns
+//!   `UnsupportedPlatform` on Windows, macOS, and FreeBSD until their listener
+//!   transports are wired.
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
 //! - [`content`]: the bounded terminal byte buffer, the hex codec, the

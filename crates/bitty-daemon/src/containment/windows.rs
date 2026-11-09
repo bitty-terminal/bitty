@@ -11,20 +11,23 @@
 //! Every Win32 call stays behind the reviewed `bitty-winjob` adapter; this
 //! module composes its safe API and adds no FFI.
 //!
-//! This plan is selected by [`probe`], but the daemon does not yet reach it:
-//! `worker::spawn_path_served` refuses the Windows job plan because this crate
-//! has no ConPTY backend, so a Windows `bittyd` cannot open a PTY. Serving a
-//! Windows session needs that backend and a new dependency (bitty#2985).
+//! [`spawn_conpty`] is the worker spawn entry point: [`ConPtyMaster::spawn_in_job`]
+//! attaches both `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and
+//! `PROC_THREAD_ATTRIBUTE_JOB_LIST` with `bInheritHandles = FALSE`, so the
+//! child joins the job at creation time and no daemon handle crosses into the
+//! child. [`spawn_with`] provides the non-PTY `Command` path for containment
+//! tests.
 
 use std::io;
-use std::os::windows::process::CommandExt as _;
+use std::os::windows::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Child, Command, ExitStatus};
 
 use bitty_winjob::{
-    CREATE_SUSPENDED_FLAG, JobMember, JobObject, process_is_running, resume_suspended_process,
-    terminate_process,
+    CREATE_SUSPENDED_FLAG, ChildSpec, ConPtyChild, ConPtyMaster, JobMember, JobObject,
+    process_is_running, resume_suspended_process, terminate_process,
 };
 
+use crate::orphan::identity::ProcessIdentity;
 use crate::platform::PlatformCell;
 use crate::registry::CleanupClass;
 
@@ -104,7 +107,7 @@ pub fn spawn_with(
         // The process is in the job but never ran; terminate the job tree and
         // report what the job could verify.
         let mut contained = ContainedChild {
-            child,
+            child: ChildProcess::Command(child),
             job,
             member,
             pid,
@@ -113,11 +116,76 @@ pub fn spawn_with(
         return Err(ContainmentError::Uncontained(cleanup));
     }
     Ok(ContainedChild {
-        child,
+        child: ChildProcess::Command(child),
         job,
         member,
         pid,
     })
+}
+
+/// Spawn one child attached to a fresh Windows pseudoconsole inside a new
+/// kill-on-close job object.
+///
+/// [`ConPtyMaster::spawn_in_job`] attaches both
+/// `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and `PROC_THREAD_ATTRIBUTE_JOB_LIST`
+/// with `bInheritHandles = FALSE`, so the child is assigned to the job at
+/// creation time (no instruction executes outside the job) and no daemon
+/// handle crosses into the child.
+///
+/// # Errors
+///
+/// Returns [`ContainmentError::Refused`] when `report` did not select the
+/// Windows job plan, [`ContainmentError::Exec`] when `CreateProcessW`
+/// refused the executable, [`ContainmentError::Spawn`] when the job,
+/// pseudoconsole, or process could not be created, or
+/// [`ContainmentError::IdentityUnavailable`] with the observed cleanup class
+/// when the leader's member handle could not be opened after spawn.
+pub fn spawn_conpty(
+    report: &ContainmentReport,
+    spec: &ChildSpec,
+    limits: ContainmentLimits,
+) -> Result<(ConPtyMaster, ContainedChild), ContainmentError> {
+    if report.kind() != ContainmentKind::WindowsJob {
+        return Err(ContainmentError::Refused(
+            report
+                .refusal()
+                .cloned()
+                .unwrap_or(ContainmentRefusal::UnsupportedPlatform {
+                    cell: report.cell(),
+                }),
+        ));
+    }
+    let job = JobObject::new().map_err(ContainmentError::Spawn)?;
+    let (master, child) = ConPtyMaster::spawn_in_job(&job, spec).map_err(classify_spawn_error)?;
+    let pid = child.pid();
+    let member = match child.open_member() {
+        Ok(member) => member,
+        Err(_) => {
+            let _ = job.terminate(JOB_TERMINATION_EXIT_CODE);
+            let _ = child.kill(JOB_TERMINATION_EXIT_CODE);
+            let reaped = child.wait().is_ok();
+            let empty = wait_bounded(limits.kill_wait(), limits, || {
+                job.active_processes().is_ok_and(|active| active == 0)
+            });
+            // Close the pseudoconsole only after the child is reaped.
+            drop(master);
+            let cleanup = if reaped && empty {
+                CleanupClass::Swept
+            } else {
+                CleanupClass::Unverified
+            };
+            return Err(ContainmentError::IdentityUnavailable(cleanup));
+        }
+    };
+    Ok((
+        master,
+        ContainedChild {
+            child: ChildProcess::ConPty(child),
+            job,
+            member,
+            pid,
+        },
+    ))
 }
 
 /// Kill a suspended child that never joined a job.
@@ -134,13 +202,19 @@ fn abandon_suspended_child(child: &mut Child, pid: u32) -> CleanupClass {
     }
 }
 
+#[derive(Debug)]
+enum ChildProcess {
+    Command(Child),
+    ConPty(ConPtyChild),
+}
+
 /// One child contained by a job object for its whole lifetime.
 ///
 /// Dropping the value closes the job's only handle; kill-on-close then ends
 /// every remaining member, so an abnormal teardown cannot leak the tree.
 #[derive(Debug)]
 pub struct ContainedChild {
-    child: Child,
+    child: ChildProcess,
     job: JobObject,
     /// Open handle to the leader, used to observe its exit without reaping.
     member: JobMember,
@@ -152,6 +226,15 @@ impl ContainedChild {
     #[must_use]
     pub const fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The journal identity this plan can re-verify after a restart.
+    ///
+    /// A Windows job handle is process-local and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+    /// ends the tree when the daemon exits, so no journal identity is committed.
+    #[must_use]
+    pub const fn durable_identity(&self) -> Option<ProcessIdentity> {
+        None
     }
 
     /// The recorded containment identity, suitable for the orphan journal.
@@ -170,13 +253,19 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
+        match &mut self.child {
+            ChildProcess::Command(child) => child.wait(),
+            ChildProcess::ConPty(child) => child.wait().map(ExitStatus::from_raw),
+        }
     }
 
     /// Take the child's standard output, when it was piped.
     #[must_use]
     pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
-        self.child.stdout.take()
+        match &mut self.child {
+            ChildProcess::Command(child) => child.stdout.take(),
+            ChildProcess::ConPty(_) => None,
+        }
     }
 
     /// Whether the direct child has been reaped.
@@ -185,7 +274,7 @@ impl ContainedChild {
     ///
     /// Propagates a `try_wait` failure other than an already-reaped child.
     pub fn has_exited(&mut self) -> io::Result<bool> {
-        self.child.try_wait().map(|status| status.is_some())
+        self.try_wait().map(|status| status.is_some())
     }
 
     /// Non-blocking wait: the exit status once the direct child has exited.
@@ -194,7 +283,12 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        match &mut self.child {
+            ChildProcess::Command(child) => child.try_wait(),
+            ChildProcess::ConPty(child) => {
+                child.try_wait().map(|code| code.map(ExitStatus::from_raw))
+            }
+        }
     }
 
     /// Whether the direct child has exited, without reaping it.
@@ -208,6 +302,20 @@ impl ContainedChild {
 
     /// Nothing to drain: the job owns every member and the kernel reaps them.
     pub const fn drain_recorded(&self) {}
+
+    /// Terminate the job tree and wait up to [`ContainmentLimits::kill_wait`]
+    /// for `ActiveProcesses` to reach zero and the leader handle to signal.
+    ///
+    /// Windows has no `SIGHUP` or `SIGTERM`: supervision calls this when the
+    /// graceful stop window expires, on an immediate `session.kill`, or after
+    /// observing a natural leader exit so any background descendant in the job
+    /// is ended before the sweep check runs.
+    pub fn kill_tree(&self, limits: ContainmentLimits) {
+        let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
+        let _ = wait_bounded(limits.kill_wait(), limits, || {
+            self.leader_exited() && self.job.active_processes().is_ok_and(|active| active == 0)
+        });
+    }
 
     /// Settle the job after the direct child was reaped.
     ///
@@ -260,9 +368,9 @@ impl ContainedChild {
         // the verdict never rests on a `try_wait` that merely lost the race.
         // `wait` cannot block here: the leader's process object is signalled.
         let reaped = if leader_exited {
-            self.child.wait().is_ok()
+            self.wait().is_ok()
         } else {
-            matches!(self.child.try_wait(), Ok(Some(_)))
+            matches!(self.try_wait(), Ok(Some(_)))
         };
         let empty = self.job.active_processes().is_ok_and(|active| active == 0);
         CleanupOutcome {
@@ -385,5 +493,49 @@ mod tests {
             child.sweep_if_empty().map(CleanupOutcome::class),
             Some(CleanupClass::Swept)
         );
+    }
+
+    #[test]
+    fn a_conpty_child_joins_the_job_at_creation_and_sweeps_on_terminate() {
+        use std::ffi::{OsStr, OsString};
+
+        let report = report();
+        let args = [
+            OsString::from("/d"),
+            OsString::from("/c"),
+            OsString::from("ping"),
+            OsString::from("-n"),
+            OsString::from("30"),
+            OsString::from("127.0.0.1"),
+        ];
+        let env = [(OsString::from("TERM"), OsString::from("xterm-256color"))];
+        let spec = ChildSpec {
+            program: OsStr::new("cmd.exe"),
+            args: &args,
+            env: &env,
+            cwd: None,
+            cols: 80,
+            rows: 24,
+        };
+        let (master, mut child) =
+            spawn_conpty(&report, &spec, limits()).expect("a contained ConPTY spawn");
+        assert_eq!(child.containment().mechanism(), "windows_job");
+        assert_eq!(child.durable_identity(), None);
+        assert!(
+            !child.leader_exited(),
+            "the ConPTY child must be running inside the job"
+        );
+        master.resize(120, 40).expect("resize pseudoconsole");
+        let outcome = child.terminate(limits());
+        assert_eq!(
+            outcome.class(),
+            CleanupClass::Swept,
+            "{report} signalled={}",
+            outcome.signalled()
+        );
+        assert!(outcome.signalled() >= 1);
+        assert!(child.sweep_if_empty().is_some());
+        // Close the pseudoconsole after the child has been reaped.
+        drop(master);
     }
 }

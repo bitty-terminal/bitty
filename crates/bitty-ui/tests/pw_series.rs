@@ -21,9 +21,9 @@ use bitty_ui::{
     ApiScope, BAR_MOVE_CMD, BAR_SPLIT_CMD, BarDropSession, BarError, BarOutcome, BarUndoStack,
     BarZone, CapabilityGate, CloseRequest, CloseResolution, CommandRegistry, FocusResolution,
     GuardError, IdentityRegistry, LastPanelPolicy, LayoutNode, LuaCapability, ManifestError,
-    PanelId, PersistedPanel, PersistencePolicy, RestartManifest, SlotNumber, View, ViewId,
-    WorkspaceGuard, classify_bar_drop, decode_manifest, encode_manifest, lookup_command,
-    plan_restore, tab_label, undo_bar_drop, validate_spellings,
+    PanelId, PanelRestoreKey, PersistedPanel, PersistencePolicy, PersistentId, RestartManifest,
+    SlotNumber, View, ViewId, WorkspaceGuard, WorkspaceId, classify_bar_drop, decode_manifest,
+    encode_manifest, lookup_command, plan_restore, tab_label, undo_bar_drop, validate_spellings,
 };
 
 fn slot(n: u8) -> SlotNumber {
@@ -79,33 +79,43 @@ fn identity_bind_fails_closed_on_occupied_and_bad_slots() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn manifest_round_trip_and_stable_restore_order() {
+fn manifest_round_trip_and_stable_restore_refusal() {
+    fn key(workspace: u64, persistent: &str) -> PanelRestoreKey {
+        PanelRestoreKey::new(
+            WorkspaceId::new(workspace),
+            PersistentId::new(persistent).unwrap(),
+        )
+    }
     let mut manifest = RestartManifest::new();
     manifest
-        .push(PersistedPanel::new(PanelId::new(9), 1, "logs").unwrap())
+        .push(PersistedPanel::new(PanelId::new(9), key(1, "logs"), "logs").unwrap())
         .unwrap();
     manifest
-        .push(PersistedPanel::new(PanelId::new(3), 0, "editor").unwrap())
+        .push(PersistedPanel::new(PanelId::new(3), key(0, "editor"), "editor").unwrap())
         .unwrap();
     let back = decode_manifest(&encode_manifest(&manifest)).unwrap();
     assert_eq!(back, manifest);
-    let stable = plan_restore(&back, PersistencePolicy::StableIdentity);
-    assert_eq!(stable[0].id, PanelId::new(3));
-    assert_eq!(stable[1].id, PanelId::new(9));
-    let ephemeral = plan_restore(&back, PersistencePolicy::Ephemeral);
+    assert_eq!(
+        plan_restore(&back, PersistencePolicy::StableIdentity),
+        Err(ManifestError::StableIdentityUnsupported),
+        "a PanelId is not a restore key"
+    );
+    let ephemeral = plan_restore(&back, PersistencePolicy::Ephemeral).unwrap();
     assert_eq!(ephemeral[0].id, PanelId::new(9));
+    assert_eq!(ephemeral[1].id, PanelId::new(3));
 }
 
 #[test]
 fn manifest_defects_reject_the_whole_document() {
     assert_eq!(
-        decode_manifest("v=99;id=1;ws=0;title=x").unwrap_err(),
+        decode_manifest("v=99;id=1;ws=0;pid=x;title=x").unwrap_err(),
         ManifestError::UnsupportedVersion {
             found: 99,
             supported: bitty_ui::PERSIST_MANIFEST_VERSION,
         }
     );
-    assert!(decode_manifest("v=1;id=1;ws=0").is_err());
+    assert!(decode_manifest("v=2;id=1;ws=0").is_err());
+    assert!(decode_manifest("v=2;id=1;ws=0;pid=BAD;title=x").is_err());
     assert!(decode_manifest("not-a-record").is_err());
 }
 

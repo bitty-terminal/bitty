@@ -863,10 +863,25 @@ impl PanelEventBus {
         self.total_dropped
     }
 
+    /// Removes every queue owned by `panel_id` and reports how many queued
+    /// events that released.
+    pub fn clear_panel_counted(&mut self, panel_id: PanelId) -> usize {
+        let mut released = 0;
+        self.queues.retain(|(pid, _), queue| {
+            if *pid == panel_id {
+                released += queue.len();
+                false
+            } else {
+                true
+            }
+        });
+        released
+    }
+
     pub fn clear_panel(&mut self, panel_id: PanelId) {
         // `total_dropped` is maintained at drop time (pop/record/push), so
         // removing the queues here must not re-add their per-queue counters.
-        self.queues.retain(|(pid, _), _| *pid != panel_id);
+        self.clear_panel_counted(panel_id);
     }
 
     pub fn topics_len(&self) -> usize {
@@ -906,6 +921,42 @@ pub struct RetainedGrantCeiling {
     pub grants: BTreeSet<String>,
 }
 
+/// Per-family release record written by the panel's unbind edge (OQ-084 A.2).
+///
+/// The edge releases four families for one `(PanelId, generation)`: the
+/// panel-scoped grant row, the panel's queued bus events, the commands the
+/// generation registered, and the overlays attributed to it. This record
+/// names the ended generation and counts what each family released, so
+/// "released nothing" (`Some(0)` everywhere) stays distinguishable from
+/// "the release never ran" (no record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationReleaseRecord {
+    /// The ended controller generation this record describes.
+    pub generation: Generation,
+    /// Panel-scoped capabilities released with the grant row.
+    pub grants: usize,
+    /// Queued bus events drained.
+    pub events: usize,
+    /// Panel commands unregistered.
+    pub commands: usize,
+    /// Overlays attributed to the generation and dismissed.
+    pub overlays: usize,
+}
+
+impl GenerationReleaseRecord {
+    /// Total items released across every family.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.grants + self.events + self.commands + self.overlays
+    }
+
+    /// Whether at least one family released something.
+    #[must_use]
+    pub fn released_any(&self) -> bool {
+        self.total() > 0
+    }
+}
+
 /// Generic Panel Runtime per window/process. One registry per window,
 /// single-process winit, holds no PTY fd, GPU object, or OS window handle
 /// (those remain with `bitty-pty`, `bitty-render`, `bitty-platform`).
@@ -929,6 +980,15 @@ pub struct PanelRegistry {
     /// bind entry, and dropped by a successful successor bind or panel
     /// disposal. Never evicted while the panel record is alive.
     retained_ceilings: BTreeMap<PanelId, RetainedGrantCeiling>,
+    /// Per-family release records (OQ-084 A.2): at most one per live panel,
+    /// written by [`PanelRegistry::release_generation_scope`], replaced by the
+    /// panel's next edge, and dropped with the container. Created even when a
+    /// family released nothing.
+    release_records: BTreeMap<PanelId, GenerationReleaseRecord>,
+    /// Overlay attribution (OQ-084 A.2/D.4): which `(PanelId, generation)`
+    /// asked for each live overlay, so the unbind edge can dismiss exactly
+    /// that generation's surfaces. Bounded by the `4+1` overlay envelope.
+    overlay_attribution: BTreeMap<u64, (PanelId, Generation)>,
     errors: HashMap<String, u64>,
     disposed: bool,
     total_created: u64,
@@ -972,6 +1032,8 @@ impl PanelRegistry {
             event_bus: PanelEventBus::new(BusDropPolicy::DropOldest),
             capabilities: HashMap::new(),
             retained_ceilings: BTreeMap::new(),
+            release_records: BTreeMap::new(),
+            overlay_attribution: BTreeMap::new(),
             errors: HashMap::new(),
             disposed: false,
             total_created: 0,
@@ -1384,6 +1446,7 @@ impl PanelRegistry {
             // A panel that never mounted and held nothing is not a
             // predecessor: a rolled-back create leaves no ceiling behind.
             self.capabilities.remove(&(panel_id, generation));
+            self.release_attributed_overlays(panel_id, generation);
         }
         // Remove view attachment if any
         if let Some(view_id) = self.panel_to_view.remove(&panel_id) {
@@ -1406,6 +1469,7 @@ impl PanelRegistry {
         // a reload of this identity; keeping the ceiling here would leave a
         // record that no bind can name and no bound can reclaim.
         self.retained_ceilings.remove(&panel_id);
+        self.release_records.remove(&panel_id);
         // Retire panel with generation bump
         if let Ok(next) = self.registry_generation.next() {
             self.registry_generation = next;
@@ -1484,8 +1548,63 @@ impl PanelRegistry {
             })
     }
 
+    /// Creates an overlay attributed to `(panel_id, generation)` (OQ-084
+    /// A.2/D.4).
+    ///
+    /// The handle is validated before allocation, so a stale or unknown
+    /// generation cannot claim a surface. The unbind edge dismisses exactly
+    /// the overlays attributed to the ended generation; an overlay created
+    /// through [`Self::create_overlay`] carries no attribution and is not
+    /// touched by that edge.
+    ///
+    /// # Errors
+    /// The [`Self::create_overlay`] errors plus `NotFound`/`StaleHandle`.
+    pub fn create_panel_overlay(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+        kind: UiOverlayKind,
+        bounds: UiRect,
+        text: impl Into<String>,
+        tooltip: Option<String>,
+    ) -> Result<u64, PanelError> {
+        self.get_panel(panel_id, generation)?;
+        let id = self.create_overlay(kind, bounds, text, tooltip)?;
+        self.overlay_attribution.insert(id, (panel_id, generation));
+        Ok(id)
+    }
+
+    /// The `(PanelId, generation)` attribution of a live overlay, if any.
+    #[must_use]
+    pub fn overlay_attribution_of(&self, id: u64) -> Option<(PanelId, Generation)> {
+        self.overlay_attribution.get(&id).copied()
+    }
+
+    /// Number of live overlays carrying panel attribution.
+    #[must_use]
+    pub fn attributed_overlay_count(&self) -> usize {
+        self.overlay_attribution.len()
+    }
+
     pub fn dismiss_overlay(&mut self, id: u64) -> Option<Overlay> {
+        self.overlay_attribution.remove(&id);
         self.overlay_manager.dismiss(id)
+    }
+
+    /// Dismisses every overlay attributed to `(panel_id, generation)` and
+    /// returns how many were released (OQ-084 A.2/D.4).
+    fn release_attributed_overlays(&mut self, panel_id: PanelId, generation: Generation) -> usize {
+        let ids: Vec<u64> = self
+            .overlay_attribution
+            .iter()
+            .filter(|(_, owner)| **owner == (panel_id, generation))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &ids {
+            self.overlay_attribution.remove(id);
+            self.overlay_manager.dismiss(*id);
+        }
+        ids.len()
     }
 
     #[must_use]
@@ -1602,6 +1721,19 @@ impl PanelRegistry {
 
     /// Runs the unbind release for one controller generation (OQ-084 A.2/B-4).
     ///
+    /// The release covers every generation-owned family, in one call:
+    ///
+    /// - the panel-scoped grant row (copied into the retired-ceiling
+    ///   tombstone first);
+    /// - the panel's queued bus events, drained;
+    /// - the commands this generation registered, unregistered;
+    /// - the overlays attributed to `(panel_id, generation)`, dismissed.
+    ///
+    /// It writes one [`GenerationReleaseRecord`] naming the ended generation
+    /// and counting each family. The record is created even when every family
+    /// releases nothing, so "the predecessor released `∅`" is distinguishable
+    /// from "no edge ran" through [`Self::unbind_release_count`].
+    ///
     /// Copies the generation's panel-scoped grant set into the retired-ceiling
     /// tombstone and only then removes the live row, so the ceiling exists for
     /// the whole window in which the row does not. The copy happens even when
@@ -1620,18 +1752,19 @@ impl PanelRegistry {
     /// "already released".
     ///
     /// The write fails closed: if the tombstone cannot be stored, the live row
-    /// is kept, no previous-controller generation is recorded, and the error is
-    /// returned. The registry never evicts another panel's ceiling to make
-    /// room.
+    /// is kept, no other family is released, no previous-controller generation
+    /// is recorded, and the error is returned. The registry never evicts
+    /// another panel's ceiling to make room.
     ///
     /// Callers that are not a generation edge — a rolled-back create — must not
     /// call this.
     ///
-    /// Returns `true` when a live row was removed.
+    /// Returns `true` when a live grant row was removed.
     ///
     /// # Errors
     /// `RegistryDisposed`, `NotFound`, `StaleHandle`, or `ResourceExhausted`
-    /// (fail-closed tombstone write; the live row is untouched).
+    /// (fail-closed tombstone write; the live row and every other family are
+    /// untouched).
     pub fn release_generation_scope(
         &mut self,
         panel_id: PanelId,
@@ -1659,7 +1792,7 @@ impl PanelRegistry {
             .is_some_and(|ceiling| ceiling.ended_generation == generation);
         if already_ended {
             // `A.2`'s phase-1 repeat: this edge ran, so there is nothing to
-            // retain and nothing to overwrite.
+            // retain, nothing to overwrite, and no family to release again.
             if let Some(record) = self.panels.get_mut(&panel_id.0) {
                 record.last_controller_generation = Some(generation);
             }
@@ -1669,9 +1802,10 @@ impl PanelRegistry {
         let had_row = held.is_some();
         // A controller generation that held no grant has no row; that is a
         // ceiling of `∅`, not an absent predecessor. Store the tombstone before
-        // deleting the row so a failed write leaves the live row in place.
+        // deleting the row so a failed write leaves the live row (and every
+        // other family) in place.
         if let Err(error) =
-            self.retain_grant_ceiling(panel_id, generation, held.unwrap_or_default())
+            self.retain_grant_ceiling(panel_id, generation, held.clone().unwrap_or_default())
         {
             self.bump_error("RetiredCeilingTableFull");
             return Err(error);
@@ -1679,7 +1813,22 @@ impl PanelRegistry {
         if let Some(record) = self.panels.get_mut(&panel_id.0) {
             record.last_controller_generation = Some(generation);
         }
+        let grants = held.map_or(0, |set| set.len());
         self.capabilities.remove(&(panel_id, generation));
+        let events = self.event_bus.clear_panel_counted(panel_id);
+        let commands = self.command_registry.commands_for(panel_id).len();
+        self.command_registry.unregister_panel(panel_id);
+        let overlays = self.release_attributed_overlays(panel_id, generation);
+        self.release_records.insert(
+            panel_id,
+            GenerationReleaseRecord {
+                generation,
+                grants,
+                events,
+                commands,
+                overlays,
+            },
+        );
         Ok(had_row)
     }
 
@@ -1712,6 +1861,36 @@ impl PanelRegistry {
     #[must_use]
     pub fn retained_grant_ceiling_count(&self) -> usize {
         self.retained_ceilings.len()
+    }
+
+    /// The per-family release record written by the panel's last unbind edge
+    /// (OQ-084 A.2), or `None` when no edge has run for this panel.
+    ///
+    /// A record whose every family is zero means the edge ran and released
+    /// nothing; that is a different fact from `None`.
+    #[must_use]
+    pub fn unbind_release_record(&self, panel_id: PanelId) -> Option<&GenerationReleaseRecord> {
+        self.release_records.get(&panel_id)
+    }
+
+    /// Total items released at the panel's last unbind edge (OQ-084 A.2).
+    ///
+    /// `None` means no edge ran; `Some(0)` means an edge ran and every family
+    /// released nothing.
+    #[must_use]
+    pub fn unbind_release_count(&self, panel_id: PanelId) -> Option<usize> {
+        self.release_records
+            .get(&panel_id)
+            .map(GenerationReleaseRecord::total)
+    }
+
+    /// Number of live per-panel release records.
+    ///
+    /// One entry per live panel at most, so the table is structurally bounded
+    /// by the configured `max_panels_per_window`.
+    #[must_use]
+    pub fn unbind_release_record_count(&self) -> usize {
+        self.release_records.len()
     }
 
     /// Stores one retired-ceiling tombstone, replacing any previous entry for
@@ -1904,6 +2083,8 @@ impl PanelRegistry {
         self.event_bus = PanelEventBus::new(BusDropPolicy::DropOldest);
         self.capabilities.clear();
         self.retained_ceilings.clear();
+        self.release_records.clear();
+        self.overlay_attribution.clear();
         if let Ok(next) = self.registry_generation.next() {
             self.registry_generation = next;
         } else {

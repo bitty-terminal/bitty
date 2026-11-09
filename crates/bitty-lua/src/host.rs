@@ -636,7 +636,14 @@ impl LuaValue {
             Value::Integer(i) => Ok(Self::Integer(i)),
             Value::Number(n) => Ok(Self::Number(n)),
             Value::String(s) => {
-                let text = String::from_utf8_lossy(s.as_bytes()).into_owned();
+                let raw_bytes = s.as_bytes();
+                if budget.bytes.saturating_add(raw_bytes.len()) > limits.max_bytes {
+                    return Err(BridgeError::value(
+                        "E_VALUE_BYTES",
+                        "value serialized size exceeds limit",
+                    ));
+                }
+                let text = String::from_utf8_lossy(raw_bytes).into_owned();
                 budget.bytes = budget.bytes.saturating_add(text.len());
                 if budget.bytes > limits.max_bytes {
                     return Err(BridgeError::value(
@@ -5477,11 +5484,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let path =
-                    fs_text_arg(stack.get(0), "fs.read path").map_err(|e| e.to_error(ctx))?;
-                validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
+                let arg0 = stack.get(0);
+                let path = fs_text_arg(&arg0, "fs.read path").map_err(|e| e.to_error(ctx))?;
+                validate_fs_path(path).map_err(|e| e.to_error(ctx))?;
                 let result = state
-                    .bounded(|_expiry| state.services.fs_read(&path))
+                    .bounded(|_expiry| state.services.fs_read(path))
                     .map_err(|e| e.to_error(ctx))?;
                 stack.replace(ctx, result.to_lua(ctx));
                 Ok(CallbackReturn::Return)
@@ -5495,12 +5502,13 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let path =
-                    fs_text_arg(stack.get(0), "fs.write path").map_err(|e| e.to_error(ctx))?;
+                let arg0 = stack.get(0);
+                let arg1 = stack.get(1);
+                let path = fs_text_arg(&arg0, "fs.write path").map_err(|e| e.to_error(ctx))?;
                 let content =
-                    fs_text_arg(stack.get(1), "fs.write content").map_err(|e| e.to_error(ctx))?;
-                validate_fs_path(&path).map_err(|e| e.to_error(ctx))?;
-                validate_fs_content(&content).map_err(|e| e.to_error(ctx))?;
+                    fs_text_arg(&arg1, "fs.write content").map_err(|e| e.to_error(ctx))?;
+                validate_fs_path(path).map_err(|e| e.to_error(ctx))?;
+                validate_fs_content(content).map_err(|e| e.to_error(ctx))?;
                 let raw_opts = stack.get(2);
                 let opts =
                     LuaValue::from_lua(raw_opts, state.limits).map_err(|e| e.to_error(ctx))?;
@@ -5509,7 +5517,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     .bounded_mutation(|expiry| {
                         state
                             .services
-                            .fs_write_with_expiry(&path, &content, append, expiry)
+                            .fs_write_with_expiry(path, content, append, expiry)
                     })
                     .map_err(|e| e.to_error(ctx))?;
                 stack.replace(ctx, result.to_lua(ctx));
@@ -5524,9 +5532,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         Callback::from_fn(&ctx, {
             let state = state.clone();
             move |ctx, _exec, mut stack| {
-                let prefix =
-                    fs_text_arg(stack.get(0), "fs.list prefix").map_err(|e| e.to_error(ctx))?;
-                validate_fs_path(&prefix).map_err(|e| e.to_error(ctx))?;
+                let arg0 = stack.get(0);
+                let prefix = fs_text_arg(&arg0, "fs.list prefix").map_err(|e| e.to_error(ctx))?;
+                validate_fs_path(prefix).map_err(|e| e.to_error(ctx))?;
                 let max_entries = match stack.get(1) {
                     Value::Nil => FS_LIST_MAX_ENTRIES,
                     Value::Integer(n) if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
@@ -5544,7 +5552,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     .bounded(|expiry| {
                         state
                             .services
-                            .fs_list_with_expiry(&prefix, max_entries, expiry)
+                            .fs_list_with_expiry(prefix, max_entries, expiry)
                     })
                     .map_err(|e| e.to_error(ctx))?;
                 stack.replace(ctx, result.to_lua(ctx));
@@ -6123,11 +6131,12 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             Callback::from_fn(&ctx, {
                 let state = state.clone();
                 move |ctx, _exec, mut stack| {
-                    let path = fs_text_arg(stack.get(0), "image.read path")
-                        .map_err(|e| e.to_error(ctx))?;
-                    validate_image_path(&path).map_err(|e| e.to_error(ctx))?;
+                    let arg0 = stack.get(0);
+                    let path =
+                        fs_text_arg(&arg0, "image.read path").map_err(|e| e.to_error(ctx))?;
+                    validate_image_path(path).map_err(|e| e.to_error(ctx))?;
                     let result = state
-                        .bounded(|_expiry| state.services.image_read(&path))
+                        .bounded(|_expiry| state.services.image_read(path))
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
                     Ok(CallbackReturn::Return)
@@ -8219,7 +8228,7 @@ pub fn validate_env_key(key: &str) -> Result<(), BridgeError> {
 /// replacements and corrupt binary/Latin-1 content under a success receipt.
 /// Fail closed with `E_DEF_INVALID` before any grant check or write so a
 /// non-UTF-8 caller gets a typed denial and no file is touched.
-fn fs_text_arg(value: Value<'_>, what: &str) -> Result<String, BridgeError> {
+fn fs_text_arg<'a>(value: &'a Value<'_>, what: &str) -> Result<&'a str, BridgeError> {
     let Value::String(raw) = value else {
         return Err(BridgeError::new(
             "validation",
@@ -8234,7 +8243,7 @@ fn fs_text_arg(value: Value<'_>, what: &str) -> Result<String, BridgeError> {
             format!("{what} must be valid UTF-8"),
         ));
     };
-    Ok(text.to_owned())
+    Ok(text)
 }
 
 /// Validate a `bitty.fs` path shape (RFC-0005, CTX-0984).
@@ -9314,5 +9323,37 @@ mod tests {
         }
         let err = parse_theme_table(&big).expect_err("overlong leaf denied");
         assert_eq!(err.code, "E_DEF_LIMIT");
+    }
+
+    #[test]
+    fn lua_value_from_lua_and_fs_text_arg_reject_oversized_strings_3069() {
+        let mut lua = phodopus::Lua::empty();
+        lua.enter(|ctx| {
+            let limits = MarshallingLimits {
+                max_depth: 4,
+                max_nodes: 16,
+                max_bytes: 32,
+            };
+            let over = Value::String(ctx.intern(&[b'x'; 64]));
+            let err = LuaValue::from_lua(over, limits).expect_err("oversized string rejected");
+            assert_eq!(err.code, "E_VALUE_BYTES");
+
+            let table = Table::new(&ctx);
+            table
+                .set(ctx, Value::String(ctx.intern(&[b'k'; 64])), 1_i64)
+                .expect("set key");
+            let err = LuaValue::from_lua(Value::Table(table), limits)
+                .expect_err("oversized table key rejected");
+            assert_eq!(err.code, "E_VALUE_BYTES");
+
+            let valid_val = Value::String(ctx.intern(b"/tmp/test.txt"));
+            assert_eq!(
+                fs_text_arg(&valid_val, "fs.read path").expect("borrowed str"),
+                "/tmp/test.txt"
+            );
+            let bad_utf8 = Value::String(ctx.intern(&[0xff, 0xfe]));
+            let err = fs_text_arg(&bad_utf8, "fs.read path").expect_err("invalid UTF-8 rejected");
+            assert_eq!(err.code, "E_DEF_INVALID");
+        });
     }
 }

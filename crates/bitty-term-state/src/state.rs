@@ -348,9 +348,21 @@ pub struct State {
     /// redraw them on `SIGWINCH` by stepping up by their logical widget height.
     /// Keeping those active widget rows 1-to-1 across width resizes prevents
     /// width shrinks from splitting widget borders/status bars into extra
-    /// physical rows that strand above `CUU`, while committed history above
-    /// `inline_top_row` continues to reflow losslessly.
+    /// physical rows that strand above `CUU`. Only rows from `inline_top_row`
+    /// down are 1-to-1: committed history above the widget top reflows to the
+    /// new width, and a widget top that lands on a soft-wrapped continuation
+    /// row reflows its whole logical line (so the part of that line above the
+    /// widget survives) and re-derives the top from where the boundary row
+    /// landed. The record is armed only from a DECSET 2026 frame and cleared
+    /// on full-screen erases, alternate-screen switches, and `RIS`.
     inline_top_row: Option<u16>,
+    /// Grid width at which the most recent primary-screen DECSET 2026 frame
+    /// began (`None` before the first frame, issue #3103).
+    sync_frame_cols: Option<u16>,
+    /// Whether the current primary-screen DECSET 2026 frame began after the
+    /// grid width had changed since the previous frame began, i.e. it may
+    /// still be an in-flight render formatted for the old viewport (#3103).
+    sync_frame_stale: bool,
     /// Whether an unsynchronized linefeed (`LF`/`VT`/`FF`/`IND`/`NEL` outside
     /// DECSET 2026) has advanced the primary screen since the last inline TUI
     /// redraw, indicating normal streaming output until the next inline frame.
@@ -414,6 +426,8 @@ impl State {
             images: ImageStore::new(),
             kitty_placements: PlacementStore::new(),
             inline_top_row: None,
+            sync_frame_cols: None,
+            sync_frame_stale: false,
             saw_unsynced_lf: false,
         }
     }
@@ -555,6 +569,12 @@ impl State {
         let old_rows = self.height;
         let alt_active = self.alt_screen != AltScreen::Off;
         let width_changed = cols != old_cols;
+        if width_changed && !alt_active && self.modes.synchronized_update {
+            // A frame that is still being applied when the grid narrows stays
+            // formatted for the old width for the rest of its body, so the
+            // remainder must not scroll the viewport (#3103).
+            self.sync_frame_stale = true;
+        }
         let mut report = ResizeReport {
             row_shift: 0,
             width_changed,
@@ -579,8 +599,22 @@ impl State {
         } else {
             (Vec::new(), Vec::new())
         };
-        let inline_top_logical_idx: Option<usize> =
-            inline_top_grid_row.and_then(|gr| row_map.get(sb_len_before + gr).map(|&(li, _)| li));
+        let inline_top_boundary: Option<(usize, usize)> =
+            inline_top_grid_row.and_then(|gr| row_map.get(sb_len_before + gr).copied());
+        // Derive the 1-to-1 boundary from the recorded widget top (#3103). A
+        // top row that begins its own logical line is a clean boundary: that
+        // logical and every later one resize 1-to-1. A top row that is a
+        // soft-wrapped continuation belongs to a logical line that began
+        // above the widget, i.e. that also carries committed history:
+        // truncating it 1-to-1 would destroy rows above the widget, so that
+        // logical reflows instead and the 1-to-1 region starts after it,
+        // with the widget top re-derived from where the boundary row landed.
+        let (inline_truncate_from, inline_split): (Option<usize>, Option<(usize, usize)>) =
+            match inline_top_boundary {
+                None => (None, None),
+                Some((li, 0)) => (Some(li), None),
+                Some((li, seg_start)) => (Some(li + 1), Some((li, seg_start))),
+            };
         let cursor_logical: Option<(usize, usize)> = if !alt_active && width_changed {
             let crow = self.cursor.position.row as usize;
             let ccol = self.cursor.position.col as usize;
@@ -605,6 +639,7 @@ impl State {
         } else {
             None
         };
+        let mut inline_split_cells: Option<(usize, Vec<Cell>, usize)> = None;
         let (reflow_counts, cursor_cells): (Vec<usize>, Option<Vec<Cell>>) = if cols == old_cols {
             // Height-only: keep the logical rows intact and move lines
             // between the viewport and scrollback instead of truncating the
@@ -632,11 +667,16 @@ impl State {
                 .map(|(line_idx, _)| line_idx)
                 .filter(|line_idx| *line_idx < old_logicals.len())
                 .map(|line_idx| old_logicals[line_idx].clone());
+            // Same budget for a boundary-split logical: it reflows instead of
+            // truncating, so the widget top has to be re-derived from where
+            // the boundary row landed (issue #3103, review probe 3).
+            inline_split_cells = inline_split
+                .and_then(|(li, seg)| old_logicals.get(li).map(|cells| (li, cells.clone(), seg)));
             let counts = Self::reflow_primary(
                 &mut self.screens.main,
                 &mut self.scrollback,
                 old_logicals,
-                inline_top_logical_idx,
+                inline_truncate_from,
                 cols,
                 rows,
                 &erase,
@@ -666,7 +706,18 @@ impl State {
         // place the cursor: logical mapping after a width reflow, else clamp.
         self.scroll_region_top = 0;
         self.scroll_region_bottom = (rows - 1) as u16;
-        if let Some(top_li) = inline_top_logical_idx {
+        if let Some((li, cells, seg)) = &inline_split_cells {
+            // The widget top row was a continuation row, so its logical line
+            // reflowed: the top is where the boundary row's first glyph landed
+            // (#3103, review probe 3).
+            let (row_off, _) = map_unit_to_rewrapped(cells, *seg, cols, &erase);
+            let inline_total_idx: usize = reflow_counts.iter().take(*li).sum();
+            let new_sb_len = self.scrollback.len();
+            let new_inline_row = (inline_total_idx + row_off)
+                .saturating_sub(new_sb_len)
+                .min(rows.saturating_sub(1));
+            self.inline_top_row = Some(new_inline_row as u16);
+        } else if let Some(top_li) = inline_truncate_from {
             let inline_total_idx: usize = reflow_counts.iter().take(top_li).sum();
             let new_sb_len = self.scrollback.len();
             let new_inline_row = inline_total_idx
@@ -683,7 +734,7 @@ impl State {
                 // Active inline TUI widget rows resize 1-to-1 in place (#3103),
                 // so their row offset is 0 and column 0 stays anchored at 0.
                 let (row_off, col) =
-                    if inline_top_logical_idx.is_some_and(|top_li| line_idx >= top_li) {
+                    if inline_truncate_from.is_some_and(|top_li| line_idx >= top_li) {
                         (0, (self.cursor.position.col as usize).min(cols - 1))
                     } else {
                         map_unit_to_rewrapped(logical, unit_offset, cols, &erase)
@@ -2099,21 +2150,25 @@ impl State {
             // text is never silently dropped.
         }
         let cols = self.width as u16;
-        let suppress_autowrap = self.in_inline_tui_sync_frame();
+        let clip_stale_frame = self.in_stale_inline_tui_sync_frame();
         // Consume a pending wrap before placing the glyph (DECAWM).
         // This is a soft wrap: the row we leave continues onto the next.
         // Mark it BEFORE `index_linefeed` so a scroll carries the flag with
         // the row (the scrolled-off top keeps its own flag; the wrapping
         // row shifts but retains `true`).
         //
-        // Issue #3103: inside an active primary-screen synchronized TUI frame
-        // (`?2026h`), horizontal overflow past `self.width` comes from an
-        // in-flight frame formatted for an older, wider viewport before a
-        // border-drag shrink. Clipping at the right margin keeps the TUI's
-        // physical row count 1-to-1 with its internal `y` cursor instead of
-        // scrolling the viewport and stranding status bars/borders above `CUU`.
+        // Issue #3103: an in-flight primary-screen synchronized TUI frame
+        // (`?2026h`) that began after a border-drag shrink is still formatted
+        // for the previous, wider viewport. Clipping at the right margin keeps
+        // the TUI's physical row count 1-to-1 with its internal `y` cursor
+        // instead of scrolling the viewport and stranding status bars/borders
+        // above `CUU`. The gate needs a recorded inline widget top *and* a
+        // frame that began after the grid changed width, so a steady-width
+        // frame that legitimately prints an over-width line (a TUI emitting
+        // scrollback history inside the frame) keeps normal soft wrapping and
+        // every glyph.
         if self.modes.auto_wrap && self.cursor.pending_wrap {
-            if suppress_autowrap {
+            if clip_stale_frame {
                 return;
             }
             let old_row = self.cursor.position.row as usize;
@@ -2129,7 +2184,7 @@ impl State {
             return;
         }
         if glyph_width == 2 && self.cursor.position.col + 1 >= cols {
-            if self.modes.auto_wrap && !suppress_autowrap {
+            if self.modes.auto_wrap && !clip_stale_frame {
                 // Single documented rule for a wide character at the final
                 // column: wrap, then place on the next line (also soft).
                 let old_row = self.cursor.position.row as usize;
@@ -2137,7 +2192,7 @@ impl State {
                 self.index_linefeed();
                 self.cursor.position.col = 0;
             } else {
-                if suppress_autowrap {
+                if clip_stale_frame {
                     self.cursor.pending_wrap = self.modes.auto_wrap;
                 }
                 return;
@@ -3287,19 +3342,25 @@ impl State {
                 self.index_linefeed();
             }
             0x0D => {
-                if !self.alt_screen_active() && self.cursor.position.col > 0 {
+                // Only a DECSET 2026 frame arms the inline viewport top: a
+                // plain unsynchronized `CR` (progress bars, `printf '\r'`,
+                // readline repaint) is ordinary output and must keep normal
+                // wrapping and reflow (review probe 5).
+                if !self.alt_screen_active()
+                    && self.modes.synchronized_update
+                    && self.cursor.position.col > 0
+                {
                     let mut top = self.cursor.position.row as usize;
                     while top > 0 && self.screens.main.wrapped(top - 1) {
                         top -= 1;
                     }
                     let top_u16 = top as u16;
-                    self.inline_top_row =
-                        Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
-                            top_u16
-                        } else {
-                            self.inline_top_row
-                                .map_or(top_u16, |prev| prev.min(top_u16))
-                        });
+                    self.inline_top_row = Some(if self.saw_unsynced_lf {
+                        top_u16
+                    } else {
+                        self.inline_top_row
+                            .map_or(top_u16, |prev| prev.min(top_u16))
+                    });
                     self.saw_unsynced_lf = false;
                 }
                 self.cursor.position.col = 0;
@@ -3378,17 +3439,13 @@ impl State {
             }
         }
         self.cursor.pending_wrap = false;
-        if !self.alt_screen_active()
-            && (self.modes.synchronized_update || matches!(dir, Direction::Up))
-        {
+        // Only a DECSET 2026 frame arms the inline viewport top; a plain
+        // unsynchronized cursor-up (readline repaint, progress spinner) is
+        // ordinary output and must keep normal wrapping and reflow (review
+        // probe 5).
+        if !self.alt_screen_active() && self.modes.synchronized_update {
             let new_row = self.cursor.position.row;
-            self.inline_top_row =
-                Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
-                    new_row
-                } else {
-                    self.inline_top_row.map_or(new_row, |top| top.min(new_row))
-                });
-            self.saw_unsynced_lf = false;
+            self.inline_top_row = Some(self.inline_top_row.map_or(new_row, |top| top.min(new_row)));
         }
     }
 
@@ -3483,15 +3540,9 @@ impl State {
             self.cursor.position.row = row.saturating_sub(1);
         }
         self.cursor.pending_wrap = false;
-        if !self.alt_screen_active() {
+        if !self.alt_screen_active() && self.modes.synchronized_update {
             let new_row = self.cursor.position.row;
-            self.inline_top_row =
-                Some(if self.saw_unsynced_lf && !self.modes.synchronized_update {
-                    new_row
-                } else {
-                    self.inline_top_row.map_or(new_row, |top| top.min(new_row))
-                });
-            self.saw_unsynced_lf = false;
+            self.inline_top_row = Some(self.inline_top_row.map_or(new_row, |top| top.min(new_row)));
         }
     }
 
@@ -3554,6 +3605,15 @@ impl State {
                 }
             }
             EraseDisplayMode::Above => {
+                if !self.alt_screen_active() {
+                    // Everything above the cursor is blank, so a recorded
+                    // widget top can only move down to the cursor row and no
+                    // pending unsynchronized linefeed can still matter (#3103
+                    // review item 4).
+                    let row = self.cursor.position.row;
+                    self.inline_top_row = self.inline_top_row.map(|top| top.min(row));
+                    self.saw_unsynced_lf = false;
+                }
                 let (row, col) = self.cursor_xy();
                 let erase = self.bce_style();
                 let last_col_u = self.width as u16 - 1;
@@ -3571,8 +3631,7 @@ impl State {
             }
             EraseDisplayMode::All => {
                 if !self.alt_screen_active() {
-                    self.inline_top_row = None;
-                    self.saw_unsynced_lf = false;
+                    self.clear_inline_viewport();
                 }
                 let erase = self.bce_style();
                 let (last_row_u, last_col_u) = (self.height as u16 - 1, self.width as u16 - 1);
@@ -3591,8 +3650,7 @@ impl State {
             }
             EraseDisplayMode::ScrollAndClear => {
                 if !self.alt_screen_active() {
-                    self.inline_top_row = None;
-                    self.saw_unsynced_lf = false;
+                    self.clear_inline_viewport();
                 }
                 // `ED 22` (kitty scroll-and-clear, adopted by ghostty): the
                 // visible screen scrolls into the scrollback and the screen
@@ -3869,6 +3927,15 @@ impl State {
                         self.inline_top_row.map_or(row, |top| top.min(row))
                     });
                     self.saw_unsynced_lf = false;
+                    // A frame that begins after the grid changed width is an
+                    // in-flight render still formatted for the previous
+                    // viewport until the TUI's own redraw arrives; only such a
+                    // frame may clip overflow at the right margin (#3103,
+                    // review item 1). The record advances every frame, so the
+                    // first frame after the change is the one clipped.
+                    let cols = self.width as u16;
+                    self.sync_frame_stale = self.sync_frame_cols.is_some_and(|prev| prev != cols);
+                    self.sync_frame_cols = Some(cols);
                 }
                 self.modes.synchronized_update = enabled;
             }
@@ -3931,6 +3998,10 @@ impl State {
                 &mut self.enhanced_keyboard_stash,
             );
             self.alt_screen = variant;
+            // Inline-viewport bookkeeping is primary-screen state: an
+            // alternate-screen session must not inherit (or leak back) a
+            // widget top recorded on the other screen (#3103 review item 4).
+            self.clear_inline_viewport();
             if variant == AltScreen::Via1049 {
                 // ?1049 clears the alternate screen on entry; ?47 keeps
                 // whatever the alt grid last held.
@@ -3990,6 +4061,10 @@ impl State {
             self.modes.mouse_tracking = None;
             self.enhanced_keyboard_stash = alt_enhanced;
             self.alt_screen = AltScreen::Off;
+            // Returning to the primary screen starts a fresh inline viewport:
+            // nothing recorded before the alt-screen session may truncate the
+            // primary content printed after it (#3103 review item 4).
+            self.clear_inline_viewport();
             // Alt-screen placements die with the session (restoring main
             // must never resurrect them); main-screen placements kept
             // their anchors untouched underneath.
@@ -4224,16 +4299,35 @@ impl State {
         // Reset clears every visible image (specification): placements,
         // prototypes, animations, and number mappings all go.
         self.kitty_placements.clear_all();
+        self.clear_inline_viewport();
+    }
+
+    /// Drops the inline-viewport record (#3103). Every event that invalidates
+    /// the primary-screen widget geometry — a full-screen erase, an
+    /// alternate-screen switch in either direction, or `RIS` — goes through
+    /// here, so a stale widget top can never truncate content it does not own.
+    fn clear_inline_viewport(&mut self) {
         self.inline_top_row = None;
+        self.sync_frame_cols = None;
+        self.sync_frame_stale = false;
         self.saw_unsynced_lf = false;
     }
 
-    /// Whether the state machine is currently applying a primary-screen
-    /// DECSET 2026 synchronized update frame from an inline TUI (#3103).
-    fn in_inline_tui_sync_frame(&self) -> bool {
+    /// Whether the state machine is applying an in-flight primary-screen
+    /// DECSET 2026 frame formatted for a viewport wider than the live grid
+    /// (#3103).
+    ///
+    /// True only when a synchronized frame has recorded an inline widget top
+    /// *and* the current frame is the first one to begin after the grid
+    /// changed width — the signature of a border-drag shrink whose redraw has
+    /// not arrived yet. A steady-width frame is never stale, so over-width
+    /// content printed inside it (a TUI emitting scrollback history in the
+    /// frame) keeps normal soft wrapping instead of losing glyphs.
+    fn in_stale_inline_tui_sync_frame(&self) -> bool {
         !self.alt_screen_active()
             && self.modes.synchronized_update
-            && (!self.cursor.visible || self.inline_top_row.is_some())
+            && self.inline_top_row.is_some()
+            && self.sync_frame_stale
     }
 
     // ------------------------------------------------------------------

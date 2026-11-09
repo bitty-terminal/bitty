@@ -856,6 +856,132 @@ fn inline_tui_status_bar_drag_resize_does_not_staircase_or_corrupt_prefix() {
     );
 }
 
+/// Number of retained cells whose glyph is `glyph`, across scrollback and the
+/// live grid (data-loss checks count glyphs, not rows).
+fn count_glyph(state: &State, glyph: char) -> usize {
+    physical_rows(state)
+        .iter()
+        .flat_map(|(cells, _)| cells.iter())
+        .filter(|cell| !cell.spacer && cell.glyph == glyph)
+        .count()
+}
+
+fn begin_sync_frame(state: &mut State) {
+    state.apply(&TerminalAction::SetMode {
+        mode: Mode::SynchronizedUpdate,
+        enabled: true,
+    });
+    state.apply(&TerminalAction::CursorVisibility { visible: false });
+}
+
+fn end_sync_frame(state: &mut State) {
+    state.apply(&TerminalAction::SetMode {
+        mode: Mode::SynchronizedUpdate,
+        enabled: false,
+    });
+}
+
+fn cursor_up(state: &mut State, n: u16) {
+    state.apply(&TerminalAction::CursorMove {
+        dir: bitty_vt::Direction::Up,
+        n: bitty_vt::Count(n),
+    });
+}
+
+/// Regression test for #3103 (review probe 3): an inline TUI widget whose
+/// recorded top row is a soft-wrapped *continuation* row belongs to a logical
+/// line that began above the widget. That logical line carries committed
+/// history, so a width change must reflow it instead of truncating it 1-to-1.
+#[test]
+fn inline_tui_widget_top_on_continuation_row_keeps_the_logical_above() {
+    let mut s = State::new();
+    s.resize(20, 6);
+    // One over-width logical line: 30 `H` occupy rows 0-1 with no linefeed.
+    prints(&mut s, &"H".repeat(30));
+    newline(&mut s);
+    // Step onto the continuation row (row 1), then open a synchronized frame
+    // there: the widget top now sits inside the logical printed above it.
+    cursor_up(&mut s, 1);
+    begin_sync_frame(&mut s);
+    assert!(s.check_invariants().is_ok());
+
+    s.resize(10, 6);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'H'),
+        30,
+        "the logical line that began above the widget top must reflow, not truncate: {:?}",
+        logical_text(&s)
+    );
+    assert!(
+        logical_text(&s).contains(&"H".repeat(30)),
+        "the over-width line above the widget top must stay one logical line: {:?}",
+        logical_text(&s)
+    );
+}
+
+/// Regression test for #3103 (review probe 5): ordinary unsynchronized `CR`
+/// and cursor-up redraws (progress bars, `printf '\r'`, readline repaint) must
+/// never arm the inline 1-to-1 resize path, which would truncate soft-wrapped
+/// output that has not scrolled into history yet.
+#[test]
+fn unsynchronized_carriage_return_and_cursor_up_never_arm_inline_truncation() {
+    // A plain `\r` after a soft-wrapped run with no linefeed.
+    let mut s = State::new();
+    prints(&mut s, &"w".repeat(35));
+    control(&mut s, 0x0D);
+    s.resize(10, 6);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'w'),
+        35,
+        "a plain CR redraw must keep normal wrapping and reflow: {:?}",
+        logical_text(&s)
+    );
+
+    // A plain cursor-up (no DECSET 2026) on the same shape.
+    let mut s = State::new();
+    prints(&mut s, &"u".repeat(35));
+    cursor_up(&mut s, 1);
+    s.resize(10, 6);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'u'),
+        35,
+        "a plain cursor-up redraw must keep normal wrapping and reflow: {:?}",
+        logical_text(&s)
+    );
+}
+
+/// Regression test for #3103 (review probe 6): an inline TUI that emits
+/// scrollback history inside its `?2026h` frame (the `tea.Println` shape) must
+/// keep every glyph of an over-width history line at a steady width — those
+/// glyphs are committed history and no later redraw can recover them.
+#[test]
+fn synchronized_frame_history_overflow_keeps_every_glyph() {
+    let mut s = State::new();
+    s.resize(20, 6);
+    begin_sync_frame(&mut s);
+    for i in 0..6 {
+        prints(&mut s, &format!("L{i}-"));
+        newline(&mut s);
+    }
+    // Over-width history line in the same frame: 30 `q` at width 20.
+    prints(&mut s, &"q".repeat(30));
+    end_sync_frame(&mut s);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'q'),
+        30,
+        "an in-frame history line must soft-wrap and keep every glyph: {:?}",
+        logical_text(&s)
+    );
+    assert!(
+        s.scrollback_len() > 0,
+        "the in-frame history lines must reach scrollback"
+    );
+}
+
 /// Regression test for #3103 (left pane): a multi-line inline prompt widget
 /// (`────` / `> ` / `────` / `? for shortcuts`) rendered below committed
 /// Markdown history lines must not leave duplicate `────────` borders above

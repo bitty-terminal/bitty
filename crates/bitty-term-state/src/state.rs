@@ -499,8 +499,8 @@ impl State {
     /// history rows on grow (bottom-anchored when the cursor is on the last
     /// row), so a width-preserving shrink/grow round-trip restores content
     /// (#2529). The alternate grid keeps the application-owned truncate/pad
-    /// path. Scroll region resets to full screen and the cursor is stepped
-    /// off spacers (RFC invariants 1-6). This is the environment-declared
+    /// path. Scroll region resets to full screen and saved/active cursors are
+    /// clamped to the new bounds. This is the environment-declared
     /// resize path (RFC "Environment declaration"). Returns full-grid plus
     /// scrollback-reflow damage tagged with the new generation. Headless:
     /// pure in-memory, no I/O, deterministic.

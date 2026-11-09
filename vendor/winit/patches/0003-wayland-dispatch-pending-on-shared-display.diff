@@ -1,8 +1,8 @@
-diff --git a/src/platform_impl/linux/wayland/event_loop/mod.rs b/src/platform_impl/linux/wayland/event_loop/mod.rs
-index f7e20c19..43d5b1d4 100644
---- a/src/platform_impl/linux/wayland/event_loop/mod.rs
-+++ b/src/platform_impl/linux/wayland/event_loop/mod.rs
-@@ -356,6 +356,21 @@ impl<T: 'static> EventLoop<T> {
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
+index f7e20c19..2157924a 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
+@@ -356,6 +356,23 @@ impl<T: 'static> EventLoop<T> {
              callback(Event::UserEvent(user_event), &self.window_target);
          }
  
@@ -18,13 +18,15 @@ index f7e20c19..43d5b1d4 100644
 +                _ => unreachable!(),
 +            };
 +            let mut wayland_source = self.wayland_dispatcher.as_source_mut();
-+            let _ = wayland_source.queue().dispatch_pending(state);
++            if let Err(err) = wayland_source.queue().dispatch_pending(state) {
++                tracing::warn!("Error dispatching pending Wayland events: {err}");
++            }
 +        }
 +
          // Drain the pending compositor updates.
          self.with_state(|state| compositor_updates.append(&mut state.window_compositor_updates));
  
-@@ -563,6 +578,10 @@ impl<T: 'static> EventLoop<T> {
+@@ -563,6 +580,10 @@ impl<T: 'static> EventLoop<T> {
          std::mem::swap(&mut self.compositor_updates, &mut compositor_updates);
          std::mem::swap(&mut self.buffer_sink, &mut buffer_sink);
          std::mem::swap(&mut self.window_ids, &mut window_ids);

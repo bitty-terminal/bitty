@@ -2438,13 +2438,18 @@ impl Runtime {
                 echo_by: now + IME_COMMIT_ECHO_WINDOW,
             },
         };
+        let had_overlay = self.ime_preedit.is_some();
         self.ime_preedit = None;
         self.ime_cursor = 0;
         if bounded.is_empty() && !was_armed {
             // bitty#3096: an unsolicited empty commit (e.g. a stray Wayland
             // `zwp_text_input_v3::done` on focus/workspace change) carries no
             // composition and no text, so it must not snap a scrolled viewport
-            // or clear selection.
+            // or clear selection; only schedule a redraw if clearing preedit
+            // dismissed a live overlay.
+            if had_overlay {
+                self.pending_full_redraw = true;
+            }
             return;
         }
         // CTX-0243: IME commit is typing — snap to live (also snaps via

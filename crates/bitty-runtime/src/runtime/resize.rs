@@ -24,20 +24,6 @@ impl Runtime {
             return Ok(());
         }
         let (new_cols, new_rows) = self.grid_from_physical(size);
-        // bitty#3096: Hyprland re-delivers `Resized` (with the same physical
-        // extent) on a workspace switch, and the embedder forwards it as a
-        // resize. Reconfiguring the presenter surface and re-sending
-        // `TIOCSWINSZ` there makes the kernel deliver `SIGWINCH`, so a
-        // full-screen TUI (rmpc, htop) repaints from the bottom and drops the
-        // scroll position the user was reading. Identical geometry is not a
-        // resize: no surface reconfigure, no PTY winsize, no forced full
-        // redraw. A real size or grid change still takes the full path.
-        if self.surface.extent() == Some(size)
-            && self.window_cells.width == u16::try_from(new_cols).unwrap_or(u16::MAX)
-            && self.window_cells.height == u16::try_from(new_rows).unwrap_or(u16::MAX)
-        {
-            return Ok(());
-        }
         self.reflow_to_grid(new_cols, new_rows, size)
     }
 

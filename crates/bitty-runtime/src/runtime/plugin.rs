@@ -14,6 +14,17 @@ use super::*;
 pub trait UrlOpener {
     /// Opens `activation`, which already passed the gesture + scheme gate.
     fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError>;
+
+    /// Opens a local-file `activation`, which already passed the gesture +
+    /// authority-free local `file:///` scheme gate (bitty#3096).
+    fn open_file_url(
+        &self,
+        activation: FileUrlActivation,
+    ) -> Result<(), bitty_platform::PlatformError> {
+        self.open_url(UrlActivation {
+            uri: activation.uri().to_owned(),
+        })
+    }
 }
 
 /// Production [`UrlOpener`]: spawns the native handler (no shell).
@@ -22,6 +33,13 @@ pub struct SystemUrlOpener;
 
 impl UrlOpener for SystemUrlOpener {
     fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError> {
+        Runtime::spawn_validated_url(activation.uri())
+    }
+
+    fn open_file_url(
+        &self,
+        activation: FileUrlActivation,
+    ) -> Result<(), bitty_platform::PlatformError> {
         Runtime::spawn_validated_url(activation.uri())
     }
 }
@@ -514,6 +532,31 @@ impl Runtime {
             self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
             return Err(bitty_platform::PlatformError::UrlActivationDenied);
         };
+        if uri.starts_with("file:") {
+            let activation = match self
+                .authorize_file_url_activation(&uri, gesture, decisions, timed_out)
+            {
+                Ok(activation) => activation,
+                Err(err) => {
+                    self.pending_activation_gesture = None;
+                    self.pending_activation_uri = None;
+                    self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                    return Err(err);
+                }
+            };
+            self.pending_activation_uri = None;
+            let opened = activation.uri().to_owned();
+            return match self.url_opener.open_file_url(activation) {
+                Ok(()) => {
+                    self.url_activations = self.url_activations.saturating_add(1);
+                    Ok(opened)
+                }
+                Err(err) => {
+                    self.url_activation_refusals = self.url_activation_refusals.saturating_add(1);
+                    Err(err)
+                }
+            };
+        }
         let activation = match self.authorize_url_activation(&uri, gesture, decisions, timed_out) {
             Ok(activation) => activation,
             Err(err) => {

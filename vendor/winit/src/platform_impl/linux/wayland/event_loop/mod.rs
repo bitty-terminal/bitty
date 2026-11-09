@@ -368,7 +368,9 @@ impl<T: 'static> EventLoop<T> {
                 _ => unreachable!(),
             };
             let mut wayland_source = self.wayland_dispatcher.as_source_mut();
-            let _ = wayland_source.queue().dispatch_pending(state);
+            if let Err(err) = wayland_source.queue().dispatch_pending(state) {
+                tracing::warn!("Error dispatching pending Wayland events: {err}");
+            }
         }
 
         // Drain the pending compositor updates.

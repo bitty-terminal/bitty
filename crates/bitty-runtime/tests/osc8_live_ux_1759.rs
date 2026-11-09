@@ -16,8 +16,8 @@ use bitty_platform::{
     WindowEventKind, WindowId,
 };
 use bitty_runtime::{
-    HYPERLINK_PREVIEW_MAX_CHARS, LayoutNode, Runtime, SplitAxis, UrlActivation, UrlOpener, View,
-    ViewId,
+    FileUrlActivation, HYPERLINK_PREVIEW_MAX_CHARS, LayoutNode, Runtime, SplitAxis, UrlActivation,
+    UrlOpener, View, ViewId,
 };
 
 #[derive(Default)]
@@ -27,6 +27,17 @@ struct RecordingOpener {
 
 impl UrlOpener for RecordingOpener {
     fn open_url(&self, activation: UrlActivation) -> Result<(), bitty_platform::PlatformError> {
+        self.opened
+            .lock()
+            .expect("poison-free")
+            .push(activation.uri().to_owned());
+        Ok(())
+    }
+
+    fn open_file_url(
+        &self,
+        activation: FileUrlActivation,
+    ) -> Result<(), bitty_platform::PlatformError> {
         self.opened
             .lock()
             .expect("poison-free")
@@ -463,9 +474,9 @@ fn ctrl_press_and_release_on_same_link_mints_singly() {
 
 #[test]
 fn hover_supports_local_file_osc8_links_and_wide_cells() {
-    let (mut rt, _) = runtime_with_recorder();
+    let (mut rt, opened) = runtime_with_recorder();
     rt.handle_pty_bytes(
-        "\x1b]8;;file:///tmp/workspace/src/main.rs#L10-L20\x07源码\x1b]8;;\x07".as_bytes(),
+        "\x1b]8;;file:///tmp/workspace/src/main.rs#L10-L20\x07源码\x1b]8;;\x07 \x1b]8;;file://remote-host/etc/passwd\x07remote\x1b]8;;\x07".as_bytes(),
     );
 
     // Leading wide cell (col 0) and trailing spacer cell (col 1) both resolve
@@ -494,4 +505,25 @@ fn hover_supports_local_file_osc8_links_and_wide_cells() {
         assert_eq!(span.col_start, 0);
         assert_eq!(span.col_end, 3);
     }
+
+    // Remote authority `file://remote-host/...` must be rejected by the hover gate.
+    move_to(&mut rt, container_cell_pixels(5, 0));
+    assert_eq!(rt.hovered_hyperlink_uri(), None);
+    assert_eq!(rt.hyperlink_cursor_icon(), CursorIcon::Text);
+
+    // Ctrl+clicking the local `file:///` link mints a gesture and activates
+    // through `authorize_file_url_activation` + `UrlOpener::open_file_url`.
+    hold_ctrl(&mut rt);
+    move_to(&mut rt, container_cell_pixels(1, 0));
+    press(&mut rt);
+    release(&mut rt);
+    assert!(rt.has_pending_hyperlink_activation());
+    let uri = rt
+        .activate_pending_hyperlink(&[], false)
+        .expect("local file:/// OSC 8 link must activate");
+    assert_eq!(uri, "file:///tmp/workspace/src/main.rs#L10-L20");
+    assert_eq!(
+        opened.lock().expect("poison-free").as_slice(),
+        ["file:///tmp/workspace/src/main.rs#L10-L20"]
+    );
 }

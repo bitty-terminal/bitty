@@ -90,7 +90,7 @@ pub(super) struct PinnedAnchor {
 pub struct HoveredHyperlink {
     /// View owning the grid the span was resolved in.
     pub view: ViewId,
-    /// Safe target URI (`http`/`https`/`mailto` only).
+    /// Safe target URI (`http`/`https`/`mailto` or authority-free local `file:///`).
     pub uri: String,
     /// Owner-grid row of the span.
     pub row: usize,
@@ -2688,6 +2688,26 @@ impl Runtime {
             .unwrap_or_else(|| self.cursor_to_cell(pos))
     }
 
+    /// Resolves the OSC 8 [`HyperlinkId`](bitty_term_state::HyperlinkId) for
+    /// `(row, col)` in `snapshot`, resolving a wide-character trailing `.spacer`
+    /// cell through its width-2 leading cell at `col - 1` (bitty#3096).
+    fn cell_hyperlink_id(
+        snapshot: &bitty_term_state::Snapshot,
+        row: usize,
+        col: usize,
+    ) -> Option<bitty_term_state::HyperlinkId> {
+        let row_base = row.checked_mul(snapshot.width)?;
+        let target = snapshot.cells.get(row_base.checked_add(col)?)?;
+        if let Some(id) = target.hyperlink {
+            Some(id)
+        } else if target.spacer && col > 0 {
+            let lead = snapshot.cells.get(row_base.checked_add(col - 1)?)?;
+            (lead.width == 2).then_some(lead.hyperlink).flatten()
+        } else {
+            None
+        }
+    }
+
     /// URI of the OSC 8 hyperlink under `pos`, resolved in the grid of the
     /// View under the pointer (CTX-0804, #1477; CTX-0808 fail-closed padding).
     ///
@@ -2714,21 +2734,7 @@ impl Runtime {
         let snapshot = state.snapshot();
         let row = usize::from(cell.row);
         let col = usize::from(cell.col);
-        let index = row.checked_mul(snapshot.width)?.checked_add(col)?;
-        let target = snapshot.cells.get(index)?;
-        let id = if let Some(id) = target.hyperlink {
-            id
-        } else if target.spacer && col > 0 {
-            let lead_idx = row.checked_mul(snapshot.width)?.checked_add(col - 1)?;
-            let lead = snapshot.cells.get(lead_idx)?;
-            if lead.width == 2 {
-                lead.hyperlink?
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        };
+        let id = Self::cell_hyperlink_id(&snapshot, row, col)?;
         state.hyperlink_entry(id).map(|(_, uri)| uri.to_owned())
     }
 
@@ -2791,19 +2797,7 @@ impl Runtime {
         if row >= snapshot.height || col >= snapshot.width {
             return None;
         }
-        let row_base = row.checked_mul(snapshot.width)?;
-        let cell_link_id = |c: usize| -> Option<bitty_term_state::HyperlinkId> {
-            let target = snapshot.cells.get(row_base.checked_add(c)?)?;
-            if let Some(id) = target.hyperlink {
-                Some(id)
-            } else if target.spacer && c > 0 {
-                let lead = snapshot.cells.get(row_base.checked_add(c - 1)?)?;
-                (lead.width == 2).then_some(lead.hyperlink).flatten()
-            } else {
-                None
-            }
-        };
-        let id = cell_link_id(col)?;
+        let id = Self::cell_hyperlink_id(&snapshot, row, col)?;
         let (id_param, uri) = state.hyperlink_entry(id)?;
         if !Self::is_safe_osc8_uri(uri)
             || id_param.is_some_and(|value| value.len() > bitty_rich::hyperlink::HYPERLINK_ID_MAX)
@@ -2811,11 +2805,13 @@ impl Runtime {
             return None;
         }
         let mut col_start = col;
-        while col_start > 0 && cell_link_id(col_start - 1) == Some(id) {
+        while col_start > 0 && Self::cell_hyperlink_id(&snapshot, row, col_start - 1) == Some(id) {
             col_start -= 1;
         }
         let mut col_end = col;
-        while col_end + 1 < snapshot.width && cell_link_id(col_end + 1) == Some(id) {
+        while col_end + 1 < snapshot.width
+            && Self::cell_hyperlink_id(&snapshot, row, col_end + 1) == Some(id)
+        {
             col_end += 1;
         }
         Some(HoveredHyperlink {

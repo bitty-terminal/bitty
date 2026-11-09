@@ -36,45 +36,6 @@ fn zero_resize_is_skipped_honestly() {
 }
 
 #[test]
-fn unchanged_resize_is_a_no_op() {
-    // bitty#3096: Hyprland re-delivers `Resized` with the same physical extent
-    // on a workspace switch. Reconfiguring the presenter surface and
-    // re-sending `TIOCSWINSZ` there emits `SIGWINCH`, so a full-screen TUI
-    // (rmpc, htop) repaints from the bottom and drops the scroll position the
-    // user was reading. Identical geometry must not reflow or force a frame.
-    let mut rt = make_runtime();
-    rt.handle_resize(PhysicalSize::new(800, 600))
-        .expect("valid resize");
-    assert!(rt.tick().is_some(), "the first resize forces a frame");
-    assert_eq!(rt.tick(), None, "idle after the resize frame");
-    let before = rt.snapshot();
-
-    rt.handle_resize(PhysicalSize::new(800, 600))
-        .expect("identical resize must not error");
-    assert_eq!(
-        rt.tick(),
-        None,
-        "identical extent and grid must not force a full redraw"
-    );
-    let after = rt.snapshot();
-    assert_eq!(
-        (after.width, after.height),
-        (before.width, before.height),
-        "grid must be unchanged by an identical resize"
-    );
-    assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(800, 600)));
-
-    // A real geometry change still takes the full path.
-    rt.handle_resize(PhysicalSize::new(801, 600))
-        .expect("valid resize");
-    assert!(
-        rt.tick().is_some(),
-        "a real resize still forces a full redraw"
-    );
-    assert_eq!(rt.surface_extent(), Some(PhysicalSize::new(801, 600)));
-}
-
-#[test]
 fn handle_platform_event_close_semantics() {
     let mut rt = make_runtime();
     let close = rt.handle_platform_event(PlatformEvent::Exiting);

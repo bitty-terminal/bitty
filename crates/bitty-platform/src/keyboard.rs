@@ -179,18 +179,18 @@ pub fn encode_key_event_with_terminal_modes(
                 return Some(vec![0x00]);
             }
             // Issue #3096: match Ghostty/foot by encoding Shift+Enter and
-            // Ctrl+Enter (with optional Alt/Super) as `\x1b[27;<mod>;13~` even
+            // Ctrl+Enter (with optional Alt) as `\x1b[27;<mod>;13~` even
             // when neither Kitty keyboard protocol nor xterm modifyOtherKeys
-            // was negotiated, while keeping bare Enter as `\r` and pure
-            // Alt+Enter as `\x1b\r`.
+            // was negotiated, while keeping bare Enter as `\r`, Super+Enter as
+            // `\r` (matching Runtime::modifier_snapshot), and pure Alt+Enter
+            // as `\x1b\r`.
             if *named == NamedKey::Enter
                 && event.location != KeyLocation::Numpad
                 && (modifiers.shift || modifiers.control)
             {
                 let mask = u8::from(modifiers.shift)
                     | (u8::from(modifiers.alt) << 1)
-                    | (u8::from(modifiers.control) << 2)
-                    | (u8::from(modifiers.super_pressed) << 3);
+                    | (u8::from(modifiers.control) << 2);
                 return Some(format!("\x1b[27;{};13~", 1 + mask).into_bytes());
             }
             if let Some(seq) = encode_named_key(*named, application_cursor_keys) {

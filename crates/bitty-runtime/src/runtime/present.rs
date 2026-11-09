@@ -14799,6 +14799,19 @@ mod async_present_tests {
                 .any(|(width, height)| *width == 1000 && *height == 700),
             "the worker applied the extent before acquiring"
         );
+        let configured_after_first = control.configured.lock().expect("configured").len();
+        runtime
+            .handle_resize(extent)
+            .expect("repeated identical resize succeeds");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        let committed_repeat = tick_until_committed(&mut runtime, TEST_WAIT)
+            .expect("repeated resize still commits a repaint frame");
+        assert!(committed_repeat.frame > committed.frame);
+        assert_eq!(
+            control.configured.lock().expect("configured").len(),
+            configured_after_first,
+            "#3099: unchanged surface extent must not reconfigure the worker swapchain"
+        );
         assert!(runtime.shutdown());
     }
 

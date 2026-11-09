@@ -613,10 +613,15 @@ impl Runtime {
             command.arg(argument);
         }
         command.arg(uri);
-        command
+        let mut child = command
             .spawn()
-            .map(|_| ())
-            .map_err(|error| bitty_platform::PlatformError::UrlLaunch(error.to_string()))
+            .map_err(|error| bitty_platform::PlatformError::UrlLaunch(error.to_string()))?;
+        let _ = std::thread::Builder::new()
+            .name("bitty-url-reaper".to_string())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        Ok(())
     }
 
     pub(super) fn handler_available(program: &str) -> bool {

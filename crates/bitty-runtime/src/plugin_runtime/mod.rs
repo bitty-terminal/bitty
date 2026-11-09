@@ -5820,6 +5820,7 @@ plugin-api = "^1.0"
             settings: Vec::new(),
             next_steps: Vec::new(),
             raw_bytes_len: 512,
+            source_sha256: None,
         }
     }
 

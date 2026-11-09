@@ -164,6 +164,7 @@ fn plugin_manifest(id: &str, network_capability: Option<&str>) -> PluginManifest
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 256,
+        source_sha256: None,
     }
 }
 
@@ -599,6 +600,7 @@ fn real_bitty_net_request() {
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 256,
+        source_sha256: None,
     };
     let hash = manifest.manifest_hash();
     runtime.register_plugin(manifest).expect("register plugin");

@@ -83,6 +83,7 @@ fn manifest(id: &str, capability: Option<&str>, host: Option<(&str, u16)>) -> Pl
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 256,
+        source_sha256: None,
     }
 }
 

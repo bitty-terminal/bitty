@@ -55,6 +55,7 @@ fn minimal_manifest(id: &str) -> PluginManifest {
         settings: Vec::new(),
         next_steps: Vec::new(),
         raw_bytes_len: 256,
+        source_sha256: None,
     }
 }
 

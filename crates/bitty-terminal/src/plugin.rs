@@ -31,13 +31,19 @@
 //!   (`$XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/`): manifest,
 //!   schema, entry point, module-tree bounds, and `compat` ranges are
 //!   verified before anything is staged, added capabilities need the same
-//!   consent, and the atomic `current.json` pointer is switched last (the
+//!   consent, and an update that replaces installed source with different
+//!   bytes always renders a bounded per-file diff and asks before installing
+//!   (even when no capability is added), and the atomic `current.json`
+//!   pointer is switched last (the
 //!   commit point). A failed commit rolls the version tree back; an
 //!   interrupted/partial tree is surfaced by `list` and repaired on the next
 //!   install after a `[y/N]` prompt (`--force` skips it; identical bytes are
 //!   adopted without a prompt). Reinstalling the same manifest version with
 //!   different content replaces the tree after the same prompt, and
-//!   `--force` does it non-interactively. The runtime then discovers and
+//!   `--force` skips only the repair prompt (the source update still asks).
+//!   A manifest may declare `[source] sha256` to pin the module tree, and
+//!   minified/obfuscated Lua is refused before any prompt. The runtime then
+//!   discovers and
 //!   activates the package as a visibly unverified third-party
 //!   (`local-path`) source. `install <git-url>`
 //!   clones a `https://<host>/<path>.git`, `git+https://…`, or
@@ -898,6 +904,15 @@ pub fn plugin_help_text() -> String {
      \x20                             manifest, entry point, bounds, and compat\n\
      \x20                             ranges are verified before anything is\n\
      \x20                             staged; added capabilities need consent.\n\
+     \x20                             An update that replaces installed source\n\
+     \x20                             with different bytes always prints a\n\
+     \x20                             bounded per-file diff and asks before\n\
+     \x20                             installing, even when no capability is\n\
+     \x20                             added (--yes approves that snapshot; --force\n\
+     \x20                             skips only the repair prompt). A manifest\n\
+     \x20                             that declares [source] sha256 pins the\n\
+     \x20                             module tree, and minified/obfuscated Lua\n\
+     \x20                             is refused.\n\
      \x20                             The package tree and current.json are\n\
      \x20                             committed together: a failed install\n\
      \x20                             rolls the tree back, so no version dir\n\
@@ -7402,6 +7417,10 @@ fn install_local_path(
     let outcome = {
         let mut consent =
             |consent_request: &package::ConsentRequest| -> Result<bool, PackageOpError> {
+                // Mandatory update diff (bitty#2069): the preview renders before
+                // the decision, so `--yes` approves a reviewed snapshot instead
+                // of an unseen one.
+                render_update_preview(output, consent_request, display);
                 if approve_all {
                     return Ok(true);
                 }
@@ -8272,11 +8291,75 @@ fn uninstall_store(
     }
 }
 
-/// Interactive consent for package repair and newly requested capabilities.
+/// Render the bounded update preview attached to a consent request
+/// (bitty#2069).
+///
+/// Prints the version and content-digest transition plus the per-file line
+/// preview computed by the installer from the staged snapshot. Display only:
+/// it grants nothing and runs no plugin code. A preview the installer could not
+/// build (`digest_only`) says so instead of implying the source is unchanged.
+fn render_update_preview(
+    output: &mut dyn std::io::Write,
+    request: &package::ConsentRequest,
+    source: &str,
+) {
+    let Some(update) = request.update.as_ref() else {
+        return;
+    };
+    let _ = writeln!(
+        output,
+        "bitty plugin: update for '{}' {} -> {} from '{source}' (content sha256 {} -> {})",
+        request.plugin_id,
+        update.previous_version,
+        request.version,
+        short_hash(&update.previous_content_digest),
+        short_hash(&update.content_digest),
+    );
+    if update.digest_only {
+        let _ = writeln!(
+            output,
+            "  (the previously installed tree could not be read; only the digest change is known)"
+        );
+        return;
+    }
+    if update.files.is_empty() {
+        let _ = writeln!(
+            output,
+            "  (no line changes in the module tree; the manifest hash changed)"
+        );
+        return;
+    }
+    for file in &update.files {
+        let _ = writeln!(
+            output,
+            "  {} (+{} -{})",
+            file.path, file.added, file.removed
+        );
+        for line in &file.lines {
+            let _ = writeln!(output, "    {line}");
+        }
+        if file.truncated {
+            let _ = writeln!(output, "    … diff truncated");
+        }
+    }
+    if update.omitted_files > 0 {
+        let _ = writeln!(
+            output,
+            "  … {} more changed file(s) not shown",
+            update.omitted_files
+        );
+    }
+}
+
+/// Interactive consent for package repair, source updates, and newly requested
+/// capabilities.
 ///
 /// A repair prompt comes first because replacing an existing version directory
-/// is destructive; declining either prompt commits nothing. `--yes` approves
-/// both non-interactively, while `--force` bypasses only the repair prompt.
+/// is destructive; declining any prompt commits nothing. `--yes` approves all
+/// of them non-interactively, while `--force` bypasses only the repair prompt.
+/// An update that replaces installed source with different bytes asks for
+/// approval even when it adds no capability (bitty#2069); the preview itself is
+/// rendered by [`render_update_preview`] before this prompt runs.
 fn ask_source_consent(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
@@ -8300,6 +8383,16 @@ fn ask_source_consent(
         }
     }
     if request.added.is_empty() {
+        // Source-only update (bitty#2069): the capability set is unchanged, but
+        // the running code is not. Approval is mandatory; the preview above is
+        // what the human is approving.
+        if request.update.is_some() {
+            return ask_yes_no(
+                input,
+                output,
+                "Install this update? (the diff above is what will run) [y/N] ",
+            );
+        }
         return Ok(true);
     }
     let _ = writeln!(
@@ -8360,6 +8453,7 @@ fn package_failure_exit(error: &PackageOpError) -> i32 {
         PackageOpError::Manifest { .. }
         | PackageOpError::BundledIdReserved { .. }
         | PackageOpError::ModuleTree { .. }
+        | PackageOpError::SourcePinMismatch { .. }
         | PackageOpError::Incompatible { .. } => EXIT_PLUGIN,
         PackageOpError::InvalidSource(_)
         | PackageOpError::ConsentAborted(_)
@@ -12433,5 +12527,104 @@ mod tests {
         assert!(out.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // ── Mandatory update diff for store updates (bitty#2069) ─────────────
+
+    /// Write a minimal store plugin fixture (`bitty-plugin.toml` + `lua/init.lua`).
+    fn write_store_plugin(root: &Path, id: &str, version: &str, body: &str) -> PathBuf {
+        let package = root.join(format!("plugin-{version}"));
+        let _ = std::fs::remove_dir_all(&package);
+        std::fs::create_dir_all(package.join("lua")).expect("lua dir");
+        let manifest = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Fixture\"\nversion = \"{version}\"\n\
+             description = \"fixture\"\n\n[compat]\nbitty = \">=0.0.1,<1.0\"\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\n"
+        );
+        std::fs::write(package.join("bitty-plugin.toml"), manifest).expect("manifest");
+        std::fs::write(package.join("lua").join("init.lua"), body).expect("init.lua");
+        package
+    }
+
+    /// [`run`] with an injected `XDG_DATA_HOME` so store installs land in a
+    /// scratch store instead of the user's real one.
+    fn run_store(raw: &[&str], config: &str, data_home: &str, input: &str) -> (i32, String) {
+        let context = PluginContext {
+            config_path: Some(config),
+            xdg_data_home: Some(data_home),
+            ..PluginContext::default()
+        };
+        let owned: Vec<String> = raw.iter().map(|token| (*token).to_string()).collect();
+        let mut input = Cursor::new(input.as_bytes().to_vec());
+        let mut output = Vec::new();
+        let code = run_plugin_subcommand(&owned, &context, &mut input, &mut output);
+        (code, String::from_utf8(output).expect("utf-8"))
+    }
+
+    #[test]
+    fn store_update_prints_diff_and_requires_approval() {
+        let dir = scratch_dir("store-update-diff");
+        let config = dir.join("init.lua").display().to_string();
+        let data_home = dir.join("data");
+        std::fs::create_dir_all(&data_home).expect("data home");
+        let id = "xuepoo.upddiff";
+        let v1 = write_store_plugin(&dir, id, "1.0.0", "return \"v1\"\n");
+        let (code, out) = run_store(
+            &["install", &v1.display().to_string(), "--yes"],
+            &config,
+            &data_home.display().to_string(),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+
+        // Same capability set, different Lua: the update must show the diff and
+        // ask, and a declined answer must leave 1.0.0 installed.
+        let v2 = write_store_plugin(&dir, id, "2.0.0", "return \"v2\"\n");
+        let (code, out) = run_store(
+            &["install", &v2.display().to_string()],
+            &config,
+            &data_home.display().to_string(),
+            "n\n",
+        );
+        assert!(
+            out.contains(&format!("update for '{id}' 1.0.0 -> 2.0.0")),
+            "the update diff header must print: {out}"
+        );
+        assert!(
+            out.contains("-return \"v1\"") && out.contains("+return \"v2\""),
+            "the changed Lua lines must print: {out}"
+        );
+        assert!(
+            out.contains("Install this update?"),
+            "a capability-neutral update must still ask for approval: {out}"
+        );
+        assert_eq!(code, EXIT_GENERIC, "{out}");
+
+        let (code, out) = run_store(
+            &["list", "--format", "json"],
+            &config,
+            &data_home.display().to_string(),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.contains("\"version\":\"1.0.0\"") || out.contains("1.0.0"),
+            "the declined update must leave 1.0.0 installed: {out}"
+        );
+
+        // `--yes` is the explicit non-interactive approval; the diff still
+        // prints so an approved snapshot is a reviewed one.
+        let (code, out) = run_store(
+            &["install", &v2.display().to_string(), "--yes"],
+            &config,
+            &data_home.display().to_string(),
+            "",
+        );
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.contains(&format!("update for '{id}' 1.0.0 -> 2.0.0")),
+            "--yes must still show the diff: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

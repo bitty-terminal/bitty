@@ -2567,10 +2567,13 @@ impl TerminalApp {
         // source, so handlers running on this tick validate against the
         // state this tick applied.
         if let Some(pin_state) = self.live_pin_state.as_ref() {
-            pin_state.publish(
-                &self.runtime.layout().leaf_ids(),
-                &self.runtime.pinned_views(),
-            );
+            let mut live_leaves = self.runtime.layout().leaf_ids();
+            for id in self.runtime.floated_views() {
+                if !live_leaves.contains(&id) {
+                    live_leaves.push(id);
+                }
+            }
+            pin_state.publish(&live_leaves, &self.runtime.pinned_views());
         }
         // One bounded snapshot pass serves the whole state diff (issue
         // #1828): terminals, per-terminal cwds, the observed-`BEL` counter,
@@ -4036,7 +4039,9 @@ impl TerminalApp {
                 if self.runtime.pinned_views().contains(&id) {
                     continue;
                 }
-                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                if self.runtime.floated_views().contains(&id)
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1)
+                {
                     self.restore_zoom();
                 }
                 if let Err(error) = self.runtime.pin_floating(id) {
@@ -4048,9 +4053,7 @@ impl TerminalApp {
                     });
                 }
             } else if self.runtime.pinned_views().contains(&id) {
-                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
-                    self.restore_zoom();
-                }
+                self.restore_zoom();
                 if let Err(error) = self.runtime.unpin_floating(id) {
                     crate::logging::warn(|| {
                         format!(
@@ -4059,7 +4062,9 @@ impl TerminalApp {
                         )
                     });
                 }
-            } else if !self.runtime.layout().leaf_ids().contains(&id) {
+            } else if !self.runtime.layout().leaf_ids().contains(&id)
+                && !self.runtime.floated_views().contains(&id)
+            {
                 crate::logging::warn(|| {
                     format!(
                         "bitty: plugin pin request dropped (unknown panel id {})",
@@ -4088,7 +4093,10 @@ impl TerminalApp {
         let requests = plugin_runtime.drain_fx_pulses();
         for queued in requests {
             let id = ViewId::new(queued.view);
-            if !self.runtime.layout().leaf_ids().contains(&id) {
+            let is_live_view = self.runtime.layout().leaf_ids().contains(&id)
+                || self.runtime.floated_views().contains(&id)
+                || self.runtime.pinned_views().contains(&id);
+            if !is_live_view {
                 crate::logging::warn(|| {
                     format!(
                         "bitty: plugin fx request dropped (unknown view id {})",
@@ -4287,6 +4295,7 @@ impl TerminalApp {
                     if was_float
                         && self.runtime.layout().leaf_count() == 0
                         && self.runtime.floated_views().is_empty()
+                        && self.runtime.pinned_count() == 0
                         && self.runtime.workspace_count() > 1
                     {
                         let workspace = self.runtime.active_workspace_index();
@@ -4350,13 +4359,21 @@ impl TerminalApp {
                 if self.runtime.layout().leaf_ids().contains(&view)
                     && self.runtime.leaf_count() <= 1
                 {
-                    // CTX-1337 (#2222): a pinned panel survives outside the
-                    // live layout, so the exited last tiled pane must not
-                    // keep its session-less leaf focused. Retire the leaf
-                    // and hand focus plus primary ownership to the pin,
-                    // exactly like the close_view path.
-                    if self.runtime.pinned_count() > 0
-                        && self.runtime.floated_count() == 0
+                    // CTX-1337 (#2222) & #3074: a detached float or pinned
+                    // panel survives outside the live layout, so the exited
+                    // last tiled pane must not keep its session-less leaf
+                    // focused. Retire the leaf and hand focus plus primary
+                    // ownership to the surviving float/pin, matching close_view.
+                    if self.runtime.floated_count() > 0
+                        && self
+                            .runtime
+                            .retire_sole_tiled_leaf_for_floated(view)
+                            .is_some()
+                    {
+                        crate::logging::info(|| {
+                            format!("bitty: pane shell {view:?} exited — float base leaf retired")
+                        });
+                    } else if self.runtime.pinned_count() > 0
                         && self
                             .runtime
                             .retire_sole_tiled_leaf_for_pinned(view)
@@ -4480,8 +4497,22 @@ impl TerminalApp {
                             )
                         });
                     }
+                } else if self.runtime.floated_count() > 0
+                    && self
+                        .runtime
+                        .retire_sole_tiled_leaf_for_floated(primary_view)
+                        .is_some()
+                {
+                    // Issue #3074: the last tiled primary shell exited while a
+                    // detached float survives. Retire the dead leaf and leave
+                    // the float as focus plus primary owner instead of a
+                    // session-less ghost tile.
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: primary shell {primary_view:?} exited — float base leaf retired"
+                        )
+                    });
                 } else if self.runtime.pinned_count() > 0
-                    && self.runtime.floated_count() == 0
                     && self
                         .runtime
                         .retire_sole_tiled_leaf_for_pinned(primary_view)
@@ -6284,6 +6315,67 @@ bitty.commands.register({
                 "trace must record {kind}; drained: {drained}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detached_float_and_pinned_views_publish_to_pin_state_and_accept_fx_pulse() {
+        use bitty_runtime::runtime::fx::QueuedFxPulse;
+        use bitty_runtime::{LayoutNode, SplitAxis, View};
+
+        let (mut app, _, root) = tracer_app();
+        let pin_state = std::rc::Rc::new(crate::plugin_runtime::LivePinState::default());
+        app = app.with_live_pin_state(Some(std::rc::Rc::clone(&pin_state)));
+
+        let tree = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            ),
+        );
+        app.runtime.set_layout(tree);
+        app.runtime
+            .float_detach(ViewId::new(1))
+            .expect("detach view 1 must succeed");
+        app.runtime
+            .float_detach(ViewId::new(2))
+            .expect("detach view 2 must succeed");
+        app.runtime
+            .pin_floating(ViewId::new(2))
+            .expect("pinning detached float view 2 must succeed");
+
+        let _ = app.drive_tick();
+        assert!(
+            pin_state.is_live_leaf(ViewId::new(1)),
+            "detached floating panel must remain published as a live leaf in pin_state"
+        );
+        assert!(
+            pin_state.is_pinned(ViewId::new(2)),
+            "pinned panel must be published in pin_state"
+        );
+
+        {
+            let pr = app.plugin_runtime.as_ref().expect("plugin runtime");
+            let mut q = pr.fx_queue().borrow_mut();
+            assert!(q.push(QueuedFxPulse { view: 1 }));
+            assert!(q.push(QueuedFxPulse { view: 2 }));
+        }
+        app.apply_plugin_fx_requests();
+        let now = std::time::Instant::now();
+        assert!(
+            app.runtime.fx_progress(ViewId::new(1), now).is_some(),
+            "apply_plugin_fx_requests must arm fx pulse on detached floating view"
+        );
+        assert!(
+            app.runtime.fx_progress(ViewId::new(2), now).is_some(),
+            "apply_plugin_fx_requests must arm fx pulse on pinned view"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

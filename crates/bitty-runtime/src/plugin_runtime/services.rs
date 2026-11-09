@@ -7914,7 +7914,9 @@ mod tests {
                     Err(_) => Ok(false),
                 }
             } else {
-                if !rt.pinned_views().contains(&id) && rt.layout().leaf_ids().contains(&id) {
+                if !rt.pinned_views().contains(&id)
+                    && (rt.layout().leaf_ids().contains(&id) || rt.floated_views().contains(&id))
+                {
                     return Ok(true);
                 }
                 match rt.unpin_floating(id) {

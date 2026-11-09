@@ -1582,9 +1582,11 @@ impl Runtime {
                             self.float_offsets.get(&id).copied().unwrap_or((0, 0));
                         let bounds = UiRect::new(
                             (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             anchor.size.0,
                             anchor.size.1,
                         );
@@ -1614,9 +1616,11 @@ impl Runtime {
                             self.pinned_offsets.get(&id).copied().unwrap_or((0, 0));
                         let bounds = UiRect::new(
                             (anchor.origin.0 + drag_dx.clamp(anchor.dx_range.0, anchor.dx_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             (anchor.origin.1 + drag_dy.clamp(anchor.dy_range.0, anchor.dy_range.1))
-                                as u16,
+                                .max(0)
+                                .min(i32::from(u16::MAX)) as u16,
                             anchor.size.0,
                             anchor.size.1,
                         );
@@ -3158,9 +3162,19 @@ impl Runtime {
         self.layout = layout;
         let leaf_ids = self.layout.leaf_ids();
         if leaf_ids.is_empty() {
-            self.focus.clear();
+            let preserve_floating_focus = self.focus.focused().is_some_and(|focused| {
+                closed.is_some()
+                    && closed != Some(focused)
+                    && (self.floats.contains(focused) || self.pinned.contains(focused))
+            });
+            if !preserve_floating_focus {
+                self.focus.clear();
+            }
         } else if let Some(focused) = self.focus.focused() {
-            if !leaf_ids.contains(&focused) {
+            let preserve_floating_focus = (closed.is_some() || preserve_border_drag)
+                && closed != Some(focused)
+                && (self.floats.contains(focused) || self.pinned.contains(focused));
+            if !leaf_ids.contains(&focused) && !preserve_floating_focus {
                 // Issue #2521 review: prefer the outgoing tree's sibling
                 // survivor when the closed pane held focus; only fall back
                 // to the incoming tree's first leaf when it is absent (for
@@ -3732,11 +3746,11 @@ impl Runtime {
     fn panel_split_plan_for(&self, focused: ViewId) -> Option<PanelSplitPlan> {
         let gap_in = self.gaps().inner;
         let allocations = self.layout_allocations();
-        let focused_rect = allocations
+        let focused_alloc = allocations
             .iter()
             .find(|(id, _)| *id == focused)
-            .map(|(_, rect)| *rect)
-            .unwrap_or(self.container);
+            .map(|(_, rect)| *rect);
+        let focused_rect = focused_alloc.unwrap_or(self.container);
         let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
             PanelLayoutMode::Balanced => {
                 let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
@@ -3747,30 +3761,43 @@ impl Runtime {
                 let (_, axis) = bisect_choice(&allocations, self.container);
                 (target, rect, axis, false, None)
             }
-            PanelLayoutMode::Dwindle => (
-                focused,
-                focused_rect,
-                splittable_axis(focused_rect, gap_in)?,
-                false,
-                None,
-            ),
+            PanelLayoutMode::Dwindle => {
+                if focused_alloc.is_some() {
+                    (
+                        focused,
+                        focused_rect,
+                        splittable_axis(focused_rect, gap_in)?,
+                        false,
+                        None,
+                    )
+                } else {
+                    let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                    (target, rect, axis, false, None)
+                }
+            }
             PanelLayoutMode::Spiral => {
-                let phase = self.panel_spiral_phase(focused);
-                match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
-                    Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
-                    None => {
-                        // Issue #2571 review: the focused Spiral slot can
-                        // exhaust on a normal window (80x24 stops after five
-                        // presses) long before the tiling is full. Fall back
-                        // to the deterministic Balanced target -- the
-                        // largest feasible leaf, first in solver order on ties --
-                        // so `Mod+N` keeps the 0.0.27 capacity instead of
-                        // dropping the chord. `spiral_phase: None` marks the
-                        // fallback and restarts the chain on the fresh pane;
-                        // the app logs one bounded warning for it. `None`
-                        // here now means no leaf can host two usable panes.
-                        let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
-                        (target, rect, axis, false, None)
+                if focused_alloc.is_none() {
+                    let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                    (target, rect, axis, false, None)
+                } else {
+                    let phase = self.panel_spiral_phase(focused);
+                    match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
+                        Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
+                        None => {
+                            // Issue #2571 review: the focused Spiral slot can
+                            // exhaust on a normal window (80x24 stops after five
+                            // presses) long before the tiling is full. Fall back
+                            // to the deterministic Balanced target -- the
+                            // largest feasible leaf, first in solver order on ties --
+                            // so `Mod+N` keeps the 0.0.27 capacity instead of
+                            // dropping the chord. `spiral_phase: None` marks the
+                            // fallback and restarts the chain on the fresh pane;
+                            // the app logs one bounded warning for it. `None`
+                            // here now means no leaf can host two usable panes.
+                            let (target, rect, axis) =
+                                largest_splittable_leaf(&allocations, gap_in)?;
+                            (target, rect, axis, false, None)
+                        }
                     }
                 }
             }
@@ -3961,6 +3988,16 @@ impl Runtime {
                 if leaf.fixed_size().is_none() {
                     leaf.set_fixed_size(Some(size));
                 }
+            }
+            if let Some(stored) = slot.floats.find_mut(view) {
+                if stored.fixed_size().is_none() {
+                    stored.set_fixed_size(Some(size));
+                }
+            }
+        }
+        if let Some(stored) = self.floats.find_mut(view) {
+            if stored.fixed_size().is_none() {
+                stored.set_fixed_size(Some(size));
             }
         }
         if let Some(stored) = self.pinned.find_mut(view) {
@@ -5669,5 +5706,73 @@ mod tests {
         // Entering the alternate screen does not make the stale view live.
         rt.handle_pty_bytes(b"\x1b[?1049h");
         assert!(!rt.bidi_enabled_for_view(extra));
+    }
+
+    #[test]
+    fn set_layout_closing_and_border_drag_preserve_focus_on_live_float_or_pin_3074() {
+        let mut rt = Runtime::with_defaults().expect("defaults");
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let third = ViewId::new(3);
+        let fourth = ViewId::new(4);
+        let leaf1 = rt.layout().find_leaf(first).cloned().expect("leaf1");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(leaf1),
+                LayoutNode::leaf(View::new(second, 40, 12)),
+            ),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(third, 40, 12)),
+                LayoutNode::leaf(View::new(fourth, 40, 12)),
+            ),
+        ));
+        rt.float_detach(first).expect("detach first");
+        rt.pin_floating(second).expect("pin second");
+        assert!(rt.set_focus(first));
+        assert_eq!(rt.focused_view(), Some(first));
+
+        // Border drag commit on the tiled base must not yank focus off the
+        // focused detached float.
+        let dragged = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.7,
+            LayoutNode::leaf(View::new(third, 40, 12)),
+            LayoutNode::leaf(View::new(fourth, 40, 12)),
+        );
+        rt.replace_layout_preserving_border_drag(dragged, None, true);
+        assert_eq!(
+            rt.focused_view(),
+            Some(first),
+            "border drag commit must preserve focus on the focused detached float"
+        );
+
+        // Closing a background tiled leaf must preserve focus on the focused
+        // pinned panel and on the focused detached float (even when the closed
+        // tiled leaf is the last tiled leaf).
+        assert!(rt.set_focus(second));
+        let mut without_third = rt.layout().clone();
+        without_third.remove_leaf(third);
+        rt.set_layout_closing(without_third, third);
+        assert_eq!(
+            rt.focused_view(),
+            Some(second),
+            "background tiled close must preserve focus on the focused pinned panel"
+        );
+
+        assert!(rt.set_focus(first));
+        let mut empty = rt.layout().clone();
+        empty.remove_leaf(fourth);
+        rt.set_layout_closing(empty, fourth);
+        assert_eq!(
+            rt.focused_view(),
+            Some(first),
+            "closing the last background tiled leaf must preserve focus on the focused float"
+        );
     }
 }

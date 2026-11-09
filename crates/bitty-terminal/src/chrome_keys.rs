@@ -1162,34 +1162,38 @@ impl TerminalApp {
     /// Never a window close (the caller keeps the `false` return).
     fn apply_scratchpad_toggle(&mut self) {
         const CMD: &str = bitty_runtime::SCRATCHPAD_CMD_TOGGLE;
-        let focused = match self.runtime.focused_view() {
-            Some(id) => id,
-            None => {
+        let hiding = !self.runtime.scratchpad_occupied();
+        let focused = if hiding {
+            let Some(id) = self.runtime.focused_view() else {
                 eprintln!("warning: keymap command:{CMD} has no focused pane — ignoring");
                 return;
-            }
-        };
-        if !self.runtime.scratchpad_occupied() {
-            let current = match self.runtime.layout().find_leaf(focused) {
+            };
+            let current = match self.runtime.layout().find_leaf(id) {
                 Some(leaf) => leaf.presentation(),
                 None => {
                     eprintln!(
-                        "warning: keymap command:{CMD} found no focused pane {focused:?} — ignoring"
+                        "warning: keymap command:{CMD} found no focused pane {id:?} — ignoring"
                     );
                     return;
                 }
             };
-            if !matches!(current, PresentationMode::Tiled) {
+            if !matches!(
+                current,
+                PresentationMode::Tiled | PresentationMode::Scratchpad
+            ) {
                 eprintln!(
                     "warning: keymap command:{CMD} needs a tiled leaf, found {current} — ignoring"
                 );
                 return;
             }
-        }
-        if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+            Some(id)
+        } else {
+            self.runtime.focused_view()
+        };
+        if !hiding || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
             self.restore_zoom();
         }
-        match self.runtime.scratchpad_toggle(Some(focused)) {
+        match self.runtime.scratchpad_toggle(focused) {
             Ok(None) => eprintln!("bitty: keymap command:{CMD} -> {focused:?} parked"),
             Ok(Some(restored)) => {
                 eprintln!("bitty: keymap command:{CMD} -> {restored:?} restored")
@@ -1612,9 +1616,28 @@ impl TerminalApp {
                 // Explicit directional splits always bisect the focused
                 // leaf, independent of `PanelLayoutMode` (which only
                 // controls the adaptive `NewPanel` path below).
-                let Some(target) = self.runtime.focused_view() else {
+                let Some(focused) = self.runtime.focused_view() else {
                     eprintln!("warning: keymap {label} has no focused pane — ignoring");
                     return false;
+                };
+                self.restore_zoom();
+                if self.runtime.layout().leaf_count() == 0 {
+                    self.create_panel_on_empty_base(focused);
+                    return false;
+                }
+                let target = if self.runtime.layout().find_leaf(focused).is_some() {
+                    focused
+                } else {
+                    let Some(fallback) = self
+                        .runtime
+                        .panel_split_plan()
+                        .map(|p| p.target)
+                        .or_else(|| self.runtime.layout().leaf_ids().into_iter().next())
+                    else {
+                        eprintln!("warning: keymap {label} found no target pane — ignoring");
+                        return false;
+                    };
+                    fallback
                 };
                 let _ =
                     self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
@@ -1791,6 +1814,7 @@ impl TerminalApp {
                     // workspace instead of a blank surface.
                     let prune_after_discard = self.runtime.floated_views() == vec![focused]
                         && self.runtime.layout().leaf_count() == 0
+                        && self.runtime.pinned_count() == 0
                         && self.runtime.workspace_count() > 1;
                     if self.runtime.discard_floating_view(focused) {
                         eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
@@ -2380,7 +2404,9 @@ impl TerminalApp {
                         return false;
                     }
                 };
-                if !self.runtime.pinned_views().contains(&focused) {
+                let pinning = !self.runtime.pinned_views().contains(&focused);
+                let from_float_store = self.runtime.floated_views().contains(&focused);
+                if pinning && !from_float_store {
                     let current = match self.runtime.layout().find_leaf(focused) {
                         Some(leaf) => leaf.presentation(),
                         None => {
@@ -2400,7 +2426,10 @@ impl TerminalApp {
                         return false;
                     }
                 }
-                if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                if !pinning
+                    || from_float_store
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1)
+                {
                     self.restore_zoom();
                 }
                 match self
@@ -11535,6 +11564,89 @@ claims = []
         assert!(
             TerminalApp::is_overlay_focus_switch(A::WorkspaceFocus(2)),
             "pure focus jumps still end the capture"
+        );
+    }
+
+    #[test]
+    fn chrome_scratchpad_toggle_alias_shows_on_empty_focus_restores_zoom_and_hides_scratchpad_stamped_leaf_3074()
+     {
+        use bitty_config::ChromeAction;
+        let toggle = ChromeAction::parse("toggle_scratchpad").expect("alias parses");
+
+        // 1. A leaf stamped `PresentationMode::Scratchpad` by a spawn rule can
+        // be hidden by `toggle_scratchpad`.
+        let mut app = workspace_test_app();
+        let mut seeded = two_pane_layout();
+        seeded
+            .find_leaf_mut(ViewId::new(1))
+            .expect("leaf 1")
+            .set_presentation(PresentationMode::Scratchpad);
+        app.runtime.set_layout(seeded);
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(toggle.clone());
+        assert!(
+            app.runtime.scratchpad_occupied(),
+            "rule-stamped Scratchpad leaf must hide into the scratchpad slot"
+        );
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+
+        // 2. Showing into a zoomed 1-leaf workspace restores zoom first so the
+        // restored scratchpad leaf does not get trapped in the zoom proxy.
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
+        app.apply_chrome_action(toggle.clone());
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "showing scratchpad into a zoomed 1-leaf workspace must restore zoom first"
+        );
+        assert!(!app.runtime.scratchpad_occupied());
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)]
+        );
+
+        // 3. Showing when `focused_view()` is `None` (e.g., emptied base) still
+        // restores the parked scratchpad leaf.
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(toggle.clone());
+        assert!(app.runtime.scratchpad_occupied());
+        let mut empty = app.runtime.layout().clone();
+        empty.remove_leaf(ViewId::new(2));
+        app.runtime.set_layout_closing(empty, ViewId::new(2));
+        assert_eq!(app.runtime.focused_view(), None);
+        app.apply_chrome_action(toggle);
+        assert!(!app.runtime.scratchpad_occupied());
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_toggle_pinned_pins_detached_float_and_new_split_splits_tiled_base_while_float_focused_3074()
+     {
+        use bitty_config::{ChromeAction, SplitDir};
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+
+        // Detach leaf 1 into the workspace float store (`Alt+A`), refocus it,
+        // and press `toggle_pinned`: it must pin cleanly into `pinned_views()`.
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert!(app.runtime.floated_views().contains(&ViewId::new(1)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::TogglePinned);
+        assert!(!app.runtime.floated_views().contains(&ViewId::new(1)));
+        assert!(app.runtime.pinned_views().contains(&ViewId::new(1)));
+
+        // While the pinned panel (outside `layout`) holds focus, `NewSplit` and
+        // `NewPanel` must split the surviving tiled base (`ViewId(2)`).
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert_eq!(
+            app.runtime.layout().leaf_count(),
+            2,
+            "new_split while a pinned panel is focused must split the tiled base"
         );
     }
 }

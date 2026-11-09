@@ -19114,3 +19114,53 @@ fn runtime_tick_block_inside_the_bound_stays_quiet() {
         "a block inside the bound must not report: {lines:?}"
     );
 }
+
+#[test]
+fn close_last_float_on_empty_base_keeps_workspace_and_focuses_pin_3074() {
+    let mut app = editor_test_app();
+    let host = app.runtime.focused_view().expect("seed focus");
+    let float_view = ViewId::new(2);
+    let pin_view = ViewId::new(3);
+    let host_leaf = app.runtime.layout().find_leaf(host).cloned().expect("host");
+    app.runtime.set_layout(LayoutNode::split(
+        bitty_runtime::SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(host_leaf),
+        LayoutNode::split(
+            bitty_runtime::SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(bitty_runtime::View::new(float_view, 40, 12)),
+            LayoutNode::leaf(bitty_runtime::View::new(pin_view, 40, 12)),
+        ),
+    ));
+    app.runtime.float_detach(float_view).expect("detach float");
+    app.runtime.pin_floating(pin_view).expect("pin");
+
+    // Open a second workspace and switch back to workspace 0 so workspace_count() > 1.
+    app.runtime.workspace_new().expect("ws2");
+    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.workspace_count(), 2);
+
+    // Retire the sole tiled leaf in workspace 0 so only `float_view` and window-global `pin_view` remain.
+    assert_eq!(
+        app.runtime.retire_sole_tiled_leaf_for_floated(host),
+        Some(float_view)
+    );
+    assert_eq!(app.runtime.layout().leaf_count(), 0);
+    assert_eq!(app.runtime.focused_view(), Some(float_view));
+
+    // Closing `float_view` via `CloseView` must NOT prune workspace 0 while `pin_view`
+    // survives; instead it must keep workspace 0 active and hand focus to `pin_view`.
+    assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
+    assert_eq!(
+        app.runtime.workspace_count(),
+        2,
+        "workspace must not be pruned while a window-global pinned panel survives"
+    );
+    assert_eq!(app.runtime.active_workspace_index(), 0);
+    assert_eq!(
+        app.runtime.focused_view(),
+        Some(pin_view),
+        "focus must fall back to the surviving pinned panel"
+    );
+}

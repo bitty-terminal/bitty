@@ -118,6 +118,15 @@ pub struct SysfsBacklightSource {
 /// Maximum device entries scanned per poll (bounded enumeration).
 const BACKLIGHT_MAX_DEVICES: usize = 32;
 
+fn is_valid_backlight_device_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 impl SysfsBacklightSource {
     /// Binds the standard Linux class root.
     #[must_use]
@@ -140,12 +149,7 @@ impl SysfsBacklightSource {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.is_empty()
-                    || name.len() > 64
-                    || name.contains('/')
-                    || name.contains('\0')
-                    || name.starts_with('.')
-                {
+                if !is_valid_backlight_device_name(&name) {
                     return None;
                 }
                 Some(name)
@@ -176,7 +180,7 @@ impl BacklightSource for SysfsBacklightSource {
     }
 
     fn levels(&mut self, device: &str) -> Option<(u32, u32)> {
-        if device.is_empty() || device.len() > 64 || device.contains('/') || device.contains('\0') {
+        if !is_valid_backlight_device_name(device) {
             return None;
         }
         self.read_levels(device)
@@ -210,11 +214,7 @@ impl SysfsBacklightBackend {
     }
 
     fn brightness_path(&self) -> Option<PathBuf> {
-        if self.device.is_empty()
-            || self.device.len() > 64
-            || self.device.contains('/')
-            || self.device.contains('\0')
-        {
+        if !is_valid_backlight_device_name(&self.device) {
             return None;
         }
         Some(
@@ -587,5 +587,33 @@ mod tests {
         let mut bridge = IdleBridge::new(NoIdleSource);
         bridge.set_grants(GrantSet::new(vec![IDLE_READ_HEAD.to_string()]));
         assert_eq!(bridge.get(&FakeClock { now: 0 }), None);
+    }
+
+    #[test]
+    fn sysfs_backlight_rejects_dot_and_backslash_device_names() {
+        let dir = std::env::temp_dir().join(format!("bitty-backlight-{}", std::process::id()));
+        let class_root = dir.join("class_backlight");
+        std::fs::create_dir_all(&class_root).expect("fixture class_root");
+        std::fs::write(dir.join(BACKLIGHT_BRIGHTNESS_FILE), "500\n").expect("parent brightness");
+        std::fs::write(dir.join(BACKLIGHT_MAX_FILE), "1000\n").expect("parent max");
+
+        let mut source = SysfsBacklightSource::with_root(class_root.clone());
+        assert_eq!(source.levels(".."), None);
+        assert_eq!(source.levels("."), None);
+        assert_eq!(source.levels(".hidden"), None);
+        assert_eq!(source.levels("intel\\0"), None);
+
+        let mut backend = SysfsBacklightBackend::with_root(class_root, "..".to_string());
+        assert!(!backend.permitted());
+        assert!(backend.write_brightness(999).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(BACKLIGHT_BRIGHTNESS_FILE))
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("500"),
+            "parent brightness must never be modified via .. device name"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

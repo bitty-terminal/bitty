@@ -125,6 +125,18 @@ pub struct FsPowerSupply {
     root: PathBuf,
 }
 
+/// Maximum power-supply entries scanned per poll (bounded enumeration).
+const POWER_SUPPLY_MAX_DEVICES: usize = 64;
+
+fn is_valid_supply_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 impl FsPowerSupply {
     /// Reader over the contract root.
     #[must_use]
@@ -142,6 +154,9 @@ impl FsPowerSupply {
 
     /// Read one supply file; absent/unreadable stays `None` (fail-closed).
     fn read_entry(&self, name: &str, file: &str) -> Option<String> {
+        if !is_valid_supply_name(name) {
+            return None;
+        }
         std::fs::read_to_string(self.root.join(name).join(file)).ok()
     }
 }
@@ -151,11 +166,16 @@ impl SysfsBatterySource for FsPowerSupply {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new();
         };
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
+        let mut names: Vec<String> = entries
+            .take(POWER_SUPPLY_MAX_DEVICES + 1)
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                is_valid_supply_name(&name).then_some(name)
+            })
+            .collect();
         names.sort();
+        names.truncate(POWER_SUPPLY_MAX_DEVICES);
         names
             .into_iter()
             .map(|name| SysfsBatteryRaw {
@@ -726,23 +746,51 @@ mod tests {
     #[test]
     fn live_sysfs_reader_lists_fixture_dir() {
         let dir = std::env::temp_dir().join(format!("bitty-battery-{}", std::process::id()));
-        let bat = dir.join("BAT0");
+        // Root is `<dir>/supplies` so a `..` segment resolves to `<dir>` itself,
+        // where a matching file is planted: the guard is what refuses it, not a
+        // missing target. Every rejected name below has a readable `capacity`
+        // behind it, so removing the validation makes these assertions fail.
+        let root = dir.join("supplies");
+        let bat = root.join("BAT0");
         std::fs::create_dir_all(&bat).expect("fixture dir");
         std::fs::write(bat.join("type"), "Battery\n").expect("type");
         std::fs::write(bat.join("capacity"), "42\n").expect("capacity");
         std::fs::write(bat.join("status"), "Charging\n").expect("status");
-        std::fs::write(dir.join("AC").join("type"), "Mains").ok();
-        std::fs::create_dir_all(dir.join("AC")).ok();
-        std::fs::write(dir.join("AC").join("type"), "Mains\n").ok();
-        let reader = FsPowerSupply::with_root(dir.clone());
+        std::fs::create_dir_all(root.join("AC")).expect("AC dir");
+        std::fs::write(root.join("AC").join("type"), "Mains\n").expect("AC type");
+        // Escape target for a `..` segment.
+        std::fs::write(dir.join("capacity"), "99\n").expect("escape target");
+        // Real directory entries that the enumeration filter must drop.
+        let dot_entry = root.join(".hidden");
+        std::fs::create_dir_all(&dot_entry).expect("dot dir");
+        std::fs::write(dot_entry.join("type"), "Battery\n").expect("dot type");
+        let long_name = "L".repeat(65);
+        let long_entry = root.join(&long_name);
+        std::fs::create_dir_all(&long_entry).expect("long dir");
+        std::fs::write(long_entry.join("type"), "Battery\n").expect("long type");
+
+        let reader = FsPowerSupply::with_root(root.clone());
         let raws = reader.sample();
+        let listed: Vec<&str> = raws.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            listed,
+            vec!["AC", "BAT0"],
+            "enumeration must drop dot-prefixed and oversized entries"
+        );
         let bat_raw = raws.iter().find(|r| r.name == "BAT0").expect("BAT0 listed");
         assert_eq!(bat_raw.capacity_text.as_deref().map(str::trim), Some("42"));
         let mut provider =
-            BatteryProvider::with_policy(NoUpower, FsPowerSupply::with_root(dir.clone()), 5000);
+            BatteryProvider::with_policy(NoUpower, FsPowerSupply::with_root(root.clone()), 5000);
         let snapshot = provider.get(0, true).expect("fixture serves");
         assert!((snapshot.capacity_pct - 42.0).abs() < 1e-9);
         assert_eq!(snapshot.state, BatteryState::Charging);
+        // All of these targets exist on disk; only the name validation refuses.
+        assert_eq!(reader.read_entry("..", "capacity"), None);
+        assert_eq!(reader.read_entry(".hidden", "capacity"), None);
+        assert_eq!(reader.read_entry(&long_name, "capacity"), None);
+        // NUL cannot name a real file, so this one stays a fail-closed smoke
+        // assertion rather than a discriminating fixture.
+        assert_eq!(reader.read_entry("BAT\0", "capacity"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

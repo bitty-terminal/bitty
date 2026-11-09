@@ -98,9 +98,9 @@ impl Runtime {
             .unwrap_or(&self.state)
     }
 
-    /// Leaf of the View copy mode is bound to, if still in the layout.
+    /// Leaf or overlay view the active copy mode is bound to, if still live.
     fn copy_view(&self) -> Option<&View> {
-        self.copy_mode_view.and_then(|id| self.layout.find_leaf(id))
+        self.copy_mode_view.and_then(|id| self.find_view(id))
     }
 
     /// Whether the bound copy-mode View still resolves to a live grid.
@@ -238,5 +238,58 @@ impl Runtime {
         }
         let _ = event;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitty_ui::{LayoutNode, SplitAxis};
+
+    #[test]
+    fn copy_view_and_copy_space_resolve_scrolled_detached_float_and_pinned_view() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        for i in 0..40 {
+            rt.handle_pty_bytes(format!("line-{i:02}\r\n").as_bytes());
+        }
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        let v1 = ViewId::new(1);
+        rt.float_detach(v1).expect("detach v1");
+        let sb_len = rt.state().scrollback_len();
+        rt.find_view_mut(v1)
+            .expect("float view")
+            .set_scroll_offset(5, sb_len);
+        rt.copy_mode_view = Some(v1);
+
+        let rows = usize::from(
+            rt.copy_view()
+                .expect("copy_view must resolve detached float")
+                .rows(),
+        );
+        assert!(rt.is_copy_space_scrolled());
+        let space = rt.copy_space();
+        assert_eq!(
+            space.origin,
+            (sb_len + rt.state().height())
+                .saturating_sub(rows)
+                .saturating_sub(5)
+        );
+
+        // Also verify when v1 is pinned.
+        rt.float_restore(v1).expect("restore float v1");
+        rt.pin_floating(v1).expect("pin v1");
+        rt.find_view_mut(v1)
+            .expect("pinned view")
+            .set_scroll_offset(5, sb_len);
+        assert!(
+            rt.copy_view().is_some(),
+            "copy_view must resolve pinned view"
+        );
+        assert!(rt.is_copy_space_scrolled());
     }
 }

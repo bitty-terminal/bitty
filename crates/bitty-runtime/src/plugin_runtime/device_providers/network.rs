@@ -123,6 +123,15 @@ const PROC_NET_ROUTE_MAX_BYTES: usize = 65_536;
 /// Maximum route rows scanned (bounded enumeration).
 const PROC_NET_ROUTE_MAX_ROWS: usize = 128;
 
+fn is_valid_ifname(iface: &str) -> bool {
+    !iface.is_empty()
+        && iface.len() <= 16
+        && !iface.starts_with('.')
+        && !iface.contains('/')
+        && !iface.contains('\\')
+        && !iface.contains('\0')
+}
+
 impl SysfsNetLink {
     /// Binds the standard Linux roots.
     #[must_use]
@@ -158,7 +167,7 @@ impl SysfsNetLink {
             if destination != "00000000" {
                 continue;
             }
-            if iface.is_empty() || iface.len() > 16 || iface.contains('/') || iface.contains('\0') {
+            if !is_valid_ifname(iface) {
                 continue;
             }
             let metric: u64 = fields[6].parse().unwrap_or(u64::MAX);
@@ -181,7 +190,7 @@ impl NetLinkSource for SysfsNetLink {
     }
 
     fn operstate(&mut self, ifname: &str) -> Option<String> {
-        if ifname.is_empty() || ifname.len() > 16 || ifname.contains('/') || ifname.contains('\0') {
+        if !is_valid_ifname(ifname) {
             return None;
         }
         let path = Path::new(&self.class_net).join(ifname).join("operstate");
@@ -189,7 +198,7 @@ impl NetLinkSource for SysfsNetLink {
     }
 
     fn medium_is_wifi(&mut self, ifname: &str) -> Option<bool> {
-        if ifname.is_empty() || ifname.len() > 16 || ifname.contains('/') || ifname.contains('\0') {
+        if !is_valid_ifname(ifname) {
             return None;
         }
         let wireless = Path::new(&self.class_net).join(ifname).join("wireless");
@@ -470,13 +479,34 @@ mod tests {
 
     #[test]
     fn sysfs_link_rejects_path_escape() {
-        let link = SysfsNetLink::with_roots(
-            std::path::PathBuf::from("/sys/class/net"),
-            std::path::PathBuf::from("/proc/net/route"),
-        );
-        let mut link = link;
+        let dir = std::env::temp_dir().join(format!("bitty-netlink-{}", std::process::id()));
+        let class_net = dir.join("class_net");
+        let route_file = dir.join("route");
+        std::fs::create_dir_all(&class_net).expect("fixture class_net");
+        // Plant parent-level files that `..` would hit if dot-segments were allowed.
+        std::fs::write(dir.join("operstate"), "up\n").expect("parent operstate");
+        std::fs::create_dir_all(dir.join("wireless")).expect("parent wireless");
+        std::fs::write(
+            &route_file,
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n\
+             ..\t00000000\t0101A8C0\t0003\t0\t0\t10\t00000000\n\
+             .hidden\t00000000\t0101A8C0\t0003\t0\t0\t20\t00000000\n\
+             eth\\0\t00000000\t0101A8C0\t0003\t0\t0\t30\t00000000\n",
+        )
+        .expect("route fixture");
+        let mut link = SysfsNetLink::with_roots(class_net, route_file);
         assert_eq!(link.operstate("../evil"), None);
+        assert_eq!(link.operstate(".."), None);
+        assert_eq!(link.operstate("."), None);
+        assert_eq!(link.operstate(".hidden"), None);
+        assert_eq!(link.operstate("eth\\0"), None);
         assert_eq!(link.operstate(""), None);
         assert_eq!(link.medium_is_wifi("a/b"), None);
+        assert_eq!(link.medium_is_wifi(".."), None);
+        assert_eq!(link.medium_is_wifi("."), None);
+        assert_eq!(link.medium_is_wifi(".hidden"), None);
+        assert_eq!(link.medium_is_wifi("eth\\0"), None);
+        assert_eq!(link.default_route_iface(), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

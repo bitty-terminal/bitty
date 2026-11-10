@@ -1241,13 +1241,17 @@ impl UiBlocks {
         Ok(true)
     }
 
-    /// Drop one block by handle, releasing its retained-string budget.
+    /// Drop one block by handle, releasing its slot and its retained-string
+    /// budget (`bitty.ui.unmount`, issue #3106).
     ///
-    /// Used to roll back a spec-acquired surface when capture acquisition
-    /// fails, so a denied acquire leaves no orphan block behind. Returns
-    /// whether a block was removed. The epoch and monotonic counter are
-    /// kept, so removed handles never alias later ones.
-    fn remove(&mut self, handle: i64) -> bool {
+    /// Returns whether a block was removed: a stale, foreign, or unknown
+    /// handle reports `false` and leaves the registry untouched. The epoch
+    /// and monotonic counter are kept, so a released handle never aliases a
+    /// later one and `update`/`unmount` on it keep reporting `false`. Used by
+    /// the `bitty.ui.unmount` surface and to roll back a spec-acquired
+    /// surface when capture acquisition fails, so a denied acquire leaves no
+    /// orphan block behind.
+    pub fn unmount(&mut self, handle: i64) -> bool {
         let Some(position) = self
             .blocks
             .iter()
@@ -3207,7 +3211,39 @@ impl PluginServices {
     /// Rolls back a spec-acquired surface when capture acquisition fails, so
     /// a denied acquire leaves no orphan block behind.
     fn remove_ui_block(&self, handle: i64) -> bool {
-        self.ui_blocks.borrow_mut().remove(handle)
+        self.ui_blocks.borrow_mut().unmount(handle)
+    }
+
+    /// Release one handle this generation mounted (`bitty.ui.unmount`,
+    /// issue #3106).
+    ///
+    /// Covers every handle kind `bitty.ui.mount` mints:
+    ///
+    /// - a v1 band/overlay block: the block leaves the registry and its
+    ///   retained-string bytes are refunded to the 2 MiB aggregate budget;
+    /// - a `terminal`-slot rich scene: the scene host detaches it and disposes
+    ///   the Core-owned panel (owner- and epoch-gated, idempotent);
+    /// - a spec-acquired overlay surface: its bookkeeping entry leaves with it.
+    ///
+    /// A *live* overlay capture handle is refused with `false` and no change:
+    /// that surface's lifecycle belongs to `bitty.ui.overlay.release`, which
+    /// also ends the input-capture session, so releasing the block here would
+    /// leave a capture pointed at a surface that no longer exists. Stale,
+    /// foreign, and unknown handles report `false` and change nothing (the
+    /// documented `ui.update` contract).
+    pub fn unmount_ui_block(&self, handle: i64) -> bool {
+        if crate::scene_host::is_scene_handle(handle) {
+            let Some(backend) = self.ui_scene_backend.borrow().clone() else {
+                return false;
+            };
+            return backend.detach(&self.plugin_id, self.ui_epoch.get(), handle);
+        }
+        if let Some(capture) = self.overlay_capture() {
+            if capture.borrow().is_owner(&self.plugin_id, handle) {
+                return false;
+            }
+        }
+        self.remove_spec_overlay_block(handle) || self.remove_ui_block(handle)
     }
 
     /// Record a spec-acquired surface, dropping any stale spec surface of
@@ -5818,6 +5854,20 @@ impl HostServices for PluginServices {
         self.ui_blocks
             .borrow_mut()
             .update(handle, component.clone())
+    }
+
+    /// Release one mounted handle (`bitty.ui.unmount`, issue #3106).
+    ///
+    /// Same grant as `mount`/`update` (`ui.rich`): a generation that may
+    /// create a block may also drop it, and a generation that may not create
+    /// one gains nothing from unmounting. The removal itself is
+    /// [`Self::unmount_ui_block`], so a stale, foreign, or unknown handle
+    /// reports `Ok(false)` and changes nothing.
+    fn ui_unmount(&self, handle: i64) -> Result<bool, BridgeError> {
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        Ok(self.unmount_ui_block(handle))
     }
 
     fn ui_overlay_acquire_with_expiry(
@@ -9403,6 +9453,242 @@ mod tests {
             "stale handle must report false"
         );
         services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    }
+
+    /// bitty#3106: `ui.unmount` releases the block slot, so a mount/unmount
+    /// cycle frees the registry instead of charging it for the generation.
+    #[test]
+    fn ui_unmount_releases_the_block_and_kills_the_handle() {
+        let services = ui_services(rich_only());
+        let handle = services
+            .ui_mount("bottom", &UiNode::text("live"))
+            .expect("mount");
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+
+        assert!(
+            services.ui_unmount(handle).expect("unmount served"),
+            "a live handle must report true"
+        );
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.is_empty(),
+                "the released block must leave the registry"
+            );
+            assert!(
+                blocks.get(handle).is_none(),
+                "the released handle must not resolve"
+            );
+        });
+
+        // The handle is dead in both directions: no update, no second release.
+        assert!(
+            !services
+                .ui_update(handle, &UiNode::text("late"))
+                .expect("stale update is not an error"),
+            "an update after unmount must report false"
+        );
+        assert!(
+            !services
+                .ui_unmount(handle)
+                .expect("stale unmount is not an error"),
+            "a second unmount must report false"
+        );
+
+        // The slot is free again, and the released handle is never re-minted.
+        let fresh = services
+            .ui_mount("bottom", &UiNode::text("next"))
+            .expect("re-mount");
+        assert_ne!(fresh, handle, "a released handle must never be re-minted");
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    }
+
+    /// bitty#3106: the retained-string aggregate (2 MiB) is charged per block,
+    /// so releasing a block must refund its bytes — otherwise a plugin that
+    /// cycles large views still exhausts the budget for the generation.
+    #[test]
+    fn ui_unmount_refunds_the_aggregated_retained_string_budget() {
+        // Eight 250 KiB blocks sit just under the 2 MiB aggregate cap.
+        let chunk = "x".repeat(250 * 1024);
+        let services = ui_services(rich_only());
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            handles.push(
+                services
+                    .ui_mount("bottom", &UiNode::text(chunk.clone()))
+                    .unwrap_or_else(|error| panic!("mount {index}: {error:?}")),
+            );
+        }
+        let error = services
+            .ui_mount("bottom", &UiNode::text(chunk.clone()))
+            .expect_err("the aggregate budget must fail closed");
+        assert_eq!(error.code, "E_UI_BLOCK_BUDGET");
+
+        // Releasing one block refunds its retained bytes, so the same mount
+        // fits again without a reload.
+        assert!(services.ui_unmount(handles[0]).expect("unmount served"));
+        services
+            .ui_mount("bottom", &UiNode::text(chunk.clone()))
+            .expect("the refunded budget must admit the mount");
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 8));
+    }
+
+    /// bitty#3106: the documented `ui.update` stale/foreign contract applies to
+    /// `unmount` too — `false`, no error, and nothing changed.
+    #[test]
+    fn ui_unmount_reports_false_for_unknown_and_foreign_handles() {
+        let first = ui_services(rich_only());
+        first.set_ui_epoch(7);
+        let handle = first
+            .ui_mount("bottom", &UiNode::text("gen1"))
+            .expect("mount");
+        let second = ui_services(rich_only());
+        second.set_ui_epoch(8);
+        let own = second
+            .ui_mount("bottom", &UiNode::text("gen2"))
+            .expect("mount");
+
+        assert!(
+            !second
+                .ui_unmount(handle)
+                .expect("a foreign handle is not an error"),
+            "a handle from another generation must report false"
+        );
+        second.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "a foreign unmount must release nothing");
+            assert!(
+                blocks.get(own).is_some(),
+                "the generation's own block stays"
+            );
+        });
+        for unknown in [own + 999, -1, 0, i64::MAX] {
+            assert!(
+                !second
+                    .ui_unmount(unknown)
+                    .expect("an unknown handle is not an error"),
+                "{unknown}: an unknown handle must report false"
+            );
+        }
+        second.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+        first.with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "the owner still holds its block")
+        });
+    }
+
+    /// bitty#3106: release is gated on `ui.rich` like `mount`/`update`, and a
+    /// refusal leaves the block retained.
+    #[test]
+    fn ui_unmount_without_ui_rich_is_refused() {
+        let services = ui_services(rich_only());
+        let handle = services
+            .ui_mount("bottom", &UiNode::text("x"))
+            .expect("mount");
+        services.set_ui_access(UiAccess::default());
+        let error = services
+            .ui_unmount(handle)
+            .expect_err("a generation without ui.rich must be refused");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert!(error.message.contains("ui.rich"), "{error:?}");
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(handle).is_some(),
+                "a refused release changes nothing"
+            )
+        });
+    }
+
+    /// bitty#3106, the motivating failure: a plugin that opens and closes a
+    /// view reuses nothing, so a mount/unmount loop must not exhaust the
+    /// 64-block registry.
+    #[test]
+    fn mount_unmount_loop_never_exhausts_the_block_budget() {
+        let services = ui_services(rich_only());
+        for cycle in 0..(UI_MAX_BLOCKS * 4) {
+            let handle = services
+                .ui_mount("bottom", &UiNode::text("row"))
+                .unwrap_or_else(|error| panic!("cycle {cycle}: mount refused: {error:?}"));
+            assert!(
+                services
+                    .ui_unmount(handle)
+                    .unwrap_or_else(|error| panic!("cycle {cycle}: unmount refused: {error:?}")),
+                "cycle {cycle}: a freshly mounted handle must release"
+            );
+        }
+        services
+            .with_ui_blocks(|blocks| assert!(blocks.is_empty(), "every cycle released its block"));
+    }
+
+    /// bitty#3106: a live overlay *capture* surface is owned by
+    /// `ui.overlay.release` (which also ends the capture session), so
+    /// `unmount` refuses it instead of orphaning a capture; once the session
+    /// ends, the same handle releases normally.
+    #[test]
+    fn ui_unmount_refuses_a_live_overlay_capture_surface() {
+        let services = focus_services();
+        let handle = mount_and_acquire(&services);
+        assert!(
+            !services
+                .ui_unmount(handle)
+                .expect("the capture path owns the surface"),
+            "a live capture handle must report false"
+        );
+        services.with_ui_blocks(|blocks| {
+            assert!(
+                blocks.get(handle).is_some(),
+                "a refused release leaves the surface mounted"
+            )
+        });
+
+        assert!(
+            services.ui_overlay_release(handle).expect("release served"),
+            "the capture owner releases its session"
+        );
+        assert!(
+            services
+                .ui_unmount(handle)
+                .expect("unmount after the session ended"),
+            "the surface releases once no capture owns it"
+        );
+        services.with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+    }
+
+    /// bitty#3106: a `terminal`-slot scene handle unmounts through the Core
+    /// scene host, which detaches the scene and retires the panel.
+    #[test]
+    fn ui_unmount_detaches_a_terminal_scene_and_retires_its_panel() {
+        let services = ui_services(rich_only());
+        let panels = Rc::new(RefCell::new(
+            crate::registry::PanelRuntime::new(crate::registry::PanelRegistryConfig::default())
+                .expect("panel host"),
+        ));
+        let target = Rc::new(Cell::new(Some(crate::ViewId::new(7))));
+        let scene = Rc::new(crate::scene_host::SceneHost::new(
+            Rc::clone(&panels),
+            Rc::clone(&target),
+        ));
+        services.set_ui_scene_backend(Some(Rc::clone(&scene)));
+        let node = bitty_lua::UiRichNode::Text {
+            text: "scene".to_string(),
+            bold: false,
+        };
+        let handle = services
+            .ui_mount_scene("terminal", &node)
+            .expect("scene mount");
+        assert!(services.ui_is_scene_handle(handle));
+
+        assert!(
+            services.ui_unmount(handle).expect("scene unmount served"),
+            "a live scene handle must report true"
+        );
+        assert_eq!(scene.scene_count(), 0, "the scene is detached");
+        assert_eq!(panels.borrow().panel_count(), 0, "the panel is retired");
+        assert!(
+            !services.ui_unmount(handle).expect("stale scene unmount"),
+            "a released scene handle must report false"
+        );
+        let next = services
+            .ui_mount_scene("terminal", &node)
+            .expect("re-mount after unmount");
+        assert_ne!(next, handle, "a released scene handle is never re-minted");
     }
 
     #[test]

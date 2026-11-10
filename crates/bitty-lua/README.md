@@ -99,6 +99,27 @@ The caps are unchanged (64 blocks and 2 MiB of retained strings per plugin
 generation); `unmount` makes them reclaimable inside a generation instead of
 only at teardown.
 
+## Lua surface: `bitty.ui.state` (issue #3107)
+
+```lua
+local handle, err = bitty.ui.mount("bottom", scene)  -- needs ui.rich
+local state = bitty.ui.state(handle)                 -- { presented = bool, focused = bool } or nil
+```
+
+A plugin that mounts a block and schedules periodic refreshes (`bitty.timers.create`)
+needs a way to tell whether its block is currently presented and whether its
+host surface holds focus, so it can pause or skip refresh work while hidden or
+unfocused (for example on `focus.changed`). `bitty.ui.state(handle)` queries the
+mounted block's live state under the same `ui.rich` grant as `mount`, `update`,
+and `unmount`.
+
+| Item     | Contract                                                                                                                                                                                                                                       |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument | An integer handle this generation received from `bitty.ui.mount`. A non-integer fails closed with `E_UI_COMPONENT_INVALID`.                                                                                                                    |
+| Result   | `{ presented = boolean, focused = boolean }` for a live handle owned by this generation; `nil` for a stale, unmounted, foreign, or unknown handle (matching the `ui.update`/`ui.unmount` stale-handle contract).                                |
+| Grant    | `ui.rich`, the same grant `mount`/`update`/`unmount` need. Without it the call fails closed with `E_CAPABILITY_DENIED`.                                                                                                                        |
+| Slots    | `top`/`bottom`/`tabline`: `presented` is `true` when the band is non-empty (reserves its row and paints), and `focused` is `presented and window_focused`. `overlay`: `presented` is `true` while the block owns capture or the presentation overlay session, and `focused` is `true` only while it owns capture and the window is focused. `terminal`: `presented` is `true` while the rich scene is attached, and `focused` is `true` when the scene's panel view is the focused target and the window is focused. |
+
 ## Lua surface: `process.spawn` working directory (CTX-1715)
 
 ```lua
@@ -252,8 +273,8 @@ selected.
 - `src/lib.rs` — crate docs with the role, budgets, and determinism sections.
 - `src/host.rs` — VM lifecycle, budget enforcement, and host calls.
 - `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /
-  `bitty.ui.update` / `bitty.ui.unmount`), the closed v1 `UiSlot` enum, and
-  the bounded `UiNode` model.
+  `bitty.ui.update` / `bitty.ui.unmount` / `bitty.ui.state`), the closed v1
+  `UiSlot` enum, and the bounded `UiNode` model.
 - `src/keymaps.rs` — bounded keymap/action registry page for
   `bitty.keymaps.list()` (issue #2405): canonical rows, 256-row pages, the
   1024-row addressable cap, and 64 KiB whole-row tail truncation.

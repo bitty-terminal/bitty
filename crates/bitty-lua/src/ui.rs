@@ -166,6 +166,21 @@ pub const UI_SLOTS: [&str; 7] = [
     UiSlot::Overlay.as_str(),
 ];
 
+/// Mounted-block visibility and focus state returned by `bitty.ui.state(handle)`
+/// (issue #3107).
+///
+/// A stale, unmounted, foreign, or unknown handle returns `None` (`nil` in Lua)
+/// without raising an error, matching the `ui.update`/`ui.unmount` stale-handle
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiBlockState {
+    /// Whether the block currently paints on the host surface (non-empty band,
+    /// active capture or presentation overlay, or attached `terminal` scene).
+    pub presented: bool,
+    /// Whether the block's host surface currently holds focus.
+    pub focused: bool,
+}
+
 /// v1 declarative node kinds accepted by the Lua bridge.
 pub const UI_V1_NODE_KINDS: [&str; 4] = ["Text", "Row", "Column", "List"];
 

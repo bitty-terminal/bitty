@@ -6289,7 +6289,11 @@ impl Runtime {
             if span.is_empty() || cells == 0 {
                 continue;
             }
-            let fg = run.fg.as_deref().map_or(default_fg, |token| {
+            let fg_token = run
+                .fg
+                .as_deref()
+                .or_else(|| super::band_host::default_band_run_fg_token(run));
+            let fg = fg_token.map_or(default_fg, |token| {
                 resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
                     self.band_stats.unknown_tokens =
                         self.band_stats.unknown_tokens.saturating_add(1);
@@ -6339,11 +6343,11 @@ impl Runtime {
         if painted_any {
             layers.any_needs_draw = true;
         }
-        // CTX-1477 (issue #2468): shared band chrome is a thin muted rule on
-        // the content-facing edge. A one-row band has no room for a sub-cell
-        // radius, so it uses the documented grid-corner path: rounded
-        // box-drawing corners only when the corner cell is blank, otherwise
-        // the square rule (never overdraw plugin text).
+        // CTX-1477 (issue #2468) + bitty#3108: shared band chrome is a thin
+        // muted rule on the content-facing edge. The rule is drawn alone —
+        // rounded box-drawing corners are NOT overlaid on the band cells, so a
+        // leading-space workspace pill and a short right-aligned group are
+        // never overdrawn (bitty#3108 defect 1).
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule_h = chrome.border_px.max(1);
@@ -6804,7 +6808,11 @@ impl Runtime {
             if span.is_empty() || cells == 0 {
                 continue;
             }
-            let fg = run.fg.as_deref().map_or(default_fg, |token| {
+            let fg_token = run
+                .fg
+                .as_deref()
+                .or_else(|| super::band_host::default_band_run_fg_token(run));
+            let fg = fg_token.map_or(default_fg, |token| {
                 resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
                     self.band_stats.unknown_tokens =
                         self.band_stats.unknown_tokens.saturating_add(1);
@@ -7557,14 +7565,16 @@ impl Runtime {
                 };
                 // Live-grid rows are already scrolled truth, so the
                 // scrollback delta is the viewport window start only.
-                let Some(tile) = bitty_rich::unicode_run_rect(
-                    &run,
-                    &cells,
-                    &proto.as_unicode_virtual(),
-                    metrics,
-                    window_start,
-                    0,
-                ) else {
+                let mut uv = proto.as_unicode_virtual();
+                if (uv.image_width == 0 || uv.image_height == 0)
+                    && let Some(stored) = self.kitty_images.get(image)
+                {
+                    uv.image_width = stored.width;
+                    uv.image_height = stored.height;
+                }
+                let Some(tile) =
+                    bitty_rich::unicode_run_rect(&run, &cells, &uv, metrics, window_start, 0)
+                else {
                     continue;
                 };
                 let Some(visible) = tile.rect.intersection(&tile.full) else {

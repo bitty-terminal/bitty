@@ -405,12 +405,15 @@ pub fn list_help_text(invoked_as: &str) -> String {
            fonts      Discovered system font faces (family, style, source; capped at 512 rows).\n  \
            plugins    Static bundled plugin catalog metadata (no VM loaded).\n  \
            instances  Live instance discovery (instance, socket, live).\n  \
-                      Windows serves the same instance-derived named pipe and verifies process\n  \
-                      identity before reporting live.\n  \
+                      Windows serves the same instance-derived named pipe and verifies process identity before reporting live.\n  \
            actions    Action catalog (`ChromeAction` + `core.*` commands) with `manual_bind_only`\n  \
                       and effective `binding`.\n  \
            keymaps    Resolved chord-to-action table and `mod_key` context (`alt` default, `super` when rebound).\n  \
            services   Registered extension interfaces (one row per `backing_head`, no VM loaded).\n\
+         \n\
+         Output (--format json|jsonl): versioned envelope v:1 —\n  \
+           {{\"v\":1,\"command\":\"list|ls\",\"ok\":true,\"result\":<per-kind>}} plus \"error\" on failure;\n  \
+           jsonl emits one row per line and diagnostics stay on stderr.\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \

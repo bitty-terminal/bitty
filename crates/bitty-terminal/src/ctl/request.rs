@@ -285,7 +285,7 @@ pub fn ctl_help_text() -> String {
            instance list                 local discovery (no IPC; same-UID sockets only)\n  \
            window list                   core.window.list (view.inspect)\n  \
            view list                     core.view.list (view.inspect)\n  \
-           view split [--dir]            core.view.split (view.manage; default --right)\n  \
+           view split [--left|--right|--up|--down]  core.view.split (view.manage; default --right)\n  \
            view focus v:N                core.view.focus (view.manage)\n  \
            panel list                    core.panel.list (view.inspect; tiled panels with bounds/role)\n  \
            terminal list                 core.terminal.list (terminal.inspect)\n  \
@@ -306,8 +306,8 @@ pub fn ctl_help_text() -> String {
            consent revoke-session        core.consent.revoke_session\n\
          \n\
          Notes:\n  \
-           - Platform: Unix uses the instance socket; Windows uses the instance-derived named pipe\n  \
-             (current-user ACL plus SID check). Without a target, verbs report no live instance (exit 6).\n  \
+           - Platform: Unix uses the instance socket; Windows uses the instance-derived named pipe (current-user ACL plus SID check).\n  \
+           Without a target, verbs report no live instance (exit 6).\n  \
            - Elevation: only terminal spawn, terminal close (terminal.manage), workspace close (terminal.manage),\n  \
              and config reload (config.modify) need BITTY_CTL_ELEVATE; without it those four verbs fail closed (exit 7).\n  \
              view split / view focus (view.manage) and workspace list / new / focus / move / rename / move-panel need no elevation.\n  \

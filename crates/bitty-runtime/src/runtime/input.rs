@@ -2229,6 +2229,18 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // bitty#3108 review: a compositor-grabbed chord (Super+S on a
+            // tiling WM) never delivers its key release to this window, so a
+            // modifier latch set on press stays armed forever and the
+            // snap-to-live on typing is suppressed for the rest of the
+            // session. Focus loss is capture loss for the keyboard too; the
+            // next `ModifiersChanged` snapshot re-syncs every latch.
+            self.shift_pressed = false;
+            self.control_pressed = false;
+            self.alt_pressed = false;
+            self.super_pressed = false;
+            self.hyper_pressed = false;
+            self.meta_pressed = false;
             // bitty#2938: focus loss ends a captured drag (no release will
             // reach this window); re-entry motion must not report it.
             self.mouse_drag_button = None;

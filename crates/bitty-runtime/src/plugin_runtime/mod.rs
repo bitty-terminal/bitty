@@ -3674,6 +3674,43 @@ impl PluginRuntime {
         result
     }
 
+    /// Reloads any non-bundled plugin that transitioned to
+    /// [`LifecycleState::Failed`] due to a transient `RC-1 wall` slice timeout.
+    ///
+    /// Long-running UI chrome plugins (`bitty-terminal.bar`, etc.) fire periodic
+    /// timers every few seconds; a single OS scheduling stall or kernel ACPI EC
+    /// read spike over multi-hour uptime can trip the 50 ms slice wall budget and
+    /// roll back the plugin's UI band. Calling this from the application host
+    /// after timer/config ticks re-activates the plugin cleanly without masking
+    /// deterministic `init.lua` or `RC-2 memory` / `RC-1 instructions` failures.
+    pub fn recover_wall_failed_plugins(&mut self) -> usize {
+        let candidates: Vec<PluginId> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                if entry.package.source_class.is_bundled() {
+                    return None;
+                }
+                match &entry.state {
+                    LifecycleState::Failed(reason) if reason.contains("RC-1 wall") => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut recovered = 0;
+        for id in candidates {
+            if self.reload_inner(&id).is_ok() {
+                recovered += 1;
+            }
+        }
+        if recovered > 0 {
+            self.sync_debug_view();
+        }
+        recovered
+    }
+
     fn reload_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let (source_class, module_root) = {
             let entry = self

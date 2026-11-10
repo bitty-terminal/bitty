@@ -773,6 +773,36 @@ impl BandButton {
 /// `ansi.*` forms) against the active theme palette (OSC-4-aware). Returns
 /// `None` for unknown tokens; callers substitute the span default and count
 /// [`BandHostStats::unknown_tokens`].
+/// Default Waybar-inspired foreground token for a `bitty-terminal.bar` module
+/// span that declares neither `fg` nor `bg`, keyed by its `bar:module:<name>`
+/// hover region identity.
+#[must_use]
+pub fn default_band_run_fg_token(run: &BandRun) -> Option<&'static str> {
+    if run.fg.is_some() || run.bg.is_some() {
+        return None;
+    }
+    let raw = run
+        .on_hover
+        .as_ref()
+        .and_then(|cmd| cmd.region.as_ref().map(|r| r.id.as_str()))?;
+    let module = raw.strip_prefix("bar:module:")?;
+    let base = module.split(':').next().unwrap_or(module);
+    match base {
+        "clock" => Some("accent"),
+        "network" => Some("cyan"),
+        "cpu" => Some("green"),
+        "memory" => Some("magenta"),
+        "battery" => Some("ok"),
+        "pulseaudio" => Some("yellow"),
+        "microphone" => Some("teal"),
+        "bluetooth" => Some("blue"),
+        "backlight" => Some("bright_yellow"),
+        "idle" => Some("purple"),
+        "spectrum" => Some("cyan"),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn resolve_band_token(token: &str, palette: &ThemePalette) -> Option<Rgba8> {
     let ansi = |idx: u8| -> Option<Rgba8> {

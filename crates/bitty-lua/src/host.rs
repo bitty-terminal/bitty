@@ -3635,7 +3635,10 @@ impl BridgeState {
         // credit only, so an enclosing host-call credit can never relax it.
         let out = f(expiry);
         let reading = mark.read();
-        let charged = reading.raw.saturating_sub(reading.credit);
+        let charged = reading
+            .raw
+            .saturating_sub(reading.credit)
+            .saturating_sub(reading.host_call_credit);
         if charged > deadline {
             return Err(BridgeError::timeout());
         }

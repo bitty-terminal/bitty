@@ -405,3 +405,30 @@ fn screenshot_keys_super_chord_and_mouse_capture_do_not_snap_scrolled_viewport()
         "mouse-captured press/release must not snap a scrolled viewport"
     );
 }
+
+#[test]
+fn stuck_super_latch_clears_on_focus_loss_so_typing_snaps() {
+    // bitty#3108 review (F1): a compositor-grabbed chord (Super+S on a tiling
+    // WM) never delivers the Super release to this window, so the modifier
+    // latch stays armed. Every later key press is then classified as a system
+    // chord and routed around the snap, so a scrolled viewport never returns
+    // to live for the rest of the session. Focus loss is capture loss for the
+    // keyboard too: it must drop the latches.
+    let mut rt = Runtime::with_defaults().expect("build");
+    fill_with_scrollback(&mut rt);
+    scroll_up(&mut rt, 2.0);
+    let before = focused_offset(&rt);
+    assert!(before > 0, "fixture must start scrolled up");
+
+    // Press Super, then lose focus with no release (the WM grabbed the chord).
+    let _ = rt.handle_key_event(modifier_key(bitty_platform::NamedKey::Super));
+    rt.set_focused(false);
+    rt.set_focused(true);
+
+    let _ = rt.handle_key_event(char_key("x"));
+    assert_eq!(
+        focused_offset(&rt),
+        0,
+        "typing after a grabbed chord must snap to live"
+    );
+}

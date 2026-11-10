@@ -487,15 +487,15 @@ pub fn dev_help_text() -> String {
      \n\
      Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
      \n\
-     Verbs:\n  \
-       trace startup                    Headless PB-1 startup phases.\n  \
-       trace latency [--iterations N]   Headless PB-4 key-to-screen trace (1..=1000).\n  \
-       capture [--layout SPEC]          Deterministic headless frame capture (single|split|stack|overlay).\n  \
-       synthesize                       Fixed local input trajectory + multiline paste-gate probe.\n  \
-       dump grid [--rows N] [--cols N]  Bounded grid text + cursor (defaults 64x256).\n  \
-       dump scene                       Layout allocations, damage regions, and present stats.\n  \
-       dump atlas                       Headless GridRenderer atlas and glyph placement report.\n  \
-       overlay list                     Overlay catalog with headless availability.\n  \
+     Verbs (trace runs via `bitty-perf`; capture/synthesize/dump/overlay require `dev-tools`):\n  \
+       trace startup                    Headless PB-1 startup phases (bitty-perf suite).\n  \
+       trace latency [--iterations N]   Headless PB-4 key-to-screen trace (1..=1000; bitty-perf suite).\n  \
+       capture [--layout SPEC]          Deterministic headless frame capture (`dev-tools`; single|split|stack|overlay).\n  \
+       synthesize                       Fixed local input trajectory + multiline paste-gate probe (`dev-tools`).\n  \
+       dump grid [--rows N] [--cols N]  Bounded grid text + cursor (`dev-tools`; defaults 64x256).\n  \
+       dump scene                       Layout allocations, damage regions, and present stats (`dev-tools`).\n  \
+       dump atlas                       Headless GridRenderer atlas and glyph placement report (`dev-tools`).\n  \
+       overlay list                     Overlay catalog with headless availability (`dev-tools`).\n  \
        overlay show <name>              Headless overlay proof (`dev-tools` cargo feature required).\n\
      \n\
      Options:\n  \

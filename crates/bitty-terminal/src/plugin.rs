@@ -890,9 +890,10 @@ pub fn plugin_help_text() -> String {
      \n\
      verbs:\n\
      \x20 list                                Show bundled, official-catalog, and installed plugins.\n\
-     \x20 install <id|path|git-url|archive>   Install or update from bundled/official catalog id,\n\
-     \x20   [--yes] [--force] [--profile P]   local directory, git URL (https://, git+https://, git@),\n\
-     \x20                                     or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
+     \x20 install <bundled-id>                Install a bundled plugin (`--profile P` is bundled-only).\n\
+     \x20   [--profile P] [--yes]\n\
+     \x20 install <catalog-id|path|git-url|archive>  Install or update from official catalog id, local dir,\n\
+     \x20   [--yes] [--force]                 git URL (https://, git+https://, git@), or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
      \x20 remove <id> --force                 Remove a bundled ledger record or installed store package.\n\
      \x20 enable <id>                         Enable a recorded plugin (applies on next startup).\n\
      \x20 disable <id>                        Disable without dropping the record or grants.\n\
@@ -910,7 +911,8 @@ pub fn plugin_help_text() -> String {
      \x20 --format table|json|jsonl   Output format for list/info/explain/config show (alias: --json).\n\
      \x20 --no-color                  Disable ANSI color (also honors NO_COLOR).\n\
      \x20 --yes                       Approve capability consent / repair prompts non-interactively.\n\
-     \x20 --force                     Confirm remove, config overwrite, or same-version/orphan replacement.\n\
+     \x20 --force                     Confirm remove, config overwrite, orphan replacement, or repair\n\
+     \x20                             (same-version source updates still require --yes or interactive consent).\n\
      \x20 --repair                    doctor only: quarantine broken trees and rebuild index/ledger.\n\
      \x20 --init                      config only: alias for `config scaffold`.\n\
      \x20 --cap <capability>          Target one capability in `grant` or `revoke`.\n\

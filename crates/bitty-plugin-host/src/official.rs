@@ -135,6 +135,32 @@ mod tests {
     }
 
     #[test]
+    fn help_plugin_resolves_from_the_official_catalog() {
+        // CTX-1784 / issue #2397: the help overlay is a plugin, so the
+        // embedded catalog must resolve its id — `bitty plugin install
+        // bitty-terminal.help` is the only install path after the Core
+        // retirement. A catalog pin that predates the onboarding leaves a
+        // stock user with no replacement surface.
+        let help = official_plugin_for("bitty-terminal.help")
+            .expect("the help plugin is part of the official catalog");
+        assert_eq!(help.name, "Help");
+        assert_eq!(
+            help.repository,
+            "https://github.com/bitty-terminal/help.git"
+        );
+        assert_eq!(
+            help.pin, "ae1d8a9a39862ce9a71ccd7238f5621975144a47",
+            "the help entry must pin the reviewed plugin revision"
+        );
+        assert_eq!(help.manifest_sha256().len(), 64);
+        assert!(help.compat_bitty.is_some());
+        assert!(
+            official_ids_sorted().contains(&"bitty-terminal.help"),
+            "the help id must be listed in the sorted official set"
+        );
+    }
+
+    #[test]
     fn pins_and_hashes_are_well_formed() {
         for entry in official_plugins() {
             let pin = entry.pin;

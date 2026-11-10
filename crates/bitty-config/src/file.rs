@@ -5036,6 +5036,61 @@ mod tests {
     }
 
     #[test]
+    fn lua_retired_toggle_help_binding_keeps_the_rest_of_the_table() {
+        // CTX-1784: a config that still says `toggle_help` (or its
+        // `show_help` alias) must load. The retired binding alone is dropped
+        // by the loader with a migration diagnostic, so every OTHER binding in
+        // the same table stays live and the file is never salvaged away.
+        let content = r#"return { keymaps = {
+            { chord = "alt+`", action = "toggle_help", context = "global" },
+            { chord = "ctrl+alt+1", action = "focus:1", context = "global" },
+            { chord = "ctrl+alt+2", action = "focus:2", context = "global" },
+        } }"#;
+        // Strict (`config check` / doctor / reload): no error at all.
+        let plan = parse_lua_config(content, &test_source()).expect("retired spelling loads");
+        assert_eq!(
+            plan.keymaps.as_ref().expect("table kept").len(),
+            3,
+            "the whole table must survive validation"
+        );
+
+        // Startup salvage reports nothing: no element was invalid.
+        let salvaged = parse_lua_config_salvaging(content, &test_source()).expect("loads");
+        assert!(
+            salvaged.diagnostics.is_empty(),
+            "a retired spelling must not salvage the table: {:?}",
+            salvaged.diagnostics
+        );
+
+        // The shared loader strips exactly the retired binding and reports it.
+        let mut entries = plan.keymaps.expect("table kept");
+        let diagnostics = crate::keymap::strip_retired_bindings(&mut entries);
+        assert_eq!(entries.len(), 2, "only the retired binding is dropped");
+        assert_eq!(diagnostics.len(), 1);
+        let message = &diagnostics[0];
+        assert!(message.contains("alt+`"), "{message}");
+        assert!(message.contains("toggle_help"), "{message}");
+        assert!(message.contains("bitty-terminal.help"), "{message}");
+        assert!(
+            message.contains("bitty plugin install bitty-terminal.help"),
+            "{message}"
+        );
+
+        // ... and the surviving siblings resolve as live user bindings.
+        let effective = crate::EffectiveConfig {
+            keymaps: entries,
+            ..crate::EffectiveConfig::default()
+        };
+        let maps = crate::keymap::resolve_keymaps(&effective).expect("resolves");
+        let live: Vec<String> = maps
+            .iter()
+            .filter(|map| !map.from_default)
+            .map(|map| map.action.canonical())
+            .collect();
+        assert_eq!(live, vec!["focus:1".to_string(), "focus:2".to_string()]);
+    }
+
+    #[test]
     fn lua_salvage_rejects_whole_file_failures() {
         // Non-element failures stay whole-layer errors: the caller drops the
         // layer and starts with the remaining layers.

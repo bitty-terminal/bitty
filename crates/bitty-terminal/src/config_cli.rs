@@ -60,7 +60,9 @@ pub(crate) struct LoadedConfig {
     /// Whether the probed user file contributed a layer (startup salvage may
     /// have dropped it entirely).
     pub(crate) file_loaded: bool,
-    /// Bounded startup diagnostics (empty on the strict path).
+    /// Bounded startup diagnostics (table salvage is startup-only; migration
+    /// diagnostics such as a dropped retired `keymaps[].action` ride both
+    /// paths so `config check` explains them).
     pub(crate) diagnostics: StartupDiagnostics,
 }
 
@@ -934,6 +936,18 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
             ));
         }
     };
+    // CTX-1784: the help overlay left Core for the `bitty-terminal.help`
+    // plugin, so `toggle_help` / `show_help` are retired action spellings. A
+    // config that kept the old default must keep every OTHER binding: drop the
+    // retired binding alone (it never dispatches and never shadows a shipped
+    // default) and report it. Runs on the strict (`config check`, `doctor`,
+    // reload) and startup paths alike, so the drop is attributed to the
+    // migration instead of looking like a config mistake.
+    for message in bitty_config::keymap::strip_retired_bindings(&mut merged.effective.keymaps) {
+        diagnostics.push(format!(
+            "bitty: warning: ignoring retired keymap binding: {message}"
+        ));
+    }
     // CTX-1490 review finding 1: a salvaged/dropped security-sensitive element
     // must never resurrect a more-permissive lower-layer value. Apply the
     // deny overlay after the normal merge and before validation/installation.
@@ -1465,6 +1479,13 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
         },
         ConfigCommand::Check | ConfigCommand::Show => match load_merged_config_typed(args) {
             Ok(loaded) => {
+                // CTX-1784: strict loads never salvage a table, but migration
+                // diagnostics (a retired `keymaps[].action` dropped during
+                // resolve) are still reported here, so `config check` explains
+                // the binding it ignored instead of failing on it.
+                if let Some(rendered) = loaded.diagnostics.render() {
+                    eprintln!("{rendered}");
+                }
                 let merged = loaded.merged;
                 let probed = loaded.probed;
                 let profile_request = loaded.profile_name;
@@ -4387,6 +4408,93 @@ mod startup_tests {
         .expect("valid config must load");
         assert_eq!(startup.app.effective, effective);
         assert!(startup.diagnostics.is_none());
+    }
+
+    #[test]
+    fn retired_toggle_help_binding_keeps_the_rest_of_the_table() {
+        // CTX-1784: `toggle_help` / `show_help` are retired action spellings.
+        // A config that kept the old default must keep every OTHER binding:
+        // `config check` exits 0 (not 2), only the retired bindings are
+        // dropped, and each drop is reported with the migration diagnostic.
+        let dir = scratch_dir("retired-toggle-help");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            concat!(
+                "return { keymaps = {\n",
+                "  { chord = \"alt+`\", action = \"toggle_help\", context = \"global\" },\n",
+                "  { chord = \"ctrl+alt+1\", action = \"focus:1\", context = \"global\" },\n",
+                "  { chord = \"ctrl+alt+2\", action = \"show_help\", context = \"global\" },\n",
+                "} }\n"
+            ),
+        )
+        .expect("write init.lua");
+        let mut args = Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+
+        // The exact command the review proved exited 2.
+        let code = run_config_subcommand(ConfigCommand::Check, &args);
+        assert_eq!(
+            code, 0,
+            "a retired keymap spelling must not fail `bitty config check`"
+        );
+
+        let loaded = load_merged_config_typed(&args).expect("strict load passes");
+        assert_eq!(
+            loaded.merged.effective.keymaps.len(),
+            1,
+            "only the live sibling binding survives"
+        );
+        assert_eq!(loaded.merged.effective.keymaps[0].action, "focus:1");
+        let reported: Vec<&str> = loaded
+            .diagnostics
+            .lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.contains("retired keymap binding"))
+            .collect();
+        assert_eq!(reported.len(), 2, "{:?}", loaded.diagnostics.lines);
+        assert!(
+            reported.iter().any(|line| line.contains("toggle_help")),
+            "{reported:?}"
+        );
+        assert!(
+            reported.iter().any(|line| line.contains("show_help")),
+            "{reported:?}"
+        );
+        for line in &reported {
+            assert!(
+                line.contains("bitty-terminal.help"),
+                "the drop must point at the replacement plugin: {line}"
+            );
+        }
+
+        // The startup path keeps the same live binding and reports the same
+        // drops instead of salvaging the whole `keymaps` table.
+        let (startup, startup_diagnostics) =
+            resolve_app_config_in(&args, LoadMode::Startup).expect("startup load passes");
+        assert_eq!(
+            startup.effective.keymaps.len(),
+            1,
+            "startup keeps every non-retired binding"
+        );
+        assert!(
+            startup_diagnostics
+                .lines
+                .iter()
+                .any(|line| line.contains("toggle_help") && line.contains("bitty-terminal.help")),
+            "{:?}",
+            startup_diagnostics.lines
+        );
+        assert!(
+            !startup_diagnostics
+                .lines
+                .iter()
+                .any(|line| line.contains("ignoring 'keymaps'")),
+            "the table must not be salvaged: {:?}",
+            startup_diagnostics.lines
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

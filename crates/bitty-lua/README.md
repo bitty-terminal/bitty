@@ -72,6 +72,33 @@ neither spelling can gain input authority. The focusable capture surface
 (`bitty.ui.overlay.acquire`, `update`, `poll`, `release`) and its
 `E_UI_ALREADY_CAPTURED` single-owner contract are unchanged.
 
+## Lua surface: `bitty.ui.unmount` (issue #3106)
+
+```lua
+local handle, err = bitty.ui.mount("bottom", scene)  -- needs ui.rich
+local released = bitty.ui.unmount(handle)            -- needs ui.rich
+```
+
+Plugin API v1 mounted a block with no way to release it: the block, its
+generation-owned handle, and its retained-string bytes stayed allocated until
+the generation was torn down (suspend, reload, dispose). A plugin that opens and
+closes a view therefore had to reuse one fixed set of handles for its whole
+generation, because a mount per open would exhaust the 64-block registry after
+eight cycles. `bitty.ui.unmount` is the release primitive.
+
+| Item         | Contract                                                                                                                                                                                                                                       |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument     | An integer handle this generation received from `bitty.ui.mount`: a v1 band/overlay block or a `terminal`-slot rich scene. A non-integer is `E_UI_COMPONENT_INVALID`.                                                                             |
+| Result       | `true` when a handle this generation held was released; `false` for a stale, foreign, or unknown handle — the `ui.update` contract, so a cleanup path never has to tell "already gone" apart from an error.                                       |
+| Grant        | `ui.rich`, the same grant `mount`/`update` need. Without it the call is refused with `E_CAPABILITY_DENIED` and the block stays mounted.                                                                                                          |
+| Release      | A band/overlay block leaves the registry and its retained-string bytes are refunded to the 2 MiB aggregate; a `terminal`-slot scene is detached and its Core-owned panel retired. The handle is never re-minted, so `update`/`unmount` on it keep reporting `false`. |
+| Capture      | A live focusable-overlay capture handle reports `false` and changes nothing: that surface is owned by `bitty.ui.overlay.release`, which also ends the input-capture session, so releasing the block alone would orphan a capture.                  |
+| Teardown     | Unchanged: suspend, unload, disable, crash, and reload still drop the whole registry. `unmount` is the per-block release, not a replacement for generation teardown.                                                                              |
+
+The caps are unchanged (64 blocks and 2 MiB of retained strings per plugin
+generation); `unmount` makes them reclaimable inside a generation instead of
+only at teardown.
+
 ## Lua surface: `process.spawn` working directory (CTX-1715)
 
 ```lua
@@ -225,8 +252,8 @@ selected.
 - `src/lib.rs` — crate docs with the role, budgets, and determinism sections.
 - `src/host.rs` — VM lifecycle, budget enforcement, and host calls.
 - `src/ui.rs` — Plugin API v1 declarative UI scenes (`bitty.ui.mount` /
-  `bitty.ui.update`), the closed v1 `UiSlot` enum, and the bounded `UiNode`
-  model.
+  `bitty.ui.update` / `bitty.ui.unmount`), the closed v1 `UiSlot` enum, and
+  the bounded `UiNode` model.
 - `src/keymaps.rs` — bounded keymap/action registry page for
   `bitty.keymaps.list()` (issue #2405): canonical rows, 256-row pages, the
   1024-row addressable cap, and 64 KiB whole-row tail truncation.

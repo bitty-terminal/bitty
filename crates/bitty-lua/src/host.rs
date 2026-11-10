@@ -1928,6 +1928,36 @@ pub trait HostServices {
         self.ui_update(handle, component)
     }
 
+    /// Release one mounted handle (`bitty.ui.unmount`, issue #3106).
+    ///
+    /// Returns `Ok(false)` for a stale, foreign, or unknown handle and changes
+    /// nothing — the accepted `ui.update` contract, so a plugin's cleanup path
+    /// never has to tell "already gone" apart from an error. Release commits a
+    /// removal from the generation-owned registry, so the bridge uses the
+    /// expiry-aware form below (CTX-0464 check-then-act) and the default
+    /// implementation fails closed like [`HostServices::ui_mount`]: a host
+    /// without a release path cannot gain one from the always-present
+    /// `bitty.ui` namespace (`LUA-OQ-2`).
+    fn ui_unmount(&self, _handle: i64) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.unmount surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_unmount`] for the pre-commit timeout
+    /// path (CTX-0464).
+    ///
+    /// A release past the call deadline returns [`BridgeError::timeout`] and
+    /// leaves the block retained, so a post-deadline effect never commits.
+    fn ui_unmount_with_expiry(&self, handle: i64, expiry: Instant) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_unmount(handle)
+    }
+
     /// Whether `handle` addresses a scene mounted through the v2 rich
     /// `bitty.ui.mount("terminal", …)` path (bitty#2785).
     ///
@@ -6387,6 +6417,38 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         }),
     )
     .expect("ui table accepts 'update'");
+
+    // Issue #3106 (Plugin API v1): release a mounted block instead of holding
+    // it — and its retained-string budget — until generation teardown. The
+    // gate is `ui.rich`, the same grant `mount`/`update` need, so a plugin that
+    // may create a block may also drop it. A stale, foreign, or unknown handle
+    // keeps the documented `ui.update` contract: `false`, no error, no change.
+    ui.set(
+        ctx,
+        "unmount",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let handle = match stack.get(0) {
+                    Value::Integer(handle) => handle,
+                    _ => {
+                        return Err(component_invalid(
+                            "ui.unmount handle must be an integer block handle",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                let released = state
+                    .bounded_mutation(|expiry| {
+                        state.services.ui_unmount_with_expiry(handle, expiry)
+                    })
+                    .map_err(|e| e.to_error(ctx))?;
+                stack.replace(ctx, Value::Boolean(released));
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("ui table accepts 'unmount'");
 
     // CTX-0941 (accepted W-01 host contract, v2 scope of OQ-056):
     // Core-owned focusable-overlay transient input capture under the decided

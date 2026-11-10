@@ -49,6 +49,14 @@ use bitty_runtime::{
 /// is unchanged.
 const MOUNT_LOOP_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Test-local wall-clock budget for the mount/unmount loop fixture (bitty#3106).
+///
+/// That loop makes two host calls per cycle (260 for 130 cycles) instead of the
+/// mount loop's 65, so it gets 4x the same wall-only headroom. Instruction and
+/// memory stay at RC defaults, and the block budget under test
+/// (`UI_MAX_BLOCKS`) is unchanged.
+const UNMOUNT_LOOP_WALL_BUDGET_MS: u64 = 4 * MOUNT_LOOP_WALL_BUDGET_MS;
+
 #[derive(Default)]
 struct MapSettings(BTreeMap<String, LuaValue>);
 
@@ -713,6 +721,166 @@ fn mount_loop_hits_block_budget_fail_closed() {
         .services(&fixture.id)
         .expect("services")
         .with_ui_blocks(|blocks| assert_eq!(blocks.len(), UI_MAX_BLOCKS));
+}
+
+/// bitty#3106: `bitty.ui.unmount` releases a mounted block, so the handle and
+/// its retained-string budget no longer live until generation teardown. A
+/// released handle is dead for `update` and for a second `unmount` (the
+/// documented `ui.update` stale contract: `false`, never an error), and the
+/// slot accepts a fresh mount with a never-reused handle.
+#[test]
+fn unmount_releases_the_block_and_the_handle_dies() {
+    let fixture = Fixture::activate(
+        "unmount",
+        "bitty-featured.uiunmount",
+        &["ui.rich"],
+        &[],
+        r#"
+        local handle = bitty.ui.mount("bottom", { kind = "Text", text = "v1" })
+        bitty.store.set("handle", handle)
+        bitty.store.set("released", bitty.ui.unmount(handle))
+        bitty.store.set("late_update", bitty.ui.update(handle, { kind = "Text", text = "late" }))
+        bitty.store.set("second_release", bitty.ui.unmount(handle))
+        bitty.store.set("unknown", bitty.ui.unmount(handle + 4096))
+        local bad_ok, bad_err = pcall(bitty.ui.unmount, "not-a-handle")
+        bitty.store.set("bad_arg_ok", bad_ok)
+        bitty.store.set("bad_arg_code", bad_ok and "NONE" or bad_err.code)
+        bitty.store.set("again", bitty.ui.mount("bottom", { kind = "Text", text = "v2" }))
+        return {}
+        "#,
+    );
+
+    let handle = match store_value(&fixture.runtime, &fixture.id, "handle") {
+        Some(LuaValue::Integer(handle)) => handle,
+        other => panic!("mount must return an integer handle, got {other:?}"),
+    };
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "released"),
+        Some(LuaValue::Bool(true)),
+        "unmount of a live handle must return true"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "late_update"),
+        Some(LuaValue::Bool(false)),
+        "a released handle must not accept an update"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "second_release"),
+        Some(LuaValue::Bool(false)),
+        "a second unmount must report false, not an error"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "unknown"),
+        Some(LuaValue::Bool(false)),
+        "an unknown handle must report false"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "bad_arg_ok"),
+        Some(LuaValue::Bool(false)),
+        "a non-integer handle must fail closed"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "bad_arg_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string())),
+        "the bridge names the accepted component error"
+    );
+    match store_value(&fixture.runtime, &fixture.id, "again") {
+        Some(LuaValue::Integer(again)) => assert!(
+            again > handle,
+            "the re-mount must mint a fresh handle ({again} > {handle})"
+        ),
+        other => panic!("re-mount must return an integer handle, got {other:?}"),
+    }
+    fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| {
+            assert_eq!(blocks.len(), 1, "only the re-mounted block is retained");
+            assert!(blocks.get(handle).is_none(), "the released block is gone");
+        });
+}
+
+/// bitty#3106, the motivating failure: `bitty-featured.devtools` reuses its
+/// eight handles for a whole generation because a mount per open/close would
+/// exhaust the 64-block budget after eight cycles. A mount/unmount loop must
+/// therefore keep the registry free no matter how many times a view opens.
+#[test]
+fn mount_unmount_loop_beyond_the_block_cap_keeps_the_budget() {
+    let fixture = Fixture::activate_with_wall_budget(
+        "unmount-loop",
+        "bitty-featured.uiunmountloop",
+        &["ui.rich"],
+        &[],
+        UNMOUNT_LOOP_WALL_BUDGET_MS,
+        r#"
+        local cycles = 0
+        local failure = "NONE"
+        for _ = 1, 130 do
+          local mount_ok, handle = pcall(bitty.ui.mount, "bottom", { kind = "Text", text = "row" })
+          if not mount_ok then
+            failure = handle.code
+            break
+          end
+          local unmount_ok, released = pcall(bitty.ui.unmount, handle)
+          if not unmount_ok then
+            failure = released.code
+            break
+          end
+          if not released then
+            failure = "UNMOUNT_FALSE"
+            break
+          end
+          cycles = cycles + 1
+        end
+        bitty.store.set("cycles", cycles)
+        bitty.store.set("failure", failure)
+        return {}
+        "#,
+    );
+
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "failure"),
+        Some(LuaValue::String("NONE".to_string())),
+        "no cycle may be refused once each mount is released"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "cycles"),
+        Some(LuaValue::Integer(130)),
+        "every cycle must mount and release (130 > the 64-block cap)"
+    );
+    fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+}
+
+/// bitty#3106: the release primitive takes the same `ui.rich` grant as
+/// `mount`/`update`; a generation without it is refused, not silently served.
+#[test]
+fn unmount_without_ui_rich_is_refused() {
+    let fixture = Fixture::activate(
+        "unmount-deny",
+        "bitty-featured.uiunmountdeny",
+        &[],
+        &[],
+        r#"
+        local ok, err = pcall(bitty.ui.unmount, 1)
+        bitty.store.set("ok", ok)
+        bitty.store.set("code", ok and "NONE" or err.code)
+        return {}
+        "#,
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "ok"),
+        Some(LuaValue::Bool(false)),
+        "unmount must fail closed without ui.rich"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "code"),
+        Some(LuaValue::String("E_CAPABILITY_DENIED".to_string()))
+    );
 }
 
 #[test]

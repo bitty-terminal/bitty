@@ -42,9 +42,12 @@
         #     `include_bytes!` in `bitty-render/src/embedded.rs` (#2931)
         #   - terminfo/bitty.ti: terminfo repair source read by
         #     `include_str!` in `bitty-terminal/src/doctor.rs` (#2924)
-        #   - crates/bitty-terminal/bitty.rc and packaging/icons/bitty.ico:
-        #     Windows icon resource compiled by `crates/bitty-terminal/build.rs`
-        #     on a Windows host (#2929)
+          #   - crates/bitty-terminal/bitty.rc and packaging/icons/bitty.ico:
+          #     Windows icon resource compiled by `crates/bitty-terminal/build.rs`
+          #     on a Windows host (#2929)
+          #   - packaging/icons/hicolor/64x64/apps/bitty.png: window icon bytes
+          #     read by `include_bytes!` in `crates/bitty-platform/src/app.rs`
+          #     (#3114)
         # Test fixtures stay out: both derivations set `doCheck = false`, so
         # cargo never compiles the test targets that read them.
         src = pkgs.lib.fileset.toSource {
@@ -57,6 +60,7 @@
             ./terminfo/bitty.ti
             ./crates/bitty-terminal/bitty.rc
             ./packaging/icons/bitty.ico
+            ./packaging/icons/hicolor/64x64/apps/bitty.png
           ];
         };
 

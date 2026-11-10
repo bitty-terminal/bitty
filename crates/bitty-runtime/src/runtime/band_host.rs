@@ -763,24 +763,45 @@ impl BandButton {
     }
 }
 
-/// Minimal host theme-token table for band paint (CTX-0946 C2).
+/// Host theme-token table for band paint (CTX-0946 C2, bitty#3108).
 ///
-/// Accepted tokens today: `foreground`, `background`, `cursor`,
-/// `selection`, and `accent` (bright-blue ANSI, OSC-4-aware). Returns `None`
-/// for anything else; callers substitute the span default and count
-/// [`BandHostStats::unknown_tokens`]. The table is deliberately closed: the
-/// candidate theme-token contract owns any wider vocabulary.
+/// Resolves semantic role tokens (`foreground`, `background`, `cursor`,
+/// `selection`, `accent`, `normal`, `muted`, `dim`, `surface`, `ok`,
+/// `success`, `warning`, `warn`, `critical`, `error`) and named ANSI 16
+/// palette tokens (`black`, `red`, `green`, `yellow`, `orange`, `blue`,
+/// `magenta`, `purple`, `cyan`, `teal`, `white`, plus `bright_*` and
+/// `ansi.*` forms) against the active theme palette (OSC-4-aware). Returns
+/// `None` for unknown tokens; callers substitute the span default and count
+/// [`BandHostStats::unknown_tokens`].
 #[must_use]
 pub fn resolve_band_token(token: &str, palette: &ThemePalette) -> Option<Rgba8> {
+    let ansi = |idx: u8| -> Option<Rgba8> {
+        let rgb = palette.active_index(idx);
+        Some([rgb[0], rgb[1], rgb[2], 0xFF])
+    };
     match token {
-        "foreground" => Some(palette.foreground),
+        "foreground" | "normal" => Some(palette.foreground),
         "background" => Some(palette.background),
         "cursor" => Some(palette.cursor),
-        "selection" => Some(palette.selection),
-        "accent" => {
-            let rgb = palette.active_index(BAND_ACCENT_ANSI_INDEX);
-            Some([rgb[0], rgb[1], rgb[2], 0xFF])
+        "selection" | "surface" | "surface.0" | "surface.1" | "surface.2" => {
+            Some(palette.selection)
         }
+        "accent" | "bright_blue" | "ansi.bright_blue" => ansi(BAND_ACCENT_ANSI_INDEX),
+        "black" | "ansi.black" => ansi(0),
+        "critical" | "error" | "red" | "ansi.red" => ansi(1),
+        "ok" | "success" | "green" | "ansi.green" => ansi(2),
+        "warning" | "warn" | "yellow" | "orange" | "ansi.yellow" => ansi(3),
+        "blue" | "ansi.blue" => ansi(4),
+        "magenta" | "purple" | "ansi.magenta" => ansi(5),
+        "cyan" | "teal" | "ansi.cyan" => ansi(6),
+        "white" | "ansi.white" => ansi(7),
+        "muted" | "dim" | "bright_black" | "ansi.bright_black" => ansi(8),
+        "bright_red" | "ansi.bright_red" => ansi(9),
+        "bright_green" | "ansi.bright_green" => ansi(10),
+        "bright_yellow" | "ansi.bright_yellow" => ansi(11),
+        "bright_magenta" | "ansi.bright_magenta" => ansi(13),
+        "bright_cyan" | "ansi.bright_cyan" => ansi(14),
+        "bright_white" | "ansi.bright_white" => ansi(15),
         _ => None,
     }
 }
@@ -3266,6 +3287,31 @@ mod tests {
         assert_eq!(accent[3], 0xFF, "accent is opaque");
         assert_ne!(accent, palette.foreground);
         assert_ne!(accent, palette.background);
+        assert_eq!(
+            resolve_band_token("normal", &palette),
+            Some(palette.foreground)
+        );
+        assert_eq!(
+            resolve_band_token("surface", &palette),
+            Some(palette.selection)
+        );
+        for tok in [
+            "muted",
+            "warning",
+            "critical",
+            "ok",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "ansi.red",
+            "ansi.cyan",
+        ] {
+            let resolved = resolve_band_token(tok, &palette).expect("semantic/ansi token resolves");
+            assert_eq!(resolved[3], 0xFF);
+        }
         assert_eq!(resolve_band_token("nope", &palette), None);
         assert_eq!(resolve_band_token("", &palette), None);
     }

@@ -275,72 +275,45 @@ pub fn ctl_help_text() -> String {
          \n\
          Usage: bitty ctl [--socket PATH] [--instance ID] [--format SHAPE] <resource> <verb> [args]\n\
          \n\
-         Targeting (precedence: --socket, --instance, BITTY_SOCKET/BITTY_INSTANCE_ID,\n\
-         \x20 exactly-one-live fallback, else ambiguity error exit 6):\n  \
-            --socket PATH    Explicit IPC socket; bypasses discovery\n  \
-            --instance ID    Explicit instance (1..=64 [a-z0-9_-]); resolved via discovery\n  \
-            --format SHAPE   Output shape: table|json|jsonl (default table)\n  \
-            -h, --help       Print this help and exit (never needs an instance)\n\
-          \n\
-          Platform: IPC verbs need a live instance with IPC serving.\n  \
-            Unix uses the instance socket; Windows uses the instance-derived\n  \
-            named pipe (same bounded protocol, current-user ACL plus SID\n  \
-            check). Without a target, verbs report no live instance (exit 6).\n  \
-            `instance list` stays local discovery only.\n\
-          \n\
-          Verbs (each maps to one registry executable; scopes enforced server-side):\n  \
-            instance list                 Local discovery (no IPC; same-UID sockets only)\n  \
-            window list                   core.window.list (view.inspect)\n  \
-            view list                     core.view.list (view.inspect)\n  \
-            panel list                    core.panel.list (view.inspect; tiled panels with bounds/role)\n  \
-            terminal list                 core.terminal.list (terminal.inspect)\n  \
-            terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
-            terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
-            terminal send t:N TEXT        core.terminal.send (terminal.input; focused leaf only)\n  \
-            terminal text t:N             core.terminal.text (terminal.inspect; untrusted output)\n  \
-            view split [--dir]            core.view.split (view.manage; default --right)\n  \
-            view focus v:N                core.view.focus (view.manage)\n  \
-            workspace list                core.workspace.list (view.inspect; bounded memory diagnostics)\n  \
-            workspace new                 core.workspace.new (view.manage)\n  \
-            workspace close ws:N          core.workspace.close (terminal.manage, elevation; kills live sessions)\n  \
-            workspace focus ws:N          core.workspace.focus (view.manage)\n  \
-            workspace move ws:N           core.workspace.move (view.manage; moves focused window)\n  \
-            workspace rename ws:N NAME    core.workspace.rename (view.manage; renames workspace)\n  \
-            workspace move-panel N        core.workspace.move_panel (view.manage; repositions focused panel)\n  \
-            config reload                 core.config.reload (config.modify, elevation)\n  \
-            consent grant --scope S       core.consent.grant (explicit gesture: interactive ALLOW prompt,\n  \
-            \x20 [--terminal T --family F]  grants a debug scope, or an automation family bearer for one terminal)\n  \
-            consent revoke --scope S      core.consent.revoke_scope (explicit revoke with receipt)\n  \
-            consent revoke-session        core.consent.revoke_session (end own session with receipt)\n\
+         Options (precedence: --socket, --instance, BITTY_SOCKET/BITTY_INSTANCE_ID, single-live fallback):\n  \
+           --socket PATH    Explicit IPC socket (bypasses discovery)\n  \
+           --instance ID    Explicit instance ID (1..=64 [a-z0-9_-])\n  \
+           --format SHAPE   Output shape: table (default) | json | jsonl\n  \
+           -h, --help       Print this help and exit\n\
          \n\
-          Elevation: only terminal spawn, terminal close (terminal.manage),\n  \
-             workspace close (terminal.manage), and\n\
-          \x20 config reload (config.modify) need BITTY_CTL_ELEVATE\n\
-          \x20 (comma-separated scopes, e.g. BITTY_CTL_ELEVATE=terminal.manage,config.modify).\n\
-          \x20 Without it those four verbs fail closed (exit 7, no partial state).\n\
-          \x20 All other verbs — including view split / view focus (view.manage)\n\
-          \x20 and workspace list / new / focus / move / rename / move-panel, panel list,\n\
-           \x20 and every list, terminal send, and terminal text verb — need no elevation.\n\
-           \n\
-           Send quoting (issue #1939): a bare CR needs ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r')); plain '\\r' sends literal backslash-r bytes (fish shows a shell continuation, not a bitty bug).\n\
-           \n\
-           PTY discovery (issue #1900): each PTY child inherits an advisory\n\
-          \x20 BITTY_SOCKET pointing at its own instance (never overriding an\n\
-          \x20 explicitly-set outer value; inherit wins). BITTY_INSTANCE_ID is\n\
-          \x20 the advisory instance label for the same precedence. Targeting\n\
-          \x20 precedence is unchanged: --socket, --instance,\n\
-          \x20 BITTY_SOCKET/BITTY_INSTANCE_ID, exactly-one-live, else exit 6.\n\
-          \n\
-          Exit codes: 0 ok; 1 generic; 2 usage; 3 config; 5 compat; 6 unavailable;\n\
-          \x20 7 permission; 8 conflict. Terminal text is untrusted observation data.\n\
+         Verbs:\n  \
+           instance list                 local discovery (no IPC; same-UID sockets only)\n  \
+           window list                   core.window.list (view.inspect)\n  \
+           view list                     core.view.list (view.inspect)\n  \
+           view split [--dir]            core.view.split (view.manage; default --right)\n  \
+           view focus v:N                core.view.focus (view.manage)\n  \
+           panel list                    core.panel.list (view.inspect; tiled panels with bounds/role)\n  \
+           terminal list                 core.terminal.list (terminal.inspect)\n  \
+           terminal spawn [--cwd PATH]   core.terminal.spawn (terminal.manage, elevation)\n  \
+           terminal close t:N            core.terminal.close (terminal.manage, elevation)\n  \
+           terminal send t:N TEXT        core.terminal.send (terminal.input; focused leaf only)\n  \
+           terminal text t:N             core.terminal.text (terminal.inspect; untrusted output)\n  \
+           workspace list                core.workspace.list (view.inspect)\n  \
+           workspace new                 core.workspace.new (view.manage)\n  \
+           workspace close ws:N          core.workspace.close (terminal.manage, elevation)\n  \
+           workspace focus ws:N          core.workspace.focus (view.manage)\n  \
+           workspace move ws:N           core.workspace.move (view.manage)\n  \
+           workspace rename ws:N NAME    core.workspace.rename (view.manage)\n  \
+           workspace move-panel N        core.workspace.move_panel (view.manage)\n  \
+           config reload                 core.config.reload (config.modify, elevation)\n  \
+           consent grant --scope S       core.consent.grant ([--terminal T --family F])\n  \
+           consent revoke --scope S      core.consent.revoke_scope\n  \
+           consent revoke-session        core.consent.revoke_session\n\
          \n\
-         Consent (issue #1520): `consent grant` prompts for an explicit\n\
-         \x20 ALLOW phrase on the local terminal and grants only to the calling\n\
-         \x20 session; issuance is never reachable from flags, environment,\n\
-         \x20 configuration, or child-process inheritance. `consent revoke`\n\
-         \x20 and `consent revoke-session` deny queued and future requests of\n\
-         \x20 the session from the next dispatch boundary, with a receipt.\n\
+         Notes:\n  \
+           - Platform: Unix uses the instance socket; Windows uses the instance-derived named pipe\n  \
+             (current-user ACL plus SID check). Without a target, verbs report no live instance (exit 6).\n  \
+           - Elevation: only terminal spawn, terminal close (terminal.manage), workspace close (terminal.manage),\n  \
+             and config reload (config.modify) need BITTY_CTL_ELEVATE; without it those four verbs fail closed (exit 7).\n  \
+             view split / view focus (view.manage) and workspace list / new / focus / move / rename / move-panel need no elevation.\n  \
+           - Send quoting: a bare CR needs ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r')).\n\
          \n\
+         Exit codes: 0 ok | 1 generic | 2 usage | 3 config | 5 compat | 6 unavailable | 7 permission | 8 conflict\n\
          Version: {}\n",
         env!("CARGO_PKG_VERSION"),
     )

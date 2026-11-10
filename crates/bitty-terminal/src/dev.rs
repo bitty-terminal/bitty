@@ -487,68 +487,30 @@ pub fn dev_help_text() -> String {
      \n\
      Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
      \n\
-      Verbs (all local class: no instance, safe-mode clean, no plugin VM):\n  \
-        trace startup                 Headless PB-1 startup phases.\n  \
-        trace latency [--iterations N]  Headless PB-4 key-to-screen trace\n  \
-                                      (default 20, range 1..=1000).\n  \
-                                      Measurement lives in the bitty-perf\n  \
-                                      validation suite (never linked here);\n  \
-                                      the verb fails with exit 1.\n  \
-       capture [--layout SPEC]       Deterministic headless frame capture:\n  \
-                                     SPEC = single|split|stack|overlay\n  \
-                                     (default single). Reports present stats,\n  \
-                                     cold-queue counters, and an FNV-1a hash\n  \
-                                     of the headless RGBA buffer.\n  \
-       synthesize                    Fixed local input trajectory (8 printable\n  \
-                                     keys through the headless input path)\n  \
-                                     plus the multiline paste-gate probe\n  \
-                                     (requested, held pending, cancelled —\n  \
-                                     never delivered). Reports the protocol-\n  \
-                                     shaped receipt plus tick stats.\n  \
-       dump grid [--rows N] [--cols N]  Bounded grid text plus cursor\n  \
-                                     (defaults rows=64 cols=256, capped at\n  \
-                                     64x256 like the inspect path).\n  \
-       dump scene                    Layout allocations, damage regions,\n  \
-                                     present stats, and generation.\n  \
-       dump atlas                    Headless GridRenderer atlas report:\n  \
-                                     fills/glyphs, placements, texel bytes,\n  \
-                                     dimensions, cache/atlas counters.\n  \
-       overlay list                  Overlay catalog with headless\n  \
-                                     availability (GPU-bound entries deferred).\n  \
-       overlay show <name>           Headless overlay proof where available\n  \
-                                     (damage, banner); deferred entries report\n  \
-                                     status deferred with the reason.\n  \
-                                     capture, synthesize, dump, and overlay\n  \
-                                     require a build with the `dev-tools`\n  \
-                                     cargo feature; without it they fail\n  \
-                                     with exit 1.\n\
+     Verbs:\n  \
+       trace startup                    Headless PB-1 startup phases.\n  \
+       trace latency [--iterations N]   Headless PB-4 key-to-screen trace (1..=1000).\n  \
+       capture [--layout SPEC]          Deterministic headless frame capture (single|split|stack|overlay).\n  \
+       synthesize                       Fixed local input trajectory + multiline paste-gate probe.\n  \
+       dump grid [--rows N] [--cols N]  Bounded grid text + cursor (defaults 64x256).\n  \
+       dump scene                       Layout allocations, damage regions, and present stats.\n  \
+       dump atlas                       Headless GridRenderer atlas and glyph placement report.\n  \
+       overlay list                     Overlay catalog with headless availability.\n  \
+       overlay show <name>              Headless overlay proof (`dev-tools` cargo feature required).\n\
      \n\
      Options:\n  \
-       --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
-       --no-color      Accepted for parity; tables carry no ANSI coloring.\n  \
-       --iterations N  trace latency sample count (1..=1000).\n  \
-       --rows N        dump grid row cap (1..=64).\n  \
-       --cols N        dump grid column cap (1..=256).\n  \
-       --layout SPEC   capture composition (single|split|stack|overlay).\n  \
-       -h, --help      Print this help and exit (never builds a runtime).\n\
+       --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+       --no-color      Disable ANSI coloring\n  \
+       --iterations N  trace latency sample count (1..=1000)\n  \
+       --rows N        dump grid row cap (1..=64)\n  \
+       --cols N        dump grid column cap (1..=256)\n  \
+       --layout SPEC   capture composition (single|split|stack|overlay)\n  \
+       -h, --help      Print this help and exit\n\
      \n\
-     Local-only: --socket/--instance are rejected (exit 2). Runtime traces\n  \
-       over IPC are future DevTools-protocol work, not invented here.\n\
-     \n\
-     Output contract:\n  \
-       Stdout carries the result; stderr carries diagnostics. JSON/JSONL use\n  \
-       envelope {\"v\":1,\"command\":\"dev\",\"ok\":true,\"result\":{\"verb\":...}}.\n  \
-       Usage errors (exit 2) go to stderr with no stdout envelope. Generic\n  \
-       post-parse failures emit ok:false envelopes (exit 1).\n\
-     \n\
-     Exit codes:\n  \
-       0 success (deferred overlay reports are informational)\n  \
-       2 usage error (missing/unknown verb, extra arg, bad flag value, stray --)\n  \
-       1 generic error (headless runtime/renderer failed after parsing)\n\
+     Exit codes: 0 success | 1 generic error | 2 usage error (--socket/--instance rejected)\n\
      \n\
      Examples:\n  \
        bitty dev trace startup\n  \
-       bitty dev trace latency --iterations 50 --format json\n  \
        bitty dev capture --layout split\n  \
        bitty dev synthesize --format json\n  \
        bitty dev dump grid --format json\n  \

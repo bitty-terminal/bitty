@@ -397,115 +397,35 @@ pub fn list_help_text(invoked_as: &str) -> String {
     format!(
         "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
-          Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
+         Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
-           themes     Built-in theme preset catalog from bitty-config::theme (e.g. bitty-dark,\n  \
-                      tokyo-night, github-dark, catppuccin-mocha; aliases like dark) plus\n  \
-                      accepted local files from <config>/bitty/themes (*.toml), selectable\n  \
-                      as local:<name>. Local class: no instance, no network; reads local\n  \
-                      theme files unless --safe keeps the catalog built-in-only.\n  \
-           colors     Effective palette for the selected theme: all 16 ANSI entries\n  \
-                      plus the UI roles (foreground, cursor, selection, derived chrome)\n  \
-                      with the measured WCAG contrast, floor, pass flag, and any\n  \
-                      documented exemption. Local class: reads the same merged config\n  \
-                      startup uses (--safe selects the built-in safe palette).\n  \
-            fonts      Discovered system font faces (family, style, source) using the\n  \
-                      renderer's fontdb scan: no network, no process spawn, no VM.\n  \
-                      Sorted, deduplicated, capped at 512 rows; unsupported platforms\n  \
-                      report supported=false with an empty list. Headless safe.\n  \
-           plugins    Static bundled plugin catalog (bitty-terminal.*), staged disabled by default.\n  \
-                      Local class: manifest metadata only, no plugin VM loaded, safe-mode clean.\n  \
-            instances  Live instance discovery (instance, socket, live). Runtime class:\n  \
-                       Unix scans the socket directory and probes each socket with a connect;\n  \
-                       Windows scans the instance registry and probes each named pipe, plus\n  \
-                       live pipe-namespace enumeration; every platform reports discovery\n  \
-                       metadata only. Windows serves the same instance-derived named pipe\n  \
-                       (CTX-1405) and probes verify the serving process identity before a\n  \
-                       row reports live. Terminal content is never fetched;\n  \
-                       detailed snapshots need debug.inspect via ctl/DevTools (bearer scoping\n  \
-                       respected by not reading privileged data here).\n  \
-           actions    Machine-readable action catalog for users and doc tooling\n  \
-                      (consumer: bitty-manual#15 drift guard). Every ChromeAction variant\n  \
-                      plus every registered core.* command. Local class: no instance;\n  \
-                      rows needing live state carry requires_runtime true (chrome)\n  \
-                      or class runtime (core). Each chrome row carries its effective\n  \
-                      binding (user-configured chord first, default fallback, null\n  \
-                      only for manual-bind-only); core rows always report null binding.\n  \
-            keymaps    Resolved chord to action table (config overrides plus defaults,\n  \
-                       same resolver `list actions` bindings read: shared code path,\n  \
-                       no fork). Local class: no instance; user file read best-effort\n  \
-                       with shipped-default fallback. Header and JSON meta carry the\n  \
-                       mod_key context (alt default, super when rebound).\n  \
-            services   Registered extension interfaces (dynapi observability): one\n  \
-                       row per backing head of each registered provision, computed\n  \
-                       from validated manifests plus install records — never\n  \
-                       provider-reported strings, no plugin VM loaded. Local class:\n  \
-                       bundled catalog plus discovery roots; invalid manifests\n  \
-                       are skipped, never fatal; `--safe` skips third-party\n  \
-                       sources like startup.\n\
+           themes     Built-in theme presets plus local files from <config>/bitty/themes/*.toml.\n  \
+           colors     Effective 16 ANSI + UI roles with measured WCAG contrast and floor.\n  \
+           fonts      Discovered system font faces (family, style, source; capped at 512 rows).\n  \
+           plugins    Static bundled plugin catalog metadata (no VM loaded).\n  \
+           instances  Live instance discovery (instance, socket, live).\n  \
+                      Windows serves the same instance-derived named pipe and verifies process\n  \
+                      identity before reporting live.\n  \
+           actions    Action catalog (`ChromeAction` + `core.*` commands) with `manual_bind_only`\n  \
+                      and effective `binding`.\n  \
+           keymaps    Resolved chord-to-action table and `mod_key` context (`alt` default, `super` when rebound).\n  \
+           services   Registered extension interfaces (one row per `backing_head`, no VM loaded).\n\
          \n\
          Options:\n  \
-           --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
-            --socket PATH   Explicit socket for `instances` (bypasses directory scan;\n  \
-                            still authenticated by the OS at probe).\n  \
-           --instance ID   Explicit instance for `instances` (resolved via BITTY_SOCKET /\n  \
-                           XDG_RUNTIME_DIR discovery, then probed like --socket).\n  \
-           --no-color      Disable ANSI coloring in table output (also honours NO_COLOR).\n  \
-           -h, --help      Print this help and exit (never needs an instance or VM).\n\
-         \n\
-         Output contract:\n  \
-           Stdout carries the result; stderr carries diagnostics. JSON/JSONL use\n  \
-           envelope {{\"v\":1,\"command\":\"{invoked_as}\",\"ok\":true,\"result\":{{\"kind\":...}}}}.\n  \
-           Usage errors (exit 2) go to stderr with no stdout envelope. Runtime\n  \
-           failures for `instances` emit ok:false envelopes (exit 6/7).\n  \
-           themes result keys: kind, count, themes (array of {{\"name\",\"aliases\",\"category\",\n  \
-           \"source\",\"provenance\",\"license\",\"background\",\"foreground\",\"cursor\",\"selection\"}});\n  \
-           source is builtin|local and provenance is the optional upstream URL.\n  \
-           colors result keys: kind, theme, background, count, colors (array of {{\"token\",\"value\",\n  \
-           \"contrast\",\"floor\",\"passed\",\"advisory\",\"exemption\"}}); 16 ANSI slots plus\n  \
-           UI roles, measured by the shared theme contrast policy.\n  \
-           fonts result keys: kind, supported, count, total, truncated, fonts\n  \
-           (array of {{\"family\",\"style\",\"source\"}}); sorted, deduplicated, capped\n  \
-           at 512 rows, no path or network data.\n  \
-           actions result keys: kind, count (actions plus commands), actions\n  \
-           (array of {{\"id\",\"description\",\"manual_bind_only\",\"requires_runtime\",\"binding\",\"mouse\",\"kind\":\"chrome\"}}),\n  \
-           commands (array of {{\"id\",\"description\",\"class\",\"requires_runtime\",\"binding\",\"kind\",\"scopes\",\"owner\"}}).\n  \
-           Binding is the effective chord (user-configured first, default fallback,\n  \
-           null only for manual-bind-only chrome actions; always null for core).\n  \
-           Mouse lists the buttons bound to the action (`right`, `middle`), empty\n  \
-           when no button uses it; the shipped matrix is right = none and\n  \
-           middle = paste_from_primary.\n  \
-           Action descriptions reuse the canonical ChromeAction::description source\n  \
-           (same strings inspect key shows); core descriptions reuse the\n  \
-           inspect command registry summaries. Manual-bind-only is derived from\n  \
-           DEFAULT_KEYMAPS (absent means manual).\n  \
-            keymaps result keys: kind, count, mod_key, source, keymaps\n  \
-            (array of {{\"chord\",\"action\",\"description\",\"context\",\"source\"}}).\n  \
-            The table header names mod_key and source; JSON meta carries both.\n  \
-            Both actions bindings and keymaps rows come from the same resolved\n  \
-            table (config overrides plus defaults, no fork).\n  \
-            services result keys: kind, count, services\n  \
-            (array of {{\"interface\",\"owner\",\"version\",\"provider\",\"backing_head\",\"grant_source\",\"status\"}}).\n  \
-            Every value is a required string (v1 never emits null); the table\n  \
-            renders absent cells as `-` (reserved null marker, currently\n  \
-            unreachable) and scrubs control characters so hostile provider\n  \
-            strings render safely.\n\
+           --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+           --socket PATH   Explicit socket for `instances` discovery\n  \
+           --instance ID   Explicit instance ID for `instances` discovery\n  \
+           --no-color      Disable ANSI coloring in table output (also honours NO_COLOR)\n  \
+           -h, --help      Print this help and exit\n\
          \n\
          Exit codes:\n  \
-           0 success (empty instances is success with count 0)\n  \
-           2 usage error (missing/unknown kind, extra arg, bad --format/--socket/--instance, stray --)\n  \
-           6 IPC/runtime unavailable (no socket base, unreadable dir, missing socket)\n  \
-           7 permission denied (directory/socket fails OS authentication)\n\
+           0 success | 2 usage error | 6 IPC/runtime unavailable | 7 permission denied\n\
          \n\
          Examples:\n  \
            bitty list themes\n  \
            bitty list colors --format json\n  \
-           bitty list fonts\n  \
-           bitty +list-keybinds --format json\n  \
-           bitty list plugins --format json\n  \
            bitty list instances\n  \
-           bitty list instances --format jsonl\n  \
            bitty list actions --format json\n  \
            bitty list keymaps --format table\n  \
            bitty list services --format json\n  \

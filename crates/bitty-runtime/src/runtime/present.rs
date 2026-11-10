@@ -6368,43 +6368,6 @@ impl Runtime {
                 ),
                 color: chrome.border_muted,
             });
-            let chars: Vec<char> = text.chars().collect();
-            let left_blank = matches!(chars.first(), None | Some(' '));
-            let right_blank = chars.len() < band_cells || matches!(chars.last(), None | Some(' '));
-            let corners = bitty_render::chrome::ChromeCornerGlyphs::resolve(
-                bitty_render::chrome::ChromeGlyphCoverage::Full,
-            );
-            let (left_corner, right_corner) = match edge {
-                BandEdge::Top => (2, 3),
-                BandEdge::Bottom => (0, 1),
-                BandEdge::Left | BandEdge::Right => return,
-            };
-            if left_blank {
-                if let Some(glyph) = corners.glyph(left_corner) {
-                    layers
-                        .combined_glyphs
-                        .extend(self.renderer.overlay_text_glyphs(
-                            &glyph.to_string(),
-                            (rule_x, origin_y),
-                            1,
-                            chrome.border_muted,
-                        ));
-                }
-            }
-            if right_blank {
-                if let Some(glyph) = corners.glyph(right_corner) {
-                    let last = u16::try_from(band_cells.saturating_sub(1)).unwrap_or(u16::MAX);
-                    let x = px_add(rule_x, px_offset_cells(0, last, cell_w));
-                    layers
-                        .combined_glyphs
-                        .extend(self.renderer.overlay_text_glyphs(
-                            &glyph.to_string(),
-                            (x, origin_y),
-                            1,
-                            chrome.border_muted,
-                        ));
-                }
-            }
             layers.any_needs_draw = true;
         }
     }
@@ -7801,6 +7764,13 @@ impl Runtime {
     }
 
     /// Drains off-thread presenter acknowledgements and enforces the
+    /// stuck-present bound against the current wall clock (bitty#2830,
+    /// bitty#3108).
+    pub fn poll_presenter_acks(&mut self) -> Option<PresentStats> {
+        self.poll_presenter(std::time::Instant::now())
+    }
+
+    /// Drains off-thread presenter acknowledgements and enforces the
     /// stuck-present bound (bitty#2830).
     ///
     /// Runs before every tick's gates, including while the surface is hidden:
@@ -7808,7 +7778,7 @@ impl Runtime {
     /// present. Returns the [`PresentStats`] of a frame this call committed,
     /// so the embedder reports a real present on the tick that learned about
     /// it. The event-loop thread never performs the acquire/present itself.
-    fn poll_presenter(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+    pub(super) fn poll_presenter(&mut self, now: std::time::Instant) -> Option<PresentStats> {
         self.presenter.as_ref()?;
         // bitty#2830: apply acknowledgements *before* any stuck decision.
         // A worker that finished just before this tick already cleared its
@@ -10576,8 +10546,8 @@ mod plugin_overlay_paint_tests {
             layers
                 .combined_glyphs
                 .iter()
-                .any(|glyph| glyph.color == tokens.border_muted),
-            "blank band corners paint the grid-safe corner glyph"
+                .all(|glyph| glyph.color != tokens.border_muted),
+            "horizontal band chrome must not paint corner glyphs over band cells"
         );
     }
 

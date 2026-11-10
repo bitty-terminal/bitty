@@ -5470,15 +5470,21 @@ impl TerminalApp {
                 {
                     self.repair_hidden_surface(repair_now);
                 }
-                // CTX-1332 C-D1: this is the only cold-delivery phase. Tick
-                // first so workspace/pin/FX/theme/submit/timer/overlay/
-                // notification/presentation work and the post-present reply
-                // flush are committed, then pump input-triggered plugin
-                // commands. Redraw/PTY-readable/resize/appearance arms never
-                // reach this pump.
+                // CTX-1332 C-D1 & bitty#3108: drain off-thread presenter acks
+                // and pump cold commands queued against the currently
+                // presented frame *before* `drive_tick()` runs plugin timers
+                // (so a timer tick cannot bump band tree version and discard a
+                // click/scroll that just completed, and so `drive_tick()`
+                // immediately commits and presents the click's effects in the
+                // same turn). Then pump a second time for any deferred hover
+                // revalidated by `drive_tick()`.
+                let _ = self.runtime.poll_presenter_acks();
+                self.watchdog_phase(Phase::ColdCommands);
+                let delivered_pre = self.pump_cold_commands();
                 let presented = self.drive_tick().is_some();
                 self.watchdog_phase(Phase::ColdCommands);
-                let delivered = self.pump_cold_commands();
+                let delivered_post = self.pump_cold_commands();
+                let delivered = delivered_pre.saturating_add(delivered_post);
                 if presented || delivered > 0 {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();

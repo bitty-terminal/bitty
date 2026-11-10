@@ -15,8 +15,8 @@ use bitty_lua::{
 };
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    CoreTargetInfo, LifecycleState, PluginRuntime, PluginRuntimeConfig, PluginRuntimeError,
-    SettingsSource, SnapshotSource, TargetSource,
+    CoreTargetInfo, LifecycleState, MAX_WALL_RECOVERY_ATTEMPTS, PluginRuntime, PluginRuntimeConfig,
+    PluginRuntimeError, SettingsSource, SnapshotSource, TargetSource,
 };
 
 /// Activation wall budget for this harness.
@@ -488,6 +488,59 @@ fn timer_callback_wall_overrun_fails_the_generation_without_phantom_fires() {
     let report = rt.reload(&id).expect("reload from active");
     assert_eq!(report.state, LifecycleState::Active);
     assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_lua_error_that_says_rc1_wall_is_never_auto_recovered() {
+    // CTX-1788 (PR #3109 round-2): recovery used to key off
+    // `reason.contains("RC-1 wall")`. A plugin controls its own error text, so
+    // `error("RC-1 wall")` in `init.lua` used to earn the same automatic
+    // reload a genuine slice timeout gets. Classification is now the typed
+    // verdict the suspend path recorded, so a rendered reason that merely
+    // mentions the phrase is never recovered.
+    let data = temp_dir("wall-text");
+    let root = temp_dir("wall-text-root");
+    let id = PluginId::new("bitty-featured.walltext").expect("id");
+    write_capability_plugin(
+        &root,
+        "bitty-featured.walltext",
+        &["terminal.semantic-read"],
+        r#"
+        error("RC-1 wall budget_ms=50 elapsed_ms=999")
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    rt.discover();
+    let err = rt.activate(&id).expect_err("init.lua must fail");
+    assert!(
+        err.to_string().contains("RC-1 wall"),
+        "the fixture must reproduce the old substring trigger: {err}"
+    );
+    let reason = match rt.state(&id) {
+        Some(LifecycleState::Failed(reason)) => reason.clone(),
+        other => panic!("failed activation must leave Failed, got {other:?}"),
+    };
+    assert!(
+        reason.contains("RC-1 wall"),
+        "the rendered reason still carries the plugin-chosen text: {reason}"
+    );
+
+    // The discriminating assertion: the same phrase in the same state, but no
+    // typed wall verdict, must never auto-recover — three passes to be sure
+    // the attempt budget cannot mask a one-shot.
+    for attempt in 1..=MAX_WALL_RECOVERY_ATTEMPTS {
+        assert_eq!(
+            rt.recover_wall_failed_plugins(),
+            0,
+            "pass {attempt}: a Lua error naming RC-1 wall is not a slice timeout"
+        );
+        assert!(
+            matches!(rt.state(&id), Some(LifecycleState::Failed(_))),
+            "pass {attempt}: the generation must stay failed"
+        );
+    }
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }

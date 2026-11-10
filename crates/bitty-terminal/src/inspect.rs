@@ -302,34 +302,64 @@ pub fn inspect_usage() -> String {
 }
 
 /// Full help for `bitty inspect --help` (stdout, exit 0).
+///
+/// `verbose` is the documented `-v` tier: the compact body is the
+/// default, and the contract block (`INSPECT_HELP_CONTRACT`) is
+/// appended only for `--help -v` (CTX-1788, PR #3109 round-2 F2/F7).
+/// Every rendered line stays within `help_width::HELP_MAX_COLUMNS`,
+/// asserted by the test-only help-width gate.
 #[must_use]
-pub fn inspect_help_text() -> String {
-    "bitty inspect — explain effective state and ownership (local, safe-mode clean)\n\
-     \n\
-     Usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\
-     \n\
-     Targets:\n  \
-       command <id>    Registry entry (`core.terminal.text` or `publisher.name:command`).\n  \
-       key <chord>     Shipped keymap owner for a chord (e.g. `ctrl+shift+m`; unbound keys reach the PTY).\n  \
-       plugin <id>     Static bundled-catalog entry (e.g. `bitty-terminal.shell-integration`; no VM).\n  \
-       config <key>    Built-in default value and layer (e.g. `font.size`; file check: `bitty config check`).\n  \
-       protocol <name> Core support state (`supported` | `stub` | `unsupported` | `policy-gated`).\n\
-     \n\
-     Options:\n  \
-       --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
-       --no-color      Disable ANSI coloring\n  \
-       -h, --help      Print this help and exit\n\
-     \n\
-     Exit codes: 0 success | 1 NotFound | 2 usage error\n\
-     \n\
-     Examples:\n  \
-       bitty inspect command core.terminal.text\n  \
-       bitty inspect key ctrl+shift+m\n  \
-       bitty inspect plugin bitty-terminal.shell-integration\n  \
-       bitty inspect config font.size\n  \
-       bitty inspect protocol kitty-graphics\n"
-    .to_string()
+pub fn inspect_help_text(verbose: bool) -> String {
+    let mut text = String::from(
+        "bitty inspect — explain effective state and ownership (local, safe-mode clean)\n\
+         \n\
+         Usage: bitty inspect <command|key|plugin|config|protocol> <value>\n       \
+         [--format table|json|jsonl] [--no-color]\n\
+         \n\
+         Targets:\n  \
+         command <id>    Registry entry (`core.terminal.text` or `publisher.name:command`).\n  \
+         key <chord>     Shipped keymap owner for a chord (e.g. `ctrl+shift+m`; unbound keys reach\n                  \
+         the PTY).\n  \
+         plugin <id>     Static bundled-catalog entry (e.g. `bitty-terminal.shell-integration`; no VM).\n  \
+         config <key>    Built-in default value and layer (e.g. `font.size`; file check:\n                  \
+         `bitty config check`).\n  \
+         protocol <name> Core support state (`supported` | `stub` | `unsupported` | `policy-gated`).\n\
+         \n\
+         Options:\n  \
+         --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+         --no-color      Disable ANSI coloring\n  \
+         -h, --help      Print this help and exit\n\
+         \n\
+         Exit codes: 0 success | 1 NotFound | 2 usage error\n\
+         \n\
+         Examples:\n  \
+         bitty inspect command core.terminal.text\n  \
+         bitty inspect key ctrl+shift+m\n  \
+         bitty inspect plugin bitty-terminal.shell-integration\n  \
+         bitty inspect config font.size\n  \
+         bitty inspect protocol kitty-graphics\n",
+    );
+    if verbose {
+        // One blank line separates the compact body from the contract
+        // tier, so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str(INSPECT_HELP_CONTRACT);
+    }
+    text
 }
+
+/// Verbose-only contract tier for `bitty inspect --help -v` (CTX-1788).
+///
+/// Appended after the compact body: the default help stays short
+/// enough to read at a glance, and `-v` is the documented opt-in for
+/// the trust boundaries a script author has to rely on.
+pub const INSPECT_HELP_CONTRACT: &str = "contract:\n  \
+         - Read-only by construction: no verb mutates config, plugins, or a running\n    \
+         instance.\n  \
+         - Resolution follows the documented layer order and names the deciding\n    \
+         layer.\n  \
+         - A target that resolves to nothing is NotFound (exit 1), never a guess or\n    \
+         an empty success.\n";
 
 // ---------------------------------------------------------------------------
 // Command registry (static core surface + bundled plugin commands)

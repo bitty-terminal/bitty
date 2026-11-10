@@ -882,63 +882,105 @@ pub fn plugin_usage() -> String {
 }
 
 /// Long help (`bitty plugin --help`).
+///
+/// `verbose` is the documented `-v` tier: the compact body is the
+/// default, and the contract block (`PLUGIN_HELP_CONTRACT`) is
+/// appended only for `--help -v` (CTX-1788, PR #3109 round-2 F2/F7).
+/// Every rendered line stays within `help_width::HELP_MAX_COLUMNS`,
+/// asserted by the test-only help-width gate.
 #[must_use]
-pub fn plugin_help_text() -> String {
-    "bitty plugin — CLI-first plugin management (local class, no VM)\n\
-     \n\
-     usage: bitty plugin <verb> [args] [flags]\n\
-     \n\
-     verbs:\n\
-     \x20 list                                Show bundled, official-catalog, and installed plugins.\n\
-     \x20 install <bundled-id>                Install a bundled plugin (`--profile P` is bundled-only).\n\
-     \x20   [--profile P] [--yes]\n\
-     \x20 install <catalog-id|path|git-url|archive>  Install or update from official catalog id, local dir,\n\
-     \x20   [--yes] [--force]                 git URL (https://...git, git+https://, git@), or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
-     \x20 remove <id> --force                 Remove a bundled ledger record or installed store package.\n\
-     \x20 enable <id>                         Enable a recorded plugin (applies on next startup).\n\
-     \x20 disable <id>                        Disable without dropping the record or grants.\n\
-     \x20 revoke <id> [--cap <cap>]           Drop all grants (and disable) or one capability.\n\
-     \x20 grant <id> --profile <name> [--yes] Preselect a reviewed profile (minimal|editor-like|panel-like|agent-like).\n\
-     \x20 grant <id> --cap <capability>       Explicitly grant one manifest-requested capability.\n\
-     \x20 info <id>                           Show manifest, recorded state, and capability effects.\n\
-     \x20 show-source <id>                    Verify digest and print installed module files to stdout.\n\
-     \x20 explain <id> <capability>           Read-only capability decision chain across all six policy layers.\n\
-     \x20 config show <id>                    Print declared [settings] schema and effective values.\n\
-     \x20 config scaffold <id> [--force]      Write a commented settings template under plugins/<id>.lua.\n\
-     \x20 doctor [--repair] [--no-color]      Diagnose or repair the package store and bitty-plugins.lua ledger.\n\
-     \n\
-     flags:\n\
-     \x20 --format table|json|jsonl   Output format for list/info/explain/config show (alias: --json).\n\
-     \x20 --no-color                  Disable ANSI color (also honors NO_COLOR).\n\
-     \x20 --yes                       Approve capability consent / repair prompts non-interactively.\n\
-     \x20 --force                     Confirm remove, config overwrite, orphan replacement, or repair\n\
-     \x20                             (same-version source updates still require --yes or interactive consent).\n\
-     \x20 --repair                    doctor only: quarantine broken trees and rebuild index/ledger.\n\
-     \x20 --init                      config only: alias for `config scaffold`.\n\
-     \x20 --cap <capability>          Target one capability in `grant` or `revoke`.\n\
-     \x20 --profile <name>            Apply a capability profile (`minimal`, `editor-like`, `panel-like`, `agent-like`).\n\
-     \n\
-     notes:\n\
-     \x20 - Ledger: $XDG_CONFIG_HOME/bitty/bitty-plugins.lua; per-plugin config: plugins/<owner>.<name>.lua;\n\
-     \x20   store: $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/.\n\
-     \x20 - Fetch helpers (`git`/`tar`/`unzip`) resolve via PATH and inherit the system proxy env and\n\
-     \x20   the system CA store (no plugin code runs during CLI operations).\n\
-     \n\
-     exit codes:\n\
-     \x20 0 success | 1 aborted/io/consent/helper failure | 2 usage error | 4 plugin/integrity/denied error\n\
-     \n\
-     examples:\n\
-     \x20 bitty plugin list\n\
-     \x20 bitty plugin install bitty-terminal.bar --yes\n\
-     \x20 bitty plugin install bitty-terminal.shell-integration --profile panel-like --yes\n\
-     \x20 bitty plugin grant bitty-terminal.shell-integration --profile editor-like\n\
-     \x20 bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read\n\
-     \x20 bitty plugin enable bitty-terminal.shell-integration   (grant does not enable it)\n\
-     \x20 bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read\n\
-     \x20 bitty plugin config show bitty-terminal.bar\n\
-     \x20 bitty plugin remove xuepoo.hello --force"
-        .to_string()
+pub fn plugin_help_text(verbose: bool) -> String {
+    let mut text = String::from(
+        "bitty plugin — CLI-first plugin management (local class, no VM)\n\
+         \n\
+         usage: bitty plugin <verb> [args] [flags]\n\
+         \n\
+         verbs:\n  \
+         list                                Show bundled, official-catalog, and installed plugins.\n  \
+         install <bundled-id>                Install a bundled plugin (`--profile P` is bundled-only).\n    \
+         [--profile P] [--yes]\n  \
+         install <catalog-id|path|git-url|archive>\n    \
+         [--yes] [--force]                 Install or update from official catalog id, local dir,\n                                      \
+         git URL (https://...git, git+https://, git@), or archive\n                                      \
+         (.tar.gz/.tgz, .tar.zst, .zip).\n  \
+         remove <id> --force                 Remove a bundled ledger record or installed store package.\n  \
+         enable <id>                         Enable a recorded plugin (applies on next startup).\n  \
+         disable <id>                        Disable without dropping the record or grants.\n  \
+         revoke <id> [--cap <cap>]           Drop all grants (and disable) or one capability.\n  \
+         grant <id> --profile <name> [--yes] Preselect a reviewed profile\n                                      \
+         (minimal|editor-like|panel-like|agent-like).\n  \
+         grant <id> --cap <capability>       Explicitly grant one manifest-requested capability.\n  \
+         info <id>                           Show manifest, recorded state, and capability effects.\n  \
+         show-source <id>                    Verify digest and print installed module files to stdout.\n  \
+         explain <id> <capability>           Read-only capability decision chain across all six\n                                      \
+         policy layers.\n  \
+         config show <id>                    Print declared [settings] schema and effective values.\n  \
+         config scaffold <id> [--force]      Write a commented settings template under\n                                      \
+         plugins/<id>.lua.\n  \
+         doctor [--repair] [--no-color]      Diagnose or repair the package store and\n                                      \
+         bitty-plugins.lua ledger.\n\
+         \n\
+         flags:\n  \
+         --format table|json|jsonl   Output format for list/info/explain/config show (alias: --json).\n  \
+         --no-color                  Disable ANSI color (also honors NO_COLOR).\n  \
+         --yes                       Approve capability consent / repair prompts non-interactively.\n  \
+         --force                     Confirm remove, config overwrite, orphan replacement, or repair\n                              \
+         (same-version source updates still require --yes or interactive\n                              \
+         consent).\n  \
+         --repair                    doctor only: quarantine broken trees and rebuild index/ledger.\n  \
+         --init                      config only: alias for `config scaffold`.\n  \
+         --cap <capability>          Target one capability in `grant` or `revoke`.\n  \
+         --profile <name>            Apply a capability profile (`minimal`, `editor-like`,\n                              \
+         `panel-like`, `agent-like`).\n\
+         \n\
+         notes:\n  \
+         - Ledger: $XDG_CONFIG_HOME/bitty/bitty-plugins.lua; per-plugin config:\n    \
+         plugins/<owner>.<name>.lua; store:\n    \
+         $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/.\n  \
+         - Fetch helpers (`git`/`tar`/`unzip`) resolve via PATH and inherit the\n    \
+         system proxy env and the system CA store (no plugin code runs during CLI\n    \
+         operations).\n\
+         \n\
+         exit codes:\n  \
+         0 success | 1 aborted/io/consent/helper failure | 2 usage error |\n  \
+         4 plugin/integrity/denied error\n\
+         \n\
+         examples:\n  \
+         bitty plugin list\n  \
+         bitty plugin install bitty-terminal.bar --yes\n  \
+         bitty plugin install bitty-terminal.shell-integration --profile panel-like --yes\n  \
+         bitty plugin grant bitty-terminal.shell-integration --profile editor-like\n  \
+         bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read\n  \
+         bitty plugin enable bitty-terminal.shell-integration   (grant does not enable it)\n  \
+         bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read\n  \
+         bitty plugin config show bitty-terminal.bar\n  \
+         bitty plugin remove xuepoo.hello --force\n",
+    );
+    if verbose {
+        // One blank line separates the compact body from the contract
+        // tier, so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str(PLUGIN_HELP_CONTRACT);
+    }
+    text
 }
+
+/// Verbose-only contract tier for `bitty plugin --help -v` (CTX-1788).
+///
+/// Appended after the compact body: the default help stays short
+/// enough to read at a glance, and `-v` is the documented opt-in for
+/// the trust boundaries a script author has to rely on.
+pub const PLUGIN_HELP_CONTRACT: &str = "contract:\n  \
+         - Profiles preselect only. `--profile` never includes exec, network,\n    \
+         agent/MCP/AI, clipboard read, environment, terminal input/raw read, debug,\n    \
+         browser, or device control; those stay explicit per-capability consent.\n  \
+         - `grant --cap` cannot exceed the manifest request and cannot clear a\n    \
+         recorded denial: a denied capability stays denied until install consent\n    \
+         re-grants it.\n  \
+         - Install trust: verify before staging, commit the tree and the index\n    \
+         together, and run no plugin code during any CLI operation.\n  \
+         - `explain` is read-only: it walks the six policy layers and reports the\n    \
+         deciding layer without changing any grant.\n";
 
 // ---------------------------------------------------------------------------
 // Managed ledger (data-only Lua; legacy TOML for one-time migration)
@@ -5481,7 +5523,10 @@ pub fn run_plugin_subcommand(
     let request = match parse_plugin_request(raw, context.pre_format) {
         Ok(request) => request,
         Err(PluginParseError::Help) => {
-            let _ = output.write_all(plugin_help_text().as_bytes());
+            // main.rs owns the `-v` tier for `bitty plugin --help`; this arm
+            // also serves direct callers, so it reads the same tail.
+            let verbose = crate::cli::verbose_help_requested(raw);
+            let _ = output.write_all(plugin_help_text(verbose).as_bytes());
             let _ = output.write_all(b"\n");
             return EXIT_OK;
         }
@@ -9884,7 +9929,7 @@ mod tests {
 
     #[test]
     fn help_and_usage_name_explain() {
-        let help = plugin_help_text();
+        let help = plugin_help_text(false);
         assert!(help.contains("explain <id> <capability>"), "{help}");
         assert!(help.contains("capability decision chain"), "{help}");
         assert!(

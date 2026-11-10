@@ -42,7 +42,7 @@
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
 //! | RC-1 | config write I/O credit         | `CONFIG_COMMIT_CREDIT_MAX_MS = 200 ms` | durable write of a committed `config.manage` change (`config.set`, `config.set_enabled`, `profiles.use`) is excluded from the hard wall limit, capped per callback; see the constant (bitty #2972) |
-//! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
+//! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at `HOST_CALL_CREDIT_MAX_MS` (the *default* spawn deadline), independent of a spawn deadline raised by `set_spawn_deadline_ms`; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
 //! All budgets are **fail-closed**: once exceeded, the VM transitions to
@@ -227,14 +227,18 @@ pub const CONFIG_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 /// ~70 ms for a callback that used ~140k instructions). No other host call is
 /// covered — see "Credited" below.
 ///
-/// The cap matches the deadline the bridge itself grants a supervised call. A
-/// smaller fixed cap (the first revision used `200 ms`) charged a callback for
-/// waits the bridge had legally allowed: on a loaded macOS runner two 35 ms
-/// spawns took ~300 ms, so 102 ms of forced wait became "charged Lua time"
-/// and would have suspended a plugin for something it did not do. The cap is a
-/// policy bound on *chaining*, not on one call — the call is already bounded
-/// by its own raw deadline, which the host enforces whether or not the credit
-/// covers it.
+/// The cap is a fixed policy constant equal to the **default** spawn deadline
+/// ([`crate::host::SPAWN_TIMEOUT_MS`], 5 s), not a mirror of the live deadline:
+/// [`LuaVm::set_spawn_deadline_ms`] may raise the spawn deadline (up to
+/// [`crate::host::SPAWN_TIMEOUT_MAX_MS`], 30 s) while this credit stays at
+/// 5 s, so a callback that raises its deadline pays charged time for the
+/// extra wait. A smaller fixed cap (the first revision used `200 ms`) charged
+/// a callback for waits the bridge had legally allowed: on a loaded macOS
+/// runner two 35 ms spawns took ~300 ms, so 102 ms of forced wait became
+/// "charged Lua time" and would have suspended a plugin for something it did
+/// not do. The cap is a policy bound on *chaining*, not on one call — the call
+/// is already bounded by its own raw deadline, which the host enforces whether
+/// or not the credit covers it.
 ///
 /// - Credited: wall time spent inside a supervised `process.spawn` call, minus
 ///   any store commit I/O already credited for the same span (no double

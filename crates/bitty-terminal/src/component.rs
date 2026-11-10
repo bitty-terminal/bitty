@@ -942,59 +942,88 @@ pub fn parse_component_request(
     })
 }
 
-/// Long help (`bitty extension --help`).
+/// Full help for `bitty extension --help` (stdout, exit 0).
+///
+/// `verbose` is the documented `-v` tier: the compact body is the
+/// default, and the contract block (`COMPONENT_HELP_CONTRACT`) is
+/// appended only for `--help -v` (CTX-1788, PR #3109 round-2 F2/F7).
+/// Every rendered line stays within `help_width::HELP_MAX_COLUMNS`,
+/// asserted by the test-only help-width gate.
 #[must_use]
-pub fn component_help_text() -> String {
-    concat!(
+pub fn component_help_text(verbose: bool) -> String {
+    let mut text = String::from(
         "bitty extension — CLI-first native binary extension management (local class, no execution)\n\
-     \n\
-     usage: bitty extension <verb> [args] [flags]\n\
-     \n\
-     verbs:\n\
-     \x20 list [<name>]                         Show installed extensions across both tiers (user|system),\n\
-     \x20                                       ABI compat, path, and the last activation transition\n\
-     \x20                                       recorded (not a liveness probe: active means a spawn was\n\
-     \x20                                       recorded). Accepts `bitty-` aliases (e.g. `bitty-graphics`).\n\
-     \x20 add <path> [--version V] [--distro D] Stage a local pre-built binary into $XDG_DATA_HOME/bitty/extensions/.\n\
-     \x20                                       A directory holds the descriptor bitty-component.toml plus\n\
-     \x20                                       the executable; a bare bitty-<name> file needs --version.\n\
-     \x20 install <name> --version V            Fetch one pinned prebuilt release + SHA256SUMS from\n\
-     \x20   [--digest H] [--force] [--yes]      https://cdn.bitty.run, verify, TOFU-pin, and stage.\n\
-     \x20                                       Catalog resolution belongs to bitty-plugin-manager.\n\
-     \x20 remove <name> [<version>]             Remove one or all user-installed versions of <name>.\n\
-     \x20 show-source <name> [<version>]        Verify hash and print exact pinned executable bytes to stdout.\n\
-     \n\
-     flags:\n\
-     \x20 --format table|json|jsonl   Output format for `list` (default table).\n\
-     \x20 --no-color                  Disable ANSI color.\n\
-     \x20 --version <semver>          Required for `install` (pinned install (bitty#2399)) and bare `add`.\n\
-     \x20 --digest <hex>              Expected SHA-256 hex digest for `install` (all-available-must-match).\n\
-     \x20 --force                     Re-pin TOFU digest after verification passes.\n\
-     \x20 --yes                       Approve download consent non-interactively.\n\
-     \x20 --distro <name|default>     WSL2 guest distro for `add` on Windows (`install --distro` is rejected).\n\
-     \n\
-     WSL2 path mapping (Windows to guest for spawn):\n",
-        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
-        "\x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
-     \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n",
-        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
-        "\x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
-     \n\
-     fetch & exit codes:\n\
-     \x20 Preflights `curl --version` (>= 7.68.0) and `tar` via PATH, using the system CA store and\n\
-     \x20 system proxy env (no *_TOKEN/*_KEY/*_SECRET forwarded).\n\
-     \x20 Exit codes: 0 success | 1 consent/io/fetch/WSL failure | 2 usage error | 4 integrity/ABI/pin error\n\
-     \n\
-     examples:\n\
-     \x20 bitty extension list\n\
-     \x20 bitty extension add ./dist/net --version 0.0.1\n\
-     \x20 bitty extension install graphics --version 0.0.24\n\
-     \x20 bitty extension install net --version 0.0.1\n\
-     \x20 bitty extension show-source net\n\
-     \x20 bitty extension remove net 0.0.1"
-    )
-        .to_string()
+         \n\
+         usage: bitty extension <verb> [args] [flags]\n\
+         \n\
+         verbs:\n  \
+         list [<name>]                         Show installed extensions across both tiers (user|system),\n                                        \
+         ABI compat, path, and the last activation transition\n                                        \
+         recorded (not a liveness probe: active means a spawn was\n                                        \
+         recorded). Accepts `bitty-` aliases (e.g. `bitty-graphics`).\n  \
+         add <path> [--version V] [--distro D]\n                                        \
+         Stage a local pre-built binary into\n                                        \
+         $XDG_DATA_HOME/bitty/extensions/.\n                                        \
+         A directory holds the descriptor bitty-component.toml plus\n                                        \
+         the executable; a bare bitty-<name> file needs --version.\n  \
+         install <name> --version V            Fetch one pinned prebuilt release + SHA256SUMS from\n    \
+         [--digest H] [--force] [--yes]      https://cdn.bitty.run, verify, TOFU-pin, and stage.\n                                        \
+         Catalog resolution belongs to bitty-plugin-manager.\n  \
+         remove <name> [<version>]             Remove one or all user-installed versions of <name>.\n  \
+         show-source <name> [<version>]        Verify hash and print exact pinned executable bytes to\n                                        \
+         stdout.\n\
+         \n\
+         flags:\n  \
+         --format table|json|jsonl   Output format for `list` (default table).\n  \
+         --no-color                  Disable ANSI color.\n  \
+         --version <semver>          Required for `install` (pinned install (bitty#2399)) and bare `add`.\n  \
+         --digest <hex>              Expected SHA-256 hex digest for `install` (all-available-must-match).\n  \
+         --force                     Re-pin TOFU digest after verification passes.\n  \
+         --yes                       Approve download consent non-interactively.\n  \
+         --distro <name|default>     WSL2 guest distro for `add` on Windows (`install --distro` is\n                              \
+         rejected).\n\
+         \n\
+         WSL2 path mapping (Windows to guest for spawn):\n  \
+         drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n  \
+         \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n  \
+         preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+         \n\
+         fetch & exit codes:\n  \
+         Preflights `curl --version` (>= 7.68.0) and `tar` via PATH, using the system CA store and\n  \
+         system proxy env (no *_TOKEN/*_KEY/*_SECRET forwarded).\n  \
+         Exit codes: 0 success | 1 consent/io/fetch/WSL failure | 2 usage error |\n              \
+         4 integrity/ABI/pin error\n\
+         \n\
+         examples:\n  \
+         bitty extension list\n  \
+         bitty extension add ./dist/net --version 0.0.1\n  \
+         bitty extension install graphics --version 0.0.24\n  \
+         bitty extension install net --version 0.0.1\n  \
+         bitty extension show-source net\n  \
+         bitty extension remove net 0.0.1\n",
+    );
+    if verbose {
+        // One blank line separates the compact body from the contract
+        // tier, so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str(COMPONENT_HELP_CONTRACT);
+    }
+    text
 }
+
+/// Verbose-only contract tier for `bitty component --help -v` (CTX-1788).
+///
+/// Appended after the compact body: the default help stays short
+/// enough to read at a glance, and `-v` is the documented opt-in for
+/// the trust boundaries a script author has to rely on.
+pub const COMPONENT_HELP_CONTRACT: &str = "contract:\n  \
+         - Two tiers: the user tier shadows the read-only system tier for the same\n    \
+         name and version.\n  \
+         - `install` verifies SHA256SUMS, TOFU-pins tarball.sha256, and fails closed\n    \
+         (exit 4) with no fallback source when verification does not match.\n  \
+         - `show-source` re-verifies the digest on every read instead of trusting the\n    \
+         pin.\n  \
+         - Alias ambiguity (`bitty-<name>` matching two entries) fails closed.\n";
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -1127,7 +1156,15 @@ pub fn run_component_subcommand(
     let request = match parse_component_request(raw, context.pre_format) {
         Ok(request) => request,
         Err(ComponentParseError::Help) => {
-            let _ = output.write_all(component_help_text().as_bytes());
+            // main.rs owns the `-v` tier for `bitty extension --help`; this arm
+            // also serves direct callers, so it reads the same tail. The check
+            // is inlined because this module is also built into the
+            // composition-root library, which has no `cli` module
+            // (`cli::verbose_help_requested` is the binary-side twin).
+            let verbose = raw
+                .iter()
+                .any(|token| token == "-v" || token == "--verbose");
+            let _ = output.write_all(component_help_text(verbose).as_bytes());
             let _ = output.write_all(b"\n");
             return EXIT_OK;
         }
@@ -3744,7 +3781,7 @@ mod tests {
 
     #[test]
     fn help_path_mapping_lines_keep_original_bytes() {
-        let help = component_help_text();
+        let help = component_help_text(false);
         let lines: Vec<&[u8]> = help
             .split_inclusive('\n')
             .filter(|line| {
@@ -3889,7 +3926,7 @@ mod tests {
 
     #[test]
     fn list_labels_activation_as_last_recorded_not_liveness() {
-        let help = component_help_text();
+        let help = component_help_text(false);
         let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             normalized.contains("last activation transition"),

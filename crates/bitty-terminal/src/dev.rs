@@ -467,7 +467,7 @@ impl DevParseError {
     /// Stderr diagnostic for the error.
     pub fn message(&self) -> String {
         match self {
-            Self::Help => dev_help_text(),
+            Self::Help => dev_help_text(false),
             Self::Usage(diagnostic) => diagnostic.clone(),
         }
     }
@@ -481,42 +481,73 @@ pub fn dev_usage() -> String {
 }
 
 /// Full help for `bitty dev --help` (stdout, exit 0).
+///
+/// `verbose` is the documented `-v` tier: the compact body is the
+/// default, and the contract block (`DEV_HELP_CONTRACT`) is
+/// appended only for `--help -v` (CTX-1788, PR #3109 round-2 F2/F7).
+/// Every rendered line stays within `help_width::HELP_MAX_COLUMNS`,
+/// asserted by the test-only help-width gate.
 #[must_use]
-pub fn dev_help_text() -> String {
-    "bitty dev — developer tracing, captures, dumps, and overlays (local)\n\
-     \n\
-     Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args] [--format table|json|jsonl] [--no-color]\n\
-     \n\
-     Verbs (trace runs via `bitty-perf`; capture/synthesize/dump/overlay require `dev-tools`):\n  \
-       trace startup                    Headless PB-1 startup phases (bitty-perf suite).\n  \
-       trace latency [--iterations N]   Headless PB-4 key-to-screen trace (1..=1000; bitty-perf suite).\n  \
-       capture [--layout SPEC]          Deterministic headless frame capture (`dev-tools`; single|split|stack|overlay).\n  \
-       synthesize                       Fixed local input trajectory + multiline paste-gate probe (`dev-tools`).\n  \
-       dump grid [--rows N] [--cols N]  Bounded grid text + cursor (`dev-tools`; defaults 64x256).\n  \
-       dump scene                       Layout allocations, damage regions, and present stats (`dev-tools`).\n  \
-       dump atlas                       Headless GridRenderer atlas and glyph placement report (`dev-tools`).\n  \
-       overlay list                     Overlay catalog with headless availability (`dev-tools`).\n  \
-       overlay show <name>              Headless overlay proof (`dev-tools` cargo feature required).\n\
-     \n\
-     Options:\n  \
-       --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
-       --no-color      Disable ANSI coloring\n  \
-       --iterations N  trace latency sample count (1..=1000)\n  \
-       --rows N        dump grid row cap (1..=64)\n  \
-       --cols N        dump grid column cap (1..=256)\n  \
-       --layout SPEC   capture composition (single|split|stack|overlay)\n  \
-       -h, --help      Print this help and exit\n\
-     \n\
-     Exit codes: 0 success | 1 generic error | 2 usage error (--socket/--instance rejected)\n\
-     \n\
-     Examples:\n  \
-       bitty dev trace startup\n  \
-       bitty dev capture --layout split\n  \
-       bitty dev synthesize --format json\n  \
-       bitty dev dump grid --format json\n  \
-       bitty dev overlay list\n"
-    .to_string()
+pub fn dev_help_text(verbose: bool) -> String {
+    let mut text = String::from(
+        "bitty dev — developer tracing, captures, dumps, and overlays (local)\n\
+         \n\
+         Usage: bitty dev <trace|capture|synthesize|dump|overlay> [args]\n       \
+         [--format table|json|jsonl] [--no-color]\n\
+         \n\
+         Verbs (trace runs via `bitty-perf`; capture/synthesize/dump/overlay require `dev-tools`):\n  \
+         trace startup                    Headless PB-1 startup phases (bitty-perf suite).\n  \
+         trace latency [--iterations N]   Headless PB-4 key-to-screen trace (1..=1000; bitty-perf suite).\n  \
+         capture [--layout SPEC]          Deterministic headless frame capture (`dev-tools`;\n                                   \
+         single|split|stack|overlay).\n  \
+         synthesize                       Fixed local input trajectory + multiline paste-gate probe\n                                   \
+         (`dev-tools`).\n  \
+         dump grid [--rows N] [--cols N]  Bounded grid text + cursor (`dev-tools`; defaults 64x256).\n  \
+         dump scene                       Layout allocations, damage regions, and present stats\n                                   \
+         (`dev-tools`).\n  \
+         dump atlas                       Headless GridRenderer atlas and glyph placement report\n                                   \
+         (`dev-tools`).\n  \
+         overlay list                     Overlay catalog with headless availability (`dev-tools`).\n  \
+         overlay show <name>              Headless overlay proof (`dev-tools` cargo feature required).\n\
+         \n\
+         Options:\n  \
+         --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+         --no-color      Disable ANSI coloring\n  \
+         --iterations N  trace latency sample count (1..=1000)\n  \
+         --rows N        dump grid row cap (1..=64)\n  \
+         --cols N        dump grid column cap (1..=256)\n  \
+         --layout SPEC   capture composition (single|split|stack|overlay)\n  \
+         -h, --help      Print this help and exit\n\
+         \n\
+         Exit codes: 0 success | 1 generic error | 2 usage error (--socket/--instance rejected)\n\
+         \n\
+         Examples:\n  \
+         bitty dev trace startup\n  \
+         bitty dev capture --layout split\n  \
+         bitty dev synthesize --format json\n  \
+         bitty dev dump grid --format json\n  \
+         bitty dev overlay list\n",
+    );
+    if verbose {
+        // One blank line separates the compact body from the contract
+        // tier, so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str(DEV_HELP_CONTRACT);
+    }
+    text
 }
+
+/// Verbose-only contract tier for `bitty dev --help -v` (CTX-1788).
+///
+/// Appended after the compact body: the default help stays short
+/// enough to read at a glance, and `-v` is the documented opt-in for
+/// the trust boundaries a script author has to rely on.
+pub const DEV_HELP_CONTRACT: &str = "contract:\n  \
+         - Every verb except `trace` requires the `dev-tools` build feature: the CLI\n    \
+         refuses (exit 2) rather than degrading to a partial run.\n  \
+         - Local only: `--socket` and `--instance` are rejected.\n  \
+         - `--format json|jsonl` emits the same `v:1` envelope as every other\n    \
+         command.\n";
 
 // ---------------------------------------------------------------------------
 // Parser
@@ -1791,7 +1822,7 @@ pub fn run_dev(request: &DevRequest, options: &DevOptions) -> i32 {
 // `bitty dev` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::cli::Args;
+use crate::cli::{Args, verbose_help_requested};
 
 /// Runs `bitty dev <verb>`; returns the process exit code.
 ///
@@ -1808,7 +1839,10 @@ use crate::cli::Args;
 pub(crate) fn run_cli(args: &Args) -> i32 {
     match parse_dev_request(&args.dev_raw) {
         Err(DevParseError::Help) => {
-            print!("{}", dev_help_text());
+            print!(
+                "{}",
+                dev_help_text(args.verbose || verbose_help_requested(&args.dev_raw))
+            );
             0
         }
         Err(err) => {
@@ -2141,7 +2175,7 @@ mod tests {
         for token in ["trace", "capture", "synthesize", "dump", "overlay"] {
             assert!(usage.contains(token), "usage must name {token}");
         }
-        let help = dev_help_text();
+        let help = dev_help_text(false);
         for token in [
             "trace startup",
             "trace latency",

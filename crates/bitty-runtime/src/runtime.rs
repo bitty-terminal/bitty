@@ -632,6 +632,17 @@ pub struct Runtime {
     pending_present: Option<self::present::PendingPresent>,
     /// Earliest retry after a failed presenter recovery.
     presenter_retry_at: Option<std::time::Instant>,
+    /// [`PresentStats`] of a frame an off-tick presenter-ack drain committed.
+    ///
+    /// `poll_presenter_acks` (the embedder's pre-tick band hit-test drain) and
+    /// the input hot path both drain worker acks outside [`Runtime::tick`], so
+    /// the frame they commit is real but has no tick to report it. The stats
+    /// are parked here and consumed by the next [`Runtime::tick_at`], which is
+    /// the documented cadence: at most one present is reported per tick, and
+    /// the tick's own frame wins when both happen (CTX-1788, PR #3109
+    /// round-2 F3). Without this the metric was dropped and `presented_frames`
+    /// under-counted every ack drained on the pre-tick path.
+    offtick_present: Option<PresentStats>,
     /// Workers abandoned by recovery that have not yet exited.
     ///
     /// A late abandoned present can land after the replacement's commit, so
@@ -2250,6 +2261,7 @@ impl Runtime {
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
+            offtick_present: None,
             abandoned_workers_alive: 0,
             abandoned_check_at: None,
             presenter_reattach_at: None,
@@ -2580,6 +2592,7 @@ impl Runtime {
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
+            offtick_present: None,
             abandoned_workers_alive: 0,
             abandoned_check_at: None,
             presenter_reattach_at: None,

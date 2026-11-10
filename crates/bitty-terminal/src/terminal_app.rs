@@ -2356,7 +2356,7 @@ impl TerminalApp {
         self.pump_plugin_timers();
         // CTX-1332 (issue #2213, P0-AC-015): input-triggered band commands are
         // NOT delivered from this render/terminal tick. The cold delivery
-        // pump runs only from the `AboutToWait` arm after this tick returns
+        // pump runs only from the `AboutToWait` arm, before this tick runs
         // (see `pump_cold_commands`), so redraw, PTY-readable, resize, and
         // appearance arms never enter an owning plugin VM.
         self.watchdog_phase(Phase::ChromeBands);
@@ -2459,53 +2459,7 @@ impl TerminalApp {
         // without extra plumbing.
         self.sync_cursor_icon();
         if let Some(present) = stats {
-            self.presented_frames += 1;
-            self.watchdog_presented();
-            // CTX-0592: emit the real-window first-frame marker exactly once
-            // when the opt-in perf harness asked for it. The harness starts
-            // its timer before spawning this process and reads the elapsed
-            // time to this line as PB-1 launch-to-first-frame. Gated on the
-            // env flag so normal sessions and CI emit nothing, and on
-            // `!present.headless` so the headless fallback path (no window or
-            // no GPU) never fabricates a real-window first frame.
-            if self.presented_frames == 1
-                && !present.headless
-                && std::env::var_os("BITTY_PERF_STARTUP_MARKER").is_some()
-            {
-                println!("bitty perf: first-frame");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            if let Some(line) = self.maybe_format_tick(&present) {
-                eprintln!("{line}");
-            }
-            if self.runtime.replies_overflowed() {
-                crate::logging::warn(|| {
-                    String::from("warning: terminal reply queue overflowed (bounded cap)")
-                });
-            }
-            self.watchdog_phase(Phase::ReplyFlush);
-            // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
-            // When no writer is present (headless), replies stay queued for `take_replies` observation.
-            let written = self.runtime.write_replies();
-            if written > 0 && self.tick_logging_enabled() {
-                eprintln!("bitty: {written} reply bytes written to PTY master (post-tick)");
-            }
-            // CTX-0230: same post-tick flush for every pane session, so a
-            // split shell's query answers never wait for the next pump.
-            // Bounded per pane (reply cap, fail-closed); no-op when quiet.
-            let mut pane_written = 0usize;
-            for id in self.runtime.pane_session_ids() {
-                pane_written += self.runtime.write_pane_replies(id);
-            }
-            if pane_written > 0 && self.tick_logging_enabled() {
-                eprintln!(
-                    "bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)"
-                );
-            }
-            // bitty#2830 (review): both reply queues just drained. Republish
-            // the gauges so an idle park's `pending=replies` names only bytes
-            // that are genuinely still held, instead of the pre-flush count.
-            self.runtime.refresh_hang_gauges();
+            self.note_presented(&present);
         }
         self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
@@ -2513,6 +2467,64 @@ impl TerminalApp {
         // never delays terminal replies or the frame.
         self.deliver_runtime_events();
         stats
+    }
+
+    /// Accounts one presented frame: counters, the opt-in startup marker, the
+    /// `bitty tick` line, and the bounded reply flush.
+    ///
+    /// Split out of [`Self::drive_tick`] (CTX-1788, PR #3109 round-2 F3) so
+    /// the two present sources share one consumer: the tick's own frame and a
+    /// frame committed by an off-tick presenter-ack drain, which
+    /// [`bitty_runtime::Runtime::tick`] now reports on the next tick instead
+    /// of dropping. Callers pass at most one stats value per tick, so
+    /// `presented_frames` stays a count of presented frames rather than of
+    /// present reports.
+    pub(crate) fn note_presented(&mut self, present: &bitty_runtime::PresentStats) {
+        self.presented_frames += 1;
+        self.watchdog_presented();
+        // CTX-0592: emit the real-window first-frame marker exactly once
+        // when the opt-in perf harness asked for it. The harness starts
+        // its timer before spawning this process and reads the elapsed
+        // time to this line as PB-1 launch-to-first-frame. Gated on the
+        // env flag so normal sessions and CI emit nothing, and on
+        // `!present.headless` so the headless fallback path (no window or
+        // no GPU) never fabricates a real-window first frame.
+        if self.presented_frames == 1
+            && !present.headless
+            && std::env::var_os("BITTY_PERF_STARTUP_MARKER").is_some()
+        {
+            println!("bitty perf: first-frame");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        if let Some(line) = self.maybe_format_tick(present) {
+            eprintln!("{line}");
+        }
+        if self.runtime.replies_overflowed() {
+            crate::logging::warn(|| {
+                String::from("warning: terminal reply queue overflowed (bounded cap)")
+            });
+        }
+        self.watchdog_phase(Phase::ReplyFlush);
+        // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
+        // When no writer is present (headless), replies stay queued for `take_replies` observation.
+        let written = self.runtime.write_replies();
+        if written > 0 && self.tick_logging_enabled() {
+            eprintln!("bitty: {written} reply bytes written to PTY master (post-tick)");
+        }
+        // CTX-0230: same post-tick flush for every pane session, so a
+        // split shell's query answers never wait for the next pump.
+        // Bounded per pane (reply cap, fail-closed); no-op when quiet.
+        let mut pane_written = 0usize;
+        for id in self.runtime.pane_session_ids() {
+            pane_written += self.runtime.write_pane_replies(id);
+        }
+        if pane_written > 0 && self.tick_logging_enabled() {
+            eprintln!("bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)");
+        }
+        // bitty#2830 (review): both reply queues just drained. Republish
+        // the gauges so an idle park's `pending=replies` names only bytes
+        // that are genuinely still held, instead of the pre-flush count.
+        self.runtime.refresh_hang_gauges();
     }
 
     /// Drains cold-path events and applies the ones the app owns (CTX-0382).
@@ -3613,14 +3625,18 @@ impl TerminalApp {
 
     /// Runs the exclusive cold delivery phase (CTX-1332, C-D1/C-D4/C-D5).
     ///
-    /// Called only from the `AboutToWait` arm — once BEFORE [`Self::drive_tick`]
-    /// (so a command admitted against the frame the user just saw is dispatched
-    /// before plugin timers can bump the band tree version, bitty#3108) and once
-    /// after it returns (present, IME sync, reply flush, and runtime events are
-    /// committed; a hover deferred by `drive_tick` is revalidated). Never from
-    /// redraw, PTY-readable, resize/DPI, headless `Resumed`, appearance, input,
-    /// timers, overlays, runtime events, config watcher, or global IPC. Input
-    /// only enqueues; the owning VM is entered here, on the cold phase.
+    /// Called exactly once per `AboutToWait` pass, and only from that arm —
+    /// BEFORE [`Self::drive_tick`], so a command admitted against the frame
+    /// the user just saw is dispatched before plugin timers can bump the band
+    /// tree version (bitty#3108). The present, IME sync, reply flush, and
+    /// runtime events that `drive_tick` commits are observed by the *next*
+    /// pass's pump, which is the same bound the pre-tick pump gives every
+    /// other cold source (CTX-1788 removed a second, post-`drive_tick` call
+    /// that re-entered the owning VM twice per tick for no extra admission
+    /// window). Never from redraw, PTY-readable, resize/DPI, headless
+    /// `Resumed`, appearance, input, timers, overlays, runtime events, config
+    /// watcher, or global IPC. Input only enqueues; the owning VM is entered
+    /// here, on the cold phase.
     ///
     /// Selection is bounded by [`bitty_runtime::COLD_ADMISSION_SELECTION_MAX`]
     /// (the literal 16 = 8 + 8 from the existing band queue caps), enforced
@@ -5483,15 +5499,14 @@ impl TerminalApp {
                 // (so a timer tick cannot bump band tree version and discard a
                 // click/scroll that just completed, and so `drive_tick()`
                 // immediately commits and presents the click's effects in the
-                // same turn). Then pump a second time for any deferred hover
-                // revalidated by `drive_tick()`.
+                // same turn). Exactly one pump runs per tick: a second one
+                // after `drive_tick()` would re-enter the owning plugin VM on
+                // the same cold phase for work the next tick's pre-pump
+                // already covers (CTX-1788, PR #3109 round-2 F4).
                 let _ = self.runtime.poll_presenter_acks();
                 self.watchdog_phase(Phase::ColdCommands);
-                let delivered_pre = self.pump_cold_commands();
+                let delivered = self.pump_cold_commands();
                 let presented = self.drive_tick().is_some();
-                self.watchdog_phase(Phase::ColdCommands);
-                let delivered_post = self.pump_cold_commands();
-                let delivered = delivered_pre.saturating_add(delivered_post);
                 if presented || delivered > 0 {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();

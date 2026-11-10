@@ -1547,3 +1547,94 @@ fn spanless_place_without_pixels_paints_nothing_and_stays_bounded() {
     assert!(rt.tick().is_some());
     assert_eq!(rt.kitty_last_frame_images(), 0);
 }
+
+/// One full tile row of `U+10EEEE` placeholder cells naming image 42 at
+/// `tile_row`, columns 0 and 1.
+///
+/// `SGR 38;5;42` names the image; the frozen kitty `rowcolumn-diacritics`
+/// table maps `U+0305` to 0 and `U+030D` to 1 on both axes, so the first
+/// diacritic is the tile row and the second is the tile column.
+fn print_placeholder_tile_row(rt: &mut Runtime, tile_row: &str) {
+    let sequence =
+        format!("\x1b[38;5;42m\u{10EEEE}{tile_row}\u{0305}\u{10EEEE}{tile_row}\u{030D}\x1b[39m");
+    rt.handle_pty_bytes(sequence.as_bytes());
+}
+
+#[test]
+fn unicode_virtual_zero_dimension_span_keeps_the_stored_aspect() {
+    // CTX-1788 (PR #3109 round-2): the `t=f` unicode-virtual shape. Pixels
+    // arrive through a separate `a=t` transmit and the placement that turns
+    // the image into a `U+10EEEE` run is bodiless (`a=p,U=1` with no
+    // payload), so the prototype registers with zero pixel dimensions
+    // (`register_virtual_for_origin(.., 0, 0, base)`). `present` must then
+    // take the pixel size from the stored image; without it `fit_aspect_rect`
+    // gets `0x0` and fails open to the whole cell span, so the image is
+    // stretched to the span instead of letterboxed inside it.
+    //
+    // The span has to be fully explicit: terminal truth refuses a place with
+    // an empty axis (`cols == 0 || rows == 0`), and the runtime refuses a
+    // fully spanless prototype, so `c=2,r=2` is the only admitted shape —
+    // and with `c=`/`r=` present the *only* thing the pixel size can still
+    // decide is the aspect fit.
+    //
+    // The nearest existing coverage uses the synchronous `a=T` form with
+    // explicit `c=`/`r=`, which always carries decoded dimensions, so the
+    // fallback is dead there.
+    let mut rt = make_runtime();
+    // Deterministic single-tick presents (see the sibling spanless tests).
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    // First present sizes the surface.
+    rt.tick();
+    // 18x19 px at the headless 9x19 cell metrics: two columns wide, one row
+    // tall. Placed in a 2x2-cell span it must letterbox, not stretch.
+    let rgba = [0xFFu8, 0x00, 0x00, 0xFF].repeat(18 * 19);
+    let encoded = base64(&rgba);
+    rt.handle_pty_bytes(
+        format!("\x1b_Ga=t,f=32,s=18,v=19,q=2,i=42,m=0;{encoded}\x1b\\").as_bytes(),
+    );
+    assert_eq!(rt.kitty_image_count(), 1, "transmit stores the pixels");
+    // Bodiless virtual placement: no payload, so no pixel dimensions.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,U=1,i=42,c=2,r=2,q=2\x1b\\");
+    assert_eq!(
+        rt.kitty_virtual_count(),
+        1,
+        "prototype registered with zero pixel dimensions"
+    );
+    // Print both tile rows inside the visible cursor-follow window, and hide
+    // the cursor so it cannot mask a cell of the probe.
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    rt.handle_pty_bytes(b"\x1b[5;3H");
+    print_placeholder_tile_row(&mut rt, "\u{0305}");
+    rt.handle_pty_bytes(b"\x1b[6;3H");
+    print_placeholder_tile_row(&mut rt, "\u{030D}");
+    assert_eq!(
+        rt.state().kitty_unicode_runs_on_row(4).len(),
+        1,
+        "tile row 0 decoded on grid row 4"
+    );
+    assert_eq!(
+        rt.state().kitty_unicode_runs_on_row(5).len(),
+        1,
+        "tile row 1 decoded on grid row 5"
+    );
+
+    assert!(rt.tick().is_some(), "the placeholder run forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "both tile rows share one span, so they composite as one blit"
+    );
+    let (x0, y0, x1, y1, count) =
+        red_bounds(&rt).expect("the placeholder run must paint the stored image");
+    assert_eq!(x1 - x0 + 1, 18, "the image fills the span's width");
+    assert_eq!(
+        y1 - y0 + 1,
+        19,
+        "the 18x19 store letterboxes into the 2-row span; 38 means the pixel \
+         size was dropped and the span stretched it"
+    );
+    assert!(
+        count >= 18 * 19,
+        "the whole fitted image is opaque: {count}"
+    );
+}

@@ -767,8 +767,8 @@ fn panel_list_parses_like_other_lists() {
     assert!(parse_ctl_request(&words(&["panel", "list", "--cwd", "/tmp"])).is_err());
     // Usage and help name the new verb.
     assert!(ctl_usage().contains("panel list"));
-    assert!(ctl_help_text().contains("panel list"));
-    assert!(ctl_help_text().contains("core.panel.list"));
+    assert!(ctl_help_text(false).contains("panel list"));
+    assert!(ctl_help_text(false).contains("core.panel.list"));
 }
 
 #[test]
@@ -1975,7 +1975,7 @@ fn control_help_names_exact_elevation_verbs() {
     // cli_default-excluded scopes) and exempt view.* explicitly, so a
     // future view denial reads as a behavior bug, not docs ambiguity.
     // CTX-0257: workspace close joins the elevated set (kill power).
-    let help = ctl_help_text();
+    let help = ctl_help_text(false);
     assert!(
         help.contains("only terminal spawn, terminal close (terminal.manage),"),
         "help must scope elevation to the exact verbs, got {help:?}"
@@ -2010,7 +2010,7 @@ fn control_help_names_exact_elevation_verbs() {
 fn control_help_documents_windows_pipe_transport() {
     // CTX-1405 (#2244): `bitty ctl --help` must describe the real Windows
     // pipe transport and keep `instance list` discovery-only.
-    let help = ctl_help_text();
+    let help = ctl_help_text(false);
     assert!(
         help.contains("Windows uses the instance-derived"),
         "help must name the Windows pipe transport, got {help:?}"
@@ -2047,7 +2047,7 @@ fn control_help_documents_send_quoting() {
     // Note: fish -c "(printf '\r') | od -An -tx1" fails (substitution in
     // command position is disallowed); the supported fish form passes
     // (printf '\r') as an argument.
-    let help = ctl_help_text();
+    let help = ctl_help_text(false);
     assert!(
         help.contains("ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r'))"),
         "help must document ANSI-C quoting shell scope for bare-CR send, got {help:?}"

@@ -982,6 +982,64 @@ fn synchronized_frame_history_overflow_keeps_every_glyph() {
     );
 }
 
+/// Regression test for #3103 (round-2 review probe 10): `ED 1` only blanks the
+/// rows *above* the cursor, so rows between the cursor row and a recorded
+/// widget top still hold text. Lowering the 1-to-1 boundary onto the cursor
+/// row would pull those unerased rows into the truncating region and lose
+/// glyphs on the next width change; the record must be kept as-is.
+///
+/// Shape: 30 `h` on rows 0-1, 30 `j` on rows 2-3, `DECSC` on row 1, a `?2026h`
+/// frame opened on row 3 (widget top = 3), `DECRC` back to row 1, `ED 1`, then
+/// a narrowing resize. The `j` logical line sits entirely below the cursor, so
+/// it is never erased and must reflow intact.
+#[test]
+fn ed1_above_keeps_unerased_rows_between_cursor_and_widget_top() {
+    let mut s = State::new();
+    s.resize(20, 6);
+    // 30 `h` occupy rows 0-1 (soft wrap, no linefeed between them).
+    prints(&mut s, &"h".repeat(30));
+    newline(&mut s);
+    // 30 `j` occupy rows 2-3: committed history that sits above the widget
+    // top that is about to be recorded, but below the cursor after DECRC.
+    prints(&mut s, &"j".repeat(30));
+    // DECSC on row 1 (inside the `h` logical line).
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(2),
+        col: Col(11),
+    });
+    s.apply(&TerminalAction::CursorSave);
+    // A `?2026h` frame opens at row 3: the recorded widget top is row 3.
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row(4),
+        col: Col(11),
+    });
+    begin_sync_frame(&mut s);
+    // DECRC returns the cursor to row 1 without re-deriving the widget top.
+    s.apply(&TerminalAction::CursorRestore);
+    // ED 1 blanks only rows above (and left of) the cursor: rows 2-3 keep
+    // their `j` glyphs.
+    s.apply(&TerminalAction::EraseInDisplay {
+        mode: bitty_vt::EraseDisplayMode::Above,
+    });
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'j'),
+        30,
+        "ED 1 above the cursor must not erase the rows below it: {:?}",
+        logical_text(&s)
+    );
+
+    s.resize(10, 6);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        count_glyph(&s, 'j'),
+        30,
+        "rows between the cursor row and the widget top survive ED 1, so they \
+         must reflow instead of truncating 1-to-1: {:?}",
+        logical_text(&s)
+    );
+}
+
 /// Regression test for #3103 (left pane): a multi-line inline prompt widget
 /// (`────` / `> ` / `────` / `? for shortcuts`) rendered below committed
 /// Markdown history lines must not leave duplicate `────────` borders above

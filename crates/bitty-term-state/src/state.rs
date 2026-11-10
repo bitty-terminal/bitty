@@ -359,9 +359,18 @@ pub struct State {
     /// Grid width at which the most recent primary-screen DECSET 2026 frame
     /// began (`None` before the first frame, issue #3103).
     sync_frame_cols: Option<u16>,
-    /// Whether the current primary-screen DECSET 2026 frame began after the
-    /// grid width had changed since the previous frame began, i.e. it may
-    /// still be an in-flight render formatted for the old viewport (#3103).
+    /// Whether the current primary-screen DECSET 2026 frame may still be
+    /// formatted for a viewport wider than the live grid (#3103).
+    ///
+    /// Set in two places: when a `?2026h` frame begins at a width different
+    /// from the one recorded for the previous frame, and by
+    /// `resize_with_report` when a width change lands while a frame is
+    /// already open. The second case is the primary drag path: the clip
+    /// engages mid-frame, holds for the rest of the in-flight frame, and is
+    /// re-derived (still stale) by the next frame that begins at the new
+    /// width, so the affected window is up to two frames. Cleared by
+    /// `clear_inline_viewport` on full-screen erase, alternate-screen switch
+    /// and `RIS`.
     sync_frame_stale: bool,
     /// Whether an unsynchronized linefeed (`LF`/`VT`/`FF`/`IND`/`NEL` outside
     /// DECSET 2026) has advanced the primary screen since the last inline TUI
@@ -2163,10 +2172,11 @@ impl State {
         // the TUI's physical row count 1-to-1 with its internal `y` cursor
         // instead of scrolling the viewport and stranding status bars/borders
         // above `CUU`. The gate needs a recorded inline widget top *and* a
-        // frame that began after the grid changed width, so a steady-width
-        // frame that legitimately prints an over-width line (a TUI emitting
-        // scrollback history inside the frame) keeps normal soft wrapping and
-        // every glyph.
+        // stale frame-width record — the frame began at a different width or
+        // the width changed mid-frame — so a steady-width frame that
+        // legitimately prints an over-width line (a TUI emitting scrollback
+        // history inside the frame) keeps normal soft wrapping and every
+        // glyph.
         if self.modes.auto_wrap && self.cursor.pending_wrap {
             if clip_stale_frame {
                 return;
@@ -3606,12 +3616,15 @@ impl State {
             }
             EraseDisplayMode::Above => {
                 if !self.alt_screen_active() {
-                    // Everything above the cursor is blank, so a recorded
-                    // widget top can only move down to the cursor row and no
-                    // pending unsynchronized linefeed can still matter (#3103
-                    // review item 4).
-                    let row = self.cursor.position.row;
-                    self.inline_top_row = self.inline_top_row.map(|top| top.min(row));
+                    // ED 1 blanks only the rows above the cursor, so any row
+                    // between the cursor row and a recorded widget top still
+                    // holds text. Lowering the 1-to-1 boundary onto the cursor
+                    // row would pull those unerased rows into the truncating
+                    // region and lose glyphs on the next width change, so the
+                    // record is kept as-is: blank rows above the cursor
+                    // truncate harmlessly, and a top below the cursor keeps
+                    // reflowing its own history. Only the unsynchronized-LF
+                    // flag is cleared (#3103 review item 4, probe 10).
                     self.saw_unsynced_lf = false;
                 }
                 let (row, col) = self.cursor_xy();
@@ -4315,14 +4328,24 @@ impl State {
 
     /// Whether the state machine is applying an in-flight primary-screen
     /// DECSET 2026 frame formatted for a viewport wider than the live grid
-    /// (#3103).
+    /// (#3103), i.e. whether overflow at the right margin must be clipped.
     ///
     /// True only when a synchronized frame has recorded an inline widget top
-    /// *and* the current frame is the first one to begin after the grid
-    /// changed width — the signature of a border-drag shrink whose redraw has
-    /// not arrived yet. A steady-width frame is never stale, so over-width
-    /// content printed inside it (a TUI emitting scrollback history in the
-    /// frame) keeps normal soft wrapping instead of losing glyphs.
+    /// *and* `sync_frame_stale` is set: either the frame began after the grid
+    /// changed width, or a width change landed inside it (the primary
+    /// border-drag path). The clip stops soft wrapping at the right margin so
+    /// the TUI's physical row count stays 1-to-1 with its internal `y` cursor
+    /// and `CUU`-based redraws cannot strand borders or status bars.
+    ///
+    /// It is deliberately not a losslessness guarantee. The stale window
+    /// lasts up to two frames — the in-flight one plus the first one that
+    /// begins at the new width — and over-width content printed inside it is
+    /// truncated at the live width rather than kept, which is the intended
+    /// trade. A stale frame that writes without repositioning the cursor can
+    /// also lose its over-width row through the `pending_wrap` latch; that is
+    /// bounded to the frame and recovers as soon as the flag clears. A
+    /// steady-width frame is never stale, so an over-width history line
+    /// printed inside it keeps normal soft wrapping and every glyph.
     fn in_stale_inline_tui_sync_frame(&self) -> bool {
         !self.alt_screen_active()
             && self.modes.synchronized_update

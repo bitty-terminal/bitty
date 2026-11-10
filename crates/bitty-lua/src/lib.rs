@@ -131,7 +131,9 @@ pub use host::{
     validate_image_path,
 };
 pub use plain_config::{ConfigLuaVm, PlainConfigError, PlainConfigLimits, PlainConfigValue};
-pub use ui::{UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiNode, UiSlot};
+pub use ui::{
+    UI_MAX_DEPTH, UI_MAX_TEXT_BYTES, UI_SLOTS, UI_V1_NODE_KINDS, UiBlockState, UiNode, UiSlot,
+};
 pub use ui_catalog::{
     CATALOG_MAX_DEPTH, CATALOG_MAX_DETAIL_BYTES, CATALOG_MAX_NODES, CATALOG_MAX_PILL_LABEL_BYTES,
     CATALOG_MAX_PILLS, CATALOG_MAX_ROWS, CATALOG_MAX_SEGMENT_BYTES, CATALOG_MAX_SEGMENTS,

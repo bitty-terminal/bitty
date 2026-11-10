@@ -1824,6 +1824,7 @@ impl TerminalApp {
         // visible in the watchdog dump without borrowing plugin state.
         if let Some(plugin) = runtime.as_mut() {
             plugin.set_hang_gauges(std::sync::Arc::clone(self.runtime.hang_gauges()));
+            plugin.set_window_focused(self.runtime.is_window_focused());
         }
         self.plugin_runtime = runtime;
         self
@@ -2565,6 +2566,7 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return;
         };
+        plugin_runtime.set_window_focused(self.runtime.is_window_focused());
         // CTX-0889: one bounded summary pass serves both the live workspace
         // source and the event diff.
         let workspaces = self.runtime.workspace_summaries();
@@ -2898,6 +2900,7 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return 0;
         };
+        plugin_runtime.set_window_focused(self.runtime.is_window_focused());
         #[cfg(test)]
         if let Some(now) = test_now {
             let fired = plugin_runtime.pump_due_timers_at(now);
@@ -3642,6 +3645,9 @@ impl TerminalApp {
     /// still-parked work counts as an attempt, while a completed resume counts
     /// as one delivered result. Returns attempts plus completed resumed parks.
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
+        if let Some(plugin_runtime) = self.plugin_runtime.as_ref() {
+            plugin_runtime.set_window_focused(self.runtime.is_window_focused());
+        }
         // Issue #2407 (review B3): surface plugin-suggestion chord
         // collisions once, on the cold path, before other plugin work.
         self.log_keymap_suggestion_conflicts();

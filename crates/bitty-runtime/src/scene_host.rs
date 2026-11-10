@@ -334,6 +334,28 @@ impl SceneHost {
         true
     }
 
+    /// Queries whether `handle` is currently attached for `(owner, epoch)` and
+    /// whether the scene panel's bound view matches the published target view
+    /// (`bitty.ui.state`, issue #3107).
+    ///
+    /// Returns `Some((presented, view_focused))` for a live attached handle of
+    /// `(owner, epoch)`, or `None` when the handle is detached, stale, or owned
+    /// by another generation.
+    #[must_use]
+    pub fn scene_state(&self, owner: &str, epoch: u32, handle: i64) -> Option<(bool, bool)> {
+        let state = self.state.borrow();
+        if !state.scenes.iter().any(|attached| {
+            attached.handle == handle && attached.owner == owner && attached.epoch == epoch
+        }) {
+            return None;
+        }
+        let view_focused = state
+            .panel
+            .as_ref()
+            .is_some_and(|panel| self.target.get() == Some(panel.view));
+        Some((true, view_focused))
+    }
+
     /// Releases every scene one plugin generation owns (suspend/dispose).
     ///
     /// Called from `clear_ui_blocks`, so a suspended, disposed, crashed, or

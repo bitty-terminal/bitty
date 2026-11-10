@@ -51,7 +51,7 @@ use phodopus::{
 
 use crate::keymaps::{KeymapPage, KeymapQuery};
 use crate::runtime_inspect::RuntimeInspectSnapshot;
-use crate::ui::{UiNode, UiSceneScope, UiSlot, component_invalid, read_component};
+use crate::ui::{UiBlockState, UiNode, UiSceneScope, UiSlot, component_invalid, read_component};
 use crate::ui_rich::{UiRichNode, read_rich_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
@@ -1956,6 +1956,20 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.ui_unmount(handle)
+    }
+
+    /// Query the live visibility/focus state of one mounted handle
+    /// (`bitty.ui.state`, issue #3107).
+    ///
+    /// Returns `Ok(None)` (`nil` in Lua) for a stale, unmounted, foreign, or
+    /// unknown handle, matching the `ui.update`/`ui.unmount` stale-handle
+    /// contract. The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_state(&self, _handle: i64) -> Result<Option<UiBlockState>, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.state surface",
+        ))
     }
 
     /// Whether `handle` addresses a scene mounted through the v2 rich
@@ -6449,6 +6463,45 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         }),
     )
     .expect("ui table accepts 'unmount'");
+
+    // Issue #3107 (Plugin API v1): query whether a mounted block is currently
+    // presented and whether its host surface holds focus (`{ presented = bool,
+    // focused = bool }`), under the same `ui.rich` grant as `mount`/`update`/
+    // `unmount`. A stale, unmounted, foreign, or unknown handle returns `nil`
+    // without error, matching the `ui.update`/`ui.unmount` stale-handle
+    // contract.
+    ui.set(
+        ctx,
+        "state",
+        Callback::from_fn(&ctx, {
+            let state = state.clone();
+            move |ctx, _exec, mut stack| {
+                let handle = match stack.get(0) {
+                    Value::Integer(handle) => handle,
+                    _ => {
+                        return Err(component_invalid(
+                            "ui.state handle must be an integer block handle",
+                        )
+                        .to_error(ctx));
+                    }
+                };
+                let block_state = state
+                    .bounded(|_expiry| state.services.ui_state(handle))
+                    .map_err(|e| e.to_error(ctx))?;
+                match block_state {
+                    Some(UiBlockState { presented, focused }) => {
+                        let table = Table::new(&ctx);
+                        let _ = table.set(ctx, "presented", Value::Boolean(presented));
+                        let _ = table.set(ctx, "focused", Value::Boolean(focused));
+                        stack.replace(ctx, Value::Table(table));
+                    }
+                    None => stack.replace(ctx, Value::Nil),
+                }
+                Ok(CallbackReturn::Return)
+            }
+        }),
+    )
+    .expect("ui table accepts 'state'");
 
     // CTX-0941 (accepted W-01 host contract, v2 scope of OQ-056):
     // Core-owned focusable-overlay transient input capture under the decided

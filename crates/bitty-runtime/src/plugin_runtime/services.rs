@@ -22,7 +22,9 @@ use bitty_lua::runtime_inspect::{
     RUNTIME_INSPECT_CALLS_PER_SECOND, RUNTIME_INSPECT_MAX_WALL_MS, RuntimeInspectSnapshot,
 };
 use bitty_lua::ui::UiSlot;
-use bitty_lua::ui::{UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiNode, UiSceneScope};
+use bitty_lua::ui::{
+    UI_MAX_AGGREGATED_TEXT_BYTES, UI_MAX_BLOCKS, UiBlockState, UiNode, UiSceneScope,
+};
 use bitty_lua::{
     BridgeError, COMPONENT_CLASS_CAPABILITY_DENIED, CommandCatalogEntry, ComponentBridgeRequest,
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
@@ -46,6 +48,7 @@ use bitty_ui::{
 use bitty_ui::{MAX_HINT_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_BINDINGS, MAX_TARGET_PROVIDERS};
 use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
+use crate::runtime::band_host::band_is_visible;
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use crate::runtime::pane_cwd::PaneCwd;
@@ -1922,6 +1925,12 @@ pub struct PluginServices {
     spawn_backend: RefCell<Option<SpawnHandler>>,
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
+    /// Runtime-shared window-focus flag for `bitty.ui.state` (issue #3107).
+    ///
+    /// Defaults to `true` when constructed standalone; the runtime shares one
+    /// cell across all generations so `set_window_focused` updates every live
+    /// generation synchronously.
+    window_focused: RefCell<Rc<Cell<bool>>>,
     /// Core-owned `terminal`-slot scene host (bitty#2785).
     ///
     /// Installed only for `ui.rich` generations; absent means a rich mount
@@ -2197,6 +2206,7 @@ impl PluginServices {
             spawn_backend: RefCell::new(None),
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
+            window_focused: RefCell::new(Rc::new(Cell::new(true))),
             ui_scene_backend: RefCell::new(None),
             ui_epoch: Cell::new(0),
             overlay_capture: RefCell::new(None),
@@ -3244,6 +3254,77 @@ impl PluginServices {
             }
         }
         self.remove_spec_overlay_block(handle) || self.remove_ui_block(handle)
+    }
+
+    /// Share the runtime's window-focus flag with this generation (`bitty.ui.state`,
+    /// issue #3107).
+    pub fn set_window_focused_source(&self, source: Rc<Cell<bool>>) {
+        *self.window_focused.borrow_mut() = source;
+    }
+
+    /// Update the window-focus flag observed by [`Self::ui_block_state`].
+    pub fn set_window_focused(&self, focused: bool) {
+        self.window_focused.borrow().set(focused);
+    }
+
+    /// Whether the host window is currently focused.
+    #[must_use]
+    pub fn is_window_focused(&self) -> bool {
+        self.window_focused.borrow().get()
+    }
+
+    /// Query the live visibility and focus state of a mounted handle owned by
+    /// this generation (`bitty.ui.state`, issue #3107).
+    ///
+    /// Returns `None` for a stale, unmounted, foreign, or unknown handle.
+    #[must_use]
+    pub fn ui_block_state(&self, handle: i64) -> Option<UiBlockState> {
+        let window_focused = self.is_window_focused();
+        if crate::scene_host::is_scene_handle(handle) {
+            let backend = self.ui_scene_backend.borrow().clone()?;
+            let (presented, view_focused) =
+                backend.scene_state(&self.plugin_id, self.ui_epoch.get(), handle)?;
+            return Some(UiBlockState {
+                presented,
+                focused: window_focused && view_focused,
+            });
+        }
+        let blocks = self.ui_blocks.borrow();
+        let block = blocks.get(handle)?;
+        match block.ui_slot() {
+            // A band paints one row per block and is hidden only by empty
+            // text (the `band_is_visible` rule the paint path uses), so
+            // `presented` is the same content gate for every band slot.
+            UiSlot::Top | UiSlot::Bottom | UiSlot::Tabline => {
+                let presented = band_is_visible(block.node());
+                Some(UiBlockState {
+                    presented,
+                    focused: presented && window_focused,
+                })
+            }
+            UiSlot::Overlay => {
+                let captured = self
+                    .overlay_capture()
+                    .is_some_and(|c| c.borrow().is_owner(&self.plugin_id, handle));
+                let presented_session = self.presentation_overlay().is_some_and(|p| {
+                    p.borrow().session() == Some((self.plugin_id.as_str(), handle))
+                });
+                Some(UiBlockState {
+                    presented: captured || presented_session,
+                    // Only the capture session owns input; the paint-only
+                    // presentation surface never reports focus.
+                    focused: captured && window_focused,
+                })
+            }
+            // Every remaining slot has no band or overlay surface here: a
+            // `left`/`right` mount fails closed at admission and the
+            // `terminal` scene path never enters this registry, so a
+            // retained block cannot be painted on them.
+            UiSlot::Left | UiSlot::Right | UiSlot::Terminal => Some(UiBlockState {
+                presented: false,
+                focused: false,
+            }),
+        }
     }
 
     /// Record a spec-acquired surface, dropping any stale spec surface of
@@ -5868,6 +5949,13 @@ impl HostServices for PluginServices {
             return Err(BridgeError::capability_denied("ui.rich"));
         }
         Ok(self.unmount_ui_block(handle))
+    }
+
+    fn ui_state(&self, handle: i64) -> Result<Option<UiBlockState>, BridgeError> {
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        Ok(self.ui_block_state(handle))
     }
 
     fn ui_overlay_acquire_with_expiry(
@@ -9689,6 +9777,184 @@ mod tests {
             .ui_mount_scene("terminal", &node)
             .expect("re-mount after unmount");
         assert_ne!(next, handle, "a released scene handle is never re-minted");
+    }
+
+    #[test]
+    fn ui_state_tracks_band_visibility_focus_and_unmount() {
+        let denied = services();
+        assert_eq!(
+            denied.ui_state(1).expect_err("no ui.rich grant").code,
+            "E_CAPABILITY_DENIED"
+        );
+
+        let granted = services();
+        granted.set_ui_access(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: true,
+            present: true,
+            claims: Vec::new(),
+        });
+        granted.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
+        granted.set_presentation_overlay(Rc::new(RefCell::new(PresentationOverlay::new())));
+
+        // Unknown handle returns None (nil in Lua), never an error.
+        assert_eq!(granted.ui_state(999).expect("unknown"), None);
+
+        // Non-empty band block: presented = true, focused tracks window focus.
+        let band = granted
+            .ui_mount("bottom", &UiNode::text("live"))
+            .expect("mount bottom");
+        assert_eq!(
+            granted.ui_state(band).expect("state"),
+            Some(UiBlockState {
+                presented: true,
+                focused: true,
+            })
+        );
+        granted.set_window_focused(false);
+        assert_eq!(
+            granted.ui_state(band).expect("state unfocused"),
+            Some(UiBlockState {
+                presented: true,
+                focused: false,
+            })
+        );
+        granted.set_window_focused(true);
+
+        // Empty-text band reserves no row and paints nothing: presented = false, focused = false.
+        assert!(
+            granted
+                .ui_update(band, &UiNode::text(""))
+                .expect("update empty")
+        );
+        assert_eq!(
+            granted.ui_state(band).expect("state empty"),
+            Some(UiBlockState {
+                presented: false,
+                focused: false,
+            })
+        );
+
+        // Unmount returns None on subsequent ui_state queries.
+        assert!(granted.ui_unmount(band).expect("unmount"));
+        assert_eq!(granted.ui_state(band).expect("unmounted"), None);
+
+        // Overlay block: unpresented until shown or captured.
+        let overlay = granted
+            .ui_mount("overlay", &UiNode::text("sheet"))
+            .expect("mount overlay");
+        assert_eq!(
+            granted.ui_state(overlay).expect("unpresented overlay"),
+            Some(UiBlockState {
+                presented: false,
+                focused: false,
+            })
+        );
+        assert!(granted.ui_overlay_show(overlay).expect("present show"));
+        assert_eq!(
+            granted.ui_state(overlay).expect("presentation overlay"),
+            Some(UiBlockState {
+                presented: true,
+                focused: false,
+            })
+        );
+        assert!(granted.ui_overlay_hide(overlay).expect("present hide"));
+        granted
+            .ui_overlay_acquire(overlay)
+            .expect("acquire capture");
+        assert_eq!(
+            granted.ui_state(overlay).expect("captured overlay"),
+            Some(UiBlockState {
+                presented: true,
+                focused: true,
+            })
+        );
+        granted.set_window_focused(false);
+        assert_eq!(
+            granted
+                .ui_state(overlay)
+                .expect("captured overlay unfocused"),
+            Some(UiBlockState {
+                presented: true,
+                focused: false,
+            })
+        );
+        assert!(granted.ui_overlay_release(overlay).expect("release"));
+    }
+
+    /// bitty#3107 (b): `focused` follows the view that hosts the block, so a
+    /// `terminal`-slot scene reports `false` once focus moves to another leaf
+    /// and `true` again when its own leaf is the published target.
+    #[test]
+    fn ui_state_tracks_the_focus_of_the_view_hosting_a_terminal_scene() {
+        let services = ui_services(rich_only());
+        services.set_ui_epoch(3);
+        let panels = Rc::new(RefCell::new(
+            crate::registry::PanelRuntime::new(crate::registry::PanelRegistryConfig::default())
+                .expect("panel host"),
+        ));
+        let hosting = crate::ViewId::new(7);
+        let other = crate::ViewId::new(9);
+        let target = Rc::new(Cell::new(Some(hosting)));
+        let scene = Rc::new(crate::scene_host::SceneHost::new(
+            Rc::clone(&panels),
+            Rc::clone(&target),
+        ));
+        services.set_ui_scene_backend(Some(Rc::clone(&scene)));
+        let node = bitty_lua::UiRichNode::Text {
+            text: "live".to_string(),
+            bold: false,
+        };
+        let handle = services
+            .ui_mount_scene("terminal", &node)
+            .expect("scene mount");
+
+        let state = services.ui_block_state(handle).expect("live scene");
+        assert!(state.presented, "an attached scene paints");
+        assert!(state.focused, "the scene's own leaf is the focused view");
+
+        target.set(Some(other));
+        let state = services.ui_block_state(handle).expect("live scene");
+        assert!(state.presented, "the scene still paints on its own leaf");
+        assert!(!state.focused, "focus moved to a different view");
+
+        target.set(Some(hosting));
+        services.set_window_focused(false);
+        let state = services.ui_block_state(handle).expect("live scene");
+        assert!(
+            !state.focused,
+            "an unfocused window has no focused block even on its own leaf"
+        );
+    }
+
+    /// bitty#3107 (c): a released handle and a foreign generation's handle both
+    /// answer `None` (Lua `nil`), never an error — the same stale-handle
+    /// contract `ui.update`/`ui.unmount` already give.
+    #[test]
+    fn ui_state_reports_none_for_a_stale_or_foreign_handle() {
+        let services = ui_services(rich_only());
+        let handle = services
+            .ui_mount("bottom", &UiNode::text("row"))
+            .expect("mount");
+        assert!(
+            services.ui_unmount(handle).expect("unmount served"),
+            "the live handle releases"
+        );
+        assert!(
+            services.ui_block_state(handle).is_none(),
+            "a released handle is stale"
+        );
+
+        let foreign_services = ui_services(rich_only());
+        foreign_services.set_ui_epoch(9);
+        let foreign = foreign_services
+            .ui_mount("bottom", &UiNode::text("row"))
+            .expect("foreign mount");
+        assert!(
+            services.ui_block_state(foreign).is_none(),
+            "another generation's handle is unknown here"
+        );
     }
 
     #[test]

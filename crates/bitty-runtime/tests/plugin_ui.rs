@@ -1809,3 +1809,106 @@ fn stale_and_foreign_handles_keep_the_false_update_contract_for_anchored_trees()
         .expect_value("update_old");
     assert_false_not_error(stale);
 }
+
+#[test]
+fn ui_state_reports_mounted_visibility_focus_and_stale_handles() {
+    // Issue #3107: `bitty.ui.state(handle)` returns `{ presented, focused }`
+    // for a live block under `ui.rich`, reflects empty-text hiding and window
+    // focus transitions, and returns `nil` after `unmount` or for a foreign/
+    // unknown handle.
+    let mut fixture = Fixture::activate_with_commands(
+        "ui-state",
+        "bitty-featured.uistate",
+        &["ui.rich"],
+        &[],
+        &["query", "hide", "show", "drop", "bad_arg"],
+        r#"
+        local handle = bitty.ui.mount("bottom", { kind = "Text", text = "hello" })
+        bitty.commands.register({
+          id = "query",
+          title = "Query state",
+          run = function()
+            local s = bitty.ui.state(handle)
+            local foreign = bitty.ui.state(handle + 999)
+            return {
+              has_state = s ~= nil,
+              presented = s and s.presented or false,
+              focused = s and s.focused or false,
+              foreign_nil = foreign == nil,
+            }
+          end,
+        })
+        bitty.commands.register({
+          id = "hide",
+          title = "Hide band",
+          run = function()
+            return bitty.ui.update(handle, { kind = "Text", text = "" })
+          end,
+        })
+        bitty.commands.register({
+          id = "show",
+          title = "Show band",
+          run = function()
+            return bitty.ui.update(handle, { kind = "Text", text = "hello" })
+          end,
+        })
+        bitty.commands.register({
+          id = "drop",
+          title = "Drop band",
+          run = function()
+            return bitty.ui.unmount(handle)
+          end,
+        })
+        bitty.commands.register({
+          id = "bad_arg",
+          title = "Bad arg",
+          run = function()
+            local ok, err = pcall(bitty.ui.state, "not-an-int")
+            return ok and "NONE" or err.code
+          end,
+        })
+        return {}
+        "#,
+    );
+
+    let initial = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "query", &[])
+        .expect_value("query");
+    assert_eq!(initial.get("has_state"), Some(&LuaValue::Bool(true)));
+    assert_eq!(initial.get("presented"), Some(&LuaValue::Bool(true)));
+    assert_eq!(initial.get("focused"), Some(&LuaValue::Bool(true)));
+    assert_eq!(initial.get("foreign_nil"), Some(&LuaValue::Bool(true)));
+
+    // Unfocused window: band stays presented, focused drops to false.
+    fixture.runtime.set_window_focused(false);
+    let unfocused = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "query", &[])
+        .expect_value("query unfocused");
+    assert_eq!(unfocused.get("presented"), Some(&LuaValue::Bool(true)));
+    assert_eq!(unfocused.get("focused"), Some(&LuaValue::Bool(false)));
+    fixture.runtime.set_window_focused(true);
+
+    // Empty-text band hides its row: presented = false, focused = false.
+    let _ = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "hide", &[])
+        .expect_value("hide");
+    let hidden = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "query", &[])
+        .expect_value("query hidden");
+    assert_eq!(hidden.get("has_state"), Some(&LuaValue::Bool(true)));
+    assert_eq!(hidden.get("presented"), Some(&LuaValue::Bool(false)));
+    assert_eq!(hidden.get("focused"), Some(&LuaValue::Bool(false)));
+
+    // Show again, then unmount: state becomes nil.
+    let _ = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "show", &[])
+        .expect_value("show");
+    let _ = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "drop", &[])
+        .expect_value("drop");
+    let dropped = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "query", &[])
+        .expect_value("query dropped");
+    assert_eq!(dropped.get("has_state"), Some(&LuaValue::Bool(false)));
+
+    let bad = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "bad_arg", &[])
+        .expect_value("bad_arg");
+    assert_eq!(
+        bad,
+        LuaValue::String("E_UI_COMPONENT_INVALID".to_string()),
+        "non-integer handle must fail closed with E_UI_COMPONENT_INVALID"
+    );
+}

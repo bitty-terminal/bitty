@@ -42,7 +42,7 @@ pub mod spawn;
 pub mod store;
 pub mod system_sensors;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -152,7 +152,7 @@ pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTE
 // Bridge value/error types the host-service traits are expressed in, so the
 // application can implement `SettingsSource`/`SnapshotSource` without taking a
 // direct `bitty-lua` dependency.
-pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue, OverlayKeyChord};
+pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue, OverlayKeyChord, UiBlockState};
 
 /// Maximum stored manifest body bytes (RFC proposed default).
 pub const PLUGIN_MANIFEST_MAX_BYTES: usize = 256 * 1024;
@@ -1027,6 +1027,11 @@ pub struct PluginRuntime {
     /// `None` in tests and embedders that do not install a watchdog; command
     /// dispatch then skips the two relaxed atomic stores per invocation.
     hang_gauges: Option<Arc<HangGauges>>,
+    /// Runtime-shared window-focus flag for `bitty.ui.state` (issue #3107).
+    ///
+    /// Shared with every generation's [`PluginServices`]; defaults to `true`
+    /// and is updated by the host before delivering events/timers/commands.
+    window_focused: Rc<Cell<bool>>,
 }
 
 impl PluginRuntime {
@@ -1127,7 +1132,21 @@ impl PluginRuntime {
             timer_deadlines: BTreeMap::new(),
             timer_fired: BTreeSet::new(),
             hang_gauges: None,
+            window_focused: Rc::new(Cell::new(true)),
         }
+    }
+
+    /// Update the window-focus flag observed by `bitty.ui.state` across all
+    /// live generations (issue #3107).
+    pub fn set_window_focused(&self, focused: bool) {
+        self.window_focused.set(focused);
+    }
+
+    /// Whether the host window is currently marked focused for `bitty.ui.state`
+    /// (issue #3107).
+    #[must_use]
+    pub fn is_window_focused(&self) -> bool {
+        self.window_focused.get()
     }
 
     /// Installs the shared hang-watchdog gauges (bitty#2830).
@@ -3098,6 +3117,7 @@ impl PluginRuntime {
         // so the single-owner invariant spans every plugin and survives
         // reload; suspend/dispose revoke this generation's capture.
         plugin_services.set_overlay_capture(self.overlay_capture.clone());
+        plugin_services.set_window_focused_source(self.window_focused.clone());
         // CTX-1431: the one runtime-shared presentation-only overlay session,
         // so the one-surface-per-window invariant spans every plugin and
         // survives reload; suspend/dispose revoke this generation's surface.

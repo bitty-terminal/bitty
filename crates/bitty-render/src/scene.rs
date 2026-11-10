@@ -713,8 +713,9 @@ impl ScenePaint {
 
 /// ANSI index carrying the `content.accent` role.
 ///
-/// Mirrors `HELP_PANEL_ACCENT_ANSI_INDEX` (bright blue), so the resolver's
-/// accent token and the Core chrome accent agree on one source.
+/// Mirrors the theme contrast report's accent probe
+/// (`bitty_config::theme::help_ring_source`, bright blue), so the resolver's
+/// accent token and the reported accent agree on one source.
 const CONTENT_ACCENT_ANSI_INDEX: u8 = 12;
 /// ANSI index carrying the `content.muted` role (bright black).
 const CONTENT_MUTED_ANSI_INDEX: u8 = 8;

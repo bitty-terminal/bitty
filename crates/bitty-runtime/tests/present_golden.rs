@@ -219,25 +219,6 @@ fn golden_paste_banner_full_then_flash_then_idle() {
 }
 
 #[test]
-fn golden_help_overlay_shown_then_hidden() {
-    let mut rt = make_runtime();
-    let _ = rt.tick().expect("first tick presents");
-    rt.set_help_rows(vec![
-        "alt+x  toggle_zoom".to_string(),
-        "ctrl+shift+v  paste_from_clipboard".to_string(),
-    ]);
-    assert!(rt.toggle_help(), "help toggles on");
-    let shown = rt.tick().expect("overlay present");
-    // Re-recorded under CTX-1477 (#2468): thin muted rounded card replaces
-    // the full-cell accent border; the hidden frame is unchanged.
-    assert_digest("help_shown", &rt, &shown, 0x7b04_a8bf_d5c7_7485);
-    assert!(!rt.toggle_help(), "help toggles off");
-    let hidden = rt.tick().expect("dismissal present");
-    assert_digest("help_hidden", &rt, &hidden, 0xa769_7a2c_a636_3963);
-    assert!(rt.tick().is_none(), "back to idle");
-}
-
-#[test]
 fn golden_selection_overlay() {
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"select me");

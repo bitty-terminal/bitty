@@ -22,15 +22,21 @@
 //!
 //! Issue #2340 follow-up: frame equality alone lets a chrome surface pass on
 //! both sides of the comparison while every production call site reads the
-//! wrong color. The pending/close-confirm banner, help panel, and IME preedit
-//! tests therefore also probe the exact pixels of their theme-derived fills
+//! wrong color. The pending/close-confirm banner and IME preedit tests
+//! therefore also probe the exact pixels of their theme-derived fills
 //! after a live switch (`dracula` -> `github-light`), so reverting one fill to
 //! a fixed constant fails the test that owns that surface.
+//!
+//! Issue #2397: the help/which-key panel is no longer Core-drawn — the
+//! first-party `bitty-terminal.help` extension paints it through the
+//! presentation overlay, whose theme-derived chrome is pinned by the
+//! `presentation_overlay_paints_one_shared_chrome_card` unit test in
+//! `bitty-runtime`'s present module.
 
 use std::time::{Duration, Instant};
 
 use bitty_config::theme::{CustomPalette, resolve_theme};
-use bitty_render::grid::{HELP_PANEL_BG, HELP_PANEL_BORDER, PENDING_PASTE_BANNER_BG};
+use bitty_render::grid::PENDING_PASTE_BANNER_BG;
 use bitty_runtime::plugin_runtime::QueuedThemeRequest;
 use bitty_runtime::{AnimationPolicy, CloseConfirmMode, Runtime, RuntimeConfig, ThemePalette};
 use bitty_ui::{CellPos, Selection};
@@ -202,24 +208,6 @@ impl Probe {
         let x = self.content_x + i32::from(col) * self.cell_w as i32 + self.cell_w as i32 / 2;
         let y = self.content_y + i32::from(row) * self.cell_h as i32 + self.cell_h as i32 / 2;
         self.pixel_at(rgba, x, y)
-    }
-
-    /// Bounding box of every pixel equal to `color` (inclusive corners), or
-    /// `None`. Used to locate the opaque help-panel ring without duplicating
-    /// the panel layout math in the test.
-    fn color_bounds(&self, rgba: &[u8], color: [u8; 4]) -> Option<(i32, i32, i32, i32)> {
-        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for y in 0..self.height as i32 {
-            for x in 0..self.width as i32 {
-                if self.pixel_at(rgba, x, y) == color {
-                    x0 = x0.min(x);
-                    y0 = y0.min(y);
-                    x1 = x1.max(x);
-                    y1 = y1.max(y);
-                }
-            }
-        }
-        (x1 >= x0 && y1 >= y0).then_some((x0, y0, x1, y1))
     }
 
     /// Probes the bottom-right confirmation pill painted for `banner`.
@@ -523,95 +511,6 @@ fn close_confirm_banner_pixels_follow_the_switched_theme() {
         probe.banner_pixel(&after, &banner),
         PENDING_PASTE_BANNER_BG,
         "the switched close-confirm banner must not keep the pre-#2333 fixed fill"
-    );
-}
-
-#[test]
-fn help_panel_follows_the_theme() {
-    let mut live = runtime(dracula());
-    live.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
-    assert!(live.toggle_help(), "help toggles on");
-    let before = frame(&mut live);
-    let probe = Probe::new(&live);
-    let dark = dracula();
-    let light = github_light();
-
-    // Locate the opaque panel surface (selection ground), then probe the
-    // one-pixel ring just outside it. CTX-1477 replaced the full-cell accent
-    // border with the theme's muted idle outline; the SDF band composites at
-    // partial coverage, so the assertion is "visible, distinct, and
-    // recoloured", not a fixed raw colour.
-    let (sx0, sy0, sx1, sy1) = probe
-        .color_bounds(&before, dark.selection)
-        .expect("help panel surface must use the active theme's selection fill");
-    let (x0, y0, x1, y1) = (sx0 - 1, sy0 - 1, sx1 + 1, sy1 + 1);
-    let mid_y = (y0 + y1) / 2;
-    let dark_edge = probe.pixel_at(&before, x0, mid_y);
-    assert_ne!(
-        dark_edge, dark.selection,
-        "help panel left edge must paint a ring above the surface"
-    );
-    assert_ne!(
-        dark_edge, dark.background,
-        "help panel ring must be visible against the ground"
-    );
-    assert_eq!(
-        probe.pixel_at(&before, x0 - 1, mid_y),
-        dark.background,
-        "the thin ring must not bleed outside the frame"
-    );
-    // Top inner row, last inner cell: blank underlay, so the pixel is the
-    // panel's own opaque ground.
-    let ground_x = x1 - probe.cell_w as i32 - probe.cell_w as i32 / 2;
-    let ground_y = y0 + probe.cell_h as i32 + probe.cell_h as i32 / 2;
-    assert_eq!(
-        probe.pixel_at(&before, ground_x, ground_y),
-        dark.selection,
-        "help panel ground must use the theme selection fill"
-    );
-
-    live.set_theme_palette(light);
-    let after = frame(&mut live);
-    assert_ne!(
-        light.selection, HELP_PANEL_BG,
-        "precondition: the switched ground must differ from the pre-#2333 fixed fill"
-    );
-    let light_surface = probe
-        .color_bounds(&after, light.selection)
-        .expect("switched help surface must use the new theme's selection fill");
-    assert_eq!(
-        light_surface,
-        (sx0, sy0, sx1, sy1),
-        "the theme switch must not move the help panel"
-    );
-    let light_edge = probe.pixel_at(&after, x0, mid_y);
-    assert_ne!(
-        dark_edge, light_edge,
-        "the switched theme must recolor the help panel ring"
-    );
-    assert_eq!(
-        probe.pixel_at(&after, ground_x, ground_y),
-        light.selection,
-        "the switched theme must recolor the help panel ground"
-    );
-    assert_ne!(
-        probe.pixel_at(&after, ground_x, ground_y),
-        HELP_PANEL_BG,
-        "the switched panel ground must not keep the pre-#2333 fixed fill"
-    );
-    assert_ne!(
-        probe.pixel_at(&after, x0, mid_y),
-        HELP_PANEL_BORDER,
-        "the switched panel border must not keep the pre-#2333 fixed accent"
-    );
-
-    let mut fresh = runtime(github_light());
-    fresh.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
-    assert!(fresh.toggle_help(), "fresh help toggles on");
-    assert_eq!(
-        after,
-        frame(&mut fresh),
-        "the help panel must be recolored by the live switch"
     );
 }
 

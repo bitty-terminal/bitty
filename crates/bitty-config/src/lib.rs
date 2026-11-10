@@ -106,13 +106,15 @@ pub use args_json::{MAX_JSON_ARGS_BYTES, MAX_JSON_ARGS_DEPTH, validate_json_args
 pub use bitty_lua::{ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase};
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
-    Chord, ChromeAction, CommandInvocation, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
-    LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN,
-    LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll, LeaderState, ModKey,
-    MouseButtonBinding, PREFIX_KEYWORD, PrefixBinding, ResolvedKeymap, ResolvedLeader, SplitDir,
-    default_keymaps, default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
+    Chord, ChromeAction, CommandInvocation, HELP_PLUGIN_ID, HintConfig, KeyName, KeyRef,
+    LEADER_DEFAULT_CHORD_RAW, LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX,
+    LEADER_TIMEOUT_MS_MIN, LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll,
+    LeaderState, ModKey, MouseButtonBinding, PREFIX_KEYWORD, PrefixBinding, RETIRED_ACTIONS,
+    ResolvedKeymap, ResolvedLeader, RetiredAction, SplitDir, default_keymaps,
+    default_keymaps_with_mod, is_prefix_entry_shape, match_keymap, match_prefix,
     parse_prefix_entry, parse_prefix_second, resolve_hint_config, resolve_keymaps, resolve_leader,
-    resolve_leader_for, resolve_prefix_bindings, split_prefix_chord, validate_leader_timeout_ms,
+    resolve_leader_for, resolve_prefix_bindings, retired_action, retired_binding_diagnostic,
+    split_prefix_chord, strip_retired_bindings, validate_leader_timeout_ms,
 };
 pub use local_theme::{
     ActiveLocalTheme, LOCAL_THEME_DIR_NAME, LOCAL_THEME_EXTENSION, LocalTheme, LocalThemeCatalog,

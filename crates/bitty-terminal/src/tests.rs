@@ -5641,9 +5641,7 @@ fn mouse_action_is_captured_by_a_pending_close_confirmation() {
     // priority/capture rules as a bound chord. While a close modal is armed,
     // a non-confirm action is consumed and the modal stays armed.
     let mut app = headless_app_with_runtime_config(bitty_runtime::RuntimeConfig {
-        mouse_right: bitty_config::MouseButtonBinding::Action(
-            bitty_config::ChromeAction::ToggleHelp,
-        ),
+        mouse_right: bitty_config::MouseButtonBinding::Action(bitty_config::ChromeAction::NewPanel),
         close_confirm: bitty_runtime::CloseConfirmMode::Always,
         ..bitty_runtime::RuntimeConfig::default()
     });
@@ -5653,14 +5651,15 @@ fn mouse_action_is_captured_by_a_pending_close_confirmation() {
         bitty_runtime::ViewCloseRequest::Pending { .. }
     ));
     assert!(app.runtime.has_pending_close_confirm());
-    assert!(!app.runtime.help_visible());
+    let leaves = app.runtime.leaf_count();
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
-    assert!(
-        !app.runtime.help_visible(),
+    assert_eq!(
+        app.runtime.leaf_count(),
+        leaves,
         "the armed close modal captures the non-confirm mouse action"
     );
     assert!(
@@ -18586,7 +18585,7 @@ claims = []
           kind = "List",
           children = {
             { kind = "Text", text = "Keyboard shortcuts" },
-            { kind = "Text", text = "alt+h  toggle_help" },
+            { kind = "Text", text = "alt+h  goto_split:left" },
           },
         })
         bitty.store.set("mount_ok", ok)

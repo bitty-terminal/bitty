@@ -2941,13 +2941,6 @@ impl Runtime {
             self.snap_focused_to_live();
             gate_cancelled = self.cancel_pending_ws_close() || gate_cancelled;
         }
-        // CTX-0475: the help popup is informational, not a confirmation gate.
-        // Dismiss it, but never consume the `Esc`: the press still routes to
-        // the focused PTY so a fullscreen app's mode state stays in sync.
-        if self.help_visible {
-            self.snap_focused_to_live();
-            self.dismiss_help();
-        }
         if self.pending_paste.is_none() {
             return gate_cancelled;
         }

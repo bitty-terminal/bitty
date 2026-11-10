@@ -279,7 +279,6 @@ pub use runtime::bell::{
     RC8_EVENTS_PER_WINDOW, RC8_WINDOW, notification_banner_text, sanitize_notification_text,
 };
 pub use runtime::close_confirm::{CLOSE_CONFIRM_BANNER_MAX_CHARS, ViewCloseRequest};
-pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::{
     HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
 };

@@ -951,237 +951,47 @@ pub fn component_help_text() -> String {
      usage: bitty extension <verb> [args] [flags]\n\
      \n\
      verbs:\n\
-     \x20 list [<name>]               Show installed extensions across both tiers:\n\
-     \x20                             name, version, active marker, source\n\
-     \x20                             (user|system), ABI compat, path, and the\n\
-     \x20                             last activation transition the broker\n\
-     \x20                             recorded for that extension name\n\
-     \x20                             (installed|active|denied:<class>|crashed|\n\
-     \x20                             stopped; installed when never activated).\n\
-     \x20                             This is last-recorded diagnostics, not a\n\
-     \x20                             liveness probe: active means a spawn was\n\
-     \x20                             recorded, not that the process is running\n\
-     \x20                             now. The label is shown once per extension,\n\
-     \x20                             on the active-version row, and covers both\n\
-     \x20                             install tiers via $XDG_STATE_HOME. An\n\
-     \x20                             optional name filters the table (aliases\n\
-     \x20                             accepted: `bitty extension list bitty-graphics`).\n\
-     \x20 add <path> [--version V]    Stage a pre-built binary into the user tier\n\
-     \x20                             ($XDG_DATA_HOME/bitty/extensions/, no root).\n\
-     \x20                             A directory holds the extension descriptor\n\
-     \x20                             bitty-component.toml plus\n\
-     \x20                             the executable; a bare bitty-<name> file\n\
-     \x20                             needs --version <semver>. The digest is\n\
-     \x20                             computed and ABI compat verified before\n\
-     \x20                             anything is written. URLs fail closed (add\n\
-     \x20                             accepts local paths only).\n\
-     \x20 install <name> --version V Fetch exactly ONE pinned prebuilt release\n\
-     \x20 [--digest H] [--force]      from R2 (https://cdn.bitty.run) plus its\n\
-     \x20 [--yes]                     SHA256SUMS, verify both fail-closed,\n\
-     \x20                             TOFU-pin, stage into the user tier, then\n\
-     \x20                             hand off to the full manager. `--version\n\
-     \x20                             X.Y.Z` is required and pins exactly; a bare\n\
-     \x20                             install is a usage error (exit 2). Catalog\n\
-     \x20                             resolution and latest selection belong to\n\
-     \x20                             bitty-plugin-manager (W-72); Core never\n\
-     \x20                             fetches or parses extensions/catalog.v1.\n\
-     \x20 remove <name> [<version>]   Remove one user-installed version, or every\n\
-     \x20                             user version when none is named. Removing\n\
-     \x20                             the active version also drops `current`.\n\
-     \x20                             Never touches the system tier.\n\
-     \x20 show-source <name> [V]     Print the exact pinned executable bytes to\n\
-     \x20                             stdout (version defaults to the active\n\
-     \x20                             `current` pointer). The hash is re-verified\n\
-     \x20                             against the installed descriptor first; a\n\
-     \x20                             missing install or mismatch fails closed\n\
-     \x20                             (exit 4) with nothing on stdout. Provenance\n\
-     \x20                             (name, version, tier, path, sha256) goes to\n\
-     \x20                             stderr so stdout stays byte-identical.\n\
-     \n\
-     name aliases (#2381):\n\
-     \x20 `list`, `install`, `remove`, and `show-source` accept one repo-style\n\
-     \x20 `bitty-` prefix (`bitty-graphics` resolves to `graphics`) because\n\
-     \x20 extension repositories carry the workspace prefix while stored\n\
-     \x20 extension names do not. Resolution only selects the target: stored\n\
-     \x20 names, directories, and TOFU pins are never rewritten. An exact\n\
-     \x20 known name wins; when both `bitty-<name>` and `<name>` are known the\n\
-     \x20 alias is ambiguous and fails closed (exit 4) instead of guessing.\n\
-     \n\
-     pinned install (bitty#2399):\n\
-     \x20 The seed is bootstrap-only: `--version X.Y.Z` is required and the\n\
-     \x20 exact (name, version, host target) key is the only selection. Host\n\
-     \x20 target is detected, never a flag, so a foreign target can never be\n\
-     \x20 confused with this one. A bare install fails as usage (exit 2) and\n\
-     \x20 never falls back to directory names, GitHub tags, or a catalog.\n\
-     \x20 Trust boundary: SHA256SUMS is the published lock record and must\n\
-     \x20 match the downloaded bytes (all-available-must-match with --digest),\n\
-     \x20 then the TOFU pin records first contact. Catalog resolution, latest\n\
-     \x20 selection, and list/inspect presentation are bitty-plugin-manager\n\
-     \x20 work (W-72); the published extensions/catalog.v1 is that manager's\n\
-     \x20 input, and Core neither fetches nor parses it.\n\
-     \n\
-     source transparency (issue #1986):\n\
-     \x20 `show-source` prints pinned bytes (stdout) with provenance on\n\
-     \x20                             stderr; `install` renders an update-diff\n\
-     \x20                             preview when the fetch would change the TOFU\n\
-     \x20                             pin (preview only, consent and --force still\n\
-     \x20                             apply; diff is local, no network); dist\n\
-     \x20                             validation refuses minified/obfuscated Lua\n\
-     \x20                             and descriptors (readability rule: max 1000\n\
-     \x20                             bytes per line, 200 average).\n\
+     \x20 list [<name>]                         Show installed extensions across both tiers (user|system),\n\
+     \x20                                       ABI compat, path, and the last activation transition\n\
+     \x20                                       recorded (not a liveness probe: active means a spawn was\n\
+     \x20                                       recorded). Accepts `bitty-` aliases (e.g. `bitty-graphics`).\n\
+     \x20 add <path> [--version V] [--distro D] Stage a local pre-built binary into $XDG_DATA_HOME/bitty/extensions/.\n\
+     \x20                                       A directory holds the descriptor bitty-component.toml plus\n\
+     \x20                                       the executable; a bare bitty-<name> file needs --version.\n\
+     \x20 install <name> --version V            Fetch one pinned prebuilt release + SHA256SUMS from\n\
+     \x20   [--digest H] [--force] [--yes]      https://cdn.bitty.run, verify, TOFU-pin, and stage.\n\
+     \x20                                       Catalog resolution belongs to bitty-plugin-manager.\n\
+     \x20 remove <name> [<version>]             Remove one or all user-installed versions of <name>.\n\
+     \x20 show-source <name> [<version>]        Verify hash and print exact pinned executable bytes to stdout.\n\
      \n\
      flags:\n\
-     \x20 --format table|json|jsonl   list output shape (default table).\n\
-     \x20 --no-color                  Accepted for parity (tables are plain text).\n\
-     \x20 --version <semver>          add: version for a bare executable.\n\
-     \x20                             install: required; pins this exact X.Y.Z\n\
-     \x20                             release (there is no latest selector).\n\
-     \x20 --digest <hex>              install only: caller-supplied expected tarball\n\
-     \x20                             digest (64 hex, SHA-256). All-available-must-\n\
-     \x20                             match with CDN SHA256SUMS; any mismatch is an\n\
-     \x20                             integrity failure (exit 4), never a silent pick.\n\
-     \x20                             Malformed values fail as usage (exit 2).\n\
-     \x20 --force                     install only: re-pin the TOFU pin to the new\n\
-     \x20                             verified digest after all-available-must-match\n\
-     \x20                             passes. Does NOT bypass digest verification.\n\
-     \x20 --yes                       install only: approve the download consent\n\
-     \x20                             non-interactively (no prompt).\n\
-     \x20 --distro <name|default>     add only: WSL2 guest distro for extension\n\
-     \x20                             execution on Windows. `default` uses the\n\
-     \x20                             wsl.exe default distro. `install --distro`\n\
-     \x20                             is rejected (install fetches the host triple\n\
-     \x20                             and cannot stage a guest helper — use `add`).\n\
-     \x20                             Windows-only in effect: Unix validates the\n\
-     \x20                             value but stays native (no-op). See `WSL2\n\
-     \x20                             trampoline` below.\n\
+     \x20 --format table|json|jsonl   Output format for `list` (default table).\n\
+     \x20 --no-color                  Disable ANSI color.\n\
+     \x20 --version <semver>          Required for `install` (pinned install (bitty#2399)) and bare `add`.\n\
+     \x20 --digest <hex>              Expected SHA-256 hex digest for `install` (all-available-must-match).\n\
+     \x20 --force                     Re-pin TOFU digest after verification passes.\n\
+     \x20 --yes                       Approve download consent non-interactively.\n\
+     \x20 --distro <name|default>     WSL2 guest distro for `add` on Windows (`install --distro` is rejected).\n\
      \n\
-     WSL2 trampoline (Windows only, issue #1908):\n\
-     \x20 Windows extension helpers that must run inside a WSL2 guest do so\n\
-     \x20 through wsl.exe [--distribution D] --exec <helper> <fixed-argv>\n\
-     \x20 (PATH-resolved wsl.exe, fixed argv, no shell on either side).\n\
-     \x20 `add` never executes the extension here: it stages only and persists\n\
-     \x20 the resolved selection per-extension to <user>/<name>/wsl_distro for\n\
-     \x20 later runs (omission preserves any previous placement). `install`\n\
-     \x20 always fetches the host triple (a Windows PE on Windows hosts) and\n\
-     \x20 takes no --distro (flag or env): any selection for it fails as usage\n\
-     \x20 (exit 2) naming `add`, before any fetch or staging. Cross-target\n\
-     \x20 Linux fetching for `install --distro` is a #1908 follow-up, not in\n\
-     \x20 this change. Guest distro selection (`add`): explicit --distro wins,\n\
-     \x20 else BITTY_WSL_DISTRO config wins, else native execution (no\n\
-     \x20 trampoline); pass the literal `default` for the wsl.exe default\n\
-     \x20 distro (no --distribution flag). A selected distro with absent WSL\n\
-     \x20 fails closed before any staging (exit 1): install WSL2 from\n\
-     \x20 the Store (inbox builds use --status fallback, unversioned) or run\n\
-     \x20 without --distro. Path mapping (Windows to guest for spawn):\n",
+     WSL2 path mapping (Windows to guest for spawn):\n",
         // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
         "\x20 drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n\
-     \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n\
-     \x20 to their launch distro (cross-distro exec fails closed); device\n\
-     \x20 paths, drive-relative, relative, and other UNC spellings fail closed\n\
-     \x20 (exit 2, no silent mangling). Backslash rewriting happens only inside\n\
-     \x20 path mapping; general argv elements pass through discrete with spaces\n",
+     \x20 \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n",
         // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
         "\x20 preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
-     \x20 exists for diagnostics only; other guest paths have no Windows\n\
-     \x20 spelling. Guest env is WSLENV-gated (forwarded proxy/TLS/locale\n\
-     \x20 names only, secrets never, otherwise clean by design). Stdio and\n\
-     \x20 signals: stdin/stdout/stderr pipes pass through wsl.exe unchanged\n\
-     \x20 (binary-safe, no CRLF translation); Ctrl-C propagates via wsl.exe to\n\
-     \x20 the guest helper; the wsl.exe exit status is the helper exit status\n\
-     \x20 (1:1 fidelity, no remapping). Fetch stays native (Windows\n\
-     \x20 curl.exe/tar.exe); the trampoline applies to extension execution,\n\
-     \x20 never to downloads.\n\
      \n\
-     installer egress:\n\
-     \x20 cdn.bitty.run:443 is the core-built-in installer egress: strict\n\
-     \x20 configurations allow the pinned first-party host with no extra\n\
-     \x20 grant. Every other host stays consent-gated and fails closed\n\
-     \x20 without explicit consent. Fetch uses fixed-argv system curl\n\
-     \x20 (pinned to https://cdn.bitty.run, --proto =https, no shell) plus\n\
-     \x20 system tar; no Rust network stack.\n\
-     \n\
-     digest arbitration:\n\
-     \x20 All-available-must-match: the CDN SHA256SUMS entry and the\n\
-     \x20 caller-supplied --digest when provided must EACH match the\n\
-     \x20 downloaded bytes. Any mismatch exits 4, never a silent pick. Hex\n\
-     \x20 compare is constant-shape (pass/fail only, no position oracle).\n\
-     \n\
-     catalog boundary (bitty#2399, W-72):\n\
-     \x20 Core no longer fetches or parses https://cdn.bitty.run/extensions/\n\
-     \x20 catalog.v1 and has no latest selector. The bounded catalog stays a\n\
-     \x20 published artifact consumed by bitty-plugin-manager, which owns\n\
-     \x20 catalog resolution, latest selection, and list/inspect. The seed\n\
-     \x20 performs at most one pinned release fetch plus its SHA256SUMS. A\n\
-     \x20 missing or offline manifest reuses an already-installed, locally\n\
-     \x20 verified exact version with no download; with no verified local\n\
-     \x20 copy (or with --force/--digest) it fails closed before the tarball.\n\
-     \n\
-     TOFU pinning:\n\
-     \x20 First install of an extension records (pins) the verified CDN\n\
-     \x20 tarball digest to <user>/<name>/tarball.sha256. Later installs\n\
-     \x20 (reinstall, upgrade, downgrade) with a differing digest fail closed\n\
-     \x20 as pin-mismatch (exit 4) naming the extension, versions, and digests;\n\
-     \x20 use --force to re-pin after verification. The pin never auto-updates.\n\
-     \n\
-     download consent:\n\
-     \x20 Consent precedes every transport contact, so a decline or EOF exits\n\
-     \x20 1 with nothing fetched or staged. Unsigned 0.1.0 therefore always\n\
-     \x20 takes the explicit-confirm path for executable downloads; --digest\n\
-     \x20 does NOT grant silent. Without --yes the installer prompts for the\n\
-     \x20 exact pin (`Grant download <name> <version>? [y/N]`, up to 3\n\
-     \x20 attempts, 64 bytes per answer); `y`/`yes` approves, `n`/`no`/empty\n\
-     \x20 declines, EOF aborts.\n\
-     \n\
-     fetch environment:\n\
-     \x20 `install` preflights `curl --version` once per invocation and needs\n\
-     \x20 curl 7.68.0 or newer (for --proto =https, --connect-timeout,\n\
-     \x20 --max-time, --max-filesize; `curl` resolves via PATH, curl.exe on\n\
-     \x20 Windows). A missing curl fails closed: install curl, or place the\n\
-     \x20 release manually under $XDG_DATA_HOME/bitty/extensions/<name>/\n\
-     \x20 <version>/; nothing is fetched or staged (exit 1). A too-old curl\n\
-     \x20 fails the same way naming the found version, the floor, and the\n\
-     \x20 upgrade hint (exit 1); a missing tar fails likewise (exit 1).\n\
-     \x20 Fetch uses the system CA store only (no --cacert override) and\n\
-     \x20 honors the system proxy env (https_proxy/HTTPS_PROXY/all_proxy\n\
-     \x20 plus no_proxy) by inheritance; no *_TOKEN/*_KEY/*_SECRET variable\n\
-     \x20 ever crosses into a fetch child, and Core carries no custom TLS\n\
-     \x20 flags.\n\
-     \n\
-     resolution:\n\
-     \x20 User $XDG_DATA_HOME/bitty/extensions/ wins over system\n\
-     \x20 /usr/lib/bitty/extensions/ (or platform equivalent) on collision.\n\
-     \x20 A tampered user install fails closed without system fallback. Every\n\
-     \x20 spawn re-verifies name, version, executable name, protocol range,\n\
-     \x20 and SHA-256; a protocol range that excludes the host seam for its\n\
-     \x20 component family fails closed.\n\
-     \n\
-     authority:\n\
-     \x20 No extension code ever runs during any `bitty extension` operation.\n\
-     \x20 Missing optional extensions fail soft: resolution reports the name,\n\
-     \x20 the `bitty extension add` command to run, and never a stack trace.\n\
-     \n\
-     exit codes:\n\
-     \x20 0 success | 1 declined consent, aborted prompt, filesystem\n\
-     \x20 failure, fetch-environment failure (missing/too-old curl,\n\
-     \x20 missing tar), or WSL absent when --distro was requested | 2 usage\n\
-     \x20 (including malformed --digest/--distro and unmappable WSL paths) | 4\n\
-     \x20 extension error (integrity, ABI, digest, pin-mismatch)\n\
+     fetch & exit codes:\n\
+     \x20 Preflights `curl --version` (>= 7.68.0) and `tar` via PATH, using the system CA store and\n\
+     \x20 system proxy env (no *_TOKEN/*_KEY/*_SECRET forwarded).\n\
+     \x20 Exit codes: 0 success | 1 consent/io/fetch/WSL failure | 2 usage error | 4 integrity/ABI/pin error\n\
      \n\
      examples:\n\
      \x20 bitty extension list\n\
-     \x20 bitty extension list --format json\n\
-     \x20 bitty extension list bitty-graphics\n\
      \x20 bitty extension add ./dist/net --version 0.0.1\n\
-     \x20 bitty extension add ./dist/net --distro Ubuntu\n\
      \x20 bitty extension install graphics --version 0.0.24\n\
      \x20 bitty extension install net --version 0.0.1\n\
-     \x20 bitty extension install bitty-net --version 0.0.1   # repo-style alias\n\
-     \x20 bitty extension install net --version 0.0.1 --digest <hex>\n\
-     \x20 bitty extension install net --version 0.0.1 --force --yes\n\
-     \x20 bitty extension remove net 0.0.1\n\
      \x20 bitty extension show-source net\n\
-     \x20 bitty extension show-source bitty-net 0.0.1\n\
-     \x20 bitty extension show-source net 0.0.1"
+     \x20 bitty extension remove net 0.0.1"
     )
         .to_string()
 }

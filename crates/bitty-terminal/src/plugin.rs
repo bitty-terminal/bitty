@@ -889,297 +889,53 @@ pub fn plugin_help_text() -> String {
      usage: bitty plugin <verb> [args] [flags]\n\
      \n\
      verbs:\n\
-     \x20 list                        Show bundled, official-catalog, and installed\n\
-     \x20                             plugins: source, state, pin status,\n\
-     \x20                             granted/requested capabilities.\n\
-     \x20 install <id> [--yes]        Resolve an exact id against the bundled\n\
-     \x20                             catalog or the build-time official catalog.\n\
-     \x20                             Official ids come from a pinned, hash-\n\
-     \x20                             verified catalog generated from bitty-\n\
-     \x20                             plugins (no runtime metadata fetch), and\n\
-     \x20                             are installed from the pinned commit.\n\
-     \x20                             Incompatible entries are refused with the\n\
-     \x20                             exact declared range before any fetch.\n\
-     \x20                             Capabilities need explicit consent; --yes\n\
-     \x20                             approves without a prompt. Add\n\
-     \x20                             --profile <name> for a bundled id to\n\
-     \x20                             preselect a reviewed subset (see flags).\n\
-     \x20 install <path> [--yes]      Install or update an external package from\n\
-     \x20                             a local directory containing\n\
-     \x20                             bitty-plugin.toml (lua/ module root). The\n\
-     \x20                             manifest, entry point, bounds, and compat\n\
-     \x20                             ranges are verified before anything is\n\
-     \x20                             staged; added capabilities need consent.\n\
-     \x20                             An update that replaces installed source\n\
-     \x20                             with different bytes always prints a\n\
-     \x20                             bounded per-file diff and asks before\n\
-     \x20                             installing, even when no capability is\n\
-     \x20                             added (--yes approves that snapshot; --force\n\
-     \x20                             skips only the repair prompt). A manifest\n\
-     \x20                             that declares [source] sha256 pins the\n\
-     \x20                             module tree, and minified/obfuscated Lua\n\
-     \x20                             is refused.\n\
-     \x20                             The package tree and current.json are\n\
-     \x20                             committed together: a failed install\n\
-     \x20                             rolls the tree back, so no version dir\n\
-     \x20                             is left without an index entry. Re-running\n\
-     \x20                             an install with the same version but\n\
-     \x20                             different content (a rebuilt checkout)\n\
-     \x20                             replaces the tree after a `[y/N]` prompt,\n\
-     \x20                             or non-interactively with --force. An\n\
-     \x20                             orphaned/partial tree left by an\n\
-     \x20                             interrupted install takes the same path,\n\
-     \x20                             and identical bytes are adopted without a\n\
-     \x20                             prompt.\n\
-     \x20 install <git-url> [--yes]  Install from a git source: exactly\n\
-     \x20                             https://<host>/<path>.git,\n\
-     \x20                             git+https://<host>/<path>.git (the git+\n\
-     \x20                             prefix is stripped before cloning), or\n\
-     \x20                             git@<host>:<path>. Fixed-argv system\n\
-     \x20                             `git clone --filter=blob:none --depth=1\n\
-     \x20                             <url> <staging-dir>` into an exclusive\n\
-     \x20                             temp dir (caller env inherited for\n\
-     \x20                             gitconfig/SSH-agent/proxy/CA), then the\n\
-     \x20                             same local-path pipeline. file://,\n\
-     \x20                             http://, ssh://, and other schemes fail\n\
-     \x20                             closed with a naming diagnostic.\n\
-     \x20 install <archive> [--yes]  Install from a local archive file:\n\
-     \x20                             .tar.gz/.tgz (tar -xzf), .tar.zst (tar\n\
-     \x20                             --use-compress-program=unzstd -xf), or\n\
-     \x20                             .zip (unzip -q -d). Fixed-argv system\n\
-     \x20                             helpers unpack into an exclusive temp\n\
-     \x20                             staging dir (members audited for ../,\n\
-     \x20                             absolute paths, and symlinks; declared\n\
-     \x20                             unpacked content bounded at 64 MiB\n\
-     \x20                             before extraction), then the\n\
-     \x20                             same local-path pipeline. A missing\n\
-     \x20                             helper or a bad/hostile archive fails\n\
-     \x20                             closed with nothing staged.\n\
-     \x20 remove <id> --force         Remove a record: bundled records drop from\n\
-     \x20                             the managed ledger (previous copy kept as\n\
-     \x20                             .bak); installed packages delete their store\n\
-     \x20                             record and package tree.\n\
-     \x20 enable <id>                 Re-enable a recorded plugin. Bundled pins\n\
-     \x20                             and grants are re-checked; installed records\n\
-     \x20                             are switched atomically in the store index.\n\
-     \x20 disable <id>                Disable without dropping the record or grant.\n\
-     \x20 revoke <id> [--cap <cap>]   Revoke grants without dropping the record:\n\
-     \x20                             without --cap every granted capability is\n\
-     \x20                             dropped and the plugin disabled; with --cap\n\
-     \x20                             one capability is dropped and remembered\n\
-     \x20                             as explicitly denied (no silent re-prompt).\n\
-     \x20                             Re-grant with `install` (explicit consent).\n\
-     \x20 grant <id> --profile <name> [--yes]\n\
-     \x20                             Apply one category profile to a bundled\n\
-     \x20                             record. The profile only preselects\n\
-     \x20                             individual grants the manifest already\n\
-     \x20                             requests; a diff/review screen lists\n\
-     \x20                             additions, already-granted, non-selected,\n\
-     \x20                             explicitly denied, and sensitive heads\n\
-     \x20                             that need per-item consent. It never\n\
-     \x20                             enables the plugin, revokes, or clears a\n\
-     \x20                             denial. Profiles: minimal | editor-like |\n\
-     \x20                             panel-like | agent-like.\n\
-     \x20 grant <id> --cap <capability> [--yes]\n\
-     \x20                             Explicitly grant one requested\n\
-     \x20                             capability. This is the per-item path for\n\
-     \x20                             exec/network/agent/clipboard-read/env and\n\
-     \x20                             every other sensitive head; naming it is\n\
-     \x20                             the consent action. It cannot add a\n\
-     \x20                             capability the manifest does not request,\n\
-     \x20                             and it never clears an explicit denial\n\
-     \x20                             (re-run `install` to re-consent).\n\
-     \x20 info <id>                   Manifest + recorded state, with the plain-\
-     \x20                             language effect per capability.\n\
-     \x20 show-source <id>            Print the verified module tree of one\n\
-     \x20                             store-installed package: the recorded\n\
-     \x20                             content digest is recomputed first, and a\n\
-     \x20                             mismatch fails closed (exit 4) with nothing\n\
-     \x20                             on stdout. Each file prints a\n\
-     \x20                             `-- <path> sha256 <digest>` header then\n\
-     \x20                             its exact bytes; provenance goes to stderr.\n\
-     \x20 explain <id> <capability>    Read-only capability decision chain for one\n\
-     \x20                             declared capability: every layer\n\
-     \x20                             (host/user/project/parent/task/request)\n\
-     \x20                             with allow/deny/empty, the first denying\n\
-     \x20                             layer, DenialKind, reason chain, trust\n\
-     \x20                             level, enforcement record, effective\n\
-     \x20                             grant, and a remediation hint. Exits 4\n\
-     \x20                             when the capability is denied. No plugin\n\
-     \x20                             code runs and nothing is mutated.\n\
-     \x20 config show <id>            Print the declared [settings] schema, the\n\
-     \x20                             selected user file, and the effective\n\
-     \x20                             value plus serving layer per key. No\n\
-     \x20                             plugin VM is created.\n\
-     \x20 config scaffold <id>        Write a commented Lua settings template\n\
-     \x20                             (canonical <owner>.<name>.lua path) from\n\
-     \x20                             the manifest [settings] defaults. Refuses\n\
-     \x20                             to overwrite without --force.\n\
-     \x20 doctor [--repair] [--no-color]\n\
-     \x20                             Diagnose the package store and the\n\
-     \x20                             bitty-plugins.lua ledger (data only).\n\
-     \x20                             Reports\n\
-     \x20                             orphaned/partial version dirs, dangling\n\
-     \x20                             index records, a corrupt current.json,\n\
-     \x20                             stale staging dirs, and stale ledger\n\
-     \x20                             records. --repair moves broken/extra\n\
-     \x20                             trees to <store>/quarantine/, removes\n\
-     \x20                             stale staging, rebuilds current.json\n\
-     \x20                             from complete trees (index last, atomic),\n\
-     \x20                             and quarantines a malformed ledger.\n\
-     \x20                             Rebuilt records with a changed manifest\n\
-     \x20                             hash start disabled with no grants; re-run\n\
-     \x20                             `install <source> --force` to re-consent.\n\
+     \x20 list                                Show bundled, official-catalog, and installed plugins.\n\
+     \x20 install <bundled-id>                Install a bundled plugin (`--profile P` is bundled-only).\n\
+     \x20   [--profile P] [--yes]\n\
+     \x20 install <catalog-id|path|git-url|archive>  Install or update from official catalog id, local dir,\n\
+     \x20   [--yes] [--force]                 git URL (https://...git, git+https://, git@), or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
+     \x20 remove <id> --force                 Remove a bundled ledger record or installed store package.\n\
+     \x20 enable <id>                         Enable a recorded plugin (applies on next startup).\n\
+     \x20 disable <id>                        Disable without dropping the record or grants.\n\
+     \x20 revoke <id> [--cap <cap>]           Drop all grants (and disable) or one capability.\n\
+     \x20 grant <id> --profile <name> [--yes] Preselect a reviewed profile (minimal|editor-like|panel-like|agent-like).\n\
+     \x20 grant <id> --cap <capability>       Explicitly grant one manifest-requested capability.\n\
+     \x20 info <id>                           Show manifest, recorded state, and capability effects.\n\
+     \x20 show-source <id>                    Verify digest and print installed module files to stdout.\n\
+     \x20 explain <id> <capability>           Read-only capability decision chain across all six policy layers.\n\
+     \x20 config show <id>                    Print declared [settings] schema and effective values.\n\
+     \x20 config scaffold <id> [--force]      Write a commented settings template under plugins/<id>.lua.\n\
+     \x20 doctor [--repair] [--no-color]      Diagnose or repair the package store and bitty-plugins.lua ledger.\n\
      \n\
      flags:\n\
-     \x20 --format table|json|jsonl   list/info/explain/config show output (default table).\n\
-     \x20 --json                      Alias for --format json.\n\
-     \x20 --no-color                  list/info/explain/config/doctor output (tables\n\
-     \x20                             are plain text; this also honors NO_COLOR).\n\
-     \x20 --yes                       install/grant: approve capability consent and\n\
-     \x20                             an orphan/same-version repair prompt. With\n\
-     \x20                             --profile it approves only the reviewed\n\
-     \x20                             preselected set, never sensitive heads.\n\
-     \x20 --force                     install/remove/config scaffold: install\n\
-     \x20                             replaces an orphaned or same-version tree\n\
-     \x20                             without the repair prompt; remove confirms\n\
-     \x20                             the destructive drop; config scaffold\n\
-     \x20                             confirms overwrite.\n\
-     \x20 --repair                    doctor only: quarantine/rebuild the store\n\
-     \x20                             and ledger.\n\
+     \x20 --format table|json|jsonl   Output format for list/info/explain/config show (alias: --json).\n\
+     \x20 --no-color                  Disable ANSI color (also honors NO_COLOR).\n\
+     \x20 --yes                       Approve capability consent / repair prompts non-interactively.\n\
+     \x20 --force                     Confirm remove, config overwrite, orphan replacement, or repair\n\
+     \x20                             (same-version source updates still require --yes or interactive consent).\n\
+     \x20 --repair                    doctor only: quarantine broken trees and rebuild index/ledger.\n\
      \x20 --init                      config only: alias for `config scaffold`.\n\
-     \x20 --cap <capability>          revoke/grant only: revoke one granted\n\
-     \x20                             capability, or explicitly grant one\n\
-     \x20                             manifest-requested capability.\n\
-     \x20 --profile <name>            install (bundled ids)/grant only: apply a\n\
-     \x20                             versioned category preselect (minimal,\n\
-     \x20                             editor-like, panel-like, agent-like).\n\
-     \x20                             Profiles never include exec, network,\n\
-     \x20                             agent/MCP/AI, clipboard read, environment,\n\
-     \x20                             terminal input/raw read, debug, browser,\n\
-     \x20                             or device control; grant those one at a\n\
-     \x20                             time with --cap. Store packages reject\n\
-     \x20                             --profile: their install transaction owns\n\
-     \x20                             the full grant set.\n\
+     \x20 --cap <capability>          Target one capability in `grant` or `revoke`.\n\
+     \x20 --profile <name>            Apply a capability profile (`minimal`, `editor-like`, `panel-like`, `agent-like`).\n\
      \n\
-     download consent:\n\
-     \x20 Capability grants use explicit confirm: --yes approves\n\
-     \x20 non-interactively, otherwise the installer prompts\n\
-     \x20 `Grant these capabilities? [y/N]` (up to 3 attempts, 64 bytes per\n\
-     \x20 answer); `y`/`yes` approves, `n`/`no`/empty declines, EOF aborts.\n\
-     \x20 A decline or EOF exits 1 with nothing changed. Unchanged or\n\
-     \x20 narrowed capability sets carry forward silently; added\n\
-     \x20 capabilities always need fresh consent. Capability profiles are\n\
-     \x20 only a preselection over individual grants: the review/diff screen\n\
-     \x20 runs before apply, every selected capability is recorded and\n\
-     \x20 revocable one by one, and the six-layer intersection plus every\n\
-     \x20 existing denial path is unchanged. Native extension downloads\n\
-     \x20 (`bitty extension install`) follow the same levels: the builtin\n\
-     \x20 installer egress cdn.bitty.run:443 needs no extra grant, while\n\
-     \x20 third-party hosts stay consent-gated and fail closed.\n\
-     \n\
-     authority:\n\
-     \x20 Plugin code is never executed by any `bitty plugin` operation. A\n\
-     \x20 capability is granted only when the manifest requests it and consent\n\
-     \x20 is explicit; grants are bound to the exact manifest hash, so a later\n\
-     \x20 manifest that adds a capability blocks until re-approved. Installed\n\
-     \x20 packages come from local directories, git checkouts, local archives\n\
-     \x20 (source class `local-path`), or the embedded official catalog\n\
-     \x20 (source class `registry`, pinned commit + raw manifest hash verified),\n\
-     \x20 are stored under packages/<id>/<version>/ with an owner-only mode, and\n\
-     \x20 load as third-party packages. The official catalog is build-time data:\n\
-     \x20 Core never fetches registry metadata at runtime.\n\
-     \n\
-     store recovery (issue #2439):\n\
-     \x20 `bitty plugin list` shows orphaned/partial package directories with\n\
-     \x20 state `orphaned` or `broken` and a repair hint instead of hiding\n\
-     \x20 them. Safe recovery ladder:\n\
-     \x20   bitty plugin doctor                 # diagnose, change nothing\n\
-     \x20   bitty plugin doctor --repair        # quarantine broken trees,\n\
-     \x20                                       # rebuild current.json/ledger\n\
-     \x20   bitty plugin remove <id> --force    # discard one orphaned tree\n\
-     \x20   bitty plugin install <source> --force  # reinstall/replace content\n\
-     \x20 A corrupt current.json is never treated as an empty store: list and\n\
-     \x20 install fail closed with the doctor repair command. `doctor --repair`\n\
-     \x20 moves the old file to <store>/quarantine/ first. Rebuilt records keep\n\
-     \x20 existing grants only when the manifest hash still matches; otherwise\n\
-     \x20 they are disabled with no grants and must be re-approved.\n\
-     \n\
-     wiring (where things land, what to edit next):\n\
-     \x20 The managed ledger lives beside the config file:\n\
-     \x20 $XDG_CONFIG_HOME/bitty/bitty-plugins.lua (fallback\n\
-     \x20 ~/.config/bitty/...; an explicit --config path selects its own\n\
-     \x20 directory). It is data-only Lua, never executed. Never hand-edit\n\
-     \x20 it: it is the grant ledger, and a malformed file fails closed.\n\
-     \x20 A legacy bitty-plugins.toml is migrated once (retained as\n\
-     \x20 bitty-plugins.toml.bak).\n\
-     \x20 Per-plugin user files live next to it, under plugins/.\n\
-     \x20 A successful install or first enable of a plugin that declares\n\
-     \x20 [settings] creates a commented defaults file at that path once;\n\
-     \x20 existing files, user edits, and a legacy <id>.toml are never\n\
-     \x20 overwritten (use `config scaffold --force` to replace explicitly).\n\
-     \x20 The canonical file is\n\
-     \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua: it returns a\n\
-     \x20 table and runs in a host-free, budgeted configuration VM. A\n\
-     \x20 <name>.lua short alias also works when exactly one discovered\n\
-     \x20 plugin claims that name. The legacy data-only form\n\
-     \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.toml (flat\n\
-     \x20 `key = value` lines only) applies only when no Lua file exists.\n\
-     \x20 Unknown keys are ignored, bad values fall back to the plugin's\n\
-     \x20 shipped defaults, and edits apply on the next activation, not\n\
-     \x20 live. Installed packages\n\
-     \x20 land under $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/\n\
-     \x20 (fallback ~/.local/share/...). Inspect with\n\
-     \x20 `bitty plugin config show <id>`; scaffold with\n\
-     \x20 `bitty plugin config scaffold <id>`.\n\
-     \x20 After a fresh local, Git, or archive install, the plugin is staged and\n\
-     \x20 disabled; updates preserve the existing enabled/disabled state. Enable\n\
-     \x20 it explicitly with:\n\
-     \x20 bitty plugin enable <id>\n\
-     \x20 bitty plugin info <id>     # manifest, grants, and settings\n\
-     \x20 A running instance reads the installed plugin store only at\n\
-     \x20 startup, so enable/disable applies on the next restart. `bitty\n\
-     \x20 reload` reports the pending installed plugin set as restart-required\n\
-     \x20 (exit 4) instead of silently leaving the old generations running.\n\
-     \n\
-     fetch:\n\
-     \x20 Git and archive installs stage under an exclusive temp dir and run\n\
-     \x20 zero plugin code. `git`/`tar`/`unzip` resolve via PATH (git.exe/\n\
-     \x20 tar.exe on Windows); a missing helper fails closed. `unzip` may be\n\
-     \x20 absent on Windows: .zip installs then fail closed with a diagnostic.\n\
-     \x20 Helpers inherit the system proxy env and the system CA store (no\n\
-     \x20 bundled certs, no custom TLS flags in Core).\n\
+     notes:\n\
+     \x20 - Ledger: $XDG_CONFIG_HOME/bitty/bitty-plugins.lua; per-plugin config: plugins/<owner>.<name>.lua;\n\
+     \x20   store: $XDG_DATA_HOME/bitty/plugins/packages/<id>/<version>/.\n\
+     \x20 - Fetch helpers (`git`/`tar`/`unzip`) resolve via PATH and inherit the system proxy env and\n\
+     \x20   the system CA store (no plugin code runs during CLI operations).\n\
      \n\
      exit codes:\n\
-     \x20 0 success (including idempotent no-ops).\n\
-     \x20 1 aborted/io: declined/EOF consent, filesystem failure, missing\n\
-     \x20    fetch helper, `git clone` failure, archive unpack failure.\n\
-     \x20 2 usage: bad verb/flag/format/id, stray `--`, wrong-verb flags.\n\
-     \x20 4 plugin error: unknown id, bad manifest/pin/grant, rejected fetch\n\
-     \x20    scheme (file://, http://, ssh://, ...), malformed git URL,\n\
-     \x20    hostile archive member, or a denied `plugin explain` capability.\n\
+     \x20 0 success | 1 aborted/io/consent/helper failure | 2 usage error | 4 plugin/integrity/denied error\n\
      \n\
      examples:\n\
      \x20 bitty plugin list\n\
-     \x20 bitty plugin list --format json\n\
-     \x20 bitty plugin install bitty-terminal.shell-integration --yes\n\
+     \x20 bitty plugin install bitty-terminal.bar --yes\n\
      \x20 bitty plugin install bitty-terminal.shell-integration --profile panel-like --yes\n\
      \x20 bitty plugin grant bitty-terminal.shell-integration --profile editor-like\n\
      \x20 bitty plugin grant bitty-terminal.shell-integration --cap terminal.semantic-read\n\
      \x20 bitty plugin enable bitty-terminal.shell-integration   (grant does not enable it)\n\
-     \x20 bitty plugin install bitty-terminal.bar --yes   (official catalog id)\n\
-     \x20 bitty plugin install ./my-plugin --yes\n\
-     \x20 bitty plugin install https://example.com/my-plugin.git --yes\n\
-     \x20 bitty plugin install git+https://example.com/my-plugin.git --yes\n\
-     \x20 bitty plugin install git@example.com:my-plugin.git --yes\n\
-     \x20 bitty plugin install ./my-plugin.tar.gz --yes\n\
-     \x20 bitty plugin install ./my-plugin.zip --yes\n\
-     \x20 bitty plugin info xuepoo.hello\n\
      \x20 bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read\n\
-     \x20 bitty plugin explain bitty-terminal.shell-integration terminal.semantic-read --json\n\
-     \x20 bitty plugin config show xuepoo.hello\n\
-     \x20 bitty plugin config scaffold xuepoo.hello\n\
-     \x20 bitty plugin disable bitty-terminal.shell-integration\n\
+     \x20 bitty plugin config show bitty-terminal.bar\n\
      \x20 bitty plugin remove xuepoo.hello --force"
         .to_string()
 }

@@ -575,6 +575,17 @@ impl Runtime {
         // landed can be sized and recorded now (no-op when none wait).
         self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
+            if wire_image != 0
+                && self
+                    .kitty_images
+                    .virtual_count_for_origin(self.kitty_origin)
+                    > 0
+            {
+                self.pending_full_redraw = true;
+                let generation = self.state.generation();
+                self.cold_queue
+                    .push(crate::ColdEvent::Damage { generation });
+            }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
             } else {
@@ -795,6 +806,17 @@ impl Runtime {
         // Issue #2875: replay any spanless `a=p` waiting on these pixels.
         self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
+            if wire_image != 0
+                && self
+                    .kitty_images
+                    .virtual_count_for_origin(self.kitty_origin)
+                    > 0
+            {
+                self.pending_full_redraw = true;
+                let generation = self.state.generation();
+                self.cold_queue
+                    .push(crate::ColdEvent::Damage { generation });
+            }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
             } else {
@@ -885,6 +907,17 @@ impl Runtime {
         // spanless `a=p` waiting on these pixels is replayed.
         self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
+            if wire_image != 0
+                && self
+                    .kitty_images
+                    .virtual_count_for_origin(self.kitty_origin)
+                    > 0
+            {
+                self.pending_full_redraw = true;
+                let generation = self.state.generation();
+                self.cold_queue
+                    .push(crate::ColdEvent::Damage { generation });
+            }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
             } else {
@@ -1950,13 +1983,20 @@ impl Runtime {
                 entry.keys.image_id,
                 entry.keys.placement_id,
             );
-            self.state.apply_kitty_place_derived_at(
-                Some((entry.anchor_col, entry.anchor_row)),
-                cols,
-                rows,
-                1,
-                entry.keys,
-            );
+            if self
+                .state
+                .kitty_placements()
+                .get(entry.keys.image_id, entry.keys.placement_id)
+                .is_none()
+            {
+                self.state.apply_kitty_place_derived_at(
+                    Some((entry.anchor_col, entry.anchor_row)),
+                    cols,
+                    rows,
+                    1,
+                    entry.keys,
+                );
+            }
             self.pending_full_redraw = true;
         }
     }

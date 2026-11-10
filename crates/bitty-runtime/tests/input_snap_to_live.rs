@@ -336,3 +336,99 @@ fn kitty_report_all_modifier_and_empty_ime_do_not_snap_on_workspace_switch() {
         "unsolicited empty IME commit must not snap the viewport"
     );
 }
+
+#[test]
+fn screenshot_keys_super_chord_and_mouse_capture_do_not_snap_scrolled_viewport() {
+    // bitty#3108: taking a screenshot with `grim` / `slurp` or a compositor
+    // shortcut (`PrintScreen` or `Super+S` / mouse release over a pane) must
+    // never snap a scrolled viewport back to the bottom.
+    let mut rt = Runtime::with_defaults().expect("build");
+    fill_with_scrollback(&mut rt);
+    scroll_up(&mut rt, 2.0);
+    rt.handle_pty_bytes(b"\x1b[=8u\x1b[?1000h\x1b[?1006h");
+    let before = focused_offset(&rt);
+
+    // 1. Unmapped / system key (`PrintScreen`) produces no terminal typing and
+    // must not snap.
+    let print_screen = KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::PrintScreen),
+        text: None,
+        location: bitty_platform::KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    };
+    let _ = rt.handle_key_event(print_screen);
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "PrintScreen press must not snap a scrolled viewport"
+    );
+
+    // 2. Compositor chord (`Super` held + `s`) under Kitty `report all keys`
+    // must not snap.
+    let _ = rt.handle_key_event(modifier_key(bitty_platform::NamedKey::Super));
+    let _ = rt.handle_key_event(char_key("s"));
+    let super_release = KeyEvent {
+        logical_key: bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Super),
+        text: None,
+        location: bitty_platform::KeyLocation::Standard,
+        state: PressState::Released,
+        repeat: false,
+        is_synthetic: false,
+    };
+    let _ = rt.handle_key_event(super_release);
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "Super+S compositor chord must not snap a scrolled viewport"
+    );
+
+    // 3. Mouse press/release over a mouse-capturing pane (`slurp` release or
+    // pane click) routes SGR mouse bytes without snapping scrollback.
+    rt.handle_cursor_moved(bitty_platform::CursorPosition { x: 16.0, y: 16.0 });
+    rt.handle_mouse_input(bitty_platform::MouseEvent {
+        button: bitty_platform::MouseButton::Left,
+        state: PressState::Pressed,
+        click_count: 1,
+        modifiers: bitty_platform::ModifiersState::default(),
+    });
+    rt.handle_mouse_input(bitty_platform::MouseEvent {
+        button: bitty_platform::MouseButton::Left,
+        state: PressState::Released,
+        click_count: 1,
+        modifiers: bitty_platform::ModifiersState::default(),
+    });
+    assert_eq!(
+        focused_offset(&rt),
+        before,
+        "mouse-captured press/release must not snap a scrolled viewport"
+    );
+}
+
+#[test]
+fn stuck_super_latch_clears_on_focus_loss_so_typing_snaps() {
+    // bitty#3108 review (F1): a compositor-grabbed chord (Super+S on a tiling
+    // WM) never delivers the Super release to this window, so the modifier
+    // latch stays armed. Every later key press is then classified as a system
+    // chord and routed around the snap, so a scrolled viewport never returns
+    // to live for the rest of the session. Focus loss is capture loss for the
+    // keyboard too: it must drop the latches.
+    let mut rt = Runtime::with_defaults().expect("build");
+    fill_with_scrollback(&mut rt);
+    scroll_up(&mut rt, 2.0);
+    let before = focused_offset(&rt);
+    assert!(before > 0, "fixture must start scrolled up");
+
+    // Press Super, then lose focus with no release (the WM grabbed the chord).
+    let _ = rt.handle_key_event(modifier_key(bitty_platform::NamedKey::Super));
+    rt.set_focused(false);
+    rt.set_focused(true);
+
+    let _ = rt.handle_key_event(char_key("x"));
+    assert_eq!(
+        focused_offset(&rt),
+        0,
+        "typing after a grabbed chord must snap to live"
+    );
+}

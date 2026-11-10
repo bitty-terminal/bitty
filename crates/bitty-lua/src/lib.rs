@@ -478,14 +478,15 @@ impl ConfigCommitWindow {
 /// where the call returns (including on the error path). The recorded credit
 /// excludes any store commit I/O reported during the same span, so the two
 /// credits never double-count one interval.
-pub(crate) struct HostCallWindow {
+pub struct HostCallWindow {
     started: Instant,
     store_at_start: Duration,
 }
 
 impl HostCallWindow {
     /// Start measuring a host call at `started` (the bridge's own call origin).
-    pub(crate) fn at(started: Instant) -> Self {
+    #[must_use]
+    pub fn at(started: Instant) -> Self {
         Self {
             started,
             store_at_start: store_commit_credit_total(),
@@ -493,7 +494,7 @@ impl HostCallWindow {
     }
 
     /// Finish the measurement and credit the host-only part of the span.
-    pub(crate) fn close(self) {
+    pub fn close(self) {
         let elapsed = self.started.elapsed();
         let store_during = store_commit_credit_total().saturating_sub(self.store_at_start);
         let credited = elapsed.saturating_sub(store_during);
@@ -1627,6 +1628,10 @@ impl LuaVm {
         self.store_commit_credit_ms = 0;
         self.host_call_credit_ms = 0;
         self.config_commit_credit_ms = 0;
+        let mem = self.lua.total_memory();
+        if mem > self.memory_limit / 2 {
+            self.lua.gc_collect();
+        }
         self.memory_used = self.lua.total_memory();
     }
 
@@ -1722,7 +1727,11 @@ impl LuaVm {
         }
 
         // Pre-check memory before stepping (fail-closed per FS-7).
-        let mem_before = self.lua.total_memory();
+        let mut mem_before = self.lua.total_memory();
+        if mem_before > self.memory_limit {
+            self.lua.gc_collect();
+            mem_before = self.lua.total_memory();
+        }
         self.memory_used = mem_before;
         if mem_before > self.memory_limit {
             let reading = self.segment_reading(state, start);
@@ -1785,7 +1794,11 @@ impl LuaVm {
                     return Ok(self.suspend_invocation(state, reading, reason));
                 }
 
-                let mem = self.lua.total_memory();
+                let mut mem = self.lua.total_memory();
+                if mem > self.memory_limit {
+                    self.lua.gc_collect();
+                    mem = self.lua.total_memory();
+                }
                 self.memory_used = mem;
                 if mem > self.memory_limit {
                     let reason = SuspendReason::MemoryExceeded {
@@ -1884,6 +1897,10 @@ impl LuaVm {
 
         // Final memory check after completion (in case last allocation pushed over).
         self.memory_used = self.lua.total_memory();
+        if self.memory_used > self.memory_limit {
+            self.lua.gc_collect();
+            self.memory_used = self.lua.total_memory();
+        }
         if self.memory_used > self.memory_limit {
             let reason = SuspendReason::MemoryExceeded {
                 used: self.memory_used,

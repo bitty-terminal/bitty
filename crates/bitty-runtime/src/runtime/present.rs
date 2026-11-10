@@ -6289,7 +6289,11 @@ impl Runtime {
             if span.is_empty() || cells == 0 {
                 continue;
             }
-            let fg = run.fg.as_deref().map_or(default_fg, |token| {
+            let fg_token = run
+                .fg
+                .as_deref()
+                .or_else(|| super::band_host::default_band_run_fg_token(run));
+            let fg = fg_token.map_or(default_fg, |token| {
                 resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
                     self.band_stats.unknown_tokens =
                         self.band_stats.unknown_tokens.saturating_add(1);
@@ -6339,11 +6343,11 @@ impl Runtime {
         if painted_any {
             layers.any_needs_draw = true;
         }
-        // CTX-1477 (issue #2468): shared band chrome is a thin muted rule on
-        // the content-facing edge. A one-row band has no room for a sub-cell
-        // radius, so it uses the documented grid-corner path: rounded
-        // box-drawing corners only when the corner cell is blank, otherwise
-        // the square rule (never overdraw plugin text).
+        // CTX-1477 (issue #2468) + bitty#3108: shared band chrome is a thin
+        // muted rule on the content-facing edge. The rule is drawn alone —
+        // rounded box-drawing corners are NOT overlaid on the band cells, so a
+        // leading-space workspace pill and a short right-aligned group are
+        // never overdrawn (bitty#3108 defect 1).
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule_h = chrome.border_px.max(1);
@@ -6368,43 +6372,6 @@ impl Runtime {
                 ),
                 color: chrome.border_muted,
             });
-            let chars: Vec<char> = text.chars().collect();
-            let left_blank = matches!(chars.first(), None | Some(' '));
-            let right_blank = chars.len() < band_cells || matches!(chars.last(), None | Some(' '));
-            let corners = bitty_render::chrome::ChromeCornerGlyphs::resolve(
-                bitty_render::chrome::ChromeGlyphCoverage::Full,
-            );
-            let (left_corner, right_corner) = match edge {
-                BandEdge::Top => (2, 3),
-                BandEdge::Bottom => (0, 1),
-                BandEdge::Left | BandEdge::Right => return,
-            };
-            if left_blank {
-                if let Some(glyph) = corners.glyph(left_corner) {
-                    layers
-                        .combined_glyphs
-                        .extend(self.renderer.overlay_text_glyphs(
-                            &glyph.to_string(),
-                            (rule_x, origin_y),
-                            1,
-                            chrome.border_muted,
-                        ));
-                }
-            }
-            if right_blank {
-                if let Some(glyph) = corners.glyph(right_corner) {
-                    let last = u16::try_from(band_cells.saturating_sub(1)).unwrap_or(u16::MAX);
-                    let x = px_add(rule_x, px_offset_cells(0, last, cell_w));
-                    layers
-                        .combined_glyphs
-                        .extend(self.renderer.overlay_text_glyphs(
-                            &glyph.to_string(),
-                            (x, origin_y),
-                            1,
-                            chrome.border_muted,
-                        ));
-                }
-            }
             layers.any_needs_draw = true;
         }
     }
@@ -6841,7 +6808,11 @@ impl Runtime {
             if span.is_empty() || cells == 0 {
                 continue;
             }
-            let fg = run.fg.as_deref().map_or(default_fg, |token| {
+            let fg_token = run
+                .fg
+                .as_deref()
+                .or_else(|| super::band_host::default_band_run_fg_token(run));
+            let fg = fg_token.map_or(default_fg, |token| {
                 resolve_band_token(token, &self.config.theme).unwrap_or_else(|| {
                     self.band_stats.unknown_tokens =
                         self.band_stats.unknown_tokens.saturating_add(1);
@@ -7594,14 +7565,16 @@ impl Runtime {
                 };
                 // Live-grid rows are already scrolled truth, so the
                 // scrollback delta is the viewport window start only.
-                let Some(tile) = bitty_rich::unicode_run_rect(
-                    &run,
-                    &cells,
-                    &proto.as_unicode_virtual(),
-                    metrics,
-                    window_start,
-                    0,
-                ) else {
+                let mut uv = proto.as_unicode_virtual();
+                if uv.image_width == 0 || uv.image_height == 0 {
+                    if let Some(stored) = self.kitty_images.get(image) {
+                        uv.image_width = stored.width;
+                        uv.image_height = stored.height;
+                    }
+                }
+                let Some(tile) =
+                    bitty_rich::unicode_run_rect(&run, &cells, &uv, metrics, window_start, 0)
+                else {
                     continue;
                 };
                 let Some(visible) = tile.rect.intersection(&tile.full) else {
@@ -7801,6 +7774,13 @@ impl Runtime {
     }
 
     /// Drains off-thread presenter acknowledgements and enforces the
+    /// stuck-present bound against the current wall clock (bitty#2830,
+    /// bitty#3108).
+    pub fn poll_presenter_acks(&mut self) -> Option<PresentStats> {
+        self.poll_presenter(std::time::Instant::now())
+    }
+
+    /// Drains off-thread presenter acknowledgements and enforces the
     /// stuck-present bound (bitty#2830).
     ///
     /// Runs before every tick's gates, including while the surface is hidden:
@@ -7808,7 +7788,7 @@ impl Runtime {
     /// present. Returns the [`PresentStats`] of a frame this call committed,
     /// so the embedder reports a real present on the tick that learned about
     /// it. The event-loop thread never performs the acquire/present itself.
-    fn poll_presenter(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+    pub(super) fn poll_presenter(&mut self, now: std::time::Instant) -> Option<PresentStats> {
         self.presenter.as_ref()?;
         // bitty#2830: apply acknowledgements *before* any stuck decision.
         // A worker that finished just before this tick already cleared its
@@ -10576,8 +10556,8 @@ mod plugin_overlay_paint_tests {
             layers
                 .combined_glyphs
                 .iter()
-                .any(|glyph| glyph.color == tokens.border_muted),
-            "blank band corners paint the grid-safe corner glyph"
+                .all(|glyph| glyph.color != tokens.border_muted),
+            "horizontal band chrome must not paint corner glyphs over band cells"
         );
     }
 

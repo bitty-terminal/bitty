@@ -2618,6 +2618,7 @@ impl TerminalApp {
             let _delivered = plugin_runtime.deliver_event("process.exited", &payload);
         }
         if let Some(reload) = config {
+            let _ = plugin_runtime.recover_wall_failed_plugins();
             let payload = LuaValue::table([
                 ("path", LuaValue::String(reload.path)),
                 ("kind", LuaValue::String(reload.kind)),
@@ -2894,9 +2895,13 @@ impl TerminalApp {
         };
         #[cfg(test)]
         if let Some(now) = test_now {
-            return plugin_runtime.pump_due_timers_at(now);
+            let fired = plugin_runtime.pump_due_timers_at(now);
+            let _ = plugin_runtime.recover_wall_failed_plugins();
+            return fired;
         }
-        plugin_runtime.pump_due_timers()
+        let fired = plugin_runtime.pump_due_timers();
+        let _ = plugin_runtime.recover_wall_failed_plugins();
+        fired
     }
 
     /// Revoke the active overlay capture unconditionally (user focus-switch
@@ -3608,12 +3613,14 @@ impl TerminalApp {
 
     /// Runs the exclusive cold delivery phase (CTX-1332, C-D1/C-D4/C-D5).
     ///
-    /// Called from exactly one place: the `AboutToWait` arm, after
-    /// [`Self::drive_tick`] has returned (present, IME sync, reply flush, and
-    /// runtime events are committed) and never from redraw, PTY-readable,
-    /// resize/DPI, headless `Resumed`, appearance, input, timers, overlays,
-    /// runtime events, config watcher, or global IPC. Input only enqueues; the
-    /// owning VM is entered here, on the cold phase.
+    /// Called only from the `AboutToWait` arm — once BEFORE [`Self::drive_tick`]
+    /// (so a command admitted against the frame the user just saw is dispatched
+    /// before plugin timers can bump the band tree version, bitty#3108) and once
+    /// after it returns (present, IME sync, reply flush, and runtime events are
+    /// committed; a hover deferred by `drive_tick` is revalidated). Never from
+    /// redraw, PTY-readable, resize/DPI, headless `Resumed`, appearance, input,
+    /// timers, overlays, runtime events, config watcher, or global IPC. Input
+    /// only enqueues; the owning VM is entered here, on the cold phase.
     ///
     /// Selection is bounded by [`bitty_runtime::COLD_ADMISSION_SELECTION_MAX`]
     /// (the literal 16 = 8 + 8 from the existing band queue caps), enforced
@@ -5470,15 +5477,21 @@ impl TerminalApp {
                 {
                     self.repair_hidden_surface(repair_now);
                 }
-                // CTX-1332 C-D1: this is the only cold-delivery phase. Tick
-                // first so workspace/pin/FX/theme/submit/timer/overlay/
-                // notification/presentation work and the post-present reply
-                // flush are committed, then pump input-triggered plugin
-                // commands. Redraw/PTY-readable/resize/appearance arms never
-                // reach this pump.
+                // CTX-1332 C-D1 & bitty#3108: drain off-thread presenter acks
+                // and pump cold commands queued against the currently
+                // presented frame *before* `drive_tick()` runs plugin timers
+                // (so a timer tick cannot bump band tree version and discard a
+                // click/scroll that just completed, and so `drive_tick()`
+                // immediately commits and presents the click's effects in the
+                // same turn). Then pump a second time for any deferred hover
+                // revalidated by `drive_tick()`.
+                let _ = self.runtime.poll_presenter_acks();
+                self.watchdog_phase(Phase::ColdCommands);
+                let delivered_pre = self.pump_cold_commands();
                 let presented = self.drive_tick().is_some();
                 self.watchdog_phase(Phase::ColdCommands);
-                let delivered = self.pump_cold_commands();
+                let delivered_post = self.pump_cold_commands();
+                let delivered = delivered_pre.saturating_add(delivered_post);
                 if presented || delivered > 0 {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();

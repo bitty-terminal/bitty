@@ -308,52 +308,26 @@ pub fn inspect_help_text() -> String {
      \n\
      Usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\
      \n\
-      Targets (each value incl. missing-value errors; unknown values are NotFound, exit 1):\n  \
-        command <id>    Registry entry with kind, class, scopes, owner, summary.\n  \
-                        Dot form (core.terminal.text) and colon form\n  \
-                        (publisher.name:command) compare equivalently.\n  \
-                        Core ids come from the ctl/list registry surface; plugin\n  \
-                        commands come from static manifests (no VM loaded).\n  \
-                        #1572: bundled catalog is shell-integration only\n  \
-                        (declares no commands); workspace verbs live in Core\n  \
-                        as `bitty ctl workspace`.\n  \
-        key <chord>     Shipped keymap owner for a chord (e.g. ctrl+shift+m).\n  \
-                        Bound chords name action, context, and layer; unbound\n  \
-                        chords succeed with bound:false (single-owner rule:\n  \
-                        unbound keys reach the PTY/shell, never chrome).\n  \
-        plugin <id>     Static bundled-catalog entry (no VM): owner publisher,\n  \
-                        version, commands, staged-disabled state.\n  \
-                        Canonical id is bitty-terminal.shell-integration\n  \
-                        (#1572: workspace manifest retired; workspace verbs\n  \
-                        live in Core as `bitty ctl workspace`).\n  \
-       config <key>    Built-in default value and owning layer (default) plus\n  \
-                       the CLI > file > profile > defaults precedence note.\n  \
-                       Effective file values: `bitty config check`.\n  \
-       protocol <name> Core support state: supported | stub | unsupported |\n  \
-                       policy-gated, with owner and detail.\n\
+     Targets:\n  \
+       command <id>    Registry entry (`core.terminal.text` or `publisher.name:command`).\n  \
+       key <chord>     Shipped keymap owner for a chord (e.g. `ctrl+shift+m`; unbound keys reach the PTY).\n  \
+       plugin <id>     Static bundled-catalog entry (e.g. `bitty-terminal.shell-integration`; no VM).\n  \
+       config <key>    Built-in default value and layer (e.g. `font.size`; file check: `bitty config check`).\n  \
+       protocol <name> Core support state (`supported` | `stub` | `unsupported` | `policy-gated`).\n\
      \n\
      Options:\n  \
-       --format SHAPE  table (default, human, not a contract) | json | jsonl (envelope v1)\n  \
-       --no-color      Accepted for script parity (tables are plain text).\n  \
-       -h, --help      Print this help and exit (never needs an instance or VM).\n\
+       --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+       --no-color      Disable ANSI coloring\n  \
+       -h, --help      Print this help and exit\n\
      \n\
-     Output contract:\n  \
-       Stdout carries the result; stderr carries diagnostics. JSON/JSONL use\n  \
-       envelope {\"v\":1,\"command\":\"inspect\",\"ok\":true,\"result\":{\"target\":...}}.\n  \
-       Usage errors (exit 2) go to stderr with no stdout envelope. Well-formed\n  \
-       but unknown values emit ok:false envelopes (exit 1, class NotFound).\n\
+     Exit codes: 0 success | 1 NotFound | 2 usage error\n\
      \n\
-     Exit codes:\n  \
-       0 success (unbound keys included, bound:false)\n  \
-       1 generic NotFound (unknown command, plugin, config key, or protocol)\n  \
-       2 usage error (missing/unknown target, missing value, extra arg, bad --format, stray --)\n\
-     \n\
-      Examples:\n  \
-        bitty inspect command core.terminal.text\n  \
-        bitty inspect key ctrl+shift+m\n  \
-        bitty inspect plugin bitty-terminal.shell-integration\n  \
-        bitty inspect config font.size\n  \
-        bitty inspect protocol kitty-graphics\n"
+     Examples:\n  \
+       bitty inspect command core.terminal.text\n  \
+       bitty inspect key ctrl+shift+m\n  \
+       bitty inspect plugin bitty-terminal.shell-integration\n  \
+       bitty inspect config font.size\n  \
+       bitty inspect protocol kitty-graphics\n"
     .to_string()
 }
 

@@ -481,8 +481,11 @@ fn timer_callback_wall_overrun_fails_the_generation_without_phantom_fires() {
     assert_eq!(rt.pump_due_timers_at(far), 0);
     assert_eq!(rt.timer_deadline(), None);
 
-    // Reload from `Failed` is still the documented recovery path.
-    let report = rt.reload(&id).expect("reload from failed");
+    // Reload from `Failed` (including `recover_wall_failed_plugins`) is the
+    // documented recovery path.
+    assert_eq!(rt.recover_wall_failed_plugins(), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let report = rt.reload(&id).expect("reload from active");
     assert_eq!(report.state, LifecycleState::Active);
     assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
     let _ = std::fs::remove_dir_all(&data);

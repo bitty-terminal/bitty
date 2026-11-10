@@ -545,12 +545,6 @@ impl Runtime {
         if self.ime_owns_key_press(&event, is_modifier, now) {
             return None;
         }
-        // CTX-0243: any real non-modifier press snaps to live (covers Esc-cancel
-        // with no bytes and unmapped keys with no encoding; normal typing
-        // also snaps via `push_input_bytes` below — idempotent).
-        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
-            self.snap_focused_to_live();
-        }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (left-click/Esc/typing dismiss). Clearing uses
         // `clear_selection` so `pending_full_redraw` forces the next tick to
@@ -682,10 +676,6 @@ impl Runtime {
         if self.ime_owns_key_press(event, is_modifier, std::time::Instant::now()) {
             return None;
         }
-        // CTX-0243: any real non-modifier press snaps to live (see owned path).
-        if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
-            self.snap_focused_to_live();
-        }
         // CTX-0166: any real non-modifier key press clears the selection
         // highlight (see owned path). Additive only; range logic untouched.
         if event.state == PressState::Pressed && !event.is_synthetic && !is_modifier {
@@ -808,7 +798,33 @@ impl Runtime {
                     | bitty_platform::NamedKey::Meta
             )
         );
-        if event.state == PressState::Released || event.is_synthetic || is_modifier {
+        let is_system_chord = self.super_pressed
+            || self.hyper_pressed
+            || self.meta_pressed
+            || matches!(
+                &event.logical_key,
+                bitty_platform::LogicalKey::Named(
+                    bitty_platform::NamedKey::PrintScreen
+                        | bitty_platform::NamedKey::Pause
+                        | bitty_platform::NamedKey::ScrollLock
+                        | bitty_platform::NamedKey::NumLock
+                        | bitty_platform::NamedKey::CapsLock
+                        | bitty_platform::NamedKey::MediaPlay
+                        | bitty_platform::NamedKey::MediaPause
+                        | bitty_platform::NamedKey::MediaPlayPause
+                        | bitty_platform::NamedKey::MediaStop
+                        | bitty_platform::NamedKey::MediaTrackNext
+                        | bitty_platform::NamedKey::MediaTrackPrevious
+                        | bitty_platform::NamedKey::AudioVolumeUp
+                        | bitty_platform::NamedKey::AudioVolumeDown
+                        | bitty_platform::NamedKey::AudioVolumeMute
+                )
+            );
+        if event.state == PressState::Released
+            || event.is_synthetic
+            || is_modifier
+            || is_system_chord
+        {
             if !bytes.is_empty() {
                 self.route_input_bytes(bytes);
             }
@@ -1037,6 +1053,7 @@ impl Runtime {
         event: bitty_platform::MouseEvent,
         now: std::time::Instant,
     ) {
+        let _ = self.poll_presenter(now);
         // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
         // Coordinates come from the last known cursor position mapped to cell
         // space (clamped); `None` when the cursor never entered the window.
@@ -1293,7 +1310,12 @@ impl Runtime {
                     row: cell.row,
                 };
                 let bytes = super::mouse_encode::encode_mouse(format, report);
-                self.push_input_bytes(bytes.as_slice());
+                // bitty#3108: mouse-tracking press/release reports are pointer
+                // protocol traffic (like motion reports), not typing; routing
+                // via `route_input_bytes` delivers to the focused pane without
+                // snapping a scrolled viewport to live when clicking or using
+                // external region-selection tools (`grim` + `slurp`).
+                self.route_input_bytes(bytes.as_slice());
                 // bitty#2938: the app received this press, so it owns the
                 // pointer until the matching release; drag motion reports
                 // this button's identity. A press consumed by Core chrome
@@ -1622,6 +1644,7 @@ impl Runtime {
     /// [`Self::handle_cursor_moved`] with an explicit wall clock
     /// (CTX-0334 virtual-clock seam for the hover dwell delay).
     pub fn handle_cursor_moved_at(&mut self, pos: CursorPosition, now: std::time::Instant) {
+        let _ = self.poll_presenter(now);
         // Issue #2787: the first move after `CursorEntered` is winit's entry
         // re-sync when it repeats the last position (or when no position is
         // known yet) — that is what the Wayland backend pushes for
@@ -1837,6 +1860,7 @@ impl Runtime {
     /// drift.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
+        let _ = self.poll_presenter(std::time::Instant::now());
         let delta = match delta {
             ScrollDelta::Lines(x, y) => ScrollDelta::Lines(
                 if x.is_finite() {
@@ -2205,6 +2229,18 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // bitty#3108 review: a compositor-grabbed chord (Super+S on a
+            // tiling WM) never delivers its key release to this window, so a
+            // modifier latch set on press stays armed forever and the
+            // snap-to-live on typing is suppressed for the rest of the
+            // session. Focus loss is capture loss for the keyboard too; the
+            // next `ModifiersChanged` snapshot re-syncs every latch.
+            self.shift_pressed = false;
+            self.control_pressed = false;
+            self.alt_pressed = false;
+            self.super_pressed = false;
+            self.hyper_pressed = false;
+            self.meta_pressed = false;
             // bitty#2938: focus loss ends a captured drag (no release will
             // reach this window); re-entry motion must not report it.
             self.mouse_drag_button = None;

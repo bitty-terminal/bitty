@@ -1376,16 +1376,17 @@ impl Runtime {
                                 );
                             }
                         }
-                    } else if relative.is_none()
+                    }
+                    if relative.is_none()
                         && self
                             .kitty_images
                             .find_root_for_origin(self.kitty_origin, image)
                             .is_none()
                     {
-                        // Issue #2875: spanless placement whose pixels have
-                        // not landed yet (a `t=f`/`t=t`/`t=s` transmit on the
-                        // async worker). Retained so the completed store can
-                        // size and replay it; bounded, drop-oldest.
+                        // Issue #2875: placement whose pixels have not landed
+                        // yet (a `t=f`/`t=t`/`t=s` transmit on the async
+                        // worker). Retained so the completed store can size
+                        // and replay it; bounded, drop-oldest.
                         self.stash_pending_kitty_place(
                             crate::runtime::kitty_images::PendingKittyPlace {
                                 origin: self.kitty_origin,
@@ -1644,11 +1645,21 @@ impl Runtime {
                         }
                         continue;
                     }
+                    let effective_action_a = if action_a.is_none()
+                        && control.image_id != 0
+                        && cols_c == 0
+                        && rows_r == 0
+                        && control.placement_id == 0
+                    {
+                        Some('t')
+                    } else {
+                        action_a
+                    };
                     if !self.enqueue_kitty_local_display(
                         format_f,
                         width_s,
                         height_v,
-                        action_a,
+                        effective_action_a,
                         cols_c,
                         rows_r,
                         cursor_movement_c,

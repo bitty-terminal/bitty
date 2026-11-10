@@ -110,6 +110,11 @@ trait SurfaceSource: Send + Sync + fmt::Debug {
 
     /// Current DPI scale factor, sanitized to a valid range.
     fn scale_factor(&self) -> ScaleFactor;
+
+    /// Notifies the windowing system immediately before presenting a frame.
+    ///
+    /// Default is a no-op for headless test fakes.
+    fn pre_present_notify(&self) {}
 }
 
 #[derive(Debug)]
@@ -147,6 +152,10 @@ impl SurfaceSource for WindowSurfaceSource {
 
     fn scale_factor(&self) -> ScaleFactor {
         ScaleFactor::new_sanitized(self.window.scale_factor())
+    }
+
+    fn pre_present_notify(&self) {
+        self.window.pre_present_notify();
     }
 }
 
@@ -236,6 +245,16 @@ impl SurfaceTarget {
     /// Current DPI scale factor, sanitized to a valid range.
     pub fn scale_factor(&self) -> ScaleFactor {
         self.source.scale_factor()
+    }
+
+    /// Requests the compositor's frame callback immediately before committing
+    /// a swap-chain frame (`wgpu::SurfaceTexture::present`, bitty#3096 / #3116).
+    ///
+    /// Calling this at the actual `frame.present()` site in `bitty-render`
+    /// (rather than ahead of `Runtime::tick`) guarantees that `wl_surface.frame`
+    /// is never armed for a tick that defers or skips presenting.
+    pub fn pre_present_notify(&self) {
+        self.source.pre_present_notify();
     }
 
     /// DPI-size refresh hook: converts a logical size into physical pixels at

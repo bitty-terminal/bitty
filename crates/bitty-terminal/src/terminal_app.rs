@@ -2415,18 +2415,11 @@ impl TerminalApp {
         // #2483 deliberately leaves this whole call under one phase: a stall
         // inside compose/present reports as `runtime-tick`, the ANR shape.
         //
-        // bitty#3096: arm the compositor frame callback for the frame this
-        // tick is about to submit. On Wayland winit only throttles
-        // `RedrawRequested` to the compositor's present cadence while a frame
-        // callback is in flight, so without this call a high-rate PTY stream
-        // spins the loop and starves main-queue dispatch. Gated on a visible
-        // surface and a live presenter: a callback armed for a frame that
-        // never commits would suppress the redraw that delivers it.
-        if self.present_owed() && self.runtime.has_gpu() {
-            if let Some(win) = self.window.handle.as_ref() {
-                win.pre_present_notify();
-            }
-        }
+        // bitty#3116: `pre_present_notify()` is invoked inside `Surface::present*`
+        // immediately before `frame.present()` commits the buffer, rather than
+        // before `self.runtime.tick()` — arming `wl_surface.frame` on ticks that
+        // defer or skip presenting leaves winit in `FrameCallbackState::Requested`
+        // without a commit and starves `RedrawRequested`.
         self.watchdog_phase(Phase::RuntimeTick);
         let stats = self.runtime.tick();
         // bitty#2859: opt-in idle-RSS attribution. Off by default; when armed

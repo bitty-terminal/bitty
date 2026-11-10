@@ -1542,7 +1542,7 @@ impl Surface {
                     images_skipped: 0,
                 })
             }
-            SurfaceKind::Gpu { surface, .. } => {
+            SurfaceKind::Gpu { surface, target } => {
                 let mut state = self.state.lock().expect("surface state poisoned");
                 let config = state.config.ok_or_else(|| {
                     RenderError::SurfaceConfigure("surface not configured".into())
@@ -1645,6 +1645,13 @@ impl Surface {
                     });
                 }
                 ctx.queue.submit(std::iter::once(encoder.finish()));
+                // bitty#3116: arm the Wayland compositor frame callback right
+                // before `frame.present()` commits the buffer, never before
+                // `Runtime::tick` decides whether a frame will actually be
+                // submitted. An uncommitted `wl_surface.frame` leaves winit in
+                // `FrameCallbackState::Requested` and suppresses subsequent
+                // `RedrawRequested` deliveries.
+                target.pre_present_notify();
                 frame.present();
                 telemetry::present_ok();
                 let mut state = self.state.lock().expect("surface state poisoned");
@@ -1773,7 +1780,7 @@ impl Surface {
             SurfaceKind::Headless => Err(PresentFailure::Error(RenderError::SurfaceConfigure(
                 "headless surface reached the GPU present branch".into(),
             ))),
-            SurfaceKind::Gpu { surface, .. } => {
+            SurfaceKind::Gpu { surface, target } => {
                 // Shared validation: configured?
                 let config = {
                     let state = self.state.lock().expect("surface state poisoned");
@@ -1949,6 +1956,11 @@ impl Surface {
                         "bitty: real-GPU present skipped {images_skipped} image/background/color-glyph blit(s) (fail-closed: malformed, unaddressable, or over budget; headless CPU blends them)"
                     );
                 }
+                // bitty#3116: arm the Wayland compositor frame callback on the
+                // presenter thread immediately before `frame.present()` commits
+                // the surface buffer, so every `wl_surface.frame` request is
+                // paired with an immediate `wl_surface.commit`.
+                target.pre_present_notify();
                 frame.present();
                 telemetry::present_ok();
                 let mut state = self.state.lock().expect("surface state poisoned");

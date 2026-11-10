@@ -475,19 +475,20 @@ pub fn shell_init_help_text() -> String {
          \n\
          Usage: bitty shell-init <shell>\n\
          \n\
-         Prints a static shell-integration script for <shell> (one of {}) to stdout.\n\
-         The script inlines Tab completion for the full CLI grammar (first-level\n\
-         words, nested verbs, and flags) and installs prompt hooks that report\n\
-         cwd (OSC 7) plus prompt-start, command-start, and exit-status marks\n\
-         (OSC 133). It never invokes `bitty` while sourcing, so an absent or\n\
-         older binary cannot break shell startup.\n\
+         Prints a static shell-integration script for <shell> (one of {})\n\
+         to stdout. The script inlines Tab completion for the full CLI grammar\n\
+         (first-level words, nested verbs, and flags) and installs prompt hooks\n\
+         that report cwd (OSC 7) plus prompt-start, command-start, and\n\
+         exit-status marks (OSC 133). It never invokes `bitty` while sourcing,\n\
+         so an absent or older binary cannot break shell startup.\n\
          \n\
          Enable it from your shell startup file:\n\
          \x20 bash:       {}  (~/.bashrc)\n\
          \x20 zsh:        {}  (~/.zshrc)\n\
          \x20 fish:       {}  (config.fish)\n\
          \x20 powershell: {}  ($PROFILE)\n\
-         \x20 nushell:    {}  (then `source` it from config.nu)\n",
+         \x20 nushell:    {}\n\
+         \x20             (then `source` it from config.nu)\n",
         shell_list(),
         install_line(CompletionShell::Bash),
         install_line(CompletionShell::Zsh),

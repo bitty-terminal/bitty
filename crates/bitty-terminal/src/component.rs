@@ -951,7 +951,7 @@ pub fn parse_component_request(
 /// asserted by the test-only help-width gate.
 #[must_use]
 pub fn component_help_text(verbose: bool) -> String {
-    let mut text = String::from(
+    let mut text = String::from(concat!(
         "bitty extension — CLI-first native binary extension management (local class, no execution)\n\
          \n\
          usage: bitty extension <verb> [args] [flags]\n\
@@ -983,10 +983,12 @@ pub fn component_help_text(verbose: bool) -> String {
          --distro <name|default>     WSL2 guest distro for `add` on Windows (`install --distro` is\n                              \
          rejected).\n\
          \n\
-         WSL2 path mapping (Windows to guest for spawn):\n  \
-         drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n  \
-         \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n  \
-         preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
+         WSL2 path mapping (Windows to guest for spawn):\n",
+        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
+        "  drive-absolute X:\\... maps to /mnt/<lower-x>/... and WSL UNC\n  \
+         \\\\wsl$\\<distro>\\... maps to guest-absolute /...; UNC paths bind\n",
+        // scratch-paths-exempt: intentional WSL help contract path example, not a host path.
+        "  preserved and metacharacters inert. Reverse (/mnt/... to Windows)\n\
          \n\
          fetch & exit codes:\n  \
          Preflights `curl --version` (>= 7.68.0) and `tar` via PATH, using the system CA store and\n  \
@@ -1001,7 +1003,7 @@ pub fn component_help_text(verbose: bool) -> String {
          bitty extension install net --version 0.0.1\n  \
          bitty extension show-source net\n  \
          bitty extension remove net 0.0.1\n",
-    );
+    ));
     if verbose {
         // One blank line separates the compact body from the contract
         // tier, so `-v` reads as an appendix rather than a run-on.

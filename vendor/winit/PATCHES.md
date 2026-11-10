@@ -37,12 +37,12 @@ from the digest pinned below. See [Integrity](#integrity).
 | Patch 2 SHA-256 | `31331ad8e0c71e6dd15fc0fd95512750d9b00842ee56de11c1d46904e52e0b05`                    |
 | Patch 2 origin  | local hardening for CodeQL alerts 9 and 10 (not an upstream change)                   |
 | Patch 3         | `patches/0003-wayland-dispatch-pending-on-shared-display.diff`                        |
-| Patch 3 SHA-256 | `0fed3b7a8cad653e0a1efcd14df7d5359545072d1ce94f4c064be592861d9be5`                    |
-| Patch 3 origin  | local fix for Wayland ANR when Vulkan presenter reads shared `wl_display` fd (#3096)  |
+| Patch 3 SHA-256 | `82a294870c8a44f47005284f4edba41cf3d902a5b9a2559895fec6ef0bd6b237`                    |
+| Patch 3 origin  | local fix for Wayland ANR and suspended-workspace frame callback handling (#3096, #3116) |
 | Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`             |
 | Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                 |
 | Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                    |
-| Tree digest     | `27e8f3c5a31a9f72429ec8f43c69ef21852bf464566e750e47f8187531822c40`                    |
+| Tree digest     | `7304ebac85a1c90e7bae4bb647eb98610fc3d48ab6165aad67ba45cbae97d3b9`                    |
 
 The PR base equals the released `0.30.13` commit, which is why the patch applies
 to the crates.io source without offsets. Only the five files below differ from

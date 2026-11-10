@@ -401,7 +401,7 @@ pub fn list_usage() -> String {
 #[must_use]
 pub fn list_help_text(invoked_as: &str, verbose: bool) -> String {
     let mut text = format!(
-        "bitty list — enumerate resources (local or runtime)\n\
+        "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
          Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services>\n       \
          [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
@@ -444,12 +444,15 @@ pub fn list_help_text(invoked_as: &str, verbose: bool) -> String {
          bitty list services --format json\n  \
          bitty ls themes --format table\n",
     );
-    text.push_str("Version: ");
-    text.push_str(env!("CARGO_PKG_VERSION"));
-    text.push('\n');
     if verbose {
         // One blank line separates the compact body from the contract
-        // tier, so `-v` reads as an appendix rather than a run-on.
+        // tier, so `-v` reads as an appendix rather than a run-on. The
+        // version belongs to that tier: the default `--help` output is
+        // unchanged from `origin/main` (CTX-1788 round-3 F7 regression).
+        text.push('\n');
+        text.push_str("Version: ");
+        text.push_str(env!("CARGO_PKG_VERSION"));
+        text.push('\n');
         text.push('\n');
         text.push_str(LIST_HELP_CONTRACT);
     }

@@ -291,7 +291,12 @@ pub fn x_help_text_with_store() -> String {
     x_help_text_for(&installed_plugins_with_store())
 }
 
-fn x_help_text_for(rows: &[XPluginRow]) -> String {
+/// Render the plugin catalog of `bitty x --help` for `rows`.
+///
+/// `pub(crate)` so the test-only help-width gate can measure a synthetic
+/// wide catalog row; the production entry points are [`x_help_text`] and
+/// [`x_help_text_with_store`].
+pub(crate) fn x_help_text_for(rows: &[XPluginRow]) -> String {
     let mut out = String::from(
         "bitty x — qualified plugin namespace (extension, no VM load)\n\
          \n\
@@ -309,11 +314,18 @@ fn x_help_text_for(rows: &[XPluginRow]) -> String {
         out.push_str("  (none)\n");
     } else {
         for row in rows {
-            let _ = write!(out, "  {} ({})", row.id, row.version);
             if row.commands.is_empty() {
-                out.push('\n');
+                let _ = writeln!(out, "  {} ({})", row.id, row.version);
             } else {
-                let _ = writeln!(out, " — {}", row.commands.join(", "));
+                // Wrapped: a plugin may declare any number of commands, and a
+                // single unbounded row rendered 455 columns in a full store.
+                crate::cli::push_wrapped_line(
+                    &mut out,
+                    &format!("  {} ({}) — ", row.id, row.version),
+                    "      ",
+                    &row.commands.join(", "),
+                    crate::cli::HELP_WRAP_COLUMNS,
+                );
             }
         }
     }

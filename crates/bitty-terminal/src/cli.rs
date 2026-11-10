@@ -2877,10 +2877,75 @@ pub(crate) fn help_usage() -> String {
     )
 }
 
+/// Column budget for help text that is assembled from data at render time.
+///
+/// Static help bodies are wrapped by hand; catalog rows (`bitty x --help`) and
+/// interpolated command lists are wrapped by [`push_wrapped_line`] so a longer
+/// store or a new subcommand cannot push a rendered line past the terminal.
+/// The test-only `help_width` gate asserts this stays inside its bound.
+pub(crate) const HELP_WRAP_COLUMNS: usize = 96;
+
+/// Append `text` to `out`, wrapped so no rendered line exceeds `max` columns.
+///
+/// `head` is the already-formatted first-line prefix; `indent` prefixes every
+/// continuation line. Breaks prefer a space and fall back to a hard break, so
+/// a single over-long token cannot escape the bound either.
+pub(crate) fn push_wrapped_line(
+    out: &mut String,
+    head: &str,
+    indent: &str,
+    text: &str,
+    max: usize,
+) {
+    let indent_width = indent.chars().count();
+    let mut line = String::from(head);
+    let mut width = head.chars().count();
+    let mut empty = true;
+
+    for word in text.split_whitespace() {
+        let word_width = word.chars().count();
+        if !empty && width + 1 + word_width > max {
+            out.push_str(line.trim_end());
+            out.push('\n');
+            line.clear();
+            line.push_str(indent);
+            width = indent_width;
+            empty = true;
+        }
+        if empty {
+            let room = max.saturating_sub(width).max(1);
+            let mut rest = word;
+            while rest.chars().count() > room {
+                let split = rest
+                    .char_indices()
+                    .nth(room)
+                    .map_or(rest.len(), |(index, _)| index);
+                let (part, tail) = rest.split_at(split);
+                line.push_str(part);
+                out.push_str(line.trim_end());
+                out.push('\n');
+                line.clear();
+                line.push_str(indent);
+                width = indent_width;
+                rest = tail;
+            }
+            line.push_str(rest);
+            width += rest.chars().count();
+            empty = false;
+        } else {
+            line.push(' ');
+            line.push_str(word);
+            width += 1 + word_width;
+        }
+    }
+    out.push_str(line.trim_end());
+    out.push('\n');
+}
+
 /// Full help for `bitty help --help` / `bitty help help` (stdout, exit 0).
 #[must_use]
 pub(crate) fn help_help_text() -> String {
-    format!(
+    let mut text = String::from(
         "bitty help — show help without spawning (local, no instance)\n\
          \n\
          Usage: bitty help [cmd]\n\
@@ -2889,15 +2954,26 @@ pub(crate) fn help_help_text() -> String {
          \x20 for full detail via `bitty --help -v`). `bitty help <cmd>` aliases\n\
          \x20 `bitty <cmd> --help` for one subcommand (e.g. `bitty help plugin`\n\
          \x20 == `bitty plugin --help`). Unknown names fail closed (exit 2)\n\
-         \x20 naming valid commands: {}.\n\
-         \n\
-         A program literally named `help` needs `bitty -- help ...` (or\n\
+         \x20 naming valid commands:\n",
+    );
+    // The command list is interpolated from the table, so it is wrapped rather
+    // than hand-broken: adding a subcommand must not push the line past the
+    // terminal (the help-width gate measures the rendered result).
+    push_wrapped_line(
+        &mut text,
+        "  ",
+        "  ",
+        &format!("{}.", help_valid_commands()),
+        HELP_WRAP_COLUMNS,
+    );
+    text.push_str(&format!(
+        "\nA program literally named `help` needs `bitty -- help ...` (or\n\
          \x20 `bitty run -- help ...`): bare `bitty help` never spawns.\n\
          \n\
          Version: {}\n",
-        help_valid_commands(),
         crate::version::version_semver(),
-    )
+    ));
+    text
 }
 
 #[cfg(test)]

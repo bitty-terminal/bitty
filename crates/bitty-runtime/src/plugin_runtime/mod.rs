@@ -4757,6 +4757,15 @@ impl PluginRuntime {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
+            // CTX-1788 (PR #3109 round-3): a rollback is a fresh classification
+            // point. Every activation/reload failure funnels through here, so
+            // leaving the previous generation's class in place would let a
+            // generation that once hit a real wall slice keep
+            // `WallSliceTimeout` across a later plain Lua error and be
+            // auto-retried by `recover_wall_failed_plugins`. The caller that
+            // *did* inspect a `SuspendReason` re-stamps the class after this
+            // call (`fail_runtime_classified`).
+            entry.failure_class = FailureClass::Unclassified;
             // bitty#2785: release the generation's UI blocks -- including the
             // terminal-slot scene and its Core-owned panel -- before dropping
             // the services that address them. A scene mounted during
@@ -5686,6 +5695,65 @@ mod tests {
                 && memory.contains(&format!("limit_bytes={memory_limit}")),
             "{memory}"
         );
+    }
+
+    #[test]
+    fn rollback_clears_the_previous_failure_class() {
+        // CTX-1788 (PR #3109 round-3): `rollback` is where every failed
+        // activation/reload lands, so it must also reset the host's typed
+        // verdict. A generation that once died on a real RC-1 wall slice kept
+        // `WallSliceTimeout` across a later plain Lua error, and
+        // `recover_wall_failed_plugins` then auto-retried a deterministic
+        // failure. The documented claim is that every failure without a typed
+        // verdict stays `FailureClass::Unclassified`; this asserts it on the
+        // path that actually decides it.
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        let manifest = manifest_toml::parse_manifest(
+            br#"[plugin]
+id = "bitty-featured.rollback-class"
+name = "Rollback class fixture"
+version = "0.0.1"
+description = "Typed failure class reset"
+[compat]
+plugin-api = "^1.0"
+"#,
+        )
+        .expect("in-memory manifest");
+        let id = manifest.id().clone();
+        runtime.insert_package(
+            id.clone(),
+            PluginPackage {
+                manifest,
+                module_root: PathBuf::new(),
+                source_class: SourceClass::LocalPath,
+                unverified: true,
+                granted: None,
+            },
+        );
+        {
+            let entry = runtime.entries.get_mut(&id).expect("entry");
+            entry.state = LifecycleState::Failed(
+                "timer callback exceeded RC-1 wall budget_ms=50".to_string(),
+            );
+            entry.failure_class = FailureClass::WallSliceTimeout;
+            entry.wall_recovery_attempts = 1;
+        }
+        runtime.rollback(&id, "init.lua: boom".to_string());
+        let entry = runtime.entries.get(&id).expect("entry");
+        assert_eq!(
+            entry.failure_class,
+            FailureClass::Unclassified,
+            "a rollback must not inherit the previous generation's wall class"
+        );
+        assert!(
+            matches!(&entry.state, LifecycleState::Failed(reason) if reason == "init.lua: boom"),
+            "rollback records the new reason: {:?}",
+            entry.state
+        );
+        // The retry budget is deliberately not reset here: the class alone is
+        // what stops the recovery, so a later real wall failure keeps counting
+        // from where it was.
+        assert_eq!(entry.wall_recovery_attempts, 1);
     }
 
     #[cfg(feature = "input-vm-test-support")]

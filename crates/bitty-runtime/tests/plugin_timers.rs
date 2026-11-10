@@ -530,6 +530,20 @@ fn a_lua_error_that_says_rc1_wall_is_never_auto_recovered() {
     // The discriminating assertion: the same phrase in the same state, but no
     // typed wall verdict, must never auto-recover — three passes to be sure
     // the attempt budget cannot mask a one-shot.
+    //
+    // The fixture is rewritten to a body that WOULD activate cleanly first, so
+    // this test cannot pass for the wrong reason: under the old substring
+    // predicate the entry is selected, retried, and `recover_wall_failed_plugins`
+    // returns 1 (the retry succeeds); under the typed classification nothing is
+    // selected and it returns 0. Before this rewrite the fixture failed on
+    // every activation, so both implementations returned 0 and the test proved
+    // nothing (PR #3109 round-3 review, probe C).
+    write_capability_plugin(
+        &root,
+        "bitty-featured.walltext",
+        &["terminal.semantic-read"],
+        "-- a retry would activate cleanly\n",
+    );
     for attempt in 1..=MAX_WALL_RECOVERY_ATTEMPTS {
         assert_eq!(
             rt.recover_wall_failed_plugins(),

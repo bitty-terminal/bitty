@@ -2328,6 +2328,14 @@ impl Runtime {
         if self.pending_present.is_some() {
             return false;
         }
+        // bitty#3116: while a speculative blind-repair frame has committed to
+        // a free swapchain slot and is waiting on `present_confirm_at` to prove
+        // the compositor actually sampled it, do not submit additional frames
+        // that would exhaust the remaining swapchain images on a hidden
+        // workspace and block `bitty-present` in `vkAcquireNextImageKHR`.
+        if self.speculative_present_reopen && self.present_confirm_at.is_some() {
+            return false;
+        }
         if self
             .presenter
             .as_ref()
@@ -2450,6 +2458,16 @@ impl Runtime {
             // bound, and the stuck-present bound owns a worker that never acks.
             // Counting a miss here would force a duplicate repaint once the
             // in-flight frame lands.
+            return;
+        }
+        if self.speculative_present_reopen {
+            // bitty#3116: the speculative reopen submitted one blind repair
+            // frame, and the driver accepted it into a free swapchain image,
+            // but the compositor still has not served a frame callback within
+            // `PRESENT_CONFIRM_BOUND`. The surface is genuinely hidden on
+            // another workspace — close the gate back before subsequent frames
+            // fill the swapchain and stall `vkAcquireNextImageKHR`.
+            self.restore_hidden_after_blind_repair(now);
             return;
         }
         if self.present_confirm_misses >= PRESENT_CONFIRM_REPAIR_LIMIT {
@@ -3529,6 +3547,9 @@ impl Runtime {
             return None;
         }
         if self.tick_time_gates(now) {
+            return None;
+        }
+        if self.speculative_present_reopen && self.present_confirm_at.is_some() {
             return None;
         }
         // Issue #2589: while the window is hidden (the Wayland shell surface
@@ -8122,12 +8143,11 @@ impl Runtime {
         // Pacing measures committed presentation cadence, exactly like the
         // synchronous path (which stamps only ticks that returned `Some`).
         self.last_present_at = Some(now);
-        // bitty#2989: a real frame is on its way to the compositor. The
-        // embedder clears this bound when the compositor serves the frame
-        // callback for it; a bound that fires first forces one corrective
-        // repaint. Committing also proves a speculative reopen right
-        // (bitty#2989 review R5).
-        self.speculative_present_reopen = false;
+        // bitty#2989 / bitty#3116: a real frame is on its way to the compositor.
+        // The embedder clears this bound (and settles `speculative_present_reopen`)
+        // when the compositor serves the frame callback for it; a driver commit
+        // alone only proves a free swapchain slot existed, not that the window
+        // is visible on the active workspace.
         self.arm_present_confirmation(now);
         // Match the synchronous tail: PTY output that presents without input
         // must refresh the devtools/IPC inspect snapshot too.
@@ -8629,9 +8649,10 @@ impl Runtime {
         // bound when the compositor serves the frame callback; a headless
         // present has no compositor and never arms it.
         if !stats.headless {
-            // A committed synchronous present is also proof the surface is on
-            // screen, which settles a speculative reopen (bitty#2989 review R5).
-            self.speculative_present_reopen = false;
+            // bitty#3116: only compositor confirmation (`note_present_confirmed`)
+            // or an explicit reveal (`queue_reveal_repaint`) settles
+            // `speculative_present_reopen`; a driver commit into a free
+            // swapchain slot does not prove the surface is on screen.
             self.arm_present_confirmation(now);
         }
         // CTX-1630: the scene report and its accessibility projection describe
@@ -14509,6 +14530,99 @@ mod async_present_tests {
 
         control.gate.release();
         let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    /// bitty#3116 regression: on Wayland + Vulkan a swapchain has 2-3 images,
+    /// so the single blind repair frame submitted by a speculative reopen
+    /// acquires a free swapchain image and acks `Presented` immediately even
+    /// while the window is hidden on another Hyprland workspace.
+    ///
+    /// Committing into a free swapchain image must NOT clear
+    /// `speculative_present_reopen`, must NOT allow additional frames to be
+    /// submitted while waiting for `present_confirm_deadline()`, and must
+    /// close the gate back (`restore_hidden_after_blind_repair`) when the
+    /// compositor still does not confirm the repair frame within
+    /// `PRESENT_CONFIRM_BOUND`.
+    #[test]
+    fn a_committed_blind_repair_that_stays_unconfirmed_closes_the_gate_again() {
+        let _guard = unconfirmed_guard();
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"frame before workspace switch");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+        assert_eq!(control.presented(), 1);
+        let first_confirm_deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+
+        // Window switches to another Hyprland workspace: the occlusion edge
+        // closes the gate with no retained damage, keeping `first_confirm_deadline`.
+        let occluded_at = first_confirm_deadline
+            .checked_sub(PRESENT_CONFIRM_BOUND)
+            .and_then(|start| start.checked_add(Duration::from_millis(300)))
+            .expect("occlusion lands inside the bound");
+        runtime.set_surface_visibility_at(occluded_at, false);
+        assert!(!runtime.is_surface_visible());
+
+        // `first_confirm_deadline` expires while hidden -> speculative reopen
+        // submits 1 blind repair frame, and the fake backend (standing in for a
+        // free swapchain slot) accepts and commits it immediately.
+        assert!(runtime.tick_at(first_confirm_deadline).is_none());
+        assert!(runtime.speculative_present_reopen);
+        tick_until_committed(&mut runtime, TEST_WAIT)
+            .expect("the blind repair commits into a free swapchain slot");
+        assert_eq!(control.presented(), 2);
+        assert!(
+            runtime.speculative_present_reopen,
+            "driver commit into a free swapchain slot must not settle speculative_present_reopen"
+        );
+        let repair_confirm_deadline = runtime
+            .present_confirm_deadline()
+            .expect("the committed blind repair arms its own confirmation bound");
+
+        // New PTY output arriving before `repair_confirm_deadline` must stay
+        // held back so it cannot fill the remaining swapchain slots on a
+        // hidden workspace.
+        runtime.handle_pty_bytes(b"animated output while hidden");
+        assert!(
+            !runtime.present_owed(),
+            "no second frame may be owed while the speculative repair awaits compositor confirmation"
+        );
+        assert!(
+            runtime
+                .tick_at(repair_confirm_deadline - Duration::from_millis(10))
+                .is_none()
+        );
+        assert!(
+            runtime.pending_present.is_none(),
+            "no second frame may be submitted while the speculative repair is unconfirmed"
+        );
+
+        // The compositor never serves a frame callback because the window is
+        // on an inactive workspace -> at `repair_confirm_deadline` the gate
+        // closes back and pauses the presenter.
+        assert!(runtime.tick_at(repair_confirm_deadline).is_none());
+        assert!(
+            !runtime.is_surface_visible(),
+            "an unconfirmed blind repair must close the visibility gate back"
+        );
+        assert!(!runtime.speculative_present_reopen);
+        assert!(
+            runtime.presenter.as_ref().expect("presenter").is_paused(),
+            "closing the gate pauses the presenter worker"
+        );
+        assert_eq!(
+            control.presented(),
+            2,
+            "no further frames were presented after the single blind repair"
+        );
+        assert!(runtime.shutdown());
     }
 
     /// bitty#2989 review R8: the same one-blind-attempt rule on the

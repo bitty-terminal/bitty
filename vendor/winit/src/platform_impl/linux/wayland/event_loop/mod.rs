@@ -510,7 +510,9 @@ impl<T: 'static> EventLoop<T> {
                 let mut window =
                     state.windows.get_mut().get_mut(window_id).unwrap().lock().unwrap();
 
-                if window.frame_callback_state() == FrameCallbackState::Requested {
+                if window.frame_callback_state() == FrameCallbackState::Requested
+                    || window.is_suspended()
+                {
                     return None;
                 }
 

@@ -1,5 +1,5 @@
 diff --git a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
-index f7e20c19..2157924a 100644
+index f7e20c19..55c54368 100644
 --- a/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
 +++ b/vendor/winit/src/platform_impl/linux/wayland/event_loop/mod.rs
 @@ -356,6 +356,23 @@ impl<T: 'static> EventLoop<T> {
@@ -26,7 +26,18 @@ index f7e20c19..2157924a 100644
          // Drain the pending compositor updates.
          self.with_state(|state| compositor_updates.append(&mut state.window_compositor_updates));
  
-@@ -563,6 +580,10 @@ impl<T: 'static> EventLoop<T> {
+@@ -493,7 +510,9 @@ impl<T: 'static> EventLoop<T> {
+                 let mut window =
+                     state.windows.get_mut().get_mut(window_id).unwrap().lock().unwrap();
+ 
+-                if window.frame_callback_state() == FrameCallbackState::Requested {
++                if window.frame_callback_state() == FrameCallbackState::Requested
++                    || window.is_suspended()
++                {
+                     return None;
+                 }
+ 
+@@ -563,6 +582,10 @@ impl<T: 'static> EventLoop<T> {
          std::mem::swap(&mut self.compositor_updates, &mut compositor_updates);
          std::mem::swap(&mut self.buffer_sink, &mut buffer_sink);
          std::mem::swap(&mut self.window_ids, &mut window_ids);
@@ -37,3 +48,38 @@ index f7e20c19..2157924a 100644
      }
  
      #[inline]
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/state.rs b/vendor/winit/src/platform_impl/linux/wayland/state.rs
+index 38369eb5..ce733614 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/state.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/state.rs
+@@ -293,7 +293,11 @@ impl WindowHandler for WinitState {
+                 .unwrap();
+             let was_suspended = window.is_suspended();
+             let resized = window.configure(configure, &self.shm, &self.subcompositor_state);
+-            (resized, was_suspended, window.is_suspended())
++            let suspended = window.is_suspended();
++            if was_suspended && !suspended {
++                window.frame_callback_reset();
++            }
++            (resized, was_suspended, suspended)
+         };
+         self.window_compositor_updates[pos].resized |= resized;
+         if suspended != was_suspended {
+diff --git a/vendor/winit/src/platform_impl/linux/wayland/window/state.rs b/vendor/winit/src/platform_impl/linux/wayland/window/state.rs
+index 56ab9a96..3060dc2b 100644
+--- a/vendor/winit/src/platform_impl/linux/wayland/window/state.rs
++++ b/vendor/winit/src/platform_impl/linux/wayland/window/state.rs
+@@ -253,11 +253,11 @@ impl WindowState {
+     pub fn request_frame_callback(&mut self) {
+         let surface = self.window.wl_surface();
+         match self.frame_callback_state {
+-            FrameCallbackState::None | FrameCallbackState::Received => {
++            FrameCallbackState::None => {
+                 self.frame_callback_state = FrameCallbackState::Requested;
+                 surface.frame(&self.queue_handle, surface.clone());
+             },
+-            FrameCallbackState::Requested => (),
++            FrameCallbackState::Received | FrameCallbackState::Requested => (),
+         }
+     }
+ 

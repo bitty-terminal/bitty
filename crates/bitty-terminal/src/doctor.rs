@@ -2538,7 +2538,8 @@ impl DoctorFormat {
 /// `bitty doctor --help`).
 #[must_use]
 pub fn doctor_usage() -> String {
-    "usage: bitty doctor [--format table|json|jsonl] [--no-color] [--config PATH] [--profile NAME] [--fix [--dry-run]]\n\
+    "usage: bitty doctor [--format table|json|jsonl] [--no-color]\n\
+     \x20      [--config PATH] [--profile NAME] [--fix [--dry-run]]\n\
      \n\
      \x20 --format SHAPE  table|json|jsonl (default table; JSON carries the same\n\
      \x20                 checks and repair receipts)\n\

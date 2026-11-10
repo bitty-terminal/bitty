@@ -253,11 +253,11 @@ impl WindowState {
     pub fn request_frame_callback(&mut self) {
         let surface = self.window.wl_surface();
         match self.frame_callback_state {
-            FrameCallbackState::None | FrameCallbackState::Received => {
+            FrameCallbackState::None => {
                 self.frame_callback_state = FrameCallbackState::Requested;
                 surface.frame(&self.queue_handle, surface.clone());
             },
-            FrameCallbackState::Requested => (),
+            FrameCallbackState::Received | FrameCallbackState::Requested => (),
         }
     }
 

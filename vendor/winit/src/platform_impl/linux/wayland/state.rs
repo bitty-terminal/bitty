@@ -293,7 +293,11 @@ impl WindowHandler for WinitState {
                 .unwrap();
             let was_suspended = window.is_suspended();
             let resized = window.configure(configure, &self.shm, &self.subcompositor_state);
-            (resized, was_suspended, window.is_suspended())
+            let suspended = window.is_suspended();
+            if was_suspended && !suspended {
+                window.frame_callback_reset();
+            }
+            (resized, was_suspended, suspended)
         };
         self.window_compositor_updates[pos].resized |= resized;
         if suspended != was_suspended {

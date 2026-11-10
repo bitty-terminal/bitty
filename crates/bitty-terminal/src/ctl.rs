@@ -123,7 +123,7 @@ pub(crate) mod request;
 // `bitty ctl` CLI entry point (relocated from `main.rs`, CTX-0305)
 // ---------------------------------------------------------------------------
 
-use crate::cli::Args;
+use crate::cli::{Args, verbose_help_requested};
 
 /// Runs `bitty ctl`; returns the process exit code.
 ///
@@ -138,7 +138,10 @@ use crate::cli::Args;
 pub(crate) fn run_cli(args: &Args) -> i32 {
     match parse_ctl_request(&args.ctl_raw) {
         Err(CtlParseError::Help) => {
-            print!("{}", ctl_help_text());
+            print!(
+                "{}",
+                ctl_help_text(args.verbose || verbose_help_requested(&args.ctl_raw))
+            );
             0
         }
         Err(err) => {

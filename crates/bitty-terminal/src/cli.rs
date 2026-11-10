@@ -706,6 +706,20 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
     }
 }
 
+/// True when a subcommand's captured raw tail asks for the verbose help tier.
+///
+/// `run`, `ctl`, `dev`, `plugin`, and `extension` own every token after their
+/// word (each keeps the tail verbatim in its `*_raw` field and stops the
+/// global loop), so the global `-v`/`--verbose` arm never sees a trailing
+/// `-v`. The help paths read it here instead. Only help rendering consults
+/// this, so a `-v` that belongs to a wrapped program is never reinterpreted
+/// (CTX-1788, PR #3109 round-2 F2).
+#[must_use]
+pub(crate) fn verbose_help_requested(raw: &[String]) -> bool {
+    raw.iter()
+        .any(|token| token == "-v" || token == "--verbose")
+}
+
 /// Parses `raw` (including `argv[0]` at index 0) into [`Args`].
 ///
 /// Recognised flags:

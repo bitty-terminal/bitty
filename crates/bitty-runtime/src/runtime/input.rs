@@ -1053,7 +1053,10 @@ impl Runtime {
         event: bitty_platform::MouseEvent,
         now: std::time::Instant,
     ) {
-        let _ = self.poll_presenter(now);
+        // CTX-1788 (PR #3109 round-2 F3): drain presenter acks here so a
+        // pointer event sees the committed frame's origin, and carry the
+        // committed frame's stats to the next tick instead of dropping them.
+        let _ = self.drain_presenter_acks_at(now);
         // CTX-0159: retain a bounded mouse trace for screenshots-free probes.
         // Coordinates come from the last known cursor position mapped to cell
         // space (clamped); `None` when the cursor never entered the window.
@@ -1644,7 +1647,8 @@ impl Runtime {
     /// [`Self::handle_cursor_moved`] with an explicit wall clock
     /// (CTX-0334 virtual-clock seam for the hover dwell delay).
     pub fn handle_cursor_moved_at(&mut self, pos: CursorPosition, now: std::time::Instant) {
-        let _ = self.poll_presenter(now);
+        // CTX-1788 (PR #3109 round-2 F3): see `handle_mouse_input_at`.
+        let _ = self.drain_presenter_acks_at(now);
         // Issue #2787: the first move after `CursorEntered` is winit's entry
         // re-sync when it repeats the last position (or when no position is
         // known yet) — that is what the Wayland backend pushes for
@@ -1860,7 +1864,8 @@ impl Runtime {
     /// drift.
     #[allow(clippy::unnecessary_cast)]
     pub fn handle_wheel(&mut self, delta: ScrollDelta) {
-        let _ = self.poll_presenter(std::time::Instant::now());
+        // CTX-1788 (PR #3109 round-2 F3): see `handle_mouse_input_at`.
+        let _ = self.drain_presenter_acks_at(std::time::Instant::now());
         let delta = match delta {
             ScrollDelta::Lines(x, y) => ScrollDelta::Lines(
                 if x.is_finite() {
@@ -2234,7 +2239,14 @@ impl Runtime {
             // modifier latch set on press stays armed forever and the
             // snap-to-live on typing is suppressed for the rest of the
             // session. Focus loss is capture loss for the keyboard too; the
-            // next `ModifiersChanged` snapshot re-syncs every latch.
+            // next `ModifiersChanged` snapshot re-syncs the four latches the
+            // platform can report (shift, control, alt, super).
+            //
+            // CTX-1788 (PR #3109 round-2): Hyper and Meta have no field in
+            // [`bitty_platform::ModifiersState`], so no backend can re-sync
+            // them. Clearing them here is still correct — they stay cleared
+            // until their next named-key press re-latches them from the
+            // keyboard event itself.
             self.shift_pressed = false;
             self.control_pressed = false;
             self.alt_pressed = false;

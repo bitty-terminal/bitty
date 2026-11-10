@@ -1056,6 +1056,14 @@ impl Runtime {
                     false
                 }
                 WindowEventKind::ModifiersChanged(mods) => {
+                    // CTX-1788 (PR #3109 round-2): the platform snapshot is
+                    // authoritative for exactly these four latches, because
+                    // [`bitty_platform::ModifiersState`] carries exactly
+                    // these four. Hyper and Meta are deliberately NOT
+                    // written here: no backend reports them, so they stay as
+                    // the named-key tracker left them (cleared by a focus
+                    // loss, re-latched by their next key press). Do not read
+                    // this arm as a full latch re-sync.
                     self.shift_pressed = mods.shift;
                     self.control_pressed = mods.control;
                     self.alt_pressed = mods.alt;
@@ -1065,6 +1073,9 @@ impl Runtime {
                     // platform snapshot here is authoritative per event.
                     self.super_pressed = mods.super_pressed;
                     // CTX-0159: retain modifier latch changes for probes.
+                    // The probe row records the same four latches; Hyper and
+                    // Meta are not part of the platform snapshot and are not
+                    // reported here.
                     self.inspect_ring.push_modifiers(
                         self.shift_pressed,
                         self.control_pressed,

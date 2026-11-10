@@ -525,23 +525,26 @@ fn main() {
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
     // top-level help.
     if args.help && args.list_word {
-        println!("{}", list::list_help_text(&args.list_spelling));
+        println!(
+            "{}",
+            list::list_help_text(&args.list_spelling, args.verbose)
+        );
         std::process::exit(0);
     }
     if args.help && args.inspect_word {
-        println!("{}", inspect::inspect_help_text());
+        println!("{}", inspect::inspect_help_text(args.verbose));
         std::process::exit(0);
     }
     // `bitty dev --help` shows dev help (never needs an instance or VM and
     // never builds a runtime); bare `--help` shows the top-level help.
     if args.help && args.dev_word {
-        println!("{}", dev::dev_help_text());
+        println!("{}", dev::dev_help_text(args.verbose));
         std::process::exit(0);
     }
     // `bitty plugin --help` shows plugin help (never needs an instance, a
     // config file, or a plugin VM).
     if args.help && args.plugin_word {
-        println!("{}", plugin::plugin_help_text());
+        println!("{}", plugin::plugin_help_text(args.verbose));
         std::process::exit(0);
     }
     // `bitty extension --help` (or the hidden `bitty component --help`
@@ -552,7 +555,7 @@ fn main() {
         if args.component_spelling == "component" {
             eprintln!("{}", component::component_deprecated_note());
         }
-        println!("{}", component::component_help_text());
+        println!("{}", component::component_help_text(args.verbose));
         std::process::exit(0);
     }
     // `bitty version --help` shows version help (local class: no instance,
@@ -641,7 +644,7 @@ fn main() {
                     std::process::exit(0);
                 }
                 Some("ctl") => {
-                    print!("{}", ctl::ctl_help_text());
+                    print!("{}", ctl::ctl_help_text(args.verbose));
                     std::process::exit(0);
                 }
                 Some("config") => {
@@ -665,19 +668,19 @@ fn main() {
                     std::process::exit(0);
                 }
                 Some("list") => {
-                    println!("{}", list::list_help_text(raw));
+                    println!("{}", list::list_help_text(raw, args.verbose));
                     std::process::exit(0);
                 }
                 Some("inspect") => {
-                    println!("{}", inspect::inspect_help_text());
+                    println!("{}", inspect::inspect_help_text(args.verbose));
                     std::process::exit(0);
                 }
                 Some("dev") => {
-                    println!("{}", dev::dev_help_text());
+                    println!("{}", dev::dev_help_text(args.verbose));
                     std::process::exit(0);
                 }
                 Some("plugin") => {
-                    println!("{}", plugin::plugin_help_text());
+                    println!("{}", plugin::plugin_help_text(args.verbose));
                     std::process::exit(0);
                 }
                 Some("extension") => {
@@ -687,7 +690,7 @@ fn main() {
                     if raw == "component" {
                         eprintln!("{}", component::component_deprecated_note());
                     }
-                    println!("{}", component::component_help_text());
+                    println!("{}", component::component_help_text(args.verbose));
                     std::process::exit(0);
                 }
                 Some("version") => {
@@ -1809,6 +1812,8 @@ pub(crate) fn spawn_startup_shells(
     }
 }
 
+#[cfg(test)]
+mod help_width;
 #[cfg(test)]
 mod session_storage_tests;
 #[cfg(test)]

@@ -392,49 +392,82 @@ pub fn list_usage() -> String {
 }
 
 /// Full help for `bitty list --help` (stdout, exit 0).
+///
+/// `verbose` is the documented `-v` tier: the compact body is the
+/// default, and the contract block (`LIST_HELP_CONTRACT`) is
+/// appended only for `--help -v` (CTX-1788, PR #3109 round-2 F2/F7).
+/// Every rendered line stays within `help_width::HELP_MAX_COLUMNS`,
+/// asserted by the test-only help-width gate.
 #[must_use]
-pub fn list_help_text(invoked_as: &str) -> String {
-    format!(
-        "bitty {invoked_as} — enumerate resources (local or runtime)\n\
+pub fn list_help_text(invoked_as: &str, verbose: bool) -> String {
+    let mut text = format!(
+        "bitty list — enumerate resources (local or runtime)\n\
          \n\
-         Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services> [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
+         Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services>\n       \
+         [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
          \n\
          Kinds:\n  \
-           themes     Built-in theme presets plus local files from <config>/bitty/themes/*.toml.\n  \
-           colors     Effective 16 ANSI + UI roles with measured WCAG contrast and floor.\n  \
-           fonts      Discovered system font faces (family, style, source; capped at 512 rows).\n  \
-           plugins    Static bundled plugin catalog metadata (no VM loaded).\n  \
-           instances  Live instance discovery (instance, socket, live).\n  \
-                      Windows serves the same instance-derived named pipe and verifies process identity before reporting live.\n  \
-           actions    Action catalog (`ChromeAction` + `core.*` commands) with `manual_bind_only`\n  \
-                      and effective `binding`.\n  \
-           keymaps    Resolved chord-to-action table and `mod_key` context (`alt` default, `super` when rebound).\n  \
-           services   Registered extension interfaces (one row per `backing_head`, no VM loaded).\n\
+         themes     Built-in theme presets plus local files from <config>/bitty/themes/*.toml.\n  \
+         colors     Effective 16 ANSI + UI roles with measured WCAG contrast and floor.\n  \
+         fonts      Discovered system font faces (family, style, source; capped at 512 rows).\n  \
+         plugins    Static bundled plugin catalog metadata (no VM loaded).\n  \
+         instances  Live instance discovery (instance, socket, live).\n             \
+         Windows serves the same instance-derived named pipe and verifies\n             \
+         process identity before reporting live.\n  \
+         actions    Action catalog (`ChromeAction` + `core.*` commands) with `manual_bind_only`\n             \
+         and effective `binding`.\n  \
+         keymaps    Resolved chord-to-action table and `mod_key` context (`alt` default, `super`\n             \
+         when rebound).\n  \
+         services   Registered extension interfaces (one row per `backing_head`, no VM loaded).\n\
          \n\
          Output (--format json|jsonl): versioned envelope v:1 —\n  \
-           {{\"v\":1,\"command\":\"list|ls\",\"ok\":true,\"result\":<per-kind>}} plus \"error\" on runtime failure\n  \
-           (usage errors exit 2 on stderr only); jsonl emits the single-line resource-array envelope and diagnostics stay on stderr.\n\
+         {{\"v\":1,\"command\":\"list|ls\",\"ok\":true,\"result\":<per-kind>}} plus \"error\" on runtime failure\n  \
+         (usage errors exit 2 on stderr only); jsonl emits the single-line resource-array envelope\n  \
+         and diagnostics stay on stderr.\n\
          \n\
          Options:\n  \
-           --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
-           --socket PATH   Explicit socket for `instances` discovery\n  \
-           --instance ID   Explicit instance ID for `instances` discovery\n  \
-           --no-color      Disable ANSI coloring in table output (also honours NO_COLOR)\n  \
-           -h, --help      Print this help and exit\n\
+         --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \
+         --socket PATH   Explicit socket for `instances` discovery\n  \
+         --instance ID   Explicit instance ID for `instances` discovery\n  \
+         --no-color      Disable ANSI coloring in table output (also honours NO_COLOR)\n  \
+         -h, --help      Print this help and exit\n\
          \n\
          Exit codes:\n  \
-           0 success | 2 usage error | 6 IPC/runtime unavailable | 7 permission denied\n\
+         0 success | 2 usage error | 6 IPC/runtime unavailable | 7 permission denied\n\
          \n\
          Examples:\n  \
-           bitty list themes\n  \
-           bitty list colors --format json\n  \
-           bitty list instances\n  \
-           bitty list actions --format json\n  \
-           bitty list keymaps --format table\n  \
-           bitty list services --format json\n  \
-           bitty ls themes --format table\n"
-    )
+         bitty list themes\n  \
+         bitty list colors --format json\n  \
+         bitty list instances\n  \
+         bitty list actions --format json\n  \
+         bitty list keymaps --format table\n  \
+         bitty list services --format json\n  \
+         bitty ls themes --format table\n",
+    );
+    text.push_str("Version: ");
+    text.push_str(env!("CARGO_PKG_VERSION"));
+    text.push('\n');
+    if verbose {
+        // One blank line separates the compact body from the contract
+        // tier, so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str(LIST_HELP_CONTRACT);
+    }
+    text
 }
+
+/// Verbose-only contract tier for `bitty list --help -v` (CTX-1788).
+///
+/// Appended after the compact body: the default help stays short
+/// enough to read at a glance, and `-v` is the documented opt-in for
+/// the trust boundaries a script author has to rely on.
+pub const LIST_HELP_CONTRACT: &str = "contract:\n  \
+         - Local kinds (themes, colors, fonts, plugins, actions) never open an\n    \
+         instance; runtime kinds (instances, keymaps, services) do.\n  \
+         - Discovery is same-UID only: another user's socket is neither listed nor\n    \
+         connectable.\n  \
+         - `--format json|jsonl` emits the `v:1` envelope on stdout; usage errors go\n    \
+         to stderr only and exit 2.\n";
 
 // ---------------------------------------------------------------------------
 // Theme enumeration (reuses bitty-config::theme, CTX-0147)
@@ -3980,7 +4013,7 @@ mod tests {
     fn list_help_documents_windows_pipe_serving() {
         // CTX-1405 (#2244): `bitty list --help` must describe the real
         // Windows pipe transport and its identity-verified probe.
-        let help = list_help_text("list");
+        let help = list_help_text("list", false);
         assert!(
             help.contains("Windows serves the same instance-derived named pipe"),
             "list help must name the Windows pipe transport, got {help:?}"
@@ -4423,7 +4456,7 @@ mod tests {
 
     #[test]
     fn list_help_documents_actions_keymaps_contract() {
-        let help = list_help_text("list");
+        let help = list_help_text("list", false);
         assert!(
             help.contains("actions"),
             "help must name actions, got {help:?}"
@@ -4660,7 +4693,7 @@ mod tests {
 
     #[test]
     fn list_help_documents_services_contract() {
-        let help = list_help_text("list");
+        let help = list_help_text("list", false);
         assert!(help.contains("services"), "help must name services");
         assert!(
             help.contains("backing_head"),

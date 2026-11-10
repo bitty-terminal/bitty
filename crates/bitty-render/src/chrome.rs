@@ -31,19 +31,17 @@
 //!
 //! # Grid-safe corners
 //!
-//! Two paint tiers share one token set:
+//! Every chrome tier shares one token set. Pixel surfaces (help, palette,
+//! presentation/plugin overlays, panels) paint a [`RoundedFill`] surface plus
+//! a 1-px ring and use the SDF inner arc as the corner mask. Glyphs that cross
+//! the arc carry the [`ChromePaint::clip`] rounded clip, so no cell ink leaks
+//! into the corner notch. This is exact at any DPI and needs no corner glyph.
 //!
-//! - **Pixel surfaces** (help, palette, presentation/plugin overlays, panels)
-//!   paint a [`RoundedFill`] surface plus a 1-px ring and use the SDF inner
-//!   arc as the corner mask. Glyphs that cross the arc carry the
-//!   [`ChromePaint::clip`] rounded clip, so no cell ink leaks into the
-//!   corner notch. This is exact at any DPI and needs no corner glyph.
-//! - **Cell-grid chrome** (one-row bands) cannot express a sub-cell radius.
-//!   [`ChromeCornerGlyphs`] names the rounded box-drawing corner set and two
-//!   documented fallbacks: light box-drawing corners when the font covers
-//!   those, then square corners (no glyph) when even those are unavailable.
-//!   The fallback never leaves a hole: the band surface stays rectangular and
-//!   only the decorative corner glyph is dropped.
+//! Cell-grid chrome (one-row bands) cannot express a sub-cell radius, so it
+//! paints the square [`ChromePaint`] fallback: the band surface stays
+//! rectangular and no decorative corner glyph is drawn. There is no
+//! glyph-tier API: a caller that wants rounded corners must paint through a
+//! pixel surface (CTX-1788 retired the unused `ChromeCornerGlyphs` table).
 //!
 //! All values are deterministic, bounded, and English-only. The module is a
 //! mechanism, not a style preference: plugins still choose their own content
@@ -93,101 +91,6 @@ pub const CHROME_ELEVATE_MIX: f32 = 0.08;
 
 /// Non-text UI floor for the focused chrome border (AC-1/AC-2, 3:1).
 pub const MIN_CHROME_FOCUS_CONTRAST: f64 = 3.0;
-
-/// Corner order used by every glyph/mask table: top-left, top-right,
-/// bottom-left, bottom-right.
-pub const CORNER_ORDER: [&str; 4] = ["top-left", "top-right", "bottom-left", "bottom-right"];
-
-/// Rounded box-drawing corners (U+256D..U+2570): the preferred grid corners.
-pub const CHROME_CORNERS_ROUNDED: [char; 4] = ['╭', '╮', '╰', '╯'];
-
-/// Light box-drawing corners (U+250C..U+2510): the first fallback when the
-/// rounded set is unavailable but the font still covers box drawing.
-pub const CHROME_CORNERS_BOX: [char; 4] = ['┌', '┐', '└', '┘'];
-
-/// Quadrant blocks that mask the outer corner of a cell-grid surface when a
-/// host supplies a surface fill below the glyphs.
-///
-/// The mask uses block elements (U+2598..U+2597), the same coverage family the
-/// renderer's fallback chain already guarantees for TUI graph cells. A host
-/// that cannot draw them must use [`ChromeGlyphCoverage::None`] and square
-/// corners instead.
-pub const CHROME_CORNER_MASKS: [char; 4] = ['▘', '▝', '▖', '▗'];
-
-/// Advertised glyph coverage for cell-grid corner drawing.
-///
-/// This is a host capability input, not a font probe: Core's default font
-/// chain lists box drawing and block elements as covered families, so the
-/// production host advertises [`Self::Full`]. A constrained host that strips
-/// those families advertises [`Self::Basic`] or [`Self::None`] and gets the
-/// documented square fallback instead of a tofu glyph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ChromeGlyphCoverage {
-    /// Rounded box drawing plus quadrant blocks are available.
-    Full,
-    /// Only light box drawing is available; corners are square (no arc) but
-    /// the frame stays visually closed.
-    Basic,
-    /// No box-drawing coverage; corners are square and glyph-free.
-    None,
-}
-
-/// The resolved corner glyphs for one host capability.
-///
-/// `None` entries mean "paint no corner glyph"; the surface keeps its square
-/// rectangle. This is the documented fallback, never a silent tofu glyph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChromeCornerGlyphs {
-    /// One optional glyph per [`CORNER_ORDER`] entry.
-    pub corners: [Option<char>; 4],
-}
-
-impl ChromeCornerGlyphs {
-    /// Resolves the corner table for a host coverage level.
-    #[must_use]
-    pub const fn resolve(coverage: ChromeGlyphCoverage) -> Self {
-        match coverage {
-            ChromeGlyphCoverage::Full => Self {
-                corners: [
-                    Some(CHROME_CORNERS_ROUNDED[0]),
-                    Some(CHROME_CORNERS_ROUNDED[1]),
-                    Some(CHROME_CORNERS_ROUNDED[2]),
-                    Some(CHROME_CORNERS_ROUNDED[3]),
-                ],
-            },
-            ChromeGlyphCoverage::Basic => Self {
-                corners: [
-                    Some(CHROME_CORNERS_BOX[0]),
-                    Some(CHROME_CORNERS_BOX[1]),
-                    Some(CHROME_CORNERS_BOX[2]),
-                    Some(CHROME_CORNERS_BOX[3]),
-                ],
-            },
-            ChromeGlyphCoverage::None => Self { corners: [None; 4] },
-        }
-    }
-
-    /// Glyph for one [`CORNER_ORDER`] index, or `None` when out of bounds.
-    #[must_use]
-    pub const fn glyph(&self, corner: usize) -> Option<char> {
-        if corner < self.corners.len() {
-            self.corners[corner]
-        } else {
-            None
-        }
-    }
-
-    /// Quadrant mask for one [`CORNER_ORDER`] index, or `None` when the host
-    /// cannot draw block elements or `corner` is out of bounds.
-    #[must_use]
-    pub const fn mask(&self, corner: usize, coverage: ChromeGlyphCoverage) -> Option<char> {
-        if corner < CHROME_CORNER_MASKS.len() && matches!(coverage, ChromeGlyphCoverage::Full) {
-            Some(CHROME_CORNER_MASKS[corner])
-        } else {
-            None
-        }
-    }
-}
 
 /// Whether a chrome surface is idle or focused.
 ///
@@ -705,24 +608,6 @@ mod tests {
             "square ring fallback"
         );
         assert!(paint.clip.is_none(), "square frames never clip glyphs");
-    }
-
-    #[test]
-    fn corner_glyph_fallback_is_documented_and_total() {
-        let full = ChromeCornerGlyphs::resolve(ChromeGlyphCoverage::Full);
-        assert_eq!(full.corners, [Some('╭'), Some('╮'), Some('╰'), Some('╯')]);
-        assert_eq!(full.glyph(0), Some('╭'));
-        assert_eq!(full.glyph(4), None);
-        assert_eq!(full.glyph(usize::MAX), None);
-        assert_eq!(full.mask(0, ChromeGlyphCoverage::Full), Some('▘'));
-        assert_eq!(full.mask(4, ChromeGlyphCoverage::Full), None);
-        assert_eq!(full.mask(usize::MAX, ChromeGlyphCoverage::Full), None);
-        let basic = ChromeCornerGlyphs::resolve(ChromeGlyphCoverage::Basic);
-        assert_eq!(basic.corners, [Some('┌'), Some('┐'), Some('└'), Some('┘')]);
-        assert_eq!(basic.mask(0, ChromeGlyphCoverage::Basic), None);
-        let none = ChromeCornerGlyphs::resolve(ChromeGlyphCoverage::None);
-        assert_eq!(none.corners, [None; 4], "square, glyph-free fallback");
-        assert_eq!(none.mask(0, ChromeGlyphCoverage::None), None);
     }
 
     #[test]

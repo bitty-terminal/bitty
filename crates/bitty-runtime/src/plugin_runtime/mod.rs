@@ -650,6 +650,32 @@ struct PluginEntry {
     budgets: Option<bitty_plugin_host::budgets::EffectiveBudgets>,
     /// Consecutive automatic recovery attempts after `RC-1 wall` failures.
     wall_recovery_attempts: u32,
+    /// Host classification of the current [`LifecycleState::Failed`] reason.
+    ///
+    /// Set only where the host *knows* the cause: the timer pump records
+    /// [`FailureClass::WallSliceTimeout`] when the suspending verdict was
+    /// [`SuspendReason::WallClockExceeded`], and every other failure stays
+    /// [`FailureClass::Unclassified`]. `recover_wall_failed_plugins` reads
+    /// this instead of matching a substring of the rendered reason, so a
+    /// plugin whose `init.lua` merely raises `error("RC-1 wall")` is never
+    /// auto-recovered (CTX-1788, PR #3109 round-2).
+    failure_class: FailureClass,
+}
+
+/// Why a generation reached [`LifecycleState::Failed`], when the host can say.
+///
+/// A rendered reason string is diagnostics, not a classification: it carries
+/// plugin-visible text (a Lua error message) that a plugin can choose. Only a
+/// typed verdict from the suspend path may drive a recovery decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum FailureClass {
+    /// No typed verdict: activation error, Lua error, instruction or memory
+    /// budget, or any path that only produced a message.
+    #[default]
+    Unclassified,
+    /// The generation was suspended on the RC-1 hard wall-clock slice budget
+    /// ([`SuspendReason::WallClockExceeded`]).
+    WallSliceTimeout,
 }
 
 /// One app-dispatched command parked at the RC-1 wall budget (bitty #2314).
@@ -2341,7 +2367,7 @@ impl PluginRuntime {
                     // callback never ran. Fail the generation without a
                     // phantom fire, and keep the reason attributed to the
                     // dispatch that suspended it.
-                    self.fail_runtime(&plugin, timer_terminal_reason(&reason, true));
+                    self.fail_runtime_on_suspend(&plugin, &reason, true);
                     self.sync_timer_cancels();
                     self.sync_new_timers(now);
                     continue;
@@ -2384,7 +2410,7 @@ impl PluginRuntime {
                         }
                     }
                     if let Some((reason, refused)) = terminal {
-                        self.fail_runtime(&plugin, timer_terminal_reason(&reason, refused));
+                        self.fail_runtime_on_suspend(&plugin, &reason, refused);
                     } else if let Some(entry) = self.entries.get_mut(&plugin) {
                         entry.wall_recovery_attempts = 0;
                     }
@@ -2758,6 +2784,7 @@ impl PluginRuntime {
                 settings_diagnostics: Vec::new(),
                 budgets: None,
                 wall_recovery_attempts: 0,
+                failure_class: FailureClass::Unclassified,
             },
         );
         self.order.push(id);
@@ -3401,6 +3428,10 @@ impl PluginRuntime {
             entry.settings_diagnostics = settings_diagnostics;
             entry.budgets = Some(effective_budgets);
             entry.state = LifecycleState::Active;
+            // CTX-1788: a generation that activated is not a wall-slice
+            // failure any more; clear the class so a later `Failed` state
+            // starts from an unclassified verdict.
+            entry.failure_class = FailureClass::Unclassified;
             (
                 entry.package.source_class,
                 entry.package.unverified,
@@ -3708,7 +3739,13 @@ impl PluginRuntime {
                     return None;
                 }
                 match &entry.state {
-                    LifecycleState::Failed(reason) if reason.contains("RC-1 wall") => {
+                    // CTX-1788 (PR #3109 round-2): classify on the typed
+                    // verdict the suspend path recorded, never on the rendered
+                    // reason. A plugin can put "RC-1 wall" in a Lua error
+                    // message; that must not earn an automatic reload.
+                    LifecycleState::Failed(reason)
+                        if entry.failure_class == FailureClass::WallSliceTimeout =>
+                    {
                         Some((id.clone(), entry.package.source_class, reason.clone()))
                     }
                     _ => None,
@@ -4671,7 +4708,15 @@ impl PluginRuntime {
     /// the lifecycle state carries the reason.
     ///
     /// [`Failed`]: LifecycleState::Failed
-    fn fail_runtime(&mut self, id: &PluginId, reason: String) {
+    /// Fails one generation and records the host's typed verdict on the cause.
+    ///
+    /// Only a path that inspected a [`SuspendReason`] may pass a class other
+    /// than [`FailureClass::Unclassified`]; the class is what
+    /// [`Self::recover_wall_failed_plugins`] filters on, so a reason string a
+    /// plugin can influence never drives a recovery. Activation and Lua-error
+    /// paths pass [`FailureClass::Unclassified`] (see
+    /// [`Self::fail_runtime_on_suspend`] for the timer pump).
+    fn fail_runtime_classified(&mut self, id: &PluginId, reason: String, class: FailureClass) {
         self.cancel_parked_command(id);
         self.rollback(id, reason);
         // A failed activation never commits a registration capture, but a
@@ -4679,8 +4724,24 @@ impl PluginRuntime {
         // snapshot and any fallback lookup cannot retain them.
         if let Some(entry) = self.entries.get_mut(id) {
             entry.registrations = RegistrationCapture::new();
+            entry.failure_class = class;
         }
         self.sync_debug_view();
+    }
+
+    /// [`Self::fail_runtime_classified`] with the class derived from the
+    /// verdict the timer pump actually observed.
+    ///
+    /// The pump has the [`SuspendReason`] in hand, so it can say *why* the
+    /// generation died instead of leaving the reason string to be re-parsed
+    /// later (CTX-1788, PR #3109 round-2).
+    fn fail_runtime_on_suspend(&mut self, id: &PluginId, reason: &SuspendReason, refused: bool) {
+        let class = match reason {
+            SuspendReason::WallClockExceeded { .. } => FailureClass::WallSliceTimeout,
+            SuspendReason::InstructionBudgetExceeded { .. }
+            | SuspendReason::MemoryExceeded { .. } => FailureClass::Unclassified,
+        };
+        self.fail_runtime_classified(id, timer_terminal_reason(reason, refused), class);
     }
 
     /// Roll back a failed activation attempt atomically.

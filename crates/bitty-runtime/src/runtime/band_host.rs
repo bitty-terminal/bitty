@@ -763,19 +763,15 @@ impl BandButton {
     }
 }
 
-/// Host theme-token table for band paint (CTX-0946 C2, bitty#3108).
-///
-/// Resolves semantic role tokens (`foreground`, `background`, `cursor`,
-/// `selection`, `accent`, `normal`, `muted`, `dim`, `surface`, `ok`,
-/// `success`, `warning`, `warn`, `critical`, `error`) and named ANSI 16
-/// palette tokens (`black`, `red`, `green`, `yellow`, `orange`, `blue`,
-/// `magenta`, `purple`, `cyan`, `teal`, `white`, plus `bright_*` and
-/// `ansi.*` forms) against the active theme palette (OSC-4-aware). Returns
-/// `None` for unknown tokens; callers substitute the span default and count
-/// [`BandHostStats::unknown_tokens`].
 /// Default Waybar-inspired foreground token for a `bitty-terminal.bar` module
 /// span that declares neither `fg` nor `bg`, keyed by its `bar:module:<name>`
 /// hover region identity.
+///
+/// Only the identity is consulted: the region id is `bar:module:<name>[:…]`,
+/// the first segment after the prefix selects the token, and an unknown or
+/// missing region yields `None` (the caller keeps the span default). A run
+/// that names its own `fg` or `bg` opts out entirely. This is a Core-owned
+/// palette role name, never a raw colour and never plugin-chosen.
 #[must_use]
 pub fn default_band_run_fg_token(run: &BandRun) -> Option<&'static str> {
     if run.fg.is_some() || run.bg.is_some() {
@@ -803,6 +799,16 @@ pub fn default_band_run_fg_token(run: &BandRun) -> Option<&'static str> {
     }
 }
 
+/// Host theme-token table for band paint (CTX-0946 C2, bitty#3108).
+///
+/// Resolves semantic role tokens (`foreground`, `background`, `cursor`,
+/// `selection`, `accent`, `normal`, `muted`, `dim`, `surface`, `ok`,
+/// `success`, `warning`, `warn`, `critical`, `error`) and named ANSI 16
+/// palette tokens (`black`, `red`, `green`, `yellow`, `orange`, `blue`,
+/// `magenta`, `purple`, `cyan`, `teal`, `white`, plus `bright_*` and
+/// `ansi.*` forms) against the active theme palette (OSC-4-aware). Returns
+/// `None` for unknown tokens; callers substitute the span default and count
+/// [`BandHostStats::unknown_tokens`].
 #[must_use]
 pub fn resolve_band_token(token: &str, palette: &ThemePalette) -> Option<Rgba8> {
     let ansi = |idx: u8| -> Option<Rgba8> {
@@ -3000,6 +3006,88 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One band run with the given declared `fg` and hover-region identity.
+    fn band_run(fg: Option<&str>, region: Option<&str>) -> BandRun {
+        BandRun {
+            start_col: 0,
+            end_col: 5,
+            start_char: 0,
+            end_char: 5,
+            fg: fg.map(str::to_string),
+            bg: None,
+            bold: false,
+            on_click: None,
+            on_scroll: None,
+            on_hover: region.map(|id| ClickCommand {
+                command: String::from("test-bar:detail"),
+                args: Vec::new(),
+                region: Some(UiRegion {
+                    id: id.to_string(),
+                    kind: bitty_lua::ui::UiRegionKind::Module,
+                }),
+            }),
+            region: None,
+        }
+    }
+
+    #[test]
+    fn default_band_run_fg_token_keys_off_the_hover_region_identity() {
+        // bitty#3108 round-2 (CTX-1788): the default fg is chosen from the
+        // module's `bar:module:<name>` hover-region identity, never from
+        // span text, and never overrides a declared fg/bg.
+        assert_eq!(
+            default_band_run_fg_token(&band_run(None, Some("bar:module:clock"))),
+            Some("accent")
+        );
+        // Only the first segment after the prefix names the module; a
+        // per-item suffix (`cpu:0`) is ignored.
+        assert_eq!(
+            default_band_run_fg_token(&band_run(None, Some("bar:module:cpu:0"))),
+            Some("green")
+        );
+        // Unknown module, a non-bar region id, and no hover binding all fall
+        // back to the span default instead of guessing.
+        assert_eq!(
+            default_band_run_fg_token(&band_run(None, Some("bar:module:unknown"))),
+            None
+        );
+        assert_eq!(
+            default_band_run_fg_token(&band_run(None, Some("clock"))),
+            None
+        );
+        assert_eq!(default_band_run_fg_token(&band_run(None, None)), None);
+        // A declared fg or bg opts out entirely, even for a known module.
+        assert_eq!(
+            default_band_run_fg_token(&band_run(Some("red"), Some("bar:module:clock"))),
+            None
+        );
+
+        // Every token the table returns is a real palette role: a typo here
+        // would silently paint the span default instead of the module colour.
+        let palette = ThemePalette::bitty_dark();
+        for module in [
+            "clock",
+            "network",
+            "cpu",
+            "memory",
+            "battery",
+            "pulseaudio",
+            "microphone",
+            "bluetooth",
+            "backlight",
+            "idle",
+            "spectrum",
+        ] {
+            let id = format!("bar:module:{module}");
+            let token = default_band_run_fg_token(&band_run(None, Some(&id)))
+                .unwrap_or_else(|| panic!("{module} must map to a token"));
+            assert!(
+                resolve_band_token(token, &palette).is_some(),
+                "{module} -> {token} must resolve against the default palette"
+            );
+        }
+    }
 
     fn text_node(text: &str) -> UiNode {
         UiNode::Text {

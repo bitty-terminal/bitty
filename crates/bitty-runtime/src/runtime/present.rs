@@ -3413,7 +3413,17 @@ impl Runtime {
         // one case that leaves nothing owed and no retry armed. Consume the
         // bound before the gates so the corrective frame is built this tick.
         self.check_present_confirmation(now);
-        let stats = self.tick_at_inner(now).or(committed);
+        let mut stats = self.tick_at_inner(now).or(committed);
+        // CTX-1788 (PR #3109 round-2 F3): an ack drained off-tick (input hot
+        // path, or the embedder's pre-tick band hit-test) committed a frame
+        // that this tick would otherwise report as no present. Report it once,
+        // here: the tick's own frame wins when both happened, so a tick never
+        // counts two presents and a stale carried frame can never be counted
+        // twice.
+        match stats {
+            Some(_) => self.offtick_present = None,
+            None => stats = self.offtick_present.take(),
+        }
         self.publish_hang_gauges();
         self.hang_gauges
             .finish_tick(u64::try_from(tick_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
@@ -7776,8 +7786,30 @@ impl Runtime {
     /// Drains off-thread presenter acknowledgements and enforces the
     /// stuck-present bound against the current wall clock (bitty#2830,
     /// bitty#3108).
+    ///
+    /// A frame this call commits is carried to the next [`Self::tick`] (the
+    /// `offtick_present` slot); the return value is the same stats for
+    /// callers that want them immediately. The embedder drains here before
+    /// its band hit-test so the presented origin is live, which is why the
+    /// carry exists at all (CTX-1788, PR #3109 round-2 F3).
     pub fn poll_presenter_acks(&mut self) -> Option<PresentStats> {
-        self.poll_presenter(std::time::Instant::now())
+        self.drain_presenter_acks_at(std::time::Instant::now())
+    }
+
+    /// [`Self::poll_presenter_acks`] with an explicit wall clock.
+    ///
+    /// Parks a committed frame's [`PresentStats`] for the next tick instead of
+    /// dropping it: an ack drained on the input hot path or on the embedder's
+    /// pre-tick band hit-test is a real present with no tick of its own.
+    pub(super) fn drain_presenter_acks_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<PresentStats> {
+        let stats = self.poll_presenter(now);
+        if stats.is_some() {
+            self.offtick_present = stats;
+        }
+        stats
     }
 
     /// Drains off-thread presenter acknowledgements and enforces the

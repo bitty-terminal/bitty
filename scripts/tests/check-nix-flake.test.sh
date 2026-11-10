@@ -43,6 +43,7 @@ else
   # terminal derivation, so the release job must build it by its own attr.
   expect_contains "$FLAKE_CONTENT" "bittyd = craneLib.buildPackage" "flake.nix declares the bittyd derivation"
   expect_contains "$FLAKE_CONTENT" "bittyd = bittyd;" "flake.nix exposes bittyd as a package"
+  expect_contains "$FLAKE_CONTENT" "./packaging/icons/hicolor/64x64/apps/bitty.png" "flake.nix includes 64x64 window icon asset in fileset"
 fi
 
 # 2. Assert release.yml workflow integration

@@ -44,7 +44,7 @@ test = false
 doctest = false
 
 [dependencies]
-bitty-config = { version = "0.0.38", path = "../bitty-config" }
+bitty-config = { version = "0.0.39", path = "../bitty-config" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
 # CTX-0939 (W-146): the composition root owns the extracted storage
 # mechanics. This is the ONLY crate in the workspace that may depend on
@@ -59,7 +59,7 @@ bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev =
 # model pin above so default builds link no component code.
 # Re-pin instructions live in `src/storage_component_host.rs`.
 bitty-storage-component = { package = "bitty-storage", git = "https://github.com/bitty-terminal/bitty-storage", rev = "502c7f5", optional = true }
-bitty-package = { version = "0.0.38", path = "../bitty-package" }
+bitty-package = { version = "0.0.39", path = "../bitty-package" }
 # CTX-0981 (W-110): the composition root owns the extracted observability
 # contract. This is the ONLY crate in the workspace that may depend on
 # `bitty-observability-api`: Core library crates never link it (Core keeps
@@ -67,13 +67,13 @@ bitty-package = { version = "0.0.38", path = "../bitty-package" }
 # the dependency direction stays one-way and default builds link no
 # exporters, metrics pipeline, or tracing runtime).
 bitty-observability-api = { git = "https://github.com/bitty-terminal/bitty-observability", rev = "f1d08f4" }
-bitty-platform = { version = "0.0.38", path = "../bitty-platform" }
-bitty-plugin-host = { version = "0.0.38", path = "../bitty-plugin-host" }
-bitty-runtime = { version = "0.0.38", path = "../bitty-runtime" }
-bitty-render = { version = "0.0.38", path = "../bitty-render" }
-bitty-rich = { version = "0.0.38", path = "../bitty-rich" }
-bitty-term-state = { version = "0.0.38", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.38", path = "../bitty-vt" }
+bitty-platform = { version = "0.0.39", path = "../bitty-platform" }
+bitty-plugin-host = { version = "0.0.39", path = "../bitty-plugin-host" }
+bitty-runtime = { version = "0.0.39", path = "../bitty-runtime" }
+bitty-render = { version = "0.0.39", path = "../bitty-render" }
+bitty-rich = { version = "0.0.39", path = "../bitty-rich" }
+bitty-term-state = { version = "0.0.39", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.39", path = "../bitty-vt" }
 pollster = { workspace = true }
 # CTX-1719 (bitty#2925): `bitty upgrade` verifies release assets against the
 # published `SHA256SUMS` before replacing a self-managed binary.
@@ -96,7 +96,7 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 # bitty#2929: the reviewed Win32 FFI boundary (`bitty-winjob`) owns the only
 # Windows `unsafe` in the workspace, so the GUI-subsystem console adoption
 # lives there and this crate stays `#![forbid(unsafe_code)]`.
-bitty-winjob = { version = "0.0.38", path = "../bitty-winjob" }
+bitty-winjob = { version = "0.0.39", path = "../bitty-winjob" }
 
 # bitty#2929: compiles `bitty.rc` (the application icon) into the Windows
 # executable. Build-dependency, so non-Windows hosts never compile it.
@@ -120,14 +120,14 @@ input-vm-test-support = ["bitty-platform/input-vm-test-support", "bitty-runtime/
 # bitty#2830: the watchdog regressions seed a completed over-bound tick and
 # inject a block inside the measured tick region. Test builds unify the
 # feature; the shipped binary links none of the seam.
-bitty-runtime = { version = "0.0.38", path = "../bitty-runtime", features = ["hang-gauge-test-support"] }
+bitty-runtime = { version = "0.0.39", path = "../bitty-runtime", features = ["hang-gauge-test-support"] }
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
 # `bitty#2869` acceptance: the safe-mode I/O-denied harness lives behind this
 # feature so a test can deny every configuration read and prove `--safe`
 # performs none. Test builds unify the feature; the shipped binary has none of
 # the gate.
-bitty-config = { version = "0.0.38", path = "../bitty-config", features = ["io-denied-harness"] }
+bitty-config = { version = "0.0.39", path = "../bitty-config", features = ["io-denied-harness"] }
 # CTX-0939: storage-parity tests build plugin-store values through the same
 # `LuaValue` type Core validates; test-only, never linked into the binary.
 bitty-lua = { path = "../bitty-lua" }

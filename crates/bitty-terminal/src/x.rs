@@ -309,12 +309,15 @@ fn x_help_text_for(rows: &[XPluginRow]) -> String {
         out.push_str("  (none)\n");
     } else {
         for row in rows {
-            let _ = write!(out, "  {} ({})", row.id, row.version);
-            if row.commands.is_empty() {
-                out.push('\n');
-            } else {
-                let _ = writeln!(out, " — {}", row.commands.join(", "));
+            // A store plugin can declare many commands: one unwrapped row
+            // rendered 455 columns in review. Wrap at `HELP_WRAP_COLUMNS`,
+            // keeping the command list aligned under the row's text.
+            let mut line = format!("  {} ({})", row.id, row.version);
+            if !row.commands.is_empty() {
+                line.push_str(" — ");
+                line.push_str(&row.commands.join(", "));
             }
+            crate::cli::push_wrapped_line(&mut out, "      ", &line);
         }
     }
     out.push_str(
@@ -652,6 +655,29 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_store_row_wraps_within_the_help_budget() {
+        // CTX-1788 review item 1: the default `bitty x --help` renders one row
+        // per installed plugin, and a row with many commands rendered 455
+        // columns before the wrap. The row is dynamic, so a static help-width
+        // check cannot cover it: assert the rendered text directly.
+        let row = XPluginRow {
+            id: String::from("example.manycommands"),
+            short: String::from("manycommands"),
+            version: String::from("1.2.3"),
+            commands: (0..12).map(|index| format!("command-{index:02}")).collect(),
+        };
+        let text = x_help_text_for(&[row]);
+        let widest = text.lines().map(|line| line.chars().count()).max();
+        assert!(
+            widest.unwrap_or(0) <= crate::cli::HELP_WRAP_COLUMNS,
+            "wrapped catalog row must fit the help budget, widest line {widest:?}"
+        );
+        // Wrapping must not lose commands.
+        assert!(text.contains("command-00"), "first command kept: {text}");
+        assert!(text.contains("command-11"), "last command kept: {text}");
+    }
 
     fn tokens(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()

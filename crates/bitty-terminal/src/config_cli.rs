@@ -1243,7 +1243,8 @@ fn builtin_app_config() -> Result<AppConfig, String> {
 
 /// Short usage for `bitty config` (stderr, fail-closed exit 2).
 pub(crate) fn config_usage() -> String {
-    "usage: bitty config <path|check|show|validate|migrate|edit|profile> [--format table|json|jsonl] [--config PATH] [--profile NAME]\n\
+    "usage: bitty config <path|check|show|validate|migrate|edit|profile> [--format\n\
+     \x20      table|json|jsonl] [--config PATH] [--profile NAME]\n\
      \n\
      verbs:\n\
      \x20 path      print the resolved config file path\n\

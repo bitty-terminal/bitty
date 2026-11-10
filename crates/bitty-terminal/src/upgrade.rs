@@ -1673,7 +1673,8 @@ pub fn upgrade_usage() -> String {
      its sha256 against the release SHA256SUMS, and replace the binary\n\
      atomically (the previous binary stays as bitty.prev). Package-manager\n\
      installs are delegated, never fought: bitty prints the exact command and\n\
-     never elevates. Upgrade docs: <https://github.com/bitty-terminal/bitty/blob/main/packaging/upgrade.md>."
+     \x20             never elevates. Upgrade docs:\n\
+     \x20             <https://github.com/bitty-terminal/bitty/blob/main/packaging/upgrade.md>."
         .to_string()
 }
 

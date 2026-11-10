@@ -655,10 +655,13 @@ struct PluginEntry {
     /// Set only where the host *knows* the cause: the timer pump records
     /// [`FailureClass::WallSliceTimeout`] when the suspending verdict was
     /// [`SuspendReason::WallClockExceeded`], and every other failure stays
-    /// [`FailureClass::Unclassified`]. `recover_wall_failed_plugins` reads
-    /// this instead of matching a substring of the rendered reason, so a
-    /// plugin whose `init.lua` merely raises `error("RC-1 wall")` is never
-    /// auto-recovered (CTX-1788, PR #3109 round-2).
+    /// [`FailureClass::Unclassified`]. [`PluginRuntime::rollback`] resets the
+    /// field on every failed activation/reload, so a generation that once hit a
+    /// real wall slice cannot carry that verdict into a later, unrelated
+    /// failure. `recover_wall_failed_plugins` reads this instead of matching a
+    /// substring of the rendered reason, so a plugin whose `init.lua` merely
+    /// raises `error("RC-1 wall")` is never auto-recovered (CTX-1788, PR #3109
+    /// round-2).
     failure_class: FailureClass,
 }
 
@@ -4757,6 +4760,14 @@ impl PluginRuntime {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
+            // CTX-1788 (PR #3109 round-2): the class describes *this* failure,
+            // so a rolled-back generation starts from no verdict. Without this
+            // reset a generation that once hit a real RC-1 wall kept
+            // `WallSliceTimeout` across a later, unrelated activation failure
+            // and was auto-retried up to `MAX_WALL_RECOVERY_ATTEMPTS` on a
+            // plain Lua error. `fail_runtime_classified` re-applies its typed
+            // class *after* this call, so the timer pump's verdict survives.
+            entry.failure_class = FailureClass::Unclassified;
             // bitty#2785: release the generation's UI blocks -- including the
             // terminal-slot scene and its Core-owned panel -- before dropping
             // the services that address them. A scene mounted during

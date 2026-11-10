@@ -720,6 +720,50 @@ pub(crate) fn verbose_help_requested(raw: &[String]) -> bool {
         .any(|token| token == "-v" || token == "--verbose")
 }
 
+/// Column budget for one rendered help line (CTX-1788, PR #3109 round-2 F7).
+///
+/// Production help builders cannot reference the test-only width gate, so the
+/// budget is declared here once and the gate asserts it equals its own
+/// [`HELP_MAX_COLUMNS`](crate::help_width::HELP_MAX_COLUMNS).
+pub(crate) const HELP_WRAP_COLUMNS: usize = 100;
+
+/// Appends `line` to `out`, wrapped at word boundaries to [`HELP_WRAP_COLUMNS`].
+///
+/// `line`'s own leading whitespace starts the first output line; every
+/// continuation line starts with `indent` instead, so a wrapped `usage:` or
+/// catalog row keeps its visual block. One trailing newline is emitted.
+///
+/// Wrapping only moves whitespace into newlines: no word is dropped or
+/// reordered, which is what lets the help gate assert "same content, narrower".
+pub(crate) fn push_wrapped_line(out: &mut String, indent: &str, line: &str) {
+    let limit = HELP_WRAP_COLUMNS;
+    let lead: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
+    let mut current = lead;
+    let mut started = false;
+    for word in line.split_whitespace() {
+        let base = current.chars().count();
+        let word_len = word.chars().count();
+        let candidate = if started {
+            base + 1 + word_len
+        } else {
+            base + word_len
+        };
+        if started && candidate > limit {
+            out.push_str(&current);
+            out.push('\n');
+            current = indent.to_string();
+            started = false;
+        }
+        if started {
+            current.push(' ');
+        }
+        current.push_str(word);
+        started = true;
+    }
+    out.push_str(&current);
+    out.push('\n');
+}
+
 /// Parses `raw` (including `argv[0]` at index 0) into [`Args`].
 ///
 /// Recognised flags:
@@ -2880,6 +2924,14 @@ pub(crate) fn help_usage() -> String {
 /// Full help for `bitty help --help` / `bitty help help` (stdout, exit 0).
 #[must_use]
 pub(crate) fn help_help_text() -> String {
+    // The valid-command list is one long interpolated sentence: wrap it so the
+    // rendered help stays inside `HELP_WRAP_COLUMNS` (CTX-1788 F7).
+    let mut valid_commands = String::new();
+    push_wrapped_line(
+        &mut valid_commands,
+        "  ",
+        &format!("  naming valid commands: {}.", help_valid_commands()),
+    );
     format!(
         "bitty help — show help without spawning (local, no instance)\n\
          \n\
@@ -2889,13 +2941,13 @@ pub(crate) fn help_help_text() -> String {
          \x20 for full detail via `bitty --help -v`). `bitty help <cmd>` aliases\n\
          \x20 `bitty <cmd> --help` for one subcommand (e.g. `bitty help plugin`\n\
          \x20 == `bitty plugin --help`). Unknown names fail closed (exit 2)\n\
-         \x20 naming valid commands: {}.\n\
+         {}\n\
          \n\
          A program literally named `help` needs `bitty -- help ...` (or\n\
          \x20 `bitty run -- help ...`): bare `bitty help` never spawns.\n\
          \n\
          Version: {}\n",
-        help_valid_commands(),
+        valid_commands.trim_end_matches('\n'),
         crate::version::version_semver(),
     )
 }

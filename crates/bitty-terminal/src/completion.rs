@@ -753,8 +753,8 @@ pub fn completion_help_text(invoked_as: &str) -> String {
          \n\
          Usage: bitty {invoked_as} <shell>\n\
          \n\
-         Prints a completion script for <shell> (one of {}) to stdout. The script\n\
-         completes the full CLI grammar: first-level words, nested verbs\n\
+         Prints a completion script for <shell> (one of {}) to stdout.\n\
+         The script completes the full CLI grammar: first-level words, nested verbs\n\
          (config, ctl resources, plugin, extension, dev, inspect, list), and\n\
          per-command flags. Bash, Zsh, Fish, and PowerShell also complete local\n\
          values for `--profile`/`--profile=`, `plugin enable|disable <id>`, and\n\

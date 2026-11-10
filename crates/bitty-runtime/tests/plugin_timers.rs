@@ -205,6 +205,15 @@ fn write_full_plugin(
     std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
 }
 
+/// Rewrite a discovered plugin's `init.lua` in place.
+///
+/// The recovery fixtures change what the next activation *does* without
+/// changing the manifest, which is how a test proves that a recovery attempt
+/// actually ran (a good `init.lua` activates) or did not (it stays failed).
+fn rewrite_init(root: &Path, id: &str, init_src: &str) {
+    std::fs::write(root.join(id).join("lua/init.lua"), init_src).expect("init rewrite");
+}
+
 fn store_get(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<LuaValue> {
     rt.services(id)
         .and_then(|services| services.with_store(|store| store.get(key)))
@@ -527,6 +536,17 @@ fn a_lua_error_that_says_rc1_wall_is_never_auto_recovered() {
         "the rendered reason still carries the plugin-chosen text: {reason}"
     );
 
+    // Make the next activation succeed. Without this the fixture fails on
+    // every attempt, so `recover_wall_failed_plugins` returns 0 under both the
+    // old substring predicate and the typed one and the test cannot fail on
+    // the bug it guards. With a good `init.lua` on disk the old predicate
+    // recovers once, which the assertion below sees.
+    rewrite_init(
+        &root,
+        "bitty-featured.walltext",
+        "bitty.timers.create(100, function() end)\n",
+    );
+
     // The discriminating assertion: the same phrase in the same state, but no
     // typed wall verdict, must never auto-recover — three passes to be sure
     // the attempt budget cannot mask a one-shot.
@@ -541,6 +561,79 @@ fn a_lua_error_that_says_rc1_wall_is_never_auto_recovered() {
             "pass {attempt}: the generation must stay failed"
         );
     }
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rollback_clears_a_previous_wall_slice_class() {
+    // CTX-1788 review item 2: `rollback` kept the previous `failure_class`, so
+    // a generation that hit a real RC-1 wall and then failed a later
+    // activation on a plain Lua error stayed eligible for automatic wall
+    // recovery. The class must describe the current failure only.
+    let data = temp_dir("wall-class-reset");
+    let root = temp_dir("wall-class-reset-root");
+    let id = PluginId::new("bitty-featured.wallclass").expect("id");
+    write_capability_plugin(
+        &root,
+        "bitty-featured.wallclass",
+        &["terminal.semantic-read", "ui.rich"],
+        r#"
+        bitty.timers.create(100, function()
+          bitty.terminal.snapshot({ scope = "semantic" })
+          while true do end
+        end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([
+            ("version", LuaValue::Integer(1)),
+            ("terminal_id", LuaValue::Integer(1)),
+        ]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let deadline = rt.timer_deadline().expect("armed");
+    assert_eq!(
+        rt.pump_due_timers_at(deadline),
+        1,
+        "the wall overrun must fail the generation"
+    );
+    assert!(
+        matches!(rt.state(&id), Some(LifecycleState::Failed(_))),
+        "a real wall overrun leaves Failed"
+    );
+
+    // A later activation failure takes the plain path through `rollback`.
+    rewrite_init(
+        &root,
+        "bitty-featured.wallclass",
+        "error(\"plain lua error\")\n",
+    );
+    let err = rt.activate(&id).expect_err("plain Lua error must fail");
+    assert!(
+        !err.to_string().contains("RC-1 wall"),
+        "this failure carries no wall verdict: {err}"
+    );
+
+    // The plugin now activates cleanly, so only a stale `WallSliceTimeout`
+    // could make the recovery path select it.
+    rewrite_init(
+        &root,
+        "bitty-featured.wallclass",
+        "bitty.timers.create(100, function() end)\n",
+    );
+    assert_eq!(
+        rt.recover_wall_failed_plugins(),
+        0,
+        "a rolled-back generation must not inherit the previous wall verdict"
+    );
+    assert!(
+        matches!(rt.state(&id), Some(LifecycleState::Failed(_))),
+        "the generation stays failed"
+    );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }

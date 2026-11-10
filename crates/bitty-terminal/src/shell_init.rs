@@ -470,12 +470,25 @@ pub fn shell_init_usage() -> String {
 /// Help text for `bitty shell-init` (`--help` never needs an instance or VM).
 #[must_use]
 pub fn shell_init_help_text() -> String {
+    // The Nushell row is the longest install line: it names a 76-column command
+    // plus the follow-up sentence. Wrap it through `cli::push_wrapped_line` so
+    // the rendered help stays inside `cli::HELP_WRAP_COLUMNS` (CTX-1788 F7).
+    let mut nushell_row = String::new();
+    crate::cli::push_wrapped_line(
+        &mut nushell_row,
+        "              ",
+        &format!(
+            "  nushell:    {}  (then `source` it from config.nu)",
+            install_line(CompletionShell::Nushell)
+        ),
+    );
     format!(
         "bitty shell-init — emit shell integration (local, no instance)\n\
          \n\
          Usage: bitty shell-init <shell>\n\
          \n\
-         Prints a static shell-integration script for <shell> (one of {}) to stdout.\n\
+         Prints a static shell-integration script for <shell>\n\
+         (one of {}) to stdout.\n\
          The script inlines Tab completion for the full CLI grammar (first-level\n\
          words, nested verbs, and flags) and installs prompt hooks that report\n\
          cwd (OSC 7) plus prompt-start, command-start, and exit-status marks\n\
@@ -487,13 +500,13 @@ pub fn shell_init_help_text() -> String {
          \x20 zsh:        {}  (~/.zshrc)\n\
          \x20 fish:       {}  (config.fish)\n\
          \x20 powershell: {}  ($PROFILE)\n\
-         \x20 nushell:    {}  (then `source` it from config.nu)\n",
+         {}\n",
         shell_list(),
         install_line(CompletionShell::Bash),
         install_line(CompletionShell::Zsh),
         install_line(CompletionShell::Fish),
         install_line(CompletionShell::Powershell),
-        install_line(CompletionShell::Nushell),
+        nushell_row.trim_end_matches('\n'),
     )
 }
 

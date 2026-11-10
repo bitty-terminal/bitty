@@ -401,7 +401,7 @@ pub fn list_usage() -> String {
 #[must_use]
 pub fn list_help_text(invoked_as: &str, verbose: bool) -> String {
     let mut text = format!(
-        "bitty list — enumerate resources (local or runtime)\n\
+        "bitty {invoked_as} — enumerate resources (local or runtime)\n\
          \n\
          Usage: bitty {invoked_as} <themes|colors|fonts|plugins|instances|actions|keymaps|services>\n       \
          [--format table|json|jsonl] [--socket PATH | --instance ID] [--no-color]\n\
@@ -444,12 +444,16 @@ pub fn list_help_text(invoked_as: &str, verbose: bool) -> String {
          bitty list services --format json\n  \
          bitty ls themes --format table\n",
     );
-    text.push_str("Version: ");
-    text.push_str(env!("CARGO_PKG_VERSION"));
-    text.push('\n');
+    // The version belongs to the `-v` tier: the default body is the compact
+    // help `origin/main` printed, so `bitty list --help` keeps its shape and
+    // only `--help -v` gains the build identity (CTX-1788 review item 3).
     if verbose {
-        // One blank line separates the compact body from the contract
-        // tier, so `-v` reads as an appendix rather than a run-on.
+        // One blank line separates the compact body from the contract tier,
+        // so `-v` reads as an appendix rather than a run-on.
+        text.push('\n');
+        text.push_str("Version: ");
+        text.push_str(env!("CARGO_PKG_VERSION"));
+        text.push('\n');
         text.push('\n');
         text.push_str(LIST_HELP_CONTRACT);
     }
@@ -4689,6 +4693,34 @@ mod tests {
             );
         }
         assert!(narrow.contains("(no services)"), "empty hint: {narrow:?}");
+    }
+
+    #[test]
+    fn list_help_title_follows_the_invoked_spelling_and_hides_the_version() {
+        // CTX-1788 review item 3: the title used to hardcode `bitty list` while
+        // the usage line interpolated the spelling, so `bitty ls --help` mixed
+        // both names; the compact body also carried a `Version:` line that
+        // `origin/main` never printed.
+        let list = list_help_text("list", false);
+        let alias = list_help_text("ls", false);
+        assert!(
+            list.starts_with("bitty list — "),
+            "canonical title: {:?}",
+            list.lines().next()
+        );
+        assert!(
+            alias.starts_with("bitty ls — "),
+            "alias title must use the invoked spelling: {:?}",
+            alias.lines().next()
+        );
+        assert!(
+            !list.contains("Version:"),
+            "the default tier must not print a Version line"
+        );
+        assert!(
+            list_help_text("list", true).contains("Version: "),
+            "the -v tier carries the build identity"
+        );
     }
 
     #[test]

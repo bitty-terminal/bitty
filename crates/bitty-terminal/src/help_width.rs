@@ -5,16 +5,12 @@
 //! trailing spaces, so a 60-column source line can render 126 columns and a
 //! source-line check would pass while the terminal wraps.
 //!
-//! Every subcommand help source is listed once, in both tiers, so a new
-//! command or a new over-wide line fails here instead of shipping. This module
+//! Every subcommand in [`crate::cli::SUBCOMMANDS`] is enumerated here, in both
+//! tiers: a new command fails this gate until it has a registered source, and
+//! an over-wide line fails with its label, line number, and width. This module
 //! is test-only: it adds no runtime behavior and no production API.
 
-use crate::component::component_help_text;
-use crate::ctl::ctl_help_text;
-use crate::dev::dev_help_text;
-use crate::inspect::inspect_help_text;
-use crate::list::list_help_text;
-use crate::plugin::plugin_help_text;
+use crate::cli::{SUBCOMMANDS, help_help_text};
 
 /// Widest column count a rendered help line may occupy.
 ///
@@ -59,39 +55,162 @@ pub(crate) fn assert_help_width(label: &str, text: &str) {
     );
 }
 
-/// One help source under test: label, compact text, verbose text.
-fn sources() -> Vec<(&'static str, String, String)> {
-    vec![
-        ("ctl", ctl_help_text(false), ctl_help_text(true)),
-        ("plugin", plugin_help_text(false), plugin_help_text(true)),
-        (
-            "extension",
-            component_help_text(false),
-            component_help_text(true),
+/// One help surface under test.
+struct HelpSurface {
+    /// Canonical subcommand name, as listed in [`SUBCOMMANDS`].
+    name: &'static str,
+    /// Default (`bitty <cmd> --help`) text.
+    compact: String,
+    /// `-v` text; `Some` only for the commands that implement the F2 tier.
+    verbose: Option<String>,
+}
+
+/// Compact and `-v` help text for one canonical subcommand.
+///
+/// `None` means "no help source registered". [`sources`] turns that into a
+/// panic naming the command, so adding a subcommand to [`SUBCOMMANDS`] without
+/// registering its help fails the gate instead of silently narrowing it.
+fn help_text_for(name: &str) -> Option<(String, Option<String>)> {
+    let tiers = |compact: String, verbose: String| Some((compact, Some(verbose)));
+    let flat = |text: String| Some((text, None));
+    match name {
+        "run" => flat(crate::run::run_help_text()),
+        "ctl" => tiers(
+            crate::ctl::ctl_help_text(false),
+            crate::ctl::ctl_help_text(true),
         ),
-        (
-            "list",
-            list_help_text("list", false),
-            list_help_text("list", true),
+        "config" => flat(crate::config_cli::config_usage()),
+        "init" => flat(crate::init::init_usage()),
+        "doctor" => flat(crate::doctor::doctor_usage()),
+        "upgrade" => flat(crate::upgrade::upgrade_usage()),
+        "reload" => flat(crate::reload::reload_help_text()),
+        "list" => tiers(
+            crate::list::list_help_text("list", false),
+            crate::list::list_help_text("list", true),
         ),
-        ("dev", dev_help_text(false), dev_help_text(true)),
-        ("inspect", inspect_help_text(false), inspect_help_text(true)),
-    ]
+        "inspect" => tiers(
+            crate::inspect::inspect_help_text(false),
+            crate::inspect::inspect_help_text(true),
+        ),
+        "dev" => tiers(
+            crate::dev::dev_help_text(false),
+            crate::dev::dev_help_text(true),
+        ),
+        "plugin" => tiers(
+            crate::plugin::plugin_help_text(false),
+            crate::plugin::plugin_help_text(true),
+        ),
+        "extension" => tiers(
+            crate::component::component_help_text(false),
+            crate::component::component_help_text(true),
+        ),
+        "version" => flat(crate::version::version_help_text()),
+        "completion" => flat(crate::completion::completion_help_text("completion")),
+        "cmd" => flat(crate::cmd::cmd_help_text()),
+        // The bundled catalog, not the store-enumerating variant: the gate must
+        // not depend on the developer's installed plugins. `x.rs` has its own
+        // test for a synthetic over-long store row.
+        "x" => flat(crate::x::x_help_text()),
+        "shell-init" => flat(crate::shell_init::shell_init_help_text()),
+        "help" => flat(help_help_text()),
+        _ => None,
+    }
+}
+
+/// Every help surface, driven by the CLI's own subcommand table.
+fn sources() -> Vec<HelpSurface> {
+    SUBCOMMANDS
+        .iter()
+        .map(|(name, _aliases)| {
+            let (compact, verbose) = help_text_for(name).unwrap_or_else(|| {
+                panic!("help_width has no source for `{name}`: register it in help_text_for")
+            });
+            HelpSurface {
+                name,
+                compact,
+                verbose,
+            }
+        })
+        .collect()
 }
 
 #[test]
 fn every_help_tier_fits_the_documented_width() {
-    for (label, compact, verbose) in sources() {
-        assert_help_width(label, &compact);
-        assert_help_width(&format!("{label} -v"), &verbose);
-        // The bound must actually be exercised, not just satisfied by short
-        // text: every tier is expected to fill at least half the budget.
+    // Collect every offender before failing: one run must name every over-wide
+    // surface, not just the first, or fixing them becomes a guessing loop.
+    let mut offenders: Vec<String> = Vec::new();
+    for surface in sources() {
         assert!(
-            max_columns(&compact) > HELP_MAX_COLUMNS / 2,
-            "{label} help looks truncated: widest line is {} columns",
-            max_columns(&compact)
+            max_columns(&surface.compact) > HELP_MAX_COLUMNS / 2,
+            "{} help looks truncated: widest line is {} columns",
+            surface.name,
+            max_columns(&surface.compact)
+        );
+        for (label, text) in [
+            (surface.name.to_string(), surface.compact.as_str()),
+            (
+                format!("{} -v", surface.name),
+                surface.verbose.as_deref().unwrap_or(""),
+            ),
+        ] {
+            let over = over_wide_lines(text);
+            if !over.is_empty() {
+                offenders.push(format!(
+                    "{label} renders {} line(s) over {HELP_MAX_COLUMNS} columns: {over:?}",
+                    over.len()
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "help surfaces over {HELP_MAX_COLUMNS} columns:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn every_subcommand_has_a_help_source() {
+    // F7: the gate must cover the CLI, not a hand-picked subset. Driving
+    // `sources()` from SUBCOMMANDS is only honest if every entry resolves, so
+    // assert the enumeration is complete and one-to-one.
+    let surfaces = sources();
+    let names: Vec<&str> = surfaces.iter().map(|surface| surface.name).collect();
+    let expected: Vec<&str> = SUBCOMMANDS.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names, expected,
+        "help_width must enumerate every SUBCOMMANDS entry, in order"
+    );
+    for surface in &surfaces {
+        assert!(
+            !surface.compact.trim().is_empty(),
+            "{}: registered help source is empty",
+            surface.name
         );
     }
+}
+
+#[test]
+fn the_verbose_tier_covers_exactly_the_documented_commands() {
+    // F2 landed a `-v` tier for six commands. This pins the set so a silently
+    // dropped (or silently added) tier is visible here rather than in a diff.
+    let mut with_tier: Vec<&str> = sources()
+        .iter()
+        .filter(|surface| surface.verbose.is_some())
+        .map(|surface| surface.name)
+        .collect();
+    with_tier.sort_unstable();
+    assert_eq!(
+        with_tier,
+        ["ctl", "dev", "extension", "inspect", "list", "plugin"]
+    );
+}
+
+#[test]
+fn the_wrap_budget_matches_the_gate() {
+    // Production builders wrap to `cli::HELP_WRAP_COLUMNS`; the gate measures
+    // against its own constant. They must not drift apart.
+    assert_eq!(crate::cli::HELP_WRAP_COLUMNS, HELP_MAX_COLUMNS);
 }
 
 #[test]
@@ -116,10 +235,13 @@ fn the_width_gate_rejects_an_over_wide_line() {
 fn verbose_tier_differs_and_carries_the_contract() {
     // F2: `bitty <cmd> --help -v` must not be byte-identical to `--help`, and
     // the extra bytes must be the contract block a script author needs.
-    for (label, compact, verbose) in sources() {
+    for surface in sources().into_iter().filter(|s| s.verbose.is_some()) {
+        let label = surface.name;
+        let compact = &surface.compact;
+        let verbose = surface.verbose.as_deref().expect("filtered to Some");
         assert_ne!(compact, verbose, "{label}: -v must add the contract tier");
         assert!(
-            verbose.starts_with(&compact),
+            verbose.starts_with(compact),
             "{label}: -v must extend the compact body, not replace it"
         );
         let added = &verbose[compact.len()..];
@@ -149,19 +271,22 @@ fn each_contract_tier_states_its_own_boundary() {
         ("dev", "`dev-tools` build feature"),
         ("inspect", "Read-only by construction"),
     ];
-    for (label, compact, verbose) in sources() {
+    for surface in sources().into_iter().filter(|s| s.verbose.is_some()) {
+        let verbose = surface.verbose.as_deref().expect("filtered to Some");
         let marker = markers
             .iter()
-            .find(|(name, _)| *name == label)
+            .find(|(name, _)| *name == surface.name)
             .map(|(_, marker)| *marker)
-            .expect("every source has a marker");
+            .expect("every verbose source has a marker");
         assert!(
             verbose.contains(marker),
-            "{label}: contract tier must state {marker:?}"
+            "{}: contract tier must state {marker:?}",
+            surface.name
         );
         assert!(
-            !compact.contains(marker),
-            "{label}: {marker:?} belongs to the -v tier only"
+            !surface.compact.contains(marker),
+            "{}: {marker:?} belongs to the -v tier only",
+            surface.name
         );
     }
 }

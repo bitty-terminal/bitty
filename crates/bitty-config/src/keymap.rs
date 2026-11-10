@@ -50,9 +50,7 @@
 //!   `scroll_page_up`, `scroll_page_down`, `increase_font_size` (aliases
 //!   `zoom_in`, `font_zoom_in`), `decrease_font_size` (aliases `zoom_out`,
 //!   `font_zoom_out`), `reset_font_size` (aliases `zoom_reset`,
-//!   `font_zoom_reset`; CTX-0263 per-window font zoom), `toggle_help`
-//!   (alias `show_help`; CTX-0265 help popup, defaults `alt+`` plus the
-//!   `alt+?` shifted-symbol spellings), `open_composer` (Command Composer
+//!   `font_zoom_reset`; CTX-0263 per-window font zoom), `open_composer` (Command Composer
 //!   manual open, CTX-0227: suggested chord `alt+e`; never bound by default
 //!   so Normal Mode stays byte-identical until the user opts in; CTX-0723 /
 //!   #982: opens the live session with input routing plus PTY submit, the
@@ -108,11 +106,10 @@
 //! `focus:<n>`); those actions stay parseable and user-bindable but are
 //! no longer bound by default — workspace numbers won the Alt slot per
 //! the owner spec, panes navigate spatially (`goto_split`,
-//! `focus_next`/`focus_prev`). The CTX-0265 help popup (009 §which-key:
-//! floating overlay listing every bound shortcut, generated from the live
-//! registry) toggles on `alt+`` plus the `alt+?` shifted-symbol spellings
-//! (`alt+?`/`alt+shift+?`/`alt+shift+/`: shifted-symbol reporting varies by
-//! platform, CTX-0263 precedent). Plain `Tab`, bare arrows, letters, and digits
+//! `focus_next`/`focus_prev`). The help/which-key overlay is a first-party
+//! extension surface (`bitty-terminal.help`): it reads the live registry
+//! through `bitty.keymaps.list` and suggests its own chords, so Core binds
+//! no help chord by default. Plain `Tab`, bare arrows, letters, and digits
 //! are deliberately unbound so they reach the shell.
 //!
 //! # Shifted symbols (physical base key, issue #1446)
@@ -168,8 +165,10 @@ pub const MAX_INVOKE_COMMAND_LEN: usize = 257;
 /// (CTX-2965, issue #2965).
 ///
 /// Smaller than the CLI's [`crate::MAX_JSON_ARGS_BYTES`] on purpose: a binding
-/// lives in a config file that is re-read on every reload and rendered in the
-/// help overlay, so a binding carries a command's *identity arguments*
+/// lives in a config file that is re-read on every reload and rendered in
+/// keymap listings (the extension help overlay reads it through
+/// `bitty.keymaps.list`), so a binding carries a command's *identity
+/// arguments*
 /// (`panel`, `needle`, `path`), not a bulk document. The structural rules are
 /// the shared ones ([`crate::validate_json_args_blob`]), so this bound is a
 /// strict subset of the CLI's: any blob accepted here is accepted by
@@ -822,16 +821,6 @@ pub enum ChromeAction {
     CloseView,
     /// Toggle single-pane zoom (`toggle_zoom`, aliases `toggle_split_zoom`, `suspend_panel`, `detach_panel`).
     ToggleZoom,
-    /// Toggle the help popup (`toggle_help`, alias `show_help`).
-    ///
-    /// CTX-0265 (009 §which-key, DEC-0035 follow-through): the floating
-    /// overlay lists every bound shortcut, generated from the live
-    /// registry ([`help_rows_from_keymaps`]) — never a hardcoded copy.
-    /// Defaults are `alt+`` plus the `alt+?` shifted-symbol spellings
-    /// (`alt+?`/`alt+shift+?`/`alt+shift+/`; one action, four bindings).
-    /// Repeating the chord hides it again; `Esc` dismisses; the overlay
-    /// never touches grid truth (present-layer only).
-    ToggleHelp,
     /// Focus next pane in depth-first order.
     FocusNext,
     /// Focus previous pane in depth-first order.
@@ -1121,10 +1110,6 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::ToggleZoom)
             }
-            "toggle_help" | "show_help" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::ToggleHelp)
-            }
             "focus_next" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::FocusNext)
@@ -1296,7 +1281,6 @@ impl ChromeAction {
             Self::ResizeSplit(d) => format!("resize_split:{}", d.canonical()),
             Self::CloseView => "close_view".to_string(),
             Self::ToggleZoom => "toggle_zoom".to_string(),
-            Self::ToggleHelp => "toggle_help".to_string(),
             Self::FocusNext => "focus_next".to_string(),
             Self::FocusPrev => "focus_prev".to_string(),
             Self::FocusId(n) => format!("focus:{n}"),
@@ -1352,7 +1336,6 @@ impl ChromeAction {
             Self::ResizeSplit(_) => "Nudge the enclosing split ratio.",
             Self::CloseView => "Close the focused pane (confirm when busy).",
             Self::ToggleZoom => "Toggle single-pane zoom.",
-            Self::ToggleHelp => "Toggle the help overlay listing bound shortcuts.",
             Self::FocusNext => "Focus the next pane in depth-first order.",
             Self::FocusPrev => "Focus the previous pane in depth-first order.",
             Self::FocusId(_) => "Focus a pane by numeric view id.",
@@ -1436,7 +1419,6 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::ResizeSplit(SplitDir::Left),
         ChromeAction::CloseView,
         ChromeAction::ToggleZoom,
-        ChromeAction::ToggleHelp,
         ChromeAction::FocusNext,
         ChromeAction::FocusPrev,
         ChromeAction::FocusId(1),
@@ -1589,7 +1571,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, toggle_help, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, command:<owner:command>";
 
 /// Require a `<head>:<dir>` argument.
 fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError> {
@@ -2011,17 +1993,6 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+minus", "decrease_font_size"),
     ("ctrl+shift+minus", "decrease_font_size"),
     ("ctrl+0", "reset_font_size"),
-    // CTX-0265 help popup (009 which-key, DEC-0035 follow-through; CTX-0264
-    // left these chords unallocated): `alt+`` toggles the overlay, plus the
-    // `alt+?` shifted-symbol spellings — `?` physically carries Shift, and
-    // shifted-symbol reporting varies by platform (CTX-0263 precedent), so
-    // the plain, shifted-`?`, and shifted-`/` spellings all toggle the one
-    // action. Every entry carries the Mod slot so a Super flip rebinds the
-    // whole gesture to `super`.
-    ("alt+`", "toggle_help"),
-    ("alt+?", "toggle_help"),
-    ("alt+shift+?", "toggle_help"),
-    ("alt+shift+/", "toggle_help"),
     // W-144 (CTX-0937): the search/copy-mode policy defaults retired with
     // the Core policy (`ctrl+shift+space` entered copy mode, `ctrl+shift+f`
     // opened search). Both chords are shell input again until the plugins
@@ -2147,26 +2118,6 @@ pub fn match_keymap(maps: &[ResolvedKeymap], key: KeyRef) -> Option<ChromeAction
         }
     }
     None
-}
-
-/// Render one help-popup row per resolved binding (CTX-0265).
-///
-/// The popup content is generated FROM the live registry: each row is the
-/// entry's canonical chord plus its canonical action
-/// (`"alt+h  goto_split:left"`), in resolved-table order, so adding,
-/// removing, or rebinding a chord (including a Super flip, which re-spells
-/// every Mod chord) changes the popup by construction — there is no
-/// hardcoded copy to drift. The app regenerates these rows from its live
-/// `keymaps` table on every show. Bounded: one row per table entry (user
-/// tables cap at [`crate::types::MAX_KEYMAPS`]); a closed-catalog row caps at
-/// `MAX_CHORD_LEN + MAX_ACTION_LEN + 2` bytes, while a `command:` row carrying
-/// an args document caps at `MAX_CHORD_LEN + MAX_COMMAND_ACTION_LEN + 2`
-/// (~4.4 KiB), so a full 256-row overlay worst-cases at ~1.1 MiB.
-#[must_use]
-pub fn help_rows_from_keymaps(maps: &[ResolvedKeymap]) -> Vec<String> {
-    maps.iter()
-        .map(|m| format!("{}  {}", m.chord.canonical(), m.action.canonical()))
-        .collect()
 }
 
 /// Semantic validation for [`KeymapEntry`]: context, chord, and action must
@@ -3889,16 +3840,16 @@ mod tests {
         // Mod-aware resize) = 59, plus CTX-0263's 7 mod-independent font-zoom
         // chords = 66, plus CTX-0259's 9 Mod+Shift+Number move chords
         // (shift+alt+1..=9) = 75, plus CTX-0945's 9 swap chords
-        // (ctrl+shift+alt+1..=9) = 84, plus CTX-0265's 4 help chords
-        // (alt+backtick + 3 alt+? shifted-symbol spellings) = 88 total
-        // (W-144 retired the CTX-0384 copy-mode chord and the CTX-0383
-        // search chord), plus CTX-0766's 1 new workspace chord (alt+t;
-        // alt+n becomes new-panel) = 89 total, plus issue #1444's 1
-        // close-view chord (alt+d) = 90 total, plus CTX-0952's 3 prompt
-        // chords (shift+alt+pageup/pagedown + alt+o) = 93 total,
-        // plus CTX-0962's 1 floating-toggle chord (alt+a) = 94 total,
-        // plus issue #1776's 1 close-view chord (alt+q) = 95 total,
-        // plus CTX-1100's 2 occupied-cycle chords (alt+[/]) = 97 total,
+        // (ctrl+shift+alt+1..=9) = 84 total (W-144 retired the CTX-0384
+        // copy-mode chord and the CTX-0383 search chord; issue #2397
+        // retired CTX-0265's 4 help chords to the `bitty-terminal.help`
+        // extension), plus CTX-0766's 1 new workspace chord (alt+t;
+        // alt+n becomes new-panel) = 85 total, plus issue #1444's 1
+        // close-view chord (alt+d) = 86 total, plus CTX-0952's 3 prompt
+        // chords (shift+alt+pageup/pagedown + alt+o) = 89 total,
+        // plus CTX-0962's 1 floating-toggle chord (alt+a) = 90 total,
+        // plus issue #1776's 1 close-view chord (alt+q) = 91 total,
+        // plus CTX-1100's 2 occupied-cycle chords (alt+[/]) = 93 total,
         // and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
@@ -3906,8 +3857,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                97,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 4 help chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle (W-144 retired copy-mode + search)"
+                93,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle (W-144 retired copy-mode + search; issue #2397 retired the 4 Core help chords)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -4734,11 +4685,12 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // The default count is 95 under Alt mod (35 shipped + 4 workspace
-        // + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 4 help
+        // The default count is 93 under Alt mod (35 shipped + 4 workspace
+        // + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom
         // + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt
-        // + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view; W-144 retired the copy-mode and
-        // search chords).
+        // + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view
+        // + 2 CTX-1100 occupied-cycle; W-144 retired the copy-mode and
+        // search chords, issue #2397 retired the 4 Core help chords).
         // Under Super mod, alt+d becomes super+d, alt+q becomes super+q (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
@@ -4767,14 +4719,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                97,
-                "no new shipped defaults under mod {:?} (90 + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle)",
+                93,
+                "no new shipped defaults under mod {:?} (35 shipped + 4 workspace + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                97 + entries.len(),
+                93 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -4927,75 +4879,48 @@ mod tests {
     }
 
     #[test]
-    fn toggle_help_action_parses_and_canonicalizes() {
-        // CTX-0265: `toggle_help` (alias `show_help`) is a first-class
-        // chrome action; the canonical spelling is the long name so merge
-        // identity and popup rows stay stable.
-        assert_eq!(
-            ChromeAction::parse("toggle_help").expect("parses"),
-            ChromeAction::ToggleHelp
-        );
-        assert_eq!(
-            ChromeAction::parse("SHOW_HELP").expect("alias parses"),
-            ChromeAction::ToggleHelp
-        );
-        assert_eq!(
-            ChromeAction::ToggleHelp.canonical(),
-            "toggle_help".to_string()
+    fn toggle_help_action_and_its_default_chords_are_retired() {
+        // ADR-0014 / issue #2397: the help/which-key overlay is a
+        // presentation extension (`bitty-terminal.help`), so Core keeps no
+        // `toggle_help` action and binds none of its historical chords. The
+        // plugin suggests the same four chords; Core's registry read
+        // (`bitty.keymaps.list`) is the mechanism it reads.
+        assert!(ChromeAction::parse("toggle_help").is_err());
+        assert!(ChromeAction::parse("show_help").is_err());
+        assert!(
+            !KNOWN_ACTIONS_HINT.contains("toggle_help"),
+            "fail-closed hint must not name the retired action"
         );
         assert!(
-            KNOWN_ACTIONS_HINT.contains("toggle_help"),
-            "fail-closed hint must name the action"
+            !all_chrome_actions()
+                .iter()
+                .any(|action| action.canonical() == "toggle_help"),
+            "the action catalog must not carry a retired action"
         );
-    }
-
-    #[test]
-    fn help_chords_resolve_to_toggle_help_both_mods() {
-        // CTX-0265: Mod+backtick plus the Mod+? shifted-symbol spellings
-        // toggle the help popup under both Alt and Super. `?` physically
-        // carries Shift and shifted-symbol reporting varies by platform
-        // (CTX-0263 precedent), so the plain, shifted-`?`, and shifted-`/`
-        // spellings all bind the one action; the Super flip re-spells every
-        // entry through the Mod slot.
-        let alt_maps = default_keymaps_with_mod(ModKey::Alt).expect("alt defaults valid");
-        for chord in ["alt+`", "alt+?", "alt+shift+?", "alt+shift+/"] {
-            let parsed = Chord::parse(chord).expect("help chord parses");
-            let keyref = KeyRef {
-                key: parsed.key,
-                ctrl: parsed.ctrl,
-                alt: parsed.alt,
-                shift: parsed.shift,
-                super_held: parsed.super_held,
+        for mod_key in [ModKey::Alt, ModKey::Super] {
+            let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
+            let prefix = if mod_key == ModKey::Alt {
+                "alt+"
+            } else {
+                "super+"
             };
-            assert_eq!(
-                match_keymap(&alt_maps, keyref),
-                Some(ChromeAction::ToggleHelp),
-                "chord {chord:?}"
-            );
+            for suffix in ["`", "?", "shift+?", "shift+/"] {
+                let chord = format!("{prefix}{suffix}");
+                let parsed = Chord::parse(&chord).expect("chord parses");
+                let keyref = KeyRef {
+                    key: parsed.key,
+                    ctrl: parsed.ctrl,
+                    alt: parsed.alt,
+                    shift: parsed.shift,
+                    super_held: parsed.super_held,
+                };
+                assert_eq!(
+                    match_keymap(&maps, keyref),
+                    None,
+                    "retired help chord {chord:?} must fall through to the shell"
+                );
+            }
         }
-        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super defaults valid");
-        for chord in ["super+`", "super+?", "super+shift+?", "super+shift+/"] {
-            let parsed = Chord::parse(chord).expect("flipped chord parses");
-            let keyref = KeyRef {
-                key: parsed.key,
-                ctrl: parsed.ctrl,
-                alt: parsed.alt,
-                shift: parsed.shift,
-                super_held: parsed.super_held,
-            };
-            assert_eq!(
-                match_keymap(&super_maps, keyref),
-                Some(ChromeAction::ToggleHelp),
-                "chord {chord:?}"
-            );
-        }
-        // The old Alt spellings are unbound under Super (back to the shell),
-        // exactly like every other Mod chord.
-        assert_eq!(
-            match_keymap(&super_maps, key_ref(KeyName::Char('`'), false, true, false)),
-            None,
-            "alt+` unbound under super mod"
-        );
     }
 
     #[test]
@@ -5025,60 +4950,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn help_rows_derive_from_live_registry() {
-        // CTX-0265 registry-generated content proof: rows render the live
-        // resolved table (canonical chord + canonical action, table order),
-        // so adding a chord appears in the popup with no second source.
-        let maps = default_keymaps().expect("defaults valid");
-        let rows = help_rows_from_keymaps(&maps);
-        assert_eq!(rows.len(), maps.len(), "one row per binding");
-        assert!(
-            rows.iter().any(|r| r == "alt+h  goto_split:left"),
-            "navigate row present: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r == "alt+`  toggle_help"),
-            "backtick help row present: {rows:?}"
-        );
-        // Adding a chord to the registry adds a popup row by construction.
-        let extended = EffectiveConfig {
-            keymaps: vec![KeymapEntry {
-                chord: "alt+e".into(),
-                action: "open_composer".into(),
-                context: "global".into(),
-            }],
-            ..Default::default()
-        };
-        let maps2 = resolve_keymaps(&extended).expect("resolves");
-        let rows2 = help_rows_from_keymaps(&maps2);
-        assert_eq!(rows2.len(), maps2.len());
-        assert!(
-            rows2.iter().any(|r| r == "alt+e  open_composer"),
-            "added chord listed: {rows2:?}"
-        );
-        // Super flip re-spells every Mod row (popup stays in sync with what
-        // is actually bound).
-        let flipped = EffectiveConfig {
-            mod_key: ModKey::Super,
-            ..Default::default()
-        };
-        let maps3 = resolve_keymaps(&flipped).expect("resolves");
-        let rows3 = help_rows_from_keymaps(&maps3);
-        assert!(
-            rows3.iter().any(|r| r == "super+`  toggle_help"),
-            "super spelling listed: {rows3:?}"
-        );
-        assert!(
-            rows3.iter().any(|r| r == "shift+super+?  toggle_help"),
-            "super ? spelling listed: {rows3:?}"
-        );
-        assert!(
-            !rows3.iter().any(|r| r.starts_with("alt+")),
-            "no Alt spellings survive the flip: {rows3:?}"
-        );
     }
 
     // -- CTX-0715 / OQ-088 Leader key contract ---------------------------
@@ -5661,7 +5532,7 @@ mod tests {
             keymaps: vec![
                 KeymapEntry {
                     chord: "alt+q".into(),
-                    action: "toggle_help".into(),
+                    action: "toggle_zoom".into(),
                     context: "global".into(),
                 },
                 KeymapEntry {
@@ -5675,7 +5546,7 @@ mod tests {
         let custom_maps = resolve_keymaps(&user_cfg).expect("resolves custom keymaps");
         assert_eq!(
             match_keymap(&custom_maps, q_alt),
-            Some(ChromeAction::ToggleHelp),
+            Some(ChromeAction::ToggleZoom),
             "user rebind of alt+q overrides default CloseView"
         );
         assert_eq!(

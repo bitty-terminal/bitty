@@ -364,16 +364,6 @@ pub const PENDING_PASTE_BANNER_BG: Rgba8 = [0x5A, 0x4A, 0x00, 0xFF];
 /// Bitty Dark reference text for [`PENDING_PASTE_BANNER_BG`]; production uses
 /// [`banner_text_in`] (contrast-derived black/white).
 pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
-/// Bitty Dark reference background for the help popup (CTX-0265); production
-/// uses [`help_panel_bg_in`] (theme selection ground).
-pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
-/// Historical Bitty Dark reference accent for the help popup ring (CTX-0265);
-/// production uses [`help_panel_border_in`], which now resolves the theme's
-/// muted idle outline (CTX-1477) instead of this fixed accent.
-pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
-/// Bitty Dark reference text for [`HELP_PANEL_BG`]; production uses
-/// [`help_panel_fg_in`] (theme foreground).
-pub const HELP_PANEL_FG: Rgba8 = [0xCD, 0xD6, 0xF4, 0xFF];
 /// Foreground alpha substituted for faint (`SGR 2`) text.
 pub const FAINT_ALPHA: u8 = 0x7F;
 
@@ -384,15 +374,6 @@ pub const FAINT_ALPHA: u8 = 0x7F;
 /// OSC 4 override. Text stays readable through
 /// [`readable_foreground_on`] instead of a second hardcoded role.
 pub const BANNER_ANSI_INDEX: u8 = 3;
-
-/// Legacy ANSI index used by the diagnostic accent probe
-/// ([`bitty_config::theme::help_ring_source`]).
-///
-/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue), but
-/// production help/chrome borders now use the theme outline pair
-/// (`border.idle` / `border.focused`, CTX-1477); this constant is retained for
-/// the contrast report's accent-family probe.
-pub const HELP_PANEL_ACCENT_ANSI_INDEX: u8 = 12;
 
 /// WCAG relative luminance of an sRGB triplet (0.0..=1.0).
 ///
@@ -445,16 +426,6 @@ pub fn banner_text_in(palette: &ThemePalette) -> Rgba8 {
     readable_foreground_on(rgb)
 }
 
-/// Theme-aware help-panel background (CTX-1395): the theme selection ground.
-///
-/// The selection pair is the one surface the theme guarantees legible with the
-/// default foreground, so a floating help panel reuses it instead of a
-/// hardcoded indigo.
-#[must_use]
-pub const fn help_panel_bg_in(palette: &ThemePalette) -> Rgba8 {
-    palette.selection
-}
-
 /// Theme-aware chrome border (CTX-1477, issue #2468): the accepted idle
 /// outline token.
 ///
@@ -472,21 +443,6 @@ pub const fn chrome_border_in(palette: &ThemePalette) -> Rgba8 {
 #[must_use]
 pub const fn chrome_focus_border_in(palette: &ThemePalette) -> Rgba8 {
     palette.border_focused
-}
-
-/// Theme-aware help-panel ring (CTX-1395, CTX-1477): the muted chrome border.
-///
-/// Retained as a named helper for the help panel; it now resolves through
-/// [`chrome_border_in`] so every Core overlay shares one border token.
-#[must_use]
-pub const fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
-    chrome_border_in(palette)
-}
-
-/// Theme-aware help-panel text (CTX-1395): the default foreground.
-#[must_use]
-pub const fn help_panel_fg_in(palette: &ThemePalette) -> Rgba8 {
-    palette.foreground
 }
 
 /// Theme-aware IME preedit ground (CTX-1395): the selection fill.

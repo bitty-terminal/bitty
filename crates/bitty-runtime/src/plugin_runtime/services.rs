@@ -13297,6 +13297,55 @@ mod history_tests {
     }
 
     #[test]
+    fn keymaps_list_serves_the_complete_default_registry_in_table_order() {
+        // ADR-0014 / issue #2397: Core retires the drawn help panel, so the
+        // registry read is the only remaining contract the `bitty-terminal.help`
+        // extension consumes. `bitty.keymaps.list` must still expose every
+        // shipped binding, in resolved-table order, with canonical
+        // chord/action spellings — exactly the data the plugin renders into
+        // its overlay scene.
+        let defaults = bitty_config::keymap::default_keymaps().expect("defaults valid");
+        let (services, source) = keymap_services(true);
+        *source.0.borrow_mut() = defaults.clone();
+
+        let page = services
+            .keymaps_list(&KeymapQuery::new(0, 256).expect("query"))
+            .expect("list");
+        assert_eq!(page.total, defaults.len(), "every binding is addressable");
+        assert_eq!(
+            page.entries.len(),
+            defaults.len(),
+            "one row per binding, none dropped"
+        );
+        assert!(!page.truncated, "the default table fits one page");
+        assert!(page.fits_budget());
+        for (row, map) in page.entries.iter().zip(defaults.iter()) {
+            assert_eq!(
+                row.chord,
+                map.chord.canonical(),
+                "rows keep resolved-table order"
+            );
+            assert_eq!(row.action, map.action.canonical(), "canonical action");
+        }
+
+        // The retired Core help action is absent from the registry, and its
+        // historical chords are free for the plugin to suggest.
+        assert!(
+            !page
+                .entries
+                .iter()
+                .any(|row| row.action == "toggle_help" || row.action == "show_help"),
+            "no Core help action survives in the live registry"
+        );
+        for chord in ["alt+`", "alt+?", "alt+shift+?", "alt+shift+/"] {
+            assert!(
+                !page.entries.iter().any(|row| row.chord == chord),
+                "retired help chord {chord:?} must not be Core-bound"
+            );
+        }
+    }
+
+    #[test]
     fn keymaps_list_keeps_an_argument_carrying_command_row() {
         // Issue #2965 review: `keymap_row` feeds the canonical action — which
         // now contains `" -- <json>"` — into `KeymapRow::new`. A rule that

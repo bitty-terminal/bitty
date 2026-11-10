@@ -2264,16 +2264,15 @@ fn renderer_resolves_cells_from_selected_palette() {
     assert_ne!(green.glyphs[0].color, [0xA6, 0xE3, 0xA1, 0xFF]);
 }
 
-/// CTX-1395 (issue #2333): the banner, help, and IME chrome helpers all read
-/// the resolved palette instead of fixed Bitty Dark constants.
-/// CTX-1477 (issue #2468): the help ring now uses the muted idle outline and
-/// the focused chrome border uses the theme's focused outline pair.
+/// CTX-1395 (issue #2333): the banner and IME chrome helpers read the resolved
+/// palette instead of fixed Bitty Dark constants.
+/// CTX-1477 (issue #2468): the focused chrome border uses the theme's focused
+/// outline pair.
 #[test]
 fn chrome_accents_follow_the_resolved_palette() {
     use super::{
         ThemePalette, banner_fill_in, banner_text_in, chrome_border_in, chrome_focus_border_in,
-        help_panel_bg_in, help_panel_border_in, help_panel_fg_in, ime_preedit_bg_in,
-        ime_preedit_underline_in, readable_foreground_on,
+        ime_preedit_bg_in, ime_preedit_underline_in, readable_foreground_on,
     };
 
     let dark = ThemePalette::bitty_dark();
@@ -2292,21 +2291,17 @@ fn chrome_accents_follow_the_resolved_palette() {
     assert_ne!(banner_fill_in(&dark), banner_fill_in(&light));
     assert_eq!(banner_text_in(&dark), readable_foreground_on(dark_banner));
 
-    assert_eq!(help_panel_bg_in(&dark), dark.selection);
-    assert_eq!(help_panel_bg_in(&light), light.selection);
-    assert_eq!(help_panel_fg_in(&dark), dark.foreground);
     assert_eq!(
-        help_panel_border_in(&dark),
+        chrome_border_in(&dark),
         [0x59, 0x59, 0x59, 0xAA],
-        "help uses the muted idle outline"
+        "idle chrome uses the muted idle outline"
     );
-    assert_eq!(help_panel_border_in(&dark), chrome_border_in(&dark));
     assert_eq!(
         chrome_focus_border_in(&dark),
         [0x33, 0xCC, 0xFF, 0xFF],
         "focused chrome uses the accepted focused outline"
     );
-    assert_ne!(help_panel_border_in(&dark), help_panel_border_in(&light));
+    assert_ne!(chrome_border_in(&dark), chrome_border_in(&light));
 
     // CTX-1477: every preset's chrome border pair stays theme-owned and the
     // focused tone differs from the idle tone.

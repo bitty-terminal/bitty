@@ -2445,20 +2445,6 @@ impl TerminalApp {
                     }
                 }
             }
-            A::ToggleHelp => {
-                // CTX-0265 which-key help popup: rows regenerate from the
-                // live keymap table on EVERY show, so the overlay lists
-                // exactly what is bound (user rebinds, added chords, and
-                // the Super-flip spelling included) — never a hardcoded
-                // copy. Repeating the chord hides it again; `Esc`
-                // dismisses through the runtime key path; the overlay is
-                // present-layer only (never grid truth).
-                let rows = bitty_config::keymap::help_rows_from_keymaps(&self.chrome.keymaps);
-                let bindings = rows.len();
-                self.runtime.set_help_rows(rows);
-                let visible = self.runtime.toggle_help();
-                eprintln!("bitty: keymap toggle_help -> visible={visible} bindings={bindings}");
-            }
             A::IncreaseFontSize => {
                 // CTX-0263 per-window font zoom: mutates only this window's
                 // live `RuntimeConfig.font_size` (never the config file),
@@ -7838,7 +7824,7 @@ claims = []
         // No capturing modal: every bound action passes, and a pending paste
         // banner alone never captures (issue #1336).
         for action in [
-            A::ToggleHelp,
+            A::ToggleZoom,
             A::PasteFromClipboard,
             A::PasteFromPrimary,
             A::CloseView,
@@ -7854,7 +7840,7 @@ claims = []
         }
         // A capturing close arm swallows an unrelated bound action...
         assert!(!action_passes_modal_gate(
-            &A::ToggleHelp,
+            &A::ToggleZoom,
             false,
             false,
             true,
@@ -7917,7 +7903,7 @@ claims = []
         ));
         // The panel modal captures every non-confirm action.
         assert!(!action_passes_modal_gate(
-            &A::ToggleHelp,
+            &A::ToggleZoom,
             false,
             false,
             false,
@@ -8373,7 +8359,7 @@ claims = []
     // CTX-0265 which-key help popup: toggle gestures, registry rows, Esc.
     // -------------------------------------------------------------------
 
-    fn help_test_app(maps: Vec<bitty_config::ResolvedKeymap>) -> TerminalApp {
+    fn app_with_keymaps(maps: Vec<bitty_config::ResolvedKeymap>) -> TerminalApp {
         let rt = Runtime::with_defaults().expect("must build");
         TerminalApp::with_theme(
             rt,
@@ -8412,54 +8398,42 @@ claims = []
     }
 
     #[test]
-    fn help_toggle_action_shows_live_registry_rows() {
-        // `toggle_help` regenerates rows from the live table on every
-        // show: the default navigate row and the backtick row are listed,
-        // and repeating the action hides the popup again.
+    fn retired_help_chord_reaches_the_shell_instead_of_painting() {
+        // Issue #2397 (ADR-0014): the help/which-key panel is painted by the
+        // `bitty-terminal.help` extension, so Core binds none of the
+        // historical help chords and keeps no paint path. Through the real
+        // intercept the chord is therefore not consumed: the byte encodes for
+        // the PTY like any other unbound key.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
-        assert!(!app.runtime.help_visible());
-        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
-        assert!(app.runtime.help_visible());
-        let rows = app.runtime.help_rows();
+        let mut app = app_with_keymaps(maps);
+        assert!(!drive_chrome(&mut app, alt_mods()));
         assert!(
-            rows.iter().any(|r| r == "alt+h  goto_split:left"),
-            "navigate row listed: {rows:?}"
+            !drive_chrome(&mut app, char_press("`", "`", false)),
+            "Mod+backtick must not be a Core-bound chord"
         );
+        let bytes = app.runtime.drain_pending_input();
         assert!(
-            rows.iter().any(|r| r == "alt+`  toggle_help"),
-            "backtick row listed: {rows:?}"
+            bytes.ends_with(b"`"),
+            "the retired chord's byte reaches the shell (meta-prefixed): {bytes:?}"
         );
-        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
-        assert!(!app.runtime.help_visible(), "same chord dismisses");
-    }
+        assert!(!drive_chrome(&mut app, char_release("`")));
+        assert!(!drive_chrome(&mut app, no_mods()));
 
-    #[test]
-    fn help_popup_lists_added_chord_by_construction() {
-        // Registry-generated content proof through the app path: a user
-        // chord appended to the live table appears in the popup with no
-        // second source.
-        let effective = bitty_config::EffectiveConfig {
-            keymaps: vec![bitty_config::KeymapEntry {
-                chord: "alt+e".into(),
-                action: "open_composer".into(),
-                context: "global".into(),
-            }],
-            ..Default::default()
-        };
-        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
-        let mut app = help_test_app(maps);
-        app.apply_chrome_action(bitty_config::ChromeAction::ToggleHelp);
-        assert!(app.runtime.help_visible());
+        // The same holds for the shifted `?` spellings that used to toggle
+        // the popup: no Core action claims them.
+        assert!(!drive_chrome(&mut app, alt_shift_mods()));
         assert!(
-            app.runtime
-                .help_rows()
-                .iter()
-                .any(|r| r == "alt+e  open_composer"),
-            "added chord listed: {:?}",
-            app.runtime.help_rows()
+            !drive_chrome(&mut app, char_press("?", "?", false)),
+            "Mod+? must not be a Core-bound chord"
         );
+        let bytes = app.runtime.drain_pending_input();
+        assert!(
+            bytes.ends_with(b"?"),
+            "the retired chord's byte reaches the shell (meta-prefixed): {bytes:?}"
+        );
+        assert!(!drive_chrome(&mut app, char_release("?")));
+        assert!(!drive_chrome(&mut app, no_mods()));
     }
 
     #[test]
@@ -8486,17 +8460,15 @@ claims = []
             None,
             "unbound Alt+E must fall through to the PTY"
         );
-        // Bound: retired — no Core session opens; layout/focus/help untouched.
-        let mut app = help_test_app(maps);
+        // Bound: retired — no Core session opens; layout/focus untouched.
+        let mut app = app_with_keymaps(maps);
         let leafs = app.runtime.leaf_count();
         let leaves = app.runtime.layout().leaf_ids();
         let focused = app.runtime.focused_view();
-        let help = app.runtime.help_visible();
         app.apply_chrome_action(ChromeAction::OpenComposer);
         assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
         assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
         assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
-        assert_eq!(app.runtime.help_visible(), help, "help unchanged");
     }
 
     #[test]
@@ -8508,7 +8480,7 @@ claims = []
         use bitty_config::ChromeAction;
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         assert_eq!(
             app.composer_owner(),
             ComposerOwner::RetainedCore(RetainedReason::NoPluginRuntime)
@@ -8526,7 +8498,7 @@ claims = []
         use bitty_config::ChromeAction;
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_safe_mode(true);
+        let mut app = app_with_keymaps(maps).with_safe_mode(true);
         assert_eq!(
             app.composer_owner(),
             ComposerOwner::RetainedCore(RetainedReason::SafeMode)
@@ -8542,7 +8514,7 @@ claims = []
         use crate::composer_owner::COMPOSER_COMMAND_OPEN;
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         let error = app
             .dispatch_composer_command(COMPOSER_COMMAND_OPEN)
             .expect_err("no owner must fail");
@@ -8582,7 +8554,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
         // The plugin path answers the open verb; no Core session exists to
         // shadow while the plugin owns UX.
@@ -8601,7 +8573,7 @@ claims = []
         // session).
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut safe_app = help_test_app(maps).with_safe_mode(true);
+        let mut safe_app = app_with_keymaps(maps).with_safe_mode(true);
         assert_eq!(
             safe_app.composer_owner(),
             ComposerOwner::RetainedCore(RetainedReason::SafeMode)
@@ -8637,7 +8609,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
         app.apply_chrome_action(ChromeAction::OpenComposer);
         assert!(
@@ -8698,7 +8670,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // Application entry: the empty-args command serves its string.
         let result = app
             .invoke_plugin_command(
@@ -8785,7 +8757,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // Issue #2336: activation itself queues no notifications, and the
         // keybinding command below must stay in-grid only.
         assert!(
@@ -8899,7 +8871,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // Pre-condition (the issue's repro): an argument-free invocation of a
         // command that requires `needle` is refused by the args schema, so the
         // test below cannot pass on the old empty-object behavior.
@@ -9010,7 +8982,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // Config accepts the document: the gate is not a JSON parser.
         let action = ChromeAction::parse(r#"command:bitty-featured.bare:run -- {"a":}"#)
             .expect("structurally valid document");
@@ -9058,7 +9030,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // `CommandInvocation::with_args` refuses an unbalanced document...
         assert!(CommandInvocation::with_args(OWNER.to_string() + ":search", "{bad").is_err());
         // ...and an invocation built before that gate existed (or by a future
@@ -9178,7 +9150,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('k'),
             ctrl: true,
@@ -9236,7 +9208,7 @@ claims = []
             ..Default::default()
         };
         let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
-        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('k'),
             ctrl: true,
@@ -9266,12 +9238,13 @@ claims = []
     }
 
     #[test]
-    fn plugin_suggestion_never_shadows_a_shipped_default() {
-        // Issue #2407 acceptance: the historical case is a help plugin
-        // suggesting the old `toggle_help` chord while Core still ships the
-        // default. The shipped default is part of the user table, so it owns
-        // the chord and the suggestion only becomes live once the default is
-        // retired (stage 6) or the user rebinds it.
+    fn retired_help_chord_is_owned_by_the_plugin_suggestion() {
+        // Issue #2407 acceptance, completed by issue #2397 (ADR-0014): the
+        // historical case is a help plugin suggesting the old `toggle_help`
+        // chord. Core used to ship that default (the shipped default owned the
+        // chord and the suggestion stayed dormant); with the paint retired the
+        // chord is free, so the plugin suggestion is what dispatches it —
+        // through the same host-mediated command path, never a Core action.
         use crate::chrome_keys::DispatchPriority;
         use crate::composer_owner::fixture;
         use bitty_config::{ChromeAction, KeyName, KeyRef};
@@ -9286,7 +9259,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('?'),
             ctrl: false,
@@ -9295,14 +9268,19 @@ claims = []
             super_held: false,
         };
         let matched = bitty_config::match_keymap(&app.chrome.keymaps, chord);
-        assert_eq!(matched, Some(ChromeAction::ToggleHelp));
+        assert_eq!(matched, None, "Core binds no help chord any more");
         let (priority, action) = app.resolve_dispatch(chord, matched);
         assert_eq!(
             priority,
-            DispatchPriority::User,
-            "a shipped default always wins over a plugin suggestion"
+            DispatchPriority::Plugin,
+            "the plugin suggestion owns the retired chord"
         );
-        assert_eq!(action, Some(ChromeAction::ToggleHelp));
+        assert_eq!(
+            action,
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string().into()
+            ))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -9327,7 +9305,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let app = help_test_app(maps)
+        let app = app_with_keymaps(maps)
             .with_plugin_runtime(Some(plugin_runtime))
             .with_mod_key(ModKey::Super);
         let alt_question = KeyRef {
@@ -9393,7 +9371,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let key = |c: char| KeyRef {
             key: KeyName::Char(c),
             ctrl: true,
@@ -9446,7 +9424,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         // Only the valid row published.
         let directory = app
             .plugin_runtime
@@ -9521,7 +9499,7 @@ claims = []
         let (plugin_runtime, pid) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('k'),
             ctrl: true,
@@ -9600,7 +9578,7 @@ claims = []
         use bitty_config::{KeyName, KeyRef};
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let app = help_test_app(maps);
+        let app = app_with_keymaps(maps);
         let chord = KeyRef {
             key: KeyName::Char('k'),
             ctrl: true,
@@ -9645,7 +9623,7 @@ claims = []
         }
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('g'),
             ctrl: true,
@@ -9721,7 +9699,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('k'),
             ctrl: true,
@@ -9786,7 +9764,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let leafs = app.runtime.leaf_count();
         let leaves = app.runtime.layout().leaf_ids();
         let focused = app.runtime.focused_view();
@@ -9865,7 +9843,7 @@ claims = []
             ..Default::default()
         };
         let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         assert!(!app.overlay_capture_active(), "no capture before the chord");
         assert!(!drive_chrome(&mut app, mods_event(true, true)));
         assert!(
@@ -9948,7 +9926,7 @@ claims = []
             ..Default::default()
         };
         let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
         assert!(!app.overlay_capture_active(), "no capture before the chord");
         assert!(!drive_chrome(&mut app, alt_mods()));
@@ -9999,7 +9977,7 @@ claims = []
         plugin_runtime.activate(&id).expect("activate");
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         assert_eq!(app.composer_owner(), ComposerOwner::Plugin);
         // Dispatch-error fallback latches (retired, no session).
         app.apply_chrome_action(ChromeAction::OpenComposer);
@@ -10065,7 +10043,7 @@ claims = []
         use bitty_config::ChromeAction;
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         app.apply_chrome_action(ChromeAction::FoldToggle);
         assert_eq!(app.runtime.cw_latest_command_id(), None);
         mark_test_command(&mut app);
@@ -10085,7 +10063,7 @@ claims = []
         // `z` + `a` dispatches the fold toggle, and no PTY byte leaks.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         mark_test_command(&mut app);
         let latest = app.runtime.cw_latest_command_id().expect("marked");
         set_leader_mods(&mut app, true);
@@ -10124,7 +10102,7 @@ claims = []
         // and no hint session ever owns follow-up keys.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps).with_hints_enabled(false);
+        let mut app = app_with_keymaps(maps).with_hints_enabled(false);
         mark_test_command(&mut app);
         set_leader_mods(&mut app, true);
         let space = test_key(LogicalKey::Named(NamedKey::Space));
@@ -10154,7 +10132,7 @@ claims = []
         // expired Leader window fail-opens the press to normal routing.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         mark_test_command(&mut app);
         set_leader_mods(&mut app, true);
         assert!(drive_chrome(
@@ -10196,7 +10174,7 @@ claims = []
         use bitty_config::ChromeAction;
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         app.apply_chrome_action(ChromeAction::OpenComposer);
         let text_key = |s: &str| KeyEvent {
             logical_key: LogicalKey::Character(s.to_string()),
@@ -10247,101 +10225,14 @@ claims = []
         );
         // Bound without a plugin runtime fails closed: diagnostic only,
         // no runtime mutation, no overlay, no routing change.
-        let mut app = help_test_app(maps);
+        let mut app = app_with_keymaps(maps);
         let leafs = app.runtime.leaf_count();
         let leaves = app.runtime.layout().leaf_ids();
         let focused = app.runtime.focused_view();
-        let help = app.runtime.help_visible();
         app.apply_chrome_action(ChromeAction::TogglePalette);
         assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
         assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
         assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
-        assert_eq!(app.runtime.help_visible(), help, "help unchanged");
-    }
-
-    #[test]
-    fn help_toggle_gestures_drive_intercept_and_esc_dismisses() {
-        // End-to-end through the real intercept: Mod+backtick shows,
-        // `Esc` (unbound, routed to `Runtime`) dismisses and still delivers
-        // the Esc to the PTY (the popup is informational, CTX-0475), and the
-        // same chord re-arms afterwards.
-        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
-            .expect("defaults");
-        let mut app = help_test_app(maps);
-        assert!(!drive_chrome(&mut app, alt_mods()));
-        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
-        assert!(app.runtime.help_visible(), "Mod+backtick shows");
-        assert!(!drive_chrome(&mut app, char_release("`")));
-        // Release the Mod before dismissing (physical truth).
-        assert!(!drive_chrome(&mut app, no_mods()));
-        assert!(!drive_chrome(&mut app, named_press(NamedKey::Escape)));
-        assert!(!app.runtime.help_visible(), "Esc dismisses");
-        assert_eq!(
-            app.runtime.drain_pending_input(),
-            b"\x1b",
-            "CTX-0475: informational dismissal still delivers Esc to the PTY"
-        );
-        // Same-chord toggle still works after an Esc dismissal.
-        assert!(!drive_chrome(&mut app, alt_mods()));
-        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
-        assert!(app.runtime.help_visible(), "re-arms after Esc");
-        assert!(!drive_chrome(&mut app, char_release("`")));
-        assert!(!drive_chrome(&mut app, no_mods()));
-    }
-
-    #[test]
-    fn help_question_gesture_matches_physical_shift() {
-        // `?` physically carries Shift (winit reports `?` with shift
-        // held): the `alt+shift+?` registry spelling matches that press
-        // exactly and toggles the popup.
-        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
-            .expect("defaults");
-        let mut app = help_test_app(maps);
-        assert!(!drive_chrome(&mut app, alt_shift_mods()));
-        assert!(drive_chrome(&mut app, char_press("?", "?", false)));
-        assert!(app.runtime.help_visible(), "Mod+? shows");
-        assert!(
-            app.runtime
-                .help_rows()
-                .iter()
-                .any(|r| r == "alt+shift+?  toggle_help"),
-            "physical spelling listed: {:?}",
-            app.runtime.help_rows()
-        );
-        assert!(!drive_chrome(&mut app, char_release("?")));
-    }
-
-    #[test]
-    fn help_super_flip_spelling_toggles_and_lists() {
-        // Super flip re-spells the whole gesture: Super+backtick toggles
-        // and the popup lists the Super spellings (never stale Alt).
-        use bitty_config::ModKey;
-        let effective = bitty_config::EffectiveConfig {
-            mod_key: ModKey::Super,
-            ..Default::default()
-        };
-        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
-        let mut app = help_test_app(maps);
-        assert!(!drive_chrome(
-            &mut app,
-            WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
-                shift: false,
-                control: false,
-                alt: false,
-                super_pressed: true,
-            })
-        ));
-        assert!(drive_chrome(&mut app, char_press("`", "`", false)));
-        assert!(app.runtime.help_visible(), "Super+backtick shows");
-        let rows = app.runtime.help_rows();
-        assert!(
-            rows.iter().any(|r| r == "super+`  toggle_help"),
-            "super spelling listed: {rows:?}"
-        );
-        assert!(
-            !rows.iter().any(|r| r.starts_with("alt+")),
-            "no Alt spellings survive the flip: {rows:?}"
-        );
     }
 
     /// Latch the app modifier mirror like the compositor-fed stream does and
@@ -10462,37 +10353,32 @@ claims = []
     }
 
     #[test]
-    fn workspace_creation_chord_is_listed_in_help() {
+    fn workspace_creation_chord_stays_in_the_live_registry() {
         // Issue #1446, "unclear how to create a new workspace": the shipped
         // creation chord is `Mod+T` (`alt+t` = `workspace_new`, the docs line
-        // for bitty-terminal-docs), and the `Mod+`` popup lists it from the
-        // live registry so the gesture is discoverable in-app.
-        let mut app = workspace_test_app();
-        assert!(drive_mod_char(&mut app, "`", false, true, false, false));
-        assert!(app.runtime.help_visible(), "Mod+backtick shows the popup");
+        // for bitty-terminal-docs). Issue #2397 moved the paint into the
+        // `bitty-terminal.help` extension, so the discoverability contract is
+        // now the live registry the plugin reads through
+        // `bitty.keymaps.list`: the same rows must still be there.
+        let app = workspace_test_app();
+        let rows: Vec<String> = app
+            .chrome
+            .keymaps
+            .iter()
+            .map(|m| format!("{}  {}", m.chord.canonical(), m.action.canonical()))
+            .collect();
         assert!(
-            app.runtime
-                .help_rows()
-                .iter()
-                .any(|row| row == "alt+t  workspace_new"),
-            "creation chord listed: {:?}",
-            app.runtime.help_rows()
+            rows.iter().any(|row| row == "alt+t  workspace_new"),
+            "creation chord listed: {rows:?}"
         );
         assert!(
-            app.runtime
-                .help_rows()
-                .iter()
-                .any(|row| row == "alt+1  workspace_focus:1"),
-            "switch chord listed: {:?}",
-            app.runtime.help_rows()
+            rows.iter().any(|row| row == "alt+1  workspace_focus:1"),
+            "switch chord listed: {rows:?}"
         );
         assert!(
-            app.runtime
-                .help_rows()
-                .iter()
+            rows.iter()
                 .any(|row| row == "alt+shift+1  workspace_move:1"),
-            "move chord listed under its canonical spelling: {:?}",
-            app.runtime.help_rows()
+            "move chord listed under its canonical spelling: {rows:?}"
         );
     }
 

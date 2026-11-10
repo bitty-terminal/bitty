@@ -5368,7 +5368,6 @@ impl Runtime {
         self.paint_ime_preedit(layers);
         self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
         self.paint_hyperlink_hover(paint, basis.pad_px, layers);
-        self.paint_help_overlay(paint, &basis.view_map, basis.pad_px, layers);
         self.paint_bell_and_notification(paint, basis.pad_px, now, layers);
         self.paint_scrollbar_overlay(paint, layers);
         self.paint_hint_overlay(paint, basis.pad_px, layers);
@@ -6031,34 +6030,6 @@ impl Runtime {
         }
     }
 
-    /// CTX-0265 which-key help panel (CTX-0474 extraction; body moved
-    /// verbatim from `tick_at`).
-    fn paint_help_overlay(
-        &mut self,
-        allocations: &[layout_focus::PresentFrame],
-        view_map: &std::collections::HashMap<ViewId, View>,
-        pad_px: i32,
-        layers: &mut FrameLayers,
-    ) {
-        // Help popup panel (CTX-0265, 009 which-key): centered floating
-        // overlay listing the live registry rows. Presentation-only like
-        // the banners above (fills + glyphs, never grid truth); painted
-        // after the pills so the panel reads on top on the rare frames
-        // where both coincide. Visibility/readiness live in
-        // `runtime::help`; toggle/dismiss paths repaint via
-        // `pending_full_redraw`.
-        if self.paint_help_panel(
-            allocations,
-            view_map,
-            pad_px,
-            &mut layers.combined_overlay_card_rounded,
-            &mut layers.combined_overlay_rounded,
-            &mut layers.combined_glyphs,
-        ) {
-            layers.any_needs_draw = true;
-        }
-    }
-
     /// CTX-0181 overlay scrollbar thumb (CTX-0474 extraction; body moved
     /// verbatim from `tick_at`).
     ///
@@ -6692,7 +6663,7 @@ impl Runtime {
             // otherwise draw through the opaque surface and ring.
             layers
                 .combined_glyphs
-                .retain(|glyph| !super::help::glyph_overlaps_rect(glyph, surface));
+                .retain(|glyph| !glyph_overlaps_rect(glyph, surface));
             let chrome_frame = bitty_render::chrome::ChromeFrame::new(
                 surface,
                 chrome,
@@ -8918,6 +8889,28 @@ impl Runtime {
     }
 }
 
+/// True when `glyph`'s pixel bounding box intersects the axis-aligned `rect`
+/// (CTX-0336, used by the overlay card occlusion in CTX-1477). Zero-area
+/// glyphs never intersect. `i64` throughout so extreme destinations cannot
+/// overflow (matching the present path's saturation discipline).
+pub(super) fn glyph_overlaps_rect(
+    glyph: &bitty_render::grid::GlyphInstance,
+    rect: bitty_render::geometry::RectPx,
+) -> bool {
+    if glyph.size[0] == 0 || glyph.size[1] == 0 {
+        return false;
+    }
+    let gx0 = i64::from(glyph.dest[0]);
+    let gy0 = i64::from(glyph.dest[1]);
+    let gx1 = gx0.saturating_add(i64::from(glyph.size[0]));
+    let gy1 = gy0.saturating_add(i64::from(glyph.size[1]));
+    let rx0 = i64::from(rect.x);
+    let ry0 = i64::from(rect.y);
+    let rx1 = rx0.saturating_add(i64::from(rect.width));
+    let ry1 = ry0.saturating_add(i64::from(rect.height));
+    gx0 < rx1 && gx1 > rx0 && gy0 < ry1 && gy1 > ry0
+}
+
 /// Issue #1409 (CTX-0797): the production guard that keeps a presented frame
 /// on one atlas epoch.
 ///
@@ -10500,34 +10493,49 @@ mod plugin_overlay_paint_tests {
     }
 
     #[test]
-    fn help_card_uses_the_overlay_rounded_layer() {
-        // CTX-1477: the help card must paint above the selection/cursor
-        // overlay fills, so it goes to the overlay-rounded layer rather than
-        // the leaf decoration layer.
-        let mut rt = runtime();
-        let frame = one_frame();
-        rt.focus_mut().set(frame.view);
-        rt.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
-        assert!(rt.toggle_help());
-        let mut layers = FrameLayers::default();
-        rt.paint_help_overlay(&[frame], &std::collections::HashMap::new(), 8, &mut layers);
-        assert_eq!(
-            layers.combined_overlay_card_rounded.len(),
-            1,
-            "help surface on the card layer"
+    fn presentation_overlay_surface_follows_the_theme() {
+        // Issue #2397: the first-party help/which-key extension paints its
+        // panel through this presentation surface, so the card must stay
+        // theme-derived (CTX-1395/#2333 discipline) instead of a fixed fill:
+        // the same scene resolves two different card surfaces under two
+        // themes, and the ring follows the theme's idle outline.
+        fn card_for(
+            theme: bitty_render::ThemePalette,
+        ) -> (bitty_render::grid::Rgba8, bitty_render::grid::Rgba8) {
+            let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+                theme,
+                theme_resolved: true,
+                ..RuntimeConfig::default()
+            })
+            .expect("deterministic runtime must build");
+            rt.set_presentation_overlay(Some(surface_with_text("Keyboard shortcuts")));
+            let frame = frame_for(1, 100, 60, 20);
+            rt.focus_mut().set(frame.view);
+            let mut layers = FrameLayers::default();
+            rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+            let surface = layers
+                .combined_overlay_card_rounded
+                .first()
+                .expect("the overlay paints one card surface");
+            let ring = layers
+                .combined_overlay_rounded
+                .first()
+                .expect("the overlay paints one ring");
+            (surface.color, ring.color)
+        }
+
+        let dark = card_for(bitty_render::ThemePalette::bitty_dark());
+        let light = card_for(bitty_render::ThemePalette::from_theme(
+            bitty_config::theme::resolve_theme(Some("github-light")),
+        ));
+        assert_ne!(
+            dark.0, light.0,
+            "the overlay card surface must follow the live theme"
         );
-        assert_eq!(
-            layers.combined_overlay_rounded.len(),
-            1,
-            "help ring on the overlay-rounded layer"
+        assert_ne!(
+            dark.1, light.1,
+            "the overlay ring must follow the live theme"
         );
-        assert!(
-            layers.combined_overlay.is_empty(),
-            "help chrome no longer competes with plain overlay fills"
-        );
-        assert!(layers.combined_overlay_content.is_empty());
-        assert!(!layers.combined_glyphs.is_empty());
-        assert!(layers.any_needs_draw);
     }
 
     #[test]

@@ -2,13 +2,13 @@
 //!
 //! `cancel_pending_on_escape` must only *consume* an `Esc` that cancels a
 //! real confirmation gate (suspicious paste, workspace kill-confirm,
-//! view/window close-confirm). The CTX-0265 help popup is informational, not
-//! modal: dismissing it must not swallow the key, because a fullscreen app
-//! (vim/less) treats `Esc` as a mode key and the swallowed press desyncs its
+//! view/window close-confirm). Informational overlays — the extension-owned
+//! help/which-key panel is one — never own the key, because a fullscreen app
+//! (vim/less) treats `Esc` as a mode key and a swallowed press desyncs its
 //! state machine.
 //!
-//! These tests are the probe matrix for that scope: they fail on the
-//! pre-fix `Esc` swallow and pin the unchanged gate semantics.
+//! These tests are the probe matrix for that scope: they fail on a
+//! pre-fix `Esc` swallow and pin the gate semantics.
 #![forbid(unsafe_code)]
 
 use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
@@ -70,66 +70,15 @@ fn ctrl_d(logical: char) -> KeyEvent {
     }
 }
 
-fn show_help(rt: &mut Runtime) {
-    rt.set_help_rows(vec![
-        "alt+x  toggle_zoom".to_string(),
-        "ctrl+shift+v  paste_from_clipboard".to_string(),
-    ]);
-    assert!(rt.toggle_help(), "help toggles on");
-}
-
 fn enter_fullscreen(rt: &mut Runtime) {
     // Alternate-screen entry, the fullscreen-app contract vim/less use.
     rt.handle_pty_bytes(b"\x1b[?1049h");
     rt.handle_pty_bytes(b"vim");
 }
 
-/// Issue #756 headline: `Esc` in vim while the help popup is visible must
-/// dismiss the popup AND reach the PTY.
+/// Regression guard: `Esc` with no confirmation gate armed still encodes.
 #[test]
-fn esc_with_help_visible_reaches_fullscreen_pty() {
-    let mut rt = make_runtime();
-    enter_fullscreen(&mut rt);
-    show_help(&mut rt);
-    rt.drain_pending_input();
-
-    let out = rt.handle_key_event(esc(PressState::Pressed));
-
-    assert!(!rt.help_visible(), "Esc dismissed the help popup");
-    assert_eq!(
-        out,
-        Some(vec![27]),
-        "dismissal Esc must reach the fullscreen app"
-    );
-    assert_eq!(
-        rt.pending_input(),
-        b"\x1b",
-        "Esc byte delivered, not swallowed"
-    );
-}
-
-/// The help overlay is informational everywhere, not only under alt-screen:
-/// a shell prompt receives the `Esc` too.
-#[test]
-fn esc_with_help_visible_reaches_plain_pty() {
-    let mut rt = make_runtime();
-    show_help(&mut rt);
-    rt.drain_pending_input();
-
-    let out = rt.handle_key_event(esc(PressState::Pressed));
-
-    assert!(!rt.help_visible(), "Esc dismissed the help popup");
-    assert_eq!(
-        out,
-        Some(vec![27]),
-        "informational overlay does not consume"
-    );
-    assert_eq!(rt.pending_input(), b"\x1b");
-}
-
-/// Regression guard: with no overlay at all the same `Esc` still encodes.
-#[test]
-fn esc_without_overlays_still_encodes() {
+fn esc_without_gates_still_encodes() {
     let mut rt = make_runtime();
     assert_eq!(
         rt.handle_key_event(esc(PressState::Pressed)),
@@ -137,29 +86,25 @@ fn esc_without_overlays_still_encodes() {
     );
 }
 
-/// An `Esc` release is not a dismissal and never produces bytes.
+/// An `Esc` release never produces bytes and cancels nothing.
 #[test]
-fn esc_release_does_not_dismiss_help_or_deliver() {
+fn esc_release_never_delivers() {
     let mut rt = make_runtime();
-    show_help(&mut rt);
     rt.drain_pending_input();
 
     let out = rt.handle_key_event(esc(PressState::Released));
 
     assert_eq!(out, None);
-    assert!(rt.help_visible(), "release never dismisses");
     assert!(rt.pending_input().is_empty(), "release never delivers");
 }
 
-/// A non-`Esc` key is unaffected: help stays visible and the key encodes.
+/// A non-`Esc` key is unaffected: it encodes normally.
 #[test]
-fn non_esc_key_with_help_visible_still_encodes() {
+fn non_esc_key_still_encodes() {
     let mut rt = make_runtime();
-    show_help(&mut rt);
     rt.drain_pending_input();
 
     assert_eq!(rt.handle_key_event(char_press('a')), Some(vec![b'a']));
-    assert!(rt.help_visible(), "help is not modal");
     assert_eq!(rt.pending_input(), b"a");
 }
 
@@ -197,37 +142,18 @@ fn esc_cancels_paste_gate_in_fullscreen_and_is_consumed() {
     assert!(rt.pending_input().is_empty(), "no Esc leaks to the PTY");
 }
 
-/// Help plus paste together: one `Esc` drops both, and the paste gate keeps
-/// the consume.
-#[test]
-fn esc_drops_help_and_paste_together_and_consumes() {
-    let mut rt = make_runtime();
-    show_help(&mut rt);
-    assert!(rt.paste_text_via_gate("one\ntwo".to_string()));
-    rt.drain_pending_input();
-
-    let out = rt.handle_key_event(esc(PressState::Pressed));
-
-    assert_eq!(out, None, "a real gate owns the consume");
-    assert!(!rt.help_visible(), "help also dismissed");
-    assert!(!rt.has_pending_paste(), "paste cancelled");
-    assert!(rt.pending_input().is_empty());
-}
-
 /// Selection clearing (CTX-0166) composes with the dismissal: the highlight
-/// clears, help hides, and the `Esc` is delivered.
+/// clears and the `Esc` is delivered.
 #[test]
-fn esc_clears_selection_dismisses_help_and_delivers() {
+fn esc_clears_selection_and_delivers() {
     let mut rt = make_runtime();
     rt.handle_pty_bytes(b"select me");
     rt.select_all();
-    show_help(&mut rt);
     rt.drain_pending_input();
 
     let out = rt.handle_key_event(esc(PressState::Pressed));
 
     assert!(!rt.has_selection(), "press clears the highlight");
-    assert!(!rt.help_visible(), "help dismissed");
     assert_eq!(out, Some(vec![27]), "Esc still reaches the shell");
 }
 
@@ -246,13 +172,12 @@ fn esc_cancels_close_confirm_gate_and_is_consumed() {
     assert!(rt.pending_input().is_empty());
 }
 
-/// `Alt`-modified `Esc` in a fullscreen app with help shown is still not a
-/// pure dismissal: help hides and the modified encoding reaches the PTY.
+/// `Alt`-modified `Esc` in a fullscreen app is still not a pure dismissal:
+/// the modified encoding reaches the PTY.
 #[test]
-fn alt_esc_with_help_visible_dismisses_and_delivers() {
+fn alt_esc_in_fullscreen_delivers() {
     let mut rt = make_runtime();
     enter_fullscreen(&mut rt);
-    show_help(&mut rt);
     // Alt is tracked from modifiers; press Alt then Esc (metaSendsEscape).
     let alt = KeyEvent {
         logical_key: LogicalKey::Named(NamedKey::Alt),
@@ -267,10 +192,9 @@ fn alt_esc_with_help_visible_dismisses_and_delivers() {
 
     let out = rt.handle_key_event(esc(PressState::Pressed));
 
-    assert!(!rt.help_visible());
     assert!(
         out.is_some(),
-        "an Alt+Esc still routes instead of vanishing into the overlay"
+        "an Alt+Esc still routes instead of vanishing into an overlay"
     );
     assert!(!rt.pending_input().is_empty(), "bytes reached the PTY");
 }

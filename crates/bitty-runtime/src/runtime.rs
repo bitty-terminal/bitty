@@ -139,7 +139,6 @@ pub mod component_host;
 pub mod copy_mode;
 pub mod cw_live;
 pub mod fx;
-pub mod help;
 pub mod input;
 pub mod kitty_file;
 pub mod kitty_images;
@@ -1000,12 +999,6 @@ pub struct Runtime {
     /// the budgeted plugin bands; resize and the `set_window_cells` seam
     /// set it.
     window_cells: UiRect,
-    /// Whether the help popup (CTX-0265) is currently shown.
-    ///
-    /// Presentation-only overlay state: toggled by the `toggle_help`
-    /// chrome action, dismissed by `Esc` or the same chord. Never grid
-    /// truth; see `runtime::help`.
-    help_visible: bool,
     /// Adaptive panel creation mode (Spiral default, Balanced, Dwindle,
     /// BisectLargest).
     panel_layout_mode: PanelLayoutMode,
@@ -1023,13 +1016,6 @@ pub struct Runtime {
     /// layer. Consulted at PTY spawn and view initialization; empty means
     /// no rule applies and spawn behavior is unchanged.
     panel_spawn_rules: Vec<bitty_config::panel_rules::PanelSpawnRule>,
-    /// Help popup rows (CTX-0265), regenerated from the live keymap
-    /// registry by the app on every show.
-    ///
-    /// Plain display strings (`"alt+h  goto_split:left"`); bounded by
-    /// [`help::HELP_MAX_ROWS`]. Painted only while `help_visible`; the
-    /// paint truncates to the panel with a `+N more` tail.
-    help_rows: Vec<String>,
     /// Panel-overlay modal bit (CTX-0482, issue #763).
     ///
     /// Presentation-only authority fed by the panel overlay integration
@@ -1955,8 +1941,6 @@ impl std::fmt::Debug for Runtime {
             .field("session_restored", &self.session_restored)
             .field("has_session_backend", &self.session_backend.is_some())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
-            .field("help_visible", &self.help_visible)
-            .field("help_rows", &self.help_rows.len())
             .field("container", &self.container)
             .field("window_cells", &self.window_cells)
             .field(
@@ -2490,11 +2474,9 @@ impl Runtime {
             pending_ws_close: None,
             window_cells: container,
             last_presented_bands: Vec::new(),
-            help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             panel_spiral: None,
             panel_spawn_rules: Vec::new(),
-            help_rows: Vec::new(),
             overlay_modal_active: false,
             ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),
@@ -2822,11 +2804,9 @@ impl Runtime {
             pending_ws_close: None,
             window_cells: container,
             last_presented_bands: Vec::new(),
-            help_visible: false,
             panel_layout_mode: config.panel_layout_mode,
             panel_spiral: None,
             panel_spawn_rules: Vec::new(),
-            help_rows: Vec::new(),
             overlay_modal_active: false,
             ipc_socket_path: None,
             cw_fold: bitty_rich::blocks::FoldState::new(),

@@ -1,6 +1,6 @@
 # Release tooling overrides this for historical tags:
 #   rpmbuild -bs ... --define "version X.Y.Z"
-%{!?version:%global version 0.0.38}
+%{!?version:%global version 0.0.39}
 # The payload is a prebuilt release bundle; there is no local compilation.
 %global debug_package %{nil}
 Name:           bitty
@@ -87,6 +87,9 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 %{_datadir}/terminfo/b/bitty
 
 %changelog
+* Tue Nov 10 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.39-1
+- Release 0.0.39
+
 * Tue Nov 10 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.38-1
 - Release 0.0.38
 

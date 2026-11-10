@@ -7566,11 +7566,11 @@ impl Runtime {
                 // Live-grid rows are already scrolled truth, so the
                 // scrollback delta is the viewport window start only.
                 let mut uv = proto.as_unicode_virtual();
-                if (uv.image_width == 0 || uv.image_height == 0)
-                    && let Some(stored) = self.kitty_images.get(image)
-                {
-                    uv.image_width = stored.width;
-                    uv.image_height = stored.height;
+                if uv.image_width == 0 || uv.image_height == 0 {
+                    if let Some(stored) = self.kitty_images.get(image) {
+                        uv.image_width = stored.width;
+                        uv.image_height = stored.height;
+                    }
                 }
                 let Some(tile) =
                     bitty_rich::unicode_run_rect(&run, &cells, &uv, metrics, window_start, 0)

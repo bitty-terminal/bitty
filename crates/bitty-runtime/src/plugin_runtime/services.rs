@@ -6666,10 +6666,7 @@ impl HostServices for PluginServices {
                 )));
             };
             let granted = self.service_heads_covered(&record.heads);
-            let window = bitty_lua::HostCallWindow::at(std::time::Instant::now());
-            let res = host.borrow_mut().call(&record.iface, method, granted);
-            window.close();
-            return res;
+            return host.borrow_mut().call(&record.iface, method, granted);
         }
         // CTX-1238: native device dispatch (issue #2100). Records published
         // by the runtime-owned `bitty-terminal.devices` component carry no
@@ -6688,12 +6685,9 @@ impl HostServices for PluginServices {
             };
             let granted_heads: Vec<String> =
                 self.granted_capabilities.borrow().iter().cloned().collect();
-            let window = bitty_lua::HostCallWindow::at(std::time::Instant::now());
-            let res = host
+            return host
                 .borrow_mut()
                 .call(&record.iface, method, args, &granted_heads);
-            window.close();
-            return res;
         }
         // CTX-1238: native audio dispatch (issue #2100). Records published
         // by the runtime-owned `bitty-terminal.audio` component carry no
@@ -6712,10 +6706,7 @@ impl HostServices for PluginServices {
                 )));
             };
             let granted = self.service_heads_covered(&record.heads);
-            let window = bitty_lua::HostCallWindow::at(std::time::Instant::now());
-            let res = host.borrow_mut().call(&record.iface, method, args, granted);
-            window.close();
-            return res;
+            return host.borrow_mut().call(&record.iface, method, args, granted);
         }
         let vm = record
             .vm

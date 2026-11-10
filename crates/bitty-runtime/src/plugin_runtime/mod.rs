@@ -631,6 +631,10 @@ impl From<bitty_plugin_host::PluginError> for PluginRuntimeError {
     }
 }
 
+/// Maximum consecutive automatic reloads for a plugin that fails with an
+/// `RC-1 wall` slice timeout before it is left stopped.
+pub const MAX_WALL_RECOVERY_ATTEMPTS: u32 = 3;
+
 struct PluginEntry {
     package: PluginPackage,
     generation: u32,
@@ -644,6 +648,8 @@ struct PluginEntry {
     /// `None` until activation resolves them and after teardown; the value is
     /// host-derived, bounded, and never includes plugin-controlled data.
     budgets: Option<bitty_plugin_host::budgets::EffectiveBudgets>,
+    /// Consecutive automatic recovery attempts after `RC-1 wall` failures.
+    wall_recovery_attempts: u32,
 }
 
 /// One app-dispatched command parked at the RC-1 wall budget (bitty #2314).
@@ -2379,6 +2385,8 @@ impl PluginRuntime {
                     }
                     if let Some((reason, refused)) = terminal {
                         self.fail_runtime(&plugin, timer_terminal_reason(&reason, refused));
+                    } else if let Some(entry) = self.entries.get_mut(&plugin) {
+                        entry.wall_recovery_attempts = 0;
                     }
                 }
             }
@@ -2749,6 +2757,7 @@ impl PluginRuntime {
                 registrations: RegistrationCapture::new(),
                 settings_diagnostics: Vec::new(),
                 budgets: None,
+                wall_recovery_attempts: 0,
             },
         );
         self.order.push(id);
@@ -3669,6 +3678,9 @@ impl PluginRuntime {
     /// [`PluginRuntimeError`] when the plugin is unknown, bundled, or fails
     /// re-resolution/activation.
     pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.wall_recovery_attempts = 0;
+        }
         let result = self.reload_inner(id);
         self.sync_debug_view();
         result
@@ -3683,31 +3695,66 @@ impl PluginRuntime {
     /// roll back the plugin's UI band. Calling this from the application host
     /// after timer/config ticks re-activates the plugin cleanly without masking
     /// deterministic `init.lua` or `RC-2 memory` / `RC-1 instructions` failures.
+    /// Consecutive recovery attempts are bounded by [`MAX_WALL_RECOVERY_ATTEMPTS`]
+    /// so a deterministically failing timer stays stopped.
     pub fn recover_wall_failed_plugins(&mut self) -> usize {
-        let candidates: Vec<PluginId> = self
+        let candidates: Vec<(PluginId, SourceClass, String)> = self
             .entries
             .iter()
             .filter_map(|(id, entry)| {
-                if entry.package.source_class.is_bundled() {
+                if entry.package.source_class.is_bundled()
+                    || entry.wall_recovery_attempts >= MAX_WALL_RECOVERY_ATTEMPTS
+                {
                     return None;
                 }
                 match &entry.state {
                     LifecycleState::Failed(reason) if reason.contains("RC-1 wall") => {
-                        Some(id.clone())
+                        Some((id.clone(), entry.package.source_class, reason.clone()))
                     }
                     _ => None,
                 }
             })
             .collect();
+        if candidates.is_empty() {
+            return 0;
+        }
         let mut recovered = 0;
-        for id in candidates {
-            if self.reload_inner(&id).is_ok() {
-                recovered += 1;
+        for (id, source_class, prev_reason) in candidates {
+            if let Some(entry) = self.entries.get_mut(&id) {
+                entry.wall_recovery_attempts = entry.wall_recovery_attempts.saturating_add(1);
+            }
+            if let Some(store_root) = self.store_root.clone() {
+                match resolution::load_index(&store_root) {
+                    Ok(records) => {
+                        if let Some(record) = records.iter().find(|r| r.plugin_id == id.as_str()) {
+                            if !record.enabled {
+                                let _ = self.dispose_inner(&id);
+                                continue;
+                            }
+                        } else if source_class != SourceClass::LocalPath {
+                            let _ = self.dispose_inner(&id);
+                            continue;
+                        }
+                    }
+                    Err(_) => {
+                        continue;
+                    }
+                }
+            }
+            match self.reload_inner(&id) {
+                Ok(_) => {
+                    recovered += 1;
+                }
+                Err(_) => {
+                    if let Some(entry) = self.entries.get_mut(&id) {
+                        if entry.state == LifecycleState::Disposed {
+                            entry.state = LifecycleState::Failed(prev_reason);
+                        }
+                    }
+                }
             }
         }
-        if recovered > 0 {
-            self.sync_debug_view();
-        }
+        self.sync_debug_view();
         recovered
     }
 

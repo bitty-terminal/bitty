@@ -412,8 +412,8 @@ pub fn list_help_text(invoked_as: &str) -> String {
            services   Registered extension interfaces (one row per `backing_head`, no VM loaded).\n\
          \n\
          Output (--format json|jsonl): versioned envelope v:1 —\n  \
-           {{\"v\":1,\"command\":\"list|ls\",\"ok\":true,\"result\":<per-kind>}} plus \"error\" on failure;\n  \
-           jsonl emits one row per line and diagnostics stay on stderr.\n\
+           {{\"v\":1,\"command\":\"list|ls\",\"ok\":true,\"result\":<per-kind>}} plus \"error\" on runtime failure\n  \
+           (usage errors exit 2 on stderr only); jsonl emits the single-line resource-array envelope and diagnostics stay on stderr.\n\
          \n\
          Options:\n  \
            --format SHAPE  table (default) | json | jsonl (envelope v1)\n  \

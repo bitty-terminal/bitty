@@ -893,7 +893,7 @@ pub fn plugin_help_text() -> String {
      \x20 install <bundled-id>                Install a bundled plugin (`--profile P` is bundled-only).\n\
      \x20   [--profile P] [--yes]\n\
      \x20 install <catalog-id|path|git-url|archive>  Install or update from official catalog id, local dir,\n\
-     \x20   [--yes] [--force]                 git URL (https://, git+https://, git@), or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
+     \x20   [--yes] [--force]                 git URL (https://...git, git+https://, git@), or archive (.tar.gz/.tgz, .tar.zst, .zip).\n\
      \x20 remove <id> --force                 Remove a bundled ledger record or installed store package.\n\
      \x20 enable <id>                         Enable a recorded plugin (applies on next startup).\n\
      \x20 disable <id>                        Disable without dropping the record or grants.\n\

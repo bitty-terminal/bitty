@@ -320,25 +320,31 @@ impl PanelRegistryConfig {
     }
 }
 
-/// Owner half of a panel's controller binding (OQ-084 A.2, D.2 phase 2 step 2).
+/// The one controller binding a panel record holds (OQ-084 A.2, A.3, D.2
+/// phase 2 step 2).
+///
+/// Phase 2 step 2 writes the binding as ONE pair, `(owner, controller
+/// generation)`, so both halves live in one value: a record can hold neither an
+/// owner without a controller generation nor a controller generation without an
+/// owner, and it cannot carry an owner from one bind beside a controller
+/// generation from another.
 ///
 /// The pair, not the plugin id alone, is the owner part of the
-/// retired-ceiling tombstone key: two plugins can present the same controller
-/// generation number, so a key without the owner could hand a successor a
-/// wider ceiling than its own predecessor held (A.2, `N-13`). Until a
-/// cross-owner adoption rule is decided (B.6) the owner generation and the
-/// controller generation written together at phase 2 step 2 are the same
-/// value; they stay separate fields because the owner pair keys the tombstone
-/// (bitty#2476 residual 7) while the controller generation keys the grant row
-/// (phase 2 step 1).
+/// retired-ceiling tombstone key `(owner, PanelId, N)`: two plugins can present
+/// the same controller generation number, so a key without the owner could hand
+/// a successor a wider ceiling than its own predecessor held (A.2, `N-13`).
+/// Until a cross-owner adoption rule is decided (B.6) the owner generation and
+/// the controller generation written together at phase 2 step 2 are the same
+/// value, which is why one generation field carries both; the tombstone key
+/// stays `(owner, PanelId, N)` (bitty#2476 residual 7).
 #[allow(dead_code)] // bitty#2476 residual 5: shape only, no bind constructs one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PanelOwner {
+struct PanelBinding {
     /// Plugin that created the panel content and holds this binding.
     plugin_id: bitty_plugin_host::PluginId,
-    /// Plugin generation that owns the content, paired with `plugin_id` so an
-    /// owner is never compared by number alone.
-    generation: Generation,
+    /// Controller generation this binding names, and (while B.6 is undecided)
+    /// the owner generation the tombstone pairs with `plugin_id`.
+    controller_generation: Generation,
 }
 
 /// Internal panel record.
@@ -354,21 +360,16 @@ struct PanelRecord {
     workspace: Option<WorkspaceId>,
     view: Option<ViewId>,
     title: Option<String>,
-    /// Owner binding written by D.2 phase 2 step 2.
+    /// The controller binding written by D.2 phase 2 step 2, if any.
+    ///
+    /// One value, never two fields: phase 2 step 2 writes the pair
+    /// `(owner, controller generation)` as one fact, so the record cannot hold
+    /// half a binding nor an owner and a controller generation that came from
+    /// different binds.
     ///
     /// `None` on every live path today — the phase 2 step 2 writer is not
-    /// installed, so no panel carries an owner until a bind lands one.
-    #[allow(dead_code)] // bitty#2476 residual 5: shape only, no bind writes it.
-    owner: Option<PanelOwner>,
-    /// Current controller binding generation (OQ-084 A.3, D.2 phase 2 step 2).
-    ///
-    /// Deliberately distinct from `generation`: the allocation epoch names the
-    /// container and never moves, while this names the generation that may
-    /// touch the panel's content and is replaced by a rebind. `None` is a valid
-    /// state (A.5, no bound controller); every panel-scoped grant lookup then
-    /// falls back to the allocation epoch, which is the only key a caller can
-    /// mint while nothing binds a controller.
-    controller_generation: Option<Generation>,
+    /// installed, so no panel carries a binding until a bind lands one.
+    binding: Option<PanelBinding>,
     /// Most recently ended controller generation, retained across the unbind
     /// edge (OQ-084 D.2 phase 0).
     ///
@@ -381,6 +382,32 @@ struct PanelRecord {
 }
 
 impl PanelRecord {
+    /// The plugin that holds this panel's content, or `None` while no
+    /// controller is bound (OQ-084 A.2, D.2 phase 2 step 2).
+    ///
+    /// Derived from the record's one binding, so an owner never exists without
+    /// the controller generation that was written with it.
+    #[allow(dead_code)] // bitty#2476 residual 5: nothing binds, and the owner
+    // consumer is the tombstone key of residual 7.
+    fn owner(&self) -> Option<&bitty_plugin_host::PluginId> {
+        self.binding.as_ref().map(|binding| &binding.plugin_id)
+    }
+
+    /// The controller generation the record's binding names (OQ-084 A.3, D.2
+    /// phase 2 step 2), or `None` while no controller is bound.
+    ///
+    /// Deliberately distinct from `generation`: the allocation epoch names the
+    /// container and never moves, while this names the generation that may
+    /// touch the panel's content and is replaced by a rebind. `None` is a valid
+    /// state (A.5, no bound controller); every panel-scoped grant lookup then
+    /// falls back to the allocation epoch, which is the only key a caller can
+    /// mint while nothing binds a controller.
+    fn controller_generation(&self) -> Option<Generation> {
+        self.binding
+            .as_ref()
+            .map(|binding| binding.controller_generation)
+    }
+
     /// The generation that keys this panel's panel-scoped grant row (OQ-084
     /// D.2 phase 2 step 1).
     ///
@@ -388,7 +415,7 @@ impl PanelRecord {
     /// allocation epoch. Before a controller can be bound the two agree, so
     /// this preserves the single-generation behaviour exactly.
     fn grant_key_generation(&self) -> Generation {
-        self.controller_generation.unwrap_or(self.generation)
+        self.controller_generation().unwrap_or(self.generation)
     }
 }
 
@@ -1246,10 +1273,10 @@ impl PanelRegistry {
             workspace,
             view: None,
             title: None,
-            // No owner and no controller binding: `create_panel` mints a
-            // container, and D.2 phase 2 step 2 is what would bind one.
-            owner: None,
-            controller_generation: None,
+            // No binding: `create_panel` mints a container, and D.2 phase 2
+            // step 2 is what would bind an owner together with a controller
+            // generation.
+            binding: None,
             last_controller_generation: None,
         };
         self.panels.insert(pid.0, rec);
@@ -1475,28 +1502,36 @@ impl PanelRegistry {
 
     /// Disposes a panel, clearing its view attachment, MRU, capabilities,
     /// event queues, and retiring `(PanelId, Generation)`.
+    ///
+    /// The `StaleHandle` fence is on the allocation epoch the handle carries,
+    /// so the public error contract does not move when a controller is bound:
+    /// a stale handle is refused exactly as before. The generations released
+    /// are the ones the record's binding names (OQ-084 D.2 phase 1), which is
+    /// the allocation epoch while no controller is bound.
     pub fn dispose_panel(
         &mut self,
         panel_id: PanelId,
         generation: Generation,
     ) -> Result<(), PanelError> {
         self.ensure_not_disposed()?;
-        let (stored_gen, workspace, was_controller) = {
+        let (stored_gen, binding_key, workspace, was_controller) = {
             let rec = self.panels.get(&panel_id.0).ok_or(PanelError::NotFound {
                 kind: "panel",
                 id_raw: panel_id.0,
             })?;
             // A generation that mounted, or that held panel-scoped grants, was
             // a controller; a bare `Created` record rolled back from a failed
-            // bind was not. The grant row is keyed by the binding generation
-            // (D.2 phase 2 step 1), which is the allocation epoch while no
-            // controller is bound.
+            // bind was not. The grant row and every other generation-owned
+            // family are keyed by the binding generation (D.2 phase 1/2 step
+            // 1), which is the allocation epoch while no controller is bound.
+            let binding_key = rec.grant_key_generation();
             let held_grants = self
                 .capabilities
-                .get(&(panel_id, rec.grant_key_generation()))
+                .get(&(panel_id, binding_key))
                 .is_some_and(|grants| !grants.is_empty());
             (
                 rec.generation,
+                binding_key,
                 rec.workspace,
                 rec.state != UiPanelState::Created || held_grants,
             )
@@ -1516,13 +1551,18 @@ impl PanelRegistry {
             // OQ-084 B-4: the edge release copies the departing generation's
             // grant set into the retained ceiling and then removes the live
             // row, so a bind for the successor reads a real ceiling instead of
-            // a drained table.
-            self.release_generation_scope(panel_id, generation)?;
+            // a drained table. The release acts on the binding generation, so
+            // it is handed that key while the fence above stays on the
+            // allocation epoch.
+            self.release_generation_scope(panel_id, binding_key)?;
         } else {
             // A panel that never mounted and held nothing is not a
-            // predecessor: a rolled-back create leaves no ceiling behind.
-            self.capabilities.remove(&(panel_id, generation));
-            self.release_attributed_overlays(panel_id, generation);
+            // predecessor: a rolled-back create leaves no ceiling behind. Its
+            // generation-owned rows and surfaces are still removed under the
+            // binding key, so a bound-but-never-mounted panel leaves no grant
+            // row behind.
+            self.capabilities.remove(&(panel_id, binding_key));
+            self.release_attributed_overlays(panel_id, binding_key);
         }
         // Remove view attachment if any
         if let Some(view_id) = self.panel_to_view.remove(&panel_id) {
@@ -1955,7 +1995,7 @@ impl PanelRegistry {
     pub fn controller_generation(&self, panel_id: PanelId) -> Option<Generation> {
         self.panels
             .get(&panel_id.0)
-            .and_then(|record| record.controller_generation)
+            .and_then(PanelRecord::controller_generation)
     }
 
     /// Number of retired-ceiling tombstones.
@@ -2223,12 +2263,24 @@ impl PanelRegistry {
     /// Binds a controller generation on the panel record for tests (OQ-084 D.2
     /// phase 2 step 2).
     ///
+    /// Phase 2 step 2 writes the binding as ONE pair, so the binder installs
+    /// the owner and the controller generation in a single assignment: there is
+    /// no way to reach a record holding one half of a binding.
+    ///
     /// The phase 2 step 2 writer is bitty#2476 residual 2; until it lands no
     /// live path binds a controller, so only tests mint one here.
     #[cfg(test)]
-    fn bind_controller_generation_for_test(&mut self, panel_id: PanelId, controller: Generation) {
+    fn bind_controller_generation_for_test(
+        &mut self,
+        panel_id: PanelId,
+        plugin: &str,
+        controller: Generation,
+    ) {
         if let Some(record) = self.panels.get_mut(&panel_id.0) {
-            record.controller_generation = Some(controller);
+            record.binding = Some(PanelBinding {
+                plugin_id: bitty_plugin_host::PluginId::new(plugin).expect("valid plugin id"),
+                controller_generation: controller,
+            });
         }
     }
 
@@ -2472,7 +2524,7 @@ mod controller_binding_shape_tests {
 
         let controller = epoch.next().expect("controller generation");
         assert_ne!(controller, epoch, "the two generations can differ");
-        registry.bind_controller_generation_for_test(handle.id, controller);
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
 
         assert_eq!(
             registry.controller_generation(handle.id),
@@ -2522,7 +2574,7 @@ mod controller_binding_shape_tests {
             .expect("grant panel capability");
 
         let controller = epoch.next().expect("controller generation");
-        registry.bind_controller_generation_for_test(handle.id, controller);
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
         // D.2 phase 2 step 1 installs the successor's set keyed by the
         // controller generation; that writer is bitty#2476 residual 2, so the
         // row is placed directly here.
@@ -2559,7 +2611,7 @@ mod controller_binding_shape_tests {
             .grant_panel_capability(handle.id, epoch, "panel.create")
             .expect("grant panel capability");
         let controller = epoch.next().expect("controller generation");
-        registry.bind_controller_generation_for_test(handle.id, controller);
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
         registry
             .capabilities
             .insert((handle.id, controller), set(&["panel.focus"]));
@@ -2603,16 +2655,16 @@ mod controller_binding_shape_tests {
     }
 
     #[test]
-    fn no_live_path_writes_an_owner() {
+    fn no_live_path_writes_a_binding() {
         let (mut registry, handle) = a_panel();
         let epoch = handle.generation;
         registry
             .mount_panel(handle.id, epoch, ViewId::new(1))
             .expect("mount panel");
         let record = registry.panels.get(&handle.id.0).expect("panel record");
-        assert!(record.owner.is_none(), "create writes no owner");
+        assert!(record.owner().is_none(), "create writes no owner");
         assert!(
-            record.controller_generation.is_none(),
+            record.controller_generation().is_none(),
             "create writes no controller binding"
         );
 
@@ -2621,26 +2673,215 @@ mod controller_binding_shape_tests {
             .expect("edge release");
         let record = registry.panels.get(&handle.id.0).expect("panel record");
         assert!(
-            record.owner.is_none(),
+            record.owner().is_none(),
             "the edge release writes no owner either"
+        );
+        assert!(
+            record.controller_generation().is_none(),
+            "the edge release binds no controller either"
+        );
+    }
+
+    #[test]
+    fn owner_and_controller_generation_are_both_present_or_both_absent_on_every_live_path() {
+        // One binding, so the two accessors can never disagree: half a binding
+        // is unrepresentable, not merely unconstructed (D.2 phase 2 step 2).
+        fn assert_pair(registry: &PanelRegistry, panel: PanelId, expected_owner: Option<&str>) {
+            let record = registry.panels.get(&panel.0).expect("panel record");
+            assert_eq!(
+                record.owner().map(bitty_plugin_host::PluginId::as_str),
+                expected_owner,
+                "the owner half of the binding"
+            );
+            assert_eq!(
+                record.owner().is_some(),
+                record.controller_generation().is_some(),
+                "an owner never exists without its controller generation, and vice versa"
+            );
+        }
+
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        assert_pair(&registry, handle.id, None); // create_panel
+
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect("mount panel");
+        assert_pair(&registry, handle.id, None); // mount_panel
+
+        registry
+            .grant_panel_capability(handle.id, epoch, "panel.create")
+            .expect("grant panel capability");
+        assert_pair(&registry, handle.id, None); // grant_panel_capability
+
+        registry
+            .release_generation_scope(handle.id, epoch)
+            .expect("edge release");
+        assert_pair(&registry, handle.id, None); // D.2 phase 1 unbind edge
+
+        registry
+            .install_rebound_grants(handle.id, epoch, &set(&["panel.create"]), &BTreeSet::new())
+            .expect("rebind install");
+        assert_pair(&registry, handle.id, None); // D.2 phase 2 step 1
+
+        registry.bind_controller_generation_for_test(
+            handle.id,
+            "acme.notes",
+            epoch.next().expect("controller generation"),
+        );
+        assert_pair(&registry, handle.id, Some("acme.notes")); // D.2 phase 2 step 2
+
+        let controller = registry
+            .controller_generation(handle.id)
+            .expect("the binder names a controller");
+        assert_eq!(
+            registry.panels[&handle.id.0]
+                .binding
+                .as_ref()
+                .map(|binding| binding.controller_generation),
+            Some(controller),
+            "the accessor and the value it derives from name one fact"
+        );
+
+        registry
+            .dispose_panel(handle.id, epoch)
+            .expect("the bound panel disposes through its allocation epoch");
+        assert!(
+            !registry.panels.contains_key(&handle.id.0),
+            "a disposed record carries no half binding"
         );
     }
 
     #[test]
     fn an_owner_key_is_the_plugin_and_its_generation_together() {
-        let markdown = PanelOwner {
+        let markdown = PanelBinding {
             plugin_id: bitty_plugin_host::PluginId::new("xuepoo.markdown").expect("plugin id"),
-            generation: Generation(7),
+            controller_generation: Generation(7),
         };
-        let notes = PanelOwner {
+        let notes = PanelBinding {
             plugin_id: bitty_plugin_host::PluginId::new("acme.notes").expect("plugin id"),
-            generation: Generation(7),
+            controller_generation: Generation(7),
         };
         assert_ne!(
             markdown, notes,
             "the same controller generation number under two plugins is two owners (A.2)"
         );
-        assert_eq!(markdown.generation, Generation(7));
+        assert_eq!(markdown.controller_generation, Generation(7));
         assert_eq!(markdown.plugin_id.as_str(), "xuepoo.markdown");
+    }
+
+    /// D-1: a bound panel disposes through the allocation epoch its handle
+    /// carries, and the release runs under the binding generation.
+    #[test]
+    fn a_bound_controller_generation_disposes_under_its_binding_key() {
+        // A capacity-1 tombstone table with one foreign entry makes the
+        // release's fail-closed tombstone write the first thing a disposal of
+        // the bound panel runs, which is what proves the release was reached
+        // under the binding key rather than refused as `StaleHandle`.
+        let config = PanelRegistryConfig {
+            max_panels_per_window: 1,
+            ..PanelRegistryConfig::default()
+        };
+        let mut registry = PanelRegistry::new(config).expect("panel registry builds");
+        let handle = registry
+            .create_panel(PanelType::Helper, None)
+            .expect("create panel");
+        let epoch = handle.generation;
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect("mount panel");
+        let controller = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
+        // D.2 phase 2 step 1 installs the successor's set keyed by the
+        // controller generation; that writer is bitty#2476 residual 2, so the
+        // row is placed directly here.
+        registry
+            .capabilities
+            .insert((handle.id, controller), set(&["panel.focus"]));
+        registry.retained_ceilings.insert(
+            PanelId::new(99),
+            RetainedGrantCeiling {
+                ended_generation: Generation(9),
+                grants: set(&["panel.create"]),
+            },
+        );
+
+        let refused = registry
+            .dispose_panel(handle.id, epoch)
+            .expect_err("the bound release must reach the fail-closed tombstone write");
+        assert!(matches!(refused, PanelError::ResourceExhausted { .. }));
+        assert!(
+            registry.is_panel_capability_granted(handle.id, controller, "panel.focus"),
+            "a fail-closed release keeps the bound row"
+        );
+        assert!(
+            registry.panels.contains_key(&handle.id.0),
+            "a failed release retires no record"
+        );
+
+        registry.retained_ceilings.remove(&PanelId::new(99));
+        registry
+            .dispose_panel(handle.id, epoch)
+            .expect("a bound panel disposes through the allocation epoch it was created with");
+        assert!(
+            !registry.panels.contains_key(&handle.id.0),
+            "the record is retired"
+        );
+        assert!(
+            matches!(
+                registry.panel_state(handle.id, epoch),
+                Err(PanelError::NotFound { .. })
+            ),
+            "the disposed identity resolves no record"
+        );
+        assert!(
+            registry.capabilities.is_empty(),
+            "the binding generation's grant row is released and none is left behind"
+        );
+        assert_eq!(
+            registry.retained_grant_ceiling_count(),
+            0,
+            "the ceiling written at the edge is dropped with the container"
+        );
+        assert_eq!(
+            registry.unbind_release_count(handle.id),
+            None,
+            "the release record is dropped with the container"
+        );
+        assert_eq!(
+            registry.error_count("StaleHandle"),
+            0,
+            "no caller presented a stale generation"
+        );
+    }
+
+    /// D-1: the rolled-back-create branch must clear the row under the binding
+    /// key, not the literal presented generation.
+    #[test]
+    fn a_bound_panel_that_never_mounted_disposes_without_leaking_a_grant_row() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        let controller = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
+        // A `Created` record holding an empty row under the bound key is not a
+        // controller (it mounted nothing and granted nothing), so disposal
+        // takes the rolled-back-create branch; the row still has to be removed
+        // under the binding key rather than the allocation epoch.
+        registry
+            .capabilities
+            .insert((handle.id, controller), BTreeSet::new());
+
+        registry
+            .dispose_panel(handle.id, epoch)
+            .expect("a bound panel that never mounted disposes");
+        assert!(
+            registry.capabilities.is_empty(),
+            "no grant row survives the container, whichever key it was written under"
+        );
+        assert!(
+            !registry.panels.contains_key(&handle.id.0),
+            "the record is retired"
+        );
+        assert_eq!(registry.retained_grant_ceiling_count(), 0);
     }
 }

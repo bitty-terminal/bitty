@@ -387,8 +387,8 @@ impl PanelRecord {
     ///
     /// Derived from the record's one binding, so an owner never exists without
     /// the controller generation that was written with it.
-    #[allow(dead_code)] // bitty#2476 residual 5: nothing binds, and the owner
-    // consumer is the tombstone key of residual 7.
+    #[allow(dead_code)] // bitty#2476 residual 7: the tombstone key is the only
+    // consumer; nothing binds yet, so it has no live caller.
     fn owner(&self) -> Option<&bitty_plugin_host::PluginId> {
         self.binding.as_ref().map(|binding| &binding.plugin_id)
     }
@@ -1508,6 +1508,12 @@ impl PanelRegistry {
     /// a stale handle is refused exactly as before. The generations released
     /// are the ones the record's binding names (OQ-084 D.2 phase 1), which is
     /// the allocation epoch while no controller is bound.
+    ///
+    /// The release is fail-closed across every key the fences can mint: the
+    /// binding generation is released first, and once that succeeded whatever
+    /// the writers left under the allocation epoch is swept before the record
+    /// goes (bitty#2476 residual 1). A refused release returns with every
+    /// family — including the epoch's rows and attributed overlays — intact.
     pub fn dispose_panel(
         &mut self,
         panel_id: PanelId,
@@ -1564,6 +1570,14 @@ impl PanelRegistry {
             self.capabilities.remove(&(panel_id, binding_key));
             self.release_attributed_overlays(panel_id, binding_key);
         }
+        // OQ-084 D.2 phase 1, bitty#2476 residual 1: the release above names the
+        // record's binding generation, but the writers in the tree key by the
+        // generation the handle carries, which the fence restricts to the
+        // allocation epoch. Sweep what was left under the epoch before the
+        // record goes, so no family keyed by a dead `PanelId` outlives its
+        // container. Reached only after a successful release, so a fail-closed
+        // release leaves every family in place.
+        self.sweep_allocation_epoch_families(panel_id, stored_gen);
         // Remove view attachment if any
         if let Some(view_id) = self.panel_to_view.remove(&panel_id) {
             self.view_to_panel.remove(&view_id);
@@ -1710,10 +1724,43 @@ impl PanelRegistry {
     /// Dismisses every overlay attributed to `(panel_id, generation)` and
     /// returns how many were released (OQ-084 A.2/D.4).
     fn release_attributed_overlays(&mut self, panel_id: PanelId, generation: Generation) -> usize {
+        self.dismiss_attributed_overlays_matching(|owner| *owner == (panel_id, generation))
+    }
+
+    /// Removes the generation-owned rows a panel can still own under its
+    /// allocation epoch and dismisses every overlay it still has attributed
+    /// (OQ-084 D.2 phase 1, bitty#2476 residual 1).
+    ///
+    /// [`Self::dispose_panel`] releases the record's binding generation, but
+    /// every writer in the tree keys its row by the generation the caller
+    /// presents and `get_panel` admits only the allocation epoch:
+    /// `grant_panel_capability`, `create_panel_overlay` and
+    /// `install_rebound_grants` all write under the epoch, while a bound
+    /// panel's release runs under the binding key. Those are the two keys the
+    /// fences can mint, and the release above already removed the binding one,
+    /// so the epoch is what is left to sweep. Without this a disposed bound
+    /// panel would leave a grant row — and attributed overlays — keyed by a
+    /// `PanelId` no live record names, which no later path can reclaim.
+    ///
+    /// The overlay pass is by panel id rather than by key: an attribution is a
+    /// live surface, so anything still attributed to this container is
+    /// dismissed whatever generation wrote it. Callers run this only after the
+    /// release succeeded, so a fail-closed release keeps every family intact.
+    fn sweep_allocation_epoch_families(&mut self, panel_id: PanelId, epoch: Generation) {
+        self.capabilities.remove(&(panel_id, epoch));
+        self.dismiss_attributed_overlays_matching(|owner| owner.0 == panel_id);
+    }
+
+    /// Dismisses every overlay whose attribution satisfies `matches` and
+    /// returns how many were released (OQ-084 A.2/D.4).
+    fn dismiss_attributed_overlays_matching(
+        &mut self,
+        matches: impl Fn(&(PanelId, Generation)) -> bool,
+    ) -> usize {
         let ids: Vec<u64> = self
             .overlay_attribution
             .iter()
-            .filter(|(_, owner)| **owner == (panel_id, generation))
+            .filter(|(_, owner)| matches(owner))
             .map(|(id, _)| *id)
             .collect();
         for id in &ids {
@@ -2798,6 +2845,23 @@ mod controller_binding_shape_tests {
         registry
             .capabilities
             .insert((handle.id, controller), set(&["panel.focus"]));
+        // The writers in the tree key by the generation the handle carries,
+        // which the fence restricts to the allocation epoch, so one panel can
+        // hold a row and a surface under its epoch while the binding names a
+        // controller generation (bitty#2476 residual 1).
+        registry
+            .grant_panel_capability(handle.id, epoch, "panel.create")
+            .expect("grant under the allocation epoch");
+        let epoch_overlay = registry
+            .create_panel_overlay(
+                handle.id,
+                epoch,
+                UiOverlayKind::NonModal,
+                UiRect::new(0, 0, 20, 10),
+                "epoch surface",
+                None,
+            )
+            .expect("overlay under the allocation epoch");
         registry.retained_ceilings.insert(
             PanelId::new(99),
             RetainedGrantCeiling {
@@ -2813,6 +2877,15 @@ mod controller_binding_shape_tests {
         assert!(
             registry.is_panel_capability_granted(handle.id, controller, "panel.focus"),
             "a fail-closed release keeps the bound row"
+        );
+        assert!(
+            registry.capabilities.contains_key(&(handle.id, epoch)),
+            "a fail-closed release keeps the epoch's row too"
+        );
+        assert_eq!(
+            registry.overlay_attribution_of(epoch_overlay),
+            Some((handle.id, epoch)),
+            "a fail-closed release dismisses no attributed overlay"
         );
         assert!(
             registry.panels.contains_key(&handle.id.0),
@@ -2836,7 +2909,17 @@ mod controller_binding_shape_tests {
         );
         assert!(
             registry.capabilities.is_empty(),
-            "the binding generation's grant row is released and none is left behind"
+            "the binding generation's grant row is released and the epoch's row with it"
+        );
+        assert_eq!(
+            registry.attributed_overlay_count(),
+            0,
+            "no overlay stays attributed to a disposed panel"
+        );
+        assert_eq!(
+            registry.overlay_len(),
+            0,
+            "the epoch's surface is dismissed with the container"
         );
         assert_eq!(
             registry.retained_grant_ceiling_count(),
@@ -2870,6 +2953,12 @@ mod controller_binding_shape_tests {
         registry
             .capabilities
             .insert((handle.id, controller), BTreeSet::new());
+        // The writers in the tree key by the generation the handle carries,
+        // which the fence restricts to the allocation epoch, so the same
+        // container can hold a row under that key too (bitty#2476 residual 1).
+        registry
+            .capabilities
+            .insert((handle.id, epoch), BTreeSet::new());
 
         registry
             .dispose_panel(handle.id, epoch)
@@ -2883,5 +2972,74 @@ mod controller_binding_shape_tests {
             "the record is retired"
         );
         assert_eq!(registry.retained_grant_ceiling_count(), 0);
+    }
+
+    /// D-3: disposal is fail-closed across every key the fences can mint. The
+    /// release names the binding generation, but every writer in the tree keys
+    /// by the generation the handle carries — the allocation epoch — so a
+    /// disposed bound panel must not leave a grant row or an attributed
+    /// overlay behind under that key (bitty#2476 residual 1).
+    #[test]
+    fn a_bound_panel_disposes_the_rows_and_overlays_its_allocation_epoch_owns() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        // The live path: grant and overlay through the handle's allocation
+        // epoch, then mount, then bind a controller generation.
+        registry
+            .grant_panel_capability(handle.id, epoch, "panel.create")
+            .expect("grant under the allocation epoch");
+        let overlay = registry
+            .create_panel_overlay(
+                handle.id,
+                epoch,
+                UiOverlayKind::NonModal,
+                UiRect::new(0, 0, 20, 10),
+                "epoch surface",
+                None,
+            )
+            .expect("overlay under the allocation epoch");
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect("mount panel");
+        let controller = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
+
+        assert!(
+            registry.capabilities.contains_key(&(handle.id, epoch)),
+            "the fixture holds a row under the epoch the release does not name"
+        );
+        assert_eq!(
+            registry.overlay_attribution_of(overlay),
+            Some((handle.id, epoch)),
+            "the fixture holds a surface under the epoch the release does not name"
+        );
+
+        registry
+            .dispose_panel(handle.id, epoch)
+            .expect("a bound panel disposes through its allocation epoch");
+
+        assert!(
+            !registry.panels.contains_key(&handle.id.0),
+            "the record is retired"
+        );
+        assert!(
+            registry.capabilities.is_empty(),
+            "no grant row outlives the container, under the epoch or the binding key"
+        );
+        assert_eq!(
+            registry.attributed_overlay_count(),
+            0,
+            "no overlay stays attributed to a disposed panel"
+        );
+        assert_eq!(
+            registry.overlay_len(),
+            0,
+            "an overlay attributed to the epoch is dismissed with the container"
+        );
+        assert_eq!(
+            registry.error_count("StaleHandle"),
+            0,
+            "no caller presented a stale generation"
+        );
     }
 }

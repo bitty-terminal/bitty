@@ -132,12 +132,20 @@ audio.spectrum = true
 #   or `nerd` (Nerd Fonts v3 Material Design glyphs). An unknown value paints
 #   `ascii` and reports one bounded diagnostic. Glyphs stay opt-in because a
 #   terminal without the font paints replacement boxes.
+# - `max_length` bounds each rendered module atom in display cells with a
+#   trailing ellipsis (`…`) when positive (`1..256`); `0` (default) leaves
+#   module atoms unbounded within the band ceiling.
+# - `rewrite` declares ordered Lua pattern rewrite rules (`<pattern>=><replacement>`)
+#   applied to module values before template formatting; `[]` (default) applies
+#   no rewrites.
 show = { type = "bool", default = true }
 edge = { type = "string", default = "bottom" }
 show_single = { type = "bool", default = false }
 name_max_chars = { type = "int", default = 32 }
 label = { type = "string", default = "index" }
 icons = { type = "string", default = "ascii" }
+max_length = { type = "int", default = 0 }
+rewrite = { type = "string-array", default = [] }
 modules_left = { type = "string-array", default = ["workspaces"] }
 modules_center = { type = "string-array", default = ["clock"] }
 modules_right = { type = "string-array", default = ["network", "cpu", "memory", "battery"] }

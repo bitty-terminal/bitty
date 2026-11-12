@@ -19,8 +19,12 @@
 
 use bitty_runtime::{
     AnimationPolicy, PresentStats, Runtime, RuntimeConfig, SYNC_UPDATE_DEFER_TIMEOUT,
-    SYNC_UPDATE_MAX_DEFER_TIMEOUT, ViewId,
+    SYNC_UPDATE_MAX_DEFER_TIMEOUT,
 };
+// Only the `#[cfg(unix)]` pane-session test names `ViewId`; importing it
+// unconditionally would be a dead import under `-D warnings` on Windows.
+#[cfg(unix)]
+use bitty_runtime::ViewId;
 use std::time::{Duration, Instant};
 
 /// Host-font-free runtime (CTX-0492 seam): the composited RGBA derives from

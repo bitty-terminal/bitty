@@ -767,6 +767,16 @@ pub struct Runtime {
     /// plugin services (`bitty.ui.mount`/`ui.update` attach through it), so
     /// this is the one scene store, never a second one (CTX-1641).
     scene_host: Option<std::rc::Rc<std::cell::RefCell<crate::registry::PanelRuntime>>>,
+    /// Report of the panel sweep the most recent workspace close ran
+    /// (OQ-084 C.9).
+    ///
+    /// `None` until a workspace close meets an installed panel host. The
+    /// report is the FS-4-style evidence for that close: one
+    /// [`registry::PanelDisposalRecord`](crate::registry::PanelDisposalRecord)
+    /// per disposed panel, the per-panel outcomes, and any panels the sweep
+    /// refused or never attempted. It is diagnostics only — the close itself
+    /// never fails because of it.
+    last_workspace_panel_disposal: Option<crate::registry::WorkspaceDisposeReport>,
     /// Scene revision consumed by the last presented frame (CTX-1641).
     ///
     /// `PanelRuntime::scene_revision` bumps on every attach/detach/dispose;
@@ -2324,6 +2334,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            last_workspace_panel_disposal: None,
             presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),
             scene_frame: self::scene_present::SceneFrameReport::default(),
@@ -2656,6 +2667,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            last_workspace_panel_disposal: None,
             presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),
             scene_frame: self::scene_present::SceneFrameReport::default(),

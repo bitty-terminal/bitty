@@ -387,14 +387,46 @@ impl PanelRuntime {
     ) -> Result<(), PanelError> {
         let result = self.registry.dispose_panel(id, generation);
         if result.is_ok() {
-            let _ = self.placement.unbind(id);
-            self.leases.remove(&id);
-            if self.scenes.remove(&id).is_some() {
-                self.scene_revision = self.scene_revision.saturating_add(1);
-            }
-            self.scene_paints.remove(&id);
+            self.release_panel_mirrors(id);
         }
         result
+    }
+
+    /// Disposes every panel attributed to `workspace` (OQ-084 C.9), focused
+    /// panel first, and releases the facade-owned families of C.8 for each
+    /// disposed panel.
+    ///
+    /// The registry's [`PanelRegistry::dispose_workspace_panels`] owns the
+    /// ordering, the per-panel all-or-nothing disposal, the FS-4-style records,
+    /// and the fail-fast report. The families the registry cannot release are
+    /// the ones this facade owns — the live [`Placement`] mirror of the view
+    /// attachment, the panel's lease entry, and its render scene slot (C.8's
+    /// `Focused -> Disposed` requires both) — so they are released here for
+    /// exactly the panels the report says were disposed, in the same order.
+    /// Panels the report refused or never attempted keep their mirrors, so a
+    /// refused sweep leaves no view bound to a half-released container.
+    #[must_use]
+    pub fn dispose_workspace_panels(
+        &mut self,
+        workspace: WorkspaceId,
+    ) -> super::panel::WorkspaceDisposeReport {
+        let report = self.registry.dispose_workspace_panels(workspace);
+        for panel in report.disposed() {
+            self.release_panel_mirrors(panel);
+        }
+        report
+    }
+
+    /// Releases the facade's own bindings for a panel the registry retired
+    /// (RUN-21 lease entry, OQ-051 scene slot and its paint cache, and the
+    /// live placement mirror of the registry's attachment).
+    fn release_panel_mirrors(&mut self, id: super::panel::PanelId) {
+        let _ = self.placement.unbind(id);
+        self.leases.remove(&id);
+        if self.scenes.remove(&id).is_some() {
+            self.scene_revision = self.scene_revision.saturating_add(1);
+        }
+        self.scene_paints.remove(&id);
     }
 
     /// Acquires an idle panel's lease for `holder` for `term_ticks` host

@@ -4511,7 +4511,7 @@ impl Runtime {
             .map_or(&self.state, |session| &session.state);
         let primary_visible = self
             .primary_view
-            .is_none_or(|id| self.find_view(id).is_some() && self.paints_primary_grid(&id));
+            .is_some_and(|id| self.find_view(id).is_some() && self.paints_primary_grid(&id));
         (primary_visible && primary_state.modes().synchronized_update)
             || self.pane_sessions.iter().any(|(id, session)| {
                 let state = if swapped_pane == Some(*id) {

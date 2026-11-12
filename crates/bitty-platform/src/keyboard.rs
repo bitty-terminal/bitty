@@ -808,13 +808,13 @@ pub fn encode_key_event_kitty_protocol(
         } else {
             None
         };
-        let embed = if report_associated_text {
+        let embed = if report_associated_text && pressed {
             event
                 .text
                 .as_deref()
                 .filter(|text| !text.is_empty())
                 .or_else(|| {
-                    (pressed && !chars.is_ascii() && !disambiguated_chord && !is_keypad)
+                    (!chars.is_ascii() && !disambiguated_chord && !is_keypad)
                         .then_some(chars.as_str())
                 })
         } else {
@@ -2359,6 +2359,12 @@ mod tests {
         assert_eq!(
             encode_key_event_kitty_protocol(&e_acute_release, 0, flags_with_text),
             Some(b"\x1b[233;1:3u".to_vec())
+        );
+        let e_acute_release_with_text = kitty_char("é", Some("é"), PressState::Released, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&e_acute_release_with_text, 0, flags_with_text),
+            Some(b"\x1b[233;1:3u".to_vec()),
+            "key release must never embed associated text even when the backend supplies event.text"
         );
         let textless_cjk_press = kitty_char("中", None, PressState::Pressed, false);
         assert_eq!(

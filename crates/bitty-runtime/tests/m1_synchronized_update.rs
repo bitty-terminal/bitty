@@ -497,4 +497,20 @@ fn pane_session_covered_primary_grid_does_not_hold_presentation() {
         !rt.synchronized_update_active(),
         "nothing holds presentation after both grids leave the mode"
     );
+
+    // Closing a live primary session clears `primary_view` to `None`; a stale
+    // `DECSET 2026` on `self.state` must still not hold presentation after the
+    // covering pane session is removed.
+    assert!(rt.close_pane_session(&ViewId::new(1)));
+    rt.spawn_shell("/bin/sh").expect("primary shell must spawn");
+    assert!(
+        rt.synchronized_update_active(),
+        "live primary session with DECSET 2026 holds presentation before close"
+    );
+    assert!(rt.close_primary_session());
+    assert_eq!(rt.primary_view(), None);
+    assert!(
+        !rt.synchronized_update_active(),
+        "closed primary session with primary_view == None must not hold presentation"
+    );
 }

@@ -774,17 +774,27 @@ pub fn encode_key_event_kitty_protocol(
             None
         };
         let is_keypad = keypad_code.is_some();
+        let report_associated_text = report_text && report_all;
+        let multi_char = chars.chars().nth(1).is_some();
         // Issue #3122: non-ASCII or multi-codepoint text-producing character
         // events without a disambiguated modifier chord (for example remote
         // desktop X11/XWayland key injection or composed text delivered via
         // `LogicalKey::Character` such as CJK, emoji, or kaomoji) have no
-        // physical key entry in the Kitty keyboard protocol table. Returning
-        // `None` falls back to the UTF-8 text path on press/repeat and stays
-        // silent on release, matching Ghostty's `kittyKeyEntry` fallback so
-        // TUIs enabling flags like `11` (`DISAMBIGUATE | REPORT_EVENTS |
-        // REPORT_ALL_KEYS`) without `REPORT_TEXT` (`16`) receive the UTF-8
-        // text instead of dropping it into a text-less `CSI <codepoint> u`.
-        if (!chars.is_ascii() || chars.chars().count() > 1) && !disambiguated_chord && !is_keypad {
+        // physical key entry in the Kitty keyboard protocol table. When
+        // associated text reporting (`REPORT_TEXT | REPORT_ALL_KEYS`) is not
+        // active — or when the logical key carries multiple codepoints —
+        // returning `None` falls back to the UTF-8 text path on press/repeat
+        // and stays silent on release, matching Ghostty's `kittyKeyEntry`
+        // fallback so TUIs enabling flags like `11` (`DISAMBIGUATE |
+        // REPORT_EVENTS | REPORT_ALL_KEYS`) without `REPORT_TEXT` (`16`)
+        // receive the UTF-8 text instead of dropping it into a text-less
+        // `CSI <codepoint> u`. When `REPORT_TEXT` is active on a
+        // single-codepoint non-ASCII key, keep the `CSI u` path and embed the
+        // character codepoint on press/repeat even if `event.text` was omitted.
+        if ((!chars.is_ascii() && !report_associated_text) || multi_char)
+            && !disambiguated_chord
+            && !is_keypad
+        {
             return None;
         }
         let code = keypad_code.unwrap_or(plain_code);
@@ -798,8 +808,15 @@ pub fn encode_key_event_kitty_protocol(
         } else {
             None
         };
-        let embed = if report_text && report_all {
-            event.text.as_deref().filter(|text| !text.is_empty())
+        let embed = if report_associated_text && pressed {
+            event
+                .text
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .or_else(|| {
+                    (!chars.is_ascii() && !disambiguated_chord && !is_keypad)
+                        .then_some(chars.as_str())
+                })
         } else {
             None
         };
@@ -2319,6 +2336,46 @@ mod tests {
             encode_key_event_kitty_protocol(&ctrl_cjk, KITTY_MOD_CTRL, flags),
             Some(b"\x1b[20013;5u".to_vec()),
             "explicit Ctrl chord on a non-ASCII character still disambiguates"
+        );
+
+        // When `REPORT_TEXT` (`16`) is also negotiated (flags `27` =
+        // `DISAMBIGUATE | REPORT_EVENTS | REPORT_ALL_KEYS | REPORT_TEXT`),
+        // single-codepoint non-ASCII keys emit `CSI u` frames with embedded
+        // associated text on press/repeat and no embedded text on release,
+        // including when `event.text` is absent on synthetic X11/XWayland
+        // key injection. Multi-codepoint sequences still fall back to raw UTF-8.
+        let flags_with_text = flags | KITTY_FLAG_REPORT_TEXT;
+        let e_acute_press = kitty_char("é", Some("é"), PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&e_acute_press, 0, flags_with_text),
+            Some(b"\x1b[233;;233u".to_vec())
+        );
+        let e_acute_repeat = kitty_char("é", Some("é"), PressState::Pressed, true);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&e_acute_repeat, 0, flags_with_text),
+            Some(b"\x1b[233;1:2;233u".to_vec())
+        );
+        let e_acute_release = kitty_char("é", None, PressState::Released, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&e_acute_release, 0, flags_with_text),
+            Some(b"\x1b[233;1:3u".to_vec())
+        );
+        let e_acute_release_with_text = kitty_char("é", Some("é"), PressState::Released, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&e_acute_release_with_text, 0, flags_with_text),
+            Some(b"\x1b[233;1:3u".to_vec()),
+            "key release must never embed associated text even when the backend supplies event.text"
+        );
+        let textless_cjk_press = kitty_char("中", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&textless_cjk_press, 0, flags_with_text),
+            Some(b"\x1b[20013;;20013u".to_vec())
+        );
+        let kaomoji_press = kitty_char("╰(°▽°)╯", Some("╰(°▽°)╯"), PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&kaomoji_press, 0, flags_with_text),
+            None,
+            "multi-codepoint text still falls back to raw UTF-8 under REPORT_TEXT"
         );
     }
 

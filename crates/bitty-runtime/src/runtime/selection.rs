@@ -2852,7 +2852,7 @@ impl Runtime {
             self.pending_full_redraw = true;
             return true;
         }
-        self.deliver_paste_bytes(text.as_bytes());
+        self.deliver_paste_bytes_bracketed(&text);
         false
     }
 
@@ -3100,10 +3100,6 @@ impl Runtime {
         );
         self.publish_inspect_snapshot();
         true
-    }
-
-    pub(super) fn deliver_paste_bytes(&mut self, bytes: &[u8]) {
-        self.write_input(bytes);
     }
 
     pub(super) fn deliver_paste_bytes_bracketed(&mut self, text: &str) {

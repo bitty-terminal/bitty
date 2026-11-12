@@ -4498,23 +4498,28 @@ impl Runtime {
     /// (see [`SYNC_UPDATE_DEFER_TIMEOUT`]).
     #[must_use]
     pub fn synchronized_update_active(&self) -> bool {
-        if self.workspaces.len() <= 1 && self.scratchpad.is_empty() {
-            return self.state.modes().synchronized_update
-                || self
-                    .pane_sessions
-                    .values()
-                    .any(|session| session.state.modes().synchronized_update);
-        }
-        // Issue #3122: when multiple workspaces or a parked scratchpad exist,
-        // scope the presentation hold to sessions visible in the active
-        // workspace (tiling tree, detached floats, or window-global pins) so a
-        // background workspace's TUI cannot defer frames in the active one.
+        // Issue #3122: scope the presentation hold to sessions visible in the
+        // active workspace (tiling tree, detached floats, or window-global
+        // pins) AND actually painted by their owning view (`paints_primary_grid`
+        // for the primary state, so a primary grid covered by a `PaneSession`
+        // cannot hold presentation). Account for `self.kitty_origin` when
+        // queried inside `handle_pane_bytes`, where `self.state` and the active
+        // pane session's `state` are temporarily swapped.
+        let swapped_pane = self.kitty_origin.map(ViewId::new);
+        let primary_state = swapped_pane
+            .and_then(|id| self.pane_sessions.get(&id))
+            .map_or(&self.state, |session| &session.state);
         let primary_visible = self
             .primary_view
-            .is_none_or(|id| self.find_view(id).is_some());
-        (primary_visible && self.state.modes().synchronized_update)
+            .is_some_and(|id| self.find_view(id).is_some() && self.paints_primary_grid(&id));
+        (primary_visible && primary_state.modes().synchronized_update)
             || self.pane_sessions.iter().any(|(id, session)| {
-                self.find_view(*id).is_some() && session.state.modes().synchronized_update
+                let state = if swapped_pane == Some(*id) {
+                    &self.state
+                } else {
+                    &session.state
+                };
+                self.find_view(*id).is_some() && state.modes().synchronized_update
             })
     }
 

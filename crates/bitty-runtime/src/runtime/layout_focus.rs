@@ -8,7 +8,7 @@ use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
 use bitty_ui::{
     SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, largest_splittable_leaf,
-    splittable_axis, splittable_rect,
+    splittable_rect,
 };
 use core::ops::{Deref, DerefMut};
 
@@ -3807,7 +3807,7 @@ impl Runtime {
                     (
                         focused,
                         focused_rect,
-                        splittable_axis(focused_rect, gap_in)?,
+                        Self::window_split_axis(self.container, focused_rect, gap_in)?,
                         false,
                         None,
                     )
@@ -3822,7 +3822,7 @@ impl Runtime {
                     (target, rect, axis, false, None)
                 } else {
                     let phase = self.panel_spiral_phase(focused);
-                    match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
+                    match Self::spiral_axis(self.container, focused_rect, gap_in) {
                         Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
                         None => {
                             // Issue #2571 review: the focused Spiral slot can
@@ -3854,29 +3854,54 @@ impl Runtime {
         })
     }
 
-    /// Axis half of the clockwise Spiral rotation.
+    /// Hyprland-style window-dimension split axis for `Dwindle` and `Spiral`.
     ///
-    /// The rotation starts from the container's balanced axis rather than
-    /// always opening horizontally: a wide window opens Right, a tall one
-    /// opens Down, and each following press turns 90 degrees. The sequence is
-    /// clockwise from that base, so a tall window reads Down -> Right -> Up ->
-    /// Left rather than the literal Right -> Down -> Left -> Up of a wide
-    /// window. Phases 0/2 use the base axis and phases
-    /// 1/3 the perpendicular one; phases 2/3 place the new pane first
-    /// (left/top). Deriving the axis from the cell aspect alone collapsed the
-    /// rotation into Right -> Right -> Left -> Left on ordinary windows. When
-    /// the phase axis cannot host two gap-aware panes, the perpendicular axis
-    /// keeps the chord working; `None` means neither fits and the caller takes
-    /// the Balanced fallback.
-    fn spiral_axis(container: UiRect, rect: UiRect, phase: u8, gap_in: u16) -> Option<SplitAxis> {
-        let base = balanced_split_axis(container);
-        let preferred = if phase % 2 == 0 {
-            base
-        } else {
-            match base {
-                SplitAxis::Horizontal => SplitAxis::Vertical,
-                SplitAxis::Vertical => SplitAxis::Horizontal,
+    /// Evaluates the target pane's own `Width` vs `Height` relative to the
+    /// workspace container's orientation so that:
+    /// - when the target pane has `Width >= Height` (full workspace, quadrant,
+    ///   etc.), it splits vertically (`SplitAxis::Horizontal`: new pane on the
+    ///   Right, or Left in Spiral phase 2);
+    /// - when the target pane has `Width < Height` (such as a half-width left
+    ///   or right column after the initial split, even on wide 160x40 / 200x46
+    ///   grids), it splits horizontally (`SplitAxis::Vertical`: new pane Below,
+    ///   or Above in Spiral phase 3).
+    ///
+    /// When the preferred axis cannot host two gap-aware panes, falls back to
+    /// the perpendicular axis; returns `None` when neither axis fits.
+    fn window_split_axis(container: UiRect, rect: UiRect, gap_in: u16) -> Option<SplitAxis> {
+        let preferred = if container.width > 0 && container.height > 0 {
+            let rw = u64::from(rect.width);
+            let rh = u64::from(rect.height);
+            let cw = u64::from(container.width);
+            let ch = u64::from(container.height);
+            // `rw*ch` vs `rh*cw` is the pane's aspect normalised against the
+            // container, so both arms below compare one ratio `a` against a
+            // bound: `a = rw*ch / (rh*cw)`. Horizontal containers keep their
+            // default (side-by-side) only for `a >= 2/3`; vertical containers
+            // leave their default (stacked) only for `a >= 3/2`. The two
+            // bounds are deliberately asymmetric: together they define an
+            // ambiguous band `a in [2/3, 3/2]` in which the container's own
+            // base axis wins, so a near-square pane cannot oscillate between
+            // split policies on tiny aspect changes. Products are u64-safe
+            // (u16^3 fits) and avoid the f32 rounding of a division.
+            match balanced_split_axis(container) {
+                SplitAxis::Horizontal => {
+                    if 3 * rw * ch >= 2 * rh * cw {
+                        SplitAxis::Horizontal
+                    } else {
+                        SplitAxis::Vertical
+                    }
+                }
+                SplitAxis::Vertical => {
+                    if 2 * rw * ch >= 3 * rh * cw {
+                        SplitAxis::Horizontal
+                    } else {
+                        SplitAxis::Vertical
+                    }
+                }
             }
+        } else {
+            balanced_split_axis(rect)
         };
         if splittable_rect(rect, preferred, gap_in) {
             return Some(preferred);
@@ -3888,14 +3913,38 @@ impl Runtime {
         splittable_rect(rect, fallback, gap_in).then_some(fallback)
     }
 
+    /// Axis half of the Spiral split: the pane's own normalised aspect.
+    ///
+    /// The axis comes from [`Self::window_split_axis`] -- the target pane's own
+    /// `Width`/`Height` normalised against the container's base axis -- so
+    /// moving focus off the creation chain (for example `Mod+h` to the left
+    /// half-width pane after one `Mod+N`) splits that tall pane horizontally
+    /// (`SplitAxis::Vertical`, placing the new pane Below) instead of
+    /// re-splitting it into narrow columns using the root container's base
+    /// axis.
+    ///
+    /// The clockwise Right -> Down -> Left -> Up chain is a consequence of that
+    /// aspect heuristic, not of phase parity: every split halves the target, so
+    /// the child that stays focused is tall after a Right split and wide after a
+    /// Down split, which flips the axis on the following press. The phase only
+    /// selects the trailing side at the call site
+    /// (`place_new_first = phase >= 2`: Left/Above instead of Right/Below); it
+    /// never chooses the axis.
+    fn spiral_axis(container: UiRect, rect: UiRect, gap_in: u16) -> Option<SplitAxis> {
+        Self::window_split_axis(container, rect, gap_in)
+    }
+
     /// Spiral phase for the next split when `focused` continues the creation
     /// chain (issue #2528).
     ///
-    /// Continues the clockwise rotation only while the pane created by the
-    /// previous `NewPanel` still holds focus; any other active pane (a
-    /// survivor after a close, a click elsewhere) restarts at phase 0
-    /// (Right). The old leaf-count phase flipped to Left after a close and
-    /// reversed the split direction.
+    /// The phase no longer rotates the split axis -- [`Self::spiral_axis`]
+    /// derives that from the pane's normalised aspect. It now selects only the
+    /// trailing side: phases 0/1 place the new pane after the target
+    /// (Right/Below), phases 2/3 before it (Left/Above). It still advances only
+    /// while the pane created by the previous `NewPanel` holds focus; any other
+    /// active pane (a survivor after a close, a click elsewhere) restarts at
+    /// phase 0 (Right). The old leaf-count phase flipped to Left after a close
+    /// and reversed the split direction.
     fn panel_spiral_phase(&self, focused: ViewId) -> u8 {
         match self.panel_spiral {
             Some((view, phase)) if view == focused => phase,
@@ -4707,6 +4756,202 @@ mod tests {
         assert_eq!(plan.spiral_phase, Some(2));
         assert!(plan.place_new_first);
         let _ = second;
+    }
+
+    #[test]
+    fn spiral_and_dwindle_split_left_panel_vertically_after_focus_move_h() {
+        for mode in [PanelLayoutMode::Spiral, PanelLayoutMode::Dwindle] {
+            for container in [
+                UiRect::new(0, 0, 80, 24),
+                UiRect::new(0, 0, 160, 40),
+                UiRect::new(0, 0, 200, 46),
+            ] {
+                let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+                rt.set_panel_layout_mode(mode);
+                rt.set_container(container);
+
+                let p1 = rt.focused_view().expect("seed focus");
+                let first_plan = rt.panel_split_plan().expect("initial split plan");
+                assert_eq!(first_plan.target, p1);
+                assert_eq!(
+                    first_plan.axis,
+                    SplitAxis::Horizontal,
+                    "initial full-workspace panel (Width >= Height) must split vertically (Right) in {mode:?} at {container:?}"
+                );
+                assert!(!first_plan.place_new_first);
+                let p2 = apply_new_panel(&mut rt);
+                assert_eq!(rt.focused_view(), Some(p2));
+
+                // Move focus back to the left half-width panel P1 (Mod+h):
+                // P1 now has Width < Height, so pressing Mod+N must split P1
+                // horizontally (SplitAxis::Vertical, placing P3 Below P1),
+                // never into two narrow side-by-side columns.
+                assert!(rt.set_focus(p1));
+                let second_plan = rt.panel_split_plan().expect("left panel split plan");
+                assert_eq!(second_plan.target, p1);
+                assert_eq!(
+                    second_plan.axis,
+                    SplitAxis::Vertical,
+                    "left half-width panel P1 (Width < Height) after Mod+h must split horizontally (Below) in {mode:?} at {container:?}"
+                );
+                assert!(
+                    !second_plan.place_new_first,
+                    "new panel P3 must be placed below P1 in {mode:?} at {container:?}"
+                );
+            }
+        }
+    }
+
+    /// Review defect 3: the horizontal-container threshold
+    /// (`3*rw*ch >= 2*rh*cw`, i.e. normalised pane aspect `>= 2/3`) is exact.
+    /// A pane exactly on the bound keeps the container's side-by-side default;
+    /// one column narrower crosses into the stacked policy. Both rects are
+    /// splittable on *both* axes, so only the threshold decides.
+    #[test]
+    fn window_split_axis_horizontal_container_boundary_is_exactly_two_thirds() {
+        // 160x40 container: `balanced_split_axis` is Horizontal (2*40 < 160).
+        let container = UiRect::new(0, 0, 160, 40);
+        assert_eq!(balanced_split_axis(container), SplitAxis::Horizontal);
+
+        // a = rw*ch / (rh*cw) = 80*40 / (30*160) = 2/3 exactly: 3*80*40 ==
+        // 2*30*160, so this pane sits exactly on the `>=` arm.
+        let exact = UiRect::new(0, 0, 80, 30);
+        assert_eq!(
+            Runtime::window_split_axis(container, exact, 0),
+            Some(SplitAxis::Horizontal),
+            "a pane exactly at the 2/3 bound keeps the horizontal container's default"
+        );
+
+        // One column narrower: a = 79*40 / (30*160) = 79/120 < 2/3, and
+        // 3*79*40 (= 9480) < 2*30*160 (= 9600) places it below the bound.
+        let below = UiRect::new(0, 0, 79, 30);
+        assert_eq!(
+            Runtime::window_split_axis(container, below, 0),
+            Some(SplitAxis::Vertical),
+            "one column below the 2/3 bound must switch to the stacked policy"
+        );
+    }
+
+    /// Review defect 3: the vertical-container threshold
+    /// (`2*rw*ch >= 3*rh*cw`, i.e. normalised pane aspect `>= 3/2`) is exact,
+    /// and it is *not* the reciprocal of the horizontal one -- the asymmetry is
+    /// what opens the ambiguous `[2/3, 3/2]` band.
+    #[test]
+    fn window_split_axis_vertical_container_boundary_is_exactly_three_halves() {
+        // 40x50 container: `balanced_split_axis` is Vertical (2*50 > 40).
+        let container = UiRect::new(0, 0, 40, 50);
+        assert_eq!(balanced_split_axis(container), SplitAxis::Vertical);
+
+        // a = rw*ch / (rh*cw) = 36*50 / (30*40) = 3/2 exactly: 2*36*50 ==
+        // 3*30*40, so this pane sits exactly on the `>=` arm.
+        let exact = UiRect::new(0, 0, 36, 30);
+        assert_eq!(
+            Runtime::window_split_axis(container, exact, 0),
+            Some(SplitAxis::Horizontal),
+            "a pane exactly at the 3/2 bound leaves the vertical container's default"
+        );
+
+        // One column narrower: a = 35*50 / (30*40) < 3/2, and 2*35*50
+        // (= 3500) < 3*30*40 (= 3600) places it below the bound.
+        let below = UiRect::new(0, 0, 35, 30);
+        assert_eq!(
+            Runtime::window_split_axis(container, below, 0),
+            Some(SplitAxis::Vertical),
+            "one column below the 3/2 bound stays stacked"
+        );
+    }
+
+    /// Review defect 3: a square pane in a square container sits mid-band, so
+    /// the container's own base axis (never the pane's raw squareness) wins.
+    #[test]
+    fn window_split_axis_square_pane_in_square_container_keeps_base_axis() {
+        let container = UiRect::new(0, 0, 40, 40);
+        let base = balanced_split_axis(container);
+        assert_eq!(base, SplitAxis::Vertical, "2*40 > 40: a square base stacks");
+        assert_eq!(
+            Runtime::window_split_axis(container, UiRect::new(0, 0, 20, 20), 0),
+            Some(base),
+            "a square pane must not override the container's base axis"
+        );
+    }
+
+    /// Review defect 3: the perpendicular fallback branch. A wide container
+    /// prefers the stacked axis for this narrow pane, but seven rows cannot
+    /// host two gap-aware rows, so the side-by-side axis is returned instead.
+    /// When neither axis fits, the helper reports `None`.
+    #[test]
+    fn window_split_axis_falls_back_to_perpendicular_axis_then_none() {
+        // 120x24 container: base Horizontal, and 120/24 is wide enough that a
+        // narrow pane still lands below the 2/3 bound.
+        let container = UiRect::new(0, 0, 120, 24);
+        assert_eq!(balanced_split_axis(container), SplitAxis::Horizontal);
+
+        // a = 21*24 / (7*120) = 0.6 and 3*21*24 (= 1512) < 2*7*120
+        // (= 1680), so the aspect heuristic prefers Vertical;
+        // 7 rows give 3-row children (< MIN_PANE_ROWS), so Vertical must fail
+        // while 21 columns still give 10-column children.
+        let pane = UiRect::new(0, 0, 21, 7);
+        assert!(
+            !splittable_rect(pane, SplitAxis::Vertical, 0),
+            "7 rows cannot host two gap-aware rows"
+        );
+        assert!(
+            splittable_rect(pane, SplitAxis::Horizontal, 0),
+            "21 columns can host two gap-aware columns"
+        );
+        assert_eq!(
+            Runtime::window_split_axis(container, pane, 0),
+            Some(SplitAxis::Horizontal),
+            "the perpendicular axis is the documented fallback"
+        );
+
+        // 19 columns (and the same 7 rows) fit neither axis.
+        let unfittable = UiRect::new(0, 0, 19, 7);
+        assert!(!splittable_rect(unfittable, SplitAxis::Horizontal, 0));
+        assert!(!splittable_rect(unfittable, SplitAxis::Vertical, 0));
+        assert_eq!(
+            Runtime::window_split_axis(container, unfittable, 0),
+            None,
+            "neither axis fits, so no split axis is offered"
+        );
+    }
+
+    /// Issue #2696 acceptance: four `Mod+N` presses in Spiral mode on a stock
+    /// 80x24 terminal walk Right -> Below -> Left -> Above, with `axis` and
+    /// `place_new_first` read from [`PanelSplitPlan`] before each press.
+    ///
+    /// The axis sequence comes from the pane-aspect heuristic (each split
+    /// halves the pane, so the retained child alternates wide/tall); the phase
+    /// only flips the trailing side at presses three and four.
+    #[test]
+    fn spiral_four_presses_rotate_right_below_left_above() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        rt.focused_view().expect("seed focus");
+
+        // Expected (axis, place_new_first, spiral_phase) per press.
+        let expected = [
+            (SplitAxis::Horizontal, false, Some(0)), // Right
+            (SplitAxis::Vertical, false, Some(1)),   // Below
+            (SplitAxis::Horizontal, true, Some(2)),  // Left
+            (SplitAxis::Vertical, true, Some(3)),    // Above
+        ];
+        let labels = ["Right", "Below", "Left", "Above"];
+        let mut observed = Vec::new();
+        for (press, (axis, side, phase)) in expected.iter().enumerate() {
+            let plan = rt.panel_split_plan().expect("plan for every press");
+            observed.push((plan.axis, plan.place_new_first, plan.spiral_phase));
+            assert_eq!(
+                (plan.axis, plan.place_new_first, plan.spiral_phase),
+                (*axis, *side, *phase),
+                "press {} must be {}",
+                press + 1,
+                labels[press]
+            );
+            apply_new_panel(&mut rt);
+        }
+        assert_eq!(observed.len(), 4);
     }
 
     /// Issue #2521 / #2571 review: a layout where neither the focused Spiral

@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "2da1c87571b6641b5361b46fe12f60c5e052c940";
+pub const SOURCE_REVISION: &str = "3307ffa446477cf3f9b76e037c59100899c49fe9";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -33,8 +33,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-featured.devtools",
         name: "Bitty DevTools",
         repository: "https://github.com/bitty-terminal/devtools.git",
-        pin: "4e8e96804bb924c8e18af608678b45346434529c",
-        manifest_hash: "sha256:a8c4755f02254e0f8c085755279f5b25951e55b02423730afe0f85ae02678f26",
+        pin: "badde42a18da6262876ff275a33ff4964a2ccb5e",
+        manifest_hash: "sha256:8dbbab2287687272c12f96d5b8ebc18b8c1f492c08ac422a393a06e990b73267",
         compat_bitty: Some(">=0.0.21"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only inspection and event tracing of the Bitty plugin runtime.",
@@ -44,11 +44,22 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.bar",
         name: "Unified Bar",
         repository: "https://github.com/bitty-terminal/bar.git",
-        pin: "7b6beb1f8d785eaa5e7cb4d9b951b732bd14d25b",
-        manifest_hash: "sha256:651cd54d78f0f85d8db5faf745fa12b10f4a12703029b7d8646140816535c0c8",
+        pin: "a00f26974c51bb2067f70302cca2dcef6685436f",
+        manifest_hash: "sha256:327837b4fea90e9f90529c7761db9539ded0627937735f01ebc370a22a705bfb",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),
         description: "Consolidated workspace-bar, tabs, and statusline presentation over generic chrome insets.",
+        license: Some("MIT"),
+    },
+    OfficialPlugin {
+        id: "bitty-terminal.beacon",
+        name: "Beacon",
+        repository: "https://github.com/bitty-terminal/beacon.git",
+        pin: "88e5998dfc1d5158d11d244cde41c2d28b0a9050",
+        manifest_hash: "sha256:f84ef7369c377b6433a6805952c6b2344b37939e3e8a66abc47aff393f0a33c7",
+        compat_bitty: Some(">=0.0.31"),
+        compat_plugin_api: Some("^1.0"),
+        description: "Spatial and semantic workspace targeting policy (Action x Target) over the live target registry and label allocator.",
         license: Some("MIT"),
     },
     OfficialPlugin {
@@ -132,7 +143,7 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.palette",
         name: "Palette",
         repository: "https://github.com/bitty-terminal/palette.git",
-        pin: "5169d9748cdfa988c5715ed96292eb2be131b841",
+        pin: "62a5dd263bf7564c98f7052314e89eaadddf8b41",
         manifest_hash: "sha256:53e334de7f98631f68af21495d1dc9c40c7ed27211cdab5062ed0c95ef191547",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),

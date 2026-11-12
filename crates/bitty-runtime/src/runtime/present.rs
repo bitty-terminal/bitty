@@ -2204,6 +2204,9 @@ impl Runtime {
             if now.saturating_duration_since(burst) < super::SYNC_UPDATE_MAX_DEFER_TIMEOUT {
                 self.sync_defer_since = Some(now);
             }
+        } else {
+            self.sync_defer_since = None;
+            self.sync_burst_since = None;
         }
         if self.present_settle.is_zero() {
             return;

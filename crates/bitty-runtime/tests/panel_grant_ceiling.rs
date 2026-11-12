@@ -337,41 +337,51 @@ fn consent_widens_only_inside_the_successor_resolution() {
     assert_eq!(granted, set(&[CREATE, FOCUS]));
 }
 
+/// A live row on a record that binds nothing is not a ceiling (OQ-084 D.2
+/// phase 0, `N-15`).
+///
+/// The state is what an edge release leaves behind when its tombstone write did
+/// not complete: the predecessor ended, the release did not, and the row is
+/// diagnostic evidence. It used to be read as the ceiling — which handed the
+/// successor a capability the predecessor's released set never contained. The
+/// still-bound half of `PGO-22(a)` (the live row wins over a stale tombstone)
+/// lives in `registry::panel::rebind_panel_tests`, where the tombstone can be
+/// held beside a binding.
 #[test]
-fn a_live_row_wins_over_the_retired_tombstone() {
+fn a_live_row_on_an_unbound_record_is_refused_not_consumed() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE], 10);
     reg.release_generation_scope(panel, generation)
         .expect("edge release");
-
-    // Synthetic still-bound predecessor: an earlier edge left a tombstone while
-    // a live row now exists for the same panel. Phase 0 takes the live row;
-    // reading the tombstone would grant `CREATE` the live row does not hold.
+    // The failed-release signature: the writers fence on the allocation epoch,
+    // so a row can appear under it after the binding is gone.
     reg.grant_panel_capability(panel, generation, FOCUS)
-        .expect("live regrant");
+        .expect("orphan row");
 
-    let granted = reg
+    let error = reg
         .install_rebound_grants(
             panel,
             generation,
             &set(&[CREATE, FOCUS, OVERLAY]),
             &BTreeSet::new(),
         )
-        .expect("rebind install");
-    assert_eq!(
-        granted,
-        set(&[FOCUS]),
-        "the live row is P when a predecessor is still bound"
+        .expect_err("the orphan row is not a source");
+    assert!(
+        matches!(error, PanelError::CeilingLost { .. }),
+        "the refusal is the lost-ceiling class, got {error:?}"
     );
     assert!(
         !reg.is_panel_capability_granted(panel, generation, CREATE),
-        "the tombstone is not consulted while a live row exists"
+        "nothing is installed from the orphan row"
     );
-    assert!(reg.retained_grant_ceiling(panel).is_none());
+    assert!(
+        reg.is_panel_capability_granted(panel, generation, FOCUS),
+        "the orphan row is left untouched as evidence"
+    );
 }
 
 #[test]
-fn a_successful_install_retires_the_ceiling() {
+fn a_successful_install_keeps_the_ceiling_until_the_bind_commits() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE], 5);
     reg.release_generation_scope(panel, generation)
@@ -381,8 +391,9 @@ fn a_successful_install_retires_the_ceiling() {
     reg.install_rebound_grants(panel, generation, &set(&[CREATE]), &BTreeSet::new())
         .expect("rebind install");
     assert!(
-        reg.retained_grant_ceiling(panel).is_none(),
-        "retention ends at the panel's next successful bind"
+        reg.retained_grant_ceiling(panel).is_some(),
+        "D.2 phase 2 step 3 retires the ceiling, not step 1: an install that \
+         never became a binding must not lose it"
     );
 }
 

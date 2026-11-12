@@ -245,6 +245,14 @@ impl PollBudget {
         )
     }
 
+    fn promote_to_synchronized(&mut self) {
+        self.max_chunks = self.max_chunks.max(POLL_PTY_SYNC_MAX_CHUNKS);
+        self.max_bytes = self
+            .max_bytes
+            .max(POLL_PTY_SYNC_MAX_CHUNKS * bitty_pty::READ_CHUNK_SIZE);
+        self.time_budget = self.time_budget.max(POLL_PTY_SYNC_TIME_BUDGET);
+    }
+
     fn with_limits(max_chunks: usize, max_bytes: usize, time_budget: std::time::Duration) -> Self {
         Self {
             start: std::time::Instant::now(),
@@ -270,6 +278,40 @@ impl PollBudget {
     }
 }
 
+/// Drains `source_count` sources under one shared `budget`, visiting them in
+/// order from `first` and wrapping. `step(index, budget)` pulls and processes
+/// one chunk for `index`, returning its byte length when a chunk was drained.
+///
+/// Running `step` inside the loop lets `budget.allows_another()` account for
+/// the real wall-clock cost of VT parsing and grid application rather than
+/// only channel `try_recv` calls.
+fn drain_fair_budgeted(
+    budget: &mut PollBudget,
+    first: usize,
+    source_count: usize,
+    mut step: impl FnMut(usize, &mut PollBudget) -> Option<usize>,
+) -> usize {
+    if source_count == 0 {
+        return 0;
+    }
+    let mut drained = 0usize;
+    for offset in 0..source_count {
+        let index = (first + offset) % source_count;
+        while budget.allows_another() {
+            let Some(len) = step(index, budget) else {
+                break;
+            };
+            debug_assert!(len <= bitty_pty::READ_CHUNK_SIZE);
+            budget.charge(len);
+            drained = drained.saturating_add(1);
+        }
+        if !budget.allows_another() {
+            break;
+        }
+    }
+    drained
+}
+
 /// Drains `sources` under one shared `budget`, visiting them in order from
 /// `first` and wrapping. Each source drains until it is empty or the budget
 /// is spent. Returns `(source index, chunk)` in drain order.
@@ -277,27 +319,19 @@ impl PollBudget {
 /// Fairness comes from the caller rotating `first` every poll: a source
 /// that leads a poll drains at least one available chunk, so every busy
 /// source progresses at least once per `sources.len()` polls.
+#[cfg(test)]
 fn drain_fair(
     budget: &mut PollBudget,
     first: usize,
     sources: &mut [&mut dyn FnMut() -> Option<Vec<u8>>],
 ) -> Vec<(usize, Vec<u8>)> {
-    let count = sources.len();
     let mut out = Vec::new();
-    for offset in 0..count {
-        let index = (first + offset) % count;
-        while budget.allows_another() {
-            let Some(chunk) = (sources[index])() else {
-                break;
-            };
-            debug_assert!(chunk.len() <= bitty_pty::READ_CHUNK_SIZE);
-            budget.charge(chunk.len());
-            out.push((index, chunk));
-        }
-        if !budget.allows_another() {
-            break;
-        }
-    }
+    drain_fair_budgeted(budget, first, sources.len(), |index, _| {
+        let chunk = (sources[index])()?;
+        let len = chunk.len();
+        out.push((index, chunk));
+        Some(len)
+    });
     out
 }
 
@@ -745,54 +779,47 @@ impl Runtime {
         } else {
             PollBudget::new()
         };
-        let mut primary: Vec<Vec<u8>> = Vec::new();
+        let mut seeded_count = 0usize;
         if let Some(seed) = seed {
             budget.charge(seed.len());
-            primary.push(seed);
+            self.handle_pty_bytes(&seed);
+            if self.synchronized_update_active() {
+                budget.promote_to_synchronized();
+            }
+            seeded_count = 1;
         }
         let panes: Vec<ViewId> = self.pane_sessions.keys().copied().collect();
         let first = self.pty_poll_turn % (panes.len() + 1);
         self.pty_poll_turn = self.pty_poll_turn.wrapping_add(1);
-        let drained: Vec<(usize, Vec<u8>)> = {
-            // Collect without holding an immutable borrow across the
-            // mutable `handle_*_bytes` calls (borrow checker).
-            let mut primary_next = || self.try_next_primary_chunk();
-            let mut pane_nexts: Vec<_> = self
-                .pane_sessions
-                .values()
-                .map(|session| move || session.try_next_chunk())
-                .collect();
-            let mut sources: Vec<&mut dyn FnMut() -> Option<Vec<u8>>> =
-                Vec::with_capacity(pane_nexts.len() + 1);
-            sources.push(&mut primary_next);
-            for next in &mut pane_nexts {
-                sources.push(next);
-            }
-            drain_fair(&mut budget, first, &mut sources)
-        };
+        let drained_count =
+            drain_fair_budgeted(&mut budget, first, panes.len() + 1, |index, budget| {
+                let chunk = match index.checked_sub(1) {
+                    None => {
+                        let chunk = self.try_next_primary_chunk()?;
+                        self.handle_pty_bytes(&chunk);
+                        chunk
+                    }
+                    Some(pane) => {
+                        let id = panes[pane];
+                        let chunk = self.pane_sessions.get(&id)?.try_next_chunk()?;
+                        self.handle_pane_bytes(id, &chunk);
+                        let _ = self.write_pane_replies(id);
+                        chunk
+                    }
+                };
+                if self.synchronized_update_active() {
+                    budget.promote_to_synchronized();
+                }
+                Some(chunk.len())
+            });
         let budget_exhausted = !budget.allows_another();
-        let mut pane_chunks: Vec<(ViewId, Vec<u8>)> = Vec::new();
-        for (source, chunk) in drained {
-            match source.checked_sub(1) {
-                None => primary.push(chunk),
-                Some(pane) => pane_chunks.push((panes[pane], chunk)),
-            }
-        }
-        let count = primary.len() + pane_chunks.len();
-        for chunk in primary {
-            self.handle_pty_bytes(&chunk);
-        }
+        let count = seeded_count + drained_count;
         // Bounded PTY reply loop: parse->state->replies->writer (4 KiB cap, fail-closed)
         // Headless (no writer) keeps replies queued for `take_replies` observation.
         let _ = self.write_replies();
-        // CTX-0176: pane chunks run through the same bounded pipeline, each
-        // pane's replies go to its own writer, and the global input-mode
-        // caches re-sync to the focused leaf.
+        // CTX-0176: re-sync global input-mode caches to the focused leaf after
+        // any pane drain.
         if !panes.is_empty() {
-            for (id, chunk) in pane_chunks {
-                self.handle_pane_bytes(id, &chunk);
-                let _ = self.write_pane_replies(id);
-            }
             self.sync_mode_caches_to_focus();
         }
         // CTX-1110: completions for reads enqueued above that already
@@ -1864,6 +1891,17 @@ impl Runtime {
             })
             .flatten();
             let damage = self.state.apply(&action);
+            if matches!(
+                &action,
+                TerminalAction::SetMode {
+                    mode: bitty_vt::Mode::SynchronizedUpdate,
+                    enabled: false,
+                } | TerminalAction::FullReset
+            ) && !self.synchronized_update_active()
+            {
+                self.sync_defer_since = None;
+                self.sync_burst_since = None;
+            }
             // #2442: swap the origin's image plane at the mode transition
             // itself (not only on the next tick), so a `?1049h`/`a=T` pair
             // in one PTY batch lands on the alt plane and a leave restores
@@ -2416,21 +2454,43 @@ mod tests {
         );
         let rx = session(POLL_PTY_SYNC_MAX_CHUNKS + 16, false);
         let mut next = || rx.try_recv().ok();
-        let mut budget = PollBudget::synchronized();
-        let drained = drain_fair(&mut budget, 0, &mut [&mut next]);
-        assert!(
-            drained.len() > POLL_PTY_MAX_CHUNKS,
-            "sync burst drained {} chunks, ordinary budget is {POLL_PTY_MAX_CHUNKS}",
-            drained.len()
+        // Use a generous wall-clock budget here so slow CI runners exercise
+        // the chunk/byte burst ceiling deterministically.
+        let mut budget = PollBudget::with_limits(
+            POLL_PTY_SYNC_MAX_CHUNKS,
+            POLL_PTY_SYNC_MAX_CHUNKS * bitty_pty::READ_CHUNK_SIZE,
+            std::time::Duration::from_secs(60),
         );
-        assert!(
-            drained.len() <= POLL_PTY_SYNC_MAX_CHUNKS,
-            "sync burst drained {} chunks, bound is {POLL_PTY_SYNC_MAX_CHUNKS}",
-            drained.len()
+        let drained = drain_fair(&mut budget, 0, &mut [&mut next]);
+        assert_eq!(
+            drained.len(),
+            POLL_PTY_SYNC_MAX_CHUNKS,
+            "sync burst must drain up to POLL_PTY_SYNC_MAX_CHUNKS"
         );
         assert!(
             rx.try_recv().is_ok(),
             "the tail left over the burst bound stays queued for the next poll"
+        );
+    }
+
+    #[test]
+    fn synchronized_budget_stops_when_step_processing_exhausts_time_budget() {
+        let rx = session(8, false);
+        let mut budget = PollBudget::synchronized();
+        let drained = drain_fair_budgeted(&mut budget, 0, 1, |_, budget| {
+            let chunk = rx.try_recv().ok()?;
+            // Simulate VT parsing + grid apply spending the time budget on the
+            // first chunk.
+            budget.start = std::time::Instant::now() - POLL_PTY_SYNC_TIME_BUDGET * 2;
+            Some(chunk.len())
+        });
+        assert_eq!(
+            drained, 1,
+            "drain_fair_budgeted must stop as soon as step processing exhausts the time budget"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "remaining chunks stay queued for the next poll"
         );
     }
 

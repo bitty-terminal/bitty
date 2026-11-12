@@ -19,7 +19,7 @@
 
 use bitty_runtime::{
     AnimationPolicy, PresentStats, Runtime, RuntimeConfig, SYNC_UPDATE_DEFER_TIMEOUT,
-    SYNC_UPDATE_MAX_DEFER_TIMEOUT,
+    SYNC_UPDATE_MAX_DEFER_TIMEOUT, ViewId,
 };
 use std::time::{Duration, Instant};
 
@@ -405,5 +405,92 @@ fn background_workspace_synchronized_update_does_not_defer_active_workspace() {
     assert!(
         !rt.synchronized_update_active(),
         "background workspace DECSET 2026 must not hold the active workspace"
+    );
+}
+
+/// Issue #3126: when a synchronized batch exits with `\x1b[?2026l` and a new
+/// batch begins before `tick_at` runs, the burst clock resets on the mode exit
+/// so the new batch gets a fresh `SYNC_UPDATE_MAX_DEFER_TIMEOUT` allowance.
+#[test]
+fn back_to_back_synchronized_batches_without_intermediate_tick_reset_burst_clock() {
+    let mut rt = harness();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    let t0 = Instant::now();
+
+    // First batch runs for 700 ms (no tick after mode exit).
+    rt.handle_pty_bytes(b"\x1b[?2026hbatch-1");
+    rt.note_present_input_at(t0);
+    assert!(rt.tick_at(t0).is_none());
+    let t_first_end = t0 + Duration::from_millis(700);
+    for step in 1..=10 {
+        let now = t0 + Duration::from_millis(step * 65);
+        rt.handle_pty_bytes(b".");
+        rt.note_present_input_at(now);
+        assert!(rt.tick_at(now).is_none());
+    }
+    rt.handle_pty_bytes(b"\x1b[?2026l");
+    rt.note_present_input_at(t_first_end);
+
+    // Second batch starts at 710 ms BEFORE any tick_at commits batch 1, and
+    // streams for another 600 ms (1310 ms from t0, well past t0 + 1000 ms,
+    // but only 600 ms from batch 2's own start).
+    let t_second_start = t0 + Duration::from_millis(710);
+    rt.handle_pty_bytes(b"\x1b[?2026hbatch-2");
+    rt.note_present_input_at(t_second_start);
+    assert!(rt.tick_at(t_second_start).is_none());
+    for step in 1..=9 {
+        let now = t_second_start + Duration::from_millis(step * 65);
+        rt.handle_pty_bytes(b"+");
+        rt.note_present_input_at(now);
+        assert!(
+            rt.tick_at(now).is_none(),
+            "batch 2 at +{} ms from its own start must still be deferred",
+            step * 65
+        );
+    }
+    let t_second_end = t_second_start + Duration::from_millis(600);
+    rt.handle_pty_bytes(b"\x1b[?2026l");
+    rt.note_present_input_at(t_second_end);
+    assert!(
+        rt.tick_at(t_second_end).is_some(),
+        "closing batch 2 commits the frame"
+    );
+}
+
+/// Issue #3126: a primary grid whose leaf owns a `PaneSession` is not painted,
+/// so its `DECSET 2026` must not hold presentation — including in the single
+/// workspace layout that used to take an unconditional `self.state` fast path.
+/// The covering session's own `DECSET 2026` still holds, so the gate narrows to
+/// the grid that is actually painted instead of dropping the mode.
+#[cfg(unix)]
+#[test]
+fn pane_session_covered_primary_grid_does_not_hold_presentation() {
+    bitty_test_support::require_pty!();
+    let mut rt = harness();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    assert_eq!(rt.primary_view(), Some(ViewId::new(1)));
+    rt.spawn_shell_for_view(ViewId::new(1), "/bin/sh", &["-c", "sleep 30"], 80, 24)
+        .expect("primary-owner pane shell must spawn");
+    assert!(
+        !rt.paints_primary_grid(&ViewId::new(1)),
+        "a pane session covers the primary grid"
+    );
+
+    rt.handle_pty_bytes(b"\x1b[?2026hhidden-primary");
+    assert!(
+        !rt.synchronized_update_active(),
+        "a covered primary grid's DECSET 2026 must not hold presentation"
+    );
+
+    // Positive control: the visible covering session's own mode still holds.
+    rt.handle_pane_bytes(ViewId::new(1), b"\x1b[?2026hpane-batch");
+    assert!(
+        rt.synchronized_update_active(),
+        "the visible covering pane's DECSET 2026 still holds presentation"
+    );
+    rt.handle_pane_bytes(ViewId::new(1), b"\x1b[?2026l");
+    assert!(
+        !rt.synchronized_update_active(),
+        "nothing holds presentation after both grids leave the mode"
     );
 }

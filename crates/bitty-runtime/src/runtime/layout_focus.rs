@@ -8,7 +8,7 @@ use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
 use bitty_ui::{
     SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, largest_splittable_leaf,
-    splittable_axis, splittable_rect,
+    splittable_rect,
 };
 use core::ops::{Deref, DerefMut};
 
@@ -3807,7 +3807,7 @@ impl Runtime {
                     (
                         focused,
                         focused_rect,
-                        splittable_axis(focused_rect, gap_in)?,
+                        Self::window_split_axis(self.container, focused_rect, gap_in)?,
                         false,
                         None,
                     )
@@ -3854,29 +3854,44 @@ impl Runtime {
         })
     }
 
-    /// Axis half of the clockwise Spiral rotation.
+    /// Hyprland-style window-dimension split axis for `Dwindle` and `Spiral`.
     ///
-    /// The rotation starts from the container's balanced axis rather than
-    /// always opening horizontally: a wide window opens Right, a tall one
-    /// opens Down, and each following press turns 90 degrees. The sequence is
-    /// clockwise from that base, so a tall window reads Down -> Right -> Up ->
-    /// Left rather than the literal Right -> Down -> Left -> Up of a wide
-    /// window. Phases 0/2 use the base axis and phases
-    /// 1/3 the perpendicular one; phases 2/3 place the new pane first
-    /// (left/top). Deriving the axis from the cell aspect alone collapsed the
-    /// rotation into Right -> Right -> Left -> Left on ordinary windows. When
-    /// the phase axis cannot host two gap-aware panes, the perpendicular axis
-    /// keeps the chord working; `None` means neither fits and the caller takes
-    /// the Balanced fallback.
-    fn spiral_axis(container: UiRect, rect: UiRect, phase: u8, gap_in: u16) -> Option<SplitAxis> {
-        let base = balanced_split_axis(container);
-        let preferred = if phase % 2 == 0 {
-            base
-        } else {
-            match base {
-                SplitAxis::Horizontal => SplitAxis::Vertical,
-                SplitAxis::Vertical => SplitAxis::Horizontal,
+    /// Evaluates the target pane's own `Width` vs `Height` relative to the
+    /// workspace container's orientation so that:
+    /// - when the target pane has `Width >= Height` (full workspace, quadrant,
+    ///   etc.), it splits vertically (`SplitAxis::Horizontal`: new pane on the
+    ///   Right, or Left in Spiral phase 2);
+    /// - when the target pane has `Width < Height` (such as a half-width left
+    ///   or right column after the initial split, even on wide 160x40 / 200x46
+    ///   grids), it splits horizontally (`SplitAxis::Vertical`: new pane Below,
+    ///   or Above in Spiral phase 3).
+    ///
+    /// When the preferred axis cannot host two gap-aware panes, falls back to
+    /// the perpendicular axis; returns `None` when neither axis fits.
+    fn window_split_axis(container: UiRect, rect: UiRect, gap_in: u16) -> Option<SplitAxis> {
+        let preferred = if container.width > 0 && container.height > 0 {
+            let rw = u64::from(rect.width);
+            let rh = u64::from(rect.height);
+            let cw = u64::from(container.width);
+            let ch = u64::from(container.height);
+            match balanced_split_axis(container) {
+                SplitAxis::Horizontal => {
+                    if 3 * rw * ch >= 2 * rh * cw {
+                        SplitAxis::Horizontal
+                    } else {
+                        SplitAxis::Vertical
+                    }
+                }
+                SplitAxis::Vertical => {
+                    if 2 * rw * ch >= 3 * rh * cw {
+                        SplitAxis::Horizontal
+                    } else {
+                        SplitAxis::Vertical
+                    }
+                }
             }
+        } else {
+            balanced_split_axis(rect)
         };
         if splittable_rect(rect, preferred, gap_in) {
             return Some(preferred);
@@ -3886,6 +3901,19 @@ impl Runtime {
             SplitAxis::Vertical => SplitAxis::Horizontal,
         };
         splittable_rect(rect, fallback, gap_in).then_some(fallback)
+    }
+
+    /// Axis half of the clockwise Spiral rotation.
+    ///
+    /// Each split inspects the target pane's own `Width` vs `Height` via
+    /// [`Self::window_split_axis`], so moving focus off the creation chain
+    /// (for example `Mod+h` to the left half-width pane after one `Mod+N`)
+    /// splits that tall pane horizontally (`SplitAxis::Vertical`, placing the
+    /// new pane Below) instead of re-splitting it into narrow columns using the
+    /// root container's base axis.
+    fn spiral_axis(container: UiRect, rect: UiRect, phase: u8, gap_in: u16) -> Option<SplitAxis> {
+        let _ = phase;
+        Self::window_split_axis(container, rect, gap_in)
     }
 
     /// Spiral phase for the next split when `focused` continues the creation
@@ -4707,6 +4735,50 @@ mod tests {
         assert_eq!(plan.spiral_phase, Some(2));
         assert!(plan.place_new_first);
         let _ = second;
+    }
+
+    #[test]
+    fn spiral_and_dwindle_split_left_panel_vertically_after_focus_move_h() {
+        for mode in [PanelLayoutMode::Spiral, PanelLayoutMode::Dwindle] {
+            for container in [
+                UiRect::new(0, 0, 80, 24),
+                UiRect::new(0, 0, 160, 40),
+                UiRect::new(0, 0, 200, 46),
+            ] {
+                let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+                rt.set_panel_layout_mode(mode);
+                rt.set_container(container);
+
+                let p1 = rt.focused_view().expect("seed focus");
+                let first_plan = rt.panel_split_plan().expect("initial split plan");
+                assert_eq!(first_plan.target, p1);
+                assert_eq!(
+                    first_plan.axis,
+                    SplitAxis::Horizontal,
+                    "initial full-workspace panel (Width >= Height) must split vertically (Right) in {mode:?} at {container:?}"
+                );
+                assert!(!first_plan.place_new_first);
+                let p2 = apply_new_panel(&mut rt);
+                assert_eq!(rt.focused_view(), Some(p2));
+
+                // Move focus back to the left half-width panel P1 (Mod+h):
+                // P1 now has Width < Height, so pressing Mod+N must split P1
+                // horizontally (SplitAxis::Vertical, placing P3 Below P1),
+                // never into two narrow side-by-side columns.
+                assert!(rt.set_focus(p1));
+                let second_plan = rt.panel_split_plan().expect("left panel split plan");
+                assert_eq!(second_plan.target, p1);
+                assert_eq!(
+                    second_plan.axis,
+                    SplitAxis::Vertical,
+                    "left half-width panel P1 (Width < Height) after Mod+h must split horizontally (Below) in {mode:?} at {container:?}"
+                );
+                assert!(
+                    !second_plan.place_new_first,
+                    "new panel P3 must be placed below P1 in {mode:?} at {container:?}"
+                );
+            }
+        }
     }
 
     /// Issue #2521 / #2571 review: a layout where neither the focused Spiral

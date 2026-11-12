@@ -316,7 +316,11 @@ fn bracketed_paste_is_defense_in_depth_only_never_bypasses_gate() {
     rt.clipboard_mut().set_text("clean".to_string()).unwrap();
     let insp = rt.paste_from_clipboard().unwrap().unwrap();
     assert!(!insp);
-    assert_eq!(rt.pending_input(), b"clean", "clean delivered immediately");
+    assert_eq!(
+        rt.pending_input(),
+        b"\x1b[200~clean\x1b[201~",
+        "clean delivered immediately with bracketed wrapping when ?2004 is on"
+    );
     // But suspicious paste still gated even with bracketed on
     rt.drain_pending_input();
     rt.clipboard_mut()

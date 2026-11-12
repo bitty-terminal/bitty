@@ -429,6 +429,115 @@ struct PanelBinding {
     controller_generation: Generation,
 }
 
+/// The predecessor ceiling phase 0 captured at bind entry (OQ-084 D.2 phase 0).
+///
+/// One immutable snapshot, stamped with the panel id, the predecessor's owner
+/// and controller generation, the captured ceiling set, and the bind attempt it
+/// belongs to. [`PanelRegistry::capture_rebind_source`] builds it; nothing
+/// inside a bind may re-read the live grant table after this exists, and the
+/// derivation in [`PanelRegistry::rebind_panel`] reads this snapshot only
+/// (D.1: "a bind is a pure function of that captured snapshot").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebindCapture {
+    panel_id: PanelId,
+    /// The bind attempt this snapshot is stamped with — the successor
+    /// controller generation the bind presents.
+    attempt: Generation,
+    /// The predecessor controller generation, or `None` on a panel that has
+    /// never been bound (the first-bind case, where `panel.create` is the
+    /// authorization and the whole resolution is granted).
+    predecessor_generation: Option<Generation>,
+    /// The predecessor's owner. `Some` only when the bind displaces a
+    /// still-bound predecessor, which is the one case the record still names
+    /// its owner: the retired-ceiling tombstone is not owner-keyed yet
+    /// (bitty#2476 residual 7), so the reload case has the generation but not
+    /// the owner. `None` is "not known here", never "no owner".
+    predecessor_owner: Option<bitty_plugin_host::PluginId>,
+    /// `None` means **absent** — no predecessor, so there is no ceiling and the
+    /// first bind commits `R`. `Some` is a real ceiling and may be empty: the
+    /// predecessor existed and held nothing, so nothing of it survives.
+    ceiling: Option<BTreeSet<String>>,
+}
+
+impl RebindCapture {
+    /// The panel this snapshot was taken for.
+    #[must_use]
+    pub const fn panel_id(&self) -> PanelId {
+        self.panel_id
+    }
+
+    /// The successor generation this bind attempt presents.
+    #[must_use]
+    pub const fn attempt(&self) -> Generation {
+        self.attempt
+    }
+
+    /// The predecessor controller generation, or `None` for a first bind.
+    #[must_use]
+    pub const fn predecessor_generation(&self) -> Option<Generation> {
+        self.predecessor_generation
+    }
+
+    /// The predecessor's owner, when the record still names it.
+    #[must_use]
+    pub fn predecessor_owner(&self) -> Option<&bitty_plugin_host::PluginId> {
+        self.predecessor_owner.as_ref()
+    }
+
+    /// The captured ceiling: `None` when no predecessor exists, `Some(∅)` when
+    /// the predecessor held nothing.
+    #[must_use]
+    pub fn ceiling(&self) -> Option<&BTreeSet<String>> {
+        self.ceiling.as_ref()
+    }
+
+    /// Whether this bind has no predecessor at all (the first bind).
+    #[must_use]
+    pub const fn is_first_bind(&self) -> bool {
+        self.predecessor_generation.is_none() && self.ceiling.is_none()
+    }
+}
+
+/// What one committed rebind did (OQ-084 D.2 phase 2).
+///
+/// Returned only after all three commit steps ran, so a caller that holds this
+/// value knows the panel is bound to `controller_generation` with `grants`
+/// installed and the predecessor's tombstone retired. A refused bind returns a
+/// `PanelError` and no value, and leaves the previous valid state intact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelRebind {
+    panel_id: PanelId,
+    predecessor_generation: Option<Generation>,
+    controller_generation: Generation,
+    grants: BTreeSet<String>,
+}
+
+impl PanelRebind {
+    /// The panel the bind moved.
+    #[must_use]
+    pub const fn panel_id(&self) -> PanelId {
+        self.panel_id
+    }
+
+    /// The generation the bind displaced, or `None` on a first bind.
+    #[must_use]
+    pub const fn predecessor_generation(&self) -> Option<Generation> {
+        self.predecessor_generation
+    }
+
+    /// The controller generation the panel is now bound to.
+    #[must_use]
+    pub const fn controller_generation(&self) -> Generation {
+        self.controller_generation
+    }
+
+    /// The installed panel-scoped grant set, `(R ∩ P) ∪ C` (D.1).
+    #[must_use]
+    pub fn grants(&self) -> &BTreeSet<String> {
+        &self.grants
+    }
+}
+
 /// The unbound container's placeholder (OQ-084 Decision E, bitty#2476
 /// residual 4).
 ///
@@ -527,8 +636,6 @@ impl PanelRecord {
     ///
     /// Derived from the record's one binding, so an owner never exists without
     /// the controller generation that was written with it.
-    #[allow(dead_code)] // bitty#2476 residual 7: the tombstone key is the only
-    // consumer; nothing binds yet, so it has no live caller.
     fn owner(&self) -> Option<&bitty_plugin_host::PluginId> {
         self.binding.as_ref().map(|binding| &binding.plugin_id)
     }
@@ -3037,23 +3144,157 @@ impl PanelRegistry {
         Ok(())
     }
 
+    /// Captures the predecessor ceiling at bind entry (OQ-084 D.2 phase 0).
+    ///
+    /// Reads and mutates nothing: the snapshot is a copy, the live grant row
+    /// stays where it is, and the caller's phase 1 removes it afterwards. The
+    /// source is selected once, in this order, and nowhere else:
+    ///
+    /// 1. **A still-bound predecessor** — the record names a controller — reads
+    ///    the live row keyed by that binding. The live row wins even when a
+    ///    tombstone for an older generation is present (PGO-22(a)). A bound
+    ///    predecessor holding no row is a ceiling of `∅`, not an absent
+    ///    ceiling: it existed, so nothing of it may widen the successor.
+    /// 2. **A live row with no binding, after a predecessor ended** is refused.
+    ///    That is the signature of an edge release whose tombstone write did
+    ///    not complete (A.2): the predecessor ended, the release did not, and
+    ///    the row is diagnostic evidence rather than a ceiling any successor
+    ///    may consume (N-15). Reported as [`PanelError::CeilingLost`], the same
+    ///    class D.2 gives the lost-record refusal, and the row is left
+    ///    untouched.
+    /// 3. **A tombstone that names the record's last controller generation**
+    ///    is the reload ceiling — the ordinary case, because generation `N` is
+    ///    disposed before `N+1` binds. A tombstone naming any other generation
+    ///    is a lost record and is refused the same way.
+    /// 4. **No predecessor at all** — a panel that has never been bound —
+    ///    yields an absent ceiling (`None`), not an empty one: the first bind
+    ///    commits the whole resolution because `panel.create` is the
+    ///    authorization. A never-bound panel's allocation-epoch row is not a
+    ///    predecessor either; the successor's own resolution is `R`, and the
+    ///    epoch row becomes unreadable once the binding names a controller
+    ///    generation (it is swept by the next edge release).
+    ///
+    /// Phase 0 stamps the snapshot with `attempt` so a caller can prove which
+    /// bind a ceiling belongs to. An empty tombstone is a real empty ceiling
+    /// (PGO-22(c)); only a missing source is refused.
+    ///
+    /// # Errors
+    /// `RegistryDisposed`, `NotFound` (unknown or disposed panel), or
+    /// `CeilingLost` when the predecessor's ceiling record is unusable.
+    pub fn capture_rebind_source(
+        &self,
+        panel_id: PanelId,
+        attempt: Generation,
+    ) -> Result<RebindCapture, PanelError> {
+        self.ensure_not_disposed()?;
+        let record = self.panels.get(&panel_id.0).ok_or(PanelError::NotFound {
+            kind: "panel",
+            id_raw: panel_id.0,
+        })?;
+        if record.state == UiPanelState::Disposed {
+            return Err(PanelError::NotFound {
+                kind: "panel",
+                id_raw: panel_id.0,
+            });
+        }
+        let bound = record.controller_generation();
+        let last = record.last_controller_generation;
+        let live_row = self
+            .capabilities
+            .get(&(panel_id, record.grant_key_generation()));
+
+        let (predecessor_generation, predecessor_owner, ceiling) = if let Some(predecessor) = bound
+        {
+            (
+                Some(predecessor),
+                record.owner().cloned(),
+                Some(live_row.cloned().unwrap_or_default()),
+            )
+        } else if live_row.is_some() && last.is_some() {
+            return Err(PanelError::CeilingLost {
+                panel_id,
+                bind_generation: attempt,
+                last_controller_generation: last,
+                tombstone_generation: self
+                    .retained_ceilings
+                    .get(&panel_id)
+                    .map(|ceiling| ceiling.ended_generation),
+            });
+        } else if let Some(ended) = last {
+            let Some(tombstone) = self.retained_ceilings.get(&panel_id) else {
+                return Err(PanelError::CeilingLost {
+                    panel_id,
+                    bind_generation: attempt,
+                    last_controller_generation: Some(ended),
+                    tombstone_generation: None,
+                });
+            };
+            if tombstone.ended_generation != ended {
+                return Err(PanelError::CeilingLost {
+                    panel_id,
+                    bind_generation: attempt,
+                    last_controller_generation: Some(ended),
+                    tombstone_generation: Some(tombstone.ended_generation),
+                });
+            }
+            (Some(ended), None, Some(tombstone.grants.clone()))
+        } else {
+            (None, None, None)
+        };
+
+        Ok(RebindCapture {
+            panel_id,
+            attempt,
+            predecessor_generation,
+            predecessor_owner,
+            ceiling,
+        })
+    }
+
+    /// The one derivation rule (OQ-084 D.1) as a pure function of a captured
+    /// ceiling: `(R ∩ P) ∪ C`.
+    ///
+    /// `P` can only subtract. An element of `P \ R` is dropped with no prompt,
+    /// and an element of `R \ P` needs an explicit consent for that capability
+    /// in `consented` — the predecessor's absence is never permission. With no
+    /// predecessor (`None`) the whole resolution is granted.
+    fn derive_grant_set(
+        ceiling: Option<&BTreeSet<String>>,
+        requested: &BTreeSet<String>,
+        consented: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let Some(ceiling) = ceiling else {
+            return requested.clone();
+        };
+        let mut grants: BTreeSet<String> = requested.intersection(ceiling).cloned().collect();
+        for capability in consented {
+            if requested.contains(capability) && !ceiling.contains(capability) {
+                grants.insert(capability.clone());
+            }
+        }
+        grants
+    }
+
     /// Derives a successor's panel-scoped grant set (OQ-084 D.1, D.2 phase 0).
     ///
     /// `grant(n+1) = (R ∩ P) ∪ C`, where `R` is `requested`, `P` is the
     /// predecessor ceiling, and `C` is the subset of `consented` that lies in
-    /// `R \ P`. Phase 0 prefers the live row when the predecessor is still
-    /// bound, then the retired-ceiling tombstone written at the predecessor's
-    /// edge. With no predecessor the whole resolution is granted with no
-    /// permission-diff consent: an absent predecessor is not an empty ceiling.
+    /// `R \ P`. The ceiling comes from [`Self::capture_rebind_source`], which
+    /// prefers the live row when the predecessor is still bound, then the
+    /// retired-ceiling tombstone written at the predecessor's edge. With no
+    /// predecessor the whole resolution is granted with no permission-diff
+    /// consent: an absent predecessor is not an empty ceiling.
     ///
-    /// A panel whose record names a previous controller generation must have a
-    /// tombstone for exactly that generation. A missing tombstone, or one that
-    /// names a different generation, means the ceiling record was lost: the
-    /// bind is refused rather than falling back to `R`.
+    /// `generation` is the handle's allocation epoch, the same fence every
+    /// other public panel entry takes. This is the pre-controller-generation
+    /// seam: it derives and returns the set without installing it, and a
+    /// production bind uses [`Self::rebind_panel`] instead, because a bind must
+    /// derive from its phase 0 snapshot rather than re-entering the capture
+    /// (D.1) and must not be able to observe a half-committed phase 2.
     ///
     /// # Errors
     /// `RegistryDisposed`, `NotFound`, `StaleHandle`, or `CeilingLost` when the
-    /// previous controller generation has no matching tombstone.
+    /// previous controller generation has no usable ceiling record.
     pub fn derive_rebind_grants(
         &self,
         panel_id: PanelId,
@@ -3061,59 +3302,23 @@ impl PanelRegistry {
         requested: &BTreeSet<String>,
         consented: &BTreeSet<String>,
     ) -> Result<BTreeSet<String>, PanelError> {
-        let record = self.get_panel(panel_id, generation)?;
-        let live_row = self
-            .capabilities
-            .get(&(panel_id, record.grant_key_generation()));
-        let predecessor = if let Some(live) = live_row {
-            // `D.2` phase 0: the live row wins over a tombstone. The row is
-            // keyed by the bound generation — the controller generation when
-            // one is bound, else the allocation epoch — not by the successor
-            // the caller presents, so a displaced still-bound predecessor is
-            // read here.
-            Some(live.clone())
-        } else if let Some(tombstone) = self.retained_ceilings.get(&panel_id) {
-            if record.last_controller_generation == Some(tombstone.ended_generation) {
-                Some(tombstone.grants.clone())
-            } else {
-                return Err(PanelError::CeilingLost {
-                    panel_id,
-                    bind_generation: generation,
-                    last_controller_generation: record.last_controller_generation,
-                    tombstone_generation: Some(tombstone.ended_generation),
-                });
-            }
-        } else if let Some(last) = record.last_controller_generation {
-            return Err(PanelError::CeilingLost {
-                panel_id,
-                bind_generation: generation,
-                last_controller_generation: Some(last),
-                tombstone_generation: None,
-            });
-        } else {
-            None
-        };
-        let Some(ceiling) = predecessor else {
-            // No predecessor: `panel.create` is the authorization and the first
-            // bind commits `R` with no permission-diff consent.
-            return Ok(requested.clone());
-        };
-        let mut grants: BTreeSet<String> = requested.intersection(&ceiling).cloned().collect();
-        for capability in consented {
-            if requested.contains(capability) && !ceiling.contains(capability) {
-                grants.insert(capability.clone());
-            }
-        }
-        Ok(grants)
+        self.get_panel(panel_id, generation)?;
+        let capture = self.capture_rebind_source(panel_id, generation)?;
+        Ok(Self::derive_grant_set(
+            capture.ceiling(),
+            requested,
+            consented,
+        ))
     }
 
-    /// Commits a rebind's derived grant set and retires the retired-ceiling
-    /// tombstone (OQ-084 D.2 phase 2 step 1).
+    /// Commits a rebind's derived grant set (OQ-084 D.2 phase 2 step 1).
     ///
     /// The set is written once, all-or-nothing: every element is validated
-    /// before any is installed. A successful install ends the tombstone's
-    /// lifetime — the retention rule is "until the panel's next successful
-    /// bind".
+    /// before any is installed. This is step 1 only — the retired-ceiling
+    /// tombstone is retired by [`Self::rebind_panel`] at step 3, after the
+    /// binding is written, so a bind that commits grants and then fails cannot
+    /// lose the ceiling its own retry needs. A caller that installs without
+    /// binding a controller keeps the tombstone.
     ///
     /// # Errors
     /// `NotFound`, `StaleHandle`, `CapabilityDenied` (nothing installed),
@@ -3142,8 +3347,214 @@ impl PanelRegistry {
         }
         self.capabilities
             .insert((panel_id, generation), grants.clone());
-        self.retained_ceilings.remove(&panel_id);
         Ok(grants)
+    }
+
+    /// Moves a mounted panel's controller binding from its current generation
+    /// to `successor` (OQ-084 D.2, bitty#2476 residual 2).
+    ///
+    /// This is the production bind. It is a pure function of one capture: phase
+    /// 0 reads the predecessor ceiling and stamps a snapshot, the derivation
+    /// runs against that snapshot, and phase 2 writes exactly that result once.
+    /// Nothing in this call re-reads the live grant table after phase 0.
+    ///
+    /// **Entry fences** run before the capture and before any mutation, so a
+    /// stale or conflicting attempt changes nothing:
+    ///
+    /// - the allocation epoch is never a controller generation (B.1/B.2), so a
+    ///   bind that presents it is refused as [`PanelError::ControllerConflict`];
+    /// - the generation the record already binds is not a move, and is refused
+    ///   as [`PanelError::ControllerConflict`] as well (PGO-8: at most one
+    ///   controller is ever recorded);
+    /// - a generation whose own binding already ended — the record's retained
+    ///   `last_controller_generation` with no binding — is refused as
+    ///   [`PanelError::ControllerReleased`], so a caller cannot resurrect a
+    ///   retired generation.
+    ///
+    /// **Phase 0** is [`Self::capture_rebind_source`] plus the derivation and
+    /// the capability validation of the derived set. Validating here, before
+    /// the predecessor is invalidated, is what makes a refused bind leave the
+    /// prior valid state intact: phase 2 step 1 then has nothing left that can
+    /// fail, so no caller can observe a panel whose predecessor was released
+    /// and whose successor holds an empty or partial set.
+    ///
+    /// **Phase 1** invalidates the predecessor in D.2's five-step order, and
+    /// every step that owns a registry table completes before phase 2:
+    ///
+    /// 1. the retired-ceiling tombstone (written before the live row is
+    ///    removed, so a failed write leaves the row in place), then the live
+    ///    row keyed by the displaced generation;
+    /// 2. the panel's queued events are cleared;
+    /// 3. capture handles and the overlay capture session have no registry
+    ///    table: the content/capture family is generation-scoped in the plugin
+    ///    host and released by `clear_ui_blocks` at suspend, dispose, and
+    ///    rollback. D.4's requirement on the bind is that it replay none of
+    ///    it, which the capture side of `tests/panel_rebind.rs` asserts;
+    /// 4. attributed overlays are dismissed — the generation-scoped pass
+    ///    inside the release, then a container-wide pass, because a writer
+    ///    that ran while no controller was bound attributed its surface under
+    ///    the allocation epoch, which the generation pass never matches;
+    /// 5. in-flight panel verbs have no queue either: a verb may not hold a
+    ///    panel reference across a yield, a callback boundary, or a queue
+    ///    drain, so the cancellation is delivered at use, where the controller
+    ///    fence refuses a predecessor verb with [`PanelError::ControllerReleased`].
+    ///
+    /// Steps 1, 2, 4 and the panel-command release are one fail-closed call to
+    /// [`Self::release_generation_scope`], which is also idempotent — on the
+    /// reload path the generation edge already ran and this repeats it as
+    /// defence in depth, answering `false`.
+    ///
+    /// **Callers.** The plugin runtime cannot reach this registry (the panel
+    /// host is app-owned), so the activation-time swap this bind exists for has
+    /// no caller in the tree yet: only the rebind tests drive it. The bind is
+    /// landed and tested ahead of that wiring rather than inventing an
+    /// activation path the app layer does not have.
+    ///
+    /// **Phase 2** commits in three steps and in this order: the derived set
+    /// keyed by the *controller* generation (not the allocation epoch), the
+    /// binding as one `(owner, controller generation)` pair, then the
+    /// predecessor's retired-ceiling tombstone is retired and the placeholder
+    /// cleared. The facade (`PanelRuntime::rebind_panel`) resets the lease to
+    /// `Idle` between the binding write and the return, so no verb is permitted
+    /// in the window D.2 names.
+    ///
+    /// # Errors
+    /// `RegistryDisposed`, `NotFound`, `ControllerConflict`,
+    /// `ControllerReleased`, `CeilingLost`, `CapabilityDenied`, and the
+    /// fail-closed `ResourceExhausted` of the tombstone write. Every one leaves
+    /// the previous valid state intact: a still-bound predecessor stays bound
+    /// on a phase 0 refusal, and a phase 1 refusal leaves the binding, the live
+    /// row, and every released family in place.
+    pub fn rebind_panel(
+        &mut self,
+        panel_id: PanelId,
+        successor: Generation,
+        owner: &bitty_plugin_host::PluginId,
+        requested: &BTreeSet<String>,
+        consented: &BTreeSet<String>,
+    ) -> Result<PanelRebind, PanelError> {
+        self.ensure_not_disposed()?;
+
+        // ------------------------------------------------------------------
+        // Entry fences — before the capture and before any mutation.
+        // ------------------------------------------------------------------
+        let (bound, last, epoch) = {
+            let record = self.panels.get(&panel_id.0).ok_or(PanelError::NotFound {
+                kind: "panel",
+                id_raw: panel_id.0,
+            })?;
+            if record.state == UiPanelState::Disposed {
+                return Err(PanelError::NotFound {
+                    kind: "panel",
+                    id_raw: panel_id.0,
+                });
+            }
+            (
+                record.controller_generation(),
+                record.last_controller_generation,
+                record.generation,
+            )
+        };
+        if successor == epoch {
+            // B.1/B.2: the allocation epoch names the container and never
+            // moves; a controller generation is a different value by
+            // construction, so presenting the epoch would collapse the two.
+            self.bump_error("ControllerConflict");
+            return Err(PanelError::ControllerConflict {
+                panel_id,
+                bound_generation: bound,
+                presented_generation: successor,
+            });
+        }
+        if bound == Some(successor) {
+            // PGO-8: a bind never installs a second controller, and a rebind
+            // to the binding already in force is not a move.
+            self.bump_error("ControllerConflict");
+            return Err(PanelError::ControllerConflict {
+                panel_id,
+                bound_generation: bound,
+                presented_generation: successor,
+            });
+        }
+        if bound.is_none() && last == Some(successor) {
+            // A generation whose own binding already ended may not be
+            // resurrected: its families were released and its ceiling belongs
+            // to the successor, not back to it.
+            self.bump_error("ControllerReleased");
+            return Err(PanelError::ControllerReleased {
+                panel_id,
+                released_generation: successor,
+            });
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 0 — capture, then validate. Reads and mutates nothing.
+        // ------------------------------------------------------------------
+        let capture = match self.capture_rebind_source(panel_id, successor) {
+            Ok(capture) => capture,
+            Err(error) => {
+                if matches!(error, PanelError::CeilingLost { .. }) {
+                    self.bump_error("CeilingLost");
+                }
+                return Err(error);
+            }
+        };
+        let grants = Self::derive_grant_set(capture.ceiling(), requested, consented);
+        // Validate before invalidate: every element of the set phase 2 will
+        // install is checked here, so the commit below cannot fail halfway.
+        for capability in &grants {
+            Self::check_panel_capability(panel_id, capability)?;
+        }
+
+        // ------------------------------------------------------------------
+        // Phase 1 — invalidate the predecessor, in D.2's order.
+        // ------------------------------------------------------------------
+        if let Some(predecessor) = capture.predecessor_generation() {
+            // Steps 1, 2, 4 and the command release in one fail-closed call.
+            // A refusal here leaves the binding, the live row, and every
+            // other family exactly as they were.
+            self.release_generation_scope(panel_id, predecessor)?;
+        }
+        // Step 4, second pass: whatever attribution is still on the container.
+        // The release above dismisses the predecessor *generation*'s overlays,
+        // but the writers in the tree key the allocation epoch while no
+        // controller generation is bound (`create_panel_overlay` fences on the
+        // epoch), so a predecessor's surface can sit under a key the
+        // generation pass never matches. At a bind the container changes hands:
+        // D.3 says overlay attribution does not survive, and a queued modal
+        // from the predecessor is never presented by the successor. This is
+        // also what makes the first bind of a container that already carries an
+        // attributed surface hand the successor an empty one.
+        self.dismiss_attributed_overlays_matching(|owner| owner.0 == panel_id);
+
+        // ------------------------------------------------------------------
+        // Phase 2 — commit, in D.2's order. Nothing below can fail.
+        // ------------------------------------------------------------------
+        // Step 1: the derived set, keyed by the controller generation.
+        self.capabilities
+            .insert((panel_id, successor), grants.clone());
+        // Step 2: the binding as one pair. The placeholder a predecessor's end
+        // presented is cleared with it: a controller owns the content again.
+        if let Some(record) = self.panels.get_mut(&panel_id.0) {
+            record.binding = Some(PanelBinding {
+                plugin_id: owner.clone(),
+                controller_generation: successor,
+            });
+            record.placeholder = None;
+        }
+        // Step 3: retire the predecessor's ceiling (D.2: "until the panel's
+        // next successful bind"). The tombstone table is keyed by panel id
+        // alone until bitty#2476 residual 7 re-keys it by owner, so this drops
+        // the panel's entry: a later bind must not consume a ceiling that has
+        // already been used. The facade resets the lease before returning.
+        self.retained_ceilings.remove(&panel_id);
+
+        Ok(PanelRebind {
+            panel_id,
+            predecessor_generation: capture.predecessor_generation(),
+            controller_generation: successor,
+            grants,
+        })
     }
 
     #[must_use]
@@ -3528,6 +3939,283 @@ mod grant_ceiling_tests {
             .expect("the newer tombstone is stored");
         assert_eq!(ceiling.ended_generation, newer);
         assert_eq!(ceiling.grants, set(&["panel.focus"]));
+    }
+}
+
+/// Phase 0 and phase 1 refusal tests for the production bind (OQ-084 D.2,
+/// bitty#2476 residual 2).
+///
+/// A module test, because two of the states these rules guard cannot be
+/// produced through the public surface: a stale tombstone beside a live binding,
+/// and a tombstone table that is full for a panel the registry still admits.
+/// Both are invariant violations the refusal exists to survive, so they are
+/// built here deliberately rather than through a path that would have to be
+/// wrong to reach them.
+#[cfg(test)]
+mod rebind_panel_tests {
+    use super::*;
+
+    const CREATE: &str = "panel.create";
+    const FOCUS: &str = "panel.focus";
+    const OVERLAY: &str = "panel.overlay";
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    fn owner(name: &str) -> bitty_plugin_host::PluginId {
+        bitty_plugin_host::PluginId::new(name).expect("valid plugin id")
+    }
+
+    fn empty() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    /// Creates and mounts a panel, then performs its first bind (the
+    /// `panel.create`-authorized one) onto a controller generation.
+    fn mounted_and_bound(
+        reg: &mut PanelRegistry,
+        grants: &[&str],
+    ) -> (PanelId, Generation, Generation) {
+        let handle = reg
+            .create_panel(PanelType::Helper, None)
+            .expect("create panel");
+        reg.mount_panel(handle.id, handle.generation, ViewId::new(1))
+            .expect("mount panel");
+        let controller = handle.generation.next().expect("controller generation");
+        reg.rebind_panel(
+            handle.id,
+            controller,
+            &owner("acme.notes"),
+            &set(grants),
+            &empty(),
+        )
+        .expect("first bind");
+        (handle.id, handle.generation, controller)
+    }
+
+    /// `PGO-22(a)`: a still-bound predecessor is read from its live row even
+    /// when an older tombstone is present, and the stale ceiling never widens
+    /// the successor.
+    #[test]
+    fn the_live_row_wins_over_a_stale_tombstone() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let (panel, _epoch, controller) = mounted_and_bound(&mut reg, &[CREATE]);
+        // The stale entry an earlier edge would have left. Only the private
+        // table can hold one beside a live binding.
+        reg.retain_grant_ceiling(panel, Generation(900), set(&[OVERLAY]))
+            .expect("stale tombstone");
+
+        let successor = controller.next().expect("successor generation");
+        let committed = reg
+            .rebind_panel(
+                panel,
+                successor,
+                &owner("acme.notes"),
+                &set(&[CREATE, OVERLAY]),
+                &empty(),
+            )
+            .expect("rebind");
+
+        assert_eq!(
+            committed.grants(),
+            &set(&[CREATE]),
+            "the live row is P; the stale tombstone is never consulted"
+        );
+        assert_eq!(committed.predecessor_generation(), Some(controller));
+        assert_eq!(committed.controller_generation(), successor);
+        assert!(
+            !reg.is_panel_capability_granted(panel, successor, OVERLAY),
+            "the stale ceiling does not widen the successor"
+        );
+        assert!(
+            reg.retained_grant_ceiling(panel).is_none(),
+            "a committed bind retires the tombstone it found"
+        );
+    }
+
+    /// `PGO-22(d)`: a panel that names a previous controller with no matching
+    /// ceiling record refuses the bind before any phase-1 step.
+    #[test]
+    fn a_missing_ceiling_is_refused_before_any_invalidation() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let (panel, _epoch, controller) = mounted_and_bound(&mut reg, &[CREATE]);
+        reg.release_generation_scope(panel, controller)
+            .expect("generation edge");
+        // The lost record: the edge ran, the tombstone is gone.
+        reg.retained_ceilings.remove(&panel);
+
+        let successor = controller.next().expect("successor generation");
+        let error = reg
+            .rebind_panel(
+                panel,
+                successor,
+                &owner("acme.notes"),
+                &set(&[CREATE, FOCUS]),
+                &empty(),
+            )
+            .expect_err("a lost ceiling refuses the bind");
+
+        assert_eq!(
+            error,
+            PanelError::CeilingLost {
+                panel_id: panel,
+                bind_generation: successor,
+                last_controller_generation: Some(controller),
+                tombstone_generation: None,
+            }
+        );
+        assert_eq!(
+            reg.controller_generation(panel),
+            None,
+            "a refused capture binds nothing"
+        );
+        assert!(
+            !reg.is_panel_capability_granted(panel, successor, CREATE),
+            "a refused bind installs nothing"
+        );
+        assert_eq!(
+            reg.error_count("CeilingLost"),
+            1,
+            "the refusal is counted once"
+        );
+    }
+
+    /// `N-15`/D.2 phase 0: a live row with no binding on the record — what a
+    /// failed edge release leaves behind — is diagnostic evidence, never a
+    /// ceiling a successor may consume.
+    #[test]
+    fn a_live_row_with_no_binding_is_refused_as_a_ceiling() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let (panel, epoch, controller) = mounted_and_bound(&mut reg, &[CREATE]);
+        reg.release_generation_scope(panel, controller)
+            .expect("generation edge");
+        // The failed-release signature: a row the ended generation's writers
+        // left under the allocation epoch. Reading it would hand the successor
+        // a capability the predecessor never held.
+        reg.capabilities.insert((panel, epoch), set(&[OVERLAY]));
+
+        let successor = controller.next().expect("successor generation");
+        let error = reg
+            .rebind_panel(
+                panel,
+                successor,
+                &owner("acme.notes"),
+                &set(&[OVERLAY]),
+                &empty(),
+            )
+            .expect_err("the orphan row is not a source");
+
+        assert!(
+            matches!(error, PanelError::CeilingLost { .. }),
+            "the row is refused as a lost ceiling, got {error:?}"
+        );
+        assert_eq!(
+            reg.capabilities.get(&(panel, epoch)),
+            Some(&set(&[OVERLAY])),
+            "the refused bind leaves the diagnostic row untouched"
+        );
+        assert!(
+            !reg.is_panel_capability_granted(panel, successor, OVERLAY),
+            "no successor row is installed"
+        );
+    }
+
+    /// `PGO-16`, at the step that can fail today: the phase-1 tombstone write.
+    /// The bind is refused whole, the predecessor stays bound, and no phase-2
+    /// step runs.
+    #[test]
+    fn a_failed_invalidation_refuses_the_bind_and_keeps_the_predecessor_bound() {
+        let config = PanelRegistryConfig {
+            max_panels_per_window: 2,
+            ..PanelRegistryConfig::default()
+        };
+        let mut reg = PanelRegistry::new(config).expect("registry");
+        let (panel, _epoch, controller) = mounted_and_bound(&mut reg, &[CREATE]);
+        // Fill the retired-ceiling table to its capacity with entries no live
+        // record owns, so the release's fail-closed write cannot complete.
+        reg.retain_grant_ceiling(PanelId::new(9_001), Generation(1), empty())
+            .expect("padding entry");
+        reg.retain_grant_ceiling(PanelId::new(9_002), Generation(2), empty())
+            .expect("padding entry");
+
+        let successor = controller.next().expect("successor generation");
+        let error = reg
+            .rebind_panel(
+                panel,
+                successor,
+                &owner("acme.notes"),
+                &set(&[CREATE, FOCUS]),
+                &empty(),
+            )
+            .expect_err("the invalidation cannot complete");
+
+        assert!(
+            matches!(error, PanelError::ResourceExhausted { .. }),
+            "the failed step is reported, got {error:?}"
+        );
+        assert_eq!(
+            reg.controller_generation(panel),
+            Some(controller),
+            "a refused invalidation leaves the predecessor bound"
+        );
+        assert!(
+            reg.is_panel_capability_granted(panel, controller, CREATE),
+            "the predecessor keeps its live row"
+        );
+        assert!(
+            !reg.is_panel_capability_granted(panel, successor, CREATE),
+            "no successor row is installed"
+        );
+        assert_eq!(
+            reg.unbind_release_record(panel),
+            None,
+            "the release did not complete, so it wrote no record"
+        );
+        assert_eq!(
+            reg.error_count("RetiredCeilingTableFull"),
+            1,
+            "the fail-closed tombstone write is counted"
+        );
+    }
+
+    /// D.2 phase 2: the installed row is keyed by the controller generation,
+    /// never by the allocation epoch the handle carries.
+    #[test]
+    fn the_commit_is_keyed_by_the_controller_generation() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let (panel, epoch, controller) = mounted_and_bound(&mut reg, &[CREATE, FOCUS]);
+
+        assert!(
+            reg.is_panel_capability_granted(panel, controller, CREATE),
+            "the successor resolves its own row"
+        );
+        assert!(
+            !reg.is_panel_capability_granted(panel, epoch, CREATE),
+            "the allocation epoch is stale once a controller is bound"
+        );
+        assert_eq!(reg.last_controller_generation(panel), None);
+
+        let successor = controller.next().expect("successor generation");
+        reg.rebind_panel(
+            panel,
+            successor,
+            &owner("acme.notes"),
+            &set(&[CREATE]),
+            &empty(),
+        )
+        .expect("rebind");
+
+        assert_eq!(
+            reg.last_controller_generation(panel),
+            Some(controller),
+            "the displaced generation is retained as the next predecessor"
+        );
+        assert_eq!(reg.controller_generation(panel), Some(successor));
+        assert!(
+            !reg.is_panel_capability_granted(panel, controller, CREATE),
+            "the predecessor's row is gone"
+        );
     }
 }
 

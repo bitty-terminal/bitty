@@ -68,7 +68,7 @@ use bitty_ui::ViewId;
 use bitty_ui::placement::{Placement, PlacementError};
 use bitty_ui::uitree::UiNodeId;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use bitty_render::scene::{ScenePaintCache, SceneSurface};
 
@@ -415,6 +415,57 @@ impl PanelRuntime {
             self.release_panel_mirrors(panel);
         }
         report
+    }
+
+    /// Re-parents a panel's controller binding onto a successor generation
+    /// (OQ-084 D.2, bitty#2476 residual 2).
+    ///
+    /// The registry owns phases 0 to 2; this facade adds the one commit step the
+    /// registry cannot reach — D.2 phase 2 step 3's lease reset — and returns
+    /// only after it ran, so no caller can issue a verb while the panel is
+    /// bound to the new generation but still leased to the old one.
+    ///
+    /// The container's presentation facts are untouched: the view attachment
+    /// ([`Placement`]), the title, the geometry, the presentation mode, and the
+    /// render scene slot all survive a rebind (D.3). Only the controller
+    /// binding, the panel-scoped grants, and the lease tenure move.
+    ///
+    /// A rebind never deletes content the caller must see: the predecessor's
+    /// generation-owned families are released by the registry's phase 1, and
+    /// nothing of them is replayed into the successor.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PanelRegistry::rebind_panel`] refuses with — `NotFound`,
+    /// `ControllerConflict`, `ControllerReleased`, `CeilingLost`,
+    /// `CapabilityDenied`, or the fail-closed `ResourceExhausted` of the
+    /// tombstone write — plus `RegistryDisposed`. A refusal leaves the binding,
+    /// the lease, the attachment, and every grant row exactly as they were.
+    pub fn rebind_panel(
+        &mut self,
+        id: super::panel::PanelId,
+        successor: Generation,
+        owner: &bitty_plugin_host::PluginId,
+        requested: &BTreeSet<String>,
+        consented: &BTreeSet<String>,
+    ) -> Result<super::panel::PanelRebind, PanelError> {
+        let committed = self
+            .registry
+            .rebind_panel(id, successor, owner, requested, consented)?;
+        // D.2 phase 2 step 3: the binding is the security fence and the lease
+        // stays a UX metaphor, so a predecessor's holder cannot keep writing
+        // through a tenure it no longer owns. The record (title, description)
+        // survives; the tenure does not. A displaced holder is reported on the
+        // lease-changed topic, the same way an expiry sweep reports one.
+        let mut released = None;
+        if let Some(entry) = self.leases.get_mut(&id) {
+            released = entry.lease.state().holder();
+            entry.lease = PanelLease::idle();
+        }
+        if let Some(holder) = released {
+            self.route_lease_event(id, LeaseEvent::Released { holder });
+        }
+        Ok(committed)
     }
 
     /// Releases the facade's own bindings for a panel the registry retired

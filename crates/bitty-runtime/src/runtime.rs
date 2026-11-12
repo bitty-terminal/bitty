@@ -279,7 +279,7 @@ pub type PtyWaker = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 ///
 /// Matches [`bitty_pty::CHANNEL_CAPACITY_CHUNKS`] so each stage stays within
 /// the documented bound. Worst-case total buffered when the wakeup pump is
-/// active is 2 x 128 KiB (original pump channel plus forwarding channel),
+/// active is 2 x 256 KiB (original pump channel plus forwarding channel),
 /// still bounded, fail-closed, and backpressured end to end.
 pub const PTY_FORWARD_CAPACITY_CHUNKS: usize = bitty_pty::CHANNEL_CAPACITY_CHUNKS;
 
@@ -369,10 +369,12 @@ fn headless_mirror(
 /// Maximum chunks drained per [`Runtime::poll_pty`] call (CTX-0476).
 ///
 /// Replaces the prior 1024-chunk collect (8 MiB worst-case stall on the
-/// render thread). 32 × 8 KiB = 256 KiB matches the worst-case total
-/// buffered across both pump stages, so one poll can catch up a full
-/// pipeline without stalling a frame.
-pub const POLL_PTY_MAX_CHUNKS: usize = 32;
+/// render thread). Issue #3122 raises it from 32 to 64 chunks: each stage
+/// buffers `CHANNEL_CAPACITY_CHUNKS` = 32 chunks, so 64 x 8 KiB = 512 KiB
+/// lets one poll catch up both pump stages without stalling a frame, and a
+/// large synchronized frame (`DECSET 2026`) drains in fewer event-loop
+/// turns (see `POLL_PTY_SYNC_MAX_CHUNKS` for the burst budget).
+pub const POLL_PTY_MAX_CHUNKS: usize = 64;
 
 /// Maximum bytes drained per [`Runtime::poll_pty`] call (CTX-0476).
 ///
@@ -390,6 +392,31 @@ pub const POLL_PTY_MAX_BYTES: usize = POLL_PTY_MAX_CHUNKS * bitty_pty::READ_CHUN
 /// `SYNC_UPDATE_DEFER_TIMEOUT` order and the 10 ms spawn-poll cadence);
 /// the remainder is picked up on the next poll.
 pub const POLL_PTY_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Maximum chunks drained per [`Runtime::poll_pty`] call while a visible
+/// session holds `DECSET 2026` (issue #3122).
+///
+/// A synchronized-output batch is atomic: every intermediate state inside
+/// `\x1b[?2026h ... \x1b[?2026l` is invisible to the user, and a TUI
+/// `writePrepend` (expand/collapse, panel or workspace switch) is hundreds
+/// of KiB to several MiB. Draining it under the ordinary 64-chunk budget
+/// takes dozens of event-loop turns; if any of them is missed the deferral
+/// expires and the scrollback repaints top-to-bottom in pieces. 256 chunks
+/// (2 MiB) covers the observed burst in one pump turn while staying a hard
+/// bound: the remainder still waits in the bounded channels under
+/// backpressure.
+pub const POLL_PTY_SYNC_MAX_CHUNKS: usize = 256;
+
+/// Wall-clock budget per [`Runtime::poll_pty`] call while a visible session
+/// holds `DECSET 2026` (issue #3122).
+///
+/// The chunk burst budget above still has to be bounded in time, because
+/// parsing is CPU-bound and the bytes are untrusted. 20 ms is the largest
+/// cost worth paying to finish an atomic frame in one turn (one skipped
+/// frame of latency) and still short enough that a hostile flood cannot
+/// stall the render thread; the remainder drains on the follow-up wake the
+/// budget cut arms.
+pub const POLL_PTY_SYNC_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Full compact banner visible duration (CTX-0192).
 ///
@@ -417,6 +444,19 @@ pub const DEFAULT_PASTE_CONFIRM_TIMEOUT: std::time::Duration = std::time::Durati
 /// the reset, the latest state still commits at this bound so a hung or
 /// buggy process can never stall presentation indefinitely.
 pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Hard upper bound on a continuously streaming synchronized-update burst
+/// (`DECSET 2026`, issue #3122).
+///
+/// While the embedder actively consumes PTY bytes inside an open `?2026h`
+/// batch (`Runtime::note_present_input`), each read extends the 100 ms idle
+/// timeout ([`SYNC_UPDATE_DEFER_TIMEOUT`]) so a multi-megabyte TUI redraw
+/// (`writePrepend` during expand/collapse or panel switch) is not torn mid-
+/// scroll at 100 ms. This 1,000 ms ceiling (matching Ghostty's 1 s
+/// synchronized-output timeout) bounds the total hold even under a runaway
+/// continuous producer.
+pub const SYNC_UPDATE_MAX_DEFER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(1000);
 
 /// Upper bound on how long presentation may be held for PTY output to go
 /// quiet (bitty#2486, [`Runtime::set_present_settle`]).
@@ -1391,6 +1431,10 @@ pub struct Runtime {
     /// [`SYNC_UPDATE_DEFER_TIMEOUT`] so the window always eventually
     /// commits, and reset to `None` when the mode exits.
     sync_defer_since: Option<std::time::Instant>,
+    /// When the current synchronized-update streaming burst first began
+    /// (issue #3122), capping active input extensions at
+    /// [`SYNC_UPDATE_MAX_DEFER_TIMEOUT`].
+    sync_burst_since: Option<std::time::Instant>,
     /// Count of OSC 52 writes rejected for invalid base64 (CTX-0212).
     ///
     /// Fail-closed telemetry: the clipboard is left unchanged and a loud
@@ -2357,6 +2401,7 @@ impl Runtime {
             dynamic_background: None,
             dynamic_cursor: None,
             sync_defer_since: None,
+            sync_burst_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
             reply_write_dropped_bytes: 0,
@@ -2688,6 +2733,7 @@ impl Runtime {
             dynamic_background: None,
             dynamic_cursor: None,
             sync_defer_since: None,
+            sync_burst_since: None,
             osc52_rejected_writes: 0,
             input_write_dropped_bytes: 0,
             reply_write_dropped_bytes: 0,
@@ -4440,11 +4486,24 @@ impl Runtime {
     /// (see [`SYNC_UPDATE_DEFER_TIMEOUT`]).
     #[must_use]
     pub fn synchronized_update_active(&self) -> bool {
-        self.state.modes().synchronized_update
-            || self
-                .pane_sessions
-                .values()
-                .any(|session| session.state.modes().synchronized_update)
+        if self.workspaces.len() <= 1 && self.scratchpad.is_empty() {
+            return self.state.modes().synchronized_update
+                || self
+                    .pane_sessions
+                    .values()
+                    .any(|session| session.state.modes().synchronized_update);
+        }
+        // Issue #3122: when multiple workspaces or a parked scratchpad exist,
+        // scope the presentation hold to sessions visible in the active
+        // workspace (tiling tree, detached floats, or window-global pins) so a
+        // background workspace's TUI cannot defer frames in the active one.
+        let primary_visible = self
+            .primary_view
+            .is_none_or(|id| self.find_view(id).is_some());
+        (primary_visible && self.state.modes().synchronized_update)
+            || self.pane_sessions.iter().any(|(id, session)| {
+                self.find_view(*id).is_some() && session.state.modes().synchronized_update
+            })
     }
 
     /// Allows or denies `OSC 10`/`OSC 11` and `OSC 4` dynamic color sets

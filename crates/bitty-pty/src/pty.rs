@@ -534,7 +534,7 @@ mod tests {
         let mut writer = pty.take_writer().expect("writer half");
         let reader = pty.take_reader().expect("reader half");
         // Drain asynchronously? The bounded pump keeps startup output small;
-        // the shell's prompt fits far under the 128 KiB channel cap.
+        // the shell's prompt fits far under the 256 KiB channel cap.
         let _keep_reader = reader;
 
         // The shell must be idle before the assertion is meaningful. Poll for

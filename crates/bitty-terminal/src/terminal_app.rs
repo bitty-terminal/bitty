@@ -2183,9 +2183,32 @@ impl TerminalApp {
         let mut consumed = false;
         // Real PTY first: drain bounded channel via runtime; replies are flushed
         // via `Runtime::write_replies` inside `poll_pty` (bounded 4 KiB, fail-closed).
-        let real = self.runtime.poll_pty();
-        if real > 0 {
-            consumed = true;
+        //
+        // Issue #3122: when a TUI emits a multi-megabyte synchronized frame
+        // (`DECSET 2026`, e.g. `agy` `Ctrl+O` expand/collapse or a panel
+        // switch `writePrepend`), one runtime poll under the ordinary budget
+        // would chop the atomic batch across dozens of event-loop turns and
+        // risk breaking out of the deferral mid-scroll. `Runtime::poll_pty`
+        // already switches to the burst allowance (`POLL_PTY_SYNC_*`); this
+        // loop keeps pumping back-to-back while bytes keep arriving, bounded
+        // by that same wall-clock budget so pump latency never regresses.
+        let pump_start = std::time::Instant::now();
+        let mut rounds = 0usize;
+        loop {
+            let real = self.runtime.poll_pty();
+            if real > 0 {
+                consumed = true;
+            }
+            rounds += 1;
+            // Re-read per round: a single drain may close the `?2026l` batch.
+            let (max_rounds, budget) = if self.runtime.synchronized_update_active() {
+                (8usize, bitty_runtime::POLL_PTY_SYNC_TIME_BUDGET)
+            } else {
+                (2usize, bitty_runtime::POLL_PTY_TIME_BUDGET)
+            };
+            if real == 0 || rounds >= max_rounds || pump_start.elapsed() >= budget {
+                break;
+            }
         }
         // Opt-in demo pump (bounded, debug/tests only — `None` in real
         // sessions so startup shows only the shell).
@@ -2427,20 +2450,30 @@ impl TerminalApp {
         // this is one `Instant` compare, and the report itself only runs on a
         // due interval, after the tick committed.
         self.maybe_write_memory_report();
-        self.watchdog_phase(Phase::SnapshotPublish);
-        // CTX-0481 (#762): after the tick commits, publish the live plugin
-        // snapshot so plugins observe the committed generation instead of a
-        // frozen generation-1 view. Monotonic: a regression is refused by
-        // the source itself.
-        if let Some(snapshot) = self.live_snapshot.as_ref() {
-            snapshot.publish(&self.runtime);
-        }
-        self.watchdog_phase(Phase::HistoryCapture);
-        // CTX-1352: sample newly completed scrollback lines into the bounded,
-        // already-redacted transcript ring. Sampling is idempotent per line id
-        // and opt-in gated inside the provider.
-        if let Some(history) = self.live_history.as_ref() {
-            crate::plugin_runtime::capture_history(&self.runtime, history);
+        // Issue #3122: while `DECSET 2026` synchronized output holds the frame
+        // (`stats.is_none() && synchronized_update_active()`), skip publishing
+        // intermediate half-written grid/scrollback snapshots (`/proc/<pid>/cwd`
+        // reads + zone scans) and transcript samples until the atomic batch
+        // either completes or commits at its timeout. IME/cursor and plugin
+        // event delivery below still run, so a deferred tick never strands a
+        // queued `process.exited` or config reload.
+        let hold_snapshot = stats.is_none() && self.runtime.synchronized_update_active();
+        if !hold_snapshot {
+            self.watchdog_phase(Phase::SnapshotPublish);
+            // CTX-0481 (#762): after the tick commits, publish the live plugin
+            // snapshot so plugins observe the committed generation instead of a
+            // frozen generation-1 view. Monotonic: a regression is refused by
+            // the source itself.
+            if let Some(snapshot) = self.live_snapshot.as_ref() {
+                snapshot.publish(&self.runtime);
+            }
+            self.watchdog_phase(Phase::HistoryCapture);
+            // CTX-1352: sample newly completed scrollback lines into the bounded,
+            // already-redacted transcript ring. Sampling is idempotent per line id
+            // and opt-in gated inside the provider.
+            if let Some(history) = self.live_history.as_ref() {
+                crate::plugin_runtime::capture_history(&self.runtime, history);
+            }
         }
         self.watchdog_phase(Phase::CursorSync);
         // CTX-0367: the presented frame refreshed the focused caret; forward

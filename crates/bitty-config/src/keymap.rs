@@ -1943,7 +1943,9 @@ impl ResolvedKeymap {
 /// Mod-aware resize variant plus CTX-0262 `ctrl+shift+alt+arrows` aliases, `ctrl+alt+arrows` navigate, `ctrl+tab` cycles,
 /// `ctrl+shift+c/v` copy/paste — ghostty `src/config/Config.zig` default
 /// keybinds: `copy_to_clipboard:mixed` / `paste_from_clipboard` under
-/// `ctrl+shift` on Linux) plus the DEC-0034 workspace entry (CTX-0257).
+/// `ctrl+shift` on Linux; issue #3122 adds the X11 `ctrl+insert` (copy) and
+/// `shift+insert` (paste) chords that remote-desktop input paths synthesize)
+/// plus the DEC-0034 workspace entry (CTX-0257).
 /// CTX-0259 adds `shift+alt+1..=9` move-window-to-workspace-N
 /// (`workspace_move:<1..=9>`, Mod+Shift+Number per DEC-0034; carries the Mod
 /// slot so a Super flip rebinds to `shift+super+1..=9`; digits stay free
@@ -2051,6 +2053,8 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("alt+f", "toggle_zoom"),
     ("ctrl+shift+c", "copy_to_clipboard"),
     ("ctrl+shift+v", "paste_from_clipboard"),
+    ("ctrl+insert", "copy_to_clipboard"),
+    ("shift+insert", "paste_from_clipboard"),
     ("alt+z", "toggle_zoom"),
     // Owner default: `alt+n` opens a new panel with Hyprland-dwindle
     // semantics (CTX-0838 #1441: adaptive axis from the focused leaf's
@@ -3945,6 +3949,39 @@ mod tests {
     }
 
     #[test]
+    fn defaults_bind_insert_clipboard_chords_issue_3122() {
+        // Issue #3122: `Ctrl+Insert` (copy) and `Shift+Insert` (paste) are the
+        // X11 conventions remote-desktop input paths synthesize — RustDesk on
+        // Wayland pastes non-ASCII text by writing the clipboard and emitting
+        // `Shift+Insert` through `uinput`, so an unbound chord meant CJK,
+        // emoji, and kaomoji never reached the shell.
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Insert, true, false, false)),
+            Some(ChromeAction::CopyToClipboard),
+            "ctrl+insert copies"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Insert, false, false, true)),
+            Some(ChromeAction::PasteFromClipboard),
+            "shift+insert pastes"
+        );
+        // The Mod slot is carried, so the chords stay identical under Super
+        // (Insert is mod-independent in the DEC-0034 sense).
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("super valid");
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::Insert, true, false, false)),
+            Some(ChromeAction::CopyToClipboard),
+            "ctrl+insert copies under Super mod too"
+        );
+        assert_eq!(
+            match_keymap(&super_maps, key_ref(KeyName::Insert, false, false, true)),
+            Some(ChromeAction::PasteFromClipboard),
+            "shift+insert pastes under Super mod too"
+        );
+    }
+
+    #[test]
     fn defaults_have_unique_chord_identities() {
         // Collision audit as a test: every default chord identity is unique
         // so no default shadows another (CTX-0178, extended CTX-0258 to
@@ -3966,15 +4003,16 @@ mod tests {
         // plus CTX-0962's 1 floating-toggle chord (alt+a) = 90 total,
         // plus issue #1776's 1 close-view chord (alt+q) = 91 total,
         // plus CTX-1100's 2 occupied-cycle chords (alt+[/]) = 93 total,
-        // and the full DEC
+        // plus issue #3122's 2 clipboard chords (ctrl+insert, shift+insert)
+        // = 95 total, and the full DEC
         // set resolves. Zoom chords carry
         // no `alt`, so they must stay unique under Alt and Super alike.
         for mod_key in [ModKey::Alt, ModKey::Super] {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                93,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle (W-144 retired copy-mode + search; issue #2397 retired the 4 Core help chords)"
+                95,
+                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle + 2 issue-3122 clipboard chords (W-144 retired copy-mode + search; issue #2397 retired the 4 Core help chords)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -4801,12 +4839,13 @@ mod tests {
         // owns exactly one action, no identity collides (with each other or
         // with the shipped defaults), and the Super rebound keeps the
         // explicit Alt spellings intact while the Super spellings stay free.
-        // The default count is 93 under Alt mod (35 shipped + 4 workspace
+        // The default count is 95 under Alt mod (35 shipped + 4 workspace
         // + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom
         // + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt
         // + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view
-        // + 2 CTX-1100 occupied-cycle; W-144 retired the copy-mode and
-        // search chords, issue #2397 retired the 4 Core help chords).
+        // + 2 CTX-1100 occupied-cycle + 2 issue-3122 clipboard chords;
+        // W-144 retired the copy-mode and search chords, issue #2397 retired
+        // the 4 Core help chords).
         // Under Super mod, alt+d becomes super+d, alt+q becomes super+q (still counted).
         let entries: &[(&str, &str)] = &[
             ("alt+f1", "goto_split:left"),
@@ -4835,14 +4874,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                93,
-                "no new shipped defaults under mod {:?} (35 shipped + 4 workspace + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle)",
+                95,
+                "no new shipped defaults under mod {:?} (35 shipped + 4 workspace + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle + 2 issue-3122 clipboard chords)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                93 + entries.len(),
+                95 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

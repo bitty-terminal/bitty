@@ -110,8 +110,8 @@ fn drive_one(corpus: &[u8]) -> (Runtime, usize, u64) {
         "corpus too large for MAX_ACTIONS proxy"
     );
     assert_eq!(READ_CHUNK_SIZE, 8 * 1024);
-    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 16);
-    assert_eq!(MAX_BUFFERED_BYTES, 128 * 1024);
+    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 32);
+    assert_eq!(MAX_BUFFERED_BYTES, 256 * 1024);
     let mut rt = make_runtime();
     let gen_before = rt.state().generation();
     // Prime one full redraw so later ticks are damage-driven (mirrors v01/soak).

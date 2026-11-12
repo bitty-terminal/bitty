@@ -19,6 +19,7 @@
 
 use bitty_runtime::{
     AnimationPolicy, PresentStats, Runtime, RuntimeConfig, SYNC_UPDATE_DEFER_TIMEOUT,
+    SYNC_UPDATE_MAX_DEFER_TIMEOUT,
 };
 use std::time::{Duration, Instant};
 
@@ -263,5 +264,146 @@ fn golden_synchronized_update_commit_frame() {
     assert_eq!(
         actual, 0x636f_64b4_dce4_c871,
         "synchronized-update commit digest changed (actual 0x{actual:016x})"
+    );
+}
+
+/// Issue #3122: while a TUI is actively streaming a multi-chunk `writePrepend`
+/// batch inside `DECSET 2026` (`note_present_input_at` called on each PTY read),
+/// the 100 ms idle timeout is extended up to `SYNC_UPDATE_MAX_DEFER_TIMEOUT`
+/// (1,000 ms) so intermediate top-to-bottom scroll steps never tear onto the
+/// screen mid-batch.
+#[test]
+fn active_streaming_synchronized_update_extends_past_100ms_until_max_cap() {
+    assert_eq!(SYNC_UPDATE_MAX_DEFER_TIMEOUT, Duration::from_millis(1000));
+    let mut rt = harness();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    let t0 = Instant::now();
+
+    rt.handle_pty_bytes(b"\x1b[?2026hchunk-0");
+    rt.note_present_input_at(t0);
+    assert!(rt.tick_at(t0).is_none());
+
+    // Stream chunks every 60 ms up to 300 ms (well past the 100 ms idle bound).
+    for step in 1..=5 {
+        let now = t0 + Duration::from_millis(step * 60);
+        rt.handle_pty_bytes(format!(" chunk-{step}").as_bytes());
+        rt.note_present_input_at(now);
+        assert!(
+            rt.tick_at(now).is_none(),
+            "active streaming at {} ms must stay deferred",
+            step * 60
+        );
+    }
+
+    // Mode exit at 320 ms commits the entire batch in a single frame.
+    let t_exit = t0 + Duration::from_millis(320);
+    rt.handle_pty_bytes(b" done\x1b[?2026l");
+    rt.note_present_input_at(t_exit);
+    let stats = rt
+        .tick_at(t_exit)
+        .expect("mode exit after 320 ms streaming burst commits one frame");
+    assert!(stats.glyphs > 0);
+
+    // A runaway continuous producer inside `?2026h` still commits at the 1000 ms hard cap.
+    let t_runaway = t0 + Duration::from_millis(400);
+    rt.handle_pty_bytes(b"\x1b[?2026hrunaway");
+    rt.note_present_input_at(t_runaway);
+    assert!(rt.tick_at(t_runaway).is_none());
+    for step in 1..=15 {
+        let now = t_runaway + Duration::from_millis(step * 60);
+        rt.handle_pty_bytes(b".");
+        rt.note_present_input_at(now);
+        if now.saturating_duration_since(t_runaway) < SYNC_UPDATE_MAX_DEFER_TIMEOUT {
+            assert!(
+                rt.tick_at(now).is_none(),
+                "still inside 1000 ms cap at +{} ms",
+                step * 60
+            );
+        }
+    }
+    let committed = rt
+        .tick_at(t_runaway + SYNC_UPDATE_MAX_DEFER_TIMEOUT)
+        .expect("1000 ms hard cap commits even under continuous input");
+    assert!(committed.glyphs > 0);
+}
+
+/// Issue #3122 regression: a multi-chunk `writePrepend`-shaped burst — cursor
+/// moved up, history written row by row, all inside one `?2026h`/`?2026l`
+/// pair and fed the way a TUI feeds it (one PTY read at a time, each noted
+/// through `note_present_input`) — commits no intermediate top-to-bottom
+/// frame and exactly one frame when the batch closes.
+#[test]
+fn multi_chunk_scrollback_prepend_coalesces_into_one_frame() {
+    let mut rt = harness();
+    let baseline = rt.tick().expect("baseline full redraw");
+    assert_eq!(rt.scrollback_len(), 0, "empty scrollback at baseline");
+
+    // `uv.TerminalRenderer::writePrepend`: home, walk up, then each history
+    // line ends with `EL` + CRLF before the active viewport is redrawn.
+    let mut body = Vec::from(&b"\x1b[?2026h\r"[..]);
+    for line in 0..60 {
+        body.extend_from_slice(format!("prepend-{line:02}\x1b[K\r\n").as_bytes());
+    }
+
+    let t0 = Instant::now();
+    let mut now = t0;
+    let mut commits = 0usize;
+    for (index, chunk) in body.chunks(48).enumerate() {
+        now = t0 + Duration::from_millis(8 * (index as u64 + 1));
+        rt.handle_pty_bytes(chunk);
+        rt.note_present_input_at(now);
+        if rt.tick_at(now).is_some() {
+            commits += 1;
+        }
+    }
+    assert_eq!(
+        commits, 0,
+        "an open synchronized batch must not commit intermediate frames"
+    );
+    assert!(
+        rt.synchronized_update_active(),
+        "the batch is still open after {} chunks",
+        body.len() / 48 + 1
+    );
+
+    let t_exit = now + Duration::from_millis(8);
+    rt.handle_pty_bytes(b"\x1b[?2026l");
+    let commit = rt
+        .tick_at(t_exit)
+        .expect("closing the batch commits the whole prepend");
+    assert_eq!(
+        commit.frame,
+        baseline.frame + 1,
+        "exactly one frame is committed for the entire multi-chunk batch"
+    );
+    assert!(
+        rt.scrollback_len() > 0,
+        "the prepended history is retained as scrollback"
+    );
+    let text: String = rt.snapshot().cells.iter().map(|cell| cell.glyph).collect();
+    assert!(
+        text.contains("prepend-59"),
+        "the last prepended line is on screen, got {text:?}"
+    );
+    assert!(
+        rt.tick_at(t_exit + Duration::from_millis(20)).is_none(),
+        "after the commit the path returns to idle"
+    );
+}
+
+/// Issue #3122: a synchronized update left open on a background workspace must
+/// not defer frames in the active workspace.
+#[test]
+fn background_workspace_synchronized_update_does_not_defer_active_workspace() {
+    let mut rt = harness();
+    assert!(rt.tick().is_some(), "baseline full redraw");
+    rt.handle_pty_bytes(b"\x1b[?2026hbackground");
+    assert!(rt.synchronized_update_active());
+
+    // Switch to a fresh workspace: primary view (ViewId(1)) stays in workspace 1.
+    assert!(rt.workspace_new().is_ok());
+    assert!(
+        !rt.synchronized_update_active(),
+        "background workspace DECSET 2026 must not hold the active workspace"
     );
 }

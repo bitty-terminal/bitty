@@ -190,12 +190,12 @@ fn v01_resize_headless_reconfigures_surface_and_reflows_layout_deterministically
 fn v01_backpressure_bounded_no_growth() {
     // Constants prove the hard bound: channel capacity * chunk size.
     assert_eq!(READ_CHUNK_SIZE, 8 * 1024);
-    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 16);
+    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 32);
     assert_eq!(
         MAX_BUFFERED_BYTES,
         READ_CHUNK_SIZE * CHANNEL_CAPACITY_CHUNKS
     );
-    assert_eq!(MAX_BUFFERED_BYTES, 128 * 1024);
+    assert_eq!(MAX_BUFFERED_BYTES, 256 * 1024);
 
     // Runtime cold queue: bounded, drop-oldest, counted (threat T-01).
     let mut rt = Runtime::new(RuntimeConfig {

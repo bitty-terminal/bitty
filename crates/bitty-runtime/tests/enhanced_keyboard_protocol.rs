@@ -1160,3 +1160,36 @@ fn popped_to_zero_restores_legacy_bytes() {
     );
     release_ctrl(&mut rt);
 }
+
+#[test]
+fn report_all_keys_falls_back_to_utf8_for_non_ascii_text_issue_3122() {
+    // Issue #3122: a remote-desktop input path (RustDesk on Wayland) delivers
+    // CJK, emoji, and kaomoji as `LogicalKey::Character` with no physical key
+    // entry in the Kitty table. Under flags `11` (disambiguate | report events
+    // | report all keys, without report-text) they must reach the PTY as raw
+    // UTF-8 text, and the release must stay silent instead of emitting a bare
+    // `CSI <codepoint> u` the child cannot interpret as text.
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[=11u");
+    assert_eq!(rt.enhanced_keyboard_flags(), 11);
+    for sample in ["中", "😀", "╰(°▽°)╯"] {
+        assert_eq!(
+            rt.handle_key_event_ref(&char_key(sample, Some(sample), PressState::Pressed, false)),
+            Some(sample.as_bytes().to_vec()),
+            "{sample:?} is typed as raw UTF-8"
+        );
+        assert_eq!(
+            rt.handle_key_event_ref(&char_key(sample, None, PressState::Released, false)),
+            None,
+            "the release of {sample:?} stays silent"
+        );
+    }
+    // A disambiguated chord still takes the CSI-u path.
+    press_ctrl(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_key("中", None, PressState::Pressed, false)),
+        Some(b"\x1b[20013;5u".to_vec()),
+        "Ctrl+中 still disambiguates"
+    );
+    release_ctrl(&mut rt);
+}

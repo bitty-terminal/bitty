@@ -217,6 +217,7 @@ mod execution_jobs;
 pub mod hang_watchdog;
 pub mod host_bridge;
 pub mod inspect;
+pub mod panel_placeholder;
 pub mod paste;
 pub mod plugin_runtime;
 pub mod queries;

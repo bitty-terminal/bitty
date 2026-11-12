@@ -173,6 +173,7 @@ pub mod panel;
 pub mod panel_identity;
 pub mod panel_lua;
 pub mod panel_persist;
+pub mod panel_recovery;
 pub mod panel_rehydrate;
 pub mod panel_rules;
 pub mod panel_state;
@@ -272,6 +273,15 @@ pub use panel_persist::{
     MAX_MANIFEST_LINE_LEN, MAX_PERSIST_PANELS, MAX_PERSISTENT_ID_LEN, ManifestError,
     PERSIST_MANIFEST_VERSION, PanelRestoreKey, PersistedPanel, PersistencePolicy, PersistentId,
     RestartManifest, decode_manifest, encode_manifest, plan_restore,
+};
+pub use panel_recovery::{
+    MAX_OWNER_SPELLING_LEN, MAX_REASON_SPELLING_LEN, MAX_RECOVERY_KEYS_PER_PANEL,
+    MAX_RECOVERY_RECORDS_PER_PANEL, PLACEHOLDER_HEADING, PLACEHOLDER_SCENE_ACTIONS,
+    PLACEHOLDER_SCENE_DEPTH, PLACEHOLDER_SCENE_NODES, PlaceholderAction, PlaceholderReason,
+    PlaceholderScene, RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget, RecoveryOutcome,
+    RecoveryReason, RecoveryReasonError, RecoveryRecord, RecoveryStep, SCN_MAX_BLOCKS_PER_TERMINAL,
+    SCN_MAX_DEPTH_PER_BLOCK, SCN_MAX_NODES_PER_BLOCK, SCN_MAX_RICH_BYTES_PER_TERMINAL,
+    SCN_MAX_TEXT_BYTES_PER_BLOCK,
 };
 pub use panel_rehydrate::{
     MAX_RECORD_LEN, MAX_SNAPSHOT_PANELS, PanelRecord, RehydrateError, RehydrateReport,

@@ -33,6 +33,11 @@ pub use bitty_ui::panel::{
     QualifiedCommand, ViewContent,
 };
 pub use bitty_ui::panel::{PanelId, PanelState, PanelType};
+pub use bitty_ui::panel_recovery::{
+    MAX_RECOVERY_KEYS_PER_PANEL, MAX_RECOVERY_RECORDS_PER_PANEL, PlaceholderReason,
+    PlaceholderScene, RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget, RecoveryOutcome,
+    RecoveryReason, RecoveryRecord, RecoveryStep,
+};
 
 // PanelId distinctness is already enforced by `bitty_ui::PanelId` being a
 // newtype with no From bridge to `ViewId`/`TerminalId`. Re-exported here so
@@ -203,6 +208,26 @@ pub enum PanelError {
         /// The ended controller generation the refused verb presented.
         released_generation: Generation,
     },
+    /// A placeholder reason outside the Decision E vocabulary (OQ-084 E.2).
+    ///
+    /// The token was refused before any panel state was read or written: no
+    /// placeholder was presented, no binding was released, and no recovery
+    /// counter moved. A reason outside the set is a defect and is counted as
+    /// such (`error_count("RecoveryReasonRejected")`), never passed through and
+    /// never accepted from a user.
+    RecoveryReasonRejected {
+        panel_id: PanelId,
+        /// The refused token, already bounded by the vocabulary's spelling cap.
+        spelling: String,
+    },
+    /// The Core-owned placeholder block failed the accepted scene bounds
+    /// (`SCN-1..3`). The table is fixed, so this is a Core defect rather than a
+    /// caller error, and nothing was stored.
+    PlaceholderSceneRejected {
+        panel_id: PanelId,
+        /// The scene admission detail, for the defect report.
+        detail: String,
+    },
     ResourceExhausted {
         reason: String,
     },
@@ -314,6 +339,14 @@ impl std::fmt::Display for PanelError {
                 f,
                 "panel {panel_id} controller released: generation {released_generation} is unbound"
             ),
+            Self::RecoveryReasonRejected { panel_id, spelling } => write!(
+                f,
+                "panel {panel_id} placeholder reason {spelling:?} is outside the vocabulary"
+            ),
+            Self::PlaceholderSceneRejected { panel_id, detail } => write!(
+                f,
+                "panel {panel_id} placeholder scene failed the scene bounds: {detail}"
+            ),
             Self::ResourceExhausted { reason } => write!(f, "resource exhausted: {reason}"),
         }
     }
@@ -396,6 +429,56 @@ struct PanelBinding {
     controller_generation: Generation,
 }
 
+/// The unbound container's placeholder (OQ-084 Decision E, bitty#2476
+/// residual 4).
+///
+/// The container is retained (the record, its state, its workspace, and its
+/// attachment are untouched), the controller binding is absent (the unbind edge
+/// cleared it, or none was ever written), and the content is absent. The
+/// reason is the one Decision E rule 2 spelling the last transition carried, so
+/// a panel has exactly one findable reason at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PanelPlaceholder {
+    reason: PlaceholderReason,
+    /// The controller generation that ended when the placeholder appeared
+    /// (`None` for a container that never had a controller: the unloaded case).
+    unbound_generation: Option<Generation>,
+}
+
+impl PanelPlaceholder {
+    /// The reason this placeholder names.
+    #[must_use]
+    pub const fn reason(self) -> PlaceholderReason {
+        self.reason
+    }
+
+    /// The controller generation the placeholder succeeded, if any.
+    #[must_use]
+    pub const fn unbound_generation(self) -> Option<Generation> {
+        self.unbound_generation
+    }
+
+    /// The Core-owned surface for this reason (fixed table, no plugin text).
+    #[must_use]
+    pub const fn scene(self) -> PlaceholderScene {
+        PlaceholderScene::for_reason(self.reason)
+    }
+}
+
+/// What [`PanelRegistry::present_placeholder`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaceholderPresentation {
+    /// Which of Decision E's three outcomes the reason selected.
+    pub outcome: RecoveryOutcome,
+    /// The placeholder now on the record; `None` for the `Drop` outcome, which
+    /// retires the container instead.
+    pub placeholder: Option<PanelPlaceholder>,
+    /// The FS-4-style record this transition emitted, when it emitted one.
+    pub record: Option<RecoveryRecord>,
+    /// Whether this call emitted the single `saturated` note for the binding.
+    pub saturated: bool,
+}
+
 /// Internal panel record.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -425,9 +508,17 @@ struct PanelRecord {
     /// `None` until the panel's first controller generation ends. Phase 0 uses
     /// it to distinguish "never bound" (the first bind commits `R`) from "a
     /// previous controller ended but its retired-ceiling tombstone is missing"
-    /// (the bind refuses). This is the predecessor read, not the live binding:
+    /// This is the predecessor read, not the live binding:
     /// `controller_generation` names the binding in force now.
     last_controller_generation: Option<Generation>,
+    /// The placeholder presented while no controller is bound (OQ-084 E,
+    /// bitty#2476 residual 4).
+    ///
+    /// `None` while a controller owns the content, before the first unbind, and
+    /// after a rebind clears it. `Some` is the "container retained, controller
+    /// unbound, content absent" state Decision C and E describe: a fact about
+    /// the binding and the content, never a seventh `PanelState`.
+    placeholder: Option<PanelPlaceholder>,
 }
 
 impl PanelRecord {
@@ -1309,6 +1400,10 @@ pub struct PanelRegistry {
     /// asked for each live overlay, so the unbind edge can dismiss exactly
     /// that generation's surfaces. Bounded by the `4+1` overlay envelope.
     overlay_attribution: BTreeMap<u64, (PanelId, Generation)>,
+    /// The capped recovery counter, keyed `(PanelId, controller generation,
+    /// reason)` and capped at eight per key (OQ-084 E.1, bitty#2476 residual
+    /// 4). Bounded per panel and cleared when a container is retired.
+    recovery: RecoveryBudget,
     errors: HashMap<String, u64>,
     disposed: bool,
     total_created: u64,
@@ -1354,6 +1449,7 @@ impl PanelRegistry {
             retained_ceilings: BTreeMap::new(),
             release_records: BTreeMap::new(),
             overlay_attribution: BTreeMap::new(),
+            recovery: RecoveryBudget::new(),
             errors: HashMap::new(),
             disposed: false,
             total_created: 0,
@@ -1608,6 +1704,7 @@ impl PanelRegistry {
             // generation.
             binding: None,
             last_controller_generation: None,
+            placeholder: None,
         };
         self.panels.insert(pid.0, rec);
         if let Some(ws) = workspace {
@@ -1711,6 +1808,10 @@ impl PanelRegistry {
         };
         rec_mut.state = UiPanelState::Mounted;
         rec_mut.view = Some(view_id);
+        // A bind clears the placeholder: the panel has a controller and content
+        // again, so the unbound representation no longer describes it (OQ-084
+        // E: the placeholder "disappears on rebind").
+        rec_mut.placeholder = None;
         self.view_to_panel.insert(view_id, panel_id);
         self.panel_to_view.insert(panel_id, view_id);
         Ok(())
@@ -1958,12 +2059,269 @@ impl PanelRegistry {
         // record that no bind can name and no bound can reclaim.
         self.retained_ceilings.remove(&panel_id);
         self.release_records.remove(&panel_id);
+        // The recovery counter is scoped to a container, so it retires with it:
+        // a new panel is a first bind, not a continuation of this one's budget.
+        self.recovery.retire(panel_id);
         // Retire panel with generation bump
         if let Ok(next) = self.registry_generation.next() {
             self.registry_generation = next;
         }
         self.panels.remove(&panel_id.0);
         Ok(())
+    }
+
+    /// Presents the placeholder for a panel whose controller is gone, or
+    /// disposes it when the reason is a user close (OQ-084 Decision E).
+    ///
+    /// `presented` is the controller generation the transition names.
+    /// `reason_token` is a token of Decision E rule 2's closed vocabulary;
+    /// `closed`, `dismissed`, and `quit` select the `Drop` outcome, `denied`
+    /// selects `Unavailable`, and the rest select `Placeholder`.
+    ///
+    /// The FS-4 record's owner is **not** an argument: it is read from the
+    /// panel record's own binding (`PanelRecord::owner`) before the unbind
+    /// edge clears it, so a transition can never be attributed to a plugin the
+    /// panel did not bind, and it is `None` exactly while no controller is
+    /// bound.
+    ///
+    /// The three rules this enforces:
+    ///
+    /// 1. **The container is retained, the binding is not.** A placeholder
+    ///    transition leaves state, workspace membership, title, and view
+    ///    attachment exactly as they were; it clears the controller binding
+    ///    through the unbind edge ([`Self::release_generation_scope`], which
+    ///    writes the retired-ceiling tombstone before it drops the generation's
+    ///    grant row) and clears the content. Focus is not moved: the panel keeps
+    ///    its focus history (C.3).
+    /// 2. **Recovery is bounded.** One counter keyed
+    ///    `(PanelId, presented, reason)`, capped at eight. The ninth attempt
+    ///    changes no state and emits the single `saturated` note for the
+    ///    binding; later attempts emit nothing. The per-panel key table is
+    ///    bounded too, and makes room by evicting its oldest key rather than
+    ///    dropping the transition: a panel past its key budget is still counted
+    ///    and still recorded.
+    /// 3. **The reason is closed.** A token outside the vocabulary is refused
+    ///    with [`PanelError::RecoveryReasonRejected`] before anything is read or
+    ///    written.
+    ///
+    /// Nothing here reaches a terminal, a PTY, a renderer handle, or a plugin
+    /// callback: the presentation is a Core-owned [`bitty_rich::scene::RichBlock`]
+    /// built from a constant table (see [`crate::panel_placeholder`]).
+    ///
+    /// No production caller today: the plugin generation boundary that would
+    /// invoke this is bitty#2476 residual 5, so the seam is implemented and
+    /// tested but unwired.
+    ///
+    /// # Errors
+    /// `NotFound`, `RegistryDisposed`, `RecoveryReasonRejected`,
+    /// `ControllerConflict`, `ControllerReleased`, `StaleHandle` (from the
+    /// controller fence), `ResourceExhausted` (from the unbind edge), and the
+    /// propagation of any `dispose_panel` refusal on the `Drop` path.
+    pub fn present_placeholder(
+        &mut self,
+        panel_id: PanelId,
+        presented: Generation,
+        reason_token: &str,
+    ) -> Result<PlaceholderPresentation, PanelError> {
+        self.ensure_not_disposed()?;
+        let outcome = match RecoveryOutcome::classify(reason_token) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.bump_error("RecoveryReasonRejected");
+                return Err(PanelError::RecoveryReasonRejected {
+                    panel_id,
+                    spelling: error.spelling().to_owned(),
+                });
+            }
+        };
+        if outcome.disposes_container() {
+            // `Drop`: a user close is Core-initiated, not a plugin verb, so the
+            // container is retired by its allocation epoch rather than through
+            // the controller fence. The record names that epoch — the
+            // generation the disposal actually used — and the owner the record
+            // held at that moment, read before the record is gone.
+            let (epoch, owner) = match self.panels.get(&panel_id.0) {
+                Some(record) => (
+                    record.generation,
+                    record.owner().map(|plugin| plugin.as_str().to_owned()),
+                ),
+                None => {
+                    return Err(PanelError::NotFound {
+                        kind: "panel",
+                        id_raw: panel_id.0,
+                    });
+                }
+            };
+            self.dispose_panel(panel_id, epoch)?;
+            let step =
+                self.recovery
+                    .note(panel_id, owner.as_deref(), epoch.get(), outcome.reason());
+            let record = match step {
+                RecoveryStep::Recorded(record) => Some(record),
+                RecoveryStep::Saturated { .. } | RecoveryStep::Unchanged => None,
+            };
+            self.recovery.retire(panel_id);
+            return Ok(PlaceholderPresentation {
+                outcome,
+                placeholder: None,
+                record,
+                saturated: false,
+            });
+        }
+        // Placeholder/Unavailable: revalidate the ending generation at use
+        // before any state moves (C.5: a transition issued by a generation the
+        // record no longer binds fails closed).
+        let state = self.panel_state_at_controller_fence(panel_id, presented)?;
+        let (bound, last, owner) = match self.panels.get(&panel_id.0) {
+            Some(record) => (
+                record.controller_generation(),
+                record.last_controller_generation,
+                record.owner().map(|plugin| plugin.as_str().to_owned()),
+            ),
+            None => {
+                return Err(PanelError::NotFound {
+                    kind: "panel",
+                    id_raw: panel_id.0,
+                });
+            }
+        };
+        let placeholder_reason = match outcome.placeholder_reason() {
+            Some(reason) => reason,
+            // Unreachable: `Drop` returned above.
+            None => {
+                return Err(PanelError::InvalidState {
+                    current: state,
+                    expected: "a placeholder outcome",
+                });
+            }
+        };
+        if bound == Some(presented) {
+            // The unbind edge: tombstone, then the generation's grant row,
+            // bus queues, commands, and attributed overlays. A refused release
+            // leaves every family and the binding in place, and this call
+            // propagates without presenting anything.
+            self.release_generation_scope(panel_id, presented)?;
+        }
+        let step = self.recovery.note(
+            panel_id,
+            owner.as_deref(),
+            presented.get(),
+            outcome.reason(),
+        );
+        let (record, saturated) = match step {
+            RecoveryStep::Recorded(record) => (Some(record), false),
+            RecoveryStep::Saturated { .. } => (None, true),
+            RecoveryStep::Unchanged => (None, false),
+        };
+        // The placeholder is written for every panel that reaches this path,
+        // whatever the counter answered. A saturated or unchanged counter emits
+        // no new record, but the generation's families have already been
+        // released: returning without a placeholder would leave the container
+        // unbound with nothing to present, the silent orphan Decision E and
+        // PGO-23 forbid.
+        if let Some(record_mut) = self.panels.get_mut(&panel_id.0) {
+            record_mut.placeholder = Some(PanelPlaceholder {
+                reason: placeholder_reason,
+                unbound_generation: bound.or(last),
+            });
+        }
+        Ok(PlaceholderPresentation {
+            outcome,
+            placeholder: self.placeholder(panel_id),
+            record,
+            saturated,
+        })
+    }
+
+    /// The placeholder on a panel, if it is unbound (OQ-084 E).
+    #[must_use]
+    pub fn placeholder(&self, panel_id: PanelId) -> Option<PanelPlaceholder> {
+        self.panels
+            .get(&panel_id.0)
+            .and_then(|record| record.placeholder)
+    }
+
+    /// The single reason a panel currently presents, if it presents one
+    /// (`PGO-14`: exactly one findable reason per panel).
+    #[must_use]
+    pub fn placeholder_reason(&self, panel_id: PanelId) -> Option<PlaceholderReason> {
+        self.placeholder(panel_id).map(PanelPlaceholder::reason)
+    }
+
+    /// The counted recovery attempts for one `(panel, generation, reason)` key.
+    #[must_use]
+    pub fn recovery_attempts(
+        &self,
+        panel_id: PanelId,
+        generation: Generation,
+        reason: PlaceholderReason,
+    ) -> u8 {
+        self.recovery
+            .count(panel_id, generation.get(), RecoveryReason::from(reason))
+    }
+
+    /// The binding a panel's single `saturated` note already went out for.
+    #[must_use]
+    pub fn recovery_saturated_for(&self, panel_id: PanelId) -> Option<Generation> {
+        self.recovery.saturated_note(panel_id).map(Generation)
+    }
+
+    /// Distinct `(controller generation, reason)` counter keys tracked for a
+    /// panel.
+    ///
+    /// Always `<= MAX_RECOVERY_KEYS_PER_PANEL`: the table makes room by evicting
+    /// its oldest key rather than growing, so a transition that arrives at the
+    /// cap is still counted and still recorded.
+    #[must_use]
+    pub fn recovery_keys(&self, panel_id: PanelId) -> usize {
+        self.recovery.tracked_keys(panel_id)
+    }
+
+    /// The retained recovery records for a panel, oldest first (at most
+    /// `RECOVERY_ATTEMPT_CAP`).
+    #[must_use]
+    pub fn recovery_records(&self, panel_id: PanelId) -> Vec<RecoveryRecord> {
+        self.recovery.records(panel_id)
+    }
+
+    /// The Core-owned placeholder block a panel currently presents, rebuilt
+    /// from its reason and admitted against `SCN-1..3`.
+    ///
+    /// `Ok(None)` when the panel is bound (it has no placeholder). The block is
+    /// never stored, so no caller and no plugin can hold or mutate it.
+    ///
+    /// # Errors
+    /// [`PanelError::PlaceholderSceneRejected`] if the fixed table ever stops
+    /// fitting the accepted scene limits (a Core defect), and `NotFound` when
+    /// the panel is gone or the registry is disposed.
+    pub fn placeholder_block(
+        &self,
+        panel_id: PanelId,
+    ) -> Result<Option<bitty_rich::scene::RichBlock>, PanelError> {
+        self.ensure_not_disposed()?;
+        let record = match self.panels.get(&panel_id.0) {
+            Some(record) => record,
+            None => {
+                return Err(PanelError::NotFound {
+                    kind: "panel",
+                    id_raw: panel_id.0,
+                });
+            }
+        };
+        let Some(placeholder) = record.placeholder else {
+            return Ok(None);
+        };
+        match crate::panel_placeholder::core_placeholder_block(
+            panel_id,
+            placeholder.reason(),
+            record.generation.get(),
+        ) {
+            Ok(block) => Ok(Some(block)),
+            Err(error) => Err(PanelError::PlaceholderSceneRejected {
+                panel_id,
+                detail: error.to_string(),
+            }),
+        }
     }
 
     /// Returns focused panel for a workspace.
@@ -3983,5 +4341,659 @@ mod controller_binding_shape_tests {
             0,
             "no caller presented a stale generation"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unbound / placeholder panel state (OQ-084 Decision E, bitty#2476 residual 4)
+// ---------------------------------------------------------------------------
+//
+// Each test names the wrong implementation it is written to fail, per the
+// record's Decision F practice. All of these are unreachable from a production
+// caller today (the generation boundary is residual 5), so they drive the seam
+// directly.
+
+#[cfg(test)]
+mod placeholder_state_tests {
+    use super::*;
+
+    const OWNER: &str = "acme.notes";
+
+    fn registry() -> PanelRegistry {
+        PanelRegistry::new(PanelRegistryConfig::default()).expect("default panel registry")
+    }
+
+    /// A mounted panel in workspace 1 at view 10.
+    fn mounted_panel(reg: &mut PanelRegistry) -> (PanelHandle, WorkspaceId) {
+        let workspace = WorkspaceId::new(1);
+        let handle = reg
+            .create_panel(PanelType::Rich, Some(workspace))
+            .expect("create panel");
+        reg.mount_panel(handle.id, handle.generation, ViewId::new(10))
+            .expect("mount panel");
+        (handle, workspace)
+    }
+
+    /// C.3/E: a crash keeps the container, its state, its attachment, and its
+    /// focus history; it clears the binding through the unbind edge and presents
+    /// the placeholder. Fails for an implementation that disposes the container
+    /// on crash (the automatic deletion E forbids), that drops the attachment,
+    /// that moves focus, or that leaves the binding claiming the crashed
+    /// generation.
+    #[test]
+    fn a_crash_presents_the_placeholder_and_keeps_the_container() {
+        let mut reg = registry();
+        let (handle, workspace) = mounted_panel(&mut reg);
+        reg.focus_panel(handle.id, handle.generation, workspace)
+            .expect("focus");
+        let controller = handle.generation;
+        reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+
+        let presented = reg
+            .present_placeholder(handle.id, controller, "crashed")
+            .expect("placeholder");
+
+        assert_eq!(
+            presented.outcome,
+            RecoveryOutcome::Placeholder(PlaceholderReason::Crashed)
+        );
+        assert!(!presented.saturated);
+        let placeholder = presented.placeholder.expect("placeholder on the record");
+        assert_eq!(placeholder.reason(), PlaceholderReason::Crashed);
+        assert_eq!(placeholder.unbound_generation(), Some(controller));
+
+        // Container retained: state, workspace membership, view, focus.
+        assert_eq!(
+            reg.panel_state(handle.id, handle.generation)
+                .expect("state readable"),
+            PanelState::Focused
+        );
+        assert_eq!(
+            reg.panel_view(handle.id, handle.generation)
+                .expect("view readable"),
+            Some(ViewId::new(10))
+        );
+        assert_eq!(reg.focused_panel(workspace), Some(handle.id));
+
+        // Controller unbound, and the ended generation is what the fence keeps.
+        assert_eq!(reg.controller_generation(handle.id), None);
+        assert_eq!(reg.last_controller_generation(handle.id), Some(controller));
+        // The unbind edge wrote the tombstone before dropping the row.
+        assert_eq!(
+            reg.retained_grant_ceiling(handle.id)
+                .map(|ceiling| ceiling.ended_generation),
+            Some(controller)
+        );
+
+        // One FS-4-style record: owner, generation, reason, action.
+        let record = presented.record.expect("one record per transition");
+        assert_eq!(record.panel, handle.id);
+        assert_eq!(
+            record.owner.as_deref(),
+            Some(OWNER),
+            "the owner is the binding's plugin id, not a caller string"
+        );
+        assert_eq!(record.controller_generation, controller.get());
+        assert_eq!(record.reason, RecoveryReason::Crashed);
+        assert_eq!(record.action, RecoveryAction::Placeholder);
+        assert_eq!(record.attempt, 1);
+        assert_eq!(
+            reg.recovery_attempts(handle.id, controller, PlaceholderReason::Crashed),
+            1
+        );
+        assert_eq!(reg.recovery_records(handle.id).len(), 1);
+    }
+
+    /// Decision E / PGO-23 through the *cap* path: a panel whose counter for the
+    /// key is already at the cap, whose placeholder a rebind cleared, and which
+    /// is then presented the same key again. The counter answers `Unchanged`
+    /// (no record), so a seam that wrote the placeholder only when a record came
+    /// back would leave the container unbound with nothing to present — the same
+    /// silent orphan, reached without the key table.
+    #[test]
+    fn a_saturated_counter_still_presents_the_placeholder_after_a_rebind() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+        for _ in 0..=RECOVERY_ATTEMPT_CAP {
+            reg.present_placeholder(handle.id, epoch, "disabled")
+                .expect("placeholder");
+        }
+        assert_eq!(reg.recovery_saturated_for(handle.id), Some(epoch));
+
+        // A rebind clears the placeholder but not the counter.
+        reg.unmount_panel(handle.id, epoch).expect("unmount");
+        reg.mount_panel(handle.id, epoch, ViewId::new(13))
+            .expect("remount");
+        assert!(
+            reg.placeholder(handle.id).is_none(),
+            "the rebind cleared it"
+        );
+
+        let presented = reg
+            .present_placeholder(handle.id, epoch, "disabled")
+            .expect("the transition still presents");
+        assert!(
+            presented.record.is_none(),
+            "the counter is at its cap: nothing new is counted"
+        );
+        assert!(
+            presented.placeholder.is_some(),
+            "the placeholder is written even when the counter emits no record"
+        );
+        assert_eq!(
+            reg.placeholder_reason(handle.id),
+            Some(PlaceholderReason::Disabled)
+        );
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "the Core surface is presentable"
+        );
+    }
+
+    /// FS-4: the record's owner is the panel record's own binding owner, never a
+    /// caller-asserted string. `None` is the honest value while no controller is
+    /// bound; `Some` is the plugin the binding named, read before the unbind edge
+    /// cleared it. Fails for an implementation that stamps a caller's argument
+    /// onto the record (which let any caller attribute a transition to a plugin
+    /// the panel never bound, and reported an owner for a container that had
+    /// none).
+    #[test]
+    fn the_record_owner_is_read_from_the_panel_binding() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+
+        // No binding: no owner to name.
+        let unloaded = reg
+            .present_placeholder(handle.id, epoch, "unloaded")
+            .expect("placeholder");
+        assert_eq!(
+            unloaded.record.expect("one record").owner,
+            None,
+            "a container that never bound a controller names no owner"
+        );
+
+        // Bound: the owner is the binding's plugin id, and it survives the
+        // unbind edge that clears the binding before the caller reads it.
+        let controller = Generation(epoch.get() + 5);
+        reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+        let crashed = reg
+            .present_placeholder(handle.id, controller, "crashed")
+            .expect("placeholder");
+        assert_eq!(
+            reg.controller_generation(handle.id),
+            None,
+            "the edge cleared the binding before the record was read"
+        );
+        assert_eq!(
+            crashed.record.expect("one record").owner.as_deref(),
+            Some(OWNER),
+            "the owner comes from the binding the transition released"
+        );
+        // The retained history carries the same owner.
+        let retained = reg.recovery_records(handle.id);
+        assert_eq!(
+            retained
+                .last()
+                .and_then(|record| record.owner.clone())
+                .as_deref(),
+            Some(OWNER)
+        );
+    }
+
+    /// E.4: a missing plugin is `unloaded`, not deleted. The container stays,
+    /// nothing is released (there is no predecessor generation), and a later
+    /// reinstall can still rebind. Fails for an implementation that invents an
+    /// unbind edge (writing a ceiling for a controller that never existed) or
+    /// that disposes the panel.
+    #[test]
+    fn a_missing_plugin_names_unloaded_without_an_unbind_edge() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+
+        let presented = reg
+            .present_placeholder(handle.id, handle.generation, "unloaded")
+            .expect("placeholder");
+
+        let placeholder = presented.placeholder.expect("placeholder on the record");
+        assert_eq!(placeholder.reason(), PlaceholderReason::Unloaded);
+        assert_eq!(
+            placeholder.unbound_generation(),
+            None,
+            "a container that never had a controller names none"
+        );
+        assert!(
+            reg.retained_grant_ceiling(handle.id).is_none(),
+            "no predecessor, so no retained ceiling"
+        );
+        assert_eq!(
+            reg.unbind_release_count(handle.id),
+            None,
+            "the release edge must not run for a never-bound panel"
+        );
+        assert_eq!(
+            reg.panel_view(handle.id, handle.generation)
+                .expect("view readable"),
+            Some(ViewId::new(10)),
+            "the placeholder keeps the attachment"
+        );
+    }
+
+    /// E's table: a denied capability selects `Unavailable`, which keeps the
+    /// container, names the denial, and is still a bounded recovery attempt.
+    #[test]
+    fn a_denied_capability_presents_unavailable() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+
+        let presented = reg
+            .present_placeholder(handle.id, handle.generation, "denied")
+            .expect("unavailable");
+
+        assert_eq!(presented.outcome, RecoveryOutcome::Unavailable);
+        let placeholder = presented.placeholder.expect("placeholder on the record");
+        assert_eq!(placeholder.reason(), PlaceholderReason::Denied);
+        let record = presented.record.expect("one record");
+        assert_eq!(record.reason, RecoveryReason::Denied);
+        assert_eq!(record.action, RecoveryAction::Unavailable);
+        assert_eq!(
+            reg.recovery_attempts(handle.id, handle.generation, PlaceholderReason::Denied),
+            1
+        );
+    }
+
+    /// E.1: eight attempts are counted, the ninth changes nothing and emits the
+    /// one `saturated` note for the binding, and every later attempt emits
+    /// nothing at all. Fails for an unbounded counter, for a per-attempt
+    /// diagnostic, for a per-attempt record list, and for an implementation that
+    /// lets the ninth attempt replace the placeholder reason.
+    #[test]
+    fn the_counter_stops_at_eight_and_emits_one_saturated_note() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+        let mut counted = 0u8;
+
+        for attempt in 1..=RECOVERY_ATTEMPT_CAP {
+            let presented = reg
+                .present_placeholder(handle.id, epoch, "disabled")
+                .expect("placeholder");
+            let record = presented.record.expect("counted transition");
+            assert_eq!(record.attempt, attempt);
+            assert!(!presented.saturated);
+            counted = attempt;
+        }
+        assert_eq!(counted, RECOVERY_ATTEMPT_CAP);
+        assert_eq!(
+            reg.panel_state(handle.id, epoch).expect("state readable"),
+            PanelState::Mounted
+        );
+
+        let ninth = reg
+            .present_placeholder(handle.id, epoch, "disabled")
+            .expect("saturated note");
+        assert!(ninth.saturated, "the ninth attempt emits the note");
+        assert!(
+            ninth.record.is_none(),
+            "the ninth attempt is not counted and is not recorded"
+        );
+        assert_eq!(
+            ninth.placeholder.expect("placeholder kept").reason(),
+            PlaceholderReason::Disabled
+        );
+        assert_eq!(
+            reg.recovery_attempts(handle.id, epoch, PlaceholderReason::Disabled),
+            RECOVERY_ATTEMPT_CAP
+        );
+        assert_eq!(reg.recovery_saturated_for(handle.id), Some(epoch));
+
+        let tenth = reg
+            .present_placeholder(handle.id, epoch, "disabled")
+            .expect("no-op attempt");
+        assert!(!tenth.saturated && tenth.record.is_none());
+        assert_eq!(reg.recovery_records(handle.id).len(), 8);
+    }
+
+    /// Decision E / PGO-23: a panel that reaches the placeholder path always
+    /// leaves a placeholder, even when its per-panel key table is already full.
+    /// Fails for an implementation that answers a full table with `Saturated`
+    /// and returns `Ok` without writing the placeholder: the generation is
+    /// released, the binding is cleared, and the retained container is left
+    /// with nothing to present — the silent orphan this record forbids.
+    #[test]
+    fn a_full_key_table_still_presents_the_placeholder() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+
+        // Eight distinct `(generation, reason)` keys, each presented by a bound
+        // controller. The per-panel key table is full afterwards.
+        for step in 1..=MAX_RECOVERY_KEYS_PER_PANEL as u64 {
+            let controller = Generation(epoch.get() + step);
+            reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+            reg.present_placeholder(handle.id, controller, "crashed")
+                .expect("placeholder");
+        }
+        assert_eq!(
+            reg.recovery_keys(handle.id),
+            MAX_RECOVERY_KEYS_PER_PANEL,
+            "the fixture fills the key table"
+        );
+
+        // A rebind clears the placeholder but not the key table.
+        reg.unmount_panel(handle.id, epoch).expect("unmount");
+        reg.mount_panel(handle.id, epoch, ViewId::new(12))
+            .expect("remount");
+        assert!(
+            reg.placeholder(handle.id).is_none(),
+            "the rebind cleared it"
+        );
+
+        // The ninth distinct key: a new controller generation crashes.
+        let ninth = Generation(epoch.get() + 100);
+        reg.bind_controller_generation_for_test(handle.id, OWNER, ninth);
+        let presented = reg
+            .present_placeholder(handle.id, ninth, "crashed")
+            .expect("the transition still presents");
+
+        assert!(
+            presented.placeholder.is_some(),
+            "a released generation always leaves a placeholder, even at the key cap"
+        );
+        assert_eq!(
+            reg.placeholder_reason(handle.id),
+            Some(PlaceholderReason::Crashed),
+            "exactly one findable reason"
+        );
+        assert_eq!(
+            reg.controller_generation(handle.id),
+            None,
+            "the unbind edge ran: the binding is gone"
+        );
+        assert!(
+            presented.record.is_some(),
+            "the transition is counted and recorded rather than answered saturated"
+        );
+        assert_eq!(
+            reg.recovery_attempts(handle.id, ninth, PlaceholderReason::Crashed),
+            1,
+            "the new key counts from one"
+        );
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "the Core surface is presentable"
+        );
+        assert_eq!(
+            reg.recovery_keys(handle.id),
+            MAX_RECOVERY_KEYS_PER_PANEL,
+            "the table made room instead of growing"
+        );
+    }
+
+    /// E.2: a reason outside the vocabulary is a typed refusal. Nothing moves:
+    /// no placeholder, no unbind, no counter, no record, and the binding still
+    /// names the generation. Fails for an implementation that defaults to a
+    /// reason, truncates the token into submission, or accepts a user-supplied
+    /// string.
+    #[test]
+    fn a_reason_outside_the_vocabulary_is_refused_before_anything_moves() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let controller = handle.generation;
+        reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+
+        let error = reg
+            .present_placeholder(handle.id, controller, "user pressed crash")
+            .expect_err("a user-supplied reason is refused");
+
+        match error {
+            PanelError::RecoveryReasonRejected { panel_id, spelling } => {
+                assert_eq!(panel_id, handle.id);
+                assert_eq!(spelling, "user pressed crash");
+            }
+            other => panic!("expected RecoveryReasonRejected, got {other:?}"),
+        }
+        assert_eq!(reg.error_count("RecoveryReasonRejected"), 1);
+        assert!(reg.placeholder(handle.id).is_none());
+        assert_eq!(
+            reg.controller_generation(handle.id),
+            Some(controller),
+            "the binding is untouched"
+        );
+        assert_eq!(
+            reg.recovery_attempts(handle.id, controller, PlaceholderReason::Crashed),
+            0
+        );
+        assert!(reg.recovery_records(handle.id).is_empty());
+    }
+
+    /// E.2: the three close-side tokens are user-initiated ends of the content,
+    /// so they select `Drop` — one disposal record, no placeholder, no orphan.
+    /// Fails for an implementation that presents a placeholder on `closed`
+    /// (which would leave a container no generation can ever fill again).
+    #[test]
+    fn a_close_token_disposes_the_container_and_reports_one_drop_record() {
+        for token in ["closed", "dismissed", "quit"] {
+            let mut reg = registry();
+            let (handle, _workspace) = mounted_panel(&mut reg);
+
+            let presented = reg
+                .present_placeholder(handle.id, handle.generation, token)
+                .expect("drop");
+
+            assert_eq!(presented.outcome, RecoveryOutcome::Drop);
+            assert!(
+                presented.placeholder.is_none(),
+                "{token} must leave no placeholder"
+            );
+            assert!(
+                reg.panel_state(handle.id, handle.generation).is_err(),
+                "{token} retires the container"
+            );
+            let record = presented.record.expect("one record");
+            assert_eq!(record.reason, RecoveryReason::Closed, "{token} normalises");
+            assert_eq!(record.action, RecoveryAction::Disposed);
+            assert_eq!(record.attempt, 0, "a disposal is not a recovery attempt");
+            assert_eq!(
+                record.owner, None,
+                "{token}: the container never bound a controller, so the record names no owner"
+            );
+            assert_eq!(
+                record.controller_generation,
+                handle.generation.get(),
+                "{token}: the record names the epoch the disposal used, not a caller's generation"
+            );
+        }
+    }
+
+    /// E.6 / PGO-3: after the placeholder, no verb reaches content. The ended
+    /// generation is refused at the controller fence and holds no capability.
+    #[test]
+    fn no_verb_reaches_content_after_the_placeholder() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        // A controller generation distinct from the allocation epoch, so the
+        // released generation is still recognisable after the unbind.
+        let controller = Generation(handle.generation.get() + 100);
+        reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+        reg.grant_panel_capability(handle.id, handle.generation, "panel.create")
+            .expect("grant");
+        reg.unmount_panel(handle.id, handle.generation)
+            .expect("unmount");
+
+        reg.present_placeholder(handle.id, controller, "crashed")
+            .expect("placeholder");
+
+        let error = reg
+            .mount_panel(handle.id, controller, ViewId::new(11))
+            .expect_err("a released generation mounts nothing");
+        assert!(
+            matches!(error, PanelError::ControllerReleased { .. }),
+            "expected ControllerReleased, got {error:?}"
+        );
+        assert_eq!(
+            reg.require_panel_capability(handle.id, controller, "panel.create"),
+            Err(PanelError::CapabilityDenied {
+                panel_id: handle.id,
+                capability: "panel.create".to_owned(),
+            })
+        );
+        assert_eq!(reg.error_count("ControllerReleased"), 1);
+    }
+
+    /// E: the placeholder clears on a rebind, so the panel is no longer
+    /// presented as unbound once a controller owns it again.
+    #[test]
+    fn a_rebind_clears_the_placeholder() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        reg.present_placeholder(handle.id, handle.generation, "reloaded")
+            .expect("placeholder");
+        assert_eq!(
+            reg.placeholder_reason(handle.id),
+            Some(PlaceholderReason::Reloaded)
+        );
+
+        // The successor re-issues the mount; the view is released first.
+        reg.unmount_panel(handle.id, handle.generation)
+            .expect("unmount");
+        reg.mount_panel(handle.id, handle.generation, ViewId::new(11))
+            .expect("remount");
+
+        assert!(reg.placeholder(handle.id).is_none());
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("no defect")
+                .is_none()
+        );
+        assert_eq!(
+            reg.panel_state(handle.id, handle.generation)
+                .expect("state readable"),
+            PanelState::Mounted
+        );
+    }
+
+    /// E.5: the surface is a Core-owned block built from the constant table,
+    /// admitted by the accepted scene gate, and rebuilt on demand — no plugin
+    /// text, no stored scene to replace, identical bytes on every read. Fails for
+    /// an implementation that stores a plugin-supplied scene, that carries
+    /// plugin text, or that lets a style through.
+    #[test]
+    fn the_placeholder_block_is_core_owned_and_bounded() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("no defect")
+                .is_none(),
+            "a bound panel presents no placeholder"
+        );
+
+        reg.present_placeholder(handle.id, handle.generation, "incompatible")
+            .expect("placeholder");
+        let block = reg
+            .placeholder_block(handle.id)
+            .expect("no defect")
+            .expect("block");
+        let surface = PlaceholderScene::for_reason(PlaceholderReason::Incompatible);
+
+        assert_eq!(
+            block.owner(),
+            crate::panel_placeholder::PLACEHOLDER_BLOCK_OWNER
+        );
+        assert_eq!(
+            block.created_at(),
+            crate::panel_placeholder::PLACEHOLDER_BLOCK_CREATED_AT
+        );
+        assert_eq!(block.content().count_nodes(), surface.node_count());
+        assert_eq!(block.content().depth(), surface.depth());
+        assert_eq!(block.content().text_bytes(), surface.text_bytes());
+        assert!(surface.within_scn_limits(), "the fixed table fits SCN-1..3");
+
+        // The whole text payload is the Core table, in order.
+        let mut painted = Vec::new();
+        collect_text(block.content(), &mut painted);
+        assert_eq!(
+            painted,
+            vec![
+                surface.heading().to_owned(),
+                surface.detail().to_owned(),
+                surface.actions()[0].label().to_owned(),
+                surface.actions()[1].label().to_owned(),
+            ]
+        );
+
+        // Rebuilt on demand, byte-identical: nothing was stored to mutate.
+        assert_eq!(
+            reg.placeholder_block(handle.id)
+                .expect("no defect")
+                .expect("block"),
+            block
+        );
+    }
+
+    fn collect_text(node: &bitty_rich::scene::SceneNode, out: &mut Vec<String>) {
+        use bitty_rich::scene::SceneNode;
+        match node {
+            SceneNode::Text(span) => out.push(span.text.clone()),
+            SceneNode::Row(children) | SceneNode::Column(children) => {
+                for child in children {
+                    collect_text(child, out);
+                }
+            }
+            SceneNode::Block { child, .. } | SceneNode::Styled { child, .. } => {
+                collect_text(child, out);
+            }
+            other => panic!("unexpected placeholder node: {other:?}"),
+        }
+    }
+
+    /// C.8: the accepted six-state table is unchanged by this residual. The
+    /// placeholder is a fact about the binding, not a seventh state, and both
+    /// disposal edges stay legal. Fails for an implementation that widens
+    /// `PanelState` or narrows the table.
+    #[test]
+    fn the_six_state_transition_table_is_unchanged() {
+        use PanelState as S;
+        const STATES: [PanelState; 6] = [
+            S::Declared,
+            S::Created,
+            S::Mounted,
+            S::Focused,
+            S::Suspended,
+            S::Disposed,
+        ];
+        let mut allowed = Vec::new();
+        for from in STATES {
+            for to in STATES {
+                if S::can_transition(from, to) {
+                    allowed.push((from, to));
+                }
+            }
+        }
+        assert_eq!(
+            allowed,
+            vec![
+                (S::Declared, S::Created),
+                (S::Created, S::Mounted),
+                (S::Created, S::Disposed),
+                (S::Mounted, S::Focused),
+                (S::Mounted, S::Suspended),
+                (S::Mounted, S::Disposed),
+                (S::Focused, S::Mounted),
+                (S::Focused, S::Suspended),
+                (S::Focused, S::Disposed),
+                (S::Suspended, S::Mounted),
+                (S::Suspended, S::Focused),
+                (S::Suspended, S::Disposed),
+            ]
+        );
+        assert!(S::can_transition(S::Created, S::Disposed));
+        assert!(S::can_transition(S::Focused, S::Disposed));
     }
 }

@@ -1071,6 +1071,9 @@ struct Shared {
     /// Completed monitor-loop polls (test observability for PB-7 0 Hz idle).
     #[cfg(test)]
     polls: AtomicU64,
+    /// Set when the monitor computes `idle_park == true` and parks at 0 Hz.
+    #[cfg(test)]
+    idle_parked: AtomicBool,
 }
 
 impl Shared {
@@ -1087,6 +1090,8 @@ impl Shared {
             presented_frames: AtomicU64::new(0),
             #[cfg(test)]
             polls: AtomicU64::new(0),
+            #[cfg(test)]
+            idle_parked: AtomicBool::new(false),
         }
     }
 
@@ -1163,14 +1168,14 @@ impl StopSignal {
     }
 
     fn notify(&self) {
-        #[cfg(unix)]
-        if let Some((_, mut w)) = self.pipe.as_ref().map(|(r, w)| (r, w)) {
-            let _ = std::io::Write::write(&mut w, &[1]);
-        }
         let mut notified = self
             .waiter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(unix)]
+        if let Some((_, mut w)) = self.pipe.as_ref().map(|(r, w)| (r, w)) {
+            let _ = std::io::Write::write(&mut w, &[1]);
+        }
         *notified = true;
         self.wake.notify_all();
     }
@@ -1907,6 +1912,8 @@ fn monitor_loop(
             && state.tick_gap.is_none()
             && !state.reported
             && shared.gauges.snapshot().tick_count == state.last_tick_seq;
+        #[cfg(test)]
+        shared.idle_parked.store(idle_park, Ordering::Release);
     }
 }
 
@@ -7137,13 +7144,17 @@ mod tests {
             Box::new(|_| DeliveryOutcome::Delivered),
         );
         watchdog.idle();
-        // Wait for the transition poll that observes `active == false` to complete.
+        // Wait until the monitor computes `idle_park == true` and parks at 0 Hz.
         let settle_deadline = Instant::now() + Duration::from_secs(1);
-        while watchdog.shared.polls.load(Ordering::Relaxed) == 0 && Instant::now() < settle_deadline
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
         {
             std::thread::sleep(Duration::from_millis(5));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            watchdog.shared.idle_parked.load(Ordering::Acquire),
+            "monitor must reach idle_park state"
+        );
         let parked_polls = watchdog.shared.polls.load(Ordering::Relaxed);
 
         // Over 10x the 12 ms poll interval, a parked monitor must perform 0 wakeups.

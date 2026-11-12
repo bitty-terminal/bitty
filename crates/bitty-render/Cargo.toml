@@ -79,7 +79,7 @@ wgpu = { version = "26.0", default-features = false, features = ["vulkan", "gles
 wgpu = { version = "26.0", default-features = false, features = ["metal"] }
 
 [target.'cfg(windows)'.dependencies]
-wgpu = { version = "26.0", default-features = false, features = ["dx12", "vulkan"] }
+wgpu = { version = "26.0", default-features = false, features = ["dx12", "vulkan", "gles"] }
 
 
 [dev-dependencies]

@@ -587,13 +587,21 @@ impl SampledReads {
                 let inline: SpawnFn = Rc::new(move |argv: &[String]| spawn(argv));
                 while let Ok((req_ms, req_started)) = rx.recv() {
                     // Reset `in_flight` on every exit path, including a panic in
-                    // the reader, so one failed read cannot wedge the sampler.
+                    // the reader, while keeping the worker loop alive so `rx`
+                    // never drops with an unread request queued behind it.
                     let _flight = FlightGuard(Arc::clone(&slot_arc));
-                    let outcome = live_read(&inline);
-                    let landed_ms = req_ms.saturating_add(
-                        u64::try_from(req_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    );
-                    lock_slot(&slot_arc).ready = Some((outcome, landed_ms));
+                    if let Ok(outcome) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            live_read(&inline)
+                        }))
+                    {
+                        let landed_ms = req_ms.saturating_add(
+                            u64::try_from(req_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
+                        let mut slot = lock_slot(&slot_arc);
+                        slot.ready = Some((outcome, landed_ms));
+                        slot.in_flight = false;
+                    }
                 }
             });
         match spawned {
@@ -1296,9 +1304,11 @@ mod tests {
         while monitor.get(2000, true).is_err() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let _ = monitor.get(2000 + STATE_MIN_INTERVAL_MS, true);
+        let second_ms = 2000 + STATE_MIN_INTERVAL_MS;
+        let _ = monitor.get(second_ms, true);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while thread_ids.lock().unwrap().len() < 6 && std::time::Instant::now() < deadline {
+            let _ = monitor.get(second_ms, true);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let ids = thread_ids.lock().unwrap().clone();

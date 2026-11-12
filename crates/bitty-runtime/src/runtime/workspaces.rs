@@ -51,7 +51,7 @@ use super::*;
 
 use std::collections::VecDeque;
 
-use crate::registry::WorkspaceId;
+use crate::registry::{WorkspaceDisposeReport, WorkspaceId};
 use bitty_plugin_host::{BoundedText, EventPayload};
 
 /// Maximum workspaces (mirrors `registry::MAX_WORKSPACES_PER_WINDOW`).
@@ -2078,6 +2078,10 @@ impl Runtime {
         // CTX-0907: capture workspace name and whether it's active before removal
         let workspace_name = self.workspaces[index].name.clone();
         let removing_active = index == self.active_workspace;
+        // OQ-084 C.9: the slot's minted id is the bucket key the panel registry
+        // attributes this workspace's panels to, so it has to be read while the
+        // slot still exists.
+        let closing_workspace_id = self.workspaces[index].id;
 
         self.workspaces.remove(index);
         for view in removed_leaves.into_iter().chain(removed_floats) {
@@ -2093,6 +2097,8 @@ impl Runtime {
             self.float_offsets.remove(&view);
             self.clear_anchored_overlay_size(view);
         }
+        // OQ-084 C.9: removing the slot retires every panel attributed to it.
+        self.dispose_panels_of_workspace(closing_workspace_id);
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();
             let leaf = View::new(fresh_id, self.cols, self.rows);
@@ -2182,6 +2188,49 @@ impl Runtime {
         }
 
         self.pending_full_redraw = true;
+    }
+
+    /// Disposes every panel attributed to `workspace` when its slot is removed
+    /// (OQ-084 C.9: a workspace close is a disposal path, not a category).
+    ///
+    /// The composition root installs the same [`crate::registry::PanelRuntime`]
+    /// the plugin services address, and the panel registry attributes a panel
+    /// to exactly the [`WorkspaceId`] `Runtime::focused_workspace_id` hands the
+    /// create path (A.7), so the sweep's bucket key is the slot id captured
+    /// before the removal. The sweep itself is
+    /// [`crate::registry::PanelRuntime::dispose_workspace_panels`]: MRU order
+    /// with the focused panel first, one FS-4-style record per disposed panel
+    /// with reason `quit` and action `disposed`, and a per-panel report.
+    ///
+    /// The close never fails because of the sweep, and the sweep never fails
+    /// because of the close: a refused panel is reported in
+    /// [`WorkspaceDisposeReport::remaining`] and keeps its container (and its
+    /// attribution, so a later sweep can retry it). With no host installed —
+    /// every headless runtime — there is nothing to dispose and the report
+    /// stays `None`. A host already borrowed elsewhere (the composition root
+    /// hands the same `Rc` to the plugin services) fails closed the same way
+    /// the present loop does instead of panicking mid-close.
+    fn dispose_panels_of_workspace(&mut self, workspace: WorkspaceId) {
+        let Some(host) = self.scene_host.clone() else {
+            return;
+        };
+        let Ok(mut host) = host.try_borrow_mut() else {
+            return;
+        };
+        let report = host.dispose_workspace_panels(workspace);
+        self.last_workspace_panel_disposal = Some(report);
+    }
+
+    /// Report of the panel sweep the most recent workspace close ran
+    /// (OQ-084 C.9), or `None` when no close has met an installed panel host.
+    ///
+    /// Diagnostics only: the report is the FS-4-style evidence for the close —
+    /// the disposal order, the per-panel outcomes, one
+    /// [`crate::registry::PanelDisposalRecord`] per disposed panel, and any
+    /// panel the sweep refused or never attempted.
+    #[must_use]
+    pub fn last_workspace_panel_disposal(&self) -> Option<&WorkspaceDisposeReport> {
+        self.last_workspace_panel_disposal.as_ref()
     }
 
     /// Re-home the primary grid onto the loaded slot's focused leaf when

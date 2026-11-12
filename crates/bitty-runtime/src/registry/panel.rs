@@ -1101,6 +1101,182 @@ impl GenerationReleaseRecord {
     }
 }
 
+/// Why a panel container was retired (OQ-084 C.9).
+///
+/// The vocabulary is closed and matches FS-4's structured-record spelling:
+/// one lowercase stable string per reason, so a diagnostic consumer never
+/// parses prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PanelDisposalReason {
+    /// The panel's workspace was closed. C.9 names this reason `quit`: the
+    /// user quit the workspace, not the plugin generation.
+    Quit,
+}
+
+impl PanelDisposalReason {
+    /// Stable identifier for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+        }
+    }
+}
+
+impl std::fmt::Display for PanelDisposalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What happened to the panel container (OQ-084 C.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PanelDisposalAction {
+    /// The container was retired and its families released.
+    Disposed,
+}
+
+impl PanelDisposalAction {
+    /// Stable identifier for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disposed => "disposed",
+        }
+    }
+}
+
+impl std::fmt::Display for PanelDisposalAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// FS-4-style record for one retired panel container (OQ-084 C.9).
+///
+/// C.9 requires "one FS-4-style record per panel with owner, controller
+/// generation, reason `quit`, and action `disposed`". [`GenerationReleaseRecord`]
+/// is not that carrier: it counts the four families an *unbind edge* releases
+/// for a generation and survives on the live panel, while this record describes
+/// the *container's* retirement, is written exactly once per disposed panel,
+/// names the owner and the workspace the container belonged to, and must exist
+/// after the panel record is gone.
+///
+/// `owner` is `None` and `controller_generation` is the allocation epoch while
+/// no controller is bound (OQ-084 A.5): the D.2 phase 2 step 2 binder that would
+/// write the `(owner, controller generation)` pair is bitty#2476 residual 2, so
+/// no live path binds a controller yet. The record reports what the binding
+/// actually named at the edge rather than inventing an owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelDisposalRecord {
+    /// The retired container.
+    pub panel: PanelId,
+    /// The workspace the container was attributed to (C.9's disposal path).
+    pub workspace: WorkspaceId,
+    /// Plugin that held the panel's content binding, if one was bound.
+    pub owner: Option<bitty_plugin_host::PluginId>,
+    /// The controller generation the disposal released: the bound controller
+    /// generation when one exists, otherwise the allocation epoch.
+    pub controller_generation: Generation,
+    /// The panel state at the edge (`Focused`/`Mounted`/`Suspended`/`Created`),
+    /// which names the rule-8 release arm that ran.
+    pub state: PanelState,
+    /// Why the container was retired.
+    pub reason: PanelDisposalReason,
+    /// What happened to it.
+    pub action: PanelDisposalAction,
+}
+
+/// Outcome of one panel's disposal inside a workspace sweep (OQ-084 C.9).
+///
+/// Disposal is all-or-nothing per panel: `Ok` means every rule-8 family for
+/// that panel was released, `Err` means the panel kept its previous valid
+/// state and nothing of it was released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelDisposalOutcome {
+    /// The panel the outcome belongs to.
+    pub panel: PanelId,
+    /// The per-panel result.
+    pub result: Result<(), PanelError>,
+}
+
+/// Per-panel result of disposing every panel of one workspace (OQ-084 C.9).
+///
+/// The sweep is ordered (focused panel first, then workspace MRU) and
+/// fail-fast: the first refused panel stops it. `remaining` names every panel
+/// the sweep did not attempt, so a partial close is never mistaken for a
+/// complete one — a caller that only inspected `outcomes` would.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDisposeReport {
+    /// The workspace whose panels were swept.
+    pub workspace: WorkspaceId,
+    /// One entry per attempted panel, in disposal order.
+    pub outcomes: Vec<PanelDisposalOutcome>,
+    /// Panels not attempted because an earlier panel was refused.
+    pub remaining: Vec<PanelId>,
+    /// One FS-4-style record per disposed panel, in disposal order.
+    pub records: Vec<PanelDisposalRecord>,
+}
+
+impl WorkspaceDisposeReport {
+    /// Whether every panel attributed to the workspace was disposed.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.refused().is_none() && self.remaining.is_empty()
+    }
+
+    /// The refused panel and the typed refusal that stopped the sweep.
+    #[must_use]
+    pub fn refused(&self) -> Option<(PanelId, &PanelError)> {
+        self.outcomes
+            .iter()
+            .find_map(|outcome| match &outcome.result {
+                Ok(()) => None,
+                Err(error) => Some((outcome.panel, error)),
+            })
+    }
+
+    /// Panels the sweep disposed, in disposal order.
+    #[must_use]
+    pub fn disposed(&self) -> Vec<PanelId> {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_ok())
+            .map(|outcome| outcome.panel)
+            .collect()
+    }
+
+    /// How many panels the sweep disposed.
+    #[must_use]
+    pub fn disposed_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.result.is_ok())
+            .count()
+    }
+}
+
+/// The facts a workspace sweep stamps on a panel's disposal record before the
+/// panel record leaves the registry (OQ-084 C.9).
+///
+/// Read through [`PanelRegistry::panel_disposal_facts`]: the sweep needs the
+/// panel's allocation epoch (to name it in the disposal), the binding
+/// generation, the owner, and the state at the edge, and every one of them is
+/// unavailable once the container is gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PanelDisposalFacts {
+    /// The container's allocation epoch (OQ-084 B.1), the fence
+    /// [`PanelRegistry::dispose_panel`] validates.
+    pub allocation_generation: Generation,
+    /// The generation the disposal releases: the bound controller generation
+    /// when one is bound, otherwise the allocation epoch (D.2 phase 2 step 1).
+    pub controller_generation: Generation,
+    /// Plugin that held the content binding, if one was bound (A.2).
+    pub owner: Option<bitty_plugin_host::PluginId>,
+    /// The panel state at the edge.
+    pub state: PanelState,
+}
+
 /// Generic Panel Runtime per window/process. One registry per window,
 /// single-process winit, holds no PTY fd, GPU object, or OS window handle
 /// (those remain with `bitty-pty`, `bitty-render`, `bitty-platform`).
@@ -1755,11 +1931,22 @@ impl PanelRegistry {
         }
         // Remove from workspace list and MRU
         if let Some(ws) = workspace {
+            let mut emptied = false;
             if let Some(list) = self.workspace_panels.get_mut(&ws) {
                 list.retain(|&id| id != panel_id);
+                emptied = list.is_empty();
             }
             if let Some(focus) = self.focus_per_workspace.get_mut(&ws) {
                 focus.on_panel_hidden(panel_id);
+            }
+            // OQ-084 A.7: a workspace id is minted once and never reused, so an
+            // empty bucket could never be reclaimed. Dropping it with the last
+            // panel keeps the table bounded by the live workspaces rather than
+            // by every workspace ever opened (the workspace-close sweep of C.9
+            // makes this the ordinary path).
+            if emptied {
+                self.workspace_panels.remove(&ws);
+                self.focus_per_workspace.remove(&ws);
             }
         }
         // Clear commands and bus queues
@@ -1793,6 +1980,162 @@ impl PanelRegistry {
             .get(&workspace)
             .map(|f| f.mru_order())
             .unwrap_or_default()
+    }
+
+    /// Panels attributed to `workspace`, in the order OQ-084 C.9 disposes them:
+    /// the focused panel first, then the rest of the workspace MRU, then any
+    /// panel the workspace bucket still holds that was never focused (creation
+    /// order).
+    ///
+    /// The bucket is authoritative for membership and the focus tracker only
+    /// for order, because [`PanelFocus`] holds the panels that were *focused*,
+    /// not the panels that exist: a `Created` panel that never took focus is in
+    /// the bucket and in no MRU list. Reading MRU alone would lose it and a
+    /// workspace close would silently leave its container behind (A.7).
+    ///
+    /// The workspace here is the runtime's minted [`WorkspaceId`] — the same
+    /// value [`PanelRegistry::create_panel`] was handed — never an index or a
+    /// terminal-registry sequence (A.7).
+    #[must_use]
+    pub fn panels_for_workspace(&self, workspace: WorkspaceId) -> Vec<PanelId> {
+        let Some(bucket) = self.workspace_panels.get(&workspace) else {
+            return Vec::new();
+        };
+        let mut ordered: Vec<PanelId> = Vec::with_capacity(bucket.len());
+        let focus = self.focus_per_workspace.get(&workspace);
+        if let Some(focused) = focus.and_then(|focus| focus.focused()) {
+            if bucket.contains(&focused) {
+                ordered.push(focused);
+            }
+        }
+        if let Some(focus) = focus {
+            for panel in focus.mru_order() {
+                if !ordered.contains(&panel) && bucket.contains(&panel) {
+                    ordered.push(panel);
+                }
+            }
+        }
+        for &panel in bucket {
+            if !ordered.contains(&panel) {
+                ordered.push(panel);
+            }
+        }
+        ordered
+    }
+
+    /// Number of workspace buckets the registry tracks.
+    ///
+    /// A bucket is created by [`Self::create_panel`] with a `WorkspaceId` and
+    /// dropped by [`Self::dispose_panel`] when its last panel goes, so a
+    /// disposed workspace leaves no empty bucket behind. `WorkspaceId`s are
+    /// minted once and never reused (A.7), so an empty bucket would never be
+    /// reclaimed.
+    #[must_use]
+    pub fn attributed_workspace_count(&self) -> usize {
+        self.workspace_panels.len()
+    }
+
+    /// The facts a workspace sweep stamps on a panel's disposal record before
+    /// the container goes (OQ-084 C.9), or `None` when the panel is not live.
+    ///
+    /// `controller_generation` is the generation the disposal releases—the
+    /// bound controller generation when one exists, otherwise the allocation
+    /// epoch (D.2 phase 2 step 1)—and `owner` is the plugin that held the
+    /// content binding, which no live path writes yet (A.2, residual 2).
+    #[must_use]
+    pub fn panel_disposal_facts(&self, panel_id: PanelId) -> Option<PanelDisposalFacts> {
+        let record = self.panels.get(&panel_id.0)?;
+        Some(PanelDisposalFacts {
+            allocation_generation: record.generation,
+            controller_generation: record.grant_key_generation(),
+            owner: record.owner().cloned(),
+            state: record.state,
+        })
+    }
+
+    /// Disposes every panel attributed to `workspace`, focused panel first
+    /// (OQ-084 C.9: "a workspace close is a disposal path, not a category").
+    ///
+    /// Each panel goes through [`Self::dispose_panel`], so every panel is
+    /// all-or-nothing and consults the six-state model rather than a second
+    /// transition table, and the `Focused -> Disposed` / `Created -> Disposed`
+    /// release obligations of C.8 are the ones already implemented there.
+    /// Ordering matters for the focused panel: disposing it releases input
+    /// routing and moves focus to the next MRU entry, so the workspace never
+    /// holds a focus pointer to a retired container.
+    ///
+    /// One [`PanelDisposalRecord`] is written per *disposed* panel with reason
+    /// [`PanelDisposalReason::Quit`] and action
+    /// [`PanelDisposalAction::Disposed`]; a refused panel emits none, because
+    /// nothing about it was disposed.
+    ///
+    /// **Failure semantics: fail-fast, resumable.** The first refusal stops the
+    /// sweep. Panels already disposed stay disposed (each disposal is atomic
+    /// and irreversible), the refused panel keeps its previous valid state
+    /// untouched, and every panel after it is reported in
+    /// [`WorkspaceDisposeReport::remaining`] rather than silently skipped — a
+    /// caller that only read `outcomes` would mistake a partial close for a
+    /// complete one. The sweep is idempotent: the refused panel and the
+    /// remainder are still attributed to the workspace, so re-running it after
+    /// the cause is fixed disposes exactly those.
+    ///
+    /// A refusal caused by the registry itself ([`PanelError::RegistryDisposed`])
+    /// therefore reports, it does not panic: the workspace close that called it
+    /// already succeeded in the layout domain and cannot be undone here.
+    #[must_use]
+    pub fn dispose_workspace_panels(&mut self, workspace: WorkspaceId) -> WorkspaceDisposeReport {
+        let ordered = self.panels_for_workspace(workspace);
+        let mut outcomes: Vec<PanelDisposalOutcome> = Vec::with_capacity(ordered.len());
+        let mut records: Vec<PanelDisposalRecord> = Vec::with_capacity(ordered.len());
+        let mut remaining: Vec<PanelId> = Vec::new();
+        for (index, panel) in ordered.iter().copied().enumerate() {
+            let Some(facts) = self.panel_disposal_facts(panel) else {
+                // The bucket and the record are written and dropped together,
+                // so this is a stale bucket entry rather than a live panel.
+                // Report it instead of skipping it: a silent skip would leave a
+                // container nothing could ever close.
+                outcomes.push(PanelDisposalOutcome {
+                    panel,
+                    result: Err(PanelError::NotFound {
+                        kind: "panel",
+                        id_raw: panel.0,
+                    }),
+                });
+                remaining.extend(ordered[index + 1..].iter().copied());
+                break;
+            };
+            match self.dispose_panel(panel, facts.allocation_generation) {
+                Ok(()) => {
+                    outcomes.push(PanelDisposalOutcome {
+                        panel,
+                        result: Ok(()),
+                    });
+                    records.push(PanelDisposalRecord {
+                        panel,
+                        workspace,
+                        owner: facts.owner,
+                        controller_generation: facts.controller_generation,
+                        state: facts.state,
+                        reason: PanelDisposalReason::Quit,
+                        action: PanelDisposalAction::Disposed,
+                    });
+                }
+                Err(error) => {
+                    outcomes.push(PanelDisposalOutcome {
+                        panel,
+                        result: Err(error),
+                    });
+                    remaining.extend(ordered[index + 1..].iter().copied());
+                    break;
+                }
+            }
+        }
+        WorkspaceDisposeReport {
+            workspace,
+            outcomes,
+            remaining,
+            records,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2548,6 +2891,86 @@ impl PanelRegistry {
     #[must_use]
     pub fn total_created(&self) -> u64 {
         self.total_created
+    }
+}
+
+/// OQ-084 C.9: the workspace sweep's failure semantics.
+///
+/// C.9 requires a refused disposal to leave the previous valid state intact and
+/// not to skip the remaining panels silently. The sweep is fail-fast and
+/// resumable: the refusal is reported with the panels it did not reach, and
+/// re-running the sweep after the cause clears disposes exactly those.
+///
+/// A module test because the refusal has to be reached through the dispose
+/// guard: `PanelRegistry::dispose` is the only public way to set it and it
+/// empties the very bucket the sweep walks, which would leave nothing to refuse.
+#[cfg(test)]
+mod workspace_dispose_tests {
+    use super::*;
+
+    /// The first refusal stops the sweep, names the rest, and changes nothing.
+    #[test]
+    fn a_refused_panel_stops_the_sweep_and_names_the_rest() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let ws = WorkspaceId::new(42);
+        let first = reg
+            .create_panel(PanelType::Helper, Some(ws))
+            .expect("first panel")
+            .id;
+        let second = reg
+            .create_panel(PanelType::Helper, Some(ws))
+            .expect("second panel")
+            .id;
+        let third = reg
+            .create_panel(PanelType::Helper, Some(ws))
+            .expect("third panel")
+            .id;
+
+        // The guard `ensure_not_disposed` reads, set without the map clear a
+        // public `dispose()` performs: the bucket still holds the three panels
+        // the sweep has to refuse.
+        reg.disposed = true;
+
+        let report = reg.dispose_workspace_panels(ws);
+        assert!(!report.is_complete(), "a refusal is never a complete close");
+        let (refused, error) = report.refused().expect("the refusal is reported");
+        assert_eq!(refused, first);
+        assert!(matches!(error, PanelError::RegistryDisposed { .. }));
+        assert_eq!(
+            report.outcomes.len(),
+            1,
+            "the sweep stops at the refused panel instead of walking past it"
+        );
+        assert!(report.records.is_empty(), "nothing was disposed");
+        assert_eq!(
+            report.remaining,
+            vec![second, third],
+            "the panels the sweep never attempted are named, not silently skipped"
+        );
+        // Previous valid state intact.
+        assert_eq!(reg.panel_count(), 3);
+        assert_eq!(reg.panels_for_workspace(ws), vec![first, second, third]);
+
+        // Resumable: with the registry usable again, exactly the refused panel
+        // and the remainder go.
+        reg.disposed = false;
+        let retry = reg.dispose_workspace_panels(ws);
+        assert!(retry.is_complete());
+        assert!(retry.remaining.is_empty());
+        assert_eq!(retry.disposed(), vec![first, second, third]);
+        assert_eq!(retry.records.len(), 3);
+        assert_eq!(reg.panel_count(), 0);
+    }
+
+    /// A sweep over a workspace with no panels is complete and writes nothing.
+    #[test]
+    fn an_empty_workspace_sweeps_to_nothing() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let report = reg.dispose_workspace_panels(WorkspaceId::new(77));
+        assert!(report.is_complete());
+        assert!(report.outcomes.is_empty());
+        assert!(report.records.is_empty());
+        assert!(report.remaining.is_empty());
     }
 }
 

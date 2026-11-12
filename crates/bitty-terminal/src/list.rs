@@ -4265,10 +4265,22 @@ mod tests {
             .expect("copy row");
         assert_eq!(copy.mouse, vec!["right".to_string()]);
         let table = format_actions_table(&rows, &list_core_commands(), true);
+        // Issue #3122: `copy_to_clipboard` ships two chords, and the catalog
+        // names the alphabetically-first one (`ctrl+insert`); the long-standing
+        // `ctrl+shift+c` chord stays bound in the shipped map.
         assert!(
-            table.contains("copy_to_clipboard ctrl+shift+c right"),
+            table.contains("copy_to_clipboard ctrl+insert right"),
             "table: {table:?}"
         );
+        let shipped = bitty_config::keymap::shipped_resolved_keymaps();
+        for chord in ["ctrl+shift+c", "ctrl+insert"] {
+            assert!(
+                shipped.iter().any(|entry| entry.from_default
+                    && entry.chord.canonical() == chord
+                    && entry.action == bitty_config::ChromeAction::CopyToClipboard),
+                "{chord} stays bound to copy_to_clipboard"
+            );
+        }
     }
 
     #[test]

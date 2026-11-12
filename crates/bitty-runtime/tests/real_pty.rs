@@ -41,7 +41,7 @@ fn runtime_real_shell_echo_bounded_backpressure() {
 
     // Poll with timeout until the echo arrives in terminal state.
     // The bounded channel guarantees each chunk <= READ_CHUNK_SIZE (8 KiB)
-    // and total in-crate buffered bytes <= MAX_BUFFERED_BYTES (128 KiB).
+    // and total in-crate buffered bytes <= MAX_BUFFERED_BYTES (256 KiB).
     let deadline = std::time::Instant::now() + TIMEOUT;
     let mut found = false;
     while std::time::Instant::now() < deadline {

@@ -85,11 +85,29 @@ pub(super) fn pty_forward_loop(
         let mut sent_any = false;
         let mut broken = false;
         for chunk in batch {
-            if tx.send(chunk).is_err() {
-                broken = true;
-                break;
+            match tx.try_send(chunk) {
+                Ok(()) => {
+                    sent_any = true;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(chunk)) => {
+                    // Issue #3122: wake the event loop BEFORE blocking on a
+                    // full bounded channel. Otherwise, if a prior wakeup was
+                    // consumed while `tx` still held chunks (or while this
+                    // batch was filling `tx`), `tx.send(chunk)` can park with
+                    // `EventWaker::queued == false` and never fire the
+                    // post-loop `(waker)()`, stalling the pane mid-frame.
+                    (waker)();
+                    if tx.send(chunk).is_err() {
+                        broken = true;
+                        break;
+                    }
+                    sent_any = true;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    broken = true;
+                    break;
+                }
             }
-            sent_any = true;
         }
         // One wakeup per batch, and only when at least one chunk was
         // forwarded: a dropped consumer exits without a spurious wakeup,
@@ -191,18 +209,50 @@ pub(super) fn spawn_forwarder_default(
 
 /// One poll's CTX-0476 drain allowance, shared by the primary session and
 /// every pane session (#1530).
+///
+/// Issue #3122 adds a second, larger allowance for polls taken while a
+/// visible session holds `DECSET 2026` ([`PollBudget::synchronized`]), so an
+/// atomic `writePrepend` batch is absorbed in one turn instead of being
+/// chopped across dozens of them.
 struct PollBudget {
     start: std::time::Instant,
     chunks: usize,
     bytes: usize,
+    max_chunks: usize,
+    max_bytes: usize,
+    time_budget: std::time::Duration,
 }
 
 impl PollBudget {
+    /// The ordinary per-poll allowance ([`POLL_PTY_MAX_CHUNKS`] /
+    /// [`POLL_PTY_MAX_BYTES`] / [`POLL_PTY_TIME_BUDGET`]).
     fn new() -> Self {
+        Self::with_limits(
+            POLL_PTY_MAX_CHUNKS,
+            POLL_PTY_MAX_BYTES,
+            POLL_PTY_TIME_BUDGET,
+        )
+    }
+
+    /// The burst allowance used while a visible session holds `DECSET 2026`
+    /// (issue #3122): [`POLL_PTY_SYNC_MAX_CHUNKS`] /
+    /// [`POLL_PTY_SYNC_TIME_BUDGET`], same byte-per-chunk bound.
+    fn synchronized() -> Self {
+        Self::with_limits(
+            POLL_PTY_SYNC_MAX_CHUNKS,
+            POLL_PTY_SYNC_MAX_CHUNKS * bitty_pty::READ_CHUNK_SIZE,
+            POLL_PTY_SYNC_TIME_BUDGET,
+        )
+    }
+
+    fn with_limits(max_chunks: usize, max_bytes: usize, time_budget: std::time::Duration) -> Self {
         Self {
             start: std::time::Instant::now(),
             chunks: 0,
             bytes: 0,
+            max_chunks,
+            max_bytes,
+            time_budget,
         }
     }
 
@@ -214,9 +264,9 @@ impl PollBudget {
     /// Whether one more chunk may drain. The first chunk of a poll always
     /// may, so a max-size chunk makes progress even past the time budget.
     fn allows_another(&self) -> bool {
-        self.chunks < POLL_PTY_MAX_CHUNKS
-            && self.bytes < POLL_PTY_MAX_BYTES
-            && (self.chunks == 0 || self.start.elapsed() < POLL_PTY_TIME_BUDGET)
+        self.chunks < self.max_chunks
+            && self.bytes < self.max_bytes
+            && (self.chunks == 0 || self.start.elapsed() < self.time_budget)
     }
 }
 
@@ -640,18 +690,20 @@ impl Runtime {
     ///
     /// Drains the wakeup-forwarder channel when [`set_pty_waker`](Self::set_pty_waker)
     /// promoted the pump, otherwise the direct pump channel. Either way the
-    /// bound holds (`CHANNEL_CAPACITY_CHUNKS` × `READ_CHUNK_SIZE` = 128 KiB
-    /// per stage, 256 KiB worst-case total with the forwarder active).
+    /// bound holds (`CHANNEL_CAPACITY_CHUNKS` × `READ_CHUNK_SIZE` = 256 KiB
+    /// per stage, 512 KiB worst-case total with the forwarder active).
     ///
     /// When a consumer stalls, the bounded channel(s) fill, the pump blocks,
-    /// the kernel PTY buffer fills, and the child's writes block —
-    /// end-to-end backpressure with zero data loss and zero unbounded memory
-    /// growth. This method is the consumer side: it drains immediately
-    /// available chunks without blocking, feeding each through the VT parser
-    /// and terminal state, stopping at the first of the CTX-0476 budgets
-    /// (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`)
-    /// so a hostile flood can delay but never stall the render thread; the
-    /// remainder stays queued for the next poll.
+    /// the kernel PTY buffer fills, and the child's writes block — end-to-end
+    /// backpressure with zero data loss and zero unbounded memory growth.
+    /// This method is the consumer side: it drains immediately available
+    /// chunks without blocking, feeding each through the VT parser and
+    /// terminal state, stopping at the first of the CTX-0476 budgets
+    /// (`POLL_PTY_MAX_CHUNKS` / `POLL_PTY_MAX_BYTES` / `POLL_PTY_TIME_BUDGET`,
+    /// or the larger `POLL_PTY_SYNC_*` burst budgets while a visible session
+    /// holds `DECSET 2026`, issue #3122) so a hostile flood can delay but
+    /// never stall the render thread; the remainder stays queued for the next
+    /// poll.
     ///
     /// Returns the number of chunks drained. `0` means either no PTY, no data
     /// available yet, or EOF has been reached and the queue drained (the
@@ -684,7 +736,15 @@ impl Runtime {
         // (which only enqueue, never block), then pump again for any
         // completions already ready.
         self.pump_kitty_local_completions();
-        let mut budget = PollBudget::new();
+        // Issue #3122: a synchronized-output batch (`DECSET 2026`) is atomic,
+        // so it drains under the burst allowance instead of the ordinary one.
+        // A background-workspace session does not qualify (see
+        // `Runtime::synchronized_update_active`).
+        let mut budget = if self.synchronized_update_active() {
+            PollBudget::synchronized()
+        } else {
+            PollBudget::new()
+        };
         let mut primary: Vec<Vec<u8>> = Vec::new();
         if let Some(seed) = seed {
             budget.charge(seed.len());
@@ -2333,13 +2393,45 @@ mod tests {
     fn the_first_chunk_of_a_poll_always_drains() {
         let rx = session(1, false);
         let mut next = || rx.try_recv().ok();
-        let mut budget = PollBudget {
-            start: std::time::Instant::now() - POLL_PTY_TIME_BUDGET * 2,
-            chunks: 0,
-            bytes: 0,
-        };
+        let mut budget = PollBudget::with_limits(
+            POLL_PTY_MAX_CHUNKS,
+            POLL_PTY_MAX_BYTES,
+            POLL_PTY_TIME_BUDGET,
+        );
+        budget.start = std::time::Instant::now() - POLL_PTY_TIME_BUDGET * 2;
         let drained = drain_fair(&mut budget, 0, &mut [&mut next]);
         assert_eq!(drained.len(), 1, "an expired clock still drains one chunk");
+    }
+
+    /// Issue #3122: while `DECSET 2026` holds, one poll may drain far more
+    /// than the ordinary budget so an atomic `writePrepend` batch lands in a
+    /// single turn; the burst allowance is still a hard bound.
+    #[test]
+    fn synchronized_budget_drains_a_full_write_prepend_burst() {
+        let sync_chunks: usize = POLL_PTY_SYNC_MAX_CHUNKS;
+        let ordinary_chunks: usize = POLL_PTY_MAX_CHUNKS;
+        assert!(
+            sync_chunks > ordinary_chunks,
+            "the burst allowance must exceed the ordinary one"
+        );
+        let rx = session(POLL_PTY_SYNC_MAX_CHUNKS + 16, false);
+        let mut next = || rx.try_recv().ok();
+        let mut budget = PollBudget::synchronized();
+        let drained = drain_fair(&mut budget, 0, &mut [&mut next]);
+        assert!(
+            drained.len() > POLL_PTY_MAX_CHUNKS,
+            "sync burst drained {} chunks, ordinary budget is {POLL_PTY_MAX_CHUNKS}",
+            drained.len()
+        );
+        assert!(
+            drained.len() <= POLL_PTY_SYNC_MAX_CHUNKS,
+            "sync burst drained {} chunks, bound is {POLL_PTY_SYNC_MAX_CHUNKS}",
+            drained.len()
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the tail left over the burst bound stays queued for the next poll"
+        );
     }
 
     #[test]

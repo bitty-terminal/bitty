@@ -178,8 +178,8 @@ fn soak_headless_1000_ticks_bounded_and_deterministic() {
     assert_eq!(rt.tick(), None);
     // Hard bound contract.
     assert_eq!(READ_CHUNK_SIZE, 8 * 1024);
-    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 16);
-    assert_eq!(MAX_BUFFERED_BYTES, 128 * 1024);
+    assert_eq!(CHANNEL_CAPACITY_CHUNKS, 32);
+    assert_eq!(MAX_BUFFERED_BYTES, 256 * 1024);
 }
 
 // ---------------------------------------------------------------------------

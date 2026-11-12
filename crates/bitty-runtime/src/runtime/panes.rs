@@ -81,7 +81,7 @@ impl Runtime {
     /// Replaces any previously spawned child: the old `Pty` is dropped, which
     /// kills and reaps its child without leaking a zombie. The output side
     /// is pumped into a bounded channel (`READ_CHUNK_SIZE` ×
-    /// `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) so backpressure is end-to-end;
+    /// `CHANNEL_CAPACITY_CHUNKS` = 256 KiB) so backpressure is end-to-end;
     /// see `poll_pty` for the non-blocking drain that feeds
     /// `handle_pty_bytes`.
     ///

@@ -774,6 +774,19 @@ pub fn encode_key_event_kitty_protocol(
             None
         };
         let is_keypad = keypad_code.is_some();
+        // Issue #3122: non-ASCII or multi-codepoint text-producing character
+        // events without a disambiguated modifier chord (for example remote
+        // desktop X11/XWayland key injection or composed text delivered via
+        // `LogicalKey::Character` such as CJK, emoji, or kaomoji) have no
+        // physical key entry in the Kitty keyboard protocol table. Returning
+        // `None` falls back to the UTF-8 text path on press/repeat and stays
+        // silent on release, matching Ghostty's `kittyKeyEntry` fallback so
+        // TUIs enabling flags like `11` (`DISAMBIGUATE | REPORT_EVENTS |
+        // REPORT_ALL_KEYS`) without `REPORT_TEXT` (`16`) receive the UTF-8
+        // text instead of dropping it into a text-less `CSI <codepoint> u`.
+        if (!chars.is_ascii() || chars.chars().count() > 1) && !disambiguated_chord && !is_keypad {
+            return None;
+        }
         let code = keypad_code.unwrap_or(plain_code);
         let shifted = if is_keypad {
             None
@@ -2264,6 +2277,48 @@ mod tests {
         assert_eq!(
             encode_key_event_kitty_protocol(&enter, KITTY_MOD_SHIFT, KITTY_FLAG_DISAMBIGUATE),
             Some(b"\x1b[13;2u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_non_ascii_and_multi_char_text_falls_back_to_utf8_without_chord() {
+        // Issue #3122: remote desktop (RustDesk) and X11/XWayland text
+        // injection deliver CJK, emoji, and kaomoji as `LogicalKey::Character`
+        // without a physical Kitty key entry. Under flags `11`
+        // (`DISAMBIGUATE | REPORT_EVENTS | REPORT_ALL_KEYS`, no `REPORT_TEXT`),
+        // unmodified or shift-only presses must return `None` from the Kitty
+        // encoder so the caller emits raw UTF-8 text on press/repeat and
+        // nothing on release, while a chord (`Ctrl+中`) still disambiguates.
+        let flags = KITTY_FLAG_DISAMBIGUATE | KITTY_FLAG_REPORT_EVENTS | KITTY_FLAG_REPORT_ALL_KEYS;
+        for sample in ["中", "😀", "╰(°▽°)╯"] {
+            let press = kitty_char(sample, Some(sample), PressState::Pressed, false);
+            assert_eq!(
+                encode_key_event_kitty_protocol(&press, 0, flags),
+                None,
+                "unmodified {sample:?} must fall back to UTF-8 text"
+            );
+            assert_eq!(
+                encode_key_event_kitty_protocol(&press, KITTY_MOD_SHIFT, flags),
+                None,
+                "shift-only {sample:?} must fall back to UTF-8 text"
+            );
+            let release = kitty_char(sample, None, PressState::Released, false);
+            assert_eq!(
+                encode_key_event_kitty_protocol(&release, 0, flags),
+                None,
+                "release of {sample:?} must not emit a spurious CSI u frame"
+            );
+            assert_eq!(
+                encode_key_event_with_terminal_modes(&press, &ModifiersState::default(), false),
+                Some(sample.as_bytes().to_vec()),
+                "fallback encoder emits raw UTF-8 for {sample:?}"
+            );
+        }
+        let ctrl_cjk = kitty_char("中", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&ctrl_cjk, KITTY_MOD_CTRL, flags),
+            Some(b"\x1b[20013;5u".to_vec()),
+            "explicit Ctrl chord on a non-ASCII character still disambiguates"
         );
     }
 

@@ -1268,7 +1268,7 @@ fn backpressure_bound_holds_under_flood() {
         "max chunk sanity"
     );
     // Verify the semantic bound documented in lib.rs: channel holds at most
-    // CHANNEL_CAPACITY_CHUNKS chunks, so hard buffer bound is 128 KiB.
+    // CHANNEL_CAPACITY_CHUNKS chunks, so hard buffer bound is 256 KiB.
     assert_eq!(
         bitty_pty::MAX_BUFFERED_BYTES,
         bitty_pty::READ_CHUNK_SIZE * bitty_pty::CHANNEL_CAPACITY_CHUNKS

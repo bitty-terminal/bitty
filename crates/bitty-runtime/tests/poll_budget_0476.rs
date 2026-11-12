@@ -8,22 +8,45 @@
 use std::time::{Duration, Instant};
 
 use bitty_runtime::{
-    POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, Runtime, RuntimeConfig,
+    POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_SYNC_MAX_CHUNKS, POLL_PTY_SYNC_TIME_BUDGET,
+    POLL_PTY_TIME_BUDGET, Runtime, RuntimeConfig,
 };
 
 const WAIT: Duration = Duration::from_secs(30);
 
 #[test]
 fn poll_budgets_match_accepted_pipeline_bounds() {
-    // 32 chunks x 8 KiB = 256 KiB matches the worst-case total buffered
-    // across both pump stages (2 x 128 KiB). The time budget keeps one poll
-    // inside a frame (10 ms order, mirrors spawn-poll cadence).
-    assert_eq!(POLL_PTY_MAX_CHUNKS, 32);
-    assert_eq!(POLL_PTY_MAX_BYTES, 32 * 8 * 1024);
+    // 64 chunks x 8 KiB = 512 KiB matches the worst-case total buffered
+    // across both pump stages (2 x 256 KiB, issue #3122 doubled the channel).
+    // The time budget keeps one poll inside a frame (10 ms order, mirrors
+    // spawn-poll cadence).
+    assert_eq!(POLL_PTY_MAX_CHUNKS, 64);
+    assert_eq!(POLL_PTY_MAX_BYTES, 64 * 8 * 1024);
     assert_eq!(POLL_PTY_TIME_BUDGET, Duration::from_millis(10));
     assert_eq!(
         POLL_PTY_MAX_BYTES,
         POLL_PTY_MAX_CHUNKS * bitty_pty::READ_CHUNK_SIZE
+    );
+}
+
+#[test]
+fn synchronized_poll_budgets_exceed_the_ordinary_ones() {
+    // Issue #3122: a `DECSET 2026` batch (a TUI `writePrepend` during
+    // expand/collapse or a panel switch) is atomic, so it gets a larger
+    // burst allowance — but it stays a hard bound.
+    assert_eq!(POLL_PTY_SYNC_MAX_CHUNKS, 256);
+    assert_eq!(POLL_PTY_SYNC_TIME_BUDGET, Duration::from_millis(20));
+    let sync_chunks: usize = POLL_PTY_SYNC_MAX_CHUNKS;
+    let ordinary_chunks: usize = POLL_PTY_MAX_CHUNKS;
+    let sync_budget: Duration = POLL_PTY_SYNC_TIME_BUDGET;
+    let ordinary_budget: Duration = POLL_PTY_TIME_BUDGET;
+    assert!(
+        sync_chunks > ordinary_chunks,
+        "sync burst {sync_chunks} must exceed the ordinary {ordinary_chunks} chunks"
+    );
+    assert!(
+        sync_budget > ordinary_budget,
+        "sync budget {sync_budget:?} must exceed the ordinary {ordinary_budget:?}"
     );
 }
 

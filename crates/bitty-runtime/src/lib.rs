@@ -311,10 +311,12 @@ pub use runtime::{
     FX_PULSE_QUEUE_CAPACITY, FileUrlActivation, FxPulseQueue, FxPulseTracker,
     HIDDEN_REPAIR_INTERVAL_MS, IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome,
     KittyImageError, MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT,
-    PASTE_BANNER_FULL_DURATION, POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET,
-    PRESENT_SETTLE_MAX, PTY_FORWARD_CAPACITY_CHUNKS, PanelAnimator, PresentStats, PtyWaker,
-    QueuedFxPulse, ReducedMotionMode, Runtime, SCENE_A11Y_KIND, SYNC_UPDATE_DEFER_TIMEOUT,
-    SceneA11yRun, SceneFrameReport, TargetAnchorSummary, TerminalDiagnostics, UrlActivation,
+    PASTE_BANNER_FULL_DURATION, POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_SYNC_MAX_CHUNKS,
+    POLL_PTY_SYNC_TIME_BUDGET, POLL_PTY_TIME_BUDGET, PRESENT_SETTLE_MAX,
+    PTY_FORWARD_CAPACITY_CHUNKS, PanelAnimator, PresentStats, PtyWaker, QueuedFxPulse,
+    ReducedMotionMode, Runtime, SCENE_A11Y_KIND, SYNC_UPDATE_DEFER_TIMEOUT,
+    SYNC_UPDATE_MAX_DEFER_TIMEOUT, SceneA11yRun, SceneFrameReport, TargetAnchorSummary,
+    TerminalDiagnostics, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

@@ -56,10 +56,20 @@ use std::time::Duration;
 pub const READ_CHUNK_SIZE: usize = 8 * 1024;
 
 /// Number of chunk slots in the bounded channel between pump and consumer.
-pub const CHANNEL_CAPACITY_CHUNKS: usize = 16;
+///
+/// Issue #3122: 32 slots (256 KiB) instead of 16 (128 KiB). A normal-screen
+/// TUI expanding its command output (`Ctrl+O`) or handling a panel switch
+/// emits a single synchronized frame (`DECSET 2026`) whose `writePrepend`
+/// body is hundreds of KiB to several MiB. With only 16 slots an unfocused
+/// or briefly un-pumped panel filled the channel mid-frame, blocked the
+/// child inside the atomic batch, and the renderer broke deferral and
+/// redrew the history top-to-bottom. The extra 128 KiB doubles the cushion
+/// per stage while keeping the bound hard and small enough that a stalled
+/// consumer still reaches kernel backpressure quickly.
+pub const CHANNEL_CAPACITY_CHUNKS: usize = 32;
 
 /// Hard upper bound on buffered PTY payload inside this crate:
-/// [`READ_CHUNK_SIZE`] x [`CHANNEL_CAPACITY_CHUNKS`] (128 KiB).
+/// [`READ_CHUNK_SIZE`] x [`CHANNEL_CAPACITY_CHUNKS`] (256 KiB).
 pub const MAX_BUFFERED_BYTES: usize = READ_CHUNK_SIZE * CHANNEL_CAPACITY_CHUNKS;
 
 /// Source of PTY output bytes. Abstracted so the pump logic is unit-testable

@@ -2194,6 +2194,17 @@ impl Runtime {
     /// `Instant` domain the embedder passes to [`Self::tick_at`].
     #[doc(hidden)]
     pub fn note_present_input_at(&mut self, now: std::time::Instant) {
+        // Issue #3122: while a visible grid is actively streaming inside a
+        // `DECSET 2026` synchronized update, each PTY drain extends the 100 ms
+        // idle timeout (`SYNC_UPDATE_DEFER_TIMEOUT`) up to the 1,000 ms hard
+        // ceiling (`SYNC_UPDATE_MAX_DEFER_TIMEOUT`), so a multi-megabyte
+        // `writePrepend` TUI redraw is not torn mid-scroll after 100 ms.
+        if self.synchronized_update_active() {
+            let burst = *self.sync_burst_since.get_or_insert(now);
+            if now.saturating_duration_since(burst) < super::SYNC_UPDATE_MAX_DEFER_TIMEOUT {
+                self.sync_defer_since = Some(now);
+            }
+        }
         if self.present_settle.is_zero() {
             return;
         }
@@ -3798,8 +3809,11 @@ impl Runtime {
         // at the bound instead of stalling presentation indefinitely. After
         // the bound, each subsequent window commits at most every timeout.
         if self.synchronized_update_active() {
+            let burst = *self.sync_burst_since.get_or_insert(now);
             let since = *self.sync_defer_since.get_or_insert(now);
-            if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT {
+            if now.saturating_duration_since(since) < SYNC_UPDATE_DEFER_TIMEOUT
+                && now.saturating_duration_since(burst) < super::SYNC_UPDATE_MAX_DEFER_TIMEOUT
+            {
                 // Keep the app wake at the sync bound, replacing any earlier
                 // settle/cadence deadline. A settle deferral may have armed a
                 // deadline that this gate has now outlived; leaving it in
@@ -3807,14 +3821,23 @@ impl Runtime {
                 // on every loop turn until the 100 ms bound elapses (a spin,
                 // not a present). The frame itself stays deferred here.
                 self.coalesced_pending = true;
-                self.coalesced_deadline = since.checked_add(SYNC_UPDATE_DEFER_TIMEOUT);
+                let idle_deadline = since.checked_add(SYNC_UPDATE_DEFER_TIMEOUT);
+                let max_deadline = burst.checked_add(super::SYNC_UPDATE_MAX_DEFER_TIMEOUT);
+                self.coalesced_deadline = match (idle_deadline, max_deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
                 return true;
             }
             // Bound reached: commit this frame, then open a fresh window so
             // a still-active mode does not present on every later tick.
             self.sync_defer_since = Some(now);
+            self.sync_burst_since = Some(now);
         } else {
             self.sync_defer_since = None;
+            self.sync_burst_since = None;
         }
         false
     }

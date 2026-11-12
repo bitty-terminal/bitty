@@ -48,7 +48,7 @@
 //!
 //! - reads are chunked at [`READ_CHUNK_SIZE`] bytes;
 //! - the channel holds at most [`CHANNEL_CAPACITY_CHUNKS`] chunks, so the
-//!   hard in-crate buffer bound is [`MAX_BUFFERED_BYTES`] (128 KiB);
+//!   hard in-crate buffer bound is [`MAX_BUFFERED_BYTES`] (256 KiB);
 //! - when the consumer stalls, the channel fills, the pump blocks, the
 //!   kernel PTY buffer fills, and the child's writes block — end-to-end
 //!   backpressure with zero data loss and zero memory growth.

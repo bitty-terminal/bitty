@@ -43,7 +43,7 @@ bitty-config = { version = "0.0.40", path = "../bitty-config" }
 # bitty#1692); WRAP crossfont as the explicit fallback (forced with
 # BITTY_TEXT_STACK=classic or selected when shaped init fails).
 # Neither upstream type may appear in this crate's public API.
-wgpu = "26.0"
+wgpu = { version = "26.0", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 crossfont = "0.9"
 # HarfBuzz shaping port (MIT, rust-version 1.85 exact). Exact pin: the
 # fontations floor drifts under swash (see skrifa note below).
@@ -71,6 +71,15 @@ ttf-parser = "=0.25.1"
 # PATCHES (CTX-1607): the persistent index is additive; setting
 # `BITTY_FONT_INDEX=0` restores the upstream full scan for diagnosis.
 fontconfig-parser = "=0.5.8"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wgpu = { version = "26.0", default-features = false, features = ["vulkan", "gles"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "26.0", default-features = false, features = ["metal"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "26.0", default-features = false, features = ["dx12", "vulkan", "gles"] }
 
 
 [dev-dependencies]

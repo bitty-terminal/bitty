@@ -486,7 +486,6 @@ impl View {
                     .position(|line| line.id == anchor.line_id)
             })
             .unwrap_or_else(|| total.saturating_sub(rows).saturating_sub(offset));
-        let snap = state.snapshot();
         let mut out = Vec::with_capacity(rows * cols);
         let blank = Cell::erased(Style::default());
         for r in 0..rows {
@@ -519,11 +518,10 @@ impl View {
             } else if combined < total {
                 // Live grid row.
                 let grid_row = combined - sb_len;
-                for c in 0..cols {
-                    let src_col = self.col_offset as usize + c;
-                    if grid_row < snap.height && src_col < snap.width {
-                        let idx = grid_row * snap.width + src_col;
-                        if let Some(cell) = snap.cells.get(idx) {
+                if let Some(src) = state.live_grid_row(grid_row) {
+                    for c in 0..cols {
+                        let src_col = self.col_offset as usize + c;
+                        if let Some(cell) = src.get(src_col) {
                             let mut cloned = *cell;
                             // Clip wide-pair overflow at the viewport's right edge:
                             // if a leading half would need its spacer beyond the
@@ -539,7 +537,9 @@ impl View {
                         } else {
                             out.push(blank);
                         }
-                    } else {
+                    }
+                } else {
+                    for _ in 0..cols {
                         out.push(blank);
                     }
                 }

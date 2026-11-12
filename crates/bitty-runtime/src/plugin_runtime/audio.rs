@@ -514,9 +514,13 @@ struct SampleSlot {
 /// spawner, and its own stack alive: it is read-only, at most one thread,
 /// and bounded by three `AUDIO_SPAWN_TIMEOUT_MS` spawns (~3 s). Nothing
 /// joins it, so host teardown never waits on a monitor.
+/// Stack reservation for the persistent `bitty-audio-sample` worker thread.
+const AUDIO_SAMPLE_THREAD_STACK_BYTES: usize = 256 * 1024;
+
 struct SampledReads {
     spawn: SampledSpawnFn,
     slot: Arc<Mutex<SampleSlot>>,
+    worker_tx: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<(u64, Instant)>>>,
 }
 
 impl SampledReads {
@@ -524,13 +528,14 @@ impl SampledReads {
         Self {
             spawn,
             slot: Arc::new(Mutex::new(SampleSlot::default())),
+            worker_tx: std::cell::RefCell::new(None),
         }
     }
 
     /// Take the next landed attempt, asking for a new one when due.
     ///
     /// Returns `Some` exactly once per completed attempt. Never blocks: the
-    /// request either starts one short-lived thread (when none is in flight
+    /// request wakes the persistent sampler thread (when none is in flight
     /// and the ceiling allows) or is dropped. A landed sample is also the
     /// moment the next read becomes useful, so serving one re-checks the
     /// 0.5 Hz window and keeps a steady cadence instead of waiting for a
@@ -554,26 +559,58 @@ impl SampledReads {
         }
         slot.in_flight = true;
         slot.request_ms = Some(now_ms);
-        // Captured before the spawn so the landing instant includes thread
-        // startup, not just the reader itself.
+        drop(slot);
+        // Captured before dispatch so the landing instant includes any thread
+        // wake/startup latency, not just the reader itself.
         let started = Instant::now();
+        let mut tx_slot = self.worker_tx.borrow_mut();
+        if let Some(tx) = tx_slot.as_ref() {
+            match tx.try_send((now_ms, started)) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    lock_slot(&self.slot).in_flight = false;
+                    return;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    *tx_slot = None;
+                }
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Instant)>(1);
+        let _ = tx.try_send((now_ms, started));
         let slot_arc = Arc::clone(&self.slot);
         let spawn = Arc::clone(&self.spawn);
         let spawned = std::thread::Builder::new()
             .name("bitty-audio-sample".to_string())
+            .stack_size(AUDIO_SAMPLE_THREAD_STACK_BYTES)
             .spawn(move || {
-                // Reset `in_flight` on every exit path, including a panic in
-                // the reader, so one failed thread cannot wedge the sampler.
-                let _flight = FlightGuard(Arc::clone(&slot_arc));
                 let inline: SpawnFn = Rc::new(move |argv: &[String]| spawn(argv));
-                let outcome = live_read(&inline);
-                let landed_ms = now_ms.saturating_add(
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                );
-                lock_slot(&slot_arc).ready = Some((outcome, landed_ms));
+                while let Ok((req_ms, req_started)) = rx.recv() {
+                    // Reset `in_flight` on every exit path, including a panic in
+                    // the reader, while keeping the worker loop alive so `rx`
+                    // never drops with an unread request queued behind it.
+                    let _flight = FlightGuard(Arc::clone(&slot_arc));
+                    if let Ok(outcome) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            live_read(&inline)
+                        }))
+                    {
+                        let landed_ms = req_ms.saturating_add(
+                            u64::try_from(req_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
+                        let mut slot = lock_slot(&slot_arc);
+                        slot.ready = Some((outcome, landed_ms));
+                        slot.in_flight = false;
+                    }
+                }
             });
-        if spawned.is_err() {
-            slot.in_flight = false;
+        match spawned {
+            Ok(_) => {
+                *tx_slot = Some(tx);
+            }
+            Err(_) => {
+                lock_slot(&self.slot).in_flight = false;
+            }
         }
     }
 }
@@ -1242,6 +1279,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(spawns.load(Ordering::SeqCst), 6, "one read per window");
+    }
+
+    #[test]
+    fn sampled_get_reuses_persistent_worker_thread_across_windows() {
+        let thread_ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = std::sync::Arc::clone(&thread_ids);
+        let spawn: SampledSpawnFn = std::sync::Arc::new(move |argv: &[String]| {
+            recorded.lock().unwrap().push(std::thread::current().id());
+            let text = argv.join(" ");
+            if text.contains("get-sink-volume") {
+                Ok(VOLUME_FIXTURE.to_string())
+            } else if text.contains("get-sink-mute") {
+                Ok(MUTE_FIXTURE.to_string())
+            } else if text.contains("list") {
+                Ok(SINKS_FIXTURE.to_string())
+            } else {
+                Err(AudioError::unavailable("unexpected argv in fixture"))
+            }
+        });
+        let mut monitor = AudioMonitor::sampled(spawn, absent_spawn());
+        let _ = monitor.get(1000, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while monitor.get(2000, true).is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let second_ms = 2000 + STATE_MIN_INTERVAL_MS;
+        let _ = monitor.get(second_ms, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while thread_ids.lock().unwrap().len() < 6 && std::time::Instant::now() < deadline {
+            let _ = monitor.get(second_ms, true);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let ids = thread_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 6, "two windows of three spawns each");
+        let first_id = ids[0];
+        assert!(
+            ids.iter().all(|&id| id == first_id),
+            "all sampled reads must run on the single persistent worker thread, got {ids:?}"
+        );
     }
 
     #[test]

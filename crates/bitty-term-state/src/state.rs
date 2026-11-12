@@ -1800,6 +1800,23 @@ impl State {
         }
     }
 
+    /// Updates `dst` in place with a versioned snapshot of the active screen,
+    /// reusing `dst.cells` and `dst.title` allocations when dimensions match.
+    pub fn snapshot_into(&self, dst: &mut Snapshot) {
+        let grid = self.screens_active();
+        let (rows, cols) = grid.dims();
+        dst.version = SNAPSHOT_VERSION;
+        dst.generation = self.generation;
+        dst.width = cols;
+        dst.height = rows;
+        grid.copy_cells_into(&mut dst.cells);
+        dst.cursor = self.cursor.clone();
+        dst.modes = self.modes.clone();
+        if dst.title != self.title {
+            dst.title = self.title.clone();
+        }
+    }
+
     /// Drains queued device-status replies (RFC: replies are returned to
     /// the caller; terminal state performs no I/O).
     pub fn take_replies(&mut self) -> Vec<Box<[u8]>> {

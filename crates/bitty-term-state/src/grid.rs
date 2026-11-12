@@ -103,6 +103,17 @@ impl Grid {
         self.cells.clone().into_boxed_slice()
     }
 
+    /// Copies the row-major grid into `dst`, reusing its allocation when the
+    /// length matches (`rows * cols`) and reallocating only on a dimension
+    /// change.
+    pub fn copy_cells_into(&self, dst: &mut Box<[Cell]>) {
+        if dst.len() == self.cells.len() {
+            dst.copy_from_slice(&self.cells);
+        } else {
+            *dst = self.cells.clone().into_boxed_slice();
+        }
+    }
+
     /// Takes a copy of the row's cells (used to push lines into scrollback).
     pub fn snapshot_row(&self, row: usize) -> Vec<Cell> {
         self.row(row).to_vec()

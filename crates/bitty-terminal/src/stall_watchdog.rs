@@ -208,9 +208,6 @@ use bitty_runtime::hang_watchdog::{
     HangGaugeSnapshot, HangGauges, TICK_RING_CAPACITY, TickGap, TickRingDrain,
 };
 
-#[cfg(unix)]
-use signal_hook::SigId;
-
 /// Environment switch for the watchdog (bitty#2830).
 pub(crate) const HANG_WATCHDOG_ENV: &str = "BITTY_HANG_WATCHDOG";
 /// Environment override for the generic hang bound in milliseconds.
@@ -1071,6 +1068,12 @@ struct Shared {
     /// counter is the independent signal: it only moves when a frame actually
     /// committed.
     presented_frames: AtomicU64,
+    /// Completed monitor-loop polls (test observability for PB-7 0 Hz idle).
+    #[cfg(test)]
+    polls: AtomicU64,
+    /// Set when the monitor computes `idle_park == true` and parks at 0 Hz.
+    #[cfg(test)]
+    idle_parked: AtomicBool,
 }
 
 impl Shared {
@@ -1085,6 +1088,10 @@ impl Shared {
             context: Mutex::new(WatchdogContext::default()),
             gauges,
             presented_frames: AtomicU64::new(0),
+            #[cfg(test)]
+            polls: AtomicU64::new(0),
+            #[cfg(test)]
+            idle_parked: AtomicBool::new(false),
         }
     }
 
@@ -1116,56 +1123,149 @@ impl Shared {
 
 /// Monitor wake-up signal.
 ///
-/// A plain sleep would make shutdown wait up to one poll interval; the
-/// condition variable wakes the monitor as soon as the stop flag is set.
+/// Supports both bounded periodic polling (`Some(timeout)`) and 0 Hz idle
+/// parking (`None`) per `PB-7`. On Unix, a non-blocking stream pair allows
+/// both thread notifications (`notify`/`request`) and async-signal-safe
+/// `SIGUSR1` delivery (`signal_hook::low_level::pipe`) to wake the monitor
+/// from `poll(..., PollTimeout::NONE)`.
 struct StopSignal {
     stopped: AtomicBool,
-    waiter: Mutex<()>,
+    stop_waiter: Mutex<()>,
+    stop_wake: Condvar,
+    waiter: Mutex<bool>,
     wake: Condvar,
+    #[cfg(unix)]
+    pipe: Option<(
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    )>,
 }
 
 impl StopSignal {
     fn new() -> Self {
+        #[cfg(unix)]
+        let pipe = std::os::unix::net::UnixStream::pair()
+            .ok()
+            .and_then(|(r, w)| {
+                r.set_nonblocking(true).ok()?;
+                w.set_nonblocking(true).ok()?;
+                Some((r, w))
+            });
         Self {
             stopped: AtomicBool::new(false),
-            waiter: Mutex::new(()),
+            stop_waiter: Mutex::new(()),
+            stop_wake: Condvar::new(),
+            waiter: Mutex::new(false),
             wake: Condvar::new(),
+            #[cfg(unix)]
+            pipe,
         }
     }
 
+    #[cfg(unix)]
+    fn clone_wake_writer(&self) -> Option<std::os::unix::net::UnixStream> {
+        self.pipe.as_ref().and_then(|(_, w)| w.try_clone().ok())
+    }
+
+    fn notify(&self) {
+        let mut notified = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(unix)]
+        if let Some((_, mut w)) = self.pipe.as_ref().map(|(r, w)| (r, w)) {
+            let _ = std::io::Write::write(&mut w, &[1]);
+        }
+        *notified = true;
+        self.wake.notify_all();
+    }
+
     fn request(&self) {
-        // Hold the waiter lock so a monitor between the check and the wait
-        // cannot miss the notification.
-        let _guard = self
+        let stop_guard = self
+            .stop_waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut notified = self
             .waiter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stopped.store(true, Ordering::SeqCst);
+        *notified = true;
         self.wake.notify_all();
+        self.stop_wake.notify_all();
+        drop(notified);
+        drop(stop_guard);
+        #[cfg(unix)]
+        if let Some((_, mut w)) = self.pipe.as_ref().map(|(r, w)| (r, w)) {
+            let _ = std::io::Write::write(&mut w, &[1]);
+        }
     }
 
     fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Wait up to `timeout` for a stop request; `true` means stop now.
-    ///
-    /// The stop flag is read *after* taking `waiter`: `request` holds the same
-    /// lock while setting the flag and notifying, so a request that lands
-    /// between the check and the wait cannot be missed.
-    fn wait(&self, timeout: Duration) -> bool {
-        let guard = self
+    fn clear_wake_notifications(&self) {
+        #[cfg(unix)]
+        if let Some((r, _)) = &self.pipe {
+            let mut buf = [0u8; 64];
+            let mut reader = r;
+            while std::io::Read::read(&mut reader, &mut buf).is_ok_and(|n| n > 0) {}
+        }
+        let mut notified = self
             .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *notified = false;
+    }
+
+    /// Periodic poll sleep: waits `timeout`, waking early only on `request()`.
+    fn wait_poll(&self, timeout: Duration) -> bool {
+        let guard = self
+            .stop_waiter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.is_stopped() {
             return true;
         }
         let (guard, _) = self
-            .wake
+            .stop_wake
             .wait_timeout(guard, timeout)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         drop(guard);
+        self.is_stopped()
+    }
+
+    /// 0 Hz idle park (`PB-7`): sleeps indefinitely until `notify()`, `SIGUSR1`,
+    /// or `request()` arrives; returns `true` when stopped.
+    fn wait_idle(&self) -> bool {
+        #[cfg(unix)]
+        if let Some((r, _)) = &self.pipe {
+            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+            use std::os::fd::AsFd;
+            if self.is_stopped() {
+                return true;
+            }
+            let mut fds = [PollFd::new(r.as_fd(), PollFlags::POLLIN)];
+            let _ = poll(&mut fds, PollTimeout::NONE);
+            self.clear_wake_notifications();
+            return self.is_stopped();
+        }
+        let mut notified = self
+            .waiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_stopped() {
+            return true;
+        }
+        if !*notified {
+            notified = self
+                .wake
+                .wait(notified)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *notified = false;
+        drop(notified);
         self.is_stopped()
     }
 }
@@ -1225,13 +1325,21 @@ mod sigusr1 {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    pub(super) struct Registration {
+        flag_id: SigId,
+        pipe_id: Option<SigId>,
+    }
+
     /// Register the report action after its monitor thread spawned and
     /// publish that a monitor is active.
     ///
     /// Returns `None` when the action could not be registered; the caller then
     /// keeps the monitor but loses only the capture, never the periodic
     /// reports.
-    pub(super) fn install(flag: Arc<AtomicBool>) -> Option<SigId> {
+    pub(super) fn install(
+        flag: Arc<AtomicBool>,
+        wake_pipe: Option<std::os::unix::net::UnixStream>,
+    ) -> Option<Registration> {
         let mut guard = lock();
         let wiring = guard.get_or_insert_with(Wiring::new);
         // Publish "a monitor is starting" before the terminating action can
@@ -1250,9 +1358,12 @@ mod sigusr1 {
             }
         }
         match signal_flag::register(SIGUSR1, flag) {
-            Ok(id) => {
+            Ok(flag_id) => {
+                let pipe_id = wake_pipe.and_then(|stream| {
+                    signal_hook::low_level::pipe::register(SIGUSR1, stream).ok()
+                });
                 wiring.active = wiring.active.saturating_add(1);
-                Some(id)
+                Some(Registration { flag_id, pipe_id })
             }
             Err(error) => {
                 if wiring.active == 0 {
@@ -1271,8 +1382,11 @@ mod sigusr1 {
 
     /// Remove the report action and re-arm the default action when it was the
     /// last one.
-    pub(super) fn release(id: SigId) {
-        let _ = signal_hook::low_level::unregister(id);
+    pub(super) fn release(reg: Registration) {
+        let _ = signal_hook::low_level::unregister(reg.flag_id);
+        if let Some(pipe_id) = reg.pipe_id {
+            let _ = signal_hook::low_level::unregister(pipe_id);
+        }
         let mut guard = lock();
         let Some(wiring) = guard.as_mut() else {
             return;
@@ -1315,7 +1429,7 @@ pub(crate) struct StallWatchdog {
     /// action was registered (the monitor failed to spawn, or registration
     /// itself failed), so this handle owns nothing to release.
     #[cfg(unix)]
-    signal_id: Option<SigId>,
+    signal_id: Option<sigusr1::Registration>,
     /// The monitor's `SIGUSR1` flag, retained for hermetic tests.
     ///
     /// Production keeps the flag inside the monitor thread; tests set it
@@ -1386,6 +1500,10 @@ impl StallWatchdog {
     ) -> Self {
         let shared = Arc::new(Shared::new(gauges));
         let stop = Arc::new(StopSignal::new());
+        let wake_stop = Arc::clone(&stop);
+        shared.gauges.set_waker(Some(Arc::new(move || {
+            wake_stop.notify();
+        })));
         #[cfg(unix)]
         let signal_flag = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
@@ -1424,6 +1542,7 @@ impl StallWatchdog {
                 // `SIGUSR1` exactly as it was: the kernel default when no
                 // monitor ever ran, or the conditional default owned by an
                 // earlier monitor. No cleanup is needed here by design.
+                shared.gauges.set_waker(None);
                 logging::warn(|| {
                     format!(
                         "bitty: hang watchdog thread unavailable ({error}); diagnostics stay off"
@@ -1439,7 +1558,7 @@ impl StallWatchdog {
         // removing one does not restore the default action.
         #[cfg(unix)]
         let signal_id = if monitor.is_some() {
-            sigusr1::install(Arc::clone(&signal_flag))
+            sigusr1::install(Arc::clone(&signal_flag), stop.clone_wake_writer())
         } else {
             None
         };
@@ -1458,7 +1577,11 @@ impl StallWatchdog {
 
     /// Mark the loop active in `phase` and advance the heartbeat.
     pub(crate) fn enter(&self, phase: Phase) {
+        let was_active = self.shared.active.load(Ordering::Relaxed);
         self.shared.mark(phase, true);
+        if !was_active {
+            self.stop.notify();
+        }
     }
 
     /// Publish the app's presented-frame counter (bitty#2830).
@@ -1475,7 +1598,11 @@ impl StallWatchdog {
 
     /// Mark the loop idle (armed `ControlFlow::Wait`): not a stall.
     pub(crate) fn idle(&self) {
+        let was_active = self.shared.active.load(Ordering::Relaxed);
         self.shared.mark(Phase::Idle, false);
+        if was_active {
+            self.stop.notify();
+        }
     }
 
     /// Simulate one `SIGUSR1` receipt for hermetic monitor tests.
@@ -1486,6 +1613,7 @@ impl StallWatchdog {
     #[cfg(all(test, unix))]
     fn simulate_signal_receipt(&self) {
         self.signal_flag.store(true, Ordering::SeqCst);
+        self.stop.notify();
     }
 
     /// Whether the app may publish a fresh context sample now.
@@ -1508,6 +1636,7 @@ impl StallWatchdog {
 
     /// Request monitor shutdown and wait for the thread to exit.
     fn shutdown(&mut self) -> std::thread::Result<()> {
+        self.shared.gauges.set_waker(None);
         self.stop.request();
         // Join before releasing: while the monitor is still winding down, a
         // `SIGUSR1` must continue to reach the handler instead of taking the
@@ -1573,10 +1702,29 @@ fn monitor_loop(
     let mut delivery = DeliverySummary::default();
     #[cfg(unix)]
     let mut last_signal_at: Option<Instant> = None;
+    let mut idle_park = false;
     loop {
-        if stop.wait(poll_interval) {
+        if idle_park {
+            #[cfg(test)]
+            shared.idle_parked.store(true, Ordering::Release);
+            if stop.wait_idle() {
+                return;
+            }
+            #[cfg(test)]
+            shared.idle_parked.store(false, Ordering::Release);
+            #[cfg(unix)]
+            let urgent_signal = signal_flag.load(Ordering::SeqCst);
+            #[cfg(not(unix))]
+            let urgent_signal = false;
+            if !urgent_signal && stop.wait_poll(poll_interval) {
+                return;
+            }
+        } else if stop.wait_poll(poll_interval) {
             return;
         }
+        stop.clear_wake_notifications();
+        #[cfg(test)]
+        shared.polls.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         #[cfg(unix)]
         if signal_flag.swap(false, Ordering::SeqCst) {
@@ -1761,6 +1909,13 @@ fn monitor_loop(
             );
             delivery.record(sink(&line));
         }
+        idle_park = !active
+            && !shared.active.load(Ordering::Acquire)
+            && !pending.any()
+            && state.pending_ticks.is_empty()
+            && state.tick_gap.is_none()
+            && !state.reported
+            && shared.gauges.snapshot().tick_count == state.last_tick_seq;
     }
 }
 
@@ -4672,9 +4827,14 @@ mod tests {
             }),
         );
         watchdog.idle();
-        // Let the monitor settle on the empty ring so the whole burst is one
-        // observed overflow.
-        std::thread::sleep(Duration::from_millis(150));
+        // Let the monitor settle into `wait_idle` on the empty ring so the
+        // whole burst is one observed overflow without racing startup poll.
+        let settle_deadline = Instant::now() + Duration::from_secs(2);
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for _ in 0..(TICK_RING_CAPACITY + 4) {
             gauges.record_tick_for_test(Duration::from_millis(1));
         }
@@ -4710,9 +4870,14 @@ mod tests {
             }),
         );
         watchdog.idle();
-        // Let the monitor capture its initial tick sequence before the seeded
-        // tick so the drain sees it (a startup watermark of 1 would ignore it).
-        std::thread::sleep(Duration::from_millis(150));
+        // Let the monitor capture its initial tick sequence and park in
+        // `wait_idle` before the seeded tick so the drain sees it.
+        let settle_deadline = Instant::now() + Duration::from_secs(2);
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let measured = Duration::from_millis(4_500);
         gauges.record_tick_for_test(measured);
         let line = rx
@@ -6980,5 +7145,50 @@ mod tests {
             started.elapsed()
         );
         drop(reader);
+    }
+
+    #[test]
+    fn idle_without_pending_work_parks_monitor_at_zero_hz() {
+        let gauges = Arc::new(HangGauges::new());
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(50),
+            Arc::clone(&gauges),
+            Box::new(|_| DeliveryOutcome::Delivered),
+        );
+        watchdog.idle();
+        // Wait until the monitor computes `idle_park == true` and parks at 0 Hz.
+        let settle_deadline = Instant::now() + Duration::from_secs(1);
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            watchdog.shared.idle_parked.load(Ordering::Acquire),
+            "monitor must reach idle_park state"
+        );
+        let parked_polls = watchdog.shared.polls.load(Ordering::Relaxed);
+
+        // Over 10x the 12 ms poll interval, a parked monitor must perform 0 wakeups.
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            watchdog.shared.polls.load(Ordering::Relaxed),
+            parked_polls,
+            "idle monitor with no pending work must park at 0 Hz (PB-7)"
+        );
+
+        // Entering an active phase wakes the monitor immediately.
+        watchdog.enter(Phase::RuntimeTick);
+        let wake_deadline = Instant::now() + Duration::from_secs(1);
+        while watchdog.shared.polls.load(Ordering::Relaxed) == parked_polls
+            && Instant::now() < wake_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            watchdog.shared.polls.load(Ordering::Relaxed) > parked_polls,
+            "entering an active phase must wake the parked monitor"
+        );
+        watchdog.stop_and_join().expect("monitor thread joined");
     }
 }

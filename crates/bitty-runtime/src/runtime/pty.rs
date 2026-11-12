@@ -2494,6 +2494,40 @@ mod tests {
         );
     }
 
+    /// Issue #3126 review residual risk: `poll_pty_seeded` applies chunks
+    /// inside the drain, so primary/pane application order follows the
+    /// rotating `first` index rather than always primary-first. This pins the
+    /// observable half of that contract at the drain layer: sources are
+    /// visited from `first` and wrap, and each source drains to empty before
+    /// the next is visited.
+    #[test]
+    fn drain_fair_visits_sources_from_the_rotated_first_index() {
+        for first in 0..3usize {
+            let receivers: Vec<_> = (0..3).map(|_| session(2, false)).collect();
+            let mut nexts: Vec<_> = receivers
+                .iter()
+                .map(|rx| move || rx.try_recv().ok())
+                .collect();
+            let mut sources: Vec<&mut dyn FnMut() -> Option<Vec<u8>>> = Vec::new();
+            for next in &mut nexts {
+                sources.push(next);
+            }
+            let mut budget = PollBudget::new();
+            let drained = drain_fair(&mut budget, first, &mut sources);
+            let order: Vec<usize> = drained.iter().map(|(index, _)| *index).collect();
+            let mut expected = Vec::new();
+            for offset in 0..3 {
+                let index = (first + offset) % 3;
+                expected.push(index);
+                expected.push(index);
+            }
+            assert_eq!(
+                order, expected,
+                "first={first} must lead the visit order and wrap, with each source drained to empty"
+            );
+        }
+    }
+
     #[test]
     fn write_chunks_reports_written_and_dropped_remainder() {
         let data = boxed(&[b"aa", b"bbb", b"c"]);

@@ -275,11 +275,11 @@ pub use panel_persist::{
     RestartManifest, decode_manifest, encode_manifest, plan_restore,
 };
 pub use panel_recovery::{
-    MAX_REASON_SPELLING_LEN, MAX_RECOVERY_KEYS_PER_PANEL, MAX_RECOVERY_RECORDS_PER_PANEL,
-    PLACEHOLDER_HEADING, PLACEHOLDER_SCENE_ACTIONS, PLACEHOLDER_SCENE_DEPTH,
-    PLACEHOLDER_SCENE_NODES, PlaceholderAction, PlaceholderReason, PlaceholderScene,
-    RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget, RecoveryOutcome, RecoveryReason,
-    RecoveryReasonError, RecoveryRecord, RecoveryStep, SCN_MAX_BLOCKS_PER_TERMINAL,
+    MAX_OWNER_SPELLING_LEN, MAX_REASON_SPELLING_LEN, MAX_RECOVERY_KEYS_PER_PANEL,
+    MAX_RECOVERY_RECORDS_PER_PANEL, PLACEHOLDER_HEADING, PLACEHOLDER_SCENE_ACTIONS,
+    PLACEHOLDER_SCENE_DEPTH, PLACEHOLDER_SCENE_NODES, PlaceholderAction, PlaceholderReason,
+    PlaceholderScene, RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget, RecoveryOutcome,
+    RecoveryReason, RecoveryReasonError, RecoveryRecord, RecoveryStep, SCN_MAX_BLOCKS_PER_TERMINAL,
     SCN_MAX_DEPTH_PER_BLOCK, SCN_MAX_NODES_PER_BLOCK, SCN_MAX_RICH_BYTES_PER_TERMINAL,
     SCN_MAX_TEXT_BYTES_PER_BLOCK,
 };

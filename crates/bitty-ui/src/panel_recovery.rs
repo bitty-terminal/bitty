@@ -33,7 +33,10 @@
 //!   `(PanelId, controller generation, reason)`, capped at
 //!   [`RECOVERY_ATTEMPT_CAP`] (eight), with one `saturated` note per
 //!   `(PanelId, binding)` and one FS-4-style [`RecoveryRecord`] per counted
-//!   transition.
+//!   transition. The counter table is bounded per panel and makes room by
+//!   evicting its oldest key, so a transition is never dropped for want of a
+//!   slot; each record's `owner` is the panel record's own binding owner, never
+//!   a caller-supplied string.
 //! - [`PlaceholderScene`] — the Core-owned, fixed, non-plugin placeholder
 //!   surface of rule 5: a constant text table under the accepted scene limits
 //!   (`SCN-1..SCN-5`), with no caller-supplied text, no style input, and no
@@ -65,10 +68,20 @@ pub const RECOVERY_ATTEMPT_CAP: u8 = 8;
 /// Distinct counter keys retained per panel.
 ///
 /// One panel cannot accumulate an unbounded counter table: at most eight
-/// `(generation, reason)` keys are tracked, and an attempt that would add a
-/// ninth is treated exactly like an attempt at the cap (the counter stops, the
-/// panel keeps its placeholder, one `saturated` note goes out). The table is
-/// also cleared when the container is retired.
+/// `(generation, reason)` keys are tracked. A transition that would add a ninth
+/// key **evicts the oldest tracked key** (the lowest-sorting pair — controller
+/// generations only move forward, so that is the stalest binding) and is then
+/// counted from one. The table therefore makes room instead of dropping the
+/// transition: a panel that has used up its table still gets a counter, a
+/// record, and — through the seam — its placeholder. Skipping the transition
+/// instead would leave a released generation with no surface at all, the silent
+/// orphan Decision E and PGO-23 forbid.
+///
+/// The cost of eviction is bounded and deliberate: an evicted key that comes
+/// back is counted again from one, so the state retained per panel stays inside
+/// `MAX_RECOVERY_KEYS_PER_PANEL` keys and
+/// [`MAX_RECOVERY_RECORDS_PER_PANEL`] records no matter how many transitions a
+/// container sees. The table is also cleared when the container is retired.
 pub const MAX_RECOVERY_KEYS_PER_PANEL: usize = RECOVERY_ATTEMPT_CAP as usize;
 
 /// FS-4-style records retained per panel for inspection.
@@ -84,6 +97,16 @@ pub const MAX_RECOVERY_RECORDS_PER_PANEL: usize = RECOVERY_ATTEMPT_CAP as usize;
 /// An unknown token is echoed (bounded) in the typed refusal, so the bound
 /// applies before the echo as well as before the lookup.
 pub const MAX_REASON_SPELLING_LEN: usize = 32;
+
+/// Longest owner spelling a [`RecoveryRecord`] can carry.
+///
+/// The owner is never a caller string: it is the panel record's own binding
+/// owner, a `bitty_plugin_host::PluginId`, whose validation already bounds the
+/// whole id (`^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$`, at most
+/// `MAX_PLUGIN_ID_LEN` = 128 bytes). `bitty-ui` does not depend on the plugin
+/// host, so the bound is restated here and pinned against the enforcing value by
+/// `crates/bitty-runtime/tests/panel_placeholder_bounds.rs`.
+pub const MAX_OWNER_SPELLING_LEN: usize = 128;
 
 /// `SCN-1`: max nodes per block (`rich-presentation-rfc.md`).
 ///
@@ -549,16 +572,24 @@ impl fmt::Display for RecoveryAction {
 
 /// One FS-4-style recovery record: owner, generation, reason, action.
 ///
-/// Decision E rule 1 requires one such record per counted transition. The
-/// owner is supplied by the seam that presents the placeholder (the panel
-/// record carries no owner field yet — bitty#2476 residual 1), so it lives on
-/// the record rather than being inferred here.
+/// Decision E rule 1 requires one such record per counted transition. The owner
+/// is the panel record's **own** binding owner ([`RecoveryRecord::owner`]), read
+/// by the seam that presents the placeholder before the unbind edge clears the
+/// binding — never a string the caller asserts. A transition can therefore not
+/// be attributed to a plugin the panel never bound, and the field is `None`
+/// exactly while no controller is bound.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoveryRecord {
     /// The unbound panel.
     pub panel: PanelId,
-    /// The plugin that owned the content when the transition happened.
-    pub owner: String,
+    /// The plugin that held the content when the transition happened, taken
+    /// from the panel record's binding.
+    ///
+    /// `None` when no controller is bound: a container that never had one
+    /// (`unloaded`, and the `Drop` records of a panel disposed before its first
+    /// bind). `Some` is the binding's `PluginId` spelling, which validation
+    /// bounds to [`MAX_OWNER_SPELLING_LEN`] bytes.
+    pub owner: Option<String>,
     /// The controller generation the transition names.
     pub controller_generation: u64,
     /// Why the panel became unbound (or why it was disposed).
@@ -579,9 +610,9 @@ pub struct RecoveryRecord {
 pub enum RecoveryStep {
     /// Counted and emitted: this is the transition's record.
     Recorded(RecoveryRecord),
-    /// The counter is at its cap (or the panel's counter table is full): the
-    /// counter did not move, the panel keeps its placeholder, and this call
-    /// emitted the single `saturated` note for this binding.
+    /// The counter is at its cap: the counter did not move, the panel keeps its
+    /// placeholder, and this call emitted the single `saturated` note for this
+    /// binding.
     Saturated {
         /// The unbound panel.
         panel: PanelId,
@@ -589,7 +620,7 @@ pub enum RecoveryStep {
         controller_generation: u64,
         /// The reason the superseded attempt carried.
         reason: RecoveryReason,
-        /// The counter's value at the cap, or `0` when the table was full.
+        /// The counter's value at the cap.
         attempt: u8,
     },
     /// The counter is at its cap and the `saturated` note for this binding has
@@ -602,8 +633,9 @@ pub enum RecoveryStep {
 /// Keys are `(PanelId, controller generation, reason)`; each counter stops at
 /// [`RECOVERY_ATTEMPT_CAP`]. The table is bounded per panel
 /// ([`MAX_RECOVERY_KEYS_PER_PANEL`] keys and [`MAX_RECOVERY_RECORDS_PER_PANEL`]
-/// retained records) and is cleared when the container is retired
-/// ([`Self::retire`]), so no diagnostic grows with the number of attempts.
+/// retained records, the oldest key evicted to make room for a new one) and is
+/// cleared when the container is retired ([`Self::retire`]), so no diagnostic
+/// grows with the number of attempts.
 #[derive(Debug, Default)]
 pub struct RecoveryBudget {
     counts: BTreeMap<PanelId, BTreeMap<(u64, RecoveryReason), u8>>,
@@ -620,23 +652,38 @@ impl RecoveryBudget {
 
     /// Counts one transition and returns what it did.
     ///
-    /// A [`RecoveryAction::Disposed`] transition is not counted: the container
-    /// is gone, so there is nothing to bound, and its record carries
+    /// The record's action is derived from `reason` through
+    /// [`RecoveryOutcome::from_reason`], the single Core mapping, so a record
+    /// can never pair a reason with an action the reason does not select
+    /// (`denied` is always `Unavailable`, `closed` is always `Disposed`).
+    ///
+    /// `owner` is the panel record's own binding owner — the seam reads it from
+    /// the record rather than taking a caller's word for it — and is `None`
+    /// exactly while no controller is bound.
+    ///
+    /// A [`RecoveryReason::Closed`] transition is not counted: the container is
+    /// gone, so there is nothing to bound, and its record carries
     /// `attempt == 0`. Every other transition increments exactly one counter
     /// keyed `(panel, controller_generation, reason)` and yields
-    /// [`RecoveryStep::Recorded`] while the counter is below the cap.
+    /// [`RecoveryStep::Recorded`] while the counter is below the cap. A key
+    /// arriving at a full table is recorded too: the table evicts its oldest
+    /// key to make room (see [`MAX_RECOVERY_KEYS_PER_PANEL`]) instead of
+    /// answering the transition with nothing, so the caller always has a record
+    /// to present against.
     pub fn note(
         &mut self,
         panel: PanelId,
-        owner: &str,
+        owner: Option<&str>,
         controller_generation: u64,
         reason: RecoveryReason,
-        action: RecoveryAction,
     ) -> RecoveryStep {
-        if action == RecoveryAction::Disposed {
+        let outcome = RecoveryOutcome::from_reason(reason);
+        let action = outcome.action();
+        let owner = owner.map(str::to_owned);
+        if outcome.disposes_container() {
             let record = RecoveryRecord {
                 panel,
-                owner: owner.to_owned(),
+                owner,
                 controller_generation,
                 reason,
                 action,
@@ -645,21 +692,28 @@ impl RecoveryBudget {
             return RecoveryStep::Recorded(record);
         }
         let key = (controller_generation, reason);
-        let mut counted = 0u8;
+        let counted;
         let mut at_cap = false;
         {
             let slots = self.counts.entry(panel).or_default();
             if !slots.contains_key(&key) && slots.len() >= MAX_RECOVERY_KEYS_PER_PANEL {
-                at_cap = true;
-            } else {
-                let counter = slots.entry(key).or_insert(0);
-                if *counter >= RECOVERY_ATTEMPT_CAP {
-                    at_cap = true;
-                    counted = *counter;
-                } else {
-                    *counter += 1;
-                    counted = *counter;
+                // Make room: the counter table is bounded, the transition is
+                // not. Evicting the lowest-sorting pair drops the stalest
+                // binding (generations only move forward) and lets this key
+                // count from one, so a full table never swallows a transition
+                // that has already released its generation.
+                let oldest = slots.keys().next().copied();
+                if let Some(oldest) = oldest {
+                    slots.remove(&oldest);
                 }
+            }
+            let counter = slots.entry(key).or_insert(0);
+            if *counter >= RECOVERY_ATTEMPT_CAP {
+                at_cap = true;
+                counted = *counter;
+            } else {
+                *counter += 1;
+                counted = *counter;
             }
         }
         if at_cap {
@@ -676,7 +730,7 @@ impl RecoveryBudget {
         }
         let record = RecoveryRecord {
             panel,
-            owner: owner.to_owned(),
+            owner,
             controller_generation,
             reason,
             action,
@@ -744,6 +798,13 @@ impl RecoveryBudget {
     #[must_use]
     pub fn total_records(&self) -> usize {
         self.records.values().map(VecDeque::len).sum()
+    }
+
+    /// Distinct `(controller generation, reason)` counter keys tracked for one
+    /// panel, always `<= MAX_RECOVERY_KEYS_PER_PANEL`.
+    #[must_use]
+    pub fn tracked_keys(&self, panel: PanelId) -> usize {
+        self.counts.get(&panel).map(BTreeMap::len).unwrap_or(0)
     }
 }
 
@@ -888,8 +949,10 @@ mod tests {
         PanelId::new(raw)
     }
 
-    /// The owner a fake seam supplies (the record carries no owner field yet:
-    /// bitty#2476 residual 1).
+    /// The owner a fake seam supplies. In the registry this value is never
+    /// chosen by the caller: `present_placeholder` reads it from the panel
+    /// record's own binding (`PanelRecord::owner`), and it is `None` while no
+    /// controller is bound.
     const OWNER: &str = "acme.notes";
 
     /// E.2: the vocabulary is exactly seven placeholder reasons plus the mapped
@@ -1037,7 +1100,7 @@ mod tests {
         let binding = 42;
         let reason = RecoveryReason::Crashed;
         for attempt in 1..=RECOVERY_ATTEMPT_CAP {
-            match budget.note(id, OWNER, binding, reason, RecoveryAction::Placeholder) {
+            match budget.note(id, Some(OWNER), binding, reason) {
                 RecoveryStep::Recorded(record) => {
                     assert_eq!(record.attempt, attempt);
                     assert_eq!(record.reason, reason);
@@ -1050,7 +1113,7 @@ mod tests {
         }
         assert_eq!(budget.count(id, binding, reason), RECOVERY_ATTEMPT_CAP);
 
-        let saturated = budget.note(id, OWNER, binding, reason, RecoveryAction::Placeholder);
+        let saturated = budget.note(id, Some(OWNER), binding, reason);
         match saturated {
             RecoveryStep::Saturated {
                 attempt,
@@ -1070,7 +1133,7 @@ mod tests {
         // Further attempts of the same reason: no state change, no emission.
         for _ in 0..4 {
             assert_eq!(
-                budget.note(id, OWNER, binding, reason, RecoveryAction::Placeholder),
+                budget.note(id, Some(OWNER), binding, reason),
                 RecoveryStep::Unchanged
             );
         }
@@ -1087,22 +1150,10 @@ mod tests {
         let mut budget = RecoveryBudget::new();
         let id = panel(3);
         for _ in 0..RECOVERY_ATTEMPT_CAP {
-            budget.note(
-                id,
-                OWNER,
-                10,
-                RecoveryReason::Crashed,
-                RecoveryAction::Placeholder,
-            );
+            budget.note(id, Some(OWNER), 10, RecoveryReason::Crashed);
         }
         assert_eq!(
-            budget.note(
-                id,
-                OWNER,
-                10,
-                RecoveryReason::Crashed,
-                RecoveryAction::Placeholder
-            ),
+            budget.note(id, Some(OWNER), 10, RecoveryReason::Crashed),
             RecoveryStep::Saturated {
                 panel: id,
                 controller_generation: 10,
@@ -1111,34 +1162,23 @@ mod tests {
             }
         );
         // A different reason is a different key and is still counted.
-        match budget.note(
-            id,
-            OWNER,
-            10,
-            RecoveryReason::Suspended,
-            RecoveryAction::Placeholder,
-        ) {
-            RecoveryStep::Recorded(record) => assert_eq!(record.attempt, 1),
+        match budget.note(id, Some(OWNER), 10, RecoveryReason::Suspended) {
+            RecoveryStep::Recorded(record) => {
+                assert_eq!(record.attempt, 1);
+                assert_eq!(
+                    record.owner.as_deref(),
+                    Some(OWNER),
+                    "the record carries the owner it was given, and nothing else stamps it"
+                );
+            }
             other => panic!("a second reason must count from one, got {other:?}"),
         }
         // A new binding re-arms the saturated note and counts from one again.
         assert_eq!(
-            budget.note(
-                id,
-                OWNER,
-                10,
-                RecoveryReason::Crashed,
-                RecoveryAction::Placeholder
-            ),
+            budget.note(id, Some(OWNER), 10, RecoveryReason::Crashed),
             RecoveryStep::Unchanged
         );
-        match budget.note(
-            id,
-            OWNER,
-            11,
-            RecoveryReason::Crashed,
-            RecoveryAction::Placeholder,
-        ) {
+        match budget.note(id, Some(OWNER), 11, RecoveryReason::Crashed) {
             RecoveryStep::Recorded(record) => {
                 assert_eq!(record.controller_generation, 11);
                 assert_eq!(record.attempt, 1);
@@ -1148,34 +1188,50 @@ mod tests {
         assert_eq!(budget.saturated_note(id), Some(10));
     }
 
-    /// E.1 carried into the retained history: the table and the record ring are
-    /// bounded per panel, and a panel beyond the key budget saturates instead
-    /// of growing. A wrong implementation that appends a record per attempt
-    /// fails here.
+    /// E.1 carried into the retained state: the key table and the record ring
+    /// are bounded per panel, and a key that arrives at a full table **makes
+    /// room** instead of being answered with nothing — the transition is still
+    /// counted and still recorded, so a panel that has already released its
+    /// generation is never left without a record to present. Fails for an
+    /// implementation that appends a record per attempt, or that drops the
+    /// transition when the table is full.
     #[test]
     fn the_retained_table_and_history_are_bounded_per_panel() {
         let mut budget = RecoveryBudget::new();
         let id = panel(5);
-        // Fill the key budget with distinct reasons across generations, one
-        // attempt each, then prove a further key is saturated, not stored.
-        let reasons = RecoveryReason::ALL;
-        for (index, reason) in reasons.iter().take(MAX_RECOVERY_KEYS_PER_PANEL).enumerate() {
-            match budget.note(id, OWNER, 1, *reason, RecoveryAction::Placeholder) {
-                RecoveryStep::Recorded(record) => assert_eq!(record.attempt, 1),
-                other => panic!("key {index} must count, got {other:?}"),
+        // The seven counted reasons fill seven of the eight keys at generation
+        // 1. `closed` is a disposal: recorded, never counted, never keyed.
+        for reason in RecoveryReason::ALL {
+            if reason.placeholder().is_none() {
+                continue;
+            }
+            match budget.note(id, Some(OWNER), 1, reason) {
+                RecoveryStep::Recorded(record) => {
+                    assert_eq!(record.attempt, 1);
+                    assert_eq!(record.owner.as_deref(), Some(OWNER));
+                }
+                other => panic!("{reason} must count, got {other:?}"),
             }
         }
-        assert_eq!(budget.records(id).len(), MAX_RECOVERY_RECORDS_PER_PANEL);
-        let extra = budget.note(
-            id,
-            OWNER,
-            2,
-            RecoveryReason::Suspended,
-            RecoveryAction::Placeholder,
-        );
-        assert!(
-            matches!(extra, RecoveryStep::Saturated { attempt: 0, .. }),
-            "a full key table must saturate, got {extra:?}"
+        assert_eq!(budget.tracked_keys(id), MAX_RECOVERY_KEYS_PER_PANEL - 1);
+        // The eighth key fills the table.
+        assert!(matches!(
+            budget.note(id, Some(OWNER), 2, RecoveryReason::Suspended),
+            RecoveryStep::Recorded(_)
+        ));
+        assert_eq!(budget.tracked_keys(id), MAX_RECOVERY_KEYS_PER_PANEL);
+        // A ninth key makes room instead of being dropped: it counts from one
+        // and the stalest key (the lowest generation) is evicted.
+        match budget.note(id, Some(OWNER), 3, RecoveryReason::Crashed) {
+            RecoveryStep::Recorded(record) => assert_eq!(record.attempt, 1),
+            other => panic!("a ninth key must be counted, not dropped, got {other:?}"),
+        }
+        assert_eq!(budget.tracked_keys(id), MAX_RECOVERY_KEYS_PER_PANEL);
+        assert_eq!(budget.count(id, 3, RecoveryReason::Crashed), 1);
+        assert_eq!(
+            budget.count(id, 1, RecoveryReason::Suspended),
+            0,
+            "the stalest key was evicted to make room"
         );
         assert_eq!(budget.records(id).len(), MAX_RECOVERY_RECORDS_PER_PANEL);
         assert_eq!(budget.tracked_panels(), 1);
@@ -1184,32 +1240,33 @@ mod tests {
         budget.retire(id);
         assert_eq!(budget.tracked_panels(), 0);
         assert_eq!(budget.total_records(), 0);
-        assert_eq!(budget.count(id, 1, RecoveryReason::Suspended), 0);
+        assert_eq!(budget.tracked_keys(id), 0);
+        assert_eq!(budget.count(id, 1, RecoveryReason::Reloaded), 0);
         assert_eq!(budget.saturated_note(id), None);
     }
 
     /// A `Drop` record is a report, not an attempt: it is not counted, and its
     /// `attempt` is zero so a diagnostic reader never mistakes a disposal for
-    /// a recovery attempt.
+    /// a recovery attempt. The action is derived from the reason, so `closed`
+    /// cannot be recorded as a placeholder.
     #[test]
     fn a_disposal_is_recorded_but_not_counted() {
         let mut budget = RecoveryBudget::new();
         let id = panel(9);
-        match budget.note(
-            id,
-            OWNER,
-            4,
-            RecoveryReason::Closed,
-            RecoveryAction::Disposed,
-        ) {
+        match budget.note(id, None, 4, RecoveryReason::Closed) {
             RecoveryStep::Recorded(record) => {
                 assert_eq!(record.attempt, 0);
                 assert_eq!(record.action, RecoveryAction::Disposed);
                 assert_eq!(record.reason, RecoveryReason::Closed);
+                assert_eq!(
+                    record.owner, None,
+                    "no binding, so the record names no owner"
+                );
             }
             other => panic!("expected a disposal record, got {other:?}"),
         }
         assert_eq!(budget.count(id, 4, RecoveryReason::Closed), 0);
+        assert_eq!(budget.tracked_keys(id), 0);
     }
 
     /// E.5: the surface is the fixed Core table, far inside SCN-1..SCN-5, and

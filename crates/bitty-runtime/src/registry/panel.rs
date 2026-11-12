@@ -34,8 +34,9 @@ pub use bitty_ui::panel::{
 };
 pub use bitty_ui::panel::{PanelId, PanelState, PanelType};
 pub use bitty_ui::panel_recovery::{
-    PlaceholderReason, PlaceholderScene, RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget,
-    RecoveryOutcome, RecoveryReason, RecoveryRecord, RecoveryStep,
+    MAX_RECOVERY_KEYS_PER_PANEL, MAX_RECOVERY_RECORDS_PER_PANEL, PlaceholderReason,
+    PlaceholderScene, RECOVERY_ATTEMPT_CAP, RecoveryAction, RecoveryBudget, RecoveryOutcome,
+    RecoveryReason, RecoveryRecord, RecoveryStep,
 };
 
 // PanelId distinctness is already enforced by `bitty_ui::PanelId` being a
@@ -1885,11 +1886,16 @@ impl PanelRegistry {
     /// Presents the placeholder for a panel whose controller is gone, or
     /// disposes it when the reason is a user close (OQ-084 Decision E).
     ///
-    /// `presented` is the controller generation the transition names, and
-    /// `owner` is the plugin that owned the content, both stamped on the FS-4
-    /// record. `reason_token` is a token of Decision E rule 2's closed
-    /// vocabulary; `closed`, `dismissed`, and `quit` select the `Drop` outcome,
-    /// `denied` selects `Unavailable`, and the rest select `Placeholder`.
+    /// `presented` is the controller generation the transition names.
+    /// `reason_token` is a token of Decision E rule 2's closed vocabulary;
+    /// `closed`, `dismissed`, and `quit` select the `Drop` outcome, `denied`
+    /// selects `Unavailable`, and the rest select `Placeholder`.
+    ///
+    /// The FS-4 record's owner is **not** an argument: it is read from the
+    /// panel record's own binding (`PanelRecord::owner`) before the unbind
+    /// edge clears it, so a transition can never be attributed to a plugin the
+    /// panel did not bind, and it is `None` exactly while no controller is
+    /// bound.
     ///
     /// The three rules this enforces:
     ///
@@ -1903,7 +1909,10 @@ impl PanelRegistry {
     /// 2. **Recovery is bounded.** One counter keyed
     ///    `(PanelId, presented, reason)`, capped at eight. The ninth attempt
     ///    changes no state and emits the single `saturated` note for the
-    ///    binding; later attempts emit nothing.
+    ///    binding; later attempts emit nothing. The per-panel key table is
+    ///    bounded too, and makes room by evicting its oldest key rather than
+    ///    dropping the transition: a panel past its key budget is still counted
+    ///    and still recorded.
     /// 3. **The reason is closed.** A token outside the vocabulary is refused
     ///    with [`PanelError::RecoveryReasonRejected`] before anything is read or
     ///    written.
@@ -1925,7 +1934,6 @@ impl PanelRegistry {
         &mut self,
         panel_id: PanelId,
         presented: Generation,
-        owner: &str,
         reason_token: &str,
     ) -> Result<PlaceholderPresentation, PanelError> {
         self.ensure_not_disposed()?;
@@ -1942,9 +1950,14 @@ impl PanelRegistry {
         if outcome.disposes_container() {
             // `Drop`: a user close is Core-initiated, not a plugin verb, so the
             // container is retired by its allocation epoch rather than through
-            // the controller fence.
-            let epoch = match self.panels.get(&panel_id.0) {
-                Some(record) => record.generation,
+            // the controller fence. The record names that epoch — the
+            // generation the disposal actually used — and the owner the record
+            // held at that moment, read before the record is gone.
+            let (epoch, owner) = match self.panels.get(&panel_id.0) {
+                Some(record) => (
+                    record.generation,
+                    record.owner().map(|plugin| plugin.as_str().to_owned()),
+                ),
                 None => {
                     return Err(PanelError::NotFound {
                         kind: "panel",
@@ -1953,13 +1966,9 @@ impl PanelRegistry {
                 }
             };
             self.dispose_panel(panel_id, epoch)?;
-            let step = self.recovery.note(
-                panel_id,
-                owner,
-                presented.get(),
-                outcome.reason(),
-                RecoveryAction::Disposed,
-            );
+            let step =
+                self.recovery
+                    .note(panel_id, owner.as_deref(), epoch.get(), outcome.reason());
             let record = match step {
                 RecoveryStep::Recorded(record) => Some(record),
                 RecoveryStep::Saturated { .. } | RecoveryStep::Unchanged => None,
@@ -1976,10 +1985,11 @@ impl PanelRegistry {
         // before any state moves (C.5: a transition issued by a generation the
         // record no longer binds fails closed).
         let state = self.panel_state_at_controller_fence(panel_id, presented)?;
-        let (bound, last) = match self.panels.get(&panel_id.0) {
+        let (bound, last, owner) = match self.panels.get(&panel_id.0) {
             Some(record) => (
                 record.controller_generation(),
                 record.last_controller_generation,
+                record.owner().map(|plugin| plugin.as_str().to_owned()),
             ),
             None => {
                 return Err(PanelError::NotFound {
@@ -2007,23 +2017,26 @@ impl PanelRegistry {
         }
         let step = self.recovery.note(
             panel_id,
-            owner,
+            owner.as_deref(),
             presented.get(),
             outcome.reason(),
-            outcome.action(),
         );
         let (record, saturated) = match step {
             RecoveryStep::Recorded(record) => (Some(record), false),
             RecoveryStep::Saturated { .. } => (None, true),
             RecoveryStep::Unchanged => (None, false),
         };
-        if record.is_some() {
-            if let Some(record_mut) = self.panels.get_mut(&panel_id.0) {
-                record_mut.placeholder = Some(PanelPlaceholder {
-                    reason: placeholder_reason,
-                    unbound_generation: bound.or(last),
-                });
-            }
+        // The placeholder is written for every panel that reaches this path,
+        // whatever the counter answered. A saturated or unchanged counter emits
+        // no new record, but the generation's families have already been
+        // released: returning without a placeholder would leave the container
+        // unbound with nothing to present, the silent orphan Decision E and
+        // PGO-23 forbid.
+        if let Some(record_mut) = self.panels.get_mut(&panel_id.0) {
+            record_mut.placeholder = Some(PanelPlaceholder {
+                reason: placeholder_reason,
+                unbound_generation: bound.or(last),
+            });
         }
         Ok(PlaceholderPresentation {
             outcome,
@@ -2064,6 +2077,17 @@ impl PanelRegistry {
     #[must_use]
     pub fn recovery_saturated_for(&self, panel_id: PanelId) -> Option<Generation> {
         self.recovery.saturated_note(panel_id).map(Generation)
+    }
+
+    /// Distinct `(controller generation, reason)` counter keys tracked for a
+    /// panel.
+    ///
+    /// Always `<= MAX_RECOVERY_KEYS_PER_PANEL`: the table makes room by evicting
+    /// its oldest key rather than growing, so a transition that arrives at the
+    /// cap is still counted and still recorded.
+    #[must_use]
+    pub fn recovery_keys(&self, panel_id: PanelId) -> usize {
+        self.recovery.tracked_keys(panel_id)
     }
 
     /// The retained recovery records for a panel, oldest first (at most
@@ -3943,7 +3967,7 @@ mod placeholder_state_tests {
         reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
 
         let presented = reg
-            .present_placeholder(handle.id, controller, OWNER, "crashed")
+            .present_placeholder(handle.id, controller, "crashed")
             .expect("placeholder");
 
         assert_eq!(
@@ -3981,7 +4005,11 @@ mod placeholder_state_tests {
         // One FS-4-style record: owner, generation, reason, action.
         let record = presented.record.expect("one record per transition");
         assert_eq!(record.panel, handle.id);
-        assert_eq!(record.owner, OWNER);
+        assert_eq!(
+            record.owner.as_deref(),
+            Some(OWNER),
+            "the owner is the binding's plugin id, not a caller string"
+        );
         assert_eq!(record.controller_generation, controller.get());
         assert_eq!(record.reason, RecoveryReason::Crashed);
         assert_eq!(record.action, RecoveryAction::Placeholder);
@@ -3991,6 +4019,106 @@ mod placeholder_state_tests {
             1
         );
         assert_eq!(reg.recovery_records(handle.id).len(), 1);
+    }
+
+    /// Decision E / PGO-23 through the *cap* path: a panel whose counter for the
+    /// key is already at the cap, whose placeholder a rebind cleared, and which
+    /// is then presented the same key again. The counter answers `Unchanged`
+    /// (no record), so a seam that wrote the placeholder only when a record came
+    /// back would leave the container unbound with nothing to present — the same
+    /// silent orphan, reached without the key table.
+    #[test]
+    fn a_saturated_counter_still_presents_the_placeholder_after_a_rebind() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+        for _ in 0..=RECOVERY_ATTEMPT_CAP {
+            reg.present_placeholder(handle.id, epoch, "disabled")
+                .expect("placeholder");
+        }
+        assert_eq!(reg.recovery_saturated_for(handle.id), Some(epoch));
+
+        // A rebind clears the placeholder but not the counter.
+        reg.unmount_panel(handle.id, epoch).expect("unmount");
+        reg.mount_panel(handle.id, epoch, ViewId::new(13))
+            .expect("remount");
+        assert!(
+            reg.placeholder(handle.id).is_none(),
+            "the rebind cleared it"
+        );
+
+        let presented = reg
+            .present_placeholder(handle.id, epoch, "disabled")
+            .expect("the transition still presents");
+        assert!(
+            presented.record.is_none(),
+            "the counter is at its cap: nothing new is counted"
+        );
+        assert!(
+            presented.placeholder.is_some(),
+            "the placeholder is written even when the counter emits no record"
+        );
+        assert_eq!(
+            reg.placeholder_reason(handle.id),
+            Some(PlaceholderReason::Disabled)
+        );
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "the Core surface is presentable"
+        );
+    }
+
+    /// FS-4: the record's owner is the panel record's own binding owner, never a
+    /// caller-asserted string. `None` is the honest value while no controller is
+    /// bound; `Some` is the plugin the binding named, read before the unbind edge
+    /// cleared it. Fails for an implementation that stamps a caller's argument
+    /// onto the record (which let any caller attribute a transition to a plugin
+    /// the panel never bound, and reported an owner for a container that had
+    /// none).
+    #[test]
+    fn the_record_owner_is_read_from_the_panel_binding() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+
+        // No binding: no owner to name.
+        let unloaded = reg
+            .present_placeholder(handle.id, epoch, "unloaded")
+            .expect("placeholder");
+        assert_eq!(
+            unloaded.record.expect("one record").owner,
+            None,
+            "a container that never bound a controller names no owner"
+        );
+
+        // Bound: the owner is the binding's plugin id, and it survives the
+        // unbind edge that clears the binding before the caller reads it.
+        let controller = Generation(epoch.get() + 5);
+        reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+        let crashed = reg
+            .present_placeholder(handle.id, controller, "crashed")
+            .expect("placeholder");
+        assert_eq!(
+            reg.controller_generation(handle.id),
+            None,
+            "the edge cleared the binding before the record was read"
+        );
+        assert_eq!(
+            crashed.record.expect("one record").owner.as_deref(),
+            Some(OWNER),
+            "the owner comes from the binding the transition released"
+        );
+        // The retained history carries the same owner.
+        let retained = reg.recovery_records(handle.id);
+        assert_eq!(
+            retained
+                .last()
+                .and_then(|record| record.owner.clone())
+                .as_deref(),
+            Some(OWNER)
+        );
     }
 
     /// E.4: a missing plugin is `unloaded`, not deleted. The container stays,
@@ -4004,7 +4132,7 @@ mod placeholder_state_tests {
         let (handle, _workspace) = mounted_panel(&mut reg);
 
         let presented = reg
-            .present_placeholder(handle.id, handle.generation, OWNER, "unloaded")
+            .present_placeholder(handle.id, handle.generation, "unloaded")
             .expect("placeholder");
 
         let placeholder = presented.placeholder.expect("placeholder on the record");
@@ -4039,7 +4167,7 @@ mod placeholder_state_tests {
         let (handle, _workspace) = mounted_panel(&mut reg);
 
         let presented = reg
-            .present_placeholder(handle.id, handle.generation, OWNER, "denied")
+            .present_placeholder(handle.id, handle.generation, "denied")
             .expect("unavailable");
 
         assert_eq!(presented.outcome, RecoveryOutcome::Unavailable);
@@ -4068,7 +4196,7 @@ mod placeholder_state_tests {
 
         for attempt in 1..=RECOVERY_ATTEMPT_CAP {
             let presented = reg
-                .present_placeholder(handle.id, epoch, OWNER, "disabled")
+                .present_placeholder(handle.id, epoch, "disabled")
                 .expect("placeholder");
             let record = presented.record.expect("counted transition");
             assert_eq!(record.attempt, attempt);
@@ -4082,7 +4210,7 @@ mod placeholder_state_tests {
         );
 
         let ninth = reg
-            .present_placeholder(handle.id, epoch, OWNER, "disabled")
+            .present_placeholder(handle.id, epoch, "disabled")
             .expect("saturated note");
         assert!(ninth.saturated, "the ninth attempt emits the note");
         assert!(
@@ -4100,10 +4228,88 @@ mod placeholder_state_tests {
         assert_eq!(reg.recovery_saturated_for(handle.id), Some(epoch));
 
         let tenth = reg
-            .present_placeholder(handle.id, epoch, OWNER, "disabled")
+            .present_placeholder(handle.id, epoch, "disabled")
             .expect("no-op attempt");
         assert!(!tenth.saturated && tenth.record.is_none());
         assert_eq!(reg.recovery_records(handle.id).len(), 8);
+    }
+
+    /// Decision E / PGO-23: a panel that reaches the placeholder path always
+    /// leaves a placeholder, even when its per-panel key table is already full.
+    /// Fails for an implementation that answers a full table with `Saturated`
+    /// and returns `Ok` without writing the placeholder: the generation is
+    /// released, the binding is cleared, and the retained container is left
+    /// with nothing to present — the silent orphan this record forbids.
+    #[test]
+    fn a_full_key_table_still_presents_the_placeholder() {
+        let mut reg = registry();
+        let (handle, _workspace) = mounted_panel(&mut reg);
+        let epoch = handle.generation;
+
+        // Eight distinct `(generation, reason)` keys, each presented by a bound
+        // controller. The per-panel key table is full afterwards.
+        for step in 1..=MAX_RECOVERY_KEYS_PER_PANEL as u64 {
+            let controller = Generation(epoch.get() + step);
+            reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
+            reg.present_placeholder(handle.id, controller, "crashed")
+                .expect("placeholder");
+        }
+        assert_eq!(
+            reg.recovery_keys(handle.id),
+            MAX_RECOVERY_KEYS_PER_PANEL,
+            "the fixture fills the key table"
+        );
+
+        // A rebind clears the placeholder but not the key table.
+        reg.unmount_panel(handle.id, epoch).expect("unmount");
+        reg.mount_panel(handle.id, epoch, ViewId::new(12))
+            .expect("remount");
+        assert!(
+            reg.placeholder(handle.id).is_none(),
+            "the rebind cleared it"
+        );
+
+        // The ninth distinct key: a new controller generation crashes.
+        let ninth = Generation(epoch.get() + 100);
+        reg.bind_controller_generation_for_test(handle.id, OWNER, ninth);
+        let presented = reg
+            .present_placeholder(handle.id, ninth, "crashed")
+            .expect("the transition still presents");
+
+        assert!(
+            presented.placeholder.is_some(),
+            "a released generation always leaves a placeholder, even at the key cap"
+        );
+        assert_eq!(
+            reg.placeholder_reason(handle.id),
+            Some(PlaceholderReason::Crashed),
+            "exactly one findable reason"
+        );
+        assert_eq!(
+            reg.controller_generation(handle.id),
+            None,
+            "the unbind edge ran: the binding is gone"
+        );
+        assert!(
+            presented.record.is_some(),
+            "the transition is counted and recorded rather than answered saturated"
+        );
+        assert_eq!(
+            reg.recovery_attempts(handle.id, ninth, PlaceholderReason::Crashed),
+            1,
+            "the new key counts from one"
+        );
+        assert!(
+            reg.placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "the Core surface is presentable"
+        );
+        assert_eq!(
+            reg.recovery_keys(handle.id),
+            MAX_RECOVERY_KEYS_PER_PANEL,
+            "the table made room instead of growing"
+        );
     }
 
     /// E.2: a reason outside the vocabulary is a typed refusal. Nothing moves:
@@ -4119,7 +4325,7 @@ mod placeholder_state_tests {
         reg.bind_controller_generation_for_test(handle.id, OWNER, controller);
 
         let error = reg
-            .present_placeholder(handle.id, controller, OWNER, "user pressed crash")
+            .present_placeholder(handle.id, controller, "user pressed crash")
             .expect_err("a user-supplied reason is refused");
 
         match error {
@@ -4154,7 +4360,7 @@ mod placeholder_state_tests {
             let (handle, _workspace) = mounted_panel(&mut reg);
 
             let presented = reg
-                .present_placeholder(handle.id, handle.generation, OWNER, token)
+                .present_placeholder(handle.id, handle.generation, token)
                 .expect("drop");
 
             assert_eq!(presented.outcome, RecoveryOutcome::Drop);
@@ -4170,7 +4376,15 @@ mod placeholder_state_tests {
             assert_eq!(record.reason, RecoveryReason::Closed, "{token} normalises");
             assert_eq!(record.action, RecoveryAction::Disposed);
             assert_eq!(record.attempt, 0, "a disposal is not a recovery attempt");
-            assert_eq!(record.owner, OWNER);
+            assert_eq!(
+                record.owner, None,
+                "{token}: the container never bound a controller, so the record names no owner"
+            );
+            assert_eq!(
+                record.controller_generation,
+                handle.generation.get(),
+                "{token}: the record names the epoch the disposal used, not a caller's generation"
+            );
         }
     }
 
@@ -4189,7 +4403,7 @@ mod placeholder_state_tests {
         reg.unmount_panel(handle.id, handle.generation)
             .expect("unmount");
 
-        reg.present_placeholder(handle.id, controller, OWNER, "crashed")
+        reg.present_placeholder(handle.id, controller, "crashed")
             .expect("placeholder");
 
         let error = reg
@@ -4215,7 +4429,7 @@ mod placeholder_state_tests {
     fn a_rebind_clears_the_placeholder() {
         let mut reg = registry();
         let (handle, _workspace) = mounted_panel(&mut reg);
-        reg.present_placeholder(handle.id, handle.generation, OWNER, "reloaded")
+        reg.present_placeholder(handle.id, handle.generation, "reloaded")
             .expect("placeholder");
         assert_eq!(
             reg.placeholder_reason(handle.id),
@@ -4257,7 +4471,7 @@ mod placeholder_state_tests {
             "a bound panel presents no placeholder"
         );
 
-        reg.present_placeholder(handle.id, handle.generation, OWNER, "incompatible")
+        reg.present_placeholder(handle.id, handle.generation, "incompatible")
             .expect("placeholder");
         let block = reg
             .placeholder_block(handle.id)

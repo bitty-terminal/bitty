@@ -334,7 +334,7 @@ fn strip_comments(text: &str) -> String {
         }
         if c == '/' && chars.peek() == Some(&'/') {
             // Line comment: drop to the end of the line, keep the newline.
-            while let Some(d) = chars.next() {
+            for d in chars.by_ref() {
                 if d == '\n' {
                     out.push('\n');
                     break;

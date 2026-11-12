@@ -3043,6 +3043,39 @@ impl PanelRegistry {
         self.retained_ceilings.get(&panel_id)
     }
 
+    /// Drops the panel's retired-ceiling tombstone: D.2 phase 2 step 3, the
+    /// tombstone half (OQ-084; §D.2 "Two-phase bind" of
+    /// `bitty-terminal-docs/specifications/panel-generation-ownership-decision.md`).
+    ///
+    /// D.2 puts this drop last in phase 2 and after the lease reset: "Reset the
+    /// panel's lease entry to `Idle`, drop the panel's retired-ceiling tombstone
+    /// for the predecessor owner and generation, then and only then permit
+    /// successor verbs." The lease table is
+    /// [`PanelRuntime`](super::host::PanelRuntime)'s and the tombstone table is
+    /// this registry's, so the two writes cannot happen in one call.
+    /// [`Self::rebind_panel`] therefore commits phase 2 steps 1 and 2 and
+    /// stops; the facade resets the lease, calls this method, and returns only
+    /// after both ran, which is D.2's order.
+    ///
+    /// The tombstone table is keyed by panel id alone until bitty#2476
+    /// residual 7 re-keys it by owner, so this drops the panel's entry: a later
+    /// bind must not consume a ceiling that has already been used.
+    ///
+    /// A no-op unless the record currently binds a controller. A caller that
+    /// has not committed phase 2 step 2 must not be able to retire a ceiling a
+    /// later bind still needs, so the drop is gated on the binding rather than
+    /// on the caller's word. Returns whether a tombstone was removed.
+    pub fn retire_rebound_ceiling(&mut self, panel_id: PanelId) -> bool {
+        let bound = self
+            .panels
+            .get(&panel_id.0)
+            .is_some_and(|record| record.controller_generation().is_some());
+        if !bound {
+            return false;
+        }
+        self.retained_ceilings.remove(&panel_id).is_some()
+    }
+
     /// The most recently ended controller generation retained on the panel
     /// record (OQ-084 D.2 phase 0), or `None` before the first edge and after
     /// panel disposal.
@@ -3315,10 +3348,11 @@ impl PanelRegistry {
     ///
     /// The set is written once, all-or-nothing: every element is validated
     /// before any is installed. This is step 1 only — the retired-ceiling
-    /// tombstone is retired by [`Self::rebind_panel`] at step 3, after the
-    /// binding is written, so a bind that commits grants and then fails cannot
-    /// lose the ceiling its own retry needs. A caller that installs without
-    /// binding a controller keeps the tombstone.
+    /// tombstone is retired by phase 2 step 3
+    /// ([`Self::retire_rebound_ceiling`]), which runs after the binding is
+    /// written, so a bind that commits grants and then fails cannot lose the
+    /// ceiling its own retry needs. A caller that installs without binding a
+    /// controller keeps the tombstone.
     ///
     /// # Errors
     /// `NotFound`, `StaleHandle`, `CapabilityDenied` (nothing installed),
@@ -3378,26 +3412,42 @@ impl PanelRegistry {
     /// fail, so no caller can observe a panel whose predecessor was released
     /// and whose successor holds an empty or partial set.
     ///
-    /// **Phase 1** invalidates the predecessor in D.2's five-step order, and
-    /// every step that owns a registry table completes before phase 2:
+    /// **Phase 1** invalidates the predecessor in D.2's five-step order
+    /// (§D.2 "Two-phase bind" of
+    /// `bitty-terminal-docs/specifications/panel-generation-ownership-decision.md`,
+    /// the draft decision record; bitty#2476 Decision D.2 is the same text).
+    /// **Three of the five steps fuse at this seam.** The other two are owned
+    /// by the plugin runtime's generation edge, which this registry cannot
+    /// reach; they are named below rather than faked with a no-op:
     ///
-    /// 1. the retired-ceiling tombstone (written before the live row is
+    /// 1. *Here.* The retired-ceiling tombstone (written before the live row is
     ///    removed, so a failed write leaves the row in place), then the live
-    ///    row keyed by the displaced generation;
-    /// 2. the panel's queued events are cleared;
-    /// 3. capture handles and the overlay capture session have no registry
-    ///    table: the content/capture family is generation-scoped in the plugin
-    ///    host and released by `clear_ui_blocks` at suspend, dispose, and
-    ///    rollback. D.4's requirement on the bind is that it replay none of
-    ///    it, which the capture side of `tests/panel_rebind.rs` asserts;
-    /// 4. attributed overlays are dismissed — the generation-scoped pass
-    ///    inside the release, then a container-wide pass, because a writer
+    ///    row keyed by the displaced generation.
+    /// 2. *Here.* The panel's queued events are cleared.
+    /// 3. *Not here.* The predecessor's capture handles and its live overlay
+    ///    capture session are released by `PluginServices::clear_ui_blocks`
+    ///    (`plugin_runtime/services.rs`: the generation's UI blocks, spec
+    ///    overlay handles, and terminal-slot scenes, the last through
+    ///    `SceneHost::release_owner`) and by `OverlayCapture::revoke_plugin`
+    ///    (`plugin_runtime/overlay.rs`: the input capture session).
+    ///    `PluginRuntime::suspend_inner`, `dispose_inner`, and `rollback` are
+    ///    those callers, and `reload_inner` runs `dispose_inner` before it
+    ///    activates a successor, so the reload path already discharged this
+    ///    step before any bind can run. D.4 asks the bind to replay none of it;
+    ///    the bind also cannot perform it.
+    /// 4. *Here.* Attributed overlays are dismissed — the generation-scoped
+    ///    pass inside the release, then a container-wide pass, because a writer
     ///    that ran while no controller was bound attributed its surface under
-    ///    the allocation epoch, which the generation pass never matches;
-    /// 5. in-flight panel verbs have no queue either: a verb may not hold a
-    ///    panel reference across a yield, a callback boundary, or a queue
-    ///    drain, so the cancellation is delivered at use, where the controller
-    ///    fence refuses a predecessor verb with [`PanelError::ControllerReleased`].
+    ///    the allocation epoch, which the generation pass never matches. This
+    ///    is the only phase-1 overlay family this registry owns.
+    /// 5. *Not here.* In-flight panel verbs are cancelled. This registry holds
+    ///    no verb queue: panel verbs are synchronous and
+    ///    `panel_state_at_controller_fence` revalidates at use, so a verb that
+    ///    still reaches the registry after the swap presents the predecessor
+    ///    generation and is refused [`PanelError::ControllerReleased`]. The
+    ///    predecessor's parked command is cancelled by
+    ///    `PluginRuntime::cancel_parked_command`, again at the plugin runtime's
+    ///    generation edge.
     ///
     /// Steps 1, 2, 4 and the panel-command release are one fail-closed call to
     /// [`Self::release_generation_scope`], which is also idempotent — on the
@@ -3406,17 +3456,40 @@ impl PanelRegistry {
     ///
     /// **Callers.** The plugin runtime cannot reach this registry (the panel
     /// host is app-owned), so the activation-time swap this bind exists for has
-    /// no caller in the tree yet: only the rebind tests drive it. The bind is
-    /// landed and tested ahead of that wiring rather than inventing an
-    /// activation path the app layer does not have.
+    /// no caller in the tree yet: only the rebind tests drive it. Residual 2
+    /// lands the bind and its tests ahead of that wiring rather than inventing
+    /// an activation path the app layer does not have, which is why the
+    /// obligations below are recorded here instead of discharged.
     ///
-    /// **Phase 2** commits in three steps and in this order: the derived set
-    /// keyed by the *controller* generation (not the allocation epoch), the
-    /// binding as one `(owner, controller generation)` pair, then the
-    /// predecessor's retired-ceiling tombstone is retired and the placeholder
-    /// cleared. The facade (`PanelRuntime::rebind_panel`) resets the lease to
-    /// `Idle` between the binding write and the return, so no verb is permitted
-    /// in the window D.2 names.
+    /// **Obligations on the wiring that installs this bind.** Steps 3 and 5
+    /// are the reason residual 2 leaves work behind, so the activation-time
+    /// swap must, in this order:
+    ///
+    /// 1. run the predecessor's `PluginRuntime::dispose_inner` (the reload
+    ///    path) or `suspend_inner` first, which is what revokes the capture
+    ///    session and quiesces its parked command (phase-1 steps 3 and 5);
+    /// 2. call this bind only after that edge returned, through
+    ///    `PanelRuntime::rebind_panel`, so phase 2 step 3's lease reset runs
+    ///    before the tombstone drop;
+    /// 3. pass the successor's own resolution as `requested` and only the
+    ///    permission-diff consents granted for *this* binding as `consented`;
+    /// 4. never bind a predecessor whose edge has not run yet: nothing later in
+    ///    this call revokes a capture session, and the at-use fence is a
+    ///    backstop for verbs, not a substitute for the revoke.
+    ///
+    /// **Phase 2** commits in D.2's order. Steps 1 and 2 are here: the derived
+    /// set keyed by the *controller* generation (not the allocation epoch),
+    /// then the binding as one `(owner, controller generation)` pair with the
+    /// placeholder cleared. Step 3 — "reset the panel's lease entry to `Idle`,
+    /// drop the panel's retired-ceiling tombstone ..., then and only then
+    /// permit successor verbs" — straddles two owners: the lease table is
+    /// `PanelRuntime`'s and the tombstone table is this registry's. So the
+    /// commit stops after step 2; the facade resets the lease, then calls
+    /// [`Self::retire_rebound_ceiling`], and returns only after both ran. That
+    /// keeps D.2's order (lease, then tombstone) without writing across the
+    /// ownership boundary. A caller that drives this registry directly must
+    /// make the same two calls in the same order; until it does, the
+    /// predecessor's tombstone is still retained.
     ///
     /// # Errors
     /// `RegistryDisposed`, `NotFound`, `ControllerConflict`,
@@ -3510,9 +3583,12 @@ impl PanelRegistry {
         // Phase 1 — invalidate the predecessor, in D.2's order.
         // ------------------------------------------------------------------
         if let Some(predecessor) = capture.predecessor_generation() {
-            // Steps 1, 2, 4 and the command release in one fail-closed call.
-            // A refusal here leaves the binding, the live row, and every
-            // other family exactly as they were.
+            // Phase 1 steps 1, 2 and 4, plus the panel-command release, in one
+            // fail-closed call. Steps 3 (capture handles, overlay capture
+            // session) and 5 (in-flight verbs) are owned by the plugin
+            // runtime's generation edge and have no registry table to act on;
+            // the rustdoc above names them. A refusal here leaves the binding,
+            // the live row, and every other family exactly as they were.
             self.release_generation_scope(panel_id, predecessor)?;
         }
         // Step 4, second pass: whatever attribution is still on the container.
@@ -3542,13 +3618,10 @@ impl PanelRegistry {
             });
             record.placeholder = None;
         }
-        // Step 3: retire the predecessor's ceiling (D.2: "until the panel's
-        // next successful bind"). The tombstone table is keyed by panel id
-        // alone until bitty#2476 residual 7 re-keys it by owner, so this drops
-        // the panel's entry: a later bind must not consume a ceiling that has
-        // already been used. The facade resets the lease before returning.
-        self.retained_ceilings.remove(&panel_id);
-
+        // Step 3 is split by ownership: the lease entry is the facade's, this
+        // registry owns the tombstone. The facade resets the lease first and
+        // then calls `retire_rebound_ceiling`; this commit stops after step 2
+        // so the two writes happen in D.2's order (see the rustdoc above).
         Ok(PanelRebind {
             panel_id,
             predecessor_generation: capture.predecessor_generation(),
@@ -4029,9 +4102,58 @@ mod rebind_panel_tests {
             "the stale ceiling does not widen the successor"
         );
         assert!(
+            reg.retained_grant_ceiling(panel).is_some(),
+            "the commit stops after step 2, so the tombstone survives it"
+        );
+        assert!(
+            reg.retire_rebound_ceiling(panel),
+            "step 3 retires the tombstone the bind found"
+        );
+        assert!(
             reg.retained_grant_ceiling(panel).is_none(),
             "a committed bind retires the tombstone it found"
         );
+    }
+
+    /// D.2 phase 2 step 3 is split from the registry commit so the facade can
+    /// reset the lease first. The tombstone half is gated on a committed
+    /// binding: a caller that has not written phase 2 step 2 cannot retire a
+    /// ceiling a later bind still needs.
+    #[test]
+    fn the_ceiling_retirement_is_gated_on_the_committed_binding() {
+        let mut reg = PanelRegistry::new(PanelRegistryConfig::default()).expect("registry");
+        let handle = reg
+            .create_panel(PanelType::Helper, None)
+            .expect("create panel");
+        let epoch = handle.generation;
+        reg.retain_grant_ceiling(handle.id, epoch, set(&[CREATE]))
+            .expect("tombstone");
+
+        // No controller bound: step 2 has not run, so step 3 must not run.
+        assert!(
+            !reg.retire_rebound_ceiling(handle.id),
+            "an unbound record cannot retire its ceiling"
+        );
+        assert!(
+            reg.retained_grant_ceiling(handle.id).is_some(),
+            "the ceiling a later bind needs is still there"
+        );
+
+        // The same call after the commit is the step-3 write.
+        let controller = epoch.next().expect("controller generation");
+        reg.rebind_panel(
+            handle.id,
+            controller,
+            &owner("acme.notes"),
+            &set(&[CREATE]),
+            &empty(),
+        )
+        .expect("first bind");
+        assert!(
+            reg.retire_rebound_ceiling(handle.id),
+            "a committed binding unlocks step 3"
+        );
+        assert!(reg.retained_grant_ceiling(handle.id).is_none());
     }
 
     /// `PGO-22(d)`: a panel that names a previous controller with no matching

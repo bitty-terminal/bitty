@@ -1,15 +1,21 @@
 #![forbid(unsafe_code)]
 //! OQ-084 D.2: the production `rebind_panel` across a plugin generation swap.
 //!
-//! The decision record makes a bind three phases: phase 0 captures the
-//! predecessor ceiling and derives the successor's set from that snapshot, five
-//! ordered phase-1 steps invalidate the predecessor, and three phase-2 steps
-//! commit. This file drives the shipped path with the six cases the issue names
-//! — reload with a mounted panel, reload with a suspended panel, an active
-//! overlay/capture at bind time, the plugin removed, the plugin denied, and
-//! restore after restart — plus the adversarial rows the matrix adds: a racing
-//! generation, a retired generation, a stale tombstone, an empty tombstone, and
-//! the lease tenure.
+//! The decision record is
+//! `bitty-terminal-docs/specifications/panel-generation-ownership-decision.md`
+//! (§D.2 "Two-phase bind"; a draft record, cited by repo-qualified path because
+//! it does not live in this tree) and bitty#2476 records the same Decision D.2.
+//! The record makes a bind three phases: phase 0 captures the predecessor
+//! ceiling and derives the successor's set from that snapshot, five ordered
+//! phase-1 steps invalidate the predecessor — three of them fuse at the
+//! registry seam, while the capture-session revoke and the in-flight-verb
+//! cancel belong to the plugin runtime's generation edge — and three phase-2
+//! steps commit. This file drives the shipped path with the six cases the issue
+//! names — reload with a mounted panel, reload with a suspended panel, an
+//! active overlay/capture at bind time, the plugin removed, the plugin denied,
+//! and restore after restart — plus the adversarial rows the matrix adds: a
+//! racing generation, a retired generation, a stale tombstone, an empty
+//! tombstone, a still-bound predecessor, and the lease tenure.
 //!
 //! What a successful rebind must never do is inherit authority: every
 //! capability the successor holds is one its own resolution declared and the
@@ -144,6 +150,17 @@ fn a_reload_with_a_mounted_panel_keeps_the_container_and_rebinds_the_controller(
     assert_eq!(
         reg.panel_state(panel, epoch).expect("panel"),
         PanelState::Mounted
+    );
+    // D.2 phase 2 step 3: the tombstone goes after the binding commits. The
+    // facade does this (lease reset, then this call); a registry caller that
+    // drives the commit directly must run the same step itself.
+    assert!(
+        reg.retained_grant_ceiling(panel).is_some(),
+        "the registry commit stops before step 3, so the ceiling is still there"
+    );
+    assert!(
+        reg.retire_rebound_ceiling(panel),
+        "step 3 retires the ceiling the bind consumed"
     );
     assert!(
         reg.retained_grant_ceiling(panel).is_none(),
@@ -754,6 +771,45 @@ fn a_rebind_re_owns_the_container_and_releases_the_old_generation_once() {
         reg.is_panel_capability_granted(panel, n1, CREATE),
         "the successor holds the container"
     );
+
+    // The still-bound case: no generation edge runs between `n1`'s binding and
+    // this rebind, so the bind's own phase-1 release is the only thing that can
+    // retire `n1`'s families. The reload above cannot observe that release —
+    // phase 0 reads the tombstone and phase 1's repeat is a no-op — so this row
+    // is what makes the test fail when phase 1 is skipped.
+    let n2 = n1.next().expect("third controller generation");
+    let still_bound = reg
+        .rebind_panel(
+            panel,
+            n2,
+            &owner("acme.notes"),
+            &set(&[CREATE, FOCUS]),
+            &empty(),
+        )
+        .expect("rebind from a still-bound predecessor");
+    assert_eq!(
+        still_bound.predecessor_generation(),
+        Some(n1),
+        "the live row is the predecessor"
+    );
+    let released = reg
+        .unbind_release_record(panel)
+        .expect("the bind released the still-bound predecessor");
+    assert_eq!(
+        released.generation, n1,
+        "the release record names the displaced generation, not the earlier edge"
+    );
+    assert_eq!(
+        released.grants, 2,
+        "both of the predecessor's grants are released"
+    );
+    assert_eq!(
+        reg.unbind_release_count(panel),
+        Some(2),
+        "the bind released the families, and only once"
+    );
+    assert_eq!(reg.unbind_release_record_count(), 1, "still one record");
+    assert_eq!(reg.controller_generation(panel), Some(n2));
 }
 
 /// D.2 phase 2 step 3, on the facade: the commit resets the lease to `Idle` and
@@ -830,6 +886,16 @@ fn the_lease_returns_to_idle_on_commit_and_survives_a_refusal() {
             .expect("lease state"),
         LeaseState::Idle,
         "the predecessor's tenure ends with its binding"
+    );
+    // D.2 phase 2 step 3 runs to completion through the facade: the lease reset,
+    // then the tombstone drop. A lingering tombstone here would mean the
+    // facade stopped after the lease half.
+    assert!(
+        runtime
+            .registry()
+            .retained_grant_ceiling(handle.id)
+            .is_none(),
+        "the facade retires the predecessor's ceiling after the lease reset"
     );
     // The successor acquires its own tenure; nothing of the old one carries.
     runtime

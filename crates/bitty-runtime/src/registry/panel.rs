@@ -172,6 +172,37 @@ pub enum PanelError {
         /// the record's last controller; `None` when no tombstone was found.
         tombstone_generation: Option<Generation>,
     },
+    /// A panel verb named a controller generation that is not the one the
+    /// record binds (OQ-084 D.2, "Two typed refusals, neither borrowed from
+    /// `StaleHandle`"). The verb touched no panel state, so the binding in
+    /// force is unchanged and the panel is left exactly as it was.
+    ///
+    /// Unreachable on a live path today: no production surface binds a
+    /// controller (bitty#2476 residual 2), and while `PanelRecord::binding` is
+    /// `None` the allocation epoch is the accepted key, so every existing call
+    /// site is unaffected. Tests mint a binding to reach it.
+    ControllerConflict {
+        panel_id: PanelId,
+        /// The generation the record's binding names, or `None` while no
+        /// controller is bound — the allocation epoch is then the only
+        /// accepted key, and a foreign generation is what is refused.
+        bound_generation: Option<Generation>,
+        /// The generation the refused verb presented.
+        presented_generation: Generation,
+    },
+    /// A panel verb presented the controller generation whose binding was
+    /// released, so the verb was in flight when its own generation was unbound
+    /// (OQ-084 D.2 phase 1 step 5, C.5). Nothing of that generation was
+    /// touched.
+    ///
+    /// Unreachable on a live path for the same reason as
+    /// [`PanelError::ControllerConflict`]: only a bound-then-released panel can
+    /// produce it.
+    ControllerReleased {
+        panel_id: PanelId,
+        /// The ended controller generation the refused verb presented.
+        released_generation: Generation,
+    },
     ResourceExhausted {
         reason: String,
     },
@@ -265,6 +296,24 @@ impl std::fmt::Display for PanelError {
                     (None, None) => f.write_str("no predecessor ceiling"),
                 }
             }
+            Self::ControllerConflict {
+                panel_id,
+                bound_generation,
+                presented_generation,
+            } => {
+                write!(f, "panel {panel_id} controller conflict: ")?;
+                match bound_generation {
+                    Some(bound) => write!(f, "bound {bound}, presented {presented_generation}"),
+                    None => write!(f, "no controller bound, presented {presented_generation}"),
+                }
+            }
+            Self::ControllerReleased {
+                panel_id,
+                released_generation,
+            } => write!(
+                f,
+                "panel {panel_id} controller released: generation {released_generation} is unbound"
+            ),
             Self::ResourceExhausted { reason } => write!(f, "resource exhausted: {reason}"),
         }
     }
@@ -416,6 +465,23 @@ impl PanelRecord {
     /// this preserves the single-generation behaviour exactly.
     fn grant_key_generation(&self) -> Generation {
         self.controller_generation().unwrap_or(self.generation)
+    }
+
+    /// Ends the binding `generation` held, if it held one (OQ-084 A.2, C.2:
+    /// "the panel becomes unbound").
+    ///
+    /// The unbind edge drops the binding together with the generation's grant
+    /// row, so the record cannot keep claiming a controller it has released:
+    /// what survives is [`Self::last_controller_generation`], which is what
+    /// makes [`PanelError::ControllerReleased`] decidable at use. A release of
+    /// a generation the binding does not name leaves the binding untouched.
+    fn release_controller_binding(&mut self, generation: Generation) {
+        if self
+            .controller_generation()
+            .is_some_and(|bound| bound == generation)
+        {
+            self.binding = None;
+        }
     }
 }
 
@@ -1165,6 +1231,94 @@ impl PanelRegistry {
         (presented == key).then_some(key)
     }
 
+    /// Revalidates a panel verb's presented generation against the record's
+    /// controller binding at use, immediately before the verb touches panel
+    /// state, and returns the record's state (OQ-084 D.2, "Revalidate at use,
+    /// not only at entry"; C.5 "a mount that started against `N` must fail
+    /// closed").
+    ///
+    /// The accepted generation is the record's binding key — the controller
+    /// generation once one is bound, otherwise the allocation epoch, the same
+    /// key [`Self::resolved_grant_generation`] accepts (A.3). Everything else
+    /// is refused by the typed class the record defines rather than borrowed
+    /// from `StaleHandle`:
+    ///
+    /// - [`PanelError::ControllerReleased`] when the presented generation's own
+    ///   binding was released: it is the record's retained
+    ///   `last_controller_generation`, and the allocation epoch is never a
+    ///   controller generation (B.1/B.2), so presenting it against a foreign
+    ///   binding is a conflict instead.
+    /// - [`PanelError::ControllerConflict`] when the record binds a controller
+    ///   or has ended one and the presented generation is neither.
+    /// - `StaleHandle` — unchanged — when the record binds nothing and has
+    ///   ended nothing: its binding key is then the allocation epoch, a foreign
+    ///   generation has never been accepted here, and this is the refusal that
+    ///   has always answered it.
+    ///
+    /// Fail-open by construction while nothing binds: no production surface
+    /// installs a binding (D.2 phase 2 step 2 is bitty#2476 residual 2), so
+    /// every live call site presents the allocation epoch, hits the first arm,
+    /// and behaves exactly as before — while `binding == None` and
+    /// `last_controller_generation == None`. Both new refusals are therefore
+    /// unreachable on today's live paths and reachable from tests, which mint a
+    /// binding.
+    ///
+    /// Applied at the mount surface, which is the one C.5 names; the remaining
+    /// panel verbs are wired by residual 2's phase 1/phase 2 work.
+    fn panel_state_at_controller_fence(
+        &mut self,
+        panel_id: PanelId,
+        presented: Generation,
+    ) -> Result<PanelState, PanelError> {
+        self.ensure_not_disposed()?;
+        let (state, key, bound, last, epoch) = match self.panels.get(&panel_id.0) {
+            Some(record) => (
+                record.state,
+                record.grant_key_generation(),
+                record.controller_generation(),
+                record.last_controller_generation,
+                record.generation,
+            ),
+            None => {
+                return Err(PanelError::NotFound {
+                    kind: "panel",
+                    id_raw: panel_id.0,
+                });
+            }
+        };
+        if state == UiPanelState::Disposed {
+            return Err(PanelError::NotFound {
+                kind: "panel",
+                id_raw: panel_id.0,
+            });
+        }
+        if presented == key {
+            return Ok(state);
+        }
+        if last == Some(presented) && presented != epoch {
+            self.bump_error("ControllerReleased");
+            return Err(PanelError::ControllerReleased {
+                panel_id,
+                released_generation: presented,
+            });
+        }
+        if bound.is_none() && last.is_none() {
+            // Not bumped: `get_panel` has always answered this call without
+            // touching the audit counter, and this arm keeps that byte for byte.
+            return Err(PanelError::StaleHandle {
+                expected_generation: epoch,
+                found_generation: presented,
+                id_raw: panel_id.0,
+            });
+        }
+        self.bump_error("ControllerConflict");
+        Err(PanelError::ControllerConflict {
+            panel_id,
+            bound_generation: bound,
+            presented_generation: presented,
+        })
+    }
+
     /// Validates `(id, generation)` before returning a reference.
     fn get_panel(&self, id: PanelId, generation: Generation) -> Result<&PanelRecord, PanelError> {
         self.ensure_not_disposed()?;
@@ -1329,8 +1483,17 @@ impl PanelRegistry {
     /// Mounts `panel` to an empty `ViewId`. Validates handles, single-owner
     /// mapping, and transitions `Created -> Mounted`.
     ///
+    /// Revalidates the caller's controller generation at use, immediately
+    /// before the commit touches panel state (OQ-084 D.2, "Revalidate at use,
+    /// not only at entry"; C.5): a mount issued by a controller generation the
+    /// record does not bind, or by one whose binding was released, fails closed
+    /// and leaves the panel in its pre-mount state. While no controller is
+    /// bound the allocation epoch is the accepted generation, so this is a
+    /// no-op on every existing call site (bitty#2476 residual 3).
+    ///
     /// # Errors
-    /// `StaleHandle`, `AlreadyMounted`, `PanelAlreadyMounted`, `InvalidState`.
+    /// `StaleHandle`, `AlreadyMounted`, `PanelAlreadyMounted`, `InvalidState`,
+    /// `ControllerConflict`, `ControllerReleased`.
     pub fn mount_panel(
         &mut self,
         panel_id: PanelId,
@@ -1353,19 +1516,27 @@ impl PanelRegistry {
                 existing: content,
             });
         }
-        let rec = self.get_panel(panel_id, generation)?;
-        if !matches!(rec.state, UiPanelState::Created | UiPanelState::Suspended) {
+        let state = self.panel_state_at_controller_fence(panel_id, generation)?;
+        if !matches!(state, UiPanelState::Created | UiPanelState::Suspended) {
             return Err(PanelError::InvalidState {
-                current: rec.state,
+                current: state,
                 expected: "Created or Suspended",
             });
         }
-        // Commit mount
-        self.view_to_panel.insert(view_id, panel_id);
-        self.panel_to_view.insert(panel_id, view_id);
-        let rec_mut = self.get_panel_mut(panel_id, generation)?;
+        // Commit mount. The fence above resolved the record and accepted
+        // `generation` as its binding key, which a bound controller generation
+        // is while the allocation epoch is not; the commit is therefore keyed
+        // by the panel id instead of re-checking the allocation epoch.
+        let Some(rec_mut) = self.panels.get_mut(&panel_id.0) else {
+            return Err(PanelError::NotFound {
+                kind: "panel",
+                id_raw: panel_id.0,
+            });
+        };
         rec_mut.state = UiPanelState::Mounted;
         rec_mut.view = Some(view_id);
+        self.view_to_panel.insert(view_id, panel_id);
+        self.panel_to_view.insert(panel_id, view_id);
         Ok(())
     }
 
@@ -1904,6 +2075,14 @@ impl PanelRegistry {
     /// `∅`" is a ceiling of `∅` and must not be confused with "there is no
     /// predecessor" (which grants the successor's whole resolution).
     ///
+    /// When the released generation is the bound controller generation, the
+    /// allocation-epoch row goes with it: writers fence on the epoch rather
+    /// than on the binding, so such a row can exist while a controller holds
+    /// the panel, and once the unbind exposes the epoch again it would key the
+    /// panel's grants and outrank the tombstone in
+    /// [`Self::derive_rebind_grants`]. The epoch row is not copied into the
+    /// tombstone — it never was a controller's grant set.
+    ///
     /// A generation that already reached its edge is not released twice: the
     /// record the first release wrote is left untouched and `false` is
     /// returned. `A.2` has a bind repeat these releases in phase 1 as defence in
@@ -1926,7 +2105,10 @@ impl PanelRegistry {
     /// generation the record currently names when one is bound, otherwise the
     /// allocation epoch. Any other value is refused as `StaleHandle` before a
     /// family is touched, so the release cannot copy or delete a row the
-    /// binding does not own.
+    /// binding does not own. The exception is a generation whose edge already
+    /// ran: it is recognised from the retained tombstone before that check, so
+    /// the repeat is answered `false` instead of being measured against the
+    /// epoch the unbind exposed.
     ///
     /// Returns `true` when a live grant row was removed.
     ///
@@ -1947,15 +2129,47 @@ impl PanelRegistry {
         // is bound, or a generation the panel has already left behind, is
         // refused before any family is touched rather than releasing the wrong
         // row.
-        let released_generation = match self.panels.get(&panel_id.0) {
-            Some(record) => record.grant_key_generation(),
-            None => {
-                return Err(PanelError::NotFound {
-                    kind: "panel",
-                    id_raw: panel_id.0,
-                });
-            }
+        let (released_generation, bound, last_ended, allocation_epoch) =
+            match self.panels.get(&panel_id.0) {
+                Some(record) => (
+                    record.grant_key_generation(),
+                    record.controller_generation(),
+                    record.last_controller_generation,
+                    record.generation,
+                ),
+                None => {
+                    return Err(PanelError::NotFound {
+                        kind: "panel",
+                        id_raw: panel_id.0,
+                    });
+                }
+            };
+        // `A.2`'s phase-1 repeat has to be decided from the *presented*
+        // generation, before the binding-key check: the first release clears the
+        // binding, so the repeat would otherwise be measured against the
+        // allocation epoch the unbind exposed and refused as `StaleHandle`
+        // instead of recognised as an edge that already ran. While a controller
+        // is still bound the key check keeps its place ahead of the tombstone,
+        // so a foreign generation is still refused before any family is
+        // touched.
+        let tombstone_names_generation = self
+            .retained_ceilings
+            .get(&panel_id)
+            .is_some_and(|ceiling| ceiling.ended_generation == generation);
+        let already_ended = if bound.is_some() {
+            released_generation == generation && tombstone_names_generation
+        } else {
+            tombstone_names_generation || last_ended == Some(generation)
         };
+        if already_ended {
+            // `A.2`'s phase-1 repeat: this edge ran, so there is nothing to
+            // retain, nothing to overwrite, and no family to release again.
+            if let Some(record) = self.panels.get_mut(&panel_id.0) {
+                record.last_controller_generation = Some(generation);
+                record.release_controller_binding(generation);
+            }
+            return Ok(self.capabilities.remove(&(panel_id, generation)).is_some());
+        }
         if released_generation != generation {
             self.bump_error("StaleHandle");
             return Err(PanelError::StaleHandle {
@@ -1963,18 +2177,6 @@ impl PanelRegistry {
                 found_generation: generation,
                 id_raw: panel_id.0,
             });
-        }
-        let already_ended = self
-            .retained_ceilings
-            .get(&panel_id)
-            .is_some_and(|ceiling| ceiling.ended_generation == generation);
-        if already_ended {
-            // `A.2`'s phase-1 repeat: this edge ran, so there is nothing to
-            // retain, nothing to overwrite, and no family to release again.
-            if let Some(record) = self.panels.get_mut(&panel_id.0) {
-                record.last_controller_generation = Some(generation);
-            }
-            return Ok(self.capabilities.remove(&(panel_id, generation)).is_some());
         }
         let held = self.capabilities.get(&(panel_id, generation)).cloned();
         let had_row = held.is_some();
@@ -1990,9 +2192,21 @@ impl PanelRegistry {
         }
         if let Some(record) = self.panels.get_mut(&panel_id.0) {
             record.last_controller_generation = Some(generation);
+            record.release_controller_binding(generation);
         }
         let grants = held.map_or(0, |set| set.len());
         self.capabilities.remove(&(panel_id, generation));
+        if bound == Some(generation) {
+            // OQ-084 D.2 phase 2 step 1: the row the allocation epoch keys was
+            // written by a writer that fences on the epoch (`get_panel`), not on
+            // the binding, so it is not the ending controller's grant set. It
+            // must not survive as the panel's binding key once the unbind
+            // exposes the epoch again — `derive_rebind_grants` prefers a live
+            // row over the tombstone, so a leftover epoch row would widen the
+            // successor's ceiling with no consent diff. Sweep it with the
+            // binding it outlived; a panel that never bound keeps its epoch row.
+            self.capabilities.remove(&(panel_id, allocation_epoch));
+        }
         let events = self.event_bus.clear_panel_counted(panel_id);
         let commands = self.command_registry.commands_for(panel_id).len();
         self.command_registry.unregister_panel(panel_id);
@@ -2698,7 +2912,312 @@ mod controller_binding_shape_tests {
         assert_eq!(ceiling.ended_generation, controller);
         assert_eq!(ceiling.grants, set(&["panel.focus"]));
         assert!(!registry.is_panel_capability_granted(handle.id, controller, "panel.focus"));
+        assert!(
+            !registry.is_panel_capability_granted(handle.id, epoch, "panel.create"),
+            "the allocation-epoch row must not become the binding key again"
+        );
+        assert_eq!(
+            registry
+                .derive_rebind_grants(
+                    handle.id,
+                    epoch,
+                    &set(&["panel.create", "panel.focus"]),
+                    &BTreeSet::new(),
+                )
+                .expect("the retained tombstone is the predecessor"),
+            set(&["panel.focus"]),
+            "the successor's ceiling is the controller's tombstone, not the epoch row"
+        );
         assert_eq!(registry.unbind_release_count(handle.id), Some(1));
+    }
+
+    /// OQ-084 A.2: `A.2`'s bind repeats the release in phase 1 as defence in
+    /// depth, so a second release of a generation whose edge already ran is a
+    /// normal call and must answer `false`, not `StaleHandle`. The first release
+    /// clears the binding, which exposes the allocation epoch as the record's
+    /// binding key — the repeat must be recognised from the tombstone before
+    /// that key is compared with the presented generation.
+    #[test]
+    fn a_repeated_release_of_an_ended_controller_generation_is_a_no_op() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect("mount panel");
+        let controller = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", controller);
+        registry
+            .capabilities
+            .insert((handle.id, controller), set(&["panel.focus"]));
+
+        assert!(
+            registry
+                .release_generation_scope(handle.id, controller)
+                .expect("the binding generation is released"),
+            "the first release removed the live row"
+        );
+        let ceiling = registry
+            .retained_grant_ceiling(handle.id)
+            .expect("the controller's ceiling is retained")
+            .grants
+            .clone();
+        assert_eq!(ceiling, set(&["panel.focus"]));
+
+        assert!(
+            !registry
+                .release_generation_scope(handle.id, controller)
+                .expect("the repeat of an ended edge is not a stale handle"),
+            "the second release removed nothing"
+        );
+        assert_eq!(
+            registry.error_count("StaleHandle"),
+            0,
+            "the repeat is a no-op, not a refusal"
+        );
+        assert_eq!(
+            registry.last_controller_generation(handle.id),
+            Some(controller),
+            "the repeat leaves the ended generation on the record"
+        );
+        assert_eq!(
+            registry
+                .retained_grant_ceiling(handle.id)
+                .expect("the tombstone survives the repeat")
+                .grants
+                .clone(),
+            ceiling,
+            "the repeat does not overwrite the retained ceiling"
+        );
+        assert_eq!(
+            registry.unbind_release_count(handle.id),
+            Some(1),
+            "the repeat does not rewrite the release record"
+        );
+    }
+
+    /// bitty#2476 residual 3 (OQ-084 D.2, "Two typed refusals, neither
+    /// borrowed from `StaleHandle`"): a mount that names a generation the
+    /// record's binding does not permit is refused with the typed class, not
+    /// with the generic stale-handle error, and commits nothing.
+    #[test]
+    fn a_mount_from_a_generation_the_record_does_not_bind_is_a_controller_conflict() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        let bound = epoch.next().expect("controller generation");
+        let foreign = bound.next().expect("foreign generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", bound);
+
+        let refusal = registry
+            .mount_panel(handle.id, foreign, ViewId::new(1))
+            .expect_err("a generation the record does not bind cannot mount");
+        assert_eq!(
+            refusal,
+            PanelError::ControllerConflict {
+                panel_id: handle.id,
+                bound_generation: Some(bound),
+                presented_generation: foreign,
+            },
+            "D.2 asks for the typed conflict class here"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "panel {} controller conflict: bound {bound}, presented {foreign}",
+                handle.id
+            )
+        );
+        assert_eq!(registry.error_count("ControllerConflict"), 1);
+        assert_eq!(
+            registry.error_count("StaleHandle"),
+            0,
+            "the refusal is not borrowed from StaleHandle"
+        );
+        // C.5: the mount is transactional, so the refused attempt leaves the
+        // panel in its pre-mount state and binds no view.
+        assert_eq!(
+            registry.panel_state(handle.id, epoch).expect("record"),
+            PanelState::Created
+        );
+        assert_eq!(registry.panel_view(handle.id, epoch).expect("record"), None);
+        assert!(!registry.panel_to_view.contains_key(&handle.id));
+        assert!(registry.view_to_panel.is_empty());
+    }
+
+    /// bitty#2476 residual 3 (OQ-084 D.2 phase 1 step 5, C.5): a verb in flight
+    /// when its own generation was unbound is refused `ControllerReleased`, and
+    /// the record no longer claims the controller the unbind edge released.
+    #[test]
+    fn a_mount_from_a_generation_whose_binding_was_released_is_controller_released() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        let bound = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", bound);
+        registry
+            .release_generation_scope(handle.id, bound)
+            .expect("the binding generation is released");
+        assert_eq!(
+            registry.controller_generation(handle.id),
+            None,
+            "the unbind edge drops the binding, so the record does not claim a released controller"
+        );
+        assert_eq!(
+            registry.last_controller_generation(handle.id),
+            Some(bound),
+            "the ended generation is what survives the edge"
+        );
+
+        let refusal = registry
+            .mount_panel(handle.id, bound, ViewId::new(1))
+            .expect_err("the released generation cannot mount");
+        assert_eq!(
+            refusal,
+            PanelError::ControllerReleased {
+                panel_id: handle.id,
+                released_generation: bound,
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            format!(
+                "panel {} controller released: generation {bound} is unbound",
+                handle.id
+            )
+        );
+        assert_eq!(registry.error_count("ControllerReleased"), 1);
+        assert_eq!(
+            registry.error_count("ControllerConflict"),
+            0,
+            "an ended generation is released, not a conflict"
+        );
+        assert_eq!(registry.error_count("StaleHandle"), 0);
+        assert_eq!(
+            registry.panel_state(handle.id, epoch).expect("record"),
+            PanelState::Created
+        );
+        assert!(registry.view_to_panel.is_empty());
+    }
+
+    /// The allocation epoch names the container and never moves (B.1/B.2), so an
+    /// epoch that once ended is not a *released controller generation*: a verb
+    /// presenting it against a foreign binding is a conflict, not a release.
+    /// Without the epoch guard in the fence, the `ControllerReleased` arm would
+    /// claim it, because the record's retained ended generation *is* the epoch.
+    #[test]
+    fn the_allocation_epoch_is_never_refused_as_a_released_controller() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        registry
+            .release_generation_scope(handle.id, epoch)
+            .expect("the epoch's own edge release");
+        let bound = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", bound);
+
+        let refusal = registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect_err("the epoch is not the bound generation");
+        assert_eq!(
+            refusal,
+            PanelError::ControllerConflict {
+                panel_id: handle.id,
+                bound_generation: Some(bound),
+                presented_generation: epoch,
+            },
+            "the epoch is a container identity, never a released controller"
+        );
+        assert_eq!(registry.error_count("ControllerReleased"), 0);
+    }
+
+    /// The accepted side of the fence: while nothing binds, the allocation
+    /// epoch mounts exactly as before, including after an edge release of that
+    /// epoch — which retains `last_controller_generation` on every live path and
+    /// must not turn into a release refusal (fail-open by construction,
+    /// bitty#2476 residual 3).
+    #[test]
+    fn an_unbound_panel_mounts_through_its_allocation_epoch_exactly_as_before() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(1))
+            .expect("an unbound panel mounts through its allocation epoch");
+        assert_eq!(
+            registry.panel_view(handle.id, epoch).expect("record"),
+            Some(ViewId::new(1))
+        );
+        registry
+            .unmount_panel(handle.id, epoch)
+            .expect("unmount, back to Suspended");
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(2))
+            .expect("a remount through the same epoch");
+        registry
+            .unmount_panel(handle.id, epoch)
+            .expect("unmount before the edge release");
+
+        registry
+            .release_generation_scope(handle.id, epoch)
+            .expect("the epoch's own edge release");
+        assert_eq!(
+            registry.last_controller_generation(handle.id),
+            Some(epoch),
+            "the live edge retains the epoch as the ended generation"
+        );
+
+        registry
+            .mount_panel(handle.id, epoch, ViewId::new(3))
+            .expect("the epoch is still the accepted key after its own release");
+        assert_eq!(
+            registry.panel_view(handle.id, epoch).expect("record"),
+            Some(ViewId::new(3))
+        );
+        assert_eq!(
+            registry.error_count("ControllerReleased") + registry.error_count("ControllerConflict"),
+            0,
+            "no live path is refused by a binding class"
+        );
+    }
+
+    /// The bound controller generation is the key the fence accepts, and the
+    /// allocation epoch stops being one once a controller is bound (A.3) —
+    /// the same rule `resolved_grant_generation` already applies to grants.
+    #[test]
+    fn a_bound_controller_generation_mounts_and_the_allocation_epoch_no_longer_does() {
+        let (mut registry, handle) = a_panel();
+        let epoch = handle.generation;
+        let bound = epoch.next().expect("controller generation");
+        registry.bind_controller_generation_for_test(handle.id, "acme.notes", bound);
+
+        registry
+            .mount_panel(handle.id, bound, ViewId::new(1))
+            .expect("the bound generation issues the mount");
+        assert_eq!(
+            registry.panel_view(handle.id, epoch).expect("record"),
+            Some(ViewId::new(1)),
+            "the mount is recorded on the container's own record"
+        );
+        assert_eq!(
+            registry.panel_to_view.get(&handle.id),
+            Some(&ViewId::new(1))
+        );
+        assert_eq!(
+            registry.view_to_panel.get(&ViewId::new(1)),
+            Some(&handle.id)
+        );
+
+        registry
+            .unmount_panel(handle.id, epoch)
+            .expect("unmount through the epoch");
+        let refusal = registry
+            .mount_panel(handle.id, epoch, ViewId::new(2))
+            .expect_err("the allocation epoch is stale once a controller is bound");
+        assert_eq!(
+            refusal,
+            PanelError::ControllerConflict {
+                panel_id: handle.id,
+                bound_generation: Some(bound),
+                presented_generation: epoch,
+            }
+        );
+        assert_eq!(registry.error_count("ControllerConflict"), 1);
     }
 
     #[test]

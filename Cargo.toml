@@ -122,6 +122,8 @@ bitty-plugin-host = { path = "crates/bitty-plugin-host" }
 # `--config 'profile.release.strip="symbols"'` and accept unnamed frames.
 [profile.release]
 strip = "debuginfo"
+lto = "thin"
+codegen-units = 1
 
 [workspace.lints.rust]
 unsafe_code = "deny"

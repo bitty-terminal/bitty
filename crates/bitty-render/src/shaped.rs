@@ -144,11 +144,14 @@ pub const PROGRAMMING_LIGATURE_TAGS: [[u8; 4]; 4] = [*b"calt", *b"liga", *b"clig
 /// and the default `10x22` cell were accepted against.
 const PT_TO_PX: f32 = 96.0 / 72.0;
 
-/// Owned font bytes for one loaded face.
-#[derive(Debug, Clone)]
+type SharedFontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// Owned or static font bytes for one loaded face.
+#[derive(Clone)]
 struct StoredFace {
-    /// Face bytes (one copy per face load; shared across calls by `Arc`).
-    data: Arc<Vec<u8>>,
+    /// Face bytes (zero-copy for static/binary faces; one shared allocation per
+    /// file face).
+    data: SharedFontBytes,
     /// Face index inside the collection (`fontdb` source index).
     face_index: u32,
     /// `fontdb`'s monospace flag for the face.
@@ -159,6 +162,16 @@ struct StoredFace {
     /// lattice, while a terminal face's is. Set at load time from the
     /// discovery metadata (no per-frame parsing).
     monospaced: bool,
+}
+
+impl std::fmt::Debug for StoredFace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredFace")
+            .field("byte_len", &self.data.as_ref().as_ref().len())
+            .field("face_index", &self.face_index)
+            .field("monospaced", &self.monospaced)
+            .finish()
+    }
 }
 
 /// Kind of font data a drawable glyph comes from (owned vocabulary).
@@ -565,7 +578,7 @@ impl SwashSingle {
     /// session or process, and otherwise stream through `take(bound + 1)` with
     /// a metadata-sized buffer so `read_to_end` does not churn intermediate
     /// heap reallocations.
-    fn load_bytes(&mut self, id: fontdb::ID) -> Result<(Arc<Vec<u8>>, u32), RenderError> {
+    fn load_bytes(&mut self, id: fontdb::ID) -> Result<(SharedFontBytes, u32), RenderError> {
         let (source, index) = self
             .db
             .face_source(id)
@@ -578,7 +591,7 @@ impl SwashSingle {
                         reason: "font face exceeds the per-face byte bound",
                     });
                 }
-                Ok((Arc::new(bytes.to_vec()), index))
+                Ok((Arc::clone(&arc), index))
             }
             Source::File(path) => {
                 if let Some(existing) = self.cached_file_bytes(&path) {
@@ -609,7 +622,7 @@ impl SwashSingle {
 
     /// Parses a stored face into a borrowed `swash` font reference.
     fn font_ref(face: &StoredFace) -> Result<swash::FontRef<'_>, RenderError> {
-        Self::font_ref_from_bytes(&face.data, face.face_index)
+        Self::font_ref_from_bytes(face.data.as_ref().as_ref(), face.face_index)
     }
 
     /// Renders one glyph to an owned bitmap at `px` pixels.
@@ -1039,7 +1052,7 @@ impl SwashSingle {
             let Some((source, face_index)) = self.db.face_source(id) else {
                 continue;
             };
-            let data: Arc<Vec<u8>> = match source {
+            let data: SharedFontBytes = match source {
                 Source::Binary(arc) => {
                     let bytes: &[u8] = arc.as_ref().as_ref();
                     if bytes.len() > MAX_FACE_BYTES {
@@ -1056,7 +1069,7 @@ impl SwashSingle {
                     if Self::probe_source(&mut scaler, glyph_id, emoji).is_none() {
                         continue;
                     }
-                    Arc::new(bytes.to_vec())
+                    Arc::clone(&arc)
                 }
                 Source::File(path) => {
                     if let Some(existing) = self.cached_file_bytes(&path) {
@@ -1072,7 +1085,8 @@ impl SwashSingle {
                         if Self::probe_source(&mut scaler, glyph_id, emoji).is_none() {
                             continue;
                         }
-                        existing
+                        let shared: SharedFontBytes = existing;
+                        shared
                     } else {
                         if probe_path.as_deref() != Some(path.as_path()) {
                             if Self::read_file_bytes_into(&path, &mut probe_buf).is_err() {
@@ -1097,7 +1111,8 @@ impl SwashSingle {
                         let arc = Arc::new(std::mem::take(&mut probe_buf));
                         probe_path = None;
                         self.remember_file_bytes(path, &arc);
-                        arc
+                        let shared: SharedFontBytes = arc;
+                        shared
                     }
                 }
             };

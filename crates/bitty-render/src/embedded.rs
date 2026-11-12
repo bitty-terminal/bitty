@@ -47,7 +47,7 @@ pub use bitty_config::types::EMBEDDED_SYMBOLS_FAMILY;
 ///
 /// Kept as a `&'static [u8]` slice: `fontdb` clones it once into the shared
 /// database as a `Source::Binary` face, and coverage probes borrow it.
-pub const EMBEDDED_SYMBOLS_BYTES: &[u8] = include_bytes!("../assets/bitty-symbols-nerd.ttf");
+pub static EMBEDDED_SYMBOLS_BYTES: &[u8] = include_bytes!("../assets/bitty-symbols-nerd.ttf");
 
 /// First private-use scalar covered by the embedded face.
 pub const PUA_FIRST: char = '\u{E000}';
@@ -89,7 +89,9 @@ pub const HAN_TEST_BYTES: &[u8] = include_bytes!("../assets/bitty-han-test.ttf")
 /// without a path. Idempotent for a given database: a second call appends a
 /// duplicate face, so callers register exactly once at database construction.
 pub(crate) fn register_face(db: &mut Database) {
-    db.load_font_data(EMBEDDED_SYMBOLS_BYTES.to_vec());
+    db.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(
+        EMBEDDED_SYMBOLS_BYTES,
+    )));
 }
 
 /// True when the embedded face maps `c` to a glyph.
@@ -217,9 +219,17 @@ mod tests {
                 .any(|(name, _)| name == EMBEDDED_SYMBOLS_FAMILY),
             "registered family name must match the chain constant"
         );
-        assert!(
-            matches!(db.face_source(id), Some((fontdb::Source::Binary(_), _))),
-            "embedded face must be a binary source"
-        );
+        match db.face_source(id) {
+            Some((fontdb::Source::Binary(arc), _)) => {
+                assert!(
+                    std::ptr::eq(
+                        arc.as_ref().as_ref().as_ptr(),
+                        EMBEDDED_SYMBOLS_BYTES.as_ptr(),
+                    ),
+                    "embedded binary source must reference the static .rodata slice without a heap copy"
+                );
+            }
+            other => panic!("embedded face must be a binary source, got {other:?}"),
+        }
     }
 }

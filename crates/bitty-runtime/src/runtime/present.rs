@@ -3956,7 +3956,7 @@ impl Runtime {
         // seam, so the `origins_changed` comparison below observes it and
         // the frame presents damage-driven (no forced full redraw).
         self.advance_kitty_animations_at(now, &allocations, &current_alt_screens);
-        let snapshot = self.state.snapshot();
+        let primary_generation = self.state.generation();
         let last = self.last_presented_generation;
         // CTX-0176/CTX-0289: the primary state and every pane session own
         // independent grid generation counters, so a single scalar `max`
@@ -3967,8 +3967,8 @@ impl Runtime {
         // session itself, so an added session starts at the `u64::MAX`
         // sentinel and always reads as changed even before `mark_frame_`
         // `presented` consumes it).
-        let mut current_gen = snapshot.generation;
-        let mut origins_changed = snapshot.generation != last;
+        let mut current_gen = primary_generation;
+        let mut origins_changed = primary_generation != last;
         for sess in self.pane_sessions.values() {
             let pane_gen = sess.state.generation();
             current_gen = current_gen.max(pane_gen);
@@ -4066,12 +4066,14 @@ impl Runtime {
 
         // Empty layout -> idle (no leaf to present).
         if allocations.is_empty() {
-            self.mark_frame_presented(snapshot.generation);
+            self.mark_frame_presented(primary_generation);
             self.publish_presented_allocations(allocations, focused);
             self.pending_full_redraw = false;
             self.pending_paint_redraw = false;
             return None;
         }
+
+        let snapshot = self.state.snapshot();
 
         // CTX-0386: genuine full invalidation only. `pending_full` already
         // funnels every window resize, DPI/font change, layout or focus edit,
@@ -4209,15 +4211,18 @@ impl Runtime {
         view: Option<&View>,
         primary_snapshot: &Snapshot,
     ) -> bool {
-        let base_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
-            Some(sess) => Some(sess.state.snapshot()),
-            None if Some(view_id) == self.primary_view => Some(primary_snapshot.clone()),
-            None => None,
-        };
+        let base_snap: Option<std::borrow::Cow<'_, Snapshot>> =
+            match self.pane_sessions.get(&view_id) {
+                Some(sess) => Some(std::borrow::Cow::Owned(sess.state.snapshot())),
+                None if Some(view_id) == self.primary_view => {
+                    Some(std::borrow::Cow::Borrowed(primary_snapshot))
+                }
+                None => None,
+            };
         let Some(base_snap) = base_snap else {
             return false;
         };
-        let view_snapshot = match view {
+        let view_snapshot: std::borrow::Cow<'_, Snapshot> = match view {
             Some(v) => {
                 let on_alt = match self.pane_sessions.get(&view_id) {
                     Some(sess) => sess.state.alt_screen_active(),
@@ -4228,21 +4233,30 @@ impl Runtime {
                         Some(sess) => v.visible_cells(&sess.state),
                         None => v.visible_cells(&self.state),
                     };
-                    Snapshot {
+                    std::borrow::Cow::Owned(Snapshot {
                         version: base_snap.version,
                         generation: base_snap.generation,
                         width: v.cols() as usize,
                         height: v.rows() as usize,
                         cells,
-                        cursor: base_snap.cursor,
-                        modes: base_snap.modes,
-                        title: base_snap.title,
-                    }
+                        cursor: base_snap.cursor.clone(),
+                        modes: base_snap.modes.clone(),
+                        title: base_snap.title.clone(),
+                    })
+                } else if base_snap.width == frame.cols as usize
+                    && base_snap.height == frame.rows as usize
+                {
+                    base_snap
                 } else {
-                    viewport_snapshot(&base_snap, frame.cols, frame.rows)
+                    std::borrow::Cow::Owned(viewport_snapshot(&base_snap, frame.cols, frame.rows))
                 }
             }
-            None => viewport_snapshot(&base_snap, frame.cols, frame.rows),
+            None if base_snap.width == frame.cols as usize
+                && base_snap.height == frame.rows as usize =>
+            {
+                base_snap
+            }
+            None => std::borrow::Cow::Owned(viewport_snapshot(&base_snap, frame.cols, frame.rows)),
         };
         snapshot_has_visible_text(&view_snapshot)
     }
@@ -4790,11 +4804,14 @@ impl Runtime {
                 // decides: every other session-less leaf (spawn failures,
                 // recipe-less leaves) presents erased, so a session-less View
                 // never paints another View's grid.
-                let pane_snap: Option<Snapshot> = match self.pane_sessions.get(&view_id) {
-                    Some(sess) => Some(sess.state.snapshot()),
-                    None if Some(view_id) == self.primary_view => Some(snapshot.clone()),
-                    None => None,
-                };
+                let pane_snap: Option<std::borrow::Cow<'_, Snapshot>> =
+                    match self.pane_sessions.get(&view_id) {
+                        Some(sess) => Some(std::borrow::Cow::Owned(sess.state.snapshot())),
+                        None if Some(view_id) == self.primary_view => {
+                            Some(std::borrow::Cow::Borrowed(snapshot))
+                        }
+                        None => None,
+                    };
                 // Erased source for session-less leaves that do not own the
                 // primary; `viewport_snapshot` pads it to the allocation below.
                 let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
@@ -4803,7 +4820,7 @@ impl Runtime {
                     None
                 };
                 let base_snap: &Snapshot = pane_snap
-                    .as_ref()
+                    .as_deref()
                     .or(erased_snap.as_ref())
                     .unwrap_or(snapshot);
                 // Determine viewport snapshot: when view scroll_offset !=0,

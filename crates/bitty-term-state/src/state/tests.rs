@@ -3131,3 +3131,26 @@ fn truncated_control_string_prefix_still_applies_and_is_counted() {
     assert_eq!(s.cursor().position, cursor_before);
     assert!(s.check_invariants().is_ok());
 }
+
+#[test]
+fn snapshot_into_reuses_buffer_at_equal_dims_and_reallocates_on_resize() {
+    let mut s = State::new();
+    prints(&mut s, "hello");
+    let mut snap = s.snapshot();
+    let ptr_before = snap.cells.as_ptr();
+
+    prints(&mut s, " world");
+    s.snapshot_into(&mut snap);
+    assert_eq!(
+        snap.cells.as_ptr(),
+        ptr_before,
+        "snapshot_into must reuse the existing Box<[Cell]> allocation when dimensions are unchanged"
+    );
+    assert_eq!(snap, s.snapshot());
+
+    s.resize(40, 12);
+    s.snapshot_into(&mut snap);
+    assert_eq!(snap.width, 40);
+    assert_eq!(snap.height, 12);
+    assert_eq!(snap, s.snapshot());
+}

@@ -311,6 +311,20 @@ hidden_damage={}",
     }
 }
 
+#[derive(Default)]
+struct GaugeWaker(std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+impl std::fmt::Debug for GaugeWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        f.debug_tuple("GaugeWaker").field(&armed).finish()
+    }
+}
+
 /// Atomic gauges shared by the runtime owner thread and the watchdog monitor.
 ///
 /// `Relaxed` ordering is deliberate for the display gauges: each field is an
@@ -352,6 +366,7 @@ pub struct HangGauges {
     pending_exits: AtomicU64,
     pending_replies: AtomicU64,
     hidden_damage: AtomicU64,
+    waker: GaugeWaker,
 }
 
 impl Default for HangGauges {
@@ -384,6 +399,7 @@ impl Default for HangGauges {
             pending_exits: AtomicU64::new(0),
             pending_replies: AtomicU64::new(0),
             hidden_damage: AtomicU64::new(0),
+            waker: GaugeWaker::default(),
         }
     }
 }
@@ -393,6 +409,29 @@ impl HangGauges {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs or clears the wake callback invoked when a tick completes or
+    /// pending work is armed while the watchdog monitor is parked at 0 Hz.
+    pub fn set_waker(&self, waker: Option<Arc<dyn Fn() + Send + Sync>>) {
+        let mut slot = self
+            .waker
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = waker;
+    }
+
+    fn notify_waker(&self) {
+        let waker = self
+            .waker
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = waker {
+            wake();
+        }
     }
 
     /// Copies every display gauge for one bounded report.
@@ -466,6 +505,7 @@ impl HangGauges {
         self.last_tick_ns.store(elapsed_ns, Ordering::Relaxed);
         self.max_tick_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
         self.tick_count.store(seq, Ordering::Release);
+        self.notify_waker();
     }
 
     /// Drains completed ticks with a sequence greater than `last_seen`.
@@ -537,12 +577,18 @@ impl HangGauges {
         self.pending_input_bytes
             .store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.pending_input_dropped.store(dropped, Ordering::Relaxed);
+        if bytes > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_cold_queue(&self, len: usize, dropped: u64) {
         self.cold_queue_len
             .store(u64::try_from(len).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.cold_queue_dropped.store(dropped, Ordering::Relaxed);
+        if len > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_plugin_pipeline(&self, events: usize, bytes: usize) {
@@ -550,17 +596,26 @@ impl HangGauges {
             .store(u64::try_from(events).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.plugin_events_bytes
             .store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if events > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_plugin_side(&self, queued: usize, dropped: u64) {
         self.plugin_side_queued
             .store(u64::try_from(queued).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.plugin_side_dropped.store(dropped, Ordering::Relaxed);
+        if queued > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_plugin_parked(&self, parked: usize) {
         self.plugin_parked_commands
             .store(u64::try_from(parked).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if parked > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_plugin_workers(&self, workers: usize) {
@@ -575,6 +630,9 @@ impl HangGauges {
             .store(u64::try_from(queued).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.component_events_dropped
             .store(dropped, Ordering::Relaxed);
+        if queued > 0 {
+            self.notify_waker();
+        }
     }
 
     pub(crate) fn set_layout(&self, panes: usize, leaves: usize, content_bytes: u64) {
@@ -601,6 +659,9 @@ impl HangGauges {
             .store(u64::try_from(queued).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.input_commands_dropped
             .store(dropped, Ordering::Relaxed);
+        if queued > 0 {
+            self.notify_waker();
+        }
     }
 
     /// Publishes the app-owned pending-exit edge count.
@@ -609,6 +670,9 @@ impl HangGauges {
             u64::try_from(pending).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        if pending > 0 {
+            self.notify_waker();
+        }
     }
 
     /// Publishes the bytes of PTY replies queued and not yet answered.
@@ -618,6 +682,9 @@ impl HangGauges {
     pub fn set_pending_replies(&self, bytes: usize) {
         self.pending_replies
             .store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+        if bytes > 0 {
+            self.notify_waker();
+        }
     }
 
     /// Publishes whether a hidden surface retains work (bitty#2830).
@@ -627,6 +694,9 @@ impl HangGauges {
     pub fn set_hidden_damage(&self, retained: bool) {
         self.hidden_damage
             .store(u64::from(retained), Ordering::Relaxed);
+        if retained {
+            self.notify_waker();
+        }
     }
 }
 

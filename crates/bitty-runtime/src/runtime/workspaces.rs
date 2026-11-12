@@ -2226,8 +2226,8 @@ impl Runtime {
     ///
     /// Diagnostics only: the report is the FS-4-style evidence for the close —
     /// the disposal order, the per-panel outcomes, one
-    /// [`PanelDisposalRecord`] per disposed panel, and any panel the sweep
-    /// refused or never attempted.
+    /// [`crate::registry::PanelDisposalRecord`] per disposed panel, and any
+    /// panel the sweep refused or never attempted.
     #[must_use]
     pub fn last_workspace_panel_disposal(&self) -> Option<&WorkspaceDisposeReport> {
         self.last_workspace_panel_disposal.as_ref()

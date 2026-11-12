@@ -793,12 +793,12 @@ impl fmt::Display for PlaceholderAction {
 
 /// The Core-owned, fixed placeholder surface (Decision E rule 5).
 ///
-/// Its whole visible payload is the constant table in
-/// [`PlaceholderReason::heading`] / [`PlaceholderReason::detail`] plus the
-/// [`PlaceholderAction`] labels. There is deliberately no constructor that
-/// accepts text, a style, a node tree, or a replacement scene: a plugin cannot
-/// style this surface, cannot place text on it, and cannot substitute one of
-/// its own. The shape is fixed at [`PLACEHOLDER_SCENE_NODES`] nodes and
+/// Its whole visible payload is [`PLACEHOLDER_HEADING`], the constant table in
+/// [`PlaceholderReason::detail`], and the [`PlaceholderAction`] labels. There is
+/// deliberately no constructor that accepts text, a style, a node tree, or a
+/// replacement scene: a plugin cannot style this surface, cannot place text on
+/// it, and cannot substitute one of its own. The shape is fixed at
+/// [`PLACEHOLDER_SCENE_NODES`] nodes and
 /// [`PLACEHOLDER_SCENE_DEPTH`] levels, far inside `SCN-1..SCN-5`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlaceholderScene {

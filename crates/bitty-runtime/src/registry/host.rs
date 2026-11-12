@@ -768,6 +768,62 @@ impl PanelRuntime {
         self.registry.panel_state(id, generation)
     }
 
+    /// Creates an overlay attributed to `(id, generation)` (OQ-084 A.2/D.4).
+    ///
+    /// The facade delegates to
+    /// [`PanelRegistry::create_panel_overlay`](super::panel::PanelRegistry::create_panel_overlay),
+    /// which validates the handle before allocating, so a stale or unknown
+    /// generation cannot claim a surface. The attribution is the row
+    /// `release_generation_scope` dismisses when that generation is released.
+    /// Callers that hold no panel identity use
+    /// [`PanelRegistry::create_overlay`](super::panel::PanelRegistry::create_overlay)
+    /// directly; those surfaces carry no attribution and no release edge
+    /// touches them.
+    ///
+    /// # Errors
+    ///
+    /// The `create_overlay` errors plus [`PanelError::StaleHandle`] and
+    /// [`PanelError::NotFound`].
+    pub fn create_panel_overlay(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+        kind: super::UiOverlayKind,
+        bounds: super::UiRect,
+        text: impl Into<String>,
+        tooltip: Option<String>,
+    ) -> Result<u64, PanelError> {
+        self.registry
+            .create_panel_overlay(id, generation, kind, bounds, text, tooltip)
+    }
+
+    /// Dismisses one overlay and drops its attribution, if any.
+    ///
+    /// Returns the dismissed surface, or `None` for an unknown or already
+    /// dismissed id: a repeated dismissal is a no-op, never an error, so a
+    /// teardown path can never wedge.
+    pub fn dismiss_overlay(&mut self, id: u64) -> Option<super::panel::Overlay> {
+        self.registry.dismiss_overlay(id)
+    }
+
+    /// The `(PanelId, generation)` attribution of a live overlay, if any.
+    #[must_use]
+    pub fn overlay_attribution_of(&self, id: u64) -> Option<(super::panel::PanelId, Generation)> {
+        self.registry.overlay_attribution_of(id)
+    }
+
+    /// Number of live overlays carrying panel attribution (diagnostics).
+    #[must_use]
+    pub fn attributed_overlay_count(&self) -> usize {
+        self.registry.attributed_overlay_count()
+    }
+
+    /// Number of live overlays in the window, attributed or not (diagnostics).
+    #[must_use]
+    pub fn overlay_count(&self) -> usize {
+        self.registry.overlay_len()
+    }
+
     /// Declares a bus topic through the accepted topic grammar.
     ///
     /// # Errors

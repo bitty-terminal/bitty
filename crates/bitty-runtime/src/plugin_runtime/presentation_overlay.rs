@@ -35,8 +35,17 @@
 //!   exists per view per generation.
 //! - **Teardown is Core-owned.** Suspend, unload, disable, crash, rollback,
 //!   and generation change drop the session, so no stale surface survives.
+//! - **Panel attribution (bitty#2476 residual 8).** When the app installs the
+//!   Core scene host, the presented surface is also attributed to the
+//!   presenting generation's own panel through
+//!   `PanelRegistry::create_panel_overlay`, so the generation release that
+//!   retires that panel dismisses the surface through
+//!   `release_attributed_overlays` instead of leaving an attributed overlay
+//!   nobody releases. A generation that owns no panel presents unattributed,
+//!   and the refusal is counted.
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use bitty_lua::{BridgeError, E_UI_UNAVAILABLE};
 use bitty_ui::panel::{MAX_OVERLAYS_PER_WINDOW, OverlayKind, OverlayManager};
@@ -54,6 +63,69 @@ pub const ESCAPE_DISMISS_REASON: &str = "escape";
 /// Core-reported reason for a presentation overlay dropped because the view it
 /// was bound to closed (issue #2849).
 pub const VIEW_CLOSED_DISMISS_REASON: &str = "view-closed";
+
+/// Admission backend that attributes a presentation surface to a panel.
+///
+/// The app installs the panel host at the existing composition seam, so the
+/// plugin runtime never owns panel identity and gains no new call direction:
+/// `PluginRuntime::set_ui_scene_backend` hands the session the Core-owned
+/// scene host, which resolves the presenting generation's own panel and
+/// admits the attributed row through `PanelRegistry::create_panel_overlay`
+/// (bitty#2476 residual 8). Without a host the session keeps its unattributed
+/// admission: the surface still presents, it just carries no panel owner for a
+/// generation release to dismiss.
+///
+/// Both operations are host-only. `admit` mints one attributed surface for
+/// `owner`; `release` dismisses it by registry id and is idempotent, because a
+/// generation release may already have dismissed the row through
+/// `release_generation_scope` before the session is revoked.
+pub trait PresentationOverlayAttribution: std::fmt::Debug {
+    /// Attributes one surface to `owner`'s generation-owned panel.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError`] when the host owns no panel for `owner` or the accepted
+    /// overlay budget refuses the admission. A refusal allocates nothing.
+    fn admit(&self, owner: &str) -> Result<u64, BridgeError>;
+
+    /// Dismisses one attributed surface by registry overlay id.
+    ///
+    /// Returns whether a surface was dismissed; an unknown or already
+    /// dismissed id reports `false` and changes nothing.
+    fn release(&self, id: u64) -> bool;
+}
+
+/// The scene host as the presentation surface's attribution sink.
+///
+/// Lives here rather than in `scene_host` so the dependency stays one-way
+/// (`plugin_runtime` → `scene_host`): the Core scene host knows panels but
+/// nothing about presentation sessions.
+#[derive(Debug)]
+struct SceneHostAttribution {
+    host: Rc<crate::scene_host::SceneHost>,
+}
+
+impl PresentationOverlayAttribution for SceneHostAttribution {
+    fn admit(&self, owner: &str) -> Result<u64, BridgeError> {
+        self.host.admit_attributed_overlay(owner)
+    }
+
+    fn release(&self, id: u64) -> bool {
+        self.host.dismiss_attributed_overlay(id)
+    }
+}
+
+/// Wraps the Core scene host as this session's attribution sink.
+///
+/// The composition root installs it from the same call that installs the
+/// scene host itself (`PluginRuntime::set_ui_scene_backend`), so the panel
+/// identity the surface is attributed to is the app-owned host's, never a
+/// second binding minted by the plugin runtime.
+pub(crate) fn scene_host_attribution(
+    host: Rc<crate::scene_host::SceneHost>,
+) -> Rc<dyn PresentationOverlayAttribution> {
+    Rc::new(SceneHostAttribution { host })
+}
 
 /// Maximum pending `overlay.dismissed` observations buffered between ticks.
 ///
@@ -104,6 +176,19 @@ pub struct PresentationOverlay {
     admissions: OverlayManager,
     /// Id of the admitted entry while `session` is live.
     admission_id: Option<u64>,
+    /// Registry overlay id of the panel-attributed row for the live surface
+    /// (bitty#2476 residual 8). `Some` only when an attribution sink is
+    /// installed and the presenting generation owns a panel.
+    attributed: Option<u64>,
+    /// App-owned sink that attributes the surface to a panel, installed by the
+    /// composition root through [`Self::set_attribution`].
+    attribution: Option<Rc<dyn PresentationOverlayAttribution>>,
+    /// Attributed admissions the host refused since creation (diagnostics).
+    ///
+    /// A refusal allocates nothing: the surface still presents through the
+    /// local admission, it just carries no panel owner for a generation
+    /// release to dismiss.
+    attribution_refused: u64,
     /// Monotonic admission generation (diagnostics; never a capability).
     next_generation: u64,
     /// Pending `overlay.dismissed` observations for the application tick.
@@ -126,10 +211,44 @@ impl PresentationOverlay {
             session: None,
             admissions: OverlayManager::new(),
             admission_id: None,
+            attributed: None,
+            attribution: None,
+            attribution_refused: 0,
             next_generation: 0,
             pending_dismissed: VecDeque::new(),
             dismissed_dropped: 0,
         }
+    }
+
+    /// Installs (or clears) the sink that attributes the surface to a panel.
+    ///
+    /// Called by the composition root before activation, from the same place
+    /// the Core scene host is installed: the panel host is app-owned, so the
+    /// attribution edge is the app's to wire and the plugin runtime only holds
+    /// the sink. Swapping the sink while a surface is live settles the old row
+    /// through the old sink first, so no attribution can outlive its owner.
+    pub fn set_attribution(&mut self, attribution: Option<Rc<dyn PresentationOverlayAttribution>>) {
+        if let Some(id) = self.attributed.take() {
+            if let Some(previous) = self.attribution.as_ref() {
+                let _ = previous.release(id);
+            }
+        }
+        self.attribution = attribution;
+    }
+
+    /// Registry overlay id of the live surface's attributed row, if any.
+    ///
+    /// Diagnostics and tests read it to prove the generation release reaches
+    /// exactly this surface.
+    #[must_use]
+    pub fn attributed_overlay(&self) -> Option<u64> {
+        self.attributed
+    }
+
+    /// Number of attributed admissions the host refused since creation.
+    #[must_use]
+    pub fn attribution_refusals(&self) -> u64 {
+        self.attribution_refused
     }
 
     /// Admit or replace the presentation surface for (`plugin_id`, `handle`).
@@ -179,6 +298,22 @@ impl PresentationOverlay {
             // no view, so a host without a layout can still present.
             view: None,
         });
+        // bitty#2476 residual 8: attribute the surface to the presenting
+        // generation's own panel, so a generation release dismisses it through
+        // `release_generation_scope`. A host that owns no panel for this
+        // generation (it mounted no terminal-slot scene) refuses, and the
+        // surface still presents unattributed -- counted, never silent.
+        let (attributed, refused) = match self.attribution.clone() {
+            None => (None, false),
+            Some(sink) => match sink.admit(plugin_id) {
+                Ok(id) => (Some(id), false),
+                Err(_) => (None, true),
+            },
+        };
+        if refused {
+            self.attribution_refused = self.attribution_refused.saturating_add(1);
+        }
+        self.attributed = attributed;
         Ok(true)
     }
 
@@ -365,6 +500,15 @@ impl PresentationOverlay {
     fn clear(&mut self) {
         if let Some(id) = self.admission_id.take() {
             let _ = self.admissions.dismiss(id);
+        }
+        // The attributed row leaves with the surface, so a hide, an `Esc`
+        // dismissal, or a view close cannot leave attributed overlays behind
+        // for a later generation release to find. A no-op when the generation
+        // release already dismissed it through `release_attributed_overlays`.
+        if let Some(id) = self.attributed.take() {
+            if let Some(sink) = self.attribution.as_ref() {
+                let _ = sink.release(id);
+            }
         }
         self.session = None;
     }

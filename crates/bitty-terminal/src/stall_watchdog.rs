@@ -1705,9 +1705,13 @@ fn monitor_loop(
     let mut idle_park = false;
     loop {
         if idle_park {
+            #[cfg(test)]
+            shared.idle_parked.store(true, Ordering::Release);
             if stop.wait_idle() {
                 return;
             }
+            #[cfg(test)]
+            shared.idle_parked.store(false, Ordering::Release);
             #[cfg(unix)]
             let urgent_signal = signal_flag.load(Ordering::SeqCst);
             #[cfg(not(unix))]
@@ -1912,8 +1916,6 @@ fn monitor_loop(
             && state.tick_gap.is_none()
             && !state.reported
             && shared.gauges.snapshot().tick_count == state.last_tick_seq;
-        #[cfg(test)]
-        shared.idle_parked.store(idle_park, Ordering::Release);
     }
 }
 
@@ -4825,9 +4827,14 @@ mod tests {
             }),
         );
         watchdog.idle();
-        // Let the monitor settle on the empty ring so the whole burst is one
-        // observed overflow.
-        std::thread::sleep(Duration::from_millis(150));
+        // Let the monitor settle into `wait_idle` on the empty ring so the
+        // whole burst is one observed overflow without racing startup poll.
+        let settle_deadline = Instant::now() + Duration::from_secs(2);
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         for _ in 0..(TICK_RING_CAPACITY + 4) {
             gauges.record_tick_for_test(Duration::from_millis(1));
         }
@@ -4863,9 +4870,14 @@ mod tests {
             }),
         );
         watchdog.idle();
-        // Let the monitor capture its initial tick sequence before the seeded
-        // tick so the drain sees it (a startup watermark of 1 would ignore it).
-        std::thread::sleep(Duration::from_millis(150));
+        // Let the monitor capture its initial tick sequence and park in
+        // `wait_idle` before the seeded tick so the drain sees it.
+        let settle_deadline = Instant::now() + Duration::from_secs(2);
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire)
+            && Instant::now() < settle_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let measured = Duration::from_millis(4_500);
         gauges.record_tick_for_test(measured);
         let line = rx

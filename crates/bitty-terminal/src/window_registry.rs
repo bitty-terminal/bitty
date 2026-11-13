@@ -30,9 +30,9 @@
 //!
 //! # Focus and close (bitty#1765, slice 3)
 //!
-//! Attribution and focus are deliberately two states, not one. [`Self::active`]
+//! Attribution and focus are deliberately two states, not one. [`WindowRegistry::active`]
 //! is *event* attribution — the window the last handled event named — while
-//! [`Self::focused`] is the window the compositor reports as focused, moved
+//! [`WindowRegistry::focused`] is the window the compositor reports as focused, moved
 //! only by `Focused(true)`/`Focused(false)` edges. A key press, a resize or an
 //! occlusion edge therefore never claims focus for a background window.
 //!
@@ -40,7 +40,7 @@
 //! was created (there is no platform seam to ask for focus), it only keeps the
 //! answer consistent — a new row takes focus when nothing was focused, and
 //! closing the focused window hands focus to a survivor instead of leaving a
-//! hole. [`Self::close_decision`] then states what one close event means for
+//! hole. [`WindowRegistry::close_decision`] then states what one close event means for
 //! the instance: [`CloseDecision::WindowOnly`] while another window survives,
 //! [`CloseDecision::LastWindow`] for the last one.
 //!

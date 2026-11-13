@@ -19,7 +19,7 @@ use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
 use crate::spawn::SpawnSpec;
 use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
-use crate::window_registry::{EventTarget, MAX_WINDOWS, SurfaceState};
+use crate::window_registry::{CloseDecision, EventTarget, MAX_WINDOWS, SurfaceState};
 
 /// PTY-quiescence settle window before a real-GUI present (bitty#2486).
 ///
@@ -317,6 +317,20 @@ fn is_input_visibility_proof(kind: &WindowEventKind) -> bool {
             | WindowEventKind::MouseWheel(_)
             | WindowEventKind::CursorMoved(_)
             | WindowEventKind::Focused(true)
+    )
+}
+
+/// Whether a window event ends one window's lifecycle (bitty#1765, slice 3).
+///
+/// `CloseRequested` is the request an owner may decline; `Closed` is the
+/// platform reporting the window is already gone. Both must run the same
+/// per-window close bookkeeping — releasing that window's surface and dropping
+/// its registry row — or the registry keeps a row for a window that no longer
+/// exists.
+fn is_window_close(kind: &WindowEventKind) -> bool {
+    matches!(
+        kind,
+        WindowEventKind::CloseRequested | WindowEventKind::Closed
     )
 }
 
@@ -4886,9 +4900,13 @@ impl TerminalApp {
             return false;
         }
         self.pending_new_windows = self.pending_new_windows.saturating_add(1).min(MAX_WINDOWS);
+        // bitty#1765 (slice 3): record which window the command targeted. The
+        // new window is a peer of the focused one, so the focus-sensitive
+        // target is what the lifecycle log must name.
+        let target = self.focused_window();
         crate::logging::info(|| {
             format!(
-                "bitty: new_window requested -> pending={} windows={:?} active={:?}",
+                "bitty: new_window requested -> pending={} target={target:?} windows={:?} active={:?}",
                 self.pending_new_windows,
                 self.windows.ids(),
                 self.windows.active()
@@ -4988,13 +5006,50 @@ impl TerminalApp {
     /// handling it. An empty registry (a headless run) and an identity this
     /// process never admitted return `false`, so the single-window path stays
     /// byte-identical to before this slice.
+    ///
+    /// bitty#1765 (slice 3): the same pass moves window focus when the event
+    /// *is* a focus edge. Only `Focused` events do — a key press, a resize or
+    /// an occlusion edge names the window that produced it and updates event
+    /// attribution instead, so a background window's traffic can never claim
+    /// focus.
     fn contain_if_secondary(&mut self, id: WindowId, kind: &WindowEventKind) -> bool {
         if self.windows.is_empty() {
             return false;
         }
+        self.track_window_focus(id, kind);
         match self.windows.target(id) {
             EventTarget::Primary => {
                 self.windows.set_active(id);
+                // bitty#1765 (slice 3): a close *request* for the first window
+                // is the one close the app can decline. Promoting a survivor to
+                // the primary role needs a runtime seam that does not exist yet
+                // (the primary swap chain, presenter and GPU context are
+                // process-wide), so closing the first window while others
+                // remain would strand them. Decline loudly instead of
+                // terminating an instance the user still has a window in —
+                // never a half-wired teardown.
+                //
+                // `Closed` cannot be declined: the platform already destroyed
+                // that window, and its surface is what the shared presenter
+                // paints into, so that event keeps the existing exit path until
+                // a survivor can be promoted.
+                if matches!(kind, WindowEventKind::CloseRequested)
+                    && self.windows.close_decision(id) == CloseDecision::WindowOnly
+                {
+                    let remaining = self.windows.len() - 1;
+                    crate::logging::warn(|| {
+                        format!(
+                            "warning: close of window {} deferred — {remaining} other window(s) remain and promoting a survivor to primary is not implemented yet; instance stays up windows={:?}",
+                            id.get(),
+                            self.windows.ids()
+                        )
+                    });
+                    eprintln!(
+                        "bitty: window {} stays open — the first window of a multi-window instance cannot be closed yet; close the other windows first",
+                        id.get()
+                    );
+                    return true;
+                }
                 false
             }
             EventTarget::Secondary => {
@@ -5010,6 +5065,58 @@ impl TerminalApp {
         }
     }
 
+    /// Applies one platform event to the focused-window record (bitty#1765,
+    /// slice 3).
+    ///
+    /// `Focused(true)` focuses that registered window; `Focused(false)` clears
+    /// focus only when it names the window currently focused, so a late blur
+    /// from the previously focused window can never clear a newer focus. Every
+    /// other kind is attribution, not focus.
+    fn track_window_focus(&mut self, id: WindowId, kind: &WindowEventKind) {
+        match crate::window_registry::focus_edge(kind) {
+            Some(true) => {
+                // A focus edge naming an identity this process never admitted
+                // changes nothing: the registry refuses it.
+                if !self.windows.focus(id) {
+                    return;
+                }
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: window focus -> {} windows={:?}",
+                        id.get(),
+                        self.windows.ids()
+                    )
+                });
+            }
+            Some(false) => {
+                if !self.windows.blur(id) {
+                    return;
+                }
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: window focus cleared by {} (no window focused)",
+                        id.get()
+                    )
+                });
+            }
+            None => {}
+        }
+    }
+
+    /// The window a focus-sensitive, window-scoped command targets
+    /// (bitty#1765, slice 3).
+    ///
+    /// The focused window; when the user moved to another application (no
+    /// window focused) the first registered one; with no registered window (a
+    /// headless run) the startup window's identity, which is `None` until a
+    /// window is created. It never returns an unregistered identity.
+    pub(crate) fn focused_window(&self) -> Option<WindowId> {
+        self.windows
+            .focused()
+            .or_else(|| self.windows.primary())
+            .or(self.window.id)
+    }
+
     /// Contains one event that belongs to a registered secondary window
     /// (bitty#1765).
     ///
@@ -5017,6 +5124,8 @@ impl TerminalApp {
     /// released first (the swap chain must outlive nothing but its window), then
     /// removing the row releases the last handle, so the OS window goes away
     /// without touching the primary's close gate or the process exit path.
+    /// `Closed` (the platform reporting that window already gone) runs the same
+    /// bookkeeping, so a destroyed window never leaves a registry row behind.
     ///
     /// A size change is the one other kind that is *acted* on rather than
     /// dropped: a secondary window owns a surface of its own, so its
@@ -5026,23 +5135,27 @@ impl TerminalApp {
     /// IME session of its own, so forwarding its event would mutate the
     /// primary's state.
     fn contain_secondary_window_event(&mut self, id: WindowId, kind: &WindowEventKind) {
-        match kind {
-            WindowEventKind::CloseRequested => {
-                let released = self.runtime.release_window_surface(id);
-                if self.windows.remove(id).is_some() {
-                    self.deferred_window_surfaces
-                        .retain(|pending| *pending != id);
-                    crate::logging::info(|| {
-                        format!(
-                            "bitty: secondary window closed id={} surface_released={released} windows={:?} window_surfaces=[{}]",
-                            id.get(),
-                            self.windows.ids(),
-                            self.runtime.window_surface_summary()
-                        )
-                    });
-                }
-                return;
+        if is_window_close(kind) {
+            let released = self.runtime.release_window_surface(id);
+            if self.windows.remove(id).is_some() {
+                self.deferred_window_surfaces
+                    .retain(|pending| *pending != id);
+                // bitty#1765 (slice 3): the row is gone, so focus and
+                // attribution were re-homed by `remove`; report both so a
+                // closed window is never silently still "the focused one".
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: secondary window closed id={} kind={kind:?} surface_released={released} windows={:?} focused={:?} window_surfaces=[{}]",
+                        id.get(),
+                        self.windows.ids(),
+                        self.windows.focused(),
+                        self.runtime.window_surface_summary()
+                    )
+                });
             }
+            return;
+        }
+        match kind {
             WindowEventKind::Resized(_) | WindowEventKind::ScaleFactorChanged(_) => {
                 self.refresh_secondary_window_surface(id);
                 return;

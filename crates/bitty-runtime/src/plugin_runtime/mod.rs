@@ -33,6 +33,7 @@ pub mod keybindings;
 pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
+pub mod panel_generation;
 pub mod plugin_settings;
 pub mod presentation_overlay;
 pub mod redaction;
@@ -67,8 +68,14 @@ use bitty_plugin_host::{
     parse_service_reference, validate_interface_schema, value_satisfies_schema,
 };
 use bitty_ui::ViewId;
+// bitty#2476 residual 4: the closed placeholder vocabulary the generation edge
+// hands the panel host. Re-using `bitty_ui`'s type rather than a second list
+// keeps one vocabulary in the tree.
+use bitty_ui::panel_recovery::PlaceholderReason;
 
 use crate::hang_watchdog::{ActiveCommandGuard, HangGauges};
+// bitty#2476 residuals 2 and 4: the panel generation edge's port, re-exported
+// so the composition root can implement it without naming the module path.
 pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
 pub use bitty_lua::runtime_inspect::{
     DecorationGeometry, ExtensionActivation, ExtensionInspectRow, ExtensionTrust, InspectRows,
@@ -127,6 +134,10 @@ pub use overlay::{
     OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,
     ReleasedEvent, TIMEOUT_RELEASE_REASON, UNLOADED_RELEASE_REASON, is_owner_release_reason,
     is_release_reason,
+};
+pub use panel_generation::{
+    CONTROLLER_GENERATION_BASE, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport,
+    PanelGenerationPort, PluginGeneration, controller_generation,
 };
 pub use presentation_overlay::{
     DismissedEvent, ESCAPE_DISMISS_REASON, PENDING_DISMISSED_MAX, PRESENTATION_OVERLAY_KIND,
@@ -843,6 +854,26 @@ pub struct PluginRuntime {
     /// release it on `clear_ui_blocks`. `None` leaves rich `terminal` mounts
     /// failing closed with `E_UI_UNAVAILABLE`.
     ui_scene_backend: Option<Rc<crate::scene_host::SceneHost>>,
+    /// bitty#2476 residuals 2 and 4: the app-owned panel generation port.
+    ///
+    /// Installed by the composition root beside the scene host (the panel host
+    /// is app-owned, so the plugin runtime cannot reach a `PanelRuntime`). The
+    /// generation edge asks it to release a generation that ended with no
+    /// successor and to bind a successor onto the containers its predecessor
+    /// drove. `None` (no panel host, headless builds, the runtime's own tests)
+    /// leaves the edge at exactly its pre-port behaviour: the generation's
+    /// content release runs and no panel is touched.
+    ///
+    /// The port carries no registry and no panel identity the plugin can
+    /// choose; see [`panel_generation`] for the contract an implementation owes.
+    panel_generation_port: Option<Rc<dyn panel_generation::PanelGenerationPort>>,
+    /// The most recent panel generation edge report (bitty#2476 residuals 2/4).
+    ///
+    /// Diagnostics only, and one entry: the edge runs at most twice per
+    /// generation transition and never retries, so this is replaced rather than
+    /// accumulated. `None` means no edge has run since startup or the port is
+    /// not installed.
+    last_panel_edge: Option<panel_generation::PanelEdgeReport>,
     /// CTX-1115: bounded queue of `bitty.panel.set_pinned` intents, drained
     /// by the application each tick
     /// ([`PluginRuntime::drain_panel_pin_requests`]).
@@ -1101,6 +1132,8 @@ impl PluginRuntime {
             panel_pin_backend: None,
             panel_create_backend: None,
             ui_scene_backend: None,
+            panel_generation_port: None,
+            last_panel_edge: None,
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
             image_roots: Vec::new(),
@@ -1767,6 +1800,93 @@ impl PluginRuntime {
             .borrow_mut()
             .set_attribution(attribution);
         self.ui_scene_backend = backend;
+    }
+
+    /// Install the app-owned panel generation port (bitty#2476 residuals 2 and
+    /// 4).
+    ///
+    /// Call before activation, beside [`Self::set_ui_scene_backend`]: the panel
+    /// host is app-owned, so the composition root — which owns the
+    /// `PanelRuntime` — is the only layer that can implement
+    /// [`panel_generation::PanelGenerationPort`], and this is where it hands the
+    /// port in. The port is asked, at a generation edge, to release the
+    /// generation that ended and to bind a successor onto the containers its
+    /// predecessor drove; it is never asked for a registry, a renderer, or a
+    /// panel id the plugin names.
+    ///
+    /// `None` restores the pre-port behaviour exactly: the edge runs the
+    /// generation's own content release and touches no panel, so a headless
+    /// build or a runtime without a panel host keeps compiling and behaving as
+    /// before.
+    pub fn set_panel_generation_port(
+        &mut self,
+        port: Option<Rc<dyn panel_generation::PanelGenerationPort>>,
+    ) {
+        self.panel_generation_port = port;
+    }
+
+    /// The most recent panel generation edge report (bitty#2476 residuals 2/4).
+    ///
+    /// `None` until an edge runs with a port installed. One entry, replaced at
+    /// the next edge: the edge never retries and never keeps a row per reload.
+    #[must_use]
+    pub fn last_panel_edge(&self) -> Option<&panel_generation::PanelEdgeReport> {
+        self.last_panel_edge.as_ref()
+    }
+
+    /// Runs the generation's unbind edge through the installed port, if any.
+    ///
+    /// Called from `dispose_inner` after the generation's own content release
+    /// (`clear_ui_blocks`, which also revokes the scene and the capture session)
+    /// and before the entry is reused, so the containers the generation bound
+    /// are released and left presenting their placeholder before any successor
+    /// exists (OQ-084 A.2: the release completes before the placeholder, and it
+    /// needs no successor).
+    fn release_panel_generation(
+        &mut self,
+        owner: &PluginId,
+        ended: panel_generation::PluginGeneration,
+        reason: PlaceholderReason,
+    ) {
+        let Some(port) = self.panel_generation_port.clone() else {
+            return;
+        };
+        let report = port.release_generation(panel_generation::PanelEdgeRelease {
+            owner,
+            ended,
+            reason,
+        });
+        self.last_panel_edge = Some(report);
+    }
+
+    /// Runs the successor bind through the installed port, if any.
+    ///
+    /// Called from `reload_inner` only after `dispose_inner` returned for the
+    /// predecessor (D.2's obligations on the wiring: the edge releases the
+    /// capture session and quiesces the parked command first) and only after
+    /// the successor activated, so the binding moves to a generation that is
+    /// live. `requested` is the successor's own panel resolution; `consented` is
+    /// empty because no permission-diff consent surface answers in this slice,
+    /// which denies every widening instead of granting it (D.1, PGO-17).
+    fn bind_panel_generation(
+        &mut self,
+        owner: &PluginId,
+        predecessor: panel_generation::PluginGeneration,
+        successor: panel_generation::PluginGeneration,
+        requested: &BTreeSet<String>,
+    ) {
+        let Some(port) = self.panel_generation_port.clone() else {
+            return;
+        };
+        let consented = BTreeSet::new();
+        let report = port.bind_successor(panel_generation::PanelEdgeBind {
+            owner,
+            predecessor,
+            successor,
+            requested,
+            consented: &consented,
+        });
+        self.last_panel_edge = Some(report);
     }
 
     /// Seed the approved wallpaper roots for `bitty.image.read` (CTX-1169,
@@ -3023,6 +3143,22 @@ impl PluginRuntime {
         let panel_focus = granted
             .iter()
             .any(|capability| capability.as_str() == "panel.focus");
+        // bitty#2476 residual 2: the generation edge's bind presents the
+        // successor's *own* panel resolution as D.1's `R`, so the whole closed
+        // `panel` family is captured here, not only the two heads a verb checks.
+        // The list is closed (OQ-084 A.3, `Capability::Panel`) and comes from
+        // the activation grant set, so nothing a plugin does later can widen it.
+        let panel_family_resolution: BTreeSet<String> = granted
+            .iter()
+            .map(|capability| capability.as_str())
+            .filter(|capability| {
+                matches!(
+                    *capability,
+                    "panel.create" | "panel.focus" | "panel.provider" | "panel.overlay"
+                )
+            })
+            .map(str::to_string)
+            .collect();
         // CTX-1239 (issue #2101): the submit grant is the lease
         // authorization for the Lua path (submit_host.rs: holder
         // attribution arrives with the capability grant lane). Read never
@@ -3208,6 +3344,9 @@ impl PluginRuntime {
         // a call without it fails closed before touching the source.
         plugin_services.set_keymaps_access(runtime_keymaps_read, self.keymap_source.clone());
         plugin_services.set_panel_access(panel_create, panel_focus);
+        // bitty#2476 residual 2: the generation keeps its own panel resolution
+        // so the edge's successor bind can present it as D.1's `R`.
+        plugin_services.set_panel_family_resolution(panel_family_resolution);
         // CTX-1099: the `bitty.panel.set_pinned` host backend. Installed
         // only for `panel.focus` generations (no backend without grant);
         // the call-time grant gate in `panel_set_pinned` stays as the
@@ -3651,17 +3790,29 @@ impl PluginRuntime {
     /// entry, matching the `Disposed -> activate` transition this module
     /// permits.
     ///
+    /// `reason` is the closed Decision E reason the generation's panel
+    /// containers present once they are released (bitty#2476 residuals 2 and
+    /// 4). It is required rather than defaulted on the inner entry because the
+    /// caller is the only place that knows *why* the generation ended, and a
+    /// placeholder that names the wrong end is a diagnostic a user cannot act
+    /// on. The public unload entry names [`PlaceholderReason::Unloaded`],
+    /// because that is what it is.
+    ///
     /// # Errors
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the plugin is unknown.
     pub fn dispose(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
-        let result = self.dispose_inner(id);
+        let result = self.dispose_inner(id, PlaceholderReason::Unloaded);
         self.sync_debug_view();
         self.publish_hang_worker_gauge();
         result
     }
 
-    fn dispose_inner(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
+    fn dispose_inner(
+        &mut self,
+        id: &PluginId,
+        reason: PlaceholderReason,
+    ) -> Result<(), PluginRuntimeError> {
         // bitty #2314: teardown cancels any parked command before the VM is
         // dropped, so no resume can observe a half-disposed generation.
         self.cancel_parked_command(id);
@@ -3692,6 +3843,17 @@ impl PluginRuntime {
             .borrow_mut()
             .revoke_plugin(id.as_str());
         entry.state = LifecycleState::Disposed;
+        // bitty#2476 residuals 2 and 4: the generation's panel containers.
+        //
+        // The entry borrow ends above, so the edge can run here. It runs after
+        // `clear_ui_blocks` (the generation's own content, scene, and capture
+        // session are released) and before the entry is reused, so the
+        // containers this generation still drives are released and left
+        // presenting the placeholder — with no successor, because disposing is
+        // not a reload (OQ-084 A.2). A port the app did not install leaves this
+        // a no-op.
+        let ended = entry.generation;
+        self.release_panel_generation(id, ended, reason);
         // CTX-0897: traces never outlive the generation (also on reload,
         // where dispose and the next activation share one public call).
         self.drop_traces(id);
@@ -3799,11 +3961,17 @@ impl PluginRuntime {
                     Ok(records) => {
                         if let Some(record) = records.iter().find(|r| r.plugin_id == id.as_str()) {
                             if !record.enabled {
-                                let _ = self.dispose_inner(&id);
+                                // bitty#2476 residual 4: the index says the
+                                // plugin is disabled, so its containers present
+                                // `disabled` until a re-enable rebinds them.
+                                let _ = self.dispose_inner(&id, PlaceholderReason::Disabled);
                                 continue;
                             }
                         } else if source_class != SourceClass::LocalPath {
-                            let _ = self.dispose_inner(&id);
+                            // The record is gone: the provider is not installed,
+                            // which Decision E names `unloaded` rather than
+                            // deleted.
+                            let _ = self.dispose_inner(&id, PlaceholderReason::Unloaded);
                             continue;
                         }
                     }
@@ -3830,7 +3998,10 @@ impl PluginRuntime {
     }
 
     fn reload_inner(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
-        let (source_class, module_root) = {
+        // bitty#2476 residual 2: the generation this reload ends. Captured
+        // before the teardown because `activate_inner` advances the counter, and
+        // the successor bind must name the predecessor's *own* generation.
+        let predecessor = {
             let entry = self
                 .entries
                 .get(id)
@@ -3838,15 +4009,21 @@ impl PluginRuntime {
             (
                 entry.package.source_class,
                 entry.package.module_root.clone(),
+                entry.generation,
             )
         };
+        let (source_class, module_root, predecessor) = predecessor;
         if source_class.is_bundled() {
             return Err(PluginRuntimeError::Lifecycle {
                 plugin: id.to_string(),
                 detail: "bundled sources are not hot-swapped".to_string(),
             });
         }
-        self.dispose_inner(id)?;
+        // The edge release runs inside the teardown and names `reloaded`, so a
+        // reload that fails before the successor activates leaves the
+        // containers presenting the reload placeholder rather than a stale
+        // controller (OQ-084 E, "mid-reload").
+        self.dispose_inner(id, PlaceholderReason::Reloaded)?;
 
         if let Some(store_root) = self.store_root.clone() {
             let records = resolution::load_index(&store_root)?;
@@ -3864,7 +4041,28 @@ impl PluginRuntime {
             verify_module_tree(id, &module_root)?;
         }
 
-        self.activate_inner(id)
+        let report = self.activate_inner(id)?;
+        // bitty#2476 residual 2: the successor bind. `dispose_inner` returned
+        // above, so the predecessor's capture session is revoked and its parked
+        // command quiesced (D.2 phase-1 steps 3 and 5) before this runs, and the
+        // successor is live. The requested set is the successor's *own* panel
+        // resolution; no permission-diff consent answers in this slice, so
+        // `bind_panel_generation` passes an empty consent set and every widening
+        // is denied rather than granted (D.1, PGO-17). A refused bind leaves the
+        // container unbound with the placeholder the edge presented.
+        let successor = self.entries.get(id).map(|entry| entry.generation);
+        if let Some(successor) = successor {
+            if successor != predecessor {
+                let requested = self
+                    .entries
+                    .get(id)
+                    .and_then(|entry| entry.services.as_ref())
+                    .map(|services| services.panel_family_resolution())
+                    .unwrap_or_default();
+                self.bind_panel_generation(id, predecessor, successor, &requested);
+            }
+        }
+        Ok(report)
     }
 
     /// Dispatch one captured command, invoking its `run` function under budget.

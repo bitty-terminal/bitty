@@ -2087,6 +2087,17 @@ pub struct PluginServices {
     history_window_start: Cell<Instant>,
     panel_create_granted: Cell<bool>,
     panel_focus_granted: Cell<bool>,
+    /// The panel capability families this generation resolved at activation
+    /// (bitty#2476 residual 2, OQ-084 D.1's `R`).
+    ///
+    /// The subset of the activation grant set inside the closed `panel` family
+    /// (`panel.create`, `panel.focus`, `panel.provider`, `panel.overlay`), kept
+    /// beside the two call-time booleans because the generation edge's rebind
+    /// needs the successor's *whole* panel resolution, not the two heads a verb
+    /// checks. Read once per generation by
+    /// [`Self::panel_family_resolution`]; never written after activation, so a
+    /// rebind cannot widen it from inside the VM.
+    panel_family_resolution: RefCell<BTreeSet<String>>,
     panel_create_backend: RefCell<Option<PanelCreateHandler>>,
     panel_pin_backend: RefCell<Option<PanelPinHandler>>,
     /// Whether this generation holds `platform.image-file` (CTX-1169).
@@ -2251,6 +2262,7 @@ impl PluginServices {
             history_window_start: Cell::new(Instant::now()),
             panel_create_granted: Cell::new(false),
             panel_focus_granted: Cell::new(false),
+            panel_family_resolution: RefCell::new(BTreeSet::new()),
             panel_create_backend: RefCell::new(None),
             panel_pin_backend: RefCell::new(None),
             image_read_granted: Cell::new(false),
@@ -2421,6 +2433,32 @@ impl PluginServices {
     pub fn set_panel_access(&self, create: bool, focus: bool) {
         self.panel_create_granted.set(create);
         self.panel_focus_granted.set(focus);
+    }
+
+    /// Records the panel capability families this generation resolved at
+    /// activation (bitty#2476 residual 2, OQ-084 D.1's `R`).
+    ///
+    /// Called once per generation from the activation path with the subset of
+    /// the activation grant set inside the closed `panel` family. The generation
+    /// edge reads it back with [`Self::panel_family_resolution`] and hands it to
+    /// the panel host as the successor's **own** resolution — never the
+    /// predecessor's set and never a union — so a rebind can only narrow what
+    /// the predecessor held unless a permission-diff consent widened it. A
+    /// generation that reaches this setter holds nothing it was not granted; the
+    /// setter is the only writer and no Lua verb can reach it.
+    pub fn set_panel_family_resolution(&self, families: BTreeSet<String>) {
+        *self.panel_family_resolution.borrow_mut() = families;
+    }
+
+    /// The panel capability families this generation resolved at activation
+    /// (bitty#2476 residual 2).
+    ///
+    /// Empty for an ungranted generation, and empty after teardown because the
+    /// services handle is per generation. The caller receives a copy, so the
+    /// edge's bind cannot be influenced by anything the VM does afterwards.
+    #[must_use]
+    pub fn panel_family_resolution(&self) -> BTreeSet<String> {
+        self.panel_family_resolution.borrow().clone()
     }
 
     /// Attach the synchronous pinned-float backend for `bitty.panel.set_pinned`

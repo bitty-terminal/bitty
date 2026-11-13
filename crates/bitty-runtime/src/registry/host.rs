@@ -482,6 +482,42 @@ impl PanelRuntime {
         Ok(committed)
     }
 
+    /// Presents the Decision E placeholder on a panel whose controller
+    /// generation is ending (OQ-084 E, bitty#2476 residual 4).
+    ///
+    /// The registry owns the whole transition: the closed reason vocabulary
+    /// ([`PanelError::RecoveryReasonRejected`] refuses a token outside it before
+    /// anything moves), the fail-closed unbind release that runs **before** the
+    /// placeholder becomes visible (A.2), the capped recovery counter
+    /// (`RECOVERY_ATTEMPT_CAP`), and the container-retaining presentation. This
+    /// facade adds nothing, because nothing of the transition is facade-owned:
+    /// the lease entry survives untouched and is reset by the next bind's phase
+    /// 2 step 3, and the view attachment, title, geometry, and workspace
+    /// membership are container facts a placeholder never moves (D.3).
+    ///
+    /// `presented` is the generation whose edge this is. When it is still bound
+    /// the call runs that generation's release and then writes the placeholder,
+    /// in that order; when the release already ran for it the call is refused
+    /// with [`PanelError::ControllerReleased`], so a caller never presents a
+    /// placeholder over a second release of the same generation.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PanelRegistry::present_placeholder`] refuses with —
+    /// `NotFound`, `RegistryDisposed`, `RecoveryReasonRejected`,
+    /// `ControllerConflict`, `ControllerReleased`, `StaleHandle`,
+    /// `ResourceExhausted` (from the unbind edge), and the propagation of any
+    /// `dispose_panel` refusal on the `Drop` path. A refusal presents no
+    /// placeholder and releases nothing.
+    pub fn present_placeholder(
+        &mut self,
+        id: super::panel::PanelId,
+        presented: Generation,
+        reason: &str,
+    ) -> Result<super::panel::PlaceholderPresentation, PanelError> {
+        self.registry.present_placeholder(id, presented, reason)
+    }
+
     /// Releases the facade's own bindings for a panel the registry retired
     /// (RUN-21 lease entry, OQ-051 scene slot and its paint cache, and the
     /// live placement mirror of the registry's attachment).

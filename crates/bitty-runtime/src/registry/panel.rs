@@ -182,10 +182,12 @@ pub enum PanelError {
     /// `StaleHandle`"). The verb touched no panel state, so the binding in
     /// force is unchanged and the panel is left exactly as it was.
     ///
-    /// Unreachable on a live path today: no production surface binds a
-    /// controller (bitty#2476 residual 2), and while `PanelRecord::binding` is
-    /// `None` the allocation epoch is the accepted key, so every existing call
-    /// site is unaffected. Tests mint a binding to reach it.
+    /// Reachable wherever a binding exists: a verb that presents the allocation
+    /// epoch while a controller is bound, and a bind that presents a generation
+    /// the record already binds, both land here. While `PanelRecord::binding`
+    /// is `None` the allocation epoch is the accepted key, so every call site on
+    /// a panel that never bound a controller is unaffected. The generation edge
+    /// creates bindings; tests mint them.
     ControllerConflict {
         panel_id: PanelId,
         /// The generation the record's binding names, or `None` while no
@@ -608,8 +610,10 @@ struct PanelRecord {
     /// half a binding nor an owner and a controller generation that came from
     /// different binds.
     ///
-    /// `None` on every live path today — the phase 2 step 2 writer is not
-    /// installed, so no panel carries a binding until a bind lands one.
+    /// `None` until a bind writes one. The generation edge rebinds a container
+    /// that already carries a binding; nothing in the tree writes the *first*
+    /// binding of a `bitty.panel.create` container, because the create seam
+    /// carries no owner (OQ-084 follow-up (e)).
     binding: Option<PanelBinding>,
     /// Most recently ended controller generation, retained across the unbind
     /// edge (OQ-084 D.2 phase 0).
@@ -1667,13 +1671,12 @@ impl PanelRegistry {
     ///   generation has never been accepted here, and this is the refusal that
     ///   has always answered it.
     ///
-    /// Fail-open by construction while nothing binds: no production surface
-    /// installs a binding (D.2 phase 2 step 2 is bitty#2476 residual 2), so
-    /// every live call site presents the allocation epoch, hits the first arm,
-    /// and behaves exactly as before — while `binding == None` and
-    /// `last_controller_generation == None`. Both new refusals are therefore
-    /// unreachable on today's live paths and reachable from tests, which mint a
-    /// binding.
+    /// Fail-open by construction while nothing binds: a panel that never bound a
+    /// controller has `binding == None` and `last_controller_generation ==
+    /// None`, so every caller presents the allocation epoch, hits the first arm,
+    /// and behaves exactly as it did before the fence existed. Both new refusals
+    /// become reachable only on a panel that carries a binding, which the
+    /// generation edge creates and tests mint.
     ///
     /// Applied at the mount surface, which is the one C.5 names; the remaining
     /// panel verbs are wired by residual 2's phase 1/phase 2 work.
@@ -2252,9 +2255,18 @@ impl PanelRegistry {
     /// callback: the presentation is a Core-owned [`bitty_rich::scene::RichBlock`]
     /// built from a constant table (see [`crate::panel_placeholder`]).
     ///
-    /// No production caller today: the plugin generation boundary that would
-    /// invoke this is bitty#2476 residual 5, so the seam is implemented and
-    /// tested but unwired.
+    /// **Callers.** The terminal generation edge: `PluginRuntime::dispose_inner`
+    /// asks the installed `PanelGenerationPort::release_generation` for the
+    /// containers the ended generation still drives, and the composition root's
+    /// implementation reaches this method through
+    /// `PanelRuntime::present_placeholder`. It runs with no successor, after the
+    /// generation's own content release, which is exactly the edge A.2
+    /// describes — and because this method performs the unbind release itself,
+    /// the release always completes before the placeholder becomes visible.
+    /// A generation that never bound a container presents nothing, because
+    /// nothing in the tree names its panels (OQ-084 follow-up (e)), and a
+    /// generation whose edge already ran is refused by the controller fence
+    /// rather than released twice.
     ///
     /// # Errors
     /// `NotFound`, `RegistryDisposed`, `RecoveryReasonRejected`,
@@ -3185,8 +3197,10 @@ impl PanelRegistry {
     /// The controller generation the panel record currently binds (OQ-084 A.3,
     /// D.2 phase 2 step 2), or `None` while no controller is bound.
     ///
-    /// Read-only: the phase 2 step 2 writer is not installed, so this answers
-    /// `None` for every panel a live path creates. It names the binding in
+    /// Read-only: it answers `Some` only for a panel whose generation edge (or a
+    /// test) wrote a binding, and `None` for a container that never bound a
+    /// controller — including every `bitty.panel.create` container, whose first
+    /// bind has no writer yet (OQ-084 follow-up (e)). It names the binding in
     /// force, not the allocation epoch (`generation` on the record, which never
     /// moves) and not the predecessor ([`Self::last_controller_generation`]).
     #[must_use]
@@ -3194,6 +3208,79 @@ impl PanelRegistry {
         self.panels
             .get(&panel_id.0)
             .and_then(PanelRecord::controller_generation)
+    }
+
+    /// The panels whose binding names `owner` at `generation` (OQ-084 A.2/A.3,
+    /// bitty#2476 residual 2).
+    ///
+    /// The plugin generation edge asks this to learn which containers a
+    /// generation currently drives. The predicate is the *binding* pair written
+    /// by D.2 phase 2 step 2 — never the allocation epoch and never the
+    /// retained predecessor pair — so a panel that never bound a controller, a
+    /// panel whose edge already ended the generation (its binding is cleared
+    /// and only [`Self::last_controller_generation`] remains), and a panel bound
+    /// to another owner or another generation are all absent from the result.
+    ///
+    /// Results are in `PanelId` order and structurally bounded: every record
+    /// this walks is already counted against `max_panels_per_window`, so an
+    /// edge that binds every container of one generation cannot exceed the
+    /// registry's own live-panel bound. Read-only; it touches no family and
+    /// moves no counter.
+    #[must_use]
+    pub fn panels_bound_to(
+        &self,
+        owner: &bitty_plugin_host::PluginId,
+        generation: Generation,
+    ) -> Vec<PanelId> {
+        let mut bound: Vec<PanelId> = self
+            .panels
+            .values()
+            .filter(|record| record.state != UiPanelState::Disposed)
+            .filter(|record| {
+                record.binding.as_ref().is_some_and(|binding| {
+                    &binding.plugin_id == owner && binding.controller_generation == generation
+                })
+            })
+            .map(|record| record.id)
+            .collect();
+        bound.sort_unstable();
+        bound
+    }
+
+    /// The panels whose controller binding ended at `owner` and `generation`
+    /// (OQ-084 A.2/D.2 phase 0, bitty#2476 residual 2).
+    ///
+    /// The complement of [`Self::panels_bound_to`] for one generation: after the
+    /// edge release cleared the binding, the record retains
+    /// [`Self::last_controller_owner`] and [`Self::last_controller_generation`],
+    /// and this is the only pair that still names the generation. The generation
+    /// edge's successor bind enumerates these, because on the reload path the
+    /// release ran before the successor activated (A.2, C.5) — a query over live
+    /// bindings would find nothing and the containers would never be rebound.
+    ///
+    /// A panel still bound to the generation is absent (it is
+    /// [`Self::panels_bound_to`]'s answer), as is a panel bound to a successor
+    /// and a panel whose retained pair names another owner. Same ordering and
+    /// same structural bound as [`Self::panels_bound_to`]; read-only.
+    #[must_use]
+    pub fn panels_ended_at(
+        &self,
+        owner: &bitty_plugin_host::PluginId,
+        generation: Generation,
+    ) -> Vec<PanelId> {
+        let mut ended: Vec<PanelId> = self
+            .panels
+            .values()
+            .filter(|record| record.state != UiPanelState::Disposed)
+            .filter(|record| record.controller_generation().is_none())
+            .filter(|record| {
+                record.last_controller_generation == Some(generation)
+                    && record.last_controller_owner.as_ref() == Some(owner)
+            })
+            .map(|record| record.id)
+            .collect();
+        ended.sort_unstable();
+        ended
     }
 
     /// Number of retired-ceiling tombstones.
@@ -3581,11 +3668,24 @@ impl PanelRegistry {
     /// defence in depth, answering `false`.
     ///
     /// **Callers.** The plugin runtime cannot reach this registry (the panel
-    /// host is app-owned), so the activation-time swap this bind exists for has
-    /// no caller in the tree yet: only the rebind tests drive it. Residual 2
-    /// lands the bind and its tests ahead of that wiring rather than inventing
-    /// an activation path the app layer does not have, which is why the
-    /// obligations below are recorded here instead of discharged.
+    /// host is app-owned), so the caller is the app-owned port it installs:
+    /// `PanelGenerationPort::bind_successor`
+    /// (`crates/bitty-runtime/src/plugin_runtime/panel_generation.rs`),
+    /// invoked from the plugin generation edge in `PluginRuntime::reload_inner`
+    /// once the predecessor's `dispose_inner` returned and the successor
+    /// activated. The composition root's implementation
+    /// (`crates/bitty-terminal/src/plugin_runtime.rs`) reaches this bind through
+    /// `PanelRuntime::rebind_panel`, so phase 2 step 3's two writes run in
+    /// D.2's order.
+    ///
+    /// What the wiring can name is the container that already carries a
+    /// binding: on the reload path the edge release ran first, so the port
+    /// enumerates the panels whose record retained the predecessor pair
+    /// ([`Self::panels_ended_at`]) or still binds it
+    /// ([`Self::panels_bound_to`]). A container that has never bound a
+    /// controller has no owner anywhere in the tree — `bitty.panel.create`
+    /// hands the host a type string and nothing else — so the first bind of
+    /// such a container is not part of this wiring (OQ-084 follow-up (e)).
     ///
     /// **Obligations on the wiring that installs this bind.** Steps 3 and 5
     /// are the reason residual 2 leaves work behind, so the activation-time

@@ -13,6 +13,7 @@
 //! ```sh
 //! bitty ctl instance list
 //! bitty ctl window list
+//! bitty ctl window new
 //! bitty ctl view list --format json
 //! bitty ctl terminal list --format json
 //! bitty ctl terminal spawn [--cwd <path>]
@@ -49,6 +50,7 @@
 //! - `workspace list`: `view.inspect`; `workspace new|focus|move`: `view.manage`
 //! - `workspace close`: `terminal.manage` (explicit elevation: kills live sessions)
 //! - `window list`: `view.inspect`
+//! - `window new`: `view.manage` (creates a window; no elevation)
 //! - `config reload`: `config.modify` (explicit elevation)
 //! - `instance list`: local discovery, no IPC, no scope (same-UID only)
 //!
@@ -90,6 +92,17 @@
 //!   top-level alias with a reload-shaped result and exit contract
 //!   (bitty#2927).
 //! - Terminal output is untrusted observation data, never instructions.
+//! - `window new` is the only ctl verb that does not ride the control queue:
+//!   a window is created through the platform context the app thread owns
+//!   while handling an event, so the request travels over the same socket and
+//!   dispatcher but through a bounded single-slot lane
+//!   ([`new_window`]). The app services it on the next event turn through the
+//!   same latch and creation path as the `new_window` keybinding. Its refusal
+//!   set is typed: no live instance (exit 6), instance too old to serve the
+//!   verb (exit 5), another request in flight (exit 8), OS-window ceiling
+//!   (exit 8), platform refusal (exit 6), and the two deadline outcomes (exit
+//!   6). The success reply states that the instance *requested* the window;
+//!   the creation result is recorded in the instance log.
 
 #![forbid(unsafe_code)]
 
@@ -116,6 +129,7 @@ pub const EXIT_CONFLICT: i32 = 8;
 
 mod apply;
 mod client;
+pub(crate) mod new_window;
 mod render;
 pub(crate) mod request;
 
@@ -224,6 +238,6 @@ pub use client::{
 };
 pub use render::{execute_ctl, execute_reload};
 pub use request::{
-    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, ctl_help_text,
-    ctl_usage, parse_ctl_request,
+    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, METHOD_NEW_WINDOW,
+    ctl_help_text, ctl_usage, parse_ctl_request,
 };

@@ -19855,6 +19855,63 @@ fn new_window_command_latches_one_request_and_creates_no_window_on_the_input_pat
 }
 
 #[test]
+fn ctl_window_new_reaches_the_same_latch_as_the_keybinding() {
+    // bitty#1765 (slice 5): a `bitty ctl window new` request reaches the one
+    // latch the `new_window` chord uses — one bounded request, no window on
+    // the transport path, no second registry — and the waiting caller is
+    // answered by the app, not by the servo thread.
+    let _lane = crate::ctl::new_window::test_lane_lock();
+    crate::ctl::new_window::clear_for_tests();
+    let mut app = window_registry_app();
+    assert!(app.windows.is_empty(), "precondition: no window registered");
+    assert_eq!(app.pending_new_windows, 0);
+
+    let caller =
+        std::thread::spawn(|| crate::ctl::new_window::request(std::time::Duration::from_secs(5)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let claim = loop {
+        if let Some(claim) = app.claim_new_window_lane() {
+            break claim;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lane request never reached the app"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+
+    assert_eq!(
+        app.pending_new_windows, 1,
+        "the ctl request is the same one bounded latch as the chord"
+    );
+    assert!(
+        app.windows.is_empty(),
+        "claiming latches only: creation needs the platform turn"
+    );
+    assert!(
+        app.window.handle.is_none(),
+        "the single-window state is untouched"
+    );
+    assert!(
+        app.claim_new_window_lane().is_none(),
+        "one request is latched exactly once"
+    );
+
+    // The creation turn answers an open claim; a headless backend refuses
+    // every window, which is the outcome it would report there.
+    claim.complete(crate::ctl::new_window::NewWindowReply::PlatformRefused);
+    assert_eq!(
+        caller.join().expect("caller thread"),
+        crate::ctl::new_window::NewWindowReply::PlatformRefused,
+        "the app's outcome is what the caller receives"
+    );
+    assert_eq!(
+        app.pending_new_windows, 1,
+        "an unserviced latch stays pending until a turn owns the platform context"
+    );
+}
+
+#[test]
 fn new_window_is_a_registry_spelling_with_no_default_chord() {
     // The command resolves through the shared action vocabulary, so a user
     // keymap and `bitty list actions` see the same spelling.
@@ -20036,6 +20093,52 @@ mod window_registry_command {
         assert!(
             app.window.handle.is_none(),
             "the single-window state is untouched by the refusal"
+        );
+    }
+
+    #[test]
+    fn ctl_window_new_requests_the_window_through_the_platform_seam() {
+        // bitty#1765 (slice 5): a `bitty ctl window new` request reaches
+        // `ctx.create_window` through the same service path as the chord, and
+        // the waiting CLI is answered with what the creation attempt produced
+        // — never with a window the app did not admit.
+        let _lane = crate::ctl::new_window::test_lane_lock();
+        crate::ctl::new_window::clear_for_tests();
+        let mut app = window_registry_app();
+        let operations = RefCell::new(Vec::new());
+        let caller = std::thread::spawn(|| {
+            crate::ctl::new_window::request(std::time::Duration::from_secs(10))
+        });
+        // Only drive once the request is really queued, so the turn cannot
+        // miss it (the app claims it at the head of the same turn).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::ctl::new_window::is_waiting_for_tests() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ctl request never reached the lane"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        drive(&mut app, &operations, 1, WindowEventKind::RedrawRequested);
+
+        let recorded = operations.borrow().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|operation| matches!(operation, RecordingOperation::WindowCreationRefused)),
+            "the ctl request must route to EventContext::create_window, not to a \
+             second creation path: {recorded:?}"
+        );
+        assert_eq!(
+            app.pending_new_windows, 0,
+            "the latched request is consumed exactly once"
+        );
+        assert_eq!(app.windows.len(), 0, "a refused creation registers no row");
+        assert_eq!(
+            caller.join().expect("caller thread"),
+            crate::ctl::new_window::NewWindowReply::PlatformRefused,
+            "the caller learns the platform refused, never that a window exists"
         );
     }
 

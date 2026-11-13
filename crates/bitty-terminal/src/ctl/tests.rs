@@ -5,12 +5,12 @@ use super::client::{
     extract_string_from, extract_top_value, parse_ctl_response, resolve_ctl_target,
 };
 use super::render::{
-    class_for_server_error, exit_for_server_error, format_failure, format_panels_table,
-    format_success, format_workspaces_table,
+    NEW_WINDOW_SKEW_MESSAGE, class_for_server_error, execute_ctl, exit_for_server_error,
+    format_failure, format_panels_table, format_success, format_workspaces_table,
 };
 use super::request::{
-    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, ctl_help_text,
-    ctl_usage, parse_ctl_request,
+    CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, METHOD_NEW_WINDOW,
+    ctl_help_text, ctl_usage, parse_ctl_request,
 };
 use super::{EXIT_CONFLICT, EXIT_GENERIC, EXIT_PERM, EXIT_RUNTIME};
 use bitty_ipc::ctl as ipc_ctl;
@@ -769,6 +769,92 @@ fn panel_list_parses_like_other_lists() {
     assert!(ctl_usage().contains("panel list"));
     assert!(ctl_help_text(false).contains("panel list"));
     assert!(ctl_help_text(false).contains("core.panel.list"));
+}
+
+#[test]
+fn window_new_parses_as_a_runtime_verb_and_documents_itself() {
+    // bitty#1765 (slice 5): `window new` is a runtime verb with no
+    // arguments, its own wire method, and a registry id that mirrors the
+    // `core.window.new` command the chrome action already reaches.
+    let (req, targeting) = parse_ctl_request(&words(&["window", "new"])).expect("must parse");
+    assert_eq!(req, CtlRequest::NewWindow);
+    assert_eq!(req.registry_id(), "core.window.new");
+    assert_eq!(req.wire_method(), Some(METHOD_NEW_WINDOW));
+    assert_eq!(
+        req.wire_params(),
+        None,
+        "the verb takes no parameters, so nothing client-shaped travels"
+    );
+    assert_eq!(targeting.format, CtlFormat::Table);
+    // No argument, no misplaced option: both are usage errors (exit 2), which
+    // never reach IPC.
+    assert!(parse_ctl_request(&words(&["window", "new", "extra"])).is_err());
+    assert!(parse_ctl_request(&words(&["window", "new", "--right"])).is_err());
+    assert!(parse_ctl_request(&words(&["window", "new", "--cwd", "/tmp"])).is_err());
+    assert!(parse_ctl_request(&words(&["window", "spawn"])).is_err());
+    // `window list` stays a list verb.
+    let (list, _) = parse_ctl_request(&words(&["window", "list"])).expect("must parse");
+    assert_eq!(list, CtlRequest::WindowList);
+    // Usage and help name the verb, so `--help` and completion agree with the
+    // parser.
+    assert!(ctl_usage().contains("window list | window new"));
+    assert!(ctl_help_text(false).contains("window new"));
+    assert!(ctl_help_text(false).contains("core.window.new"));
+}
+
+#[test]
+fn window_new_refusals_map_to_their_own_stable_exit_codes() {
+    // bitty#1765 (slice 5): every refusal the verb can produce has one
+    // (category, code) pair and one exit code, and none of them collapses
+    // into the generic exit 1 a bad argument gets.
+    let ceiling = crate::ctl::new_window::NewWindowReply::AtCapacity { max: 16, live: 16 };
+    let (category, code) = ceiling.class();
+    assert_eq!(
+        exit_for_server_error(category, code),
+        EXIT_CONFLICT,
+        "an instance at its OS-window ceiling is a conflict with live state"
+    );
+    assert_eq!(class_for_server_error(category, code), "Conflict");
+    let busy = crate::ctl::new_window::NewWindowReply::Busy;
+    let (category, code) = busy.class();
+    assert_eq!(exit_for_server_error(category, code), EXIT_CONFLICT);
+    for refusal in [
+        crate::ctl::new_window::NewWindowReply::PlatformRefused,
+        crate::ctl::new_window::NewWindowReply::Unserviced,
+        crate::ctl::new_window::NewWindowReply::OutcomeUnknown,
+    ] {
+        let (category, code) = refusal.class();
+        assert_eq!(
+            exit_for_server_error(category, code),
+            EXIT_RUNTIME,
+            "{refusal:?} is an availability failure, not a conflict"
+        );
+    }
+    // Protocol skew: an instance that answers `NotFound` for the method (it
+    // predates the verb) is reported as a compat failure with fixed text.
+    assert_eq!(
+        exit_for_server_error("usage", "NotFound"),
+        EXIT_GENERIC,
+        "other verbs keep their generic mapping"
+    );
+    assert!(NEW_WINDOW_SKEW_MESSAGE.contains("predates this verb"));
+}
+
+#[test]
+fn window_new_without_a_live_instance_exits_6_and_creates_nothing() {
+    // bitty#1765 (slice 5): "no running instance reachable" is the existing
+    // exit-6 contract, not a silent success. An explicit socket that does not
+    // exist fails endpoint verification before any request byte is written.
+    let targeting = CtlTargeting {
+        socket: Some(String::from("/nonexistent/bitty-ctl-slice5.sock")),
+        instance: None,
+        format: CtlFormat::Json,
+    };
+    let exit = execute_ctl(&CtlRequest::NewWindow, &targeting);
+    assert_eq!(
+        exit, EXIT_RUNTIME,
+        "no live instance is exit 6 (unavailable), never 0"
+    );
 }
 
 #[test]

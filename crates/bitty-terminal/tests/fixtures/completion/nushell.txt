@@ -2601,6 +2601,7 @@ extern "bitty comp" [
 ]
 extern "bitty ctl instance list" []
 extern "bitty ctl window list" []
+extern "bitty ctl window new" []
 extern "bitty ctl view list" []
 extern "bitty ctl view split" []
 extern "bitty ctl view focus" []

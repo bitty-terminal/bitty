@@ -50,11 +50,27 @@ pub struct CtlTargeting {
 /// sockets and Windows instance pipes serve it (same dispatcher).
 pub const METHOD_LIST_PANELS: &str = "bitty.debug/listPanels";
 
+/// Wire method for `ctl window new` (bitty#1765, slice 5).
+///
+/// Declared here rather than in the `bitty-ipc` pin for the same reason as
+/// [`METHOD_LIST_PANELS`]: the pin's control-scope table is closed, so a pin
+/// that predates the verb refuses it with `NotFound` before enqueueing. The
+/// servo registers it additively on its own `Dispatcher`
+/// ([`crate::ipc_serve`]), and its handler authorizes `view.manage` itself
+/// against the live connection grant. An instance built before this verb
+/// answers an unknown method (`UnknownMethod`/`NotFound`), which the CLI
+/// reports as a protocol skew (exit 5) instead of pretending the request was
+/// carried.
+pub const METHOD_NEW_WINDOW: &str = "bitty.debug/newWindow";
+
 /// One validated `bitty ctl` operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtlRequest {
     InstanceList,
     WindowList,
+    /// `window new` (bitty#1765, slice 5): ask the running instance for one
+    /// more OS window through the registry's `NewWindow` path.
+    NewWindow,
     ViewList,
     PanelList,
     TerminalList,
@@ -119,6 +135,7 @@ impl CtlRequest {
         match self {
             Self::InstanceList => "core.instance.list",
             Self::WindowList => "core.window.list",
+            Self::NewWindow => "core.window.new",
             Self::ViewList => "core.view.list",
             Self::PanelList => "core.panel.list",
             Self::TerminalList => "core.terminal.list",
@@ -148,6 +165,7 @@ impl CtlRequest {
         match self {
             Self::InstanceList => None,
             Self::WindowList => Some(ipc_ctl::METHOD_LIST_WINDOWS),
+            Self::NewWindow => Some(METHOD_NEW_WINDOW),
             Self::ViewList => Some(ipc_ctl::METHOD_LIST_VIEWS),
             Self::PanelList => Some(METHOD_LIST_PANELS),
             Self::TerminalList => Some(ipc_ctl::METHOD_LIST_TERMINALS),
@@ -177,6 +195,7 @@ impl CtlRequest {
         match self {
             Self::InstanceList
             | Self::WindowList
+            | Self::NewWindow
             | Self::ViewList
             | Self::PanelList
             | Self::TerminalList
@@ -248,7 +267,7 @@ pub fn ctl_usage() -> String {
          \n\
          resources:\n\
          \x20 instance list\n\
-         \x20 window list\n\
+         \x20 window list | window new\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 panel list\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
@@ -291,6 +310,7 @@ pub fn ctl_help_text(verbose: bool) -> String {
          Verbs:\n  \
          instance list                 local discovery (no IPC; same-UID sockets only)\n  \
          window list                   core.window.list (view.inspect)\n  \
+         window new                    core.window.new (view.manage; one OS window)\n  \
          view list                     core.view.list (view.inspect)\n  \
          view split [--left|--right|--up|--down]\n                                \
          core.view.split (view.manage; default --right)\n  \
@@ -322,7 +342,7 @@ pub fn ctl_help_text(verbose: bool) -> String {
          workspace close (terminal.manage), and\n    \
          config reload (config.modify) need BITTY_CTL_ELEVATE;\n    \
          those four verbs fail closed (exit 7) without it.\n    \
-         view split / view focus (view.manage) and\n    \
+         view split / view focus (view.manage), window new (view.manage), and\n    \
          workspace list / new / focus / move / rename / move-panel need no elevation.\n  \
          - Send quoting: a bare CR needs\n    \
          ANSI-C quoting ($'\\r' in bash/zsh; in fish use (printf '\\r')).\n\
@@ -369,7 +389,7 @@ pub const CTL_HELP_CONTRACT: &str = "contract:\n  \
 /// unit test asserts every pair is documented and that completion offers it.
 pub const CTL_RESOURCES: &[(&str, &[&str])] = &[
     ("instance", &["list"]),
-    ("window", &["list"]),
+    ("window", &["list", "new"]),
     ("view", &["list", "split", "focus"]),
     ("panel", &["list"]),
     ("terminal", &["list", "spawn", "close", "send", "text"]),
@@ -650,6 +670,11 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             reject_extra(rest, "window list")?;
             reject_ctl_options_for("window list", split_dir.is_some(), spawn_cwd.is_some())?;
             Ok((CtlRequest::WindowList, targeting))
+        }
+        (Some("window"), Some("new")) => {
+            reject_extra(rest, "window new")?;
+            reject_ctl_options_for("window new", split_dir.is_some(), spawn_cwd.is_some())?;
+            Ok((CtlRequest::NewWindow, targeting))
         }
         (Some("view"), Some("list")) => {
             reject_extra(rest, "view list")?;

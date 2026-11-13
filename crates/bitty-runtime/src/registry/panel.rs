@@ -1682,8 +1682,11 @@ impl PanelRegistry {
     /// controller has `binding == None` and `last_controller_generation ==
     /// None`, so every caller presents the allocation epoch, hits the first arm,
     /// and behaves exactly as it did before the fence existed. Both new refusals
-    /// become reachable only on a panel that carries a binding, which the
-    /// generation edge creates and tests mint.
+    /// become reachable only on a panel that carries a binding: the generation
+    /// edge rebinds such a container through the panel-generation port when the
+    /// app installs one, and nothing writes a container's first binding yet
+    /// (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
+    /// follow-up (e)), so tests mint that one.
     ///
     /// Applied at the mount surface, which is the one C.5 names; the remaining
     /// panel verbs are wired by residual 2's phase 1/phase 2 work.
@@ -3981,8 +3984,11 @@ impl PanelRegistry {
     /// the owner and the controller generation in a single assignment: there is
     /// no way to reach a record holding one half of a binding.
     ///
-    /// The phase 2 step 2 writer is bitty#2476 residual 2; until it lands no
-    /// live path binds a controller, so only tests mint one here.
+    /// The phase 2 step 2 writer is `rebind_panel`, which the generation edge
+    /// reaches through the panel-generation port for a container that already
+    /// carries a binding. A container's first binding still has no live writer
+    /// (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
+    /// follow-up (e)), so this helper mints one here.
     #[cfg(test)]
     fn bind_controller_generation_for_test(
         &mut self,
@@ -4701,9 +4707,10 @@ mod rebind_panel_tests {
 /// Shape tests for the controller binding (OQ-084 D.2 phase 2, bitty#2476
 /// residual 1).
 ///
-/// The record carries the shape; nothing binds a controller on a live path yet,
-/// so these tests mint the binding directly and prove what the grant table does
-/// once one exists.
+/// The record carries the shape; a container's first binding still has no live
+/// writer (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
+/// follow-up (e)), so these tests mint the binding directly and prove what the
+/// grant table does once one exists.
 #[cfg(test)]
 mod controller_binding_shape_tests {
     use super::*;

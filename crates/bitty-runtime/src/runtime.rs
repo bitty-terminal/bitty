@@ -102,6 +102,7 @@ use bitty_render::{
     gpu::{GpuContext, PresentMode, Surface, SurfaceConfig, SurfaceFormat},
     grid::{CellMetrics, DrawList, GridRenderer, ScrollCopy, ThemePalette},
     grid_from_surface_extent, sanitize_dpi_scale,
+    windows::{WindowPresentReport, WindowSurfaceError, WindowSurfaces},
 };
 use bitty_term_state::search::{SearchMatch, SearchOptions};
 use bitty_term_state::{
@@ -656,6 +657,19 @@ pub struct Runtime {
     renderer: GridRenderer<FallbackRasterizer<AnyRasterizer>>,
     surface: Surface,
     gpu: Option<GpuContext>,
+    /// Presentation surfaces for admitted *secondary* OS windows
+    /// (bitty#1765, slice 2).
+    ///
+    /// `surface` above is the primary window's swap chain; every additional
+    /// window the composition root admits owns one row here, created through
+    /// the same `gpu` and presented with the same frame
+    /// ([`bitty_render::windows`]). Empty in every single-window and headless
+    /// run, where the fan-out costs one `is_empty` check per present.
+    window_surfaces: WindowSurfaces,
+    /// Cumulative drops of secondary-window surfaces that refused a frame
+    /// (bitty#1765, slice 2). Diagnostics only; see
+    /// [`Self::window_surface_drops`].
+    window_surface_drops: u64,
     /// Off-thread Wayland presenter (bitty#2830).
     ///
     /// `None` keeps the synchronous present path: that is every non-Wayland
@@ -2312,6 +2326,8 @@ impl Runtime {
             renderer,
             surface,
             gpu: None,
+            window_surfaces: WindowSurfaces::new(),
+            window_surface_drops: 0,
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
@@ -2645,6 +2661,8 @@ impl Runtime {
             renderer,
             surface,
             gpu: None,
+            window_surfaces: WindowSurfaces::new(),
+            window_surface_drops: 0,
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
@@ -2957,6 +2975,157 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
+    /// Creates and configures a presentation surface for an already-admitted
+    /// secondary window (bitty#1765, slice 2).
+    ///
+    /// The surface is created through the process's own [`GpuContext`] — one
+    /// instance, one adapter, one device, several swap chains — and configured
+    /// for `extent` at `opacity`, exactly like the primary's attach. The clear
+    /// colour follows the live surface palette (OSC 4/10/11 overrides
+    /// included), so a sibling window cannot paint a different background than
+    /// the primary.
+    ///
+    /// Fail-closed: a refusal from the platform or the driver leaves the
+    /// runtime's window set unchanged, so a window either paints or reports a
+    /// typed reason — never a half-attached row.
+    ///
+    /// # Errors
+    ///
+    /// - [`WindowSurfaceError::NoOwnedGpu`] when the process owns no GPU
+    ///   context: a headless run, or the off-thread Wayland presenter
+    ///   (bitty#2830) that holds the only context on its worker thread.
+    /// - Every [`bitty_render::windows::WindowSurfaces::attach`] failure
+    ///   (duplicate, over capacity, zero extent, create, configure).
+    pub fn attach_window_surface(
+        &mut self,
+        window: bitty_platform::WindowId,
+        target: &bitty_platform::SurfaceTarget,
+        extent: PhysicalSize,
+        opacity: f32,
+    ) -> Result<(), WindowSurfaceError> {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Err(WindowSurfaceError::NoOwnedGpu);
+        };
+        self.window_surfaces.attach(
+            window,
+            target,
+            extent,
+            opacity,
+            self.surface.theme_palette(),
+            gpu,
+        )
+    }
+
+    /// Registers an already-created surface for a secondary window.
+    ///
+    /// The seam for a surface the embedder created itself, and what keeps the
+    /// present fan-out testable without an adapter: a `Surface::headless` row
+    /// composites in-process through the same entry points a swap chain uses.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowSurfaceError::Duplicate`], [`WindowSurfaceError::OverCapacity`],
+    /// or [`WindowSurfaceError::ZeroExtent`]; nothing is registered on
+    /// refusal.
+    pub fn adopt_window_surface(
+        &mut self,
+        window: bitty_platform::WindowId,
+        surface: Surface,
+        extent: PhysicalSize,
+        opacity: f32,
+    ) -> Result<(), WindowSurfaceError> {
+        self.window_surfaces.adopt(window, surface, extent, opacity)
+    }
+
+    /// Reconfigures one secondary window's surface for a new extent.
+    ///
+    /// The caller passes the window's own physical inner size (re-read, never
+    /// cached); a zero extent means the window is minimized/occluded and keeps
+    /// the previous configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`WindowSurfaceError::Unknown`] for a window with no surface,
+    /// [`WindowSurfaceError::Configure`] when the swap chain refuses the
+    /// extent, [`WindowSurfaceError::NoOwnedGpu`] for a real surface with no
+    /// device.
+    pub fn resize_window_surface(
+        &mut self,
+        window: bitty_platform::WindowId,
+        extent: PhysicalSize,
+    ) -> Result<(), WindowSurfaceError> {
+        self.window_surfaces
+            .resize(window, extent, self.gpu.as_ref())
+    }
+
+    /// Releases one secondary window's surface, returning whether a row was
+    /// removed.
+    ///
+    /// Releasing the swap chain is what lets the OS window go away once its
+    /// handle is dropped, so a close request routes here before the window's
+    /// registry row is removed.
+    pub fn release_window_surface(&mut self, window: bitty_platform::WindowId) -> bool {
+        self.window_surfaces.release(window).is_some()
+    }
+
+    /// Identities of the windows that currently have a presentation surface.
+    #[must_use]
+    pub fn window_surface_ids(&self) -> Vec<bitty_platform::WindowId> {
+        self.window_surfaces.windows()
+    }
+
+    /// Extent one secondary window's surface is configured for.
+    #[must_use]
+    pub fn window_surface_extent(&self, window: bitty_platform::WindowId) -> Option<PhysicalSize> {
+        self.window_surfaces.get(window).map(|row| row.extent())
+    }
+
+    /// Whether any secondary window has a surface (one compare per present).
+    #[must_use]
+    pub fn has_window_surfaces(&self) -> bool {
+        !self.window_surfaces.is_empty()
+    }
+
+    /// Cumulative count of secondary-window surfaces released because they
+    /// refused a frame (bitty#1765, slice 2).
+    ///
+    /// The embedder compares this against its own last-seen value to report a
+    /// dropped window once, instead of the runtime logging from inside the
+    /// present path. Monotonic; wraps only in theory.
+    #[must_use]
+    pub fn window_surface_drops(&self) -> u64 {
+        self.window_surface_drops
+    }
+
+    /// One-line `id:WxH` summary of the secondary surfaces, for lifecycle logs.
+    #[must_use]
+    pub fn window_surface_summary(&self) -> String {
+        self.window_surfaces.summary()
+    }
+
+    /// Presents one already-built frame to every secondary window's surface
+    /// (bitty#1765, slice 2).
+    ///
+    /// Split out of the tick present path so the fan-out is reachable from a
+    /// test without building a full frame: the renderer route follows the
+    /// primary's own policy (`gpu` present when a context is owned, headless
+    /// composite otherwise). A sibling that refuses the frame is dropped and
+    /// reported; it can never fail the primary's present.
+    pub fn present_window_surfaces(
+        &mut self,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], bitty_render::atlas::AtlasDims)>,
+        color_atlas: Option<(&[u8], bitty_render::atlas::AtlasDims)>,
+    ) -> WindowPresentReport {
+        let report =
+            self.window_surfaces
+                .present_all(self.gpu.as_ref(), draw_list, atlas, color_atlas);
+        self.window_surface_drops = self
+            .window_surface_drops
+            .saturating_add(report.dropped() as u64);
+        report
+    }
+
     /// Attaches the off-thread Wayland presenter (bitty#2830).
     ///
     /// The real [`Surface`] and [`GpuContext`] move to the dedicated
@@ -3023,6 +3192,11 @@ impl Runtime {
         self.shutdown_presenter();
         self.surface = mirror;
         self.gpu = None;
+        // bitty#1765 (slice 2): the primary surface (and the context with it)
+        // just moved to the worker, so the runtime owns no device to present a
+        // sibling surface with. Row release is fail-closed: a swap chain
+        // presented to a device that did not create it fails validation.
+        self.window_surfaces.release_all();
         self.presenter = Some(presenter);
         self.pending_present = None;
         self.presenter_retry_at = None;
@@ -3058,6 +3232,10 @@ impl Runtime {
             }
         }
         self.gpu = None;
+        // bitty#1765 (slice 2): the device that created every sibling surface
+        // is being dropped here, so their swap chains are released rather than
+        // left to fail validation on the next present.
+        self.window_surfaces.release_all();
         self.pending_present = None;
         self.presenter_retry_at = None;
         self.presenter_reattach_at = None;

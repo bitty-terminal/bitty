@@ -1594,11 +1594,13 @@ jobs:
   windows:
     name: Windows check and test
     runs-on: windows-latest
-    # A Cargo.lock dependency bump invalidates rust-cache, so a cold Windows
-    # run needs ~31-33 minutes: every test step passes, then the post-cache
-    # save expires at the old 30-minute ceiling. 40 keeps the gate honest
-    # (each test step has its own bounds) without failing on cache-write time.
-    timeout-minutes: 40
+    # 40 no longer fits a warm-cache run: `Run tests (nextest ci profile)`
+    # alone takes ~24 minutes, and the `Run compat release matrix` step that
+    # follows it was still running when the ceiling cancelled the job at
+    # 40:0x on four consecutive runs (main 43311837317 / 43339768784 /
+    # 43368187475, PR #3134 run 43373625694). 60 covers nextest plus the
+    # compat matrix; each test step still has its own bounds.
+    timeout-minutes: 60
     env:
       # W-105: compat-lab suites run from this pinned checkout (see the
       # validation-pins steps below); runtime M1 suites run in-workspace.

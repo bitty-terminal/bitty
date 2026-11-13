@@ -6,7 +6,8 @@ use std::thread::JoinHandle;
 
 use bitty_platform::{
     AppHandler, EventContext, EventWaker, LogicalKey, LogicalSize, MouseButton, NamedKey,
-    PhysicalSize, PlatformEvent, PressState, WindowConfig, WindowEventKind, WindowHandle, WindowId,
+    PhysicalSize, PlatformEvent, PressState, SurfaceTarget, WindowConfig, WindowEventKind,
+    WindowHandle, WindowId,
 };
 use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, OverlayKeyChord, PluginRuntime, WorkspaceRequest};
@@ -920,6 +921,18 @@ pub(crate) struct TerminalApp {
     /// has a platform context. Bounded by the registry ceiling so input can
     /// never queue unbounded window creation.
     pub(crate) pending_new_windows: usize,
+    /// Secondary windows whose first surface attach was deferred because the
+    /// OS window reported no size yet (bitty#1765, slice 2).
+    ///
+    /// Bounded by the registry ceiling: only a registered window can be
+    /// deferred, and the first non-zero `Resized` retries the attach exactly
+    /// once, so a deferred window cannot turn every later resize into another
+    /// attach attempt.
+    pub(crate) deferred_window_surfaces: Vec<WindowId>,
+    /// Last `bitty_runtime::Runtime::window_surface_drops` value this app
+    /// reported, so a released secondary surface is logged once instead of on
+    /// every subsequent tick (bitty#1765, slice 2).
+    pub(crate) window_surface_drops_logged: u64,
     /// Demo pump channel when explicitly attached for debug/tests
     /// (`None` in real sessions — CTX-0167).
     pub(crate) pty_rx: Option<Receiver<Vec<u8>>>,
@@ -1205,6 +1218,8 @@ impl TerminalApp {
             window: WindowState::new(theme_name, source),
             windows: crate::window_registry::WindowRegistry::new(),
             pending_new_windows: 0,
+            deferred_window_surfaces: Vec::new(),
+            window_surface_drops_logged: 0,
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
@@ -1273,6 +1288,8 @@ impl TerminalApp {
             window: WindowState::new(theme_name, source),
             windows: crate::window_registry::WindowRegistry::new(),
             pending_new_windows: 0,
+            deferred_window_surfaces: Vec::new(),
+            window_surface_drops_logged: 0,
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
@@ -2509,6 +2526,10 @@ impl TerminalApp {
         if let Some(present) = stats {
             self.note_presented(&present);
         }
+        // bitty#1765 (slice 2): a secondary window whose surface refused this
+        // frame was released by the runtime; report it once, here, where the
+        // app already accounts the presented frame.
+        self.report_window_surface_drops();
         self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
         // present, IME sync, and the PTY reply flush, so a slow Lua handler
@@ -4911,6 +4932,19 @@ impl TerminalApp {
             match self.windows.admit(outcome) {
                 Ok(id) => {
                     admitted += 1;
+                    // bitty#1765 (slice 2): give the admitted window a real
+                    // presentation surface through the runtime's fleet, then
+                    // record what actually happened on the row. A refusal
+                    // (no owned GPU context on the off-thread Wayland
+                    // presenter, or a driver/compositor refusal) leaves the
+                    // row `Unattached` — the window exists and is contained,
+                    // it just does not paint.
+                    let attached = self
+                        .windows
+                        .get(id)
+                        .and_then(|row| row.surface.clone())
+                        .map(|target| self.attach_secondary_surface(id, &target))
+                        .unwrap_or(false);
                     if let Some(row) = self.windows.get(id) {
                         // Read the admitted row back through its identity: the
                         // log names the registry key, the payload's own window
@@ -4919,13 +4953,15 @@ impl TerminalApp {
                         // log instead of hidden behind an assumed field.
                         crate::logging::info(|| {
                             format!(
-                                "bitty: window registered id={} handle={} surface={} state={} windows={:?} active={:?} renderer=primary-only",
+                                "bitty: window registered id={} handle={} surface={} state={} painted={} windows={:?} active={:?} window_surfaces=[{}]",
                                 row.id.get(),
                                 row.handle.id().get(),
                                 row.surface.is_some(),
                                 row.state.label(),
+                                attached,
                                 self.windows.ids(),
-                                self.windows.active()
+                                self.windows.active(),
+                                self.runtime.window_surface_summary()
                             )
                         });
                     }
@@ -4975,31 +5011,173 @@ impl TerminalApp {
     }
 
     /// Contains one event that belongs to a registered secondary window
-    /// (bitty#1765, slice 1).
+    /// (bitty#1765).
     ///
-    /// A close request closes exactly that window: removing its row releases
-    /// the last handle, so the OS window goes away without touching the
-    /// primary's close gate or the process exit path. Every other kind is
-    /// recorded loudly and dropped — a secondary window has no renderer, no
-    /// focus and no PTY of its own yet, so forwarding its event would mutate
-    /// the primary's state.
+    /// A close request closes exactly that window: its presentation surface is
+    /// released first (the swap chain must outlive nothing but its window), then
+    /// removing the row releases the last handle, so the OS window goes away
+    /// without touching the primary's close gate or the process exit path.
+    ///
+    /// A size change is the one other kind that is *acted* on rather than
+    /// dropped: a secondary window owns a surface of its own, so its
+    /// `Resized`/`ScaleFactorChanged` reconfigures that surface at the window's
+    /// own physical size (bitty#1765, slice 2). Every remaining kind is recorded
+    /// loudly and dropped — a secondary window still has no focus tree, PTY or
+    /// IME session of its own, so forwarding its event would mutate the
+    /// primary's state.
     fn contain_secondary_window_event(&mut self, id: WindowId, kind: &WindowEventKind) {
-        if matches!(kind, WindowEventKind::CloseRequested) {
-            if self.windows.remove(id).is_some() {
-                crate::logging::info(|| {
-                    format!(
-                        "bitty: secondary window closed id={} windows={:?}",
-                        id.get(),
-                        self.windows.ids()
-                    )
-                });
+        match kind {
+            WindowEventKind::CloseRequested => {
+                let released = self.runtime.release_window_surface(id);
+                if self.windows.remove(id).is_some() {
+                    self.deferred_window_surfaces
+                        .retain(|pending| *pending != id);
+                    crate::logging::info(|| {
+                        format!(
+                            "bitty: secondary window closed id={} surface_released={released} windows={:?} window_surfaces=[{}]",
+                            id.get(),
+                            self.windows.ids(),
+                            self.runtime.window_surface_summary()
+                        )
+                    });
+                }
+                return;
             }
-            return;
+            WindowEventKind::Resized(_) | WindowEventKind::ScaleFactorChanged(_) => {
+                self.refresh_secondary_window_surface(id);
+                return;
+            }
+            _ => {}
         }
         crate::logging::info(|| {
             format!(
                 "bitty: secondary window event contained id={} kind={kind:?} (no per-window routing yet)",
                 id.get()
+            )
+        });
+    }
+
+    /// Gives a newly admitted secondary window a real presentation surface
+    /// (bitty#1765, slice 2).
+    ///
+    /// The runtime creates the surface through the process's own GPU context
+    /// (one instance/device, one more swap chain) and configures it at the
+    /// window's current physical size and the window's opacity; success flips
+    /// the registry row to [`SurfaceState::Attached`], so a row never claims a
+    /// surface that does not exist. Every refusal is typed, logged once, and
+    /// leaves the row `Unattached` — the window keeps existing and stays
+    /// contained, it just does not paint.
+    ///
+    /// A window that reports no size yet (created before the compositor sized
+    /// it) is *deferred*, not refused: the first `Resized` with a non-zero size
+    /// retries exactly once (see
+    /// [`Self::refresh_secondary_window_surface`]), so the deferral cannot turn
+    /// every later resize into another attach attempt.
+    ///
+    /// Returns whether the window now has a surface.
+    fn attach_secondary_surface(&mut self, id: WindowId, target: &SurfaceTarget) -> bool {
+        let inner = target.inner_size();
+        if inner.width() == 0 || inner.height() == 0 {
+            if !self.deferred_window_surfaces.contains(&id) {
+                self.deferred_window_surfaces.push(id);
+            }
+            crate::logging::info(|| {
+                format!(
+                    "bitty: secondary window surface deferred id={} (zero-size window; retried on first resize)",
+                    id.get()
+                )
+            });
+            return false;
+        }
+        self.deferred_window_surfaces
+            .retain(|pending| *pending != id);
+        match self
+            .runtime
+            .attach_window_surface(id, target, inner, self.window.opacity)
+        {
+            Ok(()) => {
+                self.windows.mark_attached(id);
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: secondary window surface attached id={} extent={}x{} opacity={:.3} window_surfaces=[{}]",
+                        id.get(),
+                        inner.width(),
+                        inner.height(),
+                        bitty_platform::sanitize_opacity(self.window.opacity),
+                        self.runtime.window_surface_summary()
+                    )
+                });
+                true
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "warning: secondary window paints nothing id={} ({error}) — window kept, no surface",
+                        id.get()
+                    )
+                });
+                false
+            }
+        }
+    }
+
+    /// Re-reads a secondary window's size and either attaches its deferred
+    /// surface or reconfigures the one it has (bitty#1765, slice 2).
+    ///
+    /// The size is re-read from the window's [`SurfaceTarget`] rather than
+    /// taken from the event payload: a `ScaleFactorChanged` carries no size at
+    /// all (winit 0.30 dropped the negotiation hook), and the platform's own
+    /// contract is to read the current physical size instead of caching it.
+    fn refresh_secondary_window_surface(&mut self, id: WindowId) {
+        let Some(target) = self.windows.get(id).and_then(|row| row.surface.clone()) else {
+            return;
+        };
+        let inner = target.inner_size();
+        if self.deferred_window_surfaces.contains(&id) {
+            if inner.width() > 0 && inner.height() > 0 {
+                self.attach_secondary_surface(id, &target);
+            }
+            return;
+        }
+        match self.runtime.resize_window_surface(id, inner) {
+            Ok(()) => {
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: secondary window surface reconfigured id={} extent={}x{} window_surfaces=[{}]",
+                        id.get(),
+                        inner.width(),
+                        inner.height(),
+                        self.runtime.window_surface_summary()
+                    )
+                });
+            }
+            Err(error) => {
+                crate::logging::warn(|| {
+                    format!(
+                        "warning: secondary window surface not reconfigured id={} ({error})",
+                        id.get()
+                    )
+                });
+            }
+        }
+    }
+
+    /// Reports secondary-window surfaces the runtime released because they
+    /// refused a frame (bitty#1765, slice 2).
+    ///
+    /// Called once per tick; the comparison against the last reported count
+    /// keeps this silent on the steady path (no drop, no log, no formatting).
+    fn report_window_surface_drops(&mut self) {
+        let drops = self.runtime.window_surface_drops();
+        if drops == self.window_surface_drops_logged {
+            return;
+        }
+        let new_drops = drops.saturating_sub(self.window_surface_drops_logged);
+        self.window_surface_drops_logged = drops;
+        crate::logging::warn(|| {
+            format!(
+                "warning: {new_drops} secondary window surface(s) released after refusing a frame; remaining window_surfaces=[{}]",
+                self.runtime.window_surface_summary()
             )
         });
     }

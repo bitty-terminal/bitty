@@ -8687,6 +8687,22 @@ impl Runtime {
         };
         self.mark_frame_presented(snapshot.generation);
         self.publish_presented_allocations(allocations, focused);
+        // bitty#1765 (slice 2): the frame the primary just painted is the frame
+        // every admitted secondary window shows. Same draw list, same atlases,
+        // each surface at its own extent. The fan-out contains its own
+        // failures — a sibling that refuses is released and counted — so it
+        // can never fail the primary's present, clear its confirmation, or arm
+        // its retry.
+        if self.has_window_surfaces() {
+            // The report is diagnostics: `window_surface_drops` carries the
+            // count to the embedder's lifecycle log, and the released rows are
+            // already gone from the set named by `window_surface_summary`.
+            self.present_window_surfaces(
+                &combined_list,
+                Some((&atlas_texels, dims)),
+                color_atlas_arg,
+            );
+        }
         // bitty#2989: a real (non-headless) synchronous present is committed to
         // the compositor but not yet confirmed by it. The embedder clears this
         // bound when the compositor serves the frame callback; a headless
@@ -16446,5 +16462,172 @@ mod prompt_reveal_tests {
             prompt_row_has_ink(&actual, pane),
             "the workspace prompt written while hidden must be painted after the reveal"
         );
+    }
+}
+
+#[cfg(test)]
+mod second_window_surface_tests {
+    //! bitty#1765 (slice 2): a second OS window's surface really receives the
+    //! frame the primary just painted.
+    //!
+    //! The stack under test is the production one: the runtime's own present
+    //! path (`present_assembled_frame`) fans the frame out to every attached
+    //! secondary surface. Only the *surface* is a headless fake — the same
+    //! substitution the primary's own headless present already uses, and the
+    //! only one available on a CI runner with no display server or adapter.
+
+    use crate::runtime::{Runtime, RuntimeConfig};
+    use bitty_platform::{PhysicalSize, WindowId};
+    use bitty_render::gpu::Surface;
+    use std::time::{Duration, Instant};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    fn window(raw: u64) -> WindowId {
+        WindowId::from_raw_public(raw)
+    }
+
+    #[test]
+    fn a_second_window_surface_paints_the_same_frame_as_the_primary() {
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"first window\r\n");
+        assert!(
+            rt.tick_at(Instant::now()).is_some(),
+            "the primary frame presents"
+        );
+        let extent = rt.surface_extent().expect("primary surface configured");
+        // The sibling starts at the primary's extent so the two composites are
+        // byte-comparable; a differently sized sibling scales, which the
+        // resize test covers.
+        let secondary = Surface::headless(extent).expect("non-zero extent");
+        rt.adopt_window_surface(window(2), secondary, extent, 1.0)
+            .expect("the second window takes a surface row");
+        assert_eq!(rt.window_surface_ids(), vec![window(2)]);
+        assert!(rt.has_window_surfaces());
+
+        // New output, then the next frame: the sibling must paint it too.
+        rt.handle_pty_bytes(b"second window\r\n");
+        assert!(
+            rt.tick_at(Instant::now() + Duration::from_millis(50))
+                .is_some(),
+            "the next frame presents"
+        );
+
+        let primary = rt.headless_rgba().expect("primary composited a frame");
+        let sibling = rt
+            .window_surfaces
+            .get(window(2))
+            .expect("the row survives a successful present")
+            .headless_rgba()
+            .expect("the second window composited the frame");
+        assert_eq!(
+            sibling.len(),
+            primary.len(),
+            "the sibling painted at its own configured extent"
+        );
+        assert_eq!(
+            sibling, primary,
+            "the second window shows exactly the frame the primary painted"
+        );
+        assert_eq!(
+            rt.window_surface_drops(),
+            0,
+            "a surface that accepted the frame is never reported as dropped"
+        );
+    }
+
+    #[test]
+    fn closing_a_second_window_releases_only_its_surface() {
+        let mut rt = runtime();
+        let extent = PhysicalSize::new(64, 48);
+        rt.adopt_window_surface(
+            window(2),
+            Surface::headless(extent).expect("non-zero extent"),
+            extent,
+            1.0,
+        )
+        .unwrap();
+        rt.adopt_window_surface(
+            window(3),
+            Surface::headless(extent).expect("non-zero extent"),
+            extent,
+            0.9,
+        )
+        .unwrap();
+        assert!(rt.release_window_surface(window(2)));
+        assert_eq!(rt.window_surface_ids(), vec![window(3)]);
+        assert_eq!(
+            rt.window_surface_extent(window(3)),
+            Some(extent),
+            "the survivor keeps its own configuration"
+        );
+        assert!(
+            !rt.release_window_surface(window(2)),
+            "releasing a closed window is a no-op, not a corruption"
+        );
+        assert_eq!(rt.window_surface_summary(), "3:64x48");
+    }
+
+    #[test]
+    fn a_second_window_resize_reconfigures_its_own_surface_only() {
+        let mut rt = runtime();
+        let extent = PhysicalSize::new(64, 48);
+        for raw in [2, 3] {
+            rt.adopt_window_surface(
+                window(raw),
+                Surface::headless(extent).expect("non-zero extent"),
+                extent,
+                1.0,
+            )
+            .unwrap();
+        }
+        rt.resize_window_surface(window(2), PhysicalSize::new(96, 72))
+            .expect("a headless row reconfigures without an adapter");
+        assert_eq!(
+            rt.window_surface_extent(window(2)),
+            Some(PhysicalSize::new(96, 72))
+        );
+        assert_eq!(
+            rt.window_surface_extent(window(3)),
+            Some(extent),
+            "the sibling is untouched"
+        );
+        // A zero extent is a minimized window: the configuration is kept.
+        rt.resize_window_surface(window(2), PhysicalSize::new(0, 0))
+            .expect("zero extents are skipped");
+        assert_eq!(
+            rt.window_surface_extent(window(2)),
+            Some(PhysicalSize::new(96, 72))
+        );
+        assert!(matches!(
+            rt.resize_window_surface(window(9), PhysicalSize::new(8, 8)),
+            Err(bitty_render::windows::WindowSurfaceError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn detaching_the_primary_gpu_releases_every_secondary_surface() {
+        let mut rt = runtime();
+        let extent = PhysicalSize::new(64, 48);
+        rt.adopt_window_surface(
+            window(2),
+            Surface::headless(extent).expect("non-zero extent"),
+            extent,
+            1.0,
+        )
+        .unwrap();
+        assert!(rt.has_window_surfaces());
+        // The device that created the sibling surface is going away with the
+        // primary's attach: presenting a swap chain to a device that did not
+        // create it is a validation failure, so the rows are released instead.
+        rt.detach_gpu();
+        assert!(
+            !rt.has_window_surfaces(),
+            "no sibling surface outlives the device that created it"
+        );
+        assert_eq!(rt.window_surface_summary(), "");
     }
 }

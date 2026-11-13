@@ -1558,6 +1558,15 @@ impl TerminalApp {
                     }
                 }
             }
+            A::NewWindow => {
+                // bitty#1765 (slice 1): the command never writes a window
+                // pointer from the input hot path. It latches one bounded
+                // request; the event loop performs it through
+                // `EventContext::create_window` on its next ctx-bearing turn
+                // (`TerminalApp::service_new_window_requests`), so a refusal
+                // from the platform is logged there instead of panicking here.
+                let _latched = self.request_new_window();
+            }
             A::InvokeCommand(invocation) => {
                 let qualified = invocation.target();
                 // CTX-1241 (issue #2091): the core-owned scratchpad toggle

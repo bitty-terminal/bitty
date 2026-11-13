@@ -19163,3 +19163,164 @@ fn close_last_float_on_empty_base_keeps_workspace_and_focuses_pin_3074() {
         "focus must fall back to the surviving pinned panel"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bitty#1765 (slice 1): window registry and the `new_window` Core command
+// ---------------------------------------------------------------------------
+//
+// The registry row semantics (a second window, independent addressing, close
+// isolation, refusal) are pinned headlessly in `crate::window_registry::tests`
+// with a constructible window payload, because `WindowHandle` cannot be built
+// without a display server. The tests here pin the app half that needs no
+// platform context: the command is a bounded request on the input path.
+// `window_registry_command` (feature-gated) pins the half that drives the real
+// `AppHandler` against a refusing platform.
+
+/// Headless app with no plugin runtime and no live window.
+fn window_registry_app() -> TerminalApp {
+    headless_app_with_runtime_config(bitty_runtime::RuntimeConfig::default())
+}
+
+#[test]
+fn new_window_command_latches_one_request_and_creates_no_window_on_the_input_path() {
+    let mut app = window_registry_app();
+    assert!(app.windows.is_empty(), "precondition: no window registered");
+    assert_eq!(app.pending_new_windows, 0);
+
+    let exit = app.apply_chrome_action(bitty_config::ChromeAction::NewWindow);
+
+    assert!(
+        !exit,
+        "new_window is not the last-pane window-close gesture"
+    );
+    assert_eq!(app.pending_new_windows, 1, "exactly one bounded request");
+    assert!(
+        app.windows.is_empty(),
+        "the command never creates a window on the input hot path"
+    );
+    assert_eq!(app.windows.active(), None, "nothing to attribute yet");
+    assert!(
+        app.window.handle.is_none(),
+        "the single-window state is untouched"
+    );
+}
+
+#[test]
+fn new_window_is_a_registry_spelling_with_no_default_chord() {
+    // The command resolves through the shared action vocabulary, so a user
+    // keymap and `bitty list actions` see the same spelling.
+    let action = bitty_config::ChromeAction::parse("new_window").expect("registered action");
+    assert_eq!(action, bitty_config::ChromeAction::NewWindow);
+    assert_eq!(
+        bitty_config::ChromeAction::parse("new_os_window").expect("kitty spelling"),
+        bitty_config::ChromeAction::NewWindow
+    );
+    assert_eq!(
+        bitty_config::ChromeAction::NewWindow.canonical(),
+        "new_window"
+    );
+    assert!(
+        bitty_config::ChromeAction::NewWindow.is_manual_bind_only(),
+        "a fresh config stays byte-identical: multi-surface presentation is an opt-in"
+    );
+    assert!(
+        bitty_config::keymap::all_chrome_actions().contains(&bitty_config::ChromeAction::NewWindow),
+        "the action catalog carries the command"
+    );
+    // The Core command registry names the same behaviour (bitty#1765).
+    let info = crate::inspect::lookup_core_command("core.window.new")
+        .expect("the registry surfaces the new-window command");
+    assert_eq!(info.class, "runtime");
+    assert_eq!(info.scopes, &["view.manage"]);
+}
+
+#[test]
+fn a_requested_window_inherits_the_live_window_chrome() {
+    // Reference behaviour: a new window is a peer of the focused one, so it
+    // inherits the resolved title, opacity, and blur rather than opening with
+    // platform defaults.
+    let mut app = window_registry_app();
+    app.window.opacity = 0.5;
+    app.window.blur_radius = 8;
+
+    let config = app.window_config();
+
+    assert_eq!(config.opacity(), 0.5, "opacity is inherited");
+    assert_eq!(config.blur_radius(), 8, "blur radius is inherited");
+    let size = TerminalApp::default_window_size();
+    assert_eq!((size.width().get(), size.height().get()), (800.0, 600.0));
+}
+
+/// The command half that needs a platform context (`ctx.create_window`).
+///
+/// The recording context refuses every native window, which is exactly the
+/// headless backend `EventContext::create_window` maps to
+/// `PlatformError::WindowCreation`: these tests prove the command really takes
+/// that path and that the refusal registers nothing.
+#[cfg(feature = "input-vm-test-support")]
+mod window_registry_command {
+    use super::*;
+    use bitty_platform::app::RecordingOperation;
+    use bitty_platform::{AppHandler, EventContext, WindowId};
+    use std::cell::RefCell;
+
+    /// Drives one platform event through the real `AppHandler` with the
+    /// recording context (no window system, no GPU, no PTY).
+    fn drive(
+        app: &mut TerminalApp,
+        operations: &RefCell<Vec<RecordingOperation>>,
+        id: u64,
+        kind: WindowEventKind,
+    ) {
+        let mut context = EventContext::recording(operations);
+        <TerminalApp as AppHandler>::handle_event(
+            app,
+            &mut context,
+            PlatformEvent::Window {
+                window_id: WindowId::from_raw_public(id),
+                kind,
+            },
+        );
+    }
+
+    #[test]
+    fn new_window_command_reaches_the_platform_seam_and_a_refusal_registers_nothing() {
+        let mut app = window_registry_app();
+        let operations = RefCell::new(Vec::new());
+        app.apply_chrome_action(bitty_config::ChromeAction::NewWindow);
+        let before = app.windows.summary();
+
+        drive(&mut app, &operations, 1, WindowEventKind::RedrawRequested);
+
+        let recorded = operations.borrow().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|operation| matches!(operation, RecordingOperation::WindowCreationRefused)),
+            "the command must route to EventContext::create_window, not to a field write: {recorded:?}"
+        );
+        assert_eq!(
+            app.pending_new_windows, 0,
+            "the latched request is consumed exactly once"
+        );
+        assert_eq!(app.windows.len(), 0, "a refused creation registers no row");
+        assert_eq!(app.windows.summary(), before, "no row was touched");
+        assert_eq!(app.windows.active(), None);
+        assert!(
+            app.window.handle.is_none(),
+            "the single-window state is untouched by the refusal"
+        );
+    }
+
+    #[test]
+    fn window_events_naming_an_unregistered_window_change_no_attribution() {
+        // An OS event for a window this process never admitted is a no-op, so
+        // a stale or foreign identity can never steal the primary's
+        // attribution.
+        let mut app = window_registry_app();
+        let operations = RefCell::new(Vec::new());
+        drive(&mut app, &operations, 42, WindowEventKind::Focused(true));
+        assert!(app.windows.is_empty());
+        assert_eq!(app.windows.active(), None);
+    }
+}

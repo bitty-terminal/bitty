@@ -2096,6 +2096,11 @@ impl Runtime {
         // detached rather than joined, so teardown never depends on a driver
         // call returning.
         self.shutdown_presenter();
+        // bitty#1765 (slice 4): instance shutdown drops every secondary
+        // window's swap chain, in registry order, exactly once. Without this a
+        // sibling surface would only go away when the process exits, which is
+        // not a teardown the embedder can observe or test.
+        self.release_all_window_surfaces();
         // CTX-1361: stop every recorded component child before the PTY
         // teardown so no coprocess outlives the instance.
         if let Some(host) = self.component_host.as_mut() {
@@ -3063,15 +3068,82 @@ impl Runtime {
     ///
     /// Releasing the swap chain is what lets the OS window go away once its
     /// handle is dropped, so a close request routes here before the window's
-    /// registry row is removed.
+    /// registry row is removed. Idempotent: a second release for the same
+    /// window reports `false` and touches no ledger counter, so a retried close
+    /// can never drop one surface twice.
     pub fn release_window_surface(&mut self, window: bitty_platform::WindowId) -> bool {
         self.window_surfaces.release(window).is_some()
+    }
+
+    /// Releases every secondary window's surface in attachment order
+    /// (bitty#1765, slice 4), returning the identities in the order they were
+    /// dropped.
+    ///
+    /// Called from [`Self::shutdown_with_timeout`], so instance teardown drops
+    /// every sibling swap chain instead of leaving them to process exit. The
+    /// order is the app's registry order (windows are admitted one after
+    /// another), and each surface is dropped exactly once — the app's own
+    /// per-window teardown can therefore run before or after this and the
+    /// ledger still balances.
+    pub fn release_all_window_surfaces(&mut self) -> Vec<bitty_platform::WindowId> {
+        self.window_surfaces.release_all_ordered()
+    }
+
+    /// Hands the primary role to a surviving window's already-attached surface
+    /// (bitty#1765, slice 4).
+    ///
+    /// Used when the primary window closes while other windows remain: the
+    /// survivor's swap chain *moves* out of the secondary fleet into
+    /// `Runtime::surface`, and the old primary surface — bound to the window
+    /// being destroyed — is dropped by the same assignment. Moving, rather than
+    /// creating a second surface for the same window, is what keeps the
+    /// create/release ledger at exactly one drop per created surface.
+    ///
+    /// # Errors
+    ///
+    /// - [`WindowSurfaceError::PrimaryOwnedByPresenter`] when the off-thread
+    ///   Wayland presenter holds the primary surface; handing it a different
+    ///   window is not implemented, so the promotion is refused.
+    /// - [`WindowSurfaceError::Unknown`] when the promoted window has no
+    ///   attached surface (its attach was refused or deferred): promoting it
+    ///   would leave the instance painting nothing.
+    pub fn promote_window_surface(
+        &mut self,
+        window: bitty_platform::WindowId,
+    ) -> Result<(), WindowSurfaceError> {
+        if self.presenter.is_some() {
+            return Err(WindowSurfaceError::PrimaryOwnedByPresenter);
+        }
+        let row = self
+            .window_surfaces
+            .take_for_primary(window)
+            .ok_or(WindowSurfaceError::Unknown(window))?;
+        let (surface, _extent, _opacity) = row.into_parts();
+        // Keep the live palette (OSC 4/10/11 overrides included): the promoted
+        // window must not paint a different background than the closed primary
+        // did.
+        surface.set_theme_palette(self.surface.theme_palette());
+        // Drops the closed window's swap chain exactly once.
+        self.surface = surface;
+        self.pending_present = None;
+        self.pending_full_redraw = true;
+        Ok(())
     }
 
     /// Identities of the windows that currently have a presentation surface.
     #[must_use]
     pub fn window_surface_ids(&self) -> Vec<bitty_platform::WindowId> {
         self.window_surfaces.windows()
+    }
+
+    /// Lifetime create/release counters of the secondary surface fleet
+    /// (bitty#1765, slice 4).
+    ///
+    /// The embedder reads this at teardown so a leaked swap chain is visible as
+    /// `live() != 0` in the lifecycle log.
+    #[must_use]
+    pub fn window_surface_ledger(&self) -> bitty_render::windows::SurfaceLedger {
+        self.window_surfaces.ledger()
     }
 
     /// Extent one secondary window's surface is configured for.

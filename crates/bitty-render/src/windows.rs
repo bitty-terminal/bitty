@@ -34,6 +34,25 @@
 //!   retries on the next frame, and a permanently broken one is released and
 //!   reported — so one bad window can never fail the primary's frame.
 //!
+//! # Teardown and drop accounting (bitty#1765, slice 4)
+//!
+//! Every row has exactly one owner, so every swap chain is dropped exactly
+//! once and only by the paths here:
+//!
+//! - [`WindowSurfaces::release`] for one window (the close path);
+//! - [`WindowSurfaces::take_for_primary`] when a survivor is promoted to the
+//!   primary role: the row's surface is *moved* into `Runtime::surface`, never
+//!   copied and never re-created, so the promotion cannot leak or double-free
+//!   the swap chain;
+//! - [`WindowSurfaces::release_all_ordered`] / [`WindowSurfaces::release_all`]
+//!   for instance teardown and for the loss of the device that created them;
+//! - the permanent present failure inside [`WindowSurfaces::present_all`].
+//!
+//! Those four paths are the only writers of the fleet's [`SurfaceLedger`], a
+//! pair of monotonic counters (`created`, `released`). `live()` is their
+//! difference, so "no leak" and "no double drop" become checkable numbers
+//! across repeated create/close cycles instead of an assumption.
+//!
 //! # Honest scope
 //!
 //! Only the synchronous presentation path can create these surfaces: the
@@ -78,6 +97,47 @@ fn is_transient(failure: &PresentFailure) -> bool {
 /// would be a resource the app can never address.
 pub const MAX_WINDOW_SURFACES: usize = bitty_platform::MAX_OS_WINDOWS;
 
+/// Monotonic create/release counters for the surface fleet (bitty#1765,
+/// slice 4).
+///
+/// Two counters rather than a live gauge because a gauge cannot distinguish
+/// "never created" from "created and dropped twice": `created` tags every row
+/// that came into existence and `released` tags every row that went away, so
+/// `released <= created` is the no-double-drop invariant and
+/// `created - released == len()` is the no-leak one. Both only ever increase,
+/// which is what makes them comparable across repeated create/close cycles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceLedger {
+    /// Rows that came into existence ([`WindowSurfaces::adopt`] /
+    /// [`WindowSurfaces::attach`]).
+    created: u64,
+    /// Rows that were dropped again, by any of the four teardown paths.
+    released: u64,
+}
+
+impl SurfaceLedger {
+    /// Rows created since the fleet was built.
+    #[must_use]
+    pub const fn created(self) -> u64 {
+        self.created
+    }
+
+    /// Rows released since the fleet was built.
+    #[must_use]
+    pub const fn released(self) -> u64 {
+        self.released
+    }
+
+    /// Created minus released: the number of swap chains still held.
+    ///
+    /// Equals [`WindowSurfaces::len`] by construction, so a mismatch is a
+    /// bookkeeping defect rather than an accounting policy.
+    #[must_use]
+    pub const fn live(self) -> u64 {
+        self.created.saturating_sub(self.released)
+    }
+}
+
 /// One secondary window's presentation surface.
 #[derive(Debug)]
 pub struct WindowSurface {
@@ -121,6 +181,18 @@ impl WindowSurface {
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         self.surface.headless_rgba()
     }
+
+    /// Consumes the row, handing back its swap chain and configuration.
+    ///
+    /// Used by the primary-promotion path only (bitty#1765, slice 4): when a
+    /// surviving window takes over the primary role, its already-configured
+    /// surface *moves* into `Runtime::surface` instead of a second swap chain
+    /// being created for the same window and the old one dropped. Moving keeps
+    /// the drop count at exactly one per created surface.
+    #[must_use]
+    pub fn into_parts(self) -> (Surface, PhysicalSize, f32) {
+        (self.surface, self.extent, self.opacity)
+    }
 }
 
 /// Why a secondary window could not be given, resized, or kept a surface.
@@ -142,6 +214,16 @@ pub enum WindowSurfaceError {
     },
     /// No surface is attached for this window.
     Unknown(WindowId),
+    /// The primary surface is owned by the off-thread presenter, so it cannot
+    /// be swapped for another window's (bitty#1765, slice 4).
+    ///
+    /// The Wayland off-thread presenter (bitty#2830) holds the process's only
+    /// real surface and device on its worker thread; the runtime keeps a
+    /// headless mirror. Promoting a survivor to the primary role would have to
+    /// hand the worker a different window, which that presenter does not
+    /// support yet, so the promotion is refused instead of leaving the worker
+    /// presenting into a destroyed window.
+    PrimaryOwnedByPresenter,
     /// The platform refused the surface (driver, compositor, or handles).
     Create(RenderError),
     /// The surface was created but could not be configured for its extent.
@@ -165,6 +247,10 @@ impl fmt::Display for WindowSurfaceError {
                 write!(f, "window surface set is at capacity ({max})")
             }
             Self::Unknown(window) => write!(f, "window {} has no surface", window.get()),
+            Self::PrimaryOwnedByPresenter => write!(
+                f,
+                "the primary surface is owned by the off-thread presenter; a survivor cannot be promoted"
+            ),
             Self::Create(error) => write!(f, "surface creation failed: {error}"),
             Self::Configure(error) => write!(f, "surface configure failed: {error}"),
             Self::ZeroExtent => write!(f, "surface extent is zero-sized"),
@@ -251,13 +337,28 @@ impl WindowPresentReport {
 #[derive(Debug, Default)]
 pub struct WindowSurfaces {
     rows: Vec<WindowSurface>,
+    /// Create/release counters (bitty#1765, slice 4).
+    ledger: SurfaceLedger,
 }
 
 impl WindowSurfaces {
     /// Empty set: no secondary window has a surface.
     #[must_use]
     pub fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: Vec::new(),
+            ledger: SurfaceLedger::default(),
+        }
+    }
+
+    /// Lifetime counters for this fleet (bitty#1765, slice 4).
+    ///
+    /// The embedder reads this at teardown to report `created`/`released`/
+    /// `live`, so a leaked swap chain shows up as `live() != 0` in the
+    /// lifecycle log instead of staying invisible.
+    #[must_use]
+    pub fn ledger(&self) -> SurfaceLedger {
+        self.ledger
     }
 
     /// Number of attached secondary surfaces.
@@ -347,6 +448,7 @@ impl WindowSurfaces {
             extent,
             opacity,
         });
+        self.ledger.created += 1;
         Ok(())
     }
 
@@ -390,6 +492,7 @@ impl WindowSurfaces {
             extent,
             opacity,
         });
+        self.ledger.created += 1;
         Ok(())
     }
 
@@ -444,9 +547,43 @@ impl WindowSurfaces {
     /// The surviving rows keep their identity, extent, and order. Dropping the
     /// row releases the swap chain, which is what makes the OS window go away
     /// once its handle is released too.
+    ///
+    /// Idempotent: a second release for the same window returns `None` and
+    /// touches no counter, so a close that is retried (or a teardown that runs
+    /// after the close already did) can never subtract the same row twice.
     pub fn release(&mut self, window: WindowId) -> Option<WindowSurface> {
         let index = self.rows.iter().position(|row| row.window == window)?;
-        Some(self.rows.remove(index))
+        let row = self.rows.remove(index);
+        self.ledger.released += 1;
+        Some(row)
+    }
+
+    /// Moves one window's surface out of the fleet for the primary role
+    /// (bitty#1765, slice 4).
+    ///
+    /// Returns `None` for a window with no attached surface, which is the
+    /// honest answer for a window whose attach was refused — the caller must
+    /// not promote a window that paints nothing.
+    ///
+    /// The returned row is the *same* swap chain, already configured for that
+    /// window: promotion moves it instead of creating a second surface for the
+    /// same window, so the create/release ledger stays balanced.
+    pub fn take_for_primary(&mut self, window: WindowId) -> Option<WindowSurface> {
+        self.release(window)
+    }
+
+    /// Releases every surface in attachment order, returning the identities in
+    /// the order they were dropped (bitty#1765, slice 4).
+    ///
+    /// Attachment order *is* the app's registry order (windows are admitted one
+    /// after another), so this is the instance-teardown ordering contract: a
+    /// window's swap chain is dropped before the next window's, and each one is
+    /// dropped once. `drain` drops each row as it yields it, so the order is
+    /// observable to the driver rather than implied by a `clear`.
+    pub fn release_all_ordered(&mut self) -> Vec<WindowId> {
+        let released: Vec<WindowId> = self.rows.drain(..).map(|row| row.window).collect();
+        self.ledger.released = self.ledger.released.saturating_add(released.len() as u64);
+        released
     }
 
     /// Releases every surface, returning how many rows were dropped.
@@ -457,9 +594,7 @@ impl WindowSurfaces {
     /// a device that did not create it is a validation failure. Dropping the
     /// rows is the fail-closed answer.
     pub fn release_all(&mut self) -> usize {
-        let dropped = self.rows.len();
-        self.rows.clear();
-        dropped
+        self.release_all_ordered().len()
     }
 
     /// Presents one already-built frame to every attached surface.
@@ -511,6 +646,7 @@ impl WindowSurfaces {
                 }
                 Err(failure) => {
                     let row = self.rows.remove(index);
+                    self.ledger.released += 1;
                     report.failed.push(WindowPresentFailure {
                         window: row.window,
                         detail: failure.detail().to_owned(),
@@ -836,6 +972,185 @@ mod tests {
         assert_eq!(surfaces.release_all(), 2);
         assert!(surfaces.is_empty());
         assert_eq!(surfaces.release_all(), 0, "an empty set releases nothing");
+    }
+
+    // -----------------------------------------------------------------------
+    // bitty#1765 (slice 4): teardown ordering and drop accounting
+    // -----------------------------------------------------------------------
+    //
+    // These pin the numbers the lifecycle log and the headless create/close
+    // cycles rely on: one count per created row, one per released row, never a
+    // second release of the same row, and the release order the registry used.
+
+    #[test]
+    fn ledger_counts_one_create_and_one_release_per_row() {
+        let mut surfaces = WindowSurfaces::new();
+        assert_eq!(surfaces.ledger(), SurfaceLedger::default());
+        for raw in [2, 3] {
+            surfaces
+                .adopt(
+                    window(raw),
+                    headless(PhysicalSize::new(8, 4)),
+                    PhysicalSize::new(8, 4),
+                    1.0,
+                )
+                .unwrap();
+        }
+        let ledger = surfaces.ledger();
+        assert_eq!(ledger.created(), 2, "both rows came into existence");
+        assert_eq!(ledger.released(), 0, "nothing was dropped yet");
+        assert_eq!(ledger.live(), 2, "two swap chains are held");
+        assert_eq!(
+            ledger.live(),
+            surfaces.len() as u64,
+            "ledger matches the set"
+        );
+
+        assert!(surfaces.release(window(2)).is_some());
+        let ledger = surfaces.ledger();
+        assert_eq!(
+            (ledger.created(), ledger.released(), ledger.live()),
+            (2, 1, 1)
+        );
+        assert!(
+            surfaces.release(window(2)).is_none(),
+            "release is idempotent, matching the close path's retry safety"
+        );
+        assert_eq!(
+            surfaces.ledger(),
+            ledger,
+            "a refused second release must not subtract the row again"
+        );
+
+        assert_eq!(surfaces.release_all_ordered(), vec![window(3)]);
+        assert_eq!(surfaces.ledger().live(), 0, "no swap chain left behind");
+        assert_eq!(surfaces.ledger().released(), 2);
+        assert_eq!(surfaces.len(), 0);
+    }
+
+    #[test]
+    fn teardown_releases_in_attachment_order() {
+        let mut surfaces = WindowSurfaces::new();
+        for raw in [4, 2, 9] {
+            surfaces
+                .adopt(
+                    window(raw),
+                    headless(PhysicalSize::new(8, 4)),
+                    PhysicalSize::new(8, 4),
+                    1.0,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            surfaces.windows(),
+            vec![window(4), window(2), window(9)],
+            "attachment order is preserved, never sorted"
+        );
+        assert_eq!(
+            surfaces.release_all_ordered(),
+            vec![window(4), window(2), window(9)],
+            "instance teardown drops every surface in registry order"
+        );
+        assert!(surfaces.is_empty());
+        assert!(surfaces.release_all_ordered().is_empty());
+        assert_eq!(
+            surfaces.ledger().released(),
+            3,
+            "an empty second teardown adds nothing"
+        );
+    }
+
+    #[test]
+    fn repeated_create_close_cycles_leak_no_surface() {
+        // The acceptance criterion behind slice 4: N create/close cycles must
+        // leave nothing behind. A leak would show up as a rising `live()` and
+        // a double drop as `released() > created()`.
+        let mut surfaces = WindowSurfaces::new();
+        for cycle in 0..50u64 {
+            let id = window(100 + cycle);
+            surfaces
+                .adopt(
+                    id,
+                    headless(PhysicalSize::new(8, 4)),
+                    PhysicalSize::new(8, 4),
+                    1.0,
+                )
+                .expect("admission within the bound");
+            assert_eq!(surfaces.ledger().live(), 1, "cycle {cycle} holds one row");
+            assert!(surfaces.release(id).is_some());
+            assert_eq!(surfaces.ledger().live(), 0, "cycle {cycle} released it");
+        }
+        let ledger = surfaces.ledger();
+        assert_eq!(ledger.created(), 50);
+        assert_eq!(ledger.released(), 50);
+        assert_eq!(ledger.live(), 0, "no surface leaked across 50 cycles");
+        assert!(surfaces.is_empty());
+        assert!(surfaces.has_capacity(), "capacity was given back each time");
+    }
+
+    #[test]
+    fn take_for_primary_moves_the_row_out_of_the_fleet() {
+        let mut surfaces = WindowSurfaces::new();
+        let extent = PhysicalSize::new(24, 16);
+        surfaces
+            .adopt(window(2), headless(extent), extent, 0.75)
+            .unwrap();
+        let row = surfaces
+            .take_for_primary(window(2))
+            .expect("an attached row is promotable");
+        let (surface, moved_extent, opacity) = row.into_parts();
+        assert_eq!(moved_extent, extent, "the swap chain keeps its extent");
+        assert!((opacity - 0.75).abs() < 1e-6);
+        assert!(surface.is_headless(), "the same surface object moved");
+        assert!(surfaces.is_empty(), "promotion leaves no fleet row");
+        assert_eq!(
+            surfaces.ledger().released(),
+            1,
+            "the moved row is accounted for exactly once"
+        );
+        assert!(
+            surfaces.take_for_primary(window(2)).is_none(),
+            "a row can only be promoted once — a second take would double-drop"
+        );
+    }
+
+    #[test]
+    fn a_permanent_present_failure_counts_as_a_release() {
+        let mut surfaces = WindowSurfaces::new();
+        surfaces
+            .adopt(
+                window(2),
+                headless(PhysicalSize::new(8, 4)),
+                PhysicalSize::new(8, 4),
+                1.0,
+            )
+            .unwrap();
+        let mut frame = fill_frame([0xFF, 0x00, 0x00, 0xFF]);
+        frame.glyphs = vec![crate::grid::GlyphInstance {
+            dest: [0, 0],
+            size: [4, 4],
+            uv: [0.0; 4],
+            color: [0xFF; 4],
+            clip: None,
+            source: crate::grid::GlyphSource::Atlas {
+                slot: crate::atlas::AtlasSlot {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+            },
+        }];
+        let report = surfaces.present_all(None, &frame, None, None);
+        assert_eq!(report.dropped(), 1);
+        assert_eq!(
+            surfaces.ledger(),
+            SurfaceLedger {
+                created: 1,
+                released: 1,
+            },
+            "a surface the present path drops is still released exactly once"
+        );
     }
 
     #[test]

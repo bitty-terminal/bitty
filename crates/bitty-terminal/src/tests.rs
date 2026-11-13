@@ -19934,6 +19934,50 @@ fn a_focus_sensitive_command_targets_the_only_window_of_a_single_window_instance
     );
 }
 
+// bitty#1765 (slice 4): instance teardown releases each window's surface before
+// dropping its handle. The ordering and the drop counts are pinned in
+// `crate::window_registry::tests` (registry rows) and
+// `bitty_render::windows::tests` (the surface fleet) with constructible
+// payloads; what the app layer owes is that a headless run — no window, no
+// surface — tears down cleanly and idempotently, so every exit path can call it
+// unconditionally.
+
+#[test]
+fn instance_teardown_of_a_headless_run_is_a_no_op() {
+    let mut app = window_registry_app();
+    assert!(app.windows.is_empty());
+    assert!(app.window.handle.is_none());
+
+    assert_eq!(app.teardown_windows(), 0, "nothing to release");
+
+    assert_eq!(app.windows.admitted(), 0);
+    assert_eq!(app.windows.removed(), 0);
+    assert_eq!(app.windows.len(), 0);
+    assert_eq!(app.focused_window(), None);
+    assert_eq!(
+        app.teardown_windows(),
+        0,
+        "a second teardown is a no-op, never a double drop"
+    );
+}
+
+#[test]
+fn teardown_clears_the_focus_target_of_a_run_whose_windows_are_gone() {
+    let mut app = window_registry_app();
+    // A platform that refused every window still leaves the single-window
+    // identity behind; teardown must not invent a registry row for it, and the
+    // registry's accounting must stay balanced.
+    app.window.id = Some(bitty_platform::WindowId::from_raw_public(7));
+    app.teardown_windows();
+    assert!(app.windows.is_empty(), "no row was fabricated by teardown");
+    assert_eq!(app.windows.admitted(), app.windows.removed());
+    assert_eq!(
+        app.focused_window(),
+        app.window.id,
+        "the single-window identity is the last fallback and is still addressable"
+    );
+}
+
 /// The command half that needs a platform context (`ctx.create_window`).
 ///
 /// The recording context refuses every native window, which is exactly the

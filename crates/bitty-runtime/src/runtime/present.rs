@@ -16630,4 +16630,110 @@ mod second_window_surface_tests {
         );
         assert_eq!(rt.window_surface_summary(), "");
     }
+
+    // ----------------------------------------------------------------------
+    // bitty#1765 (slice 4): promotion and instance-shutdown teardown
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn promoting_a_survivor_moves_its_surface_into_the_primary_role() {
+        let mut rt = runtime();
+        let promoted_extent = PhysicalSize::new(96, 72);
+        let sibling_extent = PhysicalSize::new(64, 48);
+        rt.adopt_window_surface(
+            window(2),
+            Surface::headless(promoted_extent).expect("non-zero extent"),
+            promoted_extent,
+            1.0,
+        )
+        .unwrap();
+        rt.adopt_window_surface(
+            window(3),
+            Surface::headless(sibling_extent).expect("non-zero extent"),
+            sibling_extent,
+            1.0,
+        )
+        .unwrap();
+
+        rt.promote_window_surface(window(2))
+            .expect("a headless row promotes without an adapter");
+
+        assert_eq!(
+            rt.surface_extent(),
+            Some(promoted_extent),
+            "the primary surface is now the promoted window's own swap chain"
+        );
+        assert_eq!(
+            rt.window_surface_ids(),
+            vec![window(3)],
+            "the promoted row left the secondary fleet; its sibling stays"
+        );
+        assert!(
+            !rt.release_window_surface(window(2)),
+            "a promoted window has no fleet row left to release (no double drop)"
+        );
+        assert!(matches!(
+            rt.promote_window_surface(window(2)),
+            Err(bitty_render::windows::WindowSurfaceError::Unknown(_))
+        ));
+        // The promoted surface is a live presentation target, not a bookkeeping
+        // entry: the next frame composites into it at its own extent.
+        rt.handle_pty_bytes(b"promoted window\r\n");
+        assert!(
+            rt.tick_at(Instant::now() + Duration::from_millis(50))
+                .is_some(),
+            "the promoted primary presents"
+        );
+        let rgba = rt.headless_rgba().expect("the promoted surface painted");
+        assert_eq!(
+            rgba.len(),
+            promoted_extent.width() as usize * promoted_extent.height() as usize * 4,
+            "the promoted swap chain kept its own extent"
+        );
+    }
+
+    #[test]
+    fn instance_shutdown_releases_every_window_surface_in_registry_order() {
+        let mut rt = runtime();
+        let extent = PhysicalSize::new(64, 48);
+        for raw in [2, 3, 4] {
+            rt.adopt_window_surface(
+                window(raw),
+                Surface::headless(extent).expect("non-zero extent"),
+                extent,
+                1.0,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            rt.release_all_window_surfaces(),
+            vec![window(2), window(3), window(4)],
+            "teardown drops every surface once, in attachment (registry) order"
+        );
+        assert!(!rt.has_window_surfaces());
+        assert_eq!(
+            rt.release_all_window_surfaces(),
+            Vec::<WindowId>::new(),
+            "a second teardown is a no-op, never a double drop"
+        );
+    }
+
+    #[test]
+    fn shutdown_drops_sibling_surfaces_before_the_process_exits() {
+        let mut rt = runtime();
+        let extent = PhysicalSize::new(64, 48);
+        rt.adopt_window_surface(
+            window(2),
+            Surface::headless(extent).expect("non-zero extent"),
+            extent,
+            1.0,
+        )
+        .unwrap();
+        assert!(rt.has_window_surfaces());
+        assert!(rt.shutdown());
+        assert!(
+            !rt.has_window_surfaces(),
+            "instance shutdown releases the sibling swap chain instead of leaving it to process exit"
+        );
+    }
 }

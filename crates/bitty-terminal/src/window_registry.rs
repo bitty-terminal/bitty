@@ -54,6 +54,26 @@
 //! therefore an accurate statement — the platform refused the surface, or the
 //! process has no owned GPU context to create one with — and never a window the
 //! app believes it is painting.
+//!
+//! # Close, teardown, and drop accounting (bitty#1765, slice 4)
+//!
+//! Slice 3 decided what a close *means*; slice 4 applies it. [`WindowRegistry::close`]
+//! removes the row and hands it back, so the caller releases that window's
+//! presentation surface before the last handle drops and the OS window goes
+//! away — the ordering the surface lifetime contract requires. It also names the
+//! survivor that inherits the primary role, which is how a close of the first
+//! window destroys only that window instead of exiting the instance.
+//!
+//! [`WindowRegistry::drain`] is the instance-teardown twin: every row in
+//! registration order, returned to the caller for release-then-drop, so a
+//! shutdown cannot leave a swap chain to process exit and cannot drop one
+//! twice.
+//!
+//! Two monotonic counters ([`WindowRegistry::admitted`],
+//! [`WindowRegistry::removed`]) make the result checkable:
+//! `admitted - removed == len()` holds after any sequence of creates, refusals,
+//! closes and teardowns, so repeated create/close cycles cannot leak a row
+//! unnoticed.
 
 #![forbid(unsafe_code)]
 
@@ -107,6 +127,7 @@ impl WindowIdentity for WindowHandle {
 }
 
 /// One registered window: identity, live handle, and surface attachment point.
+#[derive(Debug)]
 pub(crate) struct WindowRow<H> {
     /// Stable identity; also the registry key.
     pub(crate) id: WindowId,
@@ -194,7 +215,7 @@ pub(crate) fn focus_edge(kind: &WindowEventKind) -> Option<bool> {
     }
 }
 
-/// What a window-close event means for the instance (bitty#1765, slice 3).
+/// What one window-close event means for the instance (bitty#1765, slice 3).
 ///
 /// The registry answers this instead of the event handler, so the rule is
 /// pinned headlessly: a close for a window that is not the last one must never
@@ -211,6 +232,27 @@ pub(crate) enum CloseDecision {
     LastWindow,
 }
 
+/// One applied close: the destroyed row, what the close meant, and the window
+/// that inherits the primary role (bitty#1765, slice 4).
+///
+/// The registry hands the row back instead of dropping it, so the caller
+/// releases that window's presentation surface *before* the handle drops and
+/// the OS window goes away — the ordering the surface lifetime contract
+/// requires. `promoted` names the survivor only when the closed window was the
+/// first registered one, because that survivor is what
+/// [`WindowRegistry::target`] will classify as
+/// [`EventTarget::Primary`] from the next event on.
+#[derive(Debug)]
+pub(crate) struct WindowClose<H> {
+    /// The removed row; dropping it releases the last handle to that window.
+    pub(crate) row: WindowRow<H>,
+    /// What the close meant for the instance.
+    pub(crate) decision: CloseDecision,
+    /// The survivor that becomes the primary window, when this close retired
+    /// the primary one.
+    pub(crate) promoted: Option<WindowId>,
+}
+
 /// Identity-keyed map of the windows this process owns.
 ///
 /// Insertion order is preserved so lifecycle logs and the primary window are
@@ -220,6 +262,15 @@ pub(crate) struct WindowRegistry<H> {
     rows: Vec<WindowRow<H>>,
     active: Option<WindowId>,
     focused: Option<WindowId>,
+    /// Rows that entered the registry since it was created (bitty#1765,
+    /// slice 4).
+    ///
+    /// Paired with [`Self::removed`] so a lifecycle log can state
+    /// `admitted - removed == len()`, which is what makes "a create/close cycle
+    /// leaked nothing" checkable instead of assumed.
+    admitted: u64,
+    /// Rows that left the registry since it was created.
+    removed: u64,
 }
 
 impl<H> Default for WindowRegistry<H> {
@@ -235,7 +286,19 @@ impl<H> WindowRegistry<H> {
             rows: Vec::new(),
             active: None,
             focused: None,
+            admitted: 0,
+            removed: 0,
         }
+    }
+
+    /// Rows that were registered since this registry was created.
+    pub(crate) fn admitted(&self) -> u64 {
+        self.admitted
+    }
+
+    /// Rows that were removed since this registry was created.
+    pub(crate) fn removed(&self) -> u64 {
+        self.removed
     }
 
     /// Number of registered windows.
@@ -423,6 +486,7 @@ impl<H> WindowRegistry<H> {
     pub(crate) fn remove(&mut self, id: WindowId) -> Option<WindowRow<H>> {
         let index = self.rows.iter().position(|row| row.id == id)?;
         let row = self.rows.remove(index);
+        self.removed = self.removed.saturating_add(1);
         if self.active == Some(id) {
             self.active = self.rows.first().map(|row| row.id);
         }
@@ -430,6 +494,59 @@ impl<H> WindowRegistry<H> {
             self.focused = self.rows.first().map(|row| row.id);
         }
         Some(row)
+    }
+
+    /// Applies one close event: removes that window and reports what the
+    /// instance must do next (bitty#1765, slice 4).
+    ///
+    /// `None` means the identity is not registered — the caller keeps its
+    /// pre-registry close path — and nothing changes. Otherwise the row is
+    /// removed exactly as [`Self::remove`] does (survivors keep their order,
+    /// attribution and focus re-home) and returned to the caller so it can
+    /// release that window's surface before the handle drops.
+    ///
+    /// `promoted` is the survivor that inherits the primary role when the first
+    /// registered window closed: [`Self::target`] classifies that survivor as
+    /// the primary from the next event on, and the caller promotes its surface
+    /// in the same step. Closing a non-first window promotes nothing — the
+    /// primary is untouched and keeps painting.
+    pub(crate) fn close(&mut self, id: WindowId) -> Option<WindowClose<H>> {
+        let decision = self.close_decision(id);
+        if decision == CloseDecision::Unknown {
+            return None;
+        }
+        let was_primary = self.rows.first().map(|row| row.id) == Some(id);
+        let row = self.remove(id)?;
+        let promoted = if was_primary {
+            self.rows.first().map(|row| row.id)
+        } else {
+            None
+        };
+        Some(WindowClose {
+            row,
+            decision,
+            promoted,
+        })
+    }
+
+    /// Removes every row in registration order, returning them (bitty#1765,
+    /// slice 4).
+    ///
+    /// Instance teardown calls this so each window's surface is released in
+    /// registry order *before* the returned handles drop, which is the order
+    /// the surface lifetime contract requires. Handing the rows back (rather
+    /// than clearing the vector here) keeps the drop of the OS windows — and
+    /// therefore of their swap chains — under the caller's control, so a
+    /// teardown can release surfaces first and drop windows second.
+    ///
+    /// The registry ends empty: no active identity, no focused identity, and
+    /// `admitted - removed == 0`.
+    pub(crate) fn drain(&mut self) -> Vec<WindowRow<H>> {
+        let rows = std::mem::take(&mut self.rows);
+        self.removed = self.removed.saturating_add(rows.len() as u64);
+        self.active = None;
+        self.focused = None;
+        rows
     }
 
     /// One-line lifecycle summary of the registered window set.
@@ -499,6 +616,7 @@ impl<H> WindowRegistry<H> {
             surface,
             state,
         });
+        self.admitted = self.admitted.saturating_add(1);
         if self.active.is_none() {
             self.active = Some(id);
         }
@@ -518,6 +636,8 @@ impl<H> WindowRegistry<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Headless stand-in for a platform window handle.
     #[derive(Debug, PartialEq, Eq)]
@@ -1020,5 +1140,276 @@ mod tests {
             "the survivor becomes the first registered window"
         );
         assert_eq!(registry.close_decision(second), CloseDecision::LastWindow);
+    }
+
+    // -----------------------------------------------------------------------
+    // bitty#1765 (slice 4): close applies destruction, teardown ordering, and
+    // drop accounting
+    // -----------------------------------------------------------------------
+    //
+    // The payload here counts its own drops, which is how these tests prove
+    // "exactly once" instead of assuming it: one clone per row, no hidden
+    // second owner.
+
+    /// Headless payload that reports when it is dropped.
+    #[derive(Debug)]
+    struct TrackedWindow {
+        raw: u64,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedWindow {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl WindowIdentity for TrackedWindow {
+        fn window_id(&self) -> WindowId {
+            WindowId::from_raw_public(self.raw)
+        }
+    }
+
+    fn tracked(raw: u64, drops: &Arc<AtomicUsize>) -> TrackedWindow {
+        TrackedWindow {
+            raw,
+            drops: Arc::clone(drops),
+        }
+    }
+
+    #[test]
+    fn closing_the_first_window_destroys_only_it_and_names_the_survivor() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .expect("primary registers");
+        let second = registry
+            .admit(Ok::<_, ()>((tracked(2, &drops), None)))
+            .expect("second window registers");
+        let third = registry
+            .admit(Ok::<_, ()>((tracked(3, &drops), None)))
+            .expect("third window registers");
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "no row was dropped yet");
+
+        let closed = registry.close(first).expect("the primary close applies");
+
+        assert_eq!(closed.decision, CloseDecision::WindowOnly);
+        assert_eq!(closed.row.id, first);
+        assert_eq!(
+            closed.promoted,
+            Some(second),
+            "the first survivor inherits the primary role"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the closed row is returned, so its handle drops only when the caller lets it"
+        );
+        drop(closed);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the closed window's handle is dropped exactly once"
+        );
+
+        assert_eq!(registry.ids(), vec![second, third]);
+        assert_eq!(
+            registry.target(second),
+            EventTarget::Primary,
+            "the survivor is the primary from the next event on"
+        );
+        assert_eq!(registry.target(third), EventTarget::Secondary);
+        assert_eq!(registry.admitted(), 3);
+        assert_eq!(registry.removed(), 1);
+        assert_eq!(
+            registry.admitted() - registry.removed(),
+            registry.len() as u64,
+            "the counters account for every row"
+        );
+    }
+
+    #[test]
+    fn closing_a_secondary_window_promotes_nothing() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry
+            .admit(Ok::<_, ()>((tracked(2, &drops), None)))
+            .unwrap();
+
+        let closed = registry.close(second).expect("the secondary close applies");
+
+        assert_eq!(closed.decision, CloseDecision::WindowOnly);
+        assert_eq!(
+            closed.promoted, None,
+            "the primary keeps its role: only the named window is destroyed"
+        );
+        drop(closed);
+        assert_eq!(registry.ids(), vec![first]);
+        assert_eq!(registry.target(first), EventTarget::Primary);
+        assert_eq!(registry.primary(), Some(first));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closing_the_last_window_reports_the_exit_decision() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        let only = registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .unwrap();
+
+        let closed = registry.close(only).expect("the last close applies");
+
+        assert_eq!(
+            closed.decision,
+            CloseDecision::LastWindow,
+            "the caller keeps its existing instance-exit path"
+        );
+        assert_eq!(
+            closed.promoted, None,
+            "nothing survives to inherit the primary role"
+        );
+        drop(closed);
+        assert!(registry.is_empty());
+        assert_eq!(registry.primary(), None);
+        assert_eq!(registry.focused(), None);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closing_an_unregistered_identity_changes_nothing() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .unwrap();
+        let before = registry.summary();
+
+        assert!(
+            registry.close(id(99)).is_none(),
+            "a foreign identity is never closed by this registry"
+        );
+
+        assert_eq!(registry.summary(), before);
+        assert_eq!(registry.admitted(), 1);
+        assert_eq!(registry.removed(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.target(first), EventTarget::Primary);
+    }
+
+    #[test]
+    fn teardown_drains_rows_in_registration_order_and_drops_each_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry
+            .admit(Ok::<_, ()>((tracked(2, &drops), None)))
+            .unwrap();
+        let third = registry
+            .admit(Ok::<_, ()>((tracked(3, &drops), None)))
+            .unwrap();
+
+        let rows = registry.drain();
+
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![first, second, third],
+            "teardown hands the rows back in registry order, so surfaces are released in that order"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "handles are still alive: the caller releases surfaces before dropping windows"
+        );
+        assert!(registry.is_empty());
+        assert_eq!(registry.active(), None);
+        assert_eq!(registry.focused(), None);
+        assert_eq!(registry.summary(), "");
+        assert_eq!(registry.admitted(), 3);
+        assert_eq!(registry.removed(), 3);
+        assert_eq!(
+            registry.admitted() - registry.removed(),
+            0,
+            "the counters balance after teardown"
+        );
+
+        drop(rows);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            3,
+            "every window handle is dropped exactly once"
+        );
+        assert!(registry.drain().is_empty(), "a second teardown is a no-op");
+        assert_eq!(registry.removed(), 3);
+    }
+
+    #[test]
+    fn repeated_create_close_cycles_leak_neither_a_row_nor_a_double_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        for cycle in 0..50u64 {
+            let id = registry
+                .register_primary(tracked(1_000 + cycle, &drops), None, SurfaceState::Attached)
+                .expect("registration within the bound");
+            assert_eq!(registry.len(), 1, "cycle {cycle} holds one row");
+            let closed = registry.close(id).expect("the row closes");
+            assert_eq!(closed.decision, CloseDecision::LastWindow);
+            drop(closed);
+            assert!(registry.is_empty(), "cycle {cycle} left no row");
+            assert!(
+                registry.has_capacity(),
+                "cycle {cycle} gave its capacity back"
+            );
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            50,
+            "one drop per created window — a double drop would exceed 50"
+        );
+        assert_eq!(registry.admitted(), 50);
+        assert_eq!(registry.removed(), 50);
+    }
+
+    #[test]
+    fn a_refused_creation_moves_no_counter() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = WindowRegistry::new();
+        registry
+            .register_primary(tracked(1, &drops), None, SurfaceState::Attached)
+            .unwrap();
+        let (admitted, removed) = (registry.admitted(), registry.removed());
+
+        let refused = registry.admit(Err::<(TrackedWindow, Option<SurfaceTarget>), _>(
+            "no window system",
+        ));
+
+        assert!(matches!(refused, Err(AdmitError::Refused(_))));
+        assert_eq!(
+            (registry.admitted(), registry.removed()),
+            (admitted, removed)
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "a refused creation never produced a window to drop"
+        );
+        // The duplicate-identity refusal is the other cancel path.
+        let duplicate = registry.admit(Ok::<_, ()>((tracked(1, &drops), None)));
+        assert!(matches!(duplicate, Err(AdmitError::Registry(_))));
+        assert_eq!(
+            (registry.admitted(), registry.removed()),
+            (admitted, removed)
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the duplicate payload drops once"
+        );
     }
 }

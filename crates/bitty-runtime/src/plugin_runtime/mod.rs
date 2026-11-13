@@ -130,7 +130,8 @@ pub use overlay::{
 };
 pub use presentation_overlay::{
     DismissedEvent, ESCAPE_DISMISS_REASON, PENDING_DISMISSED_MAX, PRESENTATION_OVERLAY_KIND,
-    PRESENTATION_OVERLAY_TIER, PresentationOverlay, VIEW_CLOSED_DISMISS_REASON,
+    PRESENTATION_OVERLAY_TIER, PresentationOverlay, PresentationOverlayAttribution,
+    VIEW_CLOSED_DISMISS_REASON,
 };
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
@@ -1751,7 +1752,20 @@ impl PluginRuntime {
     /// captures nothing (no surface without the capability). Without a host a
     /// rich `bitty.ui.mount("terminal", …)` fails closed with
     /// `E_UI_UNAVAILABLE`, like every other unhosted surface.
+    ///
+    /// The same host is the presentation surface's attribution sink
+    /// (bitty#2476 residual 8): a presented surface is attributed to the
+    /// presenting generation's own scene panel, so the generation release that
+    /// disposes that panel dismisses the surface through
+    /// `PanelRegistry::release_generation_scope`. Removing the host removes the
+    /// sink, and presentation keeps working unattributed.
     pub fn set_ui_scene_backend(&mut self, backend: Option<Rc<crate::scene_host::SceneHost>>) {
+        let attribution = backend
+            .as_ref()
+            .map(|host| presentation_overlay::scene_host_attribution(Rc::clone(host)));
+        self.presentation_overlay
+            .borrow_mut()
+            .set_attribution(attribution);
         self.ui_scene_backend = backend;
     }
 

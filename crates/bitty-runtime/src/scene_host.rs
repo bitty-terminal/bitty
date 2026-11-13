@@ -68,8 +68,9 @@ use std::rc::Rc;
 use bitty_lua::UiRichNode;
 use bitty_lua::host::{BridgeError, E_UI_UNAVAILABLE};
 use bitty_rich::scene::{BlockAnchor, BlockId, Scene, ScrollBehavior};
+use bitty_ui::Rect;
 use bitty_ui::ViewId;
-use bitty_ui::panel::PanelType;
+use bitty_ui::panel::{OverlayKind, PanelType};
 
 use crate::registry::{PanelError, PanelHandle, PanelRuntime};
 use crate::scene_bridge::{RichMount, SceneBridgeError, mount_rich_node};
@@ -376,6 +377,69 @@ impl SceneHost {
     #[must_use]
     pub fn scene_count(&self) -> usize {
         self.state.borrow().scenes.len()
+    }
+
+    /// The Core-owned panel that presents `owner`'s terminal-slot scene, if
+    /// this host currently owns one.
+    ///
+    /// The handle names the panel `owner`'s generation drives, with the
+    /// generation the registry admits. The plugin runtime reads it to
+    /// attribute the generation's presentation surface to that panel
+    /// (bitty#2476 residual 8); a generation that never mounted a
+    /// terminal-slot scene has no panel here and therefore no panel-attributed
+    /// surfaces. The lookup is by owner only: the host holds at most one scene
+    /// panel at a time, and a new epoch re-mints it, so a stale epoch can
+    /// never address a live panel.
+    #[must_use]
+    pub fn panel_handle_for(&self, owner: &str) -> Option<PanelHandle> {
+        self.state
+            .borrow()
+            .panel
+            .as_ref()
+            .filter(|panel| panel.owner == owner)
+            .map(|panel| panel.handle)
+    }
+
+    /// Attributes one presentation surface to `owner`'s generation-owned
+    /// panel (bitty#2476 residual 8).
+    ///
+    /// Admits a non-modal registry overlay under the panel handle, so the row
+    /// `release_generation_scope` dismisses on that generation's release names
+    /// this surface. Geometry and text stay with the presenting session: the
+    /// present loop paints the retained block, and only the attribution (and
+    /// the accepted `4+1` slot charge) lives here.
+    ///
+    /// # Errors
+    ///
+    /// [`BridgeError`] carrying `E_UI_UNAVAILABLE` when this host owns no
+    /// panel for `owner` (the generation mounted no terminal-slot scene, or it
+    /// already ended), or when the accepted overlay budget refuses the
+    /// admission. A refusal leaves nothing allocated.
+    pub(crate) fn admit_attributed_overlay(&self, owner: &str) -> Result<u64, BridgeError> {
+        let handle = self
+            .panel_handle_for(owner)
+            .ok_or_else(|| unavailable("no generation-owned panel to attribute the surface to"))?;
+        self.panels
+            .borrow_mut()
+            .create_panel_overlay(
+                handle.id,
+                handle.generation,
+                OverlayKind::NonModal,
+                Rect::new(0, 0, 0, 0),
+                "",
+                None,
+            )
+            .map_err(|error| panel_error("attribute the presentation surface", error))
+    }
+
+    /// Dismisses one attributed presentation surface by registry overlay id.
+    ///
+    /// Idempotent: an id the registry no longer holds (already dismissed, or
+    /// dismissed earlier by `release_generation_scope`) is a no-op, so the
+    /// session teardown that follows a generation release can never re-open or
+    /// double-count a surface.
+    pub(crate) fn dismiss_attributed_overlay(&self, id: u64) -> bool {
+        self.panels.borrow_mut().dismiss_overlay(id).is_some()
     }
 
     /// The view hosting `handle`, if this host still owns it (diagnostics).

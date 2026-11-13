@@ -8729,6 +8729,78 @@ fn init_picker_window_bounds_28_themes_and_keeps_cursor_visible() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn init_picker_max_visible_clamps_short_and_tall_windows() {
+    assert_eq!(crate::init::init_picker_rows_for_window(0), 3);
+    assert_eq!(
+        crate::init::init_picker_rows_for_window(5),
+        3,
+        "shorter than the chrome reservation still paints the minimum"
+    );
+    assert_eq!(crate::init::init_picker_rows_for_window(11), 3);
+    assert_eq!(crate::init::init_picker_rows_for_window(13), 5);
+    assert_eq!(crate::init::init_picker_rows_for_window(18), 10);
+    assert_eq!(crate::init::init_picker_rows_for_window(40), 10);
+    assert_eq!(crate::init::init_picker_rows_for_window(u16::MAX), 10);
+}
+
+#[test]
+fn init_picker_window_keeps_height_and_clamps_the_tail() {
+    assert_eq!(crate::init::init_picker_window(0, 0, 10), (0, 0));
+    assert_eq!(crate::init::init_picker_window(5, 1, 0), (0, 5));
+    assert_eq!(crate::init::init_picker_window(5, 4, 10), (0, 5));
+    assert_eq!(crate::init::init_picker_window(28, 12, 6), (9, 15));
+    assert_eq!(
+        crate::init::init_picker_window(28, 27, 6),
+        (22, 28),
+        "the tail clamp keeps the window height constant at the end of the list"
+    );
+    assert_eq!(
+        crate::init::init_picker_window(28, 99, 6),
+        (22, 28),
+        "an out-of-range cursor is bounded before the window is computed"
+    );
+}
+
+#[test]
+fn init_picker_shrinking_frame_erases_the_stale_notice_row() {
+    let presets = bitty_config::theme::list_presets();
+    let options: Vec<_> = presets.iter().copied().map(theme_option).collect();
+    // "zz" + Enter fails the theme parse, so the frame gains a notice row;
+    // 'k' clears the notice, so the next frame is one row shorter and the
+    // stale notice row has to be erased rather than left behind.
+    let mut keys: Vec<u8> = b"zz\r".to_vec();
+    keys.push(b'k');
+    keys.push(0x03);
+    let mut input = std::io::BufReader::new(keys.as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let _ = crate::init::init_picker_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        "Theme [dark]:",
+        &options,
+        0,
+        6,
+        false,
+        false,
+        crate::init::init_parse_theme_answer,
+        &mut history,
+        true,
+        &mut wait,
+        None,
+    );
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    assert!(
+        printed.contains("\r\x1b[J"),
+        "a shorter frame must clear the rows the previous frame painted: {printed:?}"
+    );
+}
+
 #[test]
 fn init_multiselect_inplace_erases_block_on_confirm_and_cancel() {
     let bundled: Vec<String> = (0..12)

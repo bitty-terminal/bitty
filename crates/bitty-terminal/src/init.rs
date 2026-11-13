@@ -2436,6 +2436,18 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
 /// preview-free (every non-theme step, and every non-interactive run).
 pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
 
+/// Bounded visible option rows for a terminal `rows` high.
+///
+/// Reserves the picker chrome and clamps into
+/// `[INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE]`, so a short
+/// window still paints a usable window and a tall one never over-renders.
+#[cfg(unix)]
+pub(crate) fn init_picker_rows_for_window(rows: u16) -> usize {
+    (rows as usize)
+        .saturating_sub(INIT_PICKER_CHROME_ROWS)
+        .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE)
+}
+
 /// Computes the visible option row count for interactive pickers.
 ///
 /// Queries the live Unix terminal row count via `rustix::termios::tcgetwinsize`
@@ -2450,9 +2462,7 @@ pub(crate) fn init_picker_max_visible(inplace: bool) -> usize {
             .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
         if let Ok(ws) = winsize {
             if ws.ws_row > 0 {
-                return (ws.ws_row as usize)
-                    .saturating_sub(INIT_PICKER_CHROME_ROWS)
-                    .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE);
+                return init_picker_rows_for_window(ws.ws_row);
             }
         }
     }

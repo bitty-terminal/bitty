@@ -384,9 +384,11 @@ pub struct CommandInfo {
 }
 
 /// Static core command surface: the 11 `ctl` executables plus the 5 `list`
-/// executables. Summaries mirror the `ctl --help` and `list --help` texts so
-/// the three surfaces can never disagree silently. `bitty list actions`
-/// reuses these summaries directly (no copied strings).
+/// executables, plus `core.window.new` — the one runtime command with no
+/// `ctl` verb yet, reachable today through the `new_window` chrome action
+/// (bitty#1765 slice 1). Summaries mirror the `ctl --help` and `list --help`
+/// texts so the three surfaces can never disagree silently. `bitty list
+/// actions` reuses these summaries directly (no copied strings).
 pub const CORE_COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         id: "core.instance.list",
@@ -402,6 +404,14 @@ pub const CORE_COMMANDS: &[CommandInfo] = &[
         class: "runtime",
         scopes: &["view.inspect"],
         summary: "List windows of the selected instance.",
+        owner: "core",
+    },
+    CommandInfo {
+        id: "core.window.new",
+        kind: "command",
+        class: "runtime",
+        scopes: &["view.manage"],
+        summary: "Request a new OS window (action: new_window).",
         owner: "core",
     },
     CommandInfo {

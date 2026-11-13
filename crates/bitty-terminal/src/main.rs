@@ -289,6 +289,7 @@ mod spawn;
 mod stall_watchdog;
 mod terminal_app;
 mod test_mode;
+mod window_registry;
 mod x;
 
 use cli::{

@@ -18,6 +18,7 @@ use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
 use crate::spawn::SpawnSpec;
 use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
+use crate::window_registry::{MAX_WINDOWS, SurfaceState};
 
 /// PTY-quiescence settle window before a real-GUI present (bitty#2486).
 ///
@@ -903,6 +904,22 @@ pub(crate) struct TerminalApp {
     pub(crate) runtime: Runtime,
     /// Window handle, title, opacity, and IME/title counters.
     pub(crate) window: WindowState,
+    /// Identity-keyed registry of the OS windows this process owns
+    /// (bitty#1765, slice 1).
+    ///
+    /// The startup window is registered from the `Resumed` creation path; a
+    /// `new_window` command admits another row through
+    /// [`Self::service_new_window_requests`]. Rows hold the live handle and
+    /// renderer attachment point, never a raw pointer.
+    pub(crate) windows: crate::window_registry::WindowRegistry<WindowHandle>,
+    /// Latched `new_window` requests (`bitty_config::ChromeAction::NewWindow`).
+    ///
+    /// The input hot path owns no [`EventContext`], so a bound `new_window`
+    /// chord only latches the request here;
+    /// [`Self::service_new_window_requests`] performs it on the next turn that
+    /// has a platform context. Bounded by the registry ceiling so input can
+    /// never queue unbounded window creation.
+    pub(crate) pending_new_windows: usize,
     /// Demo pump channel when explicitly attached for debug/tests
     /// (`None` in real sessions — CTX-0167).
     pub(crate) pty_rx: Option<Receiver<Vec<u8>>>,
@@ -1186,6 +1203,8 @@ impl TerminalApp {
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
+            windows: crate::window_registry::WindowRegistry::new(),
+            pending_new_windows: 0,
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
@@ -1252,6 +1271,8 @@ impl TerminalApp {
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
+            windows: crate::window_registry::WindowRegistry::new(),
+            pending_new_windows: 0,
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
@@ -4799,6 +4820,131 @@ impl TerminalApp {
         }
     }
 
+    /// Inner size requested for every window the app asks the platform for.
+    ///
+    /// One source of truth for the startup window and every `new_window`
+    /// request: `LogicalSize` validation only fails for non-finite or negative
+    /// inputs, so the fallback is unreachable but keeps the helper total.
+    pub(crate) fn default_window_size() -> LogicalSize {
+        LogicalSize::new(800.0, 600.0).unwrap_or_else(|_| {
+            LogicalSize::new(640.0, 480.0).expect("fallback size must be valid")
+        })
+    }
+
+    /// [`WindowConfig`] for a window this app asks the platform to create.
+    ///
+    /// The startup window and every `new_window` request build their config
+    /// here, so a second window inherits the live title, opacity, and blur
+    /// instead of platform defaults.
+    pub(crate) fn window_config(&self) -> WindowConfig {
+        WindowConfig::new()
+            .with_title(self.window.title.clone())
+            .with_inner_size(Self::default_window_size())
+            .with_opacity(self.window.opacity)
+            .with_blur_radius(self.window.blur_radius)
+            .with_visible(true)
+    }
+
+    /// Latches one `new_window` request (bitty#1765, slice 1).
+    ///
+    /// The single-owner input path owns no platform context, so a bound
+    /// `new_window` chord never creates a window itself: it records one
+    /// bounded request that [`Self::service_new_window_requests`] performs on
+    /// the next turn that has an [`EventContext`]. A request at the registry
+    /// ceiling is refused loudly and latches nothing.
+    ///
+    /// Returns whether the request was latched.
+    pub(crate) fn request_new_window(&mut self) -> bool {
+        if !self.windows.has_capacity() {
+            crate::logging::warn(|| {
+                format!(
+                    "warning: new_window refused — window registry at capacity ({MAX_WINDOWS}); windows={}",
+                    self.windows.len()
+                )
+            });
+            return false;
+        }
+        self.pending_new_windows = self.pending_new_windows.saturating_add(1).min(MAX_WINDOWS);
+        crate::logging::info(|| {
+            format!(
+                "bitty: new_window requested -> pending={} windows={:?} active={:?}",
+                self.pending_new_windows,
+                self.windows.ids(),
+                self.windows.active()
+            )
+        });
+        true
+    }
+
+    /// Performs every latched `new_window` request against the platform.
+    ///
+    /// Each request is admitted as a whole outcome
+    /// ([`WindowRegistry::admit`](crate::window_registry::WindowRegistry::admit)):
+    /// the platform either produces a window that becomes one registry row, or
+    /// refuses and leaves the registry byte-identical. A refusal is logged with
+    /// its typed reason and drops the remaining latched requests — a backend
+    /// that refused one window refuses the next, so retrying would only spin.
+    ///
+    /// Returns how many windows were admitted.
+    pub(crate) fn service_new_window_requests(&mut self, ctx: &mut EventContext<'_>) -> usize {
+        let mut admitted = 0usize;
+        while self.pending_new_windows > 0 {
+            self.pending_new_windows -= 1;
+            if !self.windows.has_capacity() {
+                crate::logging::warn(|| {
+                    format!(
+                        "warning: new_window refused — window registry at capacity ({MAX_WINDOWS}); windows={}",
+                        self.windows.len()
+                    )
+                });
+                self.pending_new_windows = 0;
+                break;
+            }
+            let config = self.window_config();
+            self.watchdog_phase(Phase::WindowCreate);
+            let outcome = ctx.create_window(config).map(|handle| {
+                // The attachment point outlives the creation call: it is the
+                // renderer's per-window seam and the row's surface identity.
+                let surface = handle.surface_target();
+                (handle, Some(surface))
+            });
+            match self.windows.admit(outcome) {
+                Ok(id) => {
+                    admitted += 1;
+                    if let Some(row) = self.windows.get(id) {
+                        // Read the admitted row back through its identity: the
+                        // log names the registry key, the payload's own window
+                        // identity, its surface attachment point, and its
+                        // renderer state, so a mismatch is visible in a dogfood
+                        // log instead of hidden behind an assumed field.
+                        crate::logging::info(|| {
+                            format!(
+                                "bitty: window registered id={} handle={} surface={} state={} windows={:?} active={:?} renderer=primary-only",
+                                row.id.get(),
+                                row.handle.id().get(),
+                                row.surface.is_some(),
+                                row.state.label(),
+                                self.windows.ids(),
+                                self.windows.active()
+                            )
+                        });
+                    }
+                }
+                Err(error) => {
+                    crate::logging::warn(|| {
+                        format!(
+                            "warning: new_window refused ({error}) — registry unchanged windows={}",
+                            self.windows.len()
+                        )
+                    });
+                    self.pending_new_windows = 0;
+                    break;
+                }
+            }
+        }
+        admitted
+    }
+
     /// Attempts to attach a real GPU surface after window creation (single-window slice).
     pub(crate) fn try_attach_gpu(&mut self, handle: &WindowHandle) {
         // Do not re-attach if already has GPU
@@ -5099,6 +5245,12 @@ impl TerminalApp {
         // instead of being queued by a stale `is_active` check.
         self.expire_overlay_captures();
 
+        // bitty#1765 (slice 1): a Core `new_window` command is performed here,
+        // on a turn that owns the platform context — never inside the key or
+        // command that asked for it. One integer compare when nothing is
+        // latched.
+        self.service_new_window_requests(ctx);
+
         // Issue #1356 / #1541: reap exited child processes across primary and
         // split pane sessions. When a split child exits, its pane is closed
         // and its sibling promoted. When the last child exits, the session
@@ -5117,7 +5269,15 @@ impl TerminalApp {
         // emergency/reserved > active overlay-modal > user-defined keymap >
         // plugin (inert, deny-by-default) > terminal encoding. A consumed
         // event never reaches `Runtime`.
-        if let PlatformEvent::Window { window_id: _, kind } = &event {
+        if let PlatformEvent::Window { window_id, kind } = &event {
+            // bitty#1765 (slice 1): every window event is attributed to the
+            // window it names, so the registry — never a struct field — decides
+            // which window an interaction belongs to. An identity this process
+            // never registered (today: every event under a headless run)
+            // changes nothing, and a headless run skips the lookup entirely.
+            if !self.windows.is_empty() {
+                self.windows.set_active(*window_id);
+            }
             self.watchdog_phase(Phase::ChromeIntercept);
             if self.intercept_chrome_key(kind) {
                 // Issue #1783: a last-pane `close_view` that confirms the
@@ -5294,19 +5454,7 @@ impl TerminalApp {
                 // aborting the process (mirrors `App::run`'s
                 // `DisplayUnavailable` mapping).
                 if self.window.handle.is_none() {
-                    let default_size = LogicalSize::new(800.0, 600.0).unwrap_or_else(|_| {
-                        // LogicalSize validation only fails for non-finite or
-                        // negative inputs; hard-coded values are valid, so
-                        // this fallback is unreachable but keeps the handler
-                        // total.
-                        LogicalSize::new(640.0, 480.0).expect("fallback size must be valid")
-                    });
-                    let config = WindowConfig::new()
-                        .with_title(self.window.title.clone())
-                        .with_inner_size(default_size)
-                        .with_opacity(self.window.opacity)
-                        .with_blur_radius(self.window.blur_radius)
-                        .with_visible(true);
+                    let config = self.window_config();
                     self.watchdog_phase(Phase::WindowCreate);
                     match ctx.create_window(config) {
                         Ok(handle) => {
@@ -5342,6 +5490,41 @@ impl TerminalApp {
                                 crash_report::lifecycle(crash_report::Lifecycle::GpuAttached);
                             } else {
                                 crash_report::lifecycle(crash_report::Lifecycle::GpuAttachFailed);
+                            }
+                            // bitty#1765 (slice 1): the startup window is
+                            // registered through the window registry, so every
+                            // later interaction addresses it by `WindowId`
+                            // instead of by a struct field. Behaviour for the
+                            // single-window case is unchanged: the row holds a
+                            // handle clone of the same window the hot path
+                            // keeps in `WindowState`.
+                            let state = if self.runtime.has_gpu() {
+                                SurfaceState::Attached
+                            } else {
+                                SurfaceState::Unattached
+                            };
+                            let surface = Some(handle_for_gpu.surface_target());
+                            match self
+                                .windows
+                                .register_primary(handle_for_gpu, surface, state)
+                            {
+                                Ok(registered) => {
+                                    crate::logging::info(|| {
+                                        format!(
+                                            "bitty: window registry primary={} windows={} set=[{}]",
+                                            registered.get(),
+                                            self.windows.len(),
+                                            self.windows.summary()
+                                        )
+                                    });
+                                }
+                                Err(err) => {
+                                    crate::logging::warn(|| {
+                                        format!(
+                                            "bitty: window registry refused the startup window ({err}) — continuing with an untracked window"
+                                        )
+                                    });
+                                }
                             }
                             crate::logging::info(|| {
                                 format!(

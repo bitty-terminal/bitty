@@ -1014,6 +1014,25 @@ pub enum ChromeAction {
     /// (same byte-identical discipline as [`Self::TogglePalette`]); the user
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
+    /// Request a new OS window (`new_window`, alias `new_os_window`;
+    /// bitty#1765 slice 1).
+    ///
+    /// Every user-facing interaction resolves through the command registry,
+    /// and window creation is no exception: the chord never touches a window
+    /// pointer. The app latches the request on the bounded pending queue and
+    /// the event loop performs it through
+    /// `EventContext::create_window`, admitting the resulting `WindowId` into
+    /// the window registry. A platform without multi-window support (or a
+    /// headless run) refuses with a typed error that is logged — never a
+    /// panic. The camelCase `newWindow` behaviour ghostty and kitty both
+    /// expose is the reference shape; `new_os_window` is kitty's spelling.
+    ///
+    /// Manual bind only, never in [`DEFAULT_KEYMAPS`] (same byte-identical
+    /// discipline as [`Self::TogglePalette`]): multi-surface presentation is
+    /// not wired yet, so creating a second window is an explicit opt-in. The
+    /// user opts in with e.g.
+    /// `{ chord = "ctrl+shift+n", action = "new_window" }`.
+    NewWindow,
     /// Invoke one registered plugin command (`command:<owner:command>`,
     /// alias `invoke_command:<owner:command>`; CTX-1035 issue #1829), optionally
     /// with a JSON args document (`command:<owner:command> -- '<json>'`;
@@ -1246,6 +1265,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePinned)
             }
+            "new_window" | "new_os_window" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::NewWindow)
+            }
             "toggle_scratchpad" | "scratchpad_toggle" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::InvokeCommand(CommandInvocation::new(
@@ -1326,6 +1349,7 @@ impl ChromeAction {
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
             Self::TogglePinned => "toggle_pinned".to_string(),
+            Self::NewWindow => "new_window".to_string(),
             Self::InvokeCommand(invocation) => match invocation.args_json() {
                 None => format!("command:{}", invocation.target()),
                 Some(blob) => format!(
@@ -1385,6 +1409,7 @@ impl ChromeAction {
             Self::TogglePalette => "Toggle the command palette overlay.",
             Self::ToggleFloating => "Toggle the focused panel between tiled and floating.",
             Self::TogglePinned => "Toggle the focused panel pinned state.",
+            Self::NewWindow => "Request a new OS window through the platform.",
             Self::InvokeCommand(_) => "Invoke one registered plugin command.",
         }
     }
@@ -1464,6 +1489,7 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::TogglePalette,
         ChromeAction::ToggleFloating,
         ChromeAction::TogglePinned,
+        ChromeAction::NewWindow,
         ChromeAction::InvokeCommand("example.owner:example-command".to_string().into()),
     ]
 }
@@ -1585,7 +1611,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, new_window, command:<owner:command>";
 
 /// Plugin id that owns the help/which-key overlay after the Core retirement
 /// (ADR-0014 / issue #2397).

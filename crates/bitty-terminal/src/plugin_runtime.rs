@@ -3304,6 +3304,21 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         assert_eq!(panels.borrow().panel_count(), 1);
     }
 
+    /// The activation generation the runtime publishes for `id`.
+    ///
+    /// `debug_plugins` is the runtime's own row set over `entry.generation` —
+    /// the very field `reload_inner` hands the generation edge as its successor
+    /// — so a row can name the generation actually installed instead of
+    /// assuming how many activations the fixture has seen.
+    fn installed_generation(runtime: &PluginRuntime, id: &str) -> u32 {
+        runtime
+            .debug_plugins()
+            .into_iter()
+            .find(|row| row.id == id)
+            .map(|row| row.generation)
+            .expect("the runtime publishes one row per discovered plugin")
+    }
+
     #[test]
     fn the_generation_edge_rebinds_a_container_through_the_installed_port() {
         // bitty#2476 residual 2 at the composition root: `discover_with_roots`
@@ -3314,6 +3329,11 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         // if the installer were dropped from the composition root, if the port
         // enumerated the wrong generation, or if it called the registry instead
         // of the facade (phase 2 step 3 would then never reset the lease).
+        //
+        // Both generations are read from the runtime's published rows, so the
+        // row does not encode how many activations the composition root
+        // performs: it asserts the one thing it is about — the installed port
+        // moved the binding onto the generation the edge named.
         let root = pin_test_dir("edge-rebind");
         write_panel_probe(&root, "xuepoo.edgerebind", &["panel.create", "panel.focus"]);
         let live = Runtime::with_defaults().expect("defaults must build");
@@ -3343,7 +3363,10 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgerebind").expect("id");
         let mut runtime = session.runtime;
 
-        // One container the plugin's first generation drives.
+        // One container the plugin's first generation drives. The generation is
+        // the one the runtime published for the fixture, so the first bind names
+        // the generation the reload edge will later end.
+        let first = installed_generation(&runtime, id.as_str());
         let handle = panels
             .borrow_mut()
             .create_panel(PanelType::Rich, Some(WorkspaceId::new(3)))
@@ -3360,7 +3383,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             .borrow_mut()
             .rebind_panel(
                 handle.id,
-                controller_generation(1),
+                controller_generation(first),
                 &id,
                 &requested,
                 &std::collections::BTreeSet::new(),
@@ -3369,9 +3392,18 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
 
         runtime.reload(&id).expect("reload");
 
+        // One reload activates the plugin once. Asserted rather than folded into
+        // the derivation below, so a double activation stays visible instead of
+        // being absorbed by whichever generation came out.
+        let successor = installed_generation(&runtime, id.as_str());
+        assert_eq!(
+            successor,
+            first + 1,
+            "one reload activates the plugin exactly once: {first} -> {successor}"
+        );
         assert_eq!(
             panels.borrow().registry().controller_generation(handle.id),
-            Some(controller_generation(2)),
+            Some(controller_generation(successor)),
             "the installed port rebound the container onto the successor generation"
         );
         assert_eq!(

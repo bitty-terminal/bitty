@@ -187,7 +187,10 @@ pub enum PanelError {
     /// the record already binds, both land here. While `PanelRecord::binding`
     /// is `None` the allocation epoch is the accepted key, so every call site on
     /// a panel that never bound a controller is unaffected. The generation edge
-    /// creates bindings; tests mint them.
+    /// only ever rebinds a container that already carries a binding; nothing
+    /// writes a container's first binding yet (`bitty.panel.create` carries no
+    /// `PluginId` and no generation, OQ-084 follow-up (e)), so tests mint that
+    /// one.
     ControllerConflict {
         panel_id: PanelId,
         /// The generation the record's binding names, or `None` while no
@@ -1387,11 +1390,15 @@ impl std::fmt::Display for PanelDisposalAction {
 /// names the owner and the workspace the container belonged to, and must exist
 /// after the panel record is gone.
 ///
-/// `owner` is `None` and `controller_generation` is the allocation epoch while
-/// no controller is bound (OQ-084 A.5): the D.2 phase 2 step 2 binder that would
-/// write the `(owner, controller generation)` pair is bitty#2476 residual 2, so
-/// no live path binds a controller yet. The record reports what the binding
-/// actually named at the edge rather than inventing an owner.
+/// `owner` is `None` exactly when the record held no binding at the edge — a
+/// container whose generation never bound a controller, or one whose binding an
+/// earlier edge already released — and `controller_generation` is then the
+/// allocation epoch (OQ-084 A.5). The binder that writes the pair is
+/// `PanelRegistry::rebind_panel` (D.2 phase 2 step 2), and the generation edge
+/// reaches it through the panel-generation port whenever the app installs one,
+/// so a container the edge rebound is disposed naming its successor's owner and
+/// controller generation. The record reports what the binding actually named at
+/// the edge rather than inventing an owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PanelDisposalRecord {
     /// The retired container.
@@ -2555,7 +2562,8 @@ impl PanelRegistry {
     /// `controller_generation` is the generation the disposal releases—the
     /// bound controller generation when one exists, otherwise the allocation
     /// epoch (D.2 phase 2 step 1)—and `owner` is the plugin that held the
-    /// content binding, which no live path writes yet (A.2, residual 2).
+    /// content binding. Only a bound controller writes an owner (A.2), so a
+    /// container that never bound one has none.
     #[must_use]
     pub fn panel_disposal_facts(&self, panel_id: PanelId) -> Option<PanelDisposalFacts> {
         let record = self.panels.get(&panel_id.0)?;

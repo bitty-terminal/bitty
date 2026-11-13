@@ -626,15 +626,17 @@ fn the_generation_edge_rebinds_the_container_and_moves_the_controller() {
 }
 
 /// Residual 4 on the production edge: a generation that ends with no successor
-/// releases its families and only then leaves the placeholder.
+/// must release its families before it leaves the placeholder.
 ///
-/// The assertion is a snapshot taken after the edge returned: the placeholder
-/// names `unloaded`, the release record names generation 1 and counts the two
-/// released grants, the grant row is gone, and the retired-ceiling tombstone
-/// carries the released set. A placeholder presented *before* the release would
-/// have to show an empty release record or a surviving grant row; one presented
-/// *after* a separate release would be refused by the controller fence and no
-/// placeholder would exist at all.
+/// The assertions are a snapshot taken after the edge returned, so this row
+/// cannot observe wall-clock order: what it proves is that the placeholder, the
+/// release record, the tombstone, and the container are all present together
+/// once the edge is done. The placeholder names `unloaded` and the generation
+/// its edge ended, the release record names that same generation and counts the
+/// two released grants, the ended generation's grant row is gone, and the
+/// retired-ceiling tombstone carries the released set — so the edge left
+/// nothing half done: no silent orphan, the container kept rather than
+/// disposed, and a placeholder carrying a closed reason.
 ///
 /// Fails for an edge that presents the placeholder without running the release,
 /// for one that releases but presents nothing (the silent orphan Decision E

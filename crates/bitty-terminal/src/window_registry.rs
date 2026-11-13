@@ -138,6 +138,24 @@ impl<E: fmt::Display> fmt::Display for AdmitError<E> {
     }
 }
 
+/// How a platform event's window identity relates to the registered set.
+///
+/// The app still owns one renderer, one focus tree and one PTY per process, so
+/// an event that belongs to a *secondary* window must not reach the primary's
+/// lifecycle or chrome handling until per-window routing exists. Deciding that
+/// here — instead of inside the event handler — keeps the rule headless-testable
+/// with a constructible payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventTarget {
+    /// The event names the primary (first registered) window.
+    Primary,
+    /// The event names a registered secondary window.
+    Secondary,
+    /// Nothing is registered, or the identity is unknown: the app keeps its
+    /// single-window behaviour and the event is handled as before.
+    Untracked,
+}
+
 /// Identity-keyed map of the windows this process owns.
 ///
 /// Insertion order is preserved so lifecycle logs and the primary window are
@@ -214,6 +232,19 @@ impl<H> WindowRegistry<H> {
 
 /// Identity-bound operations: these derive the row key from the payload.
 impl<H: WindowIdentity> WindowRegistry<H> {
+    /// Classifies a platform event's window identity against the registry.
+    ///
+    /// `Untracked` is the fail-safe answer: with no registered window (a
+    /// headless run) or an identity this process never admitted, the app keeps
+    /// its single-window behaviour instead of dropping the event.
+    pub(crate) fn target(&self, id: WindowId) -> EventTarget {
+        match self.rows.first() {
+            Some(row) if row.id == id => EventTarget::Primary,
+            Some(_) if self.contains(id) => EventTarget::Secondary,
+            _ => EventTarget::Untracked,
+        }
+    }
+
     /// Registers the startup window with its already-known surface state.
     ///
     /// Production calls this once, from the `Resumed` creation path, after the
@@ -264,11 +295,10 @@ impl<H> WindowRegistry<H> {
     /// was active, attribution moves to the first surviving row (never to a
     /// dangling identity, never to `None` while a window remains).
     ///
-    /// Window-close routing is not wired to this call yet (a single-window
-    /// process exits on close), so it is exercised by the registry tests that
-    /// pin "closing one window leaves the other intact".
-    // Wired by the close-routing slice; the semantics are pinned by tests now.
-    #[allow(dead_code)]
+    /// Window-close routing uses this for a close request that belongs to a
+    /// secondary window: dropping the row releases the last handle, so that OS
+    /// window goes away without touching the primary's close gate. The
+    /// primary's own close still runs the existing exit path.
     pub(crate) fn remove(&mut self, id: WindowId) -> Option<WindowRow<H>> {
         let index = self.rows.iter().position(|row| row.id == id)?;
         let row = self.rows.remove(index);
@@ -462,6 +492,34 @@ mod tests {
             None,
             "an empty registry has no active id"
         );
+    }
+
+    #[test]
+    fn event_target_classifies_primary_secondary_and_unknown_identities() {
+        let mut registry = WindowRegistry::new();
+        assert_eq!(
+            registry.target(id(1)),
+            EventTarget::Untracked,
+            "with nothing registered the app keeps single-window handling"
+        );
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+        assert_eq!(registry.target(first), EventTarget::Primary);
+        assert_eq!(registry.target(second), EventTarget::Secondary);
+        assert_eq!(
+            registry.target(id(99)),
+            EventTarget::Untracked,
+            "an identity this process never admitted is never treated as ours"
+        );
+        assert!(registry.remove(second).is_some());
+        assert_eq!(
+            registry.target(second),
+            EventTarget::Untracked,
+            "a closed identity stops being a secondary target"
+        );
+        assert_eq!(registry.target(first), EventTarget::Primary);
     }
 
     #[test]

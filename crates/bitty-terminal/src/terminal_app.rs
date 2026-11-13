@@ -18,7 +18,7 @@ use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
 use crate::spawn::SpawnSpec;
 use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
-use crate::window_registry::{MAX_WINDOWS, SurfaceState};
+use crate::window_registry::{EventTarget, MAX_WINDOWS, SurfaceState};
 
 /// PTY-quiescence settle window before a real-GUI present (bitty#2486).
 ///
@@ -4945,6 +4945,65 @@ impl TerminalApp {
         admitted
     }
 
+    /// Attributes one window event and contains it when it belongs to a
+    /// registered secondary window (bitty#1765, slice 1).
+    ///
+    /// Returns `true` when the event was contained and the caller must stop
+    /// handling it. An empty registry (a headless run) and an identity this
+    /// process never admitted return `false`, so the single-window path stays
+    /// byte-identical to before this slice.
+    fn contain_if_secondary(&mut self, id: WindowId, kind: &WindowEventKind) -> bool {
+        if self.windows.is_empty() {
+            return false;
+        }
+        match self.windows.target(id) {
+            EventTarget::Primary => {
+                self.windows.set_active(id);
+                false
+            }
+            EventTarget::Secondary => {
+                self.windows.set_active(id);
+                // Another window's traffic must never starve the primary's
+                // PTY: drain before containing the event.
+                self.watchdog_phase(Phase::PtyPump);
+                self.poll_pty_pump();
+                self.contain_secondary_window_event(id, kind);
+                true
+            }
+            EventTarget::Untracked => false,
+        }
+    }
+
+    /// Contains one event that belongs to a registered secondary window
+    /// (bitty#1765, slice 1).
+    ///
+    /// A close request closes exactly that window: removing its row releases
+    /// the last handle, so the OS window goes away without touching the
+    /// primary's close gate or the process exit path. Every other kind is
+    /// recorded loudly and dropped — a secondary window has no renderer, no
+    /// focus and no PTY of its own yet, so forwarding its event would mutate
+    /// the primary's state.
+    fn contain_secondary_window_event(&mut self, id: WindowId, kind: &WindowEventKind) {
+        if matches!(kind, WindowEventKind::CloseRequested) {
+            if self.windows.remove(id).is_some() {
+                crate::logging::info(|| {
+                    format!(
+                        "bitty: secondary window closed id={} windows={:?}",
+                        id.get(),
+                        self.windows.ids()
+                    )
+                });
+            }
+            return;
+        }
+        crate::logging::info(|| {
+            format!(
+                "bitty: secondary window event contained id={} kind={kind:?} (no per-window routing yet)",
+                id.get()
+            )
+        });
+    }
+
     /// Attempts to attach a real GPU surface after window creation (single-window slice).
     pub(crate) fn try_attach_gpu(&mut self, handle: &WindowHandle) {
         // Do not re-attach if already has GPU
@@ -5145,6 +5204,21 @@ fn log_occlusion_awareness_once() {
 impl TerminalApp {
     /// Event-handler body; the `AppHandler` wrapper owns the watchdog mark.
     fn handle_event_inner(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
+        // bitty#1765 (slice 1): attribute the event to the window it names and
+        // contain anything that belongs to a registered *secondary* window.
+        //
+        // The process still owns one renderer, one focus tree, one PTY and one
+        // visibility gate, so a secondary window's traffic must not reach the
+        // primary's lifecycle or chrome handling: an `Occluded(true)` from the
+        // blank second window would close the primary's surface gate, and a
+        // chord typed there would split the primary's layout. Until per-window
+        // routing lands the event is dropped after attribution — except a
+        // close request, which closes that window by releasing its row.
+        if let PlatformEvent::Window { window_id, kind } = &event {
+            if self.contain_if_secondary(*window_id, kind) {
+                return;
+            }
+        }
         // Issue #2570: record the last window/surface lifecycle event so a
         // crash report names what the surface was doing. One relaxed atomic
         // store per window event when crash capture is enabled.
@@ -5269,15 +5343,7 @@ impl TerminalApp {
         // emergency/reserved > active overlay-modal > user-defined keymap >
         // plugin (inert, deny-by-default) > terminal encoding. A consumed
         // event never reaches `Runtime`.
-        if let PlatformEvent::Window { window_id, kind } = &event {
-            // bitty#1765 (slice 1): every window event is attributed to the
-            // window it names, so the registry — never a struct field — decides
-            // which window an interaction belongs to. An identity this process
-            // never registered (today: every event under a headless run)
-            // changes nothing, and a headless run skips the lookup entirely.
-            if !self.windows.is_empty() {
-                self.windows.set_active(*window_id);
-            }
+        if let PlatformEvent::Window { window_id: _, kind } = &event {
             self.watchdog_phase(Phase::ChromeIntercept);
             if self.intercept_chrome_key(kind) {
                 // Issue #1783: a last-pane `close_view` that confirms the

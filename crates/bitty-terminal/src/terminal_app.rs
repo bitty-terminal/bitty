@@ -5020,34 +5020,15 @@ impl TerminalApp {
         match self.windows.target(id) {
             EventTarget::Primary => {
                 self.windows.set_active(id);
-                // bitty#1765 (slice 3): a close *request* for the first window
-                // is the one close the app can decline. Promoting a survivor to
-                // the primary role needs a runtime seam that does not exist yet
-                // (the primary swap chain, presenter and GPU context are
-                // process-wide), so closing the first window while others
-                // remain would strand them. Decline loudly instead of
-                // terminating an instance the user still has a window in —
-                // never a half-wired teardown.
-                //
-                // `Closed` cannot be declined: the platform already destroyed
-                // that window, and its surface is what the shared presenter
-                // paints into, so that event keeps the existing exit path until
-                // a survivor can be promoted.
-                if matches!(kind, WindowEventKind::CloseRequested)
-                    && self.windows.close_decision(id) == CloseDecision::WindowOnly
-                {
-                    let remaining = self.windows.len() - 1;
-                    crate::logging::warn(|| {
-                        format!(
-                            "warning: close of window {} deferred — {remaining} other window(s) remain and promoting a survivor to primary is not implemented yet; instance stays up windows={:?}",
-                            id.get(),
-                            self.windows.ids()
-                        )
-                    });
-                    eprintln!(
-                        "bitty: window {} stays open — the first window of a multi-window instance cannot be closed yet; close the other windows first",
-                        id.get()
-                    );
+                // bitty#1765 (slice 4): a close of the *primary* window while
+                // another window survives destroys only that window. The first
+                // survivor takes the primary role over in one step — its
+                // surface becomes the primary surface, the app's window state
+                // moves to it — and the instance keeps running. When no
+                // survivor can take the surface over (the off-thread Wayland
+                // presenter owns it), the close is declined loudly instead of
+                // terminating an instance the user still has a window in.
+                if is_window_close(kind) && self.close_registered_window(id, kind) {
                     return true;
                 }
                 false
@@ -5063,6 +5044,199 @@ impl TerminalApp {
             }
             EventTarget::Untracked => false,
         }
+    }
+
+    /// Applies a close event that belongs to a registered window (bitty#1765,
+    /// slice 4).
+    ///
+    /// Returns `true` when the close was applied to that one window (the event
+    /// is consumed), `false` when the event must keep its pre-multi-window
+    /// meaning: the last registered window keeps the instance exit path, and an
+    /// unregistered identity was never this registry's to close.
+    ///
+    /// Ordering is the surface lifetime contract: the window's swap chain is
+    /// released first, then the registry row is removed and its last handle
+    /// dropped, which is what destroys the OS window. Closing one window never
+    /// touches another window's surface — a surviving primary keeps painting,
+    /// and a promoted survivor's own already-configured swap chain is *moved*
+    /// into the primary role rather than re-created.
+    fn close_registered_window(&mut self, id: WindowId, kind: &WindowEventKind) -> bool {
+        let decision = self.windows.close_decision(id);
+        if decision != CloseDecision::WindowOnly {
+            crate::logging::info(|| {
+                format!(
+                    "bitty: window close {kind:?} id={} decision={decision:?} -> existing instance path windows={:?}",
+                    id.get(),
+                    self.windows.ids()
+                )
+            });
+            return false;
+        }
+        if self.windows.primary() == Some(id) {
+            let Some(survivor) = self
+                .windows
+                .ids()
+                .into_iter()
+                .find(|candidate| *candidate != id)
+            else {
+                // Two rows exist, so this is unreachable; refusing is still the
+                // only safe answer (never exit with a window still open).
+                return true;
+            };
+            if !self.promote_primary_window(survivor) {
+                let remaining = self.windows.len() - 1;
+                crate::logging::warn(|| {
+                    format!(
+                        "warning: close of window {} deferred — no survivor can take the primary surface over ({} other window(s) remain); instance stays up windows={:?}",
+                        id.get(),
+                        remaining,
+                        self.windows.ids()
+                    )
+                });
+                eprintln!(
+                    "bitty: window {} stays open — promoting a survivor to the primary surface is refused on this backend; close the other windows first",
+                    id.get()
+                );
+                return true;
+            }
+        }
+        // The closed window's own swap chain (a no-op when it was the primary:
+        // its surface was replaced by the promoted one).
+        let released = self.runtime.release_window_surface(id);
+        let Some(closed) = self.windows.close(id) else {
+            return true;
+        };
+        self.deferred_window_surfaces
+            .retain(|pending| *pending != id);
+        crate::logging::info(|| {
+            format!(
+                "bitty: window closed id={} kind={kind:?} decision={:?} surface_released={released} row_state={} promoted={:?} windows={:?} focused={:?} admitted={} removed={} window_surfaces=[{}]",
+                closed.row.id.get(),
+                closed.decision,
+                closed.row.state.label(),
+                closed.promoted,
+                self.windows.ids(),
+                self.windows.focused(),
+                self.windows.admitted(),
+                self.windows.removed(),
+                self.runtime.window_surface_summary()
+            )
+        });
+        // Dropping the row releases the last handle to that window, so the OS
+        // window goes away here and nowhere else.
+        drop(closed);
+        true
+    }
+
+    /// Hands the primary role to a surviving window (bitty#1765, slice 4).
+    ///
+    /// The survivor's already-configured surface moves into the primary role
+    /// ([`Runtime::promote_window_surface`]) and every piece of app state that
+    /// is bound to *one* window follows it: the platform handle, the window
+    /// identity, the OS title/cursor sinks, the IME opt-in, and the per-window
+    /// caches that must be re-applied to the new window.
+    ///
+    /// Returns `false` and changes nothing when the runtime refuses: the
+    /// survivor has no attached surface (its attach was refused or deferred) or
+    /// the off-thread presenter owns the primary surface. A refused promotion
+    /// leaves the instance exactly as it was.
+    fn promote_primary_window(&mut self, survivor: WindowId) -> bool {
+        let Some(handle) = self.windows.get(survivor).map(|row| row.handle.clone()) else {
+            return false;
+        };
+        if self
+            .windows
+            .get(survivor)
+            .is_none_or(|row| row.surface.is_none())
+        {
+            return false;
+        }
+        if let Err(error) = self.runtime.promote_window_surface(survivor) {
+            crate::logging::warn(|| {
+                format!(
+                    "warning: window {} cannot take the primary surface over ({error})",
+                    survivor.get()
+                )
+            });
+            return false;
+        }
+        // The promoted window is the one the hot path addresses from now on.
+        handle.set_ime_allowed(true);
+        self.window.handle = Some(handle.clone());
+        self.window.id = Some(survivor);
+        self.window.os_title_sink = Some(Box::new(handle.clone()));
+        self.window.os_cursor_sink = Some(Box::new(handle));
+        // Per-window caches described the window that just closed; clearing
+        // them makes the next title/cursor/IME change apply to the survivor.
+        self.window.ime_cursor_area = None;
+        self.window.last_applied_title = None;
+        self.window.last_applied_cursor = None;
+        self.windows.mark_attached(survivor);
+        self.deferred_window_surfaces
+            .retain(|pending| *pending != survivor);
+        // The survivor is on screen now: the closed window may have left the
+        // process-wide visibility gate closed.
+        self.set_surface_gate(true, "promoted");
+        crate::logging::info(|| {
+            format!(
+                "bitty: window {} promoted to primary windows={:?} window_surfaces=[{}]",
+                survivor.get(),
+                self.windows.ids(),
+                self.runtime.window_surface_summary()
+            )
+        });
+        true
+    }
+
+    /// Releases every registered window's presentation surface and destroys the
+    /// windows, in registry order (bitty#1765, slice 4).
+    ///
+    /// Every instance-exit path calls this before `Runtime::shutdown`, so an
+    /// orderly exit drops each swap chain exactly once, in registry order, and
+    /// only then the OS windows — a surface must not outlive the window it was
+    /// created from. The primary surface is released the same way, through
+    /// [`Runtime::detach_gpu`], while its window is still alive.
+    ///
+    /// Returns the number of secondary surfaces released.
+    pub(crate) fn teardown_windows(&mut self) -> usize {
+        let rows = self.windows.drain();
+        self.deferred_window_surfaces.clear();
+        if rows.is_empty() && self.window.handle.is_none() {
+            return 0;
+        }
+        let mut released = 0usize;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if self.runtime.release_window_surface(row.id) {
+                released += 1;
+            }
+            ids.push(row.id.get());
+        }
+        let primary_released = if self.runtime.has_gpu() {
+            self.runtime.detach_gpu();
+            true
+        } else {
+            false
+        };
+        let ledger = self.runtime.window_surface_ledger();
+        crate::logging::info(|| {
+            format!(
+                "bitty: window teardown ids={ids:?} surfaces_released={released} primary_surface_released={primary_released} admitted={} removed={} created={} released={} live={} window_surfaces=[{}]",
+                self.windows.admitted(),
+                self.windows.removed(),
+                ledger.created(),
+                ledger.released(),
+                ledger.live(),
+                self.runtime.window_surface_summary()
+            )
+        });
+        // Dropping the rows destroys the secondary OS windows; clearing the
+        // handle destroys the primary one.
+        drop(rows);
+        self.window.handle = None;
+        self.window.os_title_sink = None;
+        self.window.os_cursor_sink = None;
+        released
     }
 
     /// Applies one platform event to the focused-window record (bitty#1765,
@@ -5136,23 +5310,10 @@ impl TerminalApp {
     /// primary's state.
     fn contain_secondary_window_event(&mut self, id: WindowId, kind: &WindowEventKind) {
         if is_window_close(kind) {
-            let released = self.runtime.release_window_surface(id);
-            if self.windows.remove(id).is_some() {
-                self.deferred_window_surfaces
-                    .retain(|pending| *pending != id);
-                // bitty#1765 (slice 3): the row is gone, so focus and
-                // attribution were re-homed by `remove`; report both so a
-                // closed window is never silently still "the focused one".
-                crate::logging::info(|| {
-                    format!(
-                        "bitty: secondary window closed id={} kind={kind:?} surface_released={released} windows={:?} focused={:?} window_surfaces=[{}]",
-                        id.get(),
-                        self.windows.ids(),
-                        self.windows.focused(),
-                        self.runtime.window_surface_summary()
-                    )
-                });
-            }
+            // bitty#1765 (slice 4): one close path for every registered window.
+            // It releases that window's surface, removes its row, and drops the
+            // last handle — never the primary's surface, never the process.
+            self.close_registered_window(id, kind);
             return;
         }
         match kind {
@@ -5623,6 +5784,7 @@ impl TerminalApp {
         self.watchdog_phase(Phase::Reap);
         if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
             self.save_session_best_effort("shell-exit");
+            self.teardown_windows();
             self.runtime.shutdown();
             crash_report::record_exit(crash_report::ExitReason::ShellExit);
             ctx.exit();
@@ -5645,6 +5807,7 @@ impl TerminalApp {
                         "bitty: exit requested (last-pane close_view confirmed)".to_string()
                     });
                     self.save_session_best_effort("close-view");
+                    self.teardown_windows();
                     self.runtime.shutdown();
                     crash_report::record_exit(crash_report::ExitReason::CloseView);
                     ctx.exit();
@@ -5709,6 +5872,7 @@ impl TerminalApp {
             crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
             self.watchdog_phase(Phase::Shutdown);
             self.save_session_best_effort("exit");
+            self.teardown_windows();
             self.runtime.shutdown();
             let reason = match &event {
                 PlatformEvent::Window {
@@ -5730,6 +5894,7 @@ impl TerminalApp {
         if self.dispatch_pending_mouse_action() {
             crate::logging::info(|| "bitty: exit requested (mouse chrome action)".to_string());
             self.save_session_best_effort("mouse-action");
+            self.teardown_windows();
             self.runtime.shutdown();
             crash_report::record_exit(crash_report::ExitReason::MouseAction);
             ctx.exit();
@@ -6046,6 +6211,7 @@ impl TerminalApp {
                 self.watchdog_phase(Phase::Reap);
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");
+                    self.teardown_windows();
                     self.runtime.shutdown();
                     crash_report::record_exit(crash_report::ExitReason::ShellExit);
                     ctx.exit();
@@ -6245,6 +6411,7 @@ impl TerminalApp {
             // idempotent) and exits instead of silently dropping the session.
             PlatformEvent::Exiting => {
                 self.save_session_best_effort("loop-exiting");
+                self.teardown_windows();
                 self.runtime.shutdown();
                 crash_report::record_exit(crash_report::ExitReason::LoopExiting);
                 ctx.exit();

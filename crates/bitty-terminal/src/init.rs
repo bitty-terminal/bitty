@@ -25,10 +25,17 @@ pub(crate) const CONFIG_BACKUP_DIR_NAME: &str = ".backups";
 const INIT_PICKER_DEFAULT_MAX_VISIBLE: usize = 10;
 
 /// Minimum visible option rows even in very short terminal windows.
+///
+/// Read only by the Unix live-terminal clamp: non-Unix binaries fall back to
+/// `INIT_PICKER_DEFAULT_MAX_VISIBLE`, hence the dead-code allowance there.
+#[cfg_attr(not(unix), allow(dead_code))]
 const INIT_PICKER_MIN_VISIBLE: usize = 3;
 
 /// Lines reserved for the picker header, hint, preview, typed row, and
 /// completed-step banner so the rendered frame stays inside the viewport.
+///
+/// Same Unix-only read site as `INIT_PICKER_MIN_VISIBLE`.
+#[cfg_attr(not(unix), allow(dead_code))]
 const INIT_PICKER_CHROME_ROWS: usize = 8;
 
 /// Bounded collision search for a recoverable `.bak` sibling.

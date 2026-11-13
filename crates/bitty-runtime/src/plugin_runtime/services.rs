@@ -4205,34 +4205,38 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             }
             Ok(WheelSettingValue::Text(mode.clone()))
         }
-        _ if let Some(tool) = key.strip_prefix("permissions.") => {
-            if tool.is_empty() || !WHEEL_TOOL_NAMES.contains(&tool) {
-                return Err(config_key_error());
+        _ => {
+            // MSRV 1.85: `if let` guards are unstable (E0658), so the prefix-keyed
+            // settings are resolved here instead of as match guards.
+            if let Some(tool) = key.strip_prefix("permissions.") {
+                if tool.is_empty() || !WHEEL_TOOL_NAMES.contains(&tool) {
+                    return Err(config_key_error());
+                }
+                let LuaValue::String(mode) = value else {
+                    return Err(config_value_error("wheel permission mode must be a string"));
+                };
+                if !matches!(mode.as_str(), "auto" | "ask" | "deny") {
+                    return Err(config_value_error(
+                        "wheel permission mode must be auto, ask, or deny",
+                    ));
+                }
+                return Ok(WheelSettingValue::Text(mode.clone()));
             }
-            let LuaValue::String(mode) = value else {
-                return Err(config_value_error("wheel permission mode must be a string"));
-            };
-            if !matches!(mode.as_str(), "auto" | "ask" | "deny") {
-                return Err(config_value_error(
-                    "wheel permission mode must be auto, ask, or deny",
-                ));
+            if let Some(provider) = key
+                .strip_prefix("providers.")
+                .and_then(|rest| rest.strip_suffix(".model"))
+            {
+                if provider.is_empty() || !WHEEL_PROVIDER_IDS.contains(&provider) {
+                    return Err(config_key_error());
+                }
+                let LuaValue::String(model) = value else {
+                    return Err(config_value_error("wheel provider model must be a string"));
+                };
+                validate_wheel_model_string(model, false)?;
+                return Ok(WheelSettingValue::Text(model.clone()));
             }
-            Ok(WheelSettingValue::Text(mode.clone()))
+            Err(config_key_error())
         }
-        _ if let Some(provider) = key
-            .strip_prefix("providers.")
-            .and_then(|rest| rest.strip_suffix(".model")) =>
-        {
-            if provider.is_empty() || !WHEEL_PROVIDER_IDS.contains(&provider) {
-                return Err(config_key_error());
-            }
-            let LuaValue::String(model) = value else {
-                return Err(config_value_error("wheel provider model must be a string"));
-            };
-            validate_wheel_model_string(model, false)?;
-            Ok(WheelSettingValue::Text(model.clone()))
-        }
-        _ => Err(config_key_error()),
     }
 }
 
@@ -15367,5 +15371,44 @@ mod history_tests {
             );
             assert!(error.message.contains("appearance.theme"));
         }
+    }
+
+    /// The prefix-keyed Wheel settings resolve through the match fallback arm
+    /// (MSRV 1.85 has no `if let` guards), so pin the accept/refuse edges.
+    #[test]
+    fn wheel_setting_prefix_keys_resolve_through_the_fallback_arm() {
+        let mode = LuaValue::String("ask".to_owned());
+        let parsed =
+            validate_wheel_setting("permissions.bash", &mode).expect("permission key accepted");
+        assert!(matches!(parsed, WheelSettingValue::Text(ref text) if text == "ask"));
+        assert!(
+            validate_wheel_setting("permissions.not-a-tool", &mode).is_err(),
+            "unknown tool names are refused"
+        );
+        assert!(
+            validate_wheel_setting("permissions.", &mode).is_err(),
+            "an empty tool segment is refused"
+        );
+        assert!(
+            validate_wheel_setting("permissions", &mode).is_err(),
+            "the bare prefix is not a permission key"
+        );
+
+        let model = LuaValue::String("openai/gpt-5".to_owned());
+        let parsed = validate_wheel_setting("providers.openrouter.model", &model)
+            .expect("provider model key accepted");
+        assert!(matches!(parsed, WheelSettingValue::Text(ref text) if text == "openai/gpt-5"));
+        assert!(
+            validate_wheel_setting("providers.unknown.model", &model).is_err(),
+            "unknown providers are refused"
+        );
+        assert!(
+            validate_wheel_setting("providers.openrouter.endpoint", &model).is_err(),
+            "only the .model suffix is accepted"
+        );
+        assert!(
+            validate_wheel_setting("unrelated.key", &mode).is_err(),
+            "unknown keys fall through to a key error"
+        );
     }
 }

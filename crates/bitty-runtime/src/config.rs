@@ -1302,20 +1302,22 @@ pub enum PanelLayoutMode {
     /// (right/down). Keeps pane sizes usable for long creation runs; explicit
     /// opt-in since 0.0.28 (issue #2571).
     Balanced,
-    /// 4-way clockwise spiral: Right -> Down -> Left -> Up, continuing only
-    /// while the pane created by the previous split stays focused. Falls back
-    /// to the largest feasible Balanced target when the focused slot is too
-    /// small (issue #2571 review).
+    /// dwm-fibonacci 4-way clockwise spiral: Right -> Down -> Left -> Up,
+    /// continuing only while the pane created by the previous split stays
+    /// focused. Falls back to the largest feasible Balanced target when the
+    /// focused slot is too small (issue #2571 review).
     #[default]
     Spiral,
-    /// Hyprland-style dwindle: always splits the focused pane Right or Down.
+    /// Hyprland-style `dwindle` (`force_split = 0`, `default_split_ratio = 1.0`):
+    /// always splits the focused pane Right or Down according to its
+    /// container-normalized aspect ratio.
     Dwindle,
     /// Bisect the largest-area panel (CTX-0964, #1698): pick the leaf with
     /// the largest `width * height` allocation (first in solver order on
     /// ties) and split it right (`width >= height`, [`bitty_ui::SplitAxis::Horizontal`])
     /// or down (otherwise), placing the fresh pane after it. The axis uses
-    /// raw cell counts, unlike the [`bitty_ui::smart_split_axis`] 2.0
-    /// cell-aspect correction.
+    /// raw cell counts, unlike the [`bitty_ui::dwindle_split_axis`]
+    /// ([`bitty_ui::smart_split_axis`]) 2.0 cell-aspect correction.
     BisectLargest,
 }
 

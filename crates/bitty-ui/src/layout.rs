@@ -167,8 +167,9 @@ impl LayoutNode {
         }
     }
 
-    /// Creates an adaptive split with a Hyprland dwindle-style axis chosen from
-    /// the container's cell dimensions (CTX-0209, CR-UI-01).
+    /// Creates an adaptive split with a Hyprland `dwindle`-style axis chosen
+    /// from the container's cell dimensions (`force_split = 0` aspect heuristic;
+    /// CTX-0209, CR-UI-01).
     ///
     /// Wide containers split side-by-side (`SplitAxis::Horizontal`, vertical
     /// divider) and tall containers split stacked (`SplitAxis::Vertical`,
@@ -177,18 +178,53 @@ impl LayoutNode {
     /// `splitTop = box.h * split_width_multiplier > box.w` (false for a
     /// square at the default multiplier `1.0`).
     ///
+    /// Note on Hyprland terminology: in Hyprland's official layout docs,
+    /// `dwindle` chooses its split axis from window aspect (`force_split = 0`)
+    /// and `split_width_multiplier`, whereas `dwindle:smart_split = true`
+    /// divides a window into 4 triangles based on cursor position.
+    /// [`Self::dwindle_split`] is the canonical name for this aspect-driven
+    /// constructor; [`Self::smart_split`] is retained as a forwarding alias.
+    ///
     /// Opt-in: [`Self::split`] keeps its explicit axis and is unaffected.
     /// Ratio clamping is identical (delegates to [`Self::split`]).
     #[must_use]
-    pub fn smart_split(container: Rect, ratio: f32, first: LayoutNode, second: LayoutNode) -> Self {
-        Self::smart_split_with_multiplier(container, ratio, first, second, 1.0)
+    pub fn dwindle_split(
+        container: Rect,
+        ratio: f32,
+        first: LayoutNode,
+        second: LayoutNode,
+    ) -> Self {
+        Self::dwindle_split_with_multiplier(container, ratio, first, second, 1.0)
     }
 
-    /// Like [`Self::smart_split`] with an explicit width multiplier, mirroring
+    /// Like [`Self::dwindle_split`] with an explicit width multiplier, mirroring
     /// Hyprland's `dwindle:split_width_multiplier`: the container splits
     /// stacked when `height * width_multiplier > width`, side-by-side
     /// otherwise. Non-finite or non-positive multipliers fall back to `1.0`
     /// so the constructor stays total.
+    #[must_use]
+    pub fn dwindle_split_with_multiplier(
+        container: Rect,
+        ratio: f32,
+        first: LayoutNode,
+        second: LayoutNode,
+        width_multiplier: f32,
+    ) -> Self {
+        Self::split(
+            dwindle_split_axis(container, width_multiplier),
+            ratio,
+            first,
+            second,
+        )
+    }
+
+    /// Forwarding alias for [`Self::dwindle_split`] (CTX-0209).
+    #[must_use]
+    pub fn smart_split(container: Rect, ratio: f32, first: LayoutNode, second: LayoutNode) -> Self {
+        Self::dwindle_split(container, ratio, first, second)
+    }
+
+    /// Forwarding alias for [`Self::dwindle_split_with_multiplier`] (CTX-0209).
     #[must_use]
     pub fn smart_split_with_multiplier(
         container: Rect,
@@ -197,12 +233,7 @@ impl LayoutNode {
         second: LayoutNode,
         width_multiplier: f32,
     ) -> Self {
-        Self::split(
-            smart_split_axis(container, width_multiplier),
-            ratio,
-            first,
-            second,
-        )
+        Self::dwindle_split_with_multiplier(container, ratio, first, second, width_multiplier)
     }
 
     /// Creates a stack. Empty stacks are allowed (total solver) but contain no leaves.
@@ -2118,7 +2149,8 @@ pub fn split_rect_with_gap(bounds: Rect, axis: SplitAxis, ratio: f32, gap_in: u1
 /// so that physical aspect ratio is compared rather than raw cell counts.
 pub const CELL_ASPECT_RATIO: f32 = 2.0;
 
-/// Hyprland-style `dwindle` split heuristic for container bounds.
+/// Hyprland-style `dwindle` split heuristic for container bounds (`force_split = 0`,
+/// `split_width_multiplier`).
 ///
 /// Returns [`SplitAxis::Vertical`] (stacked, top/bottom) when the container is
 /// physically taller than it is wide after accounting for terminal cell aspect
@@ -2128,7 +2160,7 @@ pub const CELL_ASPECT_RATIO: f32 = 2.0;
 /// falls back to `1.0`. Total over all inputs, including empty bounds (which
 /// yield [`SplitAxis::Horizontal`]).
 #[must_use]
-pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
+pub fn dwindle_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
     let mult = if width_multiplier.is_finite() && width_multiplier > 0.0 {
         width_multiplier
     } else {
@@ -2140,6 +2172,12 @@ pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
     } else {
         SplitAxis::Horizontal
     }
+}
+
+/// Forwarding alias for [`dwindle_split_axis`].
+#[must_use]
+pub fn smart_split_axis(container: Rect, width_multiplier: f32) -> SplitAxis {
+    dwindle_split_axis(container, width_multiplier)
 }
 
 /// Raw-aspect bisect axis (CTX-0964, #1698).
@@ -4921,5 +4959,44 @@ mod tests {
         }
 
         assert_eq!(overlap_len(u32::MAX - 5, 10, u32::MAX - 2, 10), 7);
+    }
+
+    #[test]
+    fn dwindle_split_and_dwindle_split_axis_match_smart_split_aliases() {
+        let wide = Rect::new(0, 0, 80, 24);
+        let tall = Rect::new(0, 0, 20, 40);
+        assert_eq!(dwindle_split_axis(wide, 1.0), SplitAxis::Horizontal);
+        assert_eq!(dwindle_split_axis(tall, 1.0), SplitAxis::Vertical);
+        assert_eq!(dwindle_split_axis(wide, 1.0), smart_split_axis(wide, 1.0));
+
+        let tree_dwindle = LayoutNode::dwindle_split(
+            wide,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        let tree_smart = LayoutNode::smart_split(
+            wide,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+        );
+        assert_eq!(tree_dwindle.layout(wide), tree_smart.layout(wide));
+
+        let tree_d2 = LayoutNode::dwindle_split_with_multiplier(
+            wide,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            2.5,
+        );
+        let tree_s2 = LayoutNode::smart_split_with_multiplier(
+            wide,
+            0.5,
+            LayoutNode::leaf(view(1, 1, 1)),
+            LayoutNode::leaf(view(2, 1, 1)),
+            2.5,
+        );
+        assert_eq!(tree_d2.layout(wide), tree_s2.layout(wide));
     }
 }

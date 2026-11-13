@@ -4100,6 +4100,11 @@ const WHEEL_TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",
     "bash",
+    "fs_read",
+    "fs_write",
+    "run_command",
+    "git",
+    "network",
 ];
 
 /// Validate a Wheel provider id against the built-in catalog.
@@ -4176,9 +4181,12 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             let LuaValue::String(gear) = value else {
                 return Err(config_value_error("wheel thinking_gear must be a string"));
             };
-            if !matches!(gear.as_str(), "off" | "low" | "medium" | "high" | "xhigh") {
+            if !matches!(
+                gear.as_str(),
+                "off" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
                 return Err(config_value_error(
-                    "wheel thinking_gear must be off, low, medium, high, or xhigh",
+                    "wheel thinking_gear must be off, low, medium, high, xhigh, or max",
                 ));
             }
             Ok(WheelSettingValue::Text(gear.clone()))
@@ -4189,17 +4197,16 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             };
             if !matches!(
                 mode.as_str(),
-                "prompt" | "dashboard" | "auto-allow" | "auto-deny"
+                "prompt" | "terminal" | "dashboard" | "auto-allow" | "auto-deny"
             ) {
                 return Err(config_value_error(
-                    "wheel approval_mode must be prompt, dashboard, auto-allow, or auto-deny",
+                    "wheel approval_mode must be prompt, terminal, dashboard, auto-allow, or auto-deny",
                 ));
             }
             Ok(WheelSettingValue::Text(mode.clone()))
         }
-        _ if key.starts_with("permissions.") => {
-            let tool = &key["permissions.".len()..];
-            if !WHEEL_TOOL_NAMES.contains(&tool) {
+        _ if let Some(tool) = key.strip_prefix("permissions.") => {
+            if tool.is_empty() || !WHEEL_TOOL_NAMES.contains(&tool) {
                 return Err(config_key_error());
             }
             let LuaValue::String(mode) = value else {
@@ -4212,9 +4219,11 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             }
             Ok(WheelSettingValue::Text(mode.clone()))
         }
-        _ if key.starts_with("providers.") && key.ends_with(".model") => {
-            let provider = &key["providers.".len()..key.len() - ".model".len()];
-            if !WHEEL_PROVIDER_IDS.contains(&provider) {
+        _ if let Some(provider) = key
+            .strip_prefix("providers.")
+            .and_then(|rest| rest.strip_suffix(".model")) =>
+        {
+            if provider.is_empty() || !WHEEL_PROVIDER_IDS.contains(&provider) {
                 return Err(config_key_error());
             }
             let LuaValue::String(model) = value else {
@@ -5209,10 +5218,39 @@ impl PluginServices {
             .len()
             .saturating_add(snapshot.permissions.len())
             .saturating_add(snapshot.approvals.len());
-        let bytes = 64usize
-            .saturating_add(snapshot.providers.len().saturating_mul(64))
-            .saturating_add(snapshot.permissions.len().saturating_mul(16))
-            .saturating_add(snapshot.approvals.len().saturating_mul(64));
+        let mut bytes = 64usize.saturating_add(list_row_bytes(&[
+            snapshot.default_provider.as_str(),
+            snapshot.default_model.as_str(),
+            snapshot.thinking_gear.as_str(),
+            snapshot.approval_mode.as_str(),
+        ]));
+        for row in &snapshot.providers {
+            bytes = bytes.saturating_add(list_row_bytes(&[
+                row.name.as_str(),
+                row.label.as_str(),
+                row.protocol.as_str(),
+                row.default_model.as_str(),
+                row.model.as_str(),
+                row.model_source.as_str(),
+                row.auth_env.as_str(),
+                row.auth_source.as_str(),
+                row.base_url.as_str(),
+            ]));
+        }
+        for row in &snapshot.permissions {
+            bytes = bytes.saturating_add(list_row_bytes(&[row.tool.as_str(), row.mode.as_str()]));
+        }
+        for row in &snapshot.approvals {
+            bytes = bytes.saturating_add(list_row_bytes(&[
+                row.id.as_str(),
+                row.session_id.as_str(),
+                row.tool.as_str(),
+                row.risk.as_str(),
+                row.summary.as_str(),
+                row.status.as_str(),
+                row.decision.as_deref().unwrap_or(""),
+            ]));
+        }
         check_list_bounds(row_count, bytes)?;
         self.config_charge_result_bytes(started, bytes)?;
         Ok(snapshot)

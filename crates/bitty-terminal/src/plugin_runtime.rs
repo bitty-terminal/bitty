@@ -23,12 +23,13 @@ use bitty_ipc::MAX_SNAPSHOT_ZONES;
 use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
-    PaneCwdSource, PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginRuntime,
-    PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory,
-    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    PaneCwdSource, PanelCreateHandler, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport,
+    PanelGenerationPort, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
+    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
+    WorkspaceInfo, WorkspaceSource, controller_generation,
 };
 use bitty_runtime::registry::{
-    PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
+    Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
@@ -725,6 +726,126 @@ pub(crate) fn startup_panel_create_backend(
     })
 }
 
+/// Production panel generation port (bitty#2476 residuals 2 and 4).
+///
+/// The generation edge runs in the plugin runtime, which cannot name a
+/// `PanelRuntime`: the panel host is this crate's, built once at the
+/// composition root and shared with `bitty.panel.create`, the `SceneHost`, and
+/// the present loop. This is the adapter the runtime asks instead, installed
+/// with `PluginRuntime::set_panel_generation_port` beside the scene host.
+///
+/// It exposes exactly the two questions the edge has and answers them by
+/// delegating to the same public panel API every other surface uses:
+///
+/// - **release** — the containers the ended generation still binds are released
+///   and left presenting the Decision E placeholder naming `edge.reason`. The
+///   release is the registry's own `present_placeholder`, which writes the
+///   retired-ceiling tombstone, removes the grant row, drains the panel queue,
+///   unregisters the panel commands, and dismisses the attributed overlays
+///   *before* the placeholder becomes visible (OQ-084 A.2), so the ordering is
+///   the registry's rather than a second implementation here.
+/// - **bind** — the containers the predecessor drove are bound to the successor
+///   through `PanelRuntime::rebind_panel`, which is D.2 phase 2 step 3's
+///   required caller: it resets the lease and only then drops the tombstone.
+///
+/// Enumeration is one bounded `PanelId` walk per edge — the containers the
+/// generation *holds*, either because its binding is still in force (a
+/// displacement) or because its edge already ended it and the record retained
+/// the pair (the reload case, where the release ran first). A container that
+/// never bound a controller is not this port's to move: `bitty.panel.create`
+/// carries no owner (OQ-084 follow-up (e)), so nothing in the tree names one.
+///
+/// Nothing here grants authority. The capability set a bind installs is the
+/// successor's own activation resolution intersected with the predecessor's
+/// captured ceiling; a refusal moves nothing and is reported, and the panel
+/// stays unbound with the placeholder the edge presented.
+struct AppPanelGenerationPort {
+    panels: Rc<RefCell<PanelRuntime>>,
+}
+
+impl AppPanelGenerationPort {
+    fn new(panels: Rc<RefCell<PanelRuntime>>) -> Self {
+        Self { panels }
+    }
+
+    /// Panels the generation holds: still bound to it first, then the ones its
+    /// edge already ended, each list in `PanelId` order and bounded by the
+    /// registry's live panel count.
+    fn held(&self, owner: &bitty_plugin_host::PluginId, generation: Generation) -> Vec<PanelId> {
+        let host = self.panels.borrow();
+        let mut held = host.registry().panels_bound_to(owner, generation);
+        held.extend(host.registry().panels_ended_at(owner, generation));
+        held
+    }
+}
+
+impl PanelGenerationPort for AppPanelGenerationPort {
+    fn release_generation(&self, edge: PanelEdgeRelease<'_>) -> PanelEdgeReport {
+        let ended = controller_generation(edge.ended);
+        // Read-only enumeration first: the mutation below borrows the same host
+        // mutably, so the id list has to be owned before the loop starts.
+        let bound = {
+            let host = self.panels.borrow();
+            host.registry().panels_bound_to(edge.owner, ended)
+        };
+        let mut report = PanelEdgeReport::default();
+        for panel in bound {
+            report.attempted += 1;
+            match self
+                .panels
+                .borrow_mut()
+                .present_placeholder(panel, ended, edge.reason.as_str())
+            {
+                Ok(_) => report.committed.push(panel),
+                Err(error) => {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: panel {} left unbound after a refused {reason} placeholder: {error}",
+                            panel.0,
+                            reason = edge.reason.as_str()
+                        )
+                    });
+                    report.refused.push((panel, error));
+                }
+            }
+        }
+        report
+    }
+
+    fn bind_successor(&self, edge: PanelEdgeBind<'_>) -> PanelEdgeReport {
+        let predecessor = controller_generation(edge.predecessor);
+        let successor = controller_generation(edge.successor);
+        let held = self.held(edge.owner, predecessor);
+        let mut report = PanelEdgeReport::default();
+        for panel in held {
+            report.attempted += 1;
+            match self.panels.borrow_mut().rebind_panel(
+                panel,
+                successor,
+                edge.owner,
+                edge.requested,
+                edge.consented,
+            ) {
+                Ok(committed) => report.committed.push(committed.panel_id()),
+                Err(error) => {
+                    // D.2: a refused bind writes no phase 2 step, so the panel
+                    // stays unbound with the placeholder the edge presented and
+                    // the predecessor's ceiling stays retained for a later
+                    // attempt. Nothing is widened, and the refusal is named.
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: panel {} not rebound to generation {}: {error}",
+                            panel.0, edge.successor
+                        )
+                    });
+                    report.refused.push((panel, error));
+                }
+            }
+        }
+        report
+    }
+}
+
 /// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
 ///
 /// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
@@ -1047,6 +1168,16 @@ pub(crate) fn discover_with_roots(
             runtime.set_ui_scene_backend(Some(Rc::new(SceneHost::new(
                 Rc::clone(&panels),
                 Rc::clone(&scene_target),
+            ))));
+            // bitty#2476 residuals 2 and 4: the panel host is this crate's, so
+            // this is the only layer that can answer the generation edge. The
+            // port is asked to release a generation that ended with no
+            // successor (placeholder, residual 4) and to bind a successor onto
+            // the containers its predecessor drove (production `rebind_panel`,
+            // residual 2). Installing it grants nothing: every call re-checks
+            // the binding, the ceiling, and the grant family in the registry.
+            runtime.set_panel_generation_port(Some(Rc::new(AppPanelGenerationPort::new(
+                Rc::clone(&panels),
             ))));
             Some(panels)
         }
@@ -3171,6 +3302,120 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         presented.set(Some(WorkspaceId::new(3)));
         backend("rich").expect("a published workspace resolves");
         assert_eq!(panels.borrow().panel_count(), 1);
+    }
+
+    /// The activation generation the runtime publishes for `id`.
+    ///
+    /// `debug_plugins` is the runtime's own row set over `entry.generation` —
+    /// the very field `reload_inner` hands the generation edge as its successor
+    /// — so a row can name the generation actually installed instead of
+    /// assuming how many activations the fixture has seen.
+    fn installed_generation(runtime: &PluginRuntime, id: &str) -> u32 {
+        runtime
+            .debug_plugins()
+            .into_iter()
+            .find(|row| row.id == id)
+            .map(|row| row.generation)
+            .expect("the runtime publishes one row per discovered plugin")
+    }
+
+    #[test]
+    fn the_generation_edge_rebinds_a_container_through_the_installed_port() {
+        // bitty#2476 residual 2 at the composition root: `discover_with_roots`
+        // installs the app-owned panel generation port, so a reload of the
+        // plugin that drives a container must move the controller binding
+        // without touching the container. This is the only test that exercises
+        // `AppPanelGenerationPort` itself rather than a stand-in: it would fail
+        // if the installer were dropped from the composition root, if the port
+        // enumerated the wrong generation, or if it called the registry instead
+        // of the facade (phase 2 step 3 would then never reset the lease).
+        //
+        // Both generations are read from the runtime's published rows, so the
+        // row does not encode how many activations the composition root
+        // performs: it asserts the one thing it is about — the installed port
+        // moved the binding onto the generation the edge named.
+        let root = pin_test_dir("edge-rebind");
+        write_panel_probe(&root, "xuepoo.edgerebind", &["panel.create", "panel.focus"]);
+        let live = Runtime::with_defaults().expect("defaults must build");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: None,
+            focused_workspace: live.focused_workspace_id(),
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let panels = session
+            .panels
+            .clone()
+            .expect("the composition root installs the panel host");
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgerebind").expect("id");
+        let mut runtime = session.runtime;
+
+        // One container the plugin's first generation drives. The generation is
+        // the one the runtime published for the fixture, so the first bind names
+        // the generation the reload edge will later end.
+        let first = installed_generation(&runtime, id.as_str());
+        let handle = panels
+            .borrow_mut()
+            .create_panel(PanelType::Rich, Some(WorkspaceId::new(3)))
+            .expect("create panel");
+        panels
+            .borrow_mut()
+            .mount_panel(handle.id, handle.generation, ViewId::new(41))
+            .expect("mount panel");
+        let requested = ["panel.create", "panel.focus"]
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect();
+        panels
+            .borrow_mut()
+            .rebind_panel(
+                handle.id,
+                controller_generation(first),
+                &id,
+                &requested,
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("first bind");
+
+        runtime.reload(&id).expect("reload");
+
+        // One reload activates the plugin once. Asserted rather than folded into
+        // the derivation below, so a double activation stays visible instead of
+        // being absorbed by whichever generation came out.
+        let successor = installed_generation(&runtime, id.as_str());
+        assert_eq!(
+            successor,
+            first + 1,
+            "one reload activates the plugin exactly once: {first} -> {successor}"
+        );
+        assert_eq!(
+            panels.borrow().registry().controller_generation(handle.id),
+            Some(controller_generation(successor)),
+            "the installed port rebound the container onto the successor generation"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(handle.id),
+            Some(ViewId::new(41)),
+            "the container kept its attachment"
+        );
+        assert_eq!(
+            runtime.last_panel_edge().map(|report| report.attempted),
+            Some(1),
+            "the reload issued exactly one bind through the app-installed port"
+        );
     }
 
     fn parse_panel_handle(result: &str, context: &str) -> (u64, u64) {

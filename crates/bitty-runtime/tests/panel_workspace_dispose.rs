@@ -148,7 +148,7 @@ fn a_sweep_disposes_focused_first_and_emits_one_record_per_panel() {
         assert_eq!(record.action.as_str(), "disposed");
         assert!(
             record.owner.is_none(),
-            "no live path binds a controller owner yet (OQ-084 A.2, residual 2)"
+            "a container that never bound a controller carries no owner (OQ-084 A.2)"
         );
     }
     // The record names the state at the edge, so the two C.8 arms stay

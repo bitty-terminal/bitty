@@ -801,6 +801,38 @@ mod tests {
     }
 
     #[test]
+    fn the_ctl_capacity_refusal_agrees_with_the_registry_bound() {
+        // bitty#1765 (slice 5): `bitty ctl window new` refuses at exactly the
+        // bound the registry enforces, from the same constant, so the CLI can
+        // never be told there is room when the app has none (or the reverse).
+        let mut registry = WindowRegistry::new();
+        for raw in 1..=MAX_WINDOWS as u64 {
+            assert!(
+                crate::ctl::new_window::capacity_refusal(registry.len()).is_none(),
+                "row {raw} is within the bound"
+            );
+            registry
+                .admit(Ok::<_, ()>((window(raw), None)))
+                .expect("registration within the bound");
+        }
+        assert!(!registry.has_capacity());
+        match crate::ctl::new_window::capacity_refusal(registry.len()) {
+            Some(crate::ctl::new_window::NewWindowReply::AtCapacity { max, live }) => {
+                assert_eq!((max, live), (MAX_WINDOWS, MAX_WINDOWS));
+            }
+            other => panic!("the ctl lane must refuse at the registry bound: {other:?}"),
+        }
+        // And a full registry really refuses the row the CLI would have asked
+        // for.
+        assert!(matches!(
+            registry.admit(Ok::<_, ()>((window(999), None))),
+            Err(AdmitError::Registry(
+                WindowRegistryError::OverCapacity { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn a_refused_backend_leaves_the_registry_unchanged() {
         let mut registry = WindowRegistry::new();
         let first = registry

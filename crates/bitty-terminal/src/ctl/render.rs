@@ -48,6 +48,15 @@ pub fn format_failure(registry: &str, class: &str, code: &str, message: &str) ->
     )
 }
 
+/// Stable text for a running instance that predates `bitty ctl window new`
+/// (bitty#1765, slice 5).
+///
+/// The instance answers `NotFound` for the wire method, which is version skew,
+/// not a bad argument: the caller has to upgrade (restart) the instance before
+/// the verb exists on it.
+pub(crate) const NEW_WINDOW_SKEW_MESSAGE: &str = "the running instance does not serve `window new` \
+     (its ctl protocol predates this verb); restart the instance with this build and retry";
+
 /// Map a server error `(category, code)` to the stable CLI exit code.
 ///
 /// - `usage/*` after IPC is a generic argument failure (exit 1); usage
@@ -63,6 +72,9 @@ pub fn exit_for_server_error(category: &str, code: &str) -> i32 {
         (_, "Unauthenticated") => EXIT_PERM,
         (_, "Denied") => EXIT_PERM,
         (_, "Conflict") => EXIT_CONFLICT,
+        // bitty#1765 (slice 5): the instance owns its full OS-window
+        // allowance — a conflict with live state, never a transport failure.
+        (_, "WindowAtCapacity" | "ControlBusy") => EXIT_CONFLICT,
         (_, "ConfigError" | "InvalidConfig") => EXIT_CONFIG,
         (_, "UnsupportedVersion" | "VersionMismatch") => EXIT_COMPAT,
         ("transport", _) | (_, "FrameTooLarge" | "PayloadTooLarge" | "PayloadCap") => EXIT_RUNTIME,
@@ -82,6 +94,10 @@ pub fn class_for_server_error(category: &str, code: &str) -> &'static str {
             "Denied"
         }
         (_, "Conflict") => "Conflict",
+        // bitty#1765 (slice 5): window-specific refusals reuse the existing
+        // classes rather than inventing a new error taxonomy.
+        (_, "WindowAtCapacity" | "ControlBusy") => "Conflict",
+        (_, "WindowRefused") => "Unavailable",
         (_, "ConfigError" | "InvalidConfig") => "ConfigError",
         (_, "UnsupportedVersion" | "VersionMismatch") => "VersionMismatch",
         ("transport", _)
@@ -492,6 +508,25 @@ fn render_outcome(
     }
     let class = class_for_server_error(&outcome.category, &outcome.code);
     let exit = exit_for_server_error(&outcome.category, &outcome.code);
+    // bitty#1765 (slice 5): `window new` is served by a dispatcher method a
+    // pre-existing instance does not have, so its `NotFound` is a protocol
+    // skew (the running instance predates the verb), not a bad argument.
+    // Report it as such instead of the generic exit 1 an unknown method gets
+    // on every other verb.
+    if matches!(request, CtlRequest::NewWindow)
+        && matches!(outcome.code.as_str(), "NotFound" | "UnknownMethod")
+    {
+        let message = NEW_WINDOW_SKEW_MESSAGE;
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(registry, "VersionMismatch", "UnsupportedVersion", message)
+            );
+        } else {
+            eprintln!("bitty ctl: {message}");
+        }
+        return EXIT_COMPAT;
+    }
     if emit_json {
         println!(
             "{}",
@@ -561,6 +596,23 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         CtlRequest::WindowList | CtlRequest::ViewList | CtlRequest::TerminalList => {
             out.push_str(result_json);
             out.push('\n');
+        }
+        CtlRequest::NewWindow => {
+            // bitty#1765 (slice 5): the reply is the instance's answer to the
+            // *request* (latched, and the creation attempted in the same
+            // turn); the creation outcome itself is in the instance log, so
+            // this never claims a window the app did not admit.
+            if extract_bool(result_json, "requested") == Some(true) {
+                let windows = extract_number(result_json, "windows").unwrap_or(0);
+                out.push_str(&format!(
+                    "requested a new window on {} ({windows} window(s) registered; \
+                     the instance log records the creation result)\n",
+                    target.instance
+                ));
+            } else {
+                out.push_str(result_json);
+                out.push('\n');
+            }
         }
         CtlRequest::PanelList => {
             // CTX-1117: human table with the focused (current) marker; JSON
@@ -1154,7 +1206,45 @@ fn extract_object_body(text: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{reload_exit, render_reload_table};
+    use super::{NEW_WINDOW_SKEW_MESSAGE, reload_exit, render_outcome, render_reload_table};
+    use crate::ctl::{
+        CtlFormat, CtlIpcOutcome, CtlRequest, CtlTargeting, EXIT_COMPAT, ResolvedTarget,
+    };
+
+    /// bitty#1765 (slice 5): an instance that predates `window new` answers
+    /// `NotFound`; the CLI reports that as a compat failure with fixed text,
+    /// never as a generic argument error and never as success.
+    #[test]
+    fn window_new_reports_a_protocol_skew_as_a_compat_failure() {
+        let outcome = CtlIpcOutcome {
+            ok: false,
+            result_json: String::new(),
+            category: String::from("usage"),
+            code: String::from("NotFound"),
+            message: String::from("unknown method bitty.debug/newWindow"),
+        };
+        let target = ResolvedTarget {
+            socket_path: String::from("/run/user/0/bitty/default.sock"),
+            instance: String::from("default"),
+        };
+        let targeting = CtlTargeting {
+            socket: None,
+            instance: None,
+            format: CtlFormat::Json,
+        };
+        assert_eq!(
+            render_outcome(
+                &outcome,
+                "core.window.new",
+                &targeting,
+                &CtlRequest::NewWindow,
+                &target
+            ),
+            EXIT_COMPAT,
+            "protocol skew is exit 5: {}",
+            NEW_WINDOW_SKEW_MESSAGE
+        );
+    }
 
     #[test]
     fn pending_plugin_set_renders_and_exits_restart() {

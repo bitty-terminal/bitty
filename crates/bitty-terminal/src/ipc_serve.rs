@@ -286,6 +286,58 @@ fn handle_panel_list(
     }
 }
 
+/// `bitty.debug/newWindow` servo handler (bitty#1765, slice 5).
+///
+/// Unlike the panel list handler this one does not enqueue on the shared
+/// control queue: a window is created through the platform context the app
+/// thread owns while handling an event, so the request travels through the
+/// bounded lane in [`crate::ctl::new_window`] instead. Authorization is the
+/// same shape the queue applies — the handler reads the live connection
+/// authorization and requires `view.manage` (the scope `view split` needs; no
+/// elevation, no client-asserted scope) before a request is even offered, so a
+/// connection without it never reaches the app.
+///
+/// Kept alive on non-Unix builds for the Windows `-D warnings` cross-check.
+#[allow(dead_code)]
+fn handle_new_window(
+    context: &bitty_ipc::devtools::ServeContext,
+    request: &bitty_ipc::devtools::DevtoolsRequest,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    debug_assert_eq!(request.method, crate::ctl::METHOD_NEW_WINDOW);
+    let scopes = match context.current_authorization() {
+        Ok(snapshot) => snapshot.scopes,
+        Err(err) => {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                format!("permission denied: {err}"),
+            ));
+        }
+    };
+    if !scopes.contains(bitty_ipc::Scope::ViewManage) {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            String::from(
+                "permission denied: scope 'view.manage' for bitty.debug/newWindow \
+                 (needs elevation via BITTY_CTL_ELEVATE)",
+            ),
+        ));
+    }
+    // One deadline bounds the whole request: the app claims it on its next
+    // event turn and answers with the latch (and creation) outcome.
+    let reply = crate::ctl::new_window::request(bitty_ipc::ctl::CTL_TIMEOUT);
+    if let crate::ctl::new_window::NewWindowReply::Admitted { windows } = reply {
+        return Ok(format!("{{\"requested\":true,\"windows\":{windows}}}"));
+    }
+    let (category, code) = reply.class();
+    Err(bitty_ipc::devtools::HandlerError::new(
+        category,
+        code,
+        reply.message(),
+    ))
+}
+
 /// Build the dispatcher shared by the Unix and Windows serve paths.
 ///
 /// CTX-0506: test mode registers the E2E surface (`testInfo`, `testExit`);
@@ -311,6 +363,16 @@ fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     if let Err(err) = dispatcher.register(crate::ctl::METHOD_LIST_PANELS, handle_panel_list) {
         crate::logging::warn(|| {
             format!("bitty: panel list unavailable: {err} (serving without it)")
+        });
+    }
+    // bitty#1765 (slice 5): `bitty ctl window new` registers additively on the
+    // same table. The handler authorizes `view.manage` itself and routes the
+    // request into the app's `NewWindow` path through the bounded lane; an
+    // instance that fails to register it answers the documented `NotFound`,
+    // which the CLI reports as a protocol skew rather than a refusal.
+    if let Err(err) = dispatcher.register(crate::ctl::METHOD_NEW_WINDOW, handle_new_window) {
+        crate::logging::warn(|| {
+            format!("bitty: window new unavailable: {err} (serving without it)")
         });
     }
     // Issue #2773: back the accepted `listPlugins`/`getPlugin` inspect methods
@@ -1567,6 +1629,52 @@ mod tests {
         drop(client);
         let stats = handle.join().unwrap().unwrap();
         assert_eq!(stats.requests, 1);
+    }
+
+    /// bitty#1765 (slice 5): `bitty.debug/newWindow` is registered on both
+    /// dispatcher tables, and an instance that does not serve it (a build that
+    /// predates the verb) answers a typed `NotFound` — which is exactly what
+    /// the CLI reports as protocol skew (exit 5) instead of a silent success.
+    #[cfg(unix)]
+    #[test]
+    fn new_window_is_registered_and_an_older_table_answers_not_found() {
+        use std::os::unix::net::UnixStream;
+
+        for test_mode in [true, false] {
+            let dispatcher = build_dispatcher(test_mode);
+            assert!(
+                dispatcher.contains(crate::ctl::METHOD_NEW_WINDOW),
+                "table (test mode {test_mode}) must register newWindow"
+            );
+        }
+        // Version-skew fixture: a table without the handler (the pin's
+        // default set) denies the method rather than serving it.
+        let older = bitty_ipc::devtools::Dispatcher::with_defaults();
+        assert!(!older.contains(crate::ctl::METHOD_NEW_WINDOW));
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        // An attested same-UID peer, so the dispatch reaches the table instead
+        // of failing the peer recheck.
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_granted(
+            &server,
+            bitty_ipc::ScopeSet::cli_default(),
+        );
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        let request = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/newWindow","version":"1.0"}"#,
+        )
+        .expect("request");
+        let error = older
+            .dispatch(&context, &request)
+            .expect_err("an unregistered method must fail closed");
+        // The dispatcher names an unregistered method `UnknownMethod`; the CLI
+        // maps that (and `NotFound`) to the protocol-skew message and exit 5.
+        assert_eq!(error.code, "UnknownMethod", "{error:?}");
+        assert_eq!(error.category, "usage", "{error:?}");
     }
 
     /// Issue #2773: the test-mode IPC slice must serve the plugin runtime it

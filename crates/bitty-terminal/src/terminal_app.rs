@@ -4880,24 +4880,31 @@ impl TerminalApp {
             .with_visible(true)
     }
 
-    /// Latches one `new_window` request (bitty#1765, slice 1).
+    /// Latches one `new_window` request, naming why a request is refused
+    /// (bitty#1765, slice 5).
     ///
-    /// The single-owner input path owns no platform context, so a bound
-    /// `new_window` chord never creates a window itself: it records one
-    /// bounded request that [`Self::service_new_window_requests`] performs on
-    /// the next turn that has an [`EventContext`]. A request at the registry
-    /// ceiling is refused loudly and latches nothing.
+    /// The single source of truth for both request sources — the bound
+    /// `new_window` chord ([`Self::request_new_window`]) and a `bitty ctl
+    /// window new` request ([`crate::ctl::new_window`]) — so the ceiling check
+    /// and the latch can never disagree, and there is exactly one bound on how
+    /// many requests are pending.
     ///
-    /// Returns whether the request was latched.
-    pub(crate) fn request_new_window(&mut self) -> bool {
-        if !self.windows.has_capacity() {
+    /// # Errors
+    ///
+    /// [`NewWindowReply::AtCapacity`](crate::ctl::new_window::NewWindowReply::AtCapacity)
+    /// when the registry already holds [`MAX_WINDOWS`] windows; nothing is
+    /// latched in that case.
+    pub(crate) fn latch_new_window(
+        &mut self,
+    ) -> Result<(), crate::ctl::new_window::NewWindowReply> {
+        if let Some(refusal) = crate::ctl::new_window::capacity_refusal(self.windows.len()) {
             crate::logging::warn(|| {
                 format!(
                     "warning: new_window refused — window registry at capacity ({MAX_WINDOWS}); windows={}",
                     self.windows.len()
                 )
             });
-            return false;
+            return Err(refusal);
         }
         self.pending_new_windows = self.pending_new_windows.saturating_add(1).min(MAX_WINDOWS);
         // bitty#1765 (slice 3): record which window the command targeted. The
@@ -4912,7 +4919,20 @@ impl TerminalApp {
                 self.windows.active()
             )
         });
-        true
+        Ok(())
+    }
+
+    /// Latches one `new_window` request (bitty#1765, slice 1).
+    ///
+    /// The single-owner input path owns no platform context, so a bound
+    /// `new_window` chord never creates a window itself: it records one
+    /// bounded request that [`Self::service_new_window_requests`] performs on
+    /// the next turn that has an [`EventContext`]. A request at the registry
+    /// ceiling is refused loudly and latches nothing.
+    ///
+    /// Returns whether the request was latched.
+    pub(crate) fn request_new_window(&mut self) -> bool {
+        self.latch_new_window().is_ok()
     }
 
     /// Performs every latched `new_window` request against the platform.
@@ -4924,8 +4944,63 @@ impl TerminalApp {
     /// its typed reason and drops the remaining latched requests — a backend
     /// that refused one window refuses the next, so retrying would only spin.
     ///
+    /// bitty#1765 (slice 5): a `bitty ctl window new` request is a second
+    /// source for exactly the same latch, and this is the only turn type that
+    /// owns the platform context. The waiting CLI is answered here — with the
+    /// latch refusal when the registry is at its ceiling, otherwise with what
+    /// the creation attempt produced — so the reply never claims a window the
+    /// app did not admit.
+    ///
     /// Returns how many windows were admitted.
     pub(crate) fn service_new_window_requests(&mut self, ctx: &mut EventContext<'_>) -> usize {
+        use crate::ctl::new_window::NewWindowReply;
+
+        if let Some(claim) = self.claim_new_window_lane() {
+            let admitted = self.admit_pending_new_windows(ctx);
+            // A latched CLI request is one of the requests this turn
+            // serviced: `admitted > 0` means a window really exists,
+            // otherwise the platform refused and the registry is unchanged.
+            claim.complete(if admitted > 0 {
+                NewWindowReply::Admitted {
+                    windows: self.windows.len(),
+                }
+            } else {
+                NewWindowReply::PlatformRefused
+            });
+            return admitted;
+        }
+        self.admit_pending_new_windows(ctx)
+    }
+
+    /// Claims a waiting `bitty ctl window new` request and latches it
+    /// (bitty#1765, slice 5).
+    ///
+    /// Returns the open claim when one request was latched — the caller
+    /// performs the creation and answers the waiting CLI — and `None` when no
+    /// request was waiting or the registry is at its ceiling (in which case the
+    /// refusal has already been sent).
+    ///
+    /// Split out of [`Self::service_new_window_requests`] so the claim/latch
+    /// half is headless-testable: it needs no [`EventContext`], unlike the
+    /// creation that follows it.
+    pub(crate) fn claim_new_window_lane(
+        &mut self,
+    ) -> Option<crate::ctl::new_window::NewWindowClaim> {
+        let claim = crate::ctl::new_window::claim()?;
+        if let Err(refusal) = self.latch_new_window() {
+            claim.complete(refusal);
+            return None;
+        }
+        Some(claim)
+    }
+
+    /// Creates one window per latched request, in order.
+    ///
+    /// Split out of [`Self::service_new_window_requests`] so the latch (with
+    /// its ceiling refusal) and the platform creation stay separately
+    /// observable: the first is headless-testable, the second needs an
+    /// [`EventContext`].
+    fn admit_pending_new_windows(&mut self, ctx: &mut EventContext<'_>) -> usize {
         let mut admitted = 0usize;
         while self.pending_new_windows > 0 {
             self.pending_new_windows -= 1;
@@ -5613,9 +5688,16 @@ impl AppHandler for TerminalApp {
         // every action against the servo scopes before applying.
         if let Ok(w) = shared.lock() {
             let control_proxy = w.clone();
-            bitty_ipc::ctl::set_control_waker(Some(std::sync::Arc::new(move || {
+            let wake: bitty_ipc::ctl::ControlWaker = std::sync::Arc::new(move || {
                 control_proxy.wake_pty();
-            })));
+            });
+            // bitty#1765 (slice 5): the `bitty ctl window new` lane rides the
+            // same proxy, because the app services that lane on the same
+            // platform turn that drains the control queue. The lane grants
+            // nothing: the servo handler authorizes `view.manage` against the
+            // live connection before a request is ever offered.
+            crate::ctl::new_window::set_waker(Some(std::sync::Arc::clone(&wake)));
+            bitty_ipc::ctl::set_control_waker(Some(wake));
         }
         crate::logging::info(|| String::from("bitty: pty wakeup armed (event-loop proxy)"));
     }

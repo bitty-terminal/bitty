@@ -2326,9 +2326,12 @@ pub(crate) struct InitRawGuard {
     original_flags: nix::fcntl::OFlag,
 }
 
-/// Enters cbreak mode on stdin. `None` when stdin has no termios to take
-/// (piped, closed, or setup failed): the caller keeps the line loop. A
-/// half-applied setup restores what it changed before returning `None`.
+/// Enters cbreak mode on stdin without terminal signals (`ISIG` cleared) so
+/// `Ctrl-C` delivers `0x03` into the picker key loops for frame cleanup and
+/// `Drop`-based restoration instead of raising `SIGINT`. `None` when stdin has
+/// no termios to take (piped, closed, or setup failed): the caller keeps the
+/// line loop. A half-applied setup restores what it changed before returning
+/// `None`.
 #[cfg(unix)]
 pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
     use std::os::unix::io::AsFd as _;
@@ -2336,9 +2339,11 @@ pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
     let fd = stdin.as_fd();
     let original_termios = nix::sys::termios::tcgetattr(fd).ok()?;
     let mut single = original_termios.clone();
-    single
-        .local_flags
-        .remove(nix::sys::termios::LocalFlags::ICANON | nix::sys::termios::LocalFlags::ECHO);
+    single.local_flags.remove(
+        nix::sys::termios::LocalFlags::ICANON
+            | nix::sys::termios::LocalFlags::ECHO
+            | nix::sys::termios::LocalFlags::ISIG,
+    );
     nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSADRAIN, &single).ok()?;
     let flags_raw = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).ok()?;
     let original_flags = nix::fcntl::OFlag::from_bits_truncate(flags_raw);
@@ -3047,10 +3052,88 @@ fn init_plugin_inventory_groups(
 }
 
 /// Renders the three inventory groups with an optional sliding window
-/// `(cursor, max_visible)` over [`InitPluginInventory::bundled`].
+/// Computes `(bundled_max_visible, installed_cap)` for an interactive
+/// multiselect frame on a terminal of `rows` lines, subtracting prompt,
+/// headers, installed preview, network summary, optional warning, and hint
+/// rows so the complete frame never overflows the viewport.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_budget_for_window(
+    inventory: &InitPluginInventory,
+    rows: u16,
+) -> (usize, usize) {
+    // Leave one margin row because every line ends with `\n`; writing a full
+    // `rows` lines would scroll line 1 into scrollback.
+    let safe_rows = (rows as usize).saturating_sub(1);
+    let fixed_chrome = 6 + usize::from(inventory.warning.is_some());
+    let remaining = safe_rows.saturating_sub(fixed_chrome);
+
+    let min_bundled = INIT_PICKER_MIN_VISIBLE.min(inventory.bundled.len());
+    let min_bundled_lines = if inventory.bundled.is_empty() {
+        1
+    } else {
+        min_bundled + usize::from(inventory.bundled.len() > min_bundled)
+    };
+    let for_installed = remaining.saturating_sub(min_bundled_lines);
+
+    let (installed_cap, installed_lines) = if inventory.installed.is_empty() {
+        (0, 1)
+    } else if for_installed <= 1 {
+        // Collapse to a single summary line when vertical space is tight.
+        (0, 1)
+    } else if inventory.installed.len() <= INIT_PLUGIN_INSTALLED_ROWS_MAX
+        && inventory.installed.len() <= for_installed
+    {
+        let shown = inventory.installed.len();
+        (shown, shown)
+    } else {
+        let shown = (for_installed - 1)
+            .min(INIT_PLUGIN_INSTALLED_ROWS_MAX)
+            .min(inventory.installed.len().saturating_sub(1))
+            .max(1);
+        (shown, shown + 1)
+    };
+
+    let for_bundled = remaining.saturating_sub(installed_lines);
+    let bundled_max_visible = if inventory.bundled.is_empty() {
+        1
+    } else if inventory.bundled.len() <= for_bundled.min(INIT_PICKER_DEFAULT_MAX_VISIBLE) {
+        inventory.bundled.len()
+    } else {
+        for_bundled
+            .saturating_sub(1)
+            .clamp(1, INIT_PICKER_DEFAULT_MAX_VISIBLE)
+    };
+
+    (bundled_max_visible, installed_cap)
+}
+
+/// Queries live Unix terminal dimensions for the multiselect budget.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_budget(inventory: &InitPluginInventory, inplace: bool) -> (usize, usize) {
+    #[cfg(unix)]
+    if inplace {
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
+            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
+        if let Ok(ws) = winsize {
+            if ws.ws_row > 0 {
+                return init_multiselect_budget_for_window(inventory, ws.ws_row);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (inventory, inplace);
+    (
+        INIT_PICKER_DEFAULT_MAX_VISIBLE,
+        INIT_PLUGIN_INSTALLED_ROWS_MAX,
+    )
+}
+
+/// Variant of [`init_plugin_inventory_groups`] that bounds [`InitPluginInventory::bundled`]
+/// and [`InitPluginInventory::installed`] to `(cursor, bundled_max_visible, installed_cap)`
+/// when interactive windowing is enabled.
 fn init_plugin_inventory_groups_windowed(
     inventory: &InitPluginInventory,
-    window: Option<(usize, usize)>,
+    window: Option<(usize, usize, usize)>,
     bundled_row: &dyn Fn(usize, &str) -> String,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -3059,7 +3142,7 @@ fn init_plugin_inventory_groups_windowed(
         lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
     } else {
         let (start, end) = match window {
-            Some((cursor, max_visible)) => {
+            Some((cursor, max_visible, _)) => {
                 init_picker_window(inventory.bundled.len(), cursor, max_visible)
             }
             None => (0, inventory.bundled.len()),
@@ -3079,28 +3162,36 @@ fn init_plugin_inventory_groups_windowed(
     if inventory.installed.is_empty() {
         lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
     } else {
-        for plugin in inventory
-            .installed
-            .iter()
-            .take(INIT_PLUGIN_INSTALLED_ROWS_MAX)
-        {
+        let installed_cap = match window {
+            Some((_, _, cap)) => cap,
+            None => INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        };
+        if installed_cap == 0 {
+            let count = inventory.installed.len();
             lines.push(format!(
-                "    - {} {} ({})",
-                plugin.id,
-                plugin.version,
-                if plugin.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "    - {count} installed plugin{} (bitty plugin list)",
+                if count == 1 { "" } else { "s" }
             ));
-        }
-        if inventory.installed.len() > INIT_PLUGIN_INSTALLED_ROWS_MAX {
-            let hidden = inventory.installed.len() - INIT_PLUGIN_INSTALLED_ROWS_MAX;
-            lines.push(format!(
-                "    - +{hidden} more installed plugin{} (bitty plugin list)",
-                if hidden == 1 { "" } else { "s" }
-            ));
+        } else {
+            for plugin in inventory.installed.iter().take(installed_cap) {
+                lines.push(format!(
+                    "    - {} {} ({})",
+                    plugin.id,
+                    plugin.version,
+                    if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ));
+            }
+            if inventory.installed.len() > installed_cap {
+                let hidden = inventory.installed.len() - installed_cap;
+                lines.push(format!(
+                    "    - +{hidden} more installed plugin{} (bitty plugin list)",
+                    if hidden == 1 { "" } else { "s" }
+                ));
+            }
         }
     }
     lines.push(INIT_PLUGIN_NETWORK_HEADER.to_string());
@@ -3133,10 +3224,11 @@ fn init_plugin_inventory_groups_windowed(
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
 #[cfg_attr(not(unix), allow(dead_code))]
-fn init_multiselect_block(
+pub(crate) fn init_multiselect_block(
     inventory: &InitPluginInventory,
     cursor: usize,
     max_visible: usize,
+    installed_cap: usize,
     selected: &[bool],
     color: bool,
 ) -> Vec<String> {
@@ -3144,7 +3236,7 @@ fn init_multiselect_block(
     block.push(INIT_PLUGIN_PROMPT.to_string());
     block.extend(init_plugin_inventory_groups_windowed(
         inventory,
-        Some((cursor, max_visible)),
+        Some((cursor, max_visible, installed_cap)),
         &|index, id| {
             let is_cursor = index == cursor;
             let marker = if is_cursor {
@@ -3209,24 +3301,51 @@ pub(crate) fn init_multiselect_key_loop(
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
-    init_multiselect_key_loop_with_max_visible(
+    let (max_visible, installed_cap) = init_multiselect_budget(inventory, inplace);
+    init_multiselect_key_loop_with_budget(
         input,
         output,
         inventory,
-        init_picker_max_visible(inplace),
+        max_visible,
+        installed_cap,
         color,
         inplace,
         wait_for_more,
     )
 }
 
-/// [`init_multiselect_key_loop`] with an explicit `max_visible` window bound.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// [`init_multiselect_key_loop`] with an explicit bundled window bound.
+#[cfg(test)]
 pub(crate) fn init_multiselect_key_loop_with_max_visible(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     inventory: &InitPluginInventory,
     max_visible: usize,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_with_budget(
+        input,
+        output,
+        inventory,
+        max_visible,
+        INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+/// [`init_multiselect_key_loop`] with explicit `(max_visible, installed_cap)` bounds.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_key_loop_with_budget(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    max_visible: usize,
+    installed_cap: usize,
     color: bool,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
@@ -3240,7 +3359,14 @@ pub(crate) fn init_multiselect_key_loop_with_max_visible(
     }
     let mut rendered: usize = 0;
     let result = loop {
-        let block = init_multiselect_block(inventory, cursor, max_visible, &selected, color);
+        let block = init_multiselect_block(
+            inventory,
+            cursor,
+            max_visible,
+            installed_cap,
+            &selected,
+            color,
+        );
         if inplace && rendered > 0 {
             let _ = write!(output, "\x1b[{rendered}A");
         }
@@ -3876,7 +4002,81 @@ fn init_preview_runtime(
 /// touched. Gated on an enabled preview; a disabled preview prints nothing.
 /// Styling resolves with `resolve_theme_with_status` (no stderr), so an
 /// unknown seeded theme still echoes its stored name in default colors.
-fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String> {
+fn init_char_display_width(ch: char) -> usize {
+    if matches!(
+        ch as u32,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3040..=0xA4CF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE6F
+            | 0xFF01..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Conservative terminal cell width for an unstyled single-line string
+/// (BMP CJK/fullwidth/emoji blocks count as 2 columns; other printable
+/// scalar values count as 1 column).
+pub(crate) fn init_display_width(text: &str) -> usize {
+    text.chars().map(init_char_display_width).sum()
+}
+
+/// Constrains an unstyled preview line to `max_cols.saturating_sub(1)`
+/// terminal cells when `max_cols` is known, appending `...` on truncation so
+/// the live status preview stays on one physical row whenever the terminal is
+/// reasonably wide.
+pub(crate) fn init_fit_preview_line(line: &str, max_cols: Option<usize>) -> String {
+    let Some(cols) = max_cols.filter(|&cols| cols > 1) else {
+        return line.to_string();
+    };
+    let budget = cols - 1;
+    if init_display_width(line) <= budget {
+        return line.to_string();
+    }
+    if budget <= 3 {
+        return line.chars().take(budget).collect();
+    }
+    let prefix_budget = budget - 3;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let ch_width = init_char_display_width(ch);
+        if used + ch_width > prefix_budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn init_terminal_columns() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
+            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
+        if let Ok(ws) = winsize {
+            if ws.ws_col > 0 {
+                return Some(ws.ws_col as usize);
+            }
+        }
+    }
+    None
+}
+
+fn init_format_preview_echo_for_cols(
+    preview: &InitPreview,
+    color: bool,
+    max_cols: Option<usize>,
+) -> Option<(String, usize)> {
     if !preview.is_enabled() {
         return None;
     }
@@ -3888,7 +4088,7 @@ fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String
     } else {
         format!("{}", current.font.size)
     };
-    let line = format!(
+    let raw_line = format!(
         "  (preview: theme={:?}, font={:?} {}pt, gaps {}/{}, border {}, radius {})",
         current.appearance.theme.as_deref().unwrap_or("default"),
         current.font.family,
@@ -3898,13 +4098,22 @@ fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String
         current.decoration.border,
         current.decoration.radius,
     );
+    let fitted = init_fit_preview_line(&raw_line, max_cols);
+    let physical_rows = match max_cols.filter(|&cols| cols > 0) {
+        Some(cols) => init_display_width(&fitted).max(1).div_ceil(cols),
+        None => 1,
+    };
     let item = InitOptionItem {
-        label: line,
+        label: fitted,
         value_text: String::new(),
         style_fg: Some(resolved.foreground),
         style_bg: Some(resolved.background),
     };
-    Some(init_style_label(&item, false, color))
+    Some((init_style_label(&item, false, color), physical_rows))
+}
+
+fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String> {
+    init_format_preview_echo_for_cols(preview, color, None).map(|(styled, _)| styled)
 }
 
 fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
@@ -3913,27 +4122,49 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     }
 }
 
-fn init_emit_step_preview_echo(
+pub(crate) fn init_emit_step_preview_echo_for_cols(
     output: &mut dyn std::io::Write,
     preview: &InitPreview,
     color: bool,
     inplace_steps: bool,
-    has_preview_line: &mut bool,
+    prev_preview_rows: &mut usize,
+    max_cols: Option<usize>,
 ) {
     if !inplace_steps {
         init_emit_preview_echo(output, preview, color);
         return;
     }
-    let Some(styled) = init_format_preview_echo(preview, color) else {
+    let Some((styled, rows)) = init_format_preview_echo_for_cols(preview, color, max_cols) else {
         return;
     };
-    if *has_preview_line {
-        let _ = write!(output, "\x1b[1A\r\x1b[K{styled}\n");
+    if *prev_preview_rows > 0 {
+        let _ = write!(
+            output,
+            "\x1b[{rows}A\r\x1b[J{styled}\n",
+            rows = *prev_preview_rows
+        );
     } else {
         let _ = write!(output, "\r\x1b[K{styled}\n");
-        *has_preview_line = true;
     }
+    *prev_preview_rows = rows;
     let _ = output.flush();
+}
+
+fn init_emit_step_preview_echo(
+    output: &mut dyn std::io::Write,
+    preview: &InitPreview,
+    color: bool,
+    inplace_steps: bool,
+    prev_preview_rows: &mut usize,
+) {
+    init_emit_step_preview_echo_for_cols(
+        output,
+        preview,
+        color,
+        inplace_steps,
+        prev_preview_rows,
+        init_terminal_columns(),
+    );
 }
 
 /// Push only the theme half of the preview overlay through the live-adopt
@@ -4211,7 +4442,7 @@ fn run_init_interactive_impl(
     let inplace_steps = tty_interactive && nix::sys::termios::tcgetattr(std::io::stdin()).is_ok();
     #[cfg(not(unix))]
     let inplace_steps = false;
-    let mut has_preview_line = false;
+    let mut preview_rows: usize = 0;
     if !inplace_steps {
         let _ = writeln!(output, "\nShell:");
     }
@@ -4253,7 +4484,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
@@ -4333,7 +4564,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
@@ -4391,7 +4622,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let font_size = match overrides.font_size {
         Some(size) => size,
@@ -4454,7 +4685,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     if !inplace_steps {
         let _ = writeln!(
@@ -4526,7 +4757,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let gaps_out = match overrides.gaps_out {
         Some(value) => value,
@@ -4592,7 +4823,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let border = match overrides.border {
         Some(value) => value,
@@ -4657,7 +4888,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let radius = match overrides.radius {
         Some(value) => value,
@@ -4723,7 +4954,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     if !inplace_steps {
         let _ = writeln!(output, "\nBehavior:");
@@ -4778,7 +5009,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let close_confirm = match overrides.close_confirm {
         Some(mode) => mode,
@@ -4833,7 +5064,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let preset_options = vec![
         InitOptionItem {
@@ -4873,7 +5104,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     Ok(InitAnswers {
         shell,

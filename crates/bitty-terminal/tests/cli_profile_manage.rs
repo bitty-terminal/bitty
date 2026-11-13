@@ -2530,9 +2530,8 @@ fn profile_delete_backups_live_in_dot_backups_and_prune_beyond_cap() {
     );
 
     let retained = profile_backups(&root, "scratch");
-    assert_eq!(
-        retained.len(),
-        5,
+    assert!(
+        retained.len() == 5,
         "at most 5 timestamped backups may be retained per profile: {retained:?}"
     );
     #[cfg(unix)]
@@ -2552,5 +2551,38 @@ fn profile_delete_backups_live_in_dot_backups_and_prune_beyond_cap() {
             );
         }
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_backup_preserves_new_candidate_when_existing_backups_have_future_mtimes() {
+    let root = scratch_root("backup-future-mtime");
+    let backup_dir = root.join("bitty").join(".backups").join("profiles");
+    std::fs::create_dir_all(&backup_dir).expect("backup dir");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    for idx in 0..5 {
+        let stale = backup_dir.join(format!("scratch.lua.bak-999999999-{idx}"));
+        std::fs::write(&stale, format!("stale-{idx}")).expect("seed stale backup");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open stale")
+            .set_modified(future)
+            .expect("set future mtime");
+    }
+
+    let fresh_body = "return { font = { size = 19 } }\n";
+    write_profile(&root, "scratch", fresh_body);
+    let deleted = run_bitty(&root, &["config", "profile", "delete", "scratch"]);
+    assert_ok(&deleted, "delete scratch profile");
+
+    let retained = profile_backups(&root, "scratch");
+    assert_eq!(retained.len(), 5, "total retained stays capped at 5");
+    assert!(
+        retained
+            .iter()
+            .any(|path| std::fs::read_to_string(path).ok().as_deref() == Some(fresh_body)),
+        "newly created backup must survive even when older backups have future mtimes: {retained:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

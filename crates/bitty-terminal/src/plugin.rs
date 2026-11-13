@@ -2151,7 +2151,15 @@ fn retain_legacy_backup(legacy: &Path, backup: &Path) -> std::io::Result<()> {
         std::fs::remove_file(backup)?;
     }
     match std::fs::rename(legacy, backup) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let perms = std::fs::Permissions::from_mode(STATE_FILE_MODE);
+                std::fs::set_permissions(backup, perms)?;
+            }
+            Ok(())
+        }
         Err(rename_error) => {
             // Cross-device or platform-specific rename failure: copy the
             // exact bytes first, then drop the legacy file. The bytes are

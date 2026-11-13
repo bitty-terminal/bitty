@@ -8795,9 +8795,13 @@ fn init_picker_shrinking_frame_erases_the_stale_notice_row() {
         None,
     );
     let printed = String::from_utf8(output).expect("picker output is UTF-8");
-    assert!(
-        printed.contains("\r\x1b[J"),
-        "a shorter frame must clear the rows the previous frame painted: {printed:?}"
+    // Exactly two shrunken frames: the notice frame -> cleared frame, and the
+    // final frame -> abort cleanup. The loop-exit erase also writes `\r\x1b[J`,
+    // so a bare `contains` would stay green if the in-repaint erase vanished.
+    assert_eq!(
+        printed.matches("\r\x1b[J").count(),
+        2,
+        "each shorter frame must clear the rows the previous one painted: {printed:?}"
     );
 }
 
@@ -8858,6 +8862,101 @@ fn init_multiselect_inplace_erases_block_on_confirm_and_cancel() {
     assert!(
         cancel_str.ends_with("\r\x1b[J\x1b[?25h"),
         "cancel erases menu block before showing cursor:\n{cancel_str}"
+    );
+}
+
+#[test]
+fn init_multiselect_budget_fits_24_row_and_short_terminals_with_installed_plugins() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.plugin-{idx:02}"))
+        .collect();
+    let installed: Vec<_> = (0..9)
+        .map(|idx| init_installed(&format!("inst.plugin-{idx:02}"), "1.0.0", true))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled: bundled.clone(),
+        installed,
+        needs_network: vec![String::from("official.remote")],
+        warning: None,
+    };
+    let selected = vec![false; bundled.len()];
+
+    for rows in [24u16, 16u16, 12u16] {
+        let (bundled_max, installed_cap) =
+            crate::init::init_multiselect_budget_for_window(&inventory, rows);
+        let block = crate::init::init_multiselect_block(
+            &inventory,
+            bundled.len() - 1,
+            bundled_max,
+            installed_cap,
+            &selected,
+            false,
+        );
+        assert!(
+            block.len() < rows as usize,
+            "rows={rows}: frame length {} exceeded safe budget {}:\n{}",
+            block.len(),
+            rows - 1,
+            block.join("\n")
+        );
+        assert!(
+            block.iter().any(|line| line.contains("bundled.plugin-11")),
+            "rows={rows}: cursor item must stay visible:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Tight viewport collapses installed rows into a single summary entry.
+    let (_, tight_installed_cap) = crate::init::init_multiselect_budget_for_window(&inventory, 12);
+    assert_eq!(tight_installed_cap, 0);
+}
+
+#[test]
+fn init_fit_preview_line_bounds_width_and_step_preview_clears_prior_rows() {
+    let fitted = crate::init::init_fit_preview_line(
+        "  (preview: theme=\"catppuccin-mocha\", font=\"JetBrainsMono Nerd Font\" 14pt, gaps 6/12, border 2, radius 8)",
+        Some(80),
+    );
+    assert!(
+        crate::init::init_display_width(&fitted) <= 79,
+        "fitted preview exceeded 79 cells: {fitted:?}"
+    );
+    assert!(fitted.ends_with("..."), "expected ellipsis: {fitted:?}");
+
+    let mut preview = crate::init::InitPreview::enabled(bitty_config::fallback_builtin());
+    preview.apply_font_family("JetBrainsMono Nerd Font");
+    preview.apply_font_size(14.0);
+    let mut output = Vec::new();
+    let mut prev_rows = 0usize;
+    // Narrow 50-col step prints a 2-row preview, then a wider or second update
+    // must erase all prior rows via `\x1b[2A\r\x1b[J` when `prev_rows == 2`
+    // (`max_cols: None` skips truncation so rows > 1 can also be simulated or
+    // we can force prev_rows = 2 directly for the wrap-erasure check).
+    crate::init::init_emit_step_preview_echo_for_cols(
+        &mut output,
+        &preview,
+        false,
+        true,
+        &mut prev_rows,
+        Some(80),
+    );
+    assert_eq!(prev_rows, 1);
+
+    // Simulate a prior preview that wrapped onto 2 physical rows (e.g., after
+    // a terminal resize narrower) and confirm the update moves up 2 rows.
+    prev_rows = 2;
+    crate::init::init_emit_step_preview_echo_for_cols(
+        &mut output,
+        &preview,
+        false,
+        true,
+        &mut prev_rows,
+        Some(80),
+    );
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        rendered.contains("\x1b[2A\r\x1b[J"),
+        "wrapped preview must move up all prior physical rows: {rendered:?}"
     );
 }
 

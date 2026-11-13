@@ -2043,6 +2043,12 @@ fn plugin_doctor_migrates_a_legacy_ledger_on_repair() {
     );
     std::fs::create_dir_all(home.join("bitty")).expect("config dir");
     std::fs::write(&legacy, &body).expect("legacy ledger");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644))
+            .expect("permissive legacy mode");
+    }
 
     // Read-only doctor reports the pending legacy ledger without writing.
     let output = run_in(&home, &["plugin", "doctor"], None);
@@ -2068,6 +2074,16 @@ fn plugin_doctor_migrates_a_legacy_ledger_on_repair() {
         body,
         "legacy bytes retained verbatim"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "retained legacy backup must be 0600");
+    }
     let output = run_in(&home, &["plugin", "list"], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(stdout(&output).contains(PLUGIN), "{}", stdout(&output));

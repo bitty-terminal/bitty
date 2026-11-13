@@ -3295,15 +3295,22 @@ fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
 const PROFILE_MAX_RETAINED_BACKUPS: usize = 5;
 
 /// Retains at most [`PROFILE_MAX_RETAINED_BACKUPS`] timestamped backups for
-/// `file_name` inside `backup_dir`, deleting the oldest surplus copies.
-fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str) {
+/// Enforces [`PROFILE_MAX_RETAINED_BACKUPS`] per profile stem by removing the
+/// oldest surplus `*.bak-*` copies inside `backup_dir`, while never deleting
+/// `keep_path` (even if older entries carry future modification timestamps).
+fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str, keep_path: &Path) {
     let prefix = format!("{file_name}.bak-");
     let Ok(entries) = std::fs::read_dir(backup_dir) else {
         return;
     };
-    let mut matching = Vec::new();
+    let keep_name = keep_path.file_name();
+    let mut existing = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let os_name = entry.file_name();
+        if Some(os_name.as_os_str()) == keep_name {
+            continue;
+        }
+        let name = os_name.to_string_lossy().into_owned();
         if !name.starts_with(&prefix) {
             continue;
         }
@@ -3314,14 +3321,15 @@ fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str) {
             continue;
         }
         let modified = meta.modified().unwrap_or(UNIX_EPOCH);
-        matching.push((modified, name, entry.path()));
+        existing.push((modified, name, entry.path()));
     }
-    if matching.len() <= PROFILE_MAX_RETAINED_BACKUPS {
+    let max_others = PROFILE_MAX_RETAINED_BACKUPS.saturating_sub(1);
+    if existing.len() <= max_others {
         return;
     }
-    matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let excess = matching.len() - PROFILE_MAX_RETAINED_BACKUPS;
-    for (_, _, old_path) in matching.into_iter().take(excess) {
+    existing.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let excess = existing.len() - max_others;
+    for (_, _, old_path) in existing.into_iter().take(excess) {
         let _ = std::fs::remove_file(old_path);
     }
 }
@@ -3411,7 +3419,7 @@ fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
                     ));
                 }
                 sync_parent_dir(&candidate);
-                prune_excess_profile_backups(&backup_dir, &name);
+                prune_excess_profile_backups(&backup_dir, &name, &candidate);
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,

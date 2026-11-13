@@ -9155,6 +9155,159 @@ fn init_multiselect_viewport_accounts_for_40_col_wrapping_9_row_fallback_and_liv
     );
 }
 
+// CTX-1807: physical-row budgeting must model the greedy deferred wrap a real
+// VT performs. A total-cell division (`width.div_ceil(cols)`) over-counts
+// one-cell remainders and, more importantly, under-counts a two-cell glyph
+// that meets the right edge: the terminal wastes the last cell and continues
+// on the next row. The same number drives the `\x1b[NA` in-place repaint and
+// both exit erases, so an undercount drifts every repaint one row down.
+#[test]
+fn init_line_physical_rows_models_greedy_wrap_for_wide_glyphs() {
+    let wide = "\u{754c}".repeat(40);
+    let option_line = format!("> {wide}");
+    // "> " occupies cells 1-2, nineteen 2-cell glyphs fill cells 3-40, the
+    // twentieth cannot use column 41 alone and opens row 2, and the remaining
+    // twenty fill rows 2-3: three physical rows, where div_ceil(82, 41) = 2.
+    assert_eq!(
+        crate::init::init_line_physical_rows(&option_line, Some(41)),
+        3,
+        "40 wide glyphs after a 2-cell marker need 3 rows at 41 columns"
+    );
+    assert_eq!(
+        crate::init::init_frame_physical_rows(std::slice::from_ref(&option_line), Some(41)),
+        3
+    );
+    // Narrower windows: a wide glyph never shares the single leftover cell.
+    let ten_wide = "\u{754c}".repeat(10);
+    assert_eq!(crate::init::init_line_physical_rows(&ten_wide, Some(3)), 10);
+    assert_eq!(
+        crate::init::init_line_physical_rows(&"\u{754c}".repeat(3), Some(3)),
+        3
+    );
+    // Narrow text keeps the plain ceil(cells / cols) answer, exact fits included.
+    let ascii = "a".repeat(41);
+    assert_eq!(crate::init::init_line_physical_rows(&ascii, Some(41)), 1);
+    assert_eq!(crate::init::init_line_physical_rows(&ascii, Some(40)), 2);
+    // ANSI styling and combining marks take no cells at all.
+    let styled = format!("\x1b[36m{}\x1b[0m", "\u{754c}".repeat(3));
+    assert_eq!(crate::init::init_line_physical_rows(&styled, Some(3)), 3);
+    let combining = format!("e{}", "\u{301}".repeat(80));
+    assert_eq!(crate::init::init_line_physical_rows(&combining, Some(1)), 1);
+    // Unknown or degenerate widths keep the one-row floor.
+    assert_eq!(crate::init::init_line_physical_rows(&option_line, None), 1);
+    assert_eq!(
+        crate::init::init_line_physical_rows(&option_line, Some(0)),
+        1
+    );
+    assert_eq!(crate::init::init_line_physical_rows("", Some(41)), 1);
+}
+
+// CTX-1807: the picker's irreducible frame is prompt + one entry + range
+// indicator + hint + typed echo (five lines, six with a live preview), so a
+// 5- or 6-row terminal cannot fit the full chrome and the retired
+// `max_visible <= 1` escape painted it anyway, scrolling the prompt and the
+// cursor entry off screen. The frame must shed the preview first, then the
+// range indicator/hint, and only then the typed echo.
+#[test]
+fn init_picker_frame_fits_five_and_six_row_viewports() {
+    let options: Vec<crate::init::InitOptionItem> = (0..15)
+        .map(|idx| crate::init::InitOptionItem {
+            label: format!("option-item-{idx:02}"),
+            value_text: format!("option-item-{idx:02}"),
+            style_fg: None,
+            style_bg: None,
+        })
+        .collect();
+    // Independent oracle: every fixture line is single-width ASCII, so a greedy
+    // wrap is exactly ceil(cells / cols).
+    let physical = |block: &[String], cols: u16| -> usize {
+        block
+            .iter()
+            .map(|line| {
+                crate::init::init_display_width(line)
+                    .max(1)
+                    .div_ceil(usize::from(cols))
+            })
+            .sum()
+    };
+    let preview = "  preview: theme text painted in its own colors";
+    let fit = |max_visible: usize, safe_rows: usize, preview: Option<&str>| {
+        crate::init::init_fit_picker_frame(
+            |visible, chrome| {
+                crate::init::init_picker_block(
+                    "Theme", &options, 0, visible, false, false, "", preview, None, chrome,
+                )
+            },
+            max_visible,
+            safe_rows,
+            Some(80),
+        )
+    };
+
+    // 6 rows leave 5: the preview line is what must go, not the entry.
+    let six_rows = fit(3, 5, Some(preview));
+    assert!(physical(&six_rows, 80) <= 5, "{six_rows:#?}");
+    assert_eq!(six_rows.first().map(String::as_str), Some("Theme"));
+    assert!(six_rows.iter().any(|line| line.contains("option-item-00")));
+    assert!(
+        !six_rows.iter().any(|line| line.contains("preview:")),
+        "the preview must be retired before the entry: {six_rows:#?}"
+    );
+    assert!(six_rows.iter().any(|line| line.contains("(typed: ")));
+
+    // 5 rows leave 4: the range indicator and hint go as well.
+    let five_rows = fit(3, 4, Some(preview));
+    assert!(physical(&five_rows, 80) <= 4, "{five_rows:#?}");
+    assert_eq!(five_rows.first().map(String::as_str), Some("Theme"));
+    assert!(five_rows.iter().any(|line| line.contains("option-item-00")));
+    assert!(
+        !five_rows.iter().any(|line| line.contains("of 15 options")),
+        "the range indicator must be retired at 4 usable rows: {five_rows:#?}"
+    );
+    assert!(
+        !five_rows.iter().any(|line| line.contains("j/k")),
+        "the key hint must be retired at 4 usable rows: {five_rows:#?}"
+    );
+    assert!(five_rows.iter().any(|line| line.contains("(typed: ")));
+
+    // Two rows cannot hold a prompt plus even one entry; the floor stays usable
+    // rather than painting an empty frame.
+    let two_rows = fit(3, 1, Some(preview));
+    assert_eq!(two_rows.first().map(String::as_str), Some("Theme"));
+    assert!(two_rows.iter().any(|line| line.contains("option-item-00")));
+
+    // End to end: a 5-row window paints 4 rows, so the next frame moves up 4.
+    let mut input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut output = Vec::new();
+    let mut history = Vec::new();
+    let picked = crate::init::init_picker_key_loop_with_viewport(
+        &mut input,
+        &mut output,
+        "Theme",
+        &options,
+        0,
+        &mut || Some((5, Some(80))),
+        false,
+        false,
+        |raw| Ok(raw.to_string()),
+        &mut history,
+        true,
+        &mut |_| false,
+        Some(&mut |_| Some(String::from(preview))),
+    )
+    .expect("picker key loop succeeds on a 5-row terminal");
+    assert_eq!(picked, "option-item-01");
+    let painted = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        painted.contains("\x1b[4A"),
+        "a 5-row terminal must repaint the 4-row frame: {painted:?}"
+    );
+    assert!(
+        !painted.contains("j/k or arrows move"),
+        "a 5-row terminal cannot afford the key hint: {painted:?}"
+    );
+}
+
 #[test]
 fn init_color_enabled_impl_matches_convention() {
     // Pure decision table: explicit flag, NO_COLOR, dumb terminal, or piped

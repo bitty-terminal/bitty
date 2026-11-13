@@ -3294,7 +3294,6 @@ fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
 
 const PROFILE_MAX_RETAINED_BACKUPS: usize = 5;
 
-/// Retains at most [`PROFILE_MAX_RETAINED_BACKUPS`] timestamped backups for
 /// Returns `true` when `name` is any retained backup for profile `file_name`:
 /// timestamped (`<file>.bak-<stamp>`), initial (`<file>.bak`), or indexed
 /// (`<file>.bak.<N>`).

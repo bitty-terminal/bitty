@@ -2528,15 +2528,52 @@ pub(crate) fn init_picker_window(
     (start, start + max_visible)
 }
 
+/// Chrome tiers a picker frame retires, in order, until it fits a short
+/// viewport: the live preview and reprompt notice go first, then the window
+/// range indicator and key hint, then the typed-input echo. The prompt and the
+/// windowed entries always stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum InitPickerChrome {
+    /// Every line: prompt, entries, range indicator, hint, preview, notice, typed.
+    Full,
+    /// Drops the live preview line and any reprompt notice.
+    Compact,
+    /// Prompt, entries and the typed-input echo only.
+    Essential,
+    /// Prompt and the windowed entries only; the smallest frame available.
+    Bare,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl InitPickerChrome {
+    /// Tiers in retirement order, most complete first.
+    const TIERS: [Self; 4] = [Self::Full, Self::Compact, Self::Essential, Self::Bare];
+    fn shows_optional_lines(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn shows_navigation_lines(self) -> bool {
+        matches!(self, Self::Full | Self::Compact)
+    }
+
+    fn shows_typed_input(self) -> bool {
+        matches!(self, Self::Full | Self::Compact | Self::Essential)
+    }
+}
+
 /// Renders one key-loop picker frame: `prompt`, the windowed entries with the
 /// cursor marker, an optional window range indicator, the navigation hint, the
 /// optional live preview line, and the typed line.
+///
+/// `chrome` selects how much optional decoration the frame carries, so a short
+/// viewport can drop the preview, hint and typed echo before losing entries.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
 #[cfg_attr(not(unix), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
-fn init_picker_block(
+pub(crate) fn init_picker_block(
     prompt: &str,
     options: &[InitOptionItem],
     cursor: usize,
@@ -2546,6 +2583,7 @@ fn init_picker_block(
     typed: &str,
     preview_line: Option<&str>,
     notice: Option<&str>,
+    chrome: InitPickerChrome,
 ) -> Vec<String> {
     let (start, end) = init_picker_window(options.len(), cursor, max_visible);
     let mut block = Vec::with_capacity((end - start) + 5);
@@ -2564,26 +2602,65 @@ fn init_picker_block(
             block.push(format!("{marker} {label}"));
         }
     }
-    if start > 0 || end < options.len() {
+    if chrome.shows_navigation_lines() && (start > 0 || end < options.len()) {
         block.push(format!(
             "  ({}-{end} of {} options — scroll with j/k or arrows)",
             start + 1,
             options.len()
         ));
     }
-    if numbered {
-        block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
-    } else {
-        block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+    if chrome.shows_navigation_lines() {
+        if numbered {
+            block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
+        } else {
+            block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+        }
     }
-    if let Some(line) = preview_line {
-        block.push(line.to_string());
+    if chrome.shows_optional_lines() {
+        if let Some(line) = preview_line {
+            block.push(line.to_string());
+        }
+        if let Some(message) = notice {
+            block.push(message.to_string());
+        }
     }
-    if let Some(message) = notice {
-        block.push(message.to_string());
+    if chrome.shows_typed_input() {
+        block.push(format!("  (typed: {typed})"));
     }
-    block.push(format!("  (typed: {typed})"));
     block
+}
+
+/// Picks the tallest picker frame `render` can build that fits `safe_rows`
+/// physical rows at `cols`.
+///
+/// Entries are retired first (the sliding window keeps the cursor entry
+/// visible), then [`InitPickerChrome::Compact`] drops the preview/notice,
+/// [`InitPickerChrome::Essential`] drops the range indicator and hint, and
+/// [`InitPickerChrome::Bare`] drops the typed-input echo. When even one entry
+/// cannot fit (a window shorter than two rows, or an entry wider than the
+/// terminal) the smallest renderable frame is returned, because a picker still
+/// needs a prompt and an entry to be usable.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_fit_picker_frame(
+    mut render: impl FnMut(usize, InitPickerChrome) -> Vec<String>,
+    max_visible: usize,
+    safe_rows: usize,
+    cols: Option<u16>,
+) -> Vec<String> {
+    for chrome in InitPickerChrome::TIERS {
+        let mut visible = max_visible.max(1);
+        loop {
+            let block = render(visible, chrome);
+            if init_frame_physical_rows(&block, cols) <= safe_rows {
+                return block;
+            }
+            if visible <= 1 {
+                break;
+            }
+            visible -= 1;
+        }
+    }
+    render(1, InitPickerChrome::Bare)
 }
 
 /// Runs one key-loop submit: the typed buffer wins, else the cursor entry;
@@ -2815,7 +2892,7 @@ fn init_picker_key_loop_impl<T>(
             Some(hook) => hook(&options[cursor]),
             None => None,
         };
-        let (mut max_visible, window) = match fixed_max_visible {
+        let (max_visible, window) = match fixed_max_visible {
             Some(explicit) => (explicit, None),
             None => match query_winsize() {
                 Some((rows, cols)) => (
@@ -2826,10 +2903,33 @@ fn init_picker_key_loop_impl<T>(
             },
         };
         // Fit the frame to the live viewport in PHYSICAL rows (wrapped lines
-        // included) and retire option rows before the chrome, so the cursor
-        // entry stays on screen after a mid-session resize.
-        let block = loop {
-            let block = init_picker_block(
+        // included). Entries retire before the chrome, and the chrome tiers
+        // below keep the prompt plus the cursor entry on screen even when the
+        // window is shorter than the full picker frame.
+        let block = match window {
+            Some((rows, Some(cols))) => {
+                let safe_rows = usize::from(rows).saturating_sub(1).max(1);
+                init_fit_picker_frame(
+                    |visible, chrome| {
+                        init_picker_block(
+                            prompt,
+                            options,
+                            cursor,
+                            visible,
+                            color,
+                            numbered,
+                            &typed,
+                            preview_line.as_deref(),
+                            notice.as_deref(),
+                            chrome,
+                        )
+                    },
+                    max_visible,
+                    safe_rows,
+                    Some(cols),
+                )
+            }
+            _ => init_picker_block(
                 prompt,
                 options,
                 cursor,
@@ -2839,15 +2939,8 @@ fn init_picker_key_loop_impl<T>(
                 &typed,
                 preview_line.as_deref(),
                 notice.as_deref(),
-            );
-            let Some((rows, Some(cols))) = window else {
-                break block;
-            };
-            let safe_rows = usize::from(rows).saturating_sub(1).max(1);
-            if init_frame_physical_rows(&block, Some(cols)) <= safe_rows || max_visible <= 1 {
-                break block;
-            }
-            max_visible -= 1;
+                InitPickerChrome::Full,
+            ),
         };
         let cols = window.and_then(|(_, cols)| cols);
         rendered = init_paint_inplace_frame(output, &block, inplace, rendered, cols);
@@ -4274,10 +4367,9 @@ pub(crate) fn init_display_width(text: &str) -> usize {
     text.chars().map(init_char_display_width).sum()
 }
 
-/// Terminal cell width of a single line after stripping ANSI CSI escape
-/// sequences (`\x1b[...<final byte>`).
-pub(crate) fn init_visible_display_width(text: &str) -> usize {
-    let mut width = 0usize;
+/// Calls `visit` with the cell width of every printable glyph in `text`,
+/// skipping ANSI CSI escape sequences (`\x1b[...<final byte>`).
+fn init_for_each_visible_width(text: &str, mut visit: impl FnMut(usize)) {
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -4291,20 +4383,47 @@ pub(crate) fn init_visible_display_width(text: &str) -> usize {
             }
             continue;
         }
-        width = width.saturating_add(init_char_display_width(ch));
+        visit(init_char_display_width(ch));
     }
+}
+
+/// Terminal cell width of a single line after stripping ANSI CSI escape
+/// sequences (`\x1b[...<final byte>`).
+pub(crate) fn init_visible_display_width(text: &str) -> usize {
+    let mut width = 0usize;
+    init_for_each_visible_width(text, |glyph| width = width.saturating_add(glyph));
     width
 }
 
-/// Number of physical terminal rows occupied by `line` at `cols` columns
-/// (empty/short lines occupy 1 row; long lines wrap at `cols`).
+/// Number of physical terminal rows occupied by `line` at `cols` columns.
+///
+/// Simulates the greedy deferred wrap a VT performs: cells accumulate on the
+/// current row, and a glyph that does not fit the remaining cells starts the
+/// next row, so a two-cell East Asian glyph never straddles the right edge and
+/// leaves the leftover cell blank. Combining marks and ANSI styling take no
+/// cells. Empty, styling-only and `cols`-less lines occupy one row.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn init_line_physical_rows(line: &str, cols: Option<u16>) -> usize {
     let Some(cols) = cols.map(usize::from).filter(|&c| c > 0) else {
         return 1;
     };
-    let width = init_visible_display_width(line);
-    if width == 0 { 1 } else { width.div_ceil(cols) }
+    let mut wraps = 0usize;
+    let mut used = 0usize;
+    let mut painted = false;
+    init_for_each_visible_width(line, |glyph| {
+        if glyph == 0 {
+            return;
+        }
+        painted = true;
+        if used > 0 && used + glyph > cols {
+            wraps += 1;
+            used = 0;
+        }
+        // A glyph wider than the whole terminal still occupies one row; clamp
+        // so the following glyph opens the next one.
+        used = (used + glyph).min(cols);
+    });
+    if painted { wraps + 1 } else { 1 }
 }
 
 /// Total physical terminal rows occupied by a block of lines at `cols` columns.

@@ -25,7 +25,24 @@
 //!   platform refusal leaves the registry byte-identical instead of removing a
 //!   half-inserted row.
 //! - Removing a window never renumbers or re-creates the survivors, and the
-//!   active window falls back to a surviving row rather than to `None`.
+//!   active and focused windows fall back to a surviving row rather than to a
+//!   dangling identity.
+//!
+//! # Focus and close (bitty#1765, slice 3)
+//!
+//! Attribution and focus are deliberately two states, not one. [`WindowRegistry::active`]
+//! is *event* attribution — the window the last handled event named — while
+//! [`WindowRegistry::focused`] is the window the compositor reports as focused, moved
+//! only by `Focused(true)`/`Focused(false)` edges. A key press, a resize or an
+//! occlusion edge therefore never claims focus for a background window.
+//!
+//! Focus is the OS's to decide: the registry never focuses a window because it
+//! was created (there is no platform seam to ask for focus), it only keeps the
+//! answer consistent — a new row takes focus when nothing was focused, and
+//! closing the focused window hands focus to a survivor instead of leaving a
+//! hole. [`WindowRegistry::close_decision`] then states what one close event means for
+//! the instance: [`CloseDecision::WindowOnly`] while another window survives,
+//! [`CloseDecision::LastWindow`] for the last one.
 //!
 //! # Honest scope
 //!
@@ -42,7 +59,7 @@
 
 use std::fmt::{self, Write as _};
 
-use bitty_platform::{SurfaceTarget, WindowHandle, WindowId};
+use bitty_platform::{SurfaceTarget, WindowEventKind, WindowHandle, WindowId};
 
 /// Upper bound on simultaneously registered windows.
 ///
@@ -162,6 +179,38 @@ pub(crate) enum EventTarget {
     Untracked,
 }
 
+/// Whether a window event is a focus edge, and whether it gained or lost focus
+/// (bitty#1765, slice 3).
+///
+/// Only `Focused` events move [`WindowRegistry::focused`]: every other kind
+/// names the window that produced it (a key press, a resize, an occlusion
+/// edge, a close request) and updates event attribution instead. Returning
+/// `None` for those keeps the rule in one place, so the event handler applies a
+/// decision instead of re-deriving which events count as focus.
+pub(crate) fn focus_edge(kind: &WindowEventKind) -> Option<bool> {
+    match kind {
+        WindowEventKind::Focused(focused) => Some(*focused),
+        _ => None,
+    }
+}
+
+/// What a window-close event means for the instance (bitty#1765, slice 3).
+///
+/// The registry answers this instead of the event handler, so the rule is
+/// pinned headlessly: a close for a window that is not the last one must never
+/// reach the instance exit path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseDecision {
+    /// The identity is not registered: the close keeps its existing
+    /// single-window path (a headless run, or a window this process never
+    /// admitted).
+    Unknown,
+    /// Another registered window survives, so only this window closes.
+    WindowOnly,
+    /// This is the last registered window: the instance exits as today.
+    LastWindow,
+}
+
 /// Identity-keyed map of the windows this process owns.
 ///
 /// Insertion order is preserved so lifecycle logs and the primary window are
@@ -170,6 +219,7 @@ pub(crate) enum EventTarget {
 pub(crate) struct WindowRegistry<H> {
     rows: Vec<WindowRow<H>>,
     active: Option<WindowId>,
+    focused: Option<WindowId>,
 }
 
 impl<H> Default for WindowRegistry<H> {
@@ -179,11 +229,12 @@ impl<H> Default for WindowRegistry<H> {
 }
 
 impl<H> WindowRegistry<H> {
-    /// Empty registry: no window is registered and none is active.
+    /// Empty registry: no window is registered, none is active, none focused.
     pub(crate) fn new() -> Self {
         Self {
             rows: Vec::new(),
             active: None,
+            focused: None,
         }
     }
 
@@ -233,6 +284,67 @@ impl<H> WindowRegistry<H> {
         }
         self.active = Some(id);
         true
+    }
+
+    /// The window the compositor reports focused, if any (bitty#1765, slice 3).
+    ///
+    /// `None` means no window of this process holds OS focus: nothing was
+    /// focused yet, the focused window reported `Focused(false)` (the user
+    /// switched to another application), or every window is gone. It never
+    /// names an unregistered identity.
+    pub(crate) fn focused(&self) -> Option<WindowId> {
+        self.focused
+    }
+
+    /// The first registered window: the app's startup window while it lives.
+    pub(crate) fn primary(&self) -> Option<WindowId> {
+        self.rows.first().map(|row| row.id)
+    }
+
+    /// Marks an already-registered window as the focused one.
+    ///
+    /// Returns `false` and changes nothing for an unknown identity: a focus
+    /// edge naming a window this process never registered can never move focus
+    /// away from a registered one.
+    pub(crate) fn focus(&mut self, id: WindowId) -> bool {
+        if !self.contains(id) {
+            return false;
+        }
+        self.focused = Some(id);
+        true
+    }
+
+    /// Clears focus when `id` is the focused window.
+    ///
+    /// Returns whether focus was cleared. A blur naming any other window is a
+    /// no-op, because focus edges can cross in flight: a platform reports the
+    /// new window focused before the old one blurred, so validating the
+    /// identity is what stops a stale blur from clearing a newer focus.
+    pub(crate) fn blur(&mut self, id: WindowId) -> bool {
+        if self.focused != Some(id) {
+            return false;
+        }
+        self.focused = None;
+        true
+    }
+
+    /// What a close event naming `id` means for the instance (bitty#1765,
+    /// slice 3).
+    ///
+    /// [`CloseDecision::WindowOnly`] means another registered window survives,
+    /// so the close must stop at that window. [`CloseDecision::LastWindow`] is
+    /// the last row: the instance exits exactly as it did with one window.
+    /// [`CloseDecision::Unknown`] keeps the pre-registry behaviour, which is
+    /// what a headless run and a foreign identity rely on.
+    pub(crate) fn close_decision(&self, id: WindowId) -> CloseDecision {
+        if !self.contains(id) {
+            return CloseDecision::Unknown;
+        }
+        if self.rows.len() == 1 {
+            CloseDecision::LastWindow
+        } else {
+            CloseDecision::WindowOnly
+        }
     }
 }
 
@@ -300,7 +412,9 @@ impl<H> WindowRegistry<H> {
     ///
     /// The survivors keep their identities and order. When the removed window
     /// was active, attribution moves to the first surviving row (never to a
-    /// dangling identity, never to `None` while a window remains).
+    /// dangling identity, never to `None` while a window remains); when it was
+    /// the focused window, focus moves to that same survivor, so a close can
+    /// never punch a focus hole.
     ///
     /// Window-close routing uses this for a close request that belongs to a
     /// secondary window: dropping the row releases the last handle, so that OS
@@ -311,6 +425,9 @@ impl<H> WindowRegistry<H> {
         let row = self.rows.remove(index);
         if self.active == Some(id) {
             self.active = self.rows.first().map(|row| row.id);
+        }
+        if self.focused == Some(id) {
+            self.focused = self.rows.first().map(|row| row.id);
         }
         Some(row)
     }
@@ -384,6 +501,15 @@ impl<H> WindowRegistry<H> {
         });
         if self.active.is_none() {
             self.active = Some(id);
+        }
+        // A window becomes the focused one only when nothing was focused: the
+        // registry has no platform seam to ask for focus, so creation never
+        // steals it from a window the compositor is actually showing focused.
+        // The next real `Focused` edge confirms or moves it, and this fallback
+        // is what keeps "registered" and "focusable" from disagreeing while a
+        // window exists.
+        if self.focused.is_none() {
+            self.focused = Some(id);
         }
         Ok(())
     }
@@ -643,5 +769,256 @@ mod tests {
             other => panic!("duplicate identity must fail closed: {other:?}"),
         }
         assert_eq!(small.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // bitty#1765 (slice 3): per-window focus and the per-window close decision
+    // -----------------------------------------------------------------------
+    //
+    // These pin the state model the app delegates to: which window holds OS
+    // focus, how creation and destruction keep that answer consistent, and
+    // what one close event means for the instance. The app layer only forwards
+    // `Focused` edges and applies the decision, so the invariants that matter
+    // (no focus hole, no dangling identity, never exit while a window survives)
+    // are provable here without a display server.
+
+    #[test]
+    fn only_focus_events_move_window_focus() {
+        // The app forwards every window event through this rule, so an event
+        // that merely names a window (a key press in a background window, a
+        // resize, an occlusion edge) must never be read as a focus change.
+        assert_eq!(
+            focus_edge(&WindowEventKind::Focused(true)),
+            Some(true),
+            "focus gain is the one edge that moves focus"
+        );
+        assert_eq!(
+            focus_edge(&WindowEventKind::Focused(false)),
+            Some(false),
+            "focus loss is the other"
+        );
+        for kind in [
+            WindowEventKind::Resized(bitty_platform::PhysicalSize::new(80, 24)),
+            WindowEventKind::ScaleFactorChanged(bitty_platform::ScaleFactor::new_sanitized(1.5)),
+            WindowEventKind::RedrawRequested,
+            WindowEventKind::CursorEntered,
+            WindowEventKind::CursorLeft,
+            WindowEventKind::CloseRequested,
+            WindowEventKind::Closed,
+            WindowEventKind::Occluded(true),
+            WindowEventKind::Occluded(false),
+        ] {
+            assert_eq!(
+                focus_edge(&kind),
+                None,
+                "{kind:?} names a window, it does not focus one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_registered_window_starts_focused_only_when_nothing_was_focused() {
+        let mut registry: WindowRegistry<TestWindow> = WindowRegistry::new();
+        assert_eq!(
+            registry.focused(),
+            None,
+            "an empty registry has no focused window"
+        );
+
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .expect("primary registers");
+        assert_eq!(
+            registry.focused(),
+            Some(first),
+            "the startup window is the target of focus-sensitive commands"
+        );
+
+        let second = registry
+            .admit(Ok::<_, ()>((window(2), None)))
+            .expect("second window registers");
+        assert_eq!(
+            registry.focused(),
+            Some(first),
+            "creation never steals focus from the window the compositor shows focused"
+        );
+        assert!(registry.focus(second), "a registered window can take focus");
+        assert_eq!(registry.focused(), Some(second));
+    }
+
+    #[test]
+    fn focus_edges_move_focus_and_unknown_identities_are_refused() {
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+
+        assert!(registry.focus(second));
+        assert!(registry.blur(second), "the focused window clears its focus");
+        assert_eq!(
+            registry.focused(),
+            None,
+            "the user moved to another application"
+        );
+        assert!(
+            !registry.blur(second),
+            "a repeated blur is a no-op, not a state change"
+        );
+        // Fail closed: an identity this process never admitted can neither
+        // take nor clear focus.
+        assert!(!registry.focus(id(99)));
+        assert_eq!(registry.focused(), None);
+        assert!(registry.focus(first));
+        assert!(!registry.blur(id(99)));
+        assert_eq!(
+            registry.focused(),
+            Some(first),
+            "a foreign blur never clears a registered window's focus"
+        );
+    }
+
+    #[test]
+    fn a_stale_blur_from_the_previously_focused_window_cannot_clear_a_newer_focus() {
+        // Focus edges cross in flight: a platform reports the new window
+        // focused before the old one blurred. Validating the identity is what
+        // keeps the late edge from clearing focus.
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+
+        assert!(registry.focus(second));
+        assert!(
+            !registry.blur(first),
+            "the old window's late blur is dropped"
+        );
+        assert_eq!(registry.focused(), Some(second));
+        assert_eq!(
+            registry.active(),
+            Some(first),
+            "attribution is a separate state: only focus edges move focus"
+        );
+    }
+
+    #[test]
+    fn closing_the_focused_window_rehomes_focus_to_a_survivor() {
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+        assert!(registry.mark_attached(second));
+        assert!(registry.focus(second));
+
+        let closed = registry.remove(second).expect("the focused window closes");
+        assert_eq!(closed.id, second);
+        assert_eq!(
+            registry.focused(),
+            Some(first),
+            "focus moves to the surviving window instead of leaving a hole"
+        );
+        assert_eq!(registry.active(), Some(first));
+        assert!(!registry.contains(second), "no dangling identity survives");
+        assert_eq!(
+            registry.get(first).map(|row| row.state),
+            Some(SurfaceState::Attached),
+            "the survivor's surface state is untouched by the close"
+        );
+        assert_eq!(
+            registry.close_decision(first),
+            CloseDecision::LastWindow,
+            "one window remains, so its close is the instance exit again"
+        );
+    }
+
+    #[test]
+    fn closing_an_unfocused_window_leaves_focus_on_its_window() {
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+        assert!(registry.set_active(second));
+        assert!(registry.focus(first));
+
+        assert!(registry.remove(second).is_some());
+        assert_eq!(
+            registry.focused(),
+            Some(first),
+            "closing another window never moves focus"
+        );
+        assert_eq!(
+            registry.active(),
+            Some(first),
+            "attribution falls back to the survivor, never to the closed row"
+        );
+        assert_eq!(registry.ids(), vec![first]);
+    }
+
+    #[test]
+    fn closing_the_last_window_leaves_no_focus_and_no_registry_row() {
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        assert!(registry.remove(first).is_some());
+        assert_eq!(registry.focused(), None);
+        assert_eq!(registry.active(), None);
+        assert!(registry.ids().is_empty());
+        assert_eq!(registry.summary(), "");
+        assert_eq!(
+            registry.close_decision(first),
+            CloseDecision::Unknown,
+            "a closed identity stops deciding anything"
+        );
+        // The next window is focused again: a fully closed registry has no
+        // remembered focus to leak into it.
+        let reopened = registry.admit(Ok::<_, ()>((window(3), None))).unwrap();
+        assert_eq!(registry.focused(), Some(reopened));
+        assert_eq!(registry.close_decision(reopened), CloseDecision::LastWindow);
+    }
+
+    #[test]
+    fn close_decision_separates_window_only_last_window_and_unknown() {
+        let mut registry: WindowRegistry<TestWindow> = WindowRegistry::new();
+        assert_eq!(
+            registry.close_decision(id(1)),
+            CloseDecision::Unknown,
+            "with nothing registered the pre-registry close path owns the event"
+        );
+        assert_eq!(registry.primary(), None);
+
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        assert_eq!(registry.primary(), Some(first));
+        assert_eq!(
+            registry.close_decision(first),
+            CloseDecision::LastWindow,
+            "a single window is the instance: its close exits exactly as before"
+        );
+
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+        assert_eq!(
+            registry.close_decision(first),
+            CloseDecision::WindowOnly,
+            "another window survives, so the close must stop at that window"
+        );
+        assert_eq!(registry.close_decision(second), CloseDecision::WindowOnly);
+        assert_eq!(
+            registry.close_decision(id(99)),
+            CloseDecision::Unknown,
+            "a foreign identity is never closed by this registry"
+        );
+
+        assert!(registry.remove(first).is_some());
+        assert_eq!(
+            registry.primary(),
+            Some(second),
+            "the survivor becomes the first registered window"
+        );
+        assert_eq!(registry.close_decision(second), CloseDecision::LastWindow);
     }
 }

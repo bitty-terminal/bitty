@@ -19900,6 +19900,40 @@ fn a_requested_window_inherits_the_live_window_chrome() {
     assert_eq!((size.width().get(), size.height().get()), (800.0, 600.0));
 }
 
+// bitty#1765 (slice 3): the registry's focus state and close decision are
+// pinned in `crate::window_registry::tests` with a constructible window
+// payload — a `WindowHandle` cannot exist without a display server, so that is
+// where the multi-window lifecycle is provable headlessly. What is left for the
+// app layer is the focus target a window-scoped command resolves to, and the
+// rule that a close which no registered window owns keeps its old meaning.
+
+#[test]
+fn a_focus_sensitive_command_targets_the_only_window_of_a_single_window_instance() {
+    let mut app = window_registry_app();
+    assert!(app.windows.is_empty(), "precondition: nothing registered");
+    assert_eq!(
+        app.focused_window(),
+        None,
+        "a headless run has no window to target"
+    );
+
+    // Before the startup window is registered (and on any run where the
+    // platform refused a window) the target is the single-window identity, so
+    // the pre-multi-window behaviour is unchanged.
+    let only = bitty_platform::WindowId::from_raw_public(7);
+    app.window.id = Some(only);
+    assert_eq!(app.focused_window(), Some(only));
+    assert!(
+        app.windows.is_empty(),
+        "resolving a target never fabricates a registry row"
+    );
+    assert_eq!(
+        app.windows.close_decision(only),
+        crate::window_registry::CloseDecision::Unknown,
+        "an unregistered identity keeps the pre-registry close path"
+    );
+}
+
 /// The command half that needs a platform context (`ctx.create_window`).
 ///
 /// The recording context refuses every native window, which is exactly the
@@ -19971,5 +20005,27 @@ mod window_registry_command {
         drive(&mut app, &operations, 42, WindowEventKind::Focused(true));
         assert!(app.windows.is_empty());
         assert_eq!(app.windows.active(), None);
+    }
+
+    #[test]
+    fn a_close_request_for_an_unregistered_window_still_takes_the_exit_path() {
+        // bitty#1765 (slice 3): `CloseDecision::Unknown` keeps the
+        // pre-multi-window meaning of a close. With no registered window (a
+        // headless run, or a platform that refused every window) the request
+        // must still reach the instance exit path, and it must not invent a
+        // registry row or a focus target on the way out.
+        let mut app = window_registry_app();
+        let operations = RefCell::new(Vec::new());
+
+        drive(&mut app, &operations, 1, WindowEventKind::CloseRequested);
+
+        let recorded = operations.borrow().clone();
+        assert!(
+            recorded.contains(&RecordingOperation::Exit),
+            "a close with no registered window is still the instance exit: {recorded:?}"
+        );
+        assert!(app.windows.is_empty(), "no row was fabricated");
+        assert_eq!(app.windows.focused(), None);
+        assert_eq!(app.focused_window(), None);
     }
 }

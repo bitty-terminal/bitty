@@ -78,8 +78,10 @@ fn assert_ok(output: &Output, label: &str) {
 }
 
 fn backup_entries(root: &Path) -> Vec<PathBuf> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(root.join("bitty"))
-        .expect("config dir")
+    let Ok(entries) = std::fs::read_dir(root.join("bitty").join(".backups")) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -124,7 +126,7 @@ fn version_zero_migrates_with_a_backup_then_second_run_is_a_no_op() {
     assert_eq!(backups.len(), 1, "one backup expected: {backups:?}");
     assert_eq!(
         backups[0],
-        path.with_file_name("init.lua.bak-0"),
+        root.join("bitty").join(".backups").join("init.lua.bak-0"),
         "the backup name carries the source version"
     );
     assert_eq!(
@@ -291,7 +293,6 @@ fn version_one_validates_without_a_migration_hint() {
 fn no_backup_skips_the_backup_and_collisions_number_the_suffix() {
     let root = scratch_root("backup");
     write_init(&root, VERSION_ZERO);
-    let path = init_path(&root);
 
     let no_backup = run_bitty(&root, &["config", "migrate", "--no-backup"]);
     assert_ok(&no_backup, "config migrate --no-backup");
@@ -302,7 +303,9 @@ fn no_backup_skips_the_backup_and_collisions_number_the_suffix() {
 
     // Reset to the version-0 shape and pre-create the default backup name.
     write_init(&root, VERSION_ZERO);
-    let taken = path.with_file_name("init.lua.bak-0");
+    let backup_dir = root.join("bitty").join(".backups");
+    std::fs::create_dir_all(&backup_dir).expect("backup dir");
+    let taken = backup_dir.join("init.lua.bak-0");
     std::fs::write(&taken, "older backup\n").expect("pre-create backup");
 
     let output = run_bitty(&root, &["config", "migrate"]);
@@ -314,7 +317,7 @@ fn no_backup_skips_the_backup_and_collisions_number_the_suffix() {
     );
     let backups = backup_entries(&root);
     assert!(
-        backups.contains(&path.with_file_name("init.lua.bak-0.1")),
+        backups.contains(&backup_dir.join("init.lua.bak-0.1")),
         "a collision must pick a numbered suffix: {backups:?}"
     );
 
@@ -335,8 +338,12 @@ fn profile_flag_migrates_the_named_profile_file() {
         "the named profile must be stamped: {migrated:?}"
     );
     assert!(
-        profile.with_file_name("work.lua.bak-0").exists(),
-        "the profile backup must be written beside it"
+        root.join("bitty")
+            .join(".backups")
+            .join("profiles")
+            .join("work.lua.bak-0")
+            .exists(),
+        "the profile backup must be written inside .backups/profiles"
     );
     assert!(
         !init_path(&root).exists(),
@@ -350,7 +357,6 @@ fn profile_flag_migrates_the_named_profile_file() {
 fn json_format_reports_the_change_list_and_backup() {
     let root = scratch_root("json");
     write_init(&root, VERSION_ZERO);
-    let path = init_path(&root);
 
     let output = run_bitty(&root, &["config", "migrate", "--format", "json"]);
     assert_ok(&output, "config migrate --format json");
@@ -367,10 +373,11 @@ fn json_format_reports_the_change_list_and_backup() {
         text.contains("\"key\":\"config_version\",\"from\":null,\"to\":\"1\""),
         "the change list must name the absent old value: {text:?}"
     );
+    let expected_backup = root.join("bitty").join(".backups").join("init.lua.bak-0");
     assert!(
         text.contains(&format!(
             "\"backup\":\"{}\"",
-            json_string(&path.with_file_name("init.lua.bak-0").display().to_string())
+            json_string(&expected_backup.display().to_string())
         )),
         "the envelope must report the backup path: {text:?}"
     );

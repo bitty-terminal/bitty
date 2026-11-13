@@ -8661,6 +8661,135 @@ fn init_key_loop_inplace_repaints_with_cursor_up() {
 }
 
 #[test]
+fn init_picker_window_bounds_28_themes_and_keeps_cursor_visible() {
+    let presets = bitty_config::theme::list_presets();
+    assert!(presets.len() >= 28, "expected at least 28 theme presets");
+    let options: Vec<_> = presets.iter().copied().map(theme_option).collect();
+    let mut keys = vec![b'j'; 15];
+    keys.extend([b'k'; 3]);
+    keys.push(b'\r');
+    let mut input = std::io::BufReader::new(keys.as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        "Theme [dark]:",
+        &options,
+        0,
+        6,
+        false,
+        false,
+        crate::init::init_parse_theme_answer,
+        &mut history,
+        true,
+        &mut wait,
+        None,
+    );
+    assert_eq!(
+        result.expect("Enter selects cursor=12"),
+        options[12].value_text
+    );
+
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    let expected_end = "\x1b[10A\r\x1b[J\x1b[?25h";
+    assert!(
+        printed.ends_with(expected_end),
+        "expected exit erase sequence, got tail: {:?}",
+        &printed[printed.len().saturating_sub(64)..]
+    );
+    let body = printed
+        .strip_prefix("\x1b[?25l")
+        .expect("cursor hide")
+        .strip_suffix(expected_end)
+        .expect("exit erase");
+    let frames: Vec<&str> = body.split("\x1b[10A").collect();
+    assert_eq!(frames.len(), 19, "1 initial + 15 j + 3 k frames");
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(lines.len(), 10, "frame {frame_idx} height bounded: {frame}");
+        assert!(
+            lines.iter().any(|line| line.contains("> ")),
+            "frame {frame_idx} keeps cursor visible:\n{frame}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("of {} options", options.len()))),
+            "frame {frame_idx} shows scroll range:\n{frame}"
+        );
+    }
+    assert!(
+        frames.last().expect("last frame").contains("10-15 of "),
+        "cursor 12 window shifted cleanly:\n{}",
+        frames.last().expect("last frame")
+    );
+}
+
+#[test]
+fn init_multiselect_inplace_erases_block_on_confirm_and_cancel() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.plugin-{idx:02}"))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled,
+        installed: Vec::new(),
+        needs_network: Vec::new(),
+        warning: None,
+    };
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+
+    // Confirm path: Space selects first item, Enter confirms and erases menu.
+    let mut input = std::io::BufReader::new(b" \r".as_slice());
+    let mut output = Vec::new();
+    let selected = crate::init::init_multiselect_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        &inventory,
+        5,
+        false,
+        true,
+        &mut wait,
+    )
+    .expect("Space + Enter confirms selection");
+    assert_eq!(selected, vec![String::from("bundled.plugin-00")]);
+    let confirm_out = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        confirm_out.contains("1-5 of 12 bundled plugins"),
+        "expected windowed bundled summary, got:\n{confirm_out}"
+    );
+    assert!(
+        confirm_out.ends_with("\r\x1b[J\x1b[?25h"),
+        "confirm erases menu block before showing cursor:\n{confirm_out}"
+    );
+
+    // Cancel path (`0x03` / Ctrl-C byte): returns cancelled error and erases menu.
+    let mut cancel_in = std::io::BufReader::new([0x03u8].as_slice());
+    let mut cancel_out = Vec::new();
+    let err = crate::init::init_multiselect_key_loop_with_max_visible(
+        &mut cancel_in,
+        &mut cancel_out,
+        &inventory,
+        5,
+        false,
+        true,
+        &mut wait,
+    )
+    .expect_err("0x03 cancels multiselect");
+    assert!(err.contains("cancelled"), "unexpected error: {err}");
+    let cancel_str = String::from_utf8(cancel_out).expect("UTF-8");
+    assert!(
+        cancel_str.ends_with("\r\x1b[J\x1b[?25h"),
+        "cancel erases menu block before showing cursor:\n{cancel_str}"
+    );
+}
+
+#[test]
 fn init_color_enabled_impl_matches_convention() {
     // Pure decision table: explicit flag, NO_COLOR, dumb terminal, or piped
     // stdout disables; otherwise color is allowed.
@@ -8953,7 +9082,7 @@ fn init_preview_never_writes_config_file() {
     );
     assert!(!target.exists(), "cancel creates no config file");
     assert!(
-        !target.with_extension("lua.bak").exists(),
+        !crate::init::config_backup_path_for(&target).exists(),
         "cancel creates no backup"
     );
 
@@ -8973,7 +9102,7 @@ fn init_preview_never_writes_config_file() {
         "-- existing\n"
     );
     assert!(
-        !target.with_extension("lua.bak").exists(),
+        !crate::init::config_backup_path_for(&target).exists(),
         "cancel writes no backup"
     );
 
@@ -10564,7 +10693,7 @@ fn init_write_new_refuse_force_backup_idempotent() {
     let outcome = write_init_config(&target, &updated_content, true).expect("forced write");
     assert!(outcome.updated);
     let backup = outcome.backup.expect("backup path");
-    assert_eq!(backup, target.with_extension("lua.bak"));
+    assert_eq!(backup, crate::init::config_backup_path_for(&target));
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup bytes"),
         content
@@ -10740,7 +10869,7 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
     });
     let outcome = write_init_config(&target, &second, true).expect("first forced write");
     let backup = outcome.backup.expect("backup path");
-    assert_eq!(backup, target.with_extension("lua.bak"));
+    assert_eq!(backup, crate::init::config_backup_path_for(&target));
     assert_eq!(std::fs::read_to_string(&backup).expect("backup"), first);
 
     // A second forced write never overwrites the sole recovery copy.
@@ -10750,7 +10879,7 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
     });
     let outcome = write_init_config(&target, &third, true).expect("second forced write");
     let second_backup = outcome.backup.expect("second backup path");
-    assert_eq!(second_backup, dir.join("init.lua.bak.1"));
+    assert_eq!(second_backup, dir.join(".backups").join("init.lua.bak.1"));
     assert_eq!(
         std::fs::read_to_string(&second_backup).expect("second backup"),
         second
@@ -10772,8 +10901,9 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
 
     // Invalid generated content is refused before any mutation: the target
     // keeps its bytes and no new backup is created.
-    let backups_before = std::fs::read_dir(&dir)
-        .expect("read dir")
+    let backup_dir = crate::init::config_backup_dir_for(&target);
+    let backups_before = std::fs::read_dir(&backup_dir)
+        .expect("read backup dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
@@ -10784,8 +10914,8 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
         std::fs::read_to_string(&target).expect("target intact"),
         third
     );
-    let backups_after = std::fs::read_dir(&dir)
-        .expect("read dir")
+    let backups_after = std::fs::read_dir(&backup_dir)
+        .expect("read backup dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
@@ -10910,12 +11040,12 @@ fn init_dispatch_yes_force_idempotent() {
         run_init_subcommand_with_io(&args, &sh_env, &mut input, &mut output),
         0
     );
-    let backup = target.with_extension("lua.bak");
+    let backup = crate::init::config_backup_path_for(&target);
     assert_eq!(
         std::fs::read_to_string(&backup).expect("selector backup"),
         written_selector
     );
-    let profile_backup = profile.with_extension("lua.bak");
+    let profile_backup = crate::init::config_backup_path_for(&profile);
     assert_eq!(
         std::fs::read_to_string(&profile_backup).expect("profile backup"),
         written_profile

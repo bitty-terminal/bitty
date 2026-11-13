@@ -17,6 +17,20 @@ pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
 /// Default generated profile name (CTX-1404 / issue #2187).
 pub(crate) const DEFAULT_PROFILE_NAME: &str = "default";
 
+/// Subdirectory under the active configuration root holding retained `.bak` copies.
+pub(crate) const CONFIG_BACKUP_DIR_NAME: &str = ".backups";
+
+/// Default maximum visible option rows in `bitty init` interactive pickers
+/// when terminal height cannot be queried or fits comfortably.
+const INIT_PICKER_DEFAULT_MAX_VISIBLE: usize = 10;
+
+/// Minimum visible option rows even in very short terminal windows.
+const INIT_PICKER_MIN_VISIBLE: usize = 3;
+
+/// Lines reserved for the picker header, hint, preview, typed row, and
+/// completed-step banner so the rendered frame stays inside the viewport.
+const INIT_PICKER_CHROME_ROWS: usize = 8;
+
 /// Bounded collision search for a recoverable `.bak` sibling.
 const INIT_MAX_BACKUP_ATTEMPTS: u32 = 100;
 
@@ -2415,12 +2429,54 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
 /// preview-free (every non-theme step, and every non-interactive run).
 pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
 
-/// Renders one key-loop picker frame: `prompt`, every entry with the cursor
-/// marker, the navigation hint, the optional live preview line, and the typed
-/// line. The typed line is always present (even empty) so in-place repaints
-/// keep a constant frame height; a step that passes a preview line must pass
-/// one on every frame (`init_theme_preview_strip` falls back to the running
-/// preview theme) for the same reason.
+/// Computes the visible option row count for interactive pickers.
+///
+/// Queries the live Unix terminal row count via `rustix::termios::tcgetwinsize`
+/// when repainting in place, clamping to `[3, 10]` after reserving chrome rows
+/// so long option catalogs (such as the 28 theme presets) never scroll past
+/// the top of a short window.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_picker_max_visible(inplace: bool) -> usize {
+    #[cfg(unix)]
+    if inplace {
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
+            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
+        if let Ok(ws) = winsize {
+            if ws.ws_row > 0 {
+                return (ws.ws_row as usize)
+                    .saturating_sub(INIT_PICKER_CHROME_ROWS)
+                    .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = inplace;
+    INIT_PICKER_DEFAULT_MAX_VISIBLE
+}
+
+/// Returns the inclusive-start, exclusive-end sliding window keeping `cursor`
+/// centered when `total > max_visible` and keeping window height constant.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_picker_window(
+    total: usize,
+    cursor: usize,
+    max_visible: usize,
+) -> (usize, usize) {
+    if total == 0 || max_visible == 0 || total <= max_visible {
+        return (0, total);
+    }
+    let bounded_cursor = cursor.min(total - 1);
+    let half = max_visible / 2;
+    let mut start = bounded_cursor.saturating_sub(half);
+    if start + max_visible > total {
+        start = total - max_visible;
+    }
+    (start, start + max_visible)
+}
+
+/// Renders one key-loop picker frame: `prompt`, the windowed entries with the
+/// cursor marker, an optional window range indicator, the navigation hint, the
+/// optional live preview line, and the typed line.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
@@ -2430,15 +2486,17 @@ fn init_picker_block(
     prompt: &str,
     options: &[InitOptionItem],
     cursor: usize,
+    max_visible: usize,
     color: bool,
     numbered: bool,
     typed: &str,
     preview_line: Option<&str>,
     notice: Option<&str>,
 ) -> Vec<String> {
-    let mut block = Vec::with_capacity(options.len() + 4);
+    let (start, end) = init_picker_window(options.len(), cursor, max_visible);
+    let mut block = Vec::with_capacity((end - start) + 5);
     block.push(prompt.to_string());
-    for (index, item) in options.iter().enumerate() {
+    for (index, item) in options.iter().enumerate().take(end).skip(start) {
         let selected = index == cursor;
         let marker = if selected {
             if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
@@ -2451,6 +2509,13 @@ fn init_picker_block(
         } else {
             block.push(format!("{marker} {label}"));
         }
+    }
+    if start > 0 || end < options.len() {
+        block.push(format!(
+            "  ({}-{end} of {} options — scroll with j/k or arrows)",
+            start + 1,
+            options.len()
+        ));
     }
     if numbered {
         block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
@@ -2569,6 +2634,41 @@ pub(crate) fn init_picker_key_loop<T>(
     history: &mut Vec<String>,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_with_max_visible(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        init_picker_max_visible(inplace),
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+/// [`init_picker_key_loop`] with an explicit `max_visible` window bound.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_picker_key_loop_with_max_visible<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    max_visible: usize,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
     mut preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
@@ -2591,6 +2691,7 @@ pub(crate) fn init_picker_key_loop<T>(
             prompt,
             options,
             cursor,
+            max_visible,
             color,
             numbered,
             &typed,
@@ -2606,6 +2707,9 @@ pub(crate) fn init_picker_key_loop<T>(
             } else {
                 let _ = writeln!(output, "{line}");
             }
+        }
+        if inplace && rendered > block.len() {
+            let _ = write!(output, "\r\x1b[J");
         }
         let _ = output.flush();
         rendered = block.len();
@@ -2696,6 +2800,7 @@ pub(crate) fn init_picker_key_loop<T>(
                     break done;
                 }
             }
+            0x03 => break Err("bitty init: aborted (cancelled)".to_string()),
             0x04 => break Err("bitty init: aborted (end of input)".to_string()),
             0x7f | 0x08 => {
                 if typed.pop().is_some() {
@@ -2741,6 +2846,9 @@ pub(crate) fn init_picker_key_loop<T>(
         }
     };
     if inplace {
+        if rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A\r\x1b[J");
+        }
         let _ = write!(output, "\x1b[?25h");
         let _ = output.flush();
     }
@@ -2918,13 +3026,36 @@ fn init_plugin_inventory_groups(
     inventory: &InitPluginInventory,
     bundled_row: &dyn Fn(usize, &str) -> String,
 ) -> Vec<String> {
+    init_plugin_inventory_groups_windowed(inventory, None, bundled_row)
+}
+
+/// Renders the three inventory groups with an optional sliding window
+/// `(cursor, max_visible)` over [`InitPluginInventory::bundled`].
+fn init_plugin_inventory_groups_windowed(
+    inventory: &InitPluginInventory,
+    window: Option<(usize, usize)>,
+    bundled_row: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(INIT_PLUGIN_BUNDLED_HEADER.to_string());
     if inventory.bundled.is_empty() {
         lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
     } else {
-        for (index, id) in inventory.bundled.iter().enumerate() {
+        let (start, end) = match window {
+            Some((cursor, max_visible)) => {
+                init_picker_window(inventory.bundled.len(), cursor, max_visible)
+            }
+            None => (0, inventory.bundled.len()),
+        };
+        for (index, id) in inventory.bundled.iter().enumerate().take(end).skip(start) {
             lines.push(bundled_row(index, id));
+        }
+        if start > 0 || end < inventory.bundled.len() {
+            lines.push(format!(
+                "    ({}-{end} of {} bundled plugins)",
+                start + 1,
+                inventory.bundled.len()
+            ));
         }
     }
     lines.push(INIT_PLUGIN_INSTALLED_HEADER.to_string());
@@ -2988,30 +3119,35 @@ fn init_plugin_inventory_groups(
 fn init_multiselect_block(
     inventory: &InitPluginInventory,
     cursor: usize,
+    max_visible: usize,
     selected: &[bool],
     color: bool,
 ) -> Vec<String> {
     let mut block = Vec::new();
     block.push(INIT_PLUGIN_PROMPT.to_string());
-    block.extend(init_plugin_inventory_groups(inventory, &|index, id| {
-        let is_cursor = index == cursor;
-        let marker = if is_cursor {
-            if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
-        } else {
-            " "
-        };
-        let checkbox = if selected.get(index).copied().unwrap_or(false) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
-        let label = if color && is_cursor {
-            format!("\u{1b}[1m{id}\u{1b}[0m")
-        } else {
-            id.to_string()
-        };
-        format!("{marker} {checkbox} {label}")
-    }));
+    block.extend(init_plugin_inventory_groups_windowed(
+        inventory,
+        Some((cursor, max_visible)),
+        &|index, id| {
+            let is_cursor = index == cursor;
+            let marker = if is_cursor {
+                if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
+            } else {
+                " "
+            };
+            let checkbox = if selected.get(index).copied().unwrap_or(false) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let label = if color && is_cursor {
+                format!("\u{1b}[1m{id}\u{1b}[0m")
+            } else {
+                id.to_string()
+            };
+            format!("{marker} {checkbox} {label}")
+        },
+    ));
     block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
     block
 }
@@ -3056,6 +3192,28 @@ pub(crate) fn init_multiselect_key_loop(
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_with_max_visible(
+        input,
+        output,
+        inventory,
+        init_picker_max_visible(inplace),
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+/// [`init_multiselect_key_loop`] with an explicit `max_visible` window bound.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_key_loop_with_max_visible(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    max_visible: usize,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
     let ids = &inventory.bundled;
     assert!(!ids.is_empty(), "plugin list must not be empty");
     let mut cursor = 0usize;
@@ -3065,7 +3223,7 @@ pub(crate) fn init_multiselect_key_loop(
     }
     let mut rendered: usize = 0;
     let result = loop {
-        let block = init_multiselect_block(inventory, cursor, &selected, color);
+        let block = init_multiselect_block(inventory, cursor, max_visible, &selected, color);
         if inplace && rendered > 0 {
             let _ = write!(output, "\x1b[{rendered}A");
         }
@@ -3075,6 +3233,9 @@ pub(crate) fn init_multiselect_key_loop(
             } else {
                 let _ = writeln!(output, "{line}");
             }
+        }
+        if inplace && rendered > block.len() {
+            let _ = write!(output, "\r\x1b[J");
         }
         let _ = output.flush();
         rendered = block.len();
@@ -3129,6 +3290,7 @@ pub(crate) fn init_multiselect_key_loop(
         }
         match first {
             b'\r' | b'\n' => break Ok(init_multiselect_selection(ids, &selected)),
+            0x03 => break Err("bitty init: aborted (cancelled)".to_string()),
             0x04 => break Err("bitty init: aborted (end of input)".to_string()),
             b' ' => selected[cursor] = !selected[cursor],
             b'j' | b'J' => cursor = (cursor + 1) % ids.len(),
@@ -3137,6 +3299,9 @@ pub(crate) fn init_multiselect_key_loop(
         }
     };
     if inplace {
+        if rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A\r\x1b[J");
+        }
         let _ = write!(output, "\x1b[?25h");
         let _ = output.flush();
     }
@@ -3694,9 +3859,9 @@ fn init_preview_runtime(
 /// touched. Gated on an enabled preview; a disabled preview prints nothing.
 /// Styling resolves with `resolve_theme_with_status` (no stderr), so an
 /// unknown seeded theme still echoes its stored name in default colors.
-fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
+fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String> {
     if !preview.is_enabled() {
-        return;
+        return None;
     }
     let current = preview.current();
     let (resolved, _) =
@@ -3722,7 +3887,36 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
         style_fg: Some(resolved.foreground),
         style_bg: Some(resolved.background),
     };
-    let _ = writeln!(output, "{}", init_style_label(&item, false, color));
+    Some(init_style_label(&item, false, color))
+}
+
+fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
+    if let Some(styled) = init_format_preview_echo(preview, color) {
+        let _ = writeln!(output, "{styled}");
+    }
+}
+
+fn init_emit_step_preview_echo(
+    output: &mut dyn std::io::Write,
+    preview: &InitPreview,
+    color: bool,
+    inplace_steps: bool,
+    has_preview_line: &mut bool,
+) {
+    if !inplace_steps {
+        init_emit_preview_echo(output, preview, color);
+        return;
+    }
+    let Some(styled) = init_format_preview_echo(preview, color) else {
+        return;
+    };
+    if *has_preview_line {
+        let _ = write!(output, "\x1b[1A\r\x1b[K{styled}\n");
+    } else {
+        let _ = write!(output, "\r\x1b[K{styled}\n");
+        *has_preview_line = true;
+    }
+    let _ = output.flush();
 }
 
 /// Push only the theme half of the preview overlay through the live-adopt
@@ -3996,7 +4190,14 @@ fn run_init_interactive_impl(
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
     }
-    let _ = writeln!(output, "\nShell:");
+    #[cfg(unix)]
+    let inplace_steps = tty_interactive && nix::sys::termios::tcgetattr(std::io::stdin()).is_ok();
+    #[cfg(not(unix))]
+    let inplace_steps = false;
+    let mut has_preview_line = false;
+    if !inplace_steps {
+        let _ = writeln!(output, "\nShell:");
+    }
     let shell_options: Vec<InitOptionItem> = candidates
         .iter()
         .enumerate()
@@ -4035,7 +4236,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
@@ -4115,7 +4316,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
@@ -4173,7 +4374,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let font_size = match overrides.font_size {
         Some(size) => size,
@@ -4236,12 +4437,14 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
-    let _ = writeln!(
-        output,
-        "\nDecoration (logical pixels; 0 disables; see RFC-0001):"
-    );
+    if !inplace_steps {
+        let _ = writeln!(
+            output,
+            "\nDecoration (logical pixels; 0 disables; see RFC-0001):"
+        );
+    }
     let gaps_in = match overrides.gaps_in {
         Some(value) => value,
         None => {
@@ -4306,7 +4509,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let gaps_out = match overrides.gaps_out {
         Some(value) => value,
@@ -4372,7 +4575,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let border = match overrides.border {
         Some(value) => value,
@@ -4437,7 +4640,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let radius = match overrides.radius {
         Some(value) => value,
@@ -4503,9 +4706,11 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
-    let _ = writeln!(output, "\nBehavior:");
+    if !inplace_steps {
+        let _ = writeln!(output, "\nBehavior:");
+    }
     let scrollback = match overrides.scrollback {
         Some(value) => value,
         None => {
@@ -4556,7 +4761,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let close_confirm = match overrides.close_confirm {
         Some(mode) => mode,
@@ -4611,7 +4816,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     let preset_options = vec![
         InitOptionItem {
@@ -4651,7 +4856,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut has_preview_line);
     }
     Ok(InitAnswers {
         shell,
@@ -4782,8 +4987,211 @@ pub(crate) fn write_init_config(
     })
 }
 
-/// Copies the current bytes to a collision-free `<name>.bak[.N]` sibling
-/// using `create_new` so the sole recovery copy is never overwritten.
+/// Resolves the centralized `.backups/` directory for `target`.
+///
+/// Profiles under `<config_root>/profiles/` map to `<config_root>/.backups/profiles/`
+/// so all backups live inside one `<config_root>/.backups/` hierarchy rather than
+/// cluttering `profiles/` or `<config_root>/`.
+pub(crate) fn config_backup_dir_for(target: &std::path::Path) -> std::path::PathBuf {
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    if parent.file_name().is_some_and(|name| name == "profiles") {
+        if let Some(config_root) = parent.parent() {
+            let root = if config_root.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                config_root
+            };
+            return root.join(CONFIG_BACKUP_DIR_NAME).join("profiles");
+        }
+    }
+    parent.join(CONFIG_BACKUP_DIR_NAME)
+}
+
+/// Returns the canonical `<backup_dir>/<file_name>.bak` path for `target`.
+pub(crate) fn config_backup_path_for(target: &std::path::Path) -> std::path::PathBuf {
+    let name = target.file_name().map_or_else(
+        || "config.lua".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    config_backup_dir_for(target).join(format!("{name}.bak"))
+}
+
+fn ensure_single_backup_dir(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "backup directory '{}' is not a regular directory",
+                        dir.display()
+                    ),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            match builder.create(dir) {
+                Ok(()) => Ok(()),
+                Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = std::fs::symlink_metadata(dir)?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "backup directory '{}' is not a regular directory",
+                                dir.display()
+                            ),
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(create_err) => Err(create_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Ensures `backup_dir` (and `.backups` parent for `.backups/profiles`) exists
+/// as a non-symlink owner-only (`0700` on Unix) directory.
+pub(crate) fn ensure_config_backup_dir(backup_dir: &std::path::Path) -> Result<(), std::io::Error> {
+    if backup_dir
+        .file_name()
+        .is_some_and(|name| name == "profiles")
+    {
+        if let Some(root_backups) = backup_dir.parent() {
+            if !root_backups.as_os_str().is_empty() {
+                ensure_single_backup_dir(root_backups)?;
+            }
+        }
+    }
+    ensure_single_backup_dir(backup_dir)
+}
+
+/// Writes `content` to `target`, preserving any previous selector bytes in a
+/// single rolling `<config_root>/.backups/<selector>.bak` copy instead of
+/// accumulating `.bak.N` siblings across repeated profile switches.
+pub(crate) fn write_selector_with_rolling_backup(
+    target: &std::path::Path,
+    content: &str,
+) -> Result<InitWriteOutcome, InitWriteError> {
+    {
+        let source = bitty_config::plan::ConfigSource::new(
+            bitty_config::plan::LayerKind::User,
+            Some(target.display().to_string()),
+        );
+        bitty_config::file::parse_lua_config(content, &source).map_err(|err| {
+            InitWriteError::Refused(format!(
+                "bitty init: generated config is invalid ({err}) — refusing to write"
+            ))
+        })?;
+    }
+    let existing = match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: refusing to write through symlink '{}'",
+                    target.display()
+                )));
+            }
+            if !meta.is_file() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: '{}' is not a regular file; refusing to replace it",
+                    target.display()
+                )));
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(InitWriteError::Io(format!(
+                "bitty init: cannot inspect '{}': {err}",
+                target.display()
+            )));
+        }
+    };
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                InitWriteError::Io(format!(
+                    "bitty init: cannot create '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let backup = if existing {
+        let meta = std::fs::metadata(target).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot inspect '{}': {err}",
+                target.display()
+            ))
+        })?;
+        if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+            return Err(InitWriteError::Refused(format!(
+                "bitty init: '{}' exceeds {} bytes; refusing to back up and replace it",
+                target.display(),
+                bitty_config::file::MAX_CONFIG_FILE_BYTES
+            )));
+        }
+        let previous = std::fs::read_to_string(target).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot read '{}': {err}",
+                target.display()
+            ))
+        })?;
+        let backup_dir = config_backup_dir_for(target);
+        ensure_config_backup_dir(&backup_dir).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot prepare backup directory '{}': {err}",
+                backup_dir.display()
+            ))
+        })?;
+        let backup_path = config_backup_path_for(target);
+        if let Ok(meta) = std::fs::symlink_metadata(&backup_path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: refusing to overwrite non-regular backup '{}'",
+                    backup_path.display()
+                )));
+            }
+        }
+        replace_atomically(&backup_path, &previous)?;
+        Some(backup_path)
+    } else {
+        None
+    };
+    if existing {
+        replace_atomically(target, content)?;
+    } else {
+        create_new_exclusively(target, content)?;
+    }
+    Ok(InitWriteOutcome {
+        path: target.to_path_buf(),
+        backup,
+        updated: existing,
+    })
+}
+
+/// Copies the current bytes to a collision-free `<backup_dir>/<name>.bak[.N]`
+/// path inside `<config_root>/.backups/` using `create_new` so an older
+/// recovery copy is never overwritten.
 fn write_recoverable_backup(
     target: &std::path::Path,
 ) -> Result<std::path::PathBuf, InitWriteError> {
@@ -4806,15 +5214,22 @@ fn write_recoverable_backup(
             target.display()
         ))
     })?;
+    let backup_dir = config_backup_dir_for(target);
+    ensure_config_backup_dir(&backup_dir).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot prepare backup directory '{}': {err}",
+            backup_dir.display()
+        ))
+    })?;
     let name = target.file_name().map_or_else(
         || "config.lua".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
     for attempt in 0..=INIT_MAX_BACKUP_ATTEMPTS {
         let candidate = if attempt == 0 {
-            target.with_file_name(format!("{name}.bak"))
+            backup_dir.join(format!("{name}.bak"))
         } else {
-            target.with_file_name(format!("{name}.bak.{attempt}"))
+            backup_dir.join(format!("{name}.bak.{attempt}"))
         };
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -4833,6 +5248,7 @@ fn write_recoverable_backup(
                         candidate.display()
                     ))
                 })?;
+                sync_parent_dir(&candidate);
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -4845,8 +5261,8 @@ fn write_recoverable_backup(
         }
     }
     Err(InitWriteError::Io(format!(
-        "bitty init: exhausted {INIT_MAX_BACKUP_ATTEMPTS} backup names beside '{}'; remove an old .bak file",
-        target.display()
+        "bitty init: exhausted {INIT_MAX_BACKUP_ATTEMPTS} backup names in '{}'; remove an old .bak file",
+        backup_dir.display()
     )))
 }
 
@@ -5533,9 +5949,9 @@ pub(crate) fn init_prompt_plugin_selection(
     #[cfg(unix)]
     if tty_interactive {
         if let Some(_raw) = init_raw_guard() {
-            // One blank separator above the frame; the frame itself starts
-            // at column 0 so in-place cursor-up repaints stay aligned.
-            let _ = writeln!(output);
+            // Ensure the frame starts at column 0 without adding an orphan
+            // blank line that remains after the multiselect erases itself.
+            let _ = write!(output, "\r");
             let _ = output.flush();
             return init_multiselect_key_loop(
                 input,

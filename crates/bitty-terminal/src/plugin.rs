@@ -2097,9 +2097,12 @@ fn migrate_legacy_ledger(
     )?;
     // The commit point has passed: the Lua ledger is authoritative. A failure
     // to retain the backup is reported but cannot un-migrate.
-    let mut backup_name = legacy_path.as_os_str().to_os_string();
-    backup_name.push(STATE_BACKUP_SUFFIX);
-    let backup = PathBuf::from(backup_name);
+    let backup = ensure_ledger_backup_path(legacy_path).map_err(|error| {
+        MigrationError::Warning(format!(
+            "migrated the plugin ledger but could not prepare backup directory for '{}': {error}",
+            legacy_path.display()
+        ))
+    })?;
     retain_legacy_backup(legacy_path, &backup).map_err(|error| {
         MigrationError::Warning(format!(
             "migrated the plugin ledger but could not retain the legacy TOML at '{}': {error}",
@@ -2107,6 +2110,13 @@ fn migrate_legacy_ledger(
         ))
     })?;
     Ok(Some(backup))
+}
+
+/// Ensures the centralized `.backups/` directory exists and returns `<backup_dir>/<file>.bak`.
+fn ensure_ledger_backup_path(path: &Path) -> std::io::Result<PathBuf> {
+    let backup_dir = crate::init::config_backup_dir_for(path);
+    crate::init::ensure_config_backup_dir(&backup_dir)?;
+    Ok(crate::init::config_backup_path_for(path))
 }
 
 /// Move the legacy ledger bytes to the `.bak` path without following links.
@@ -2376,9 +2386,15 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
     let mut backup = None;
     match read_bounded_regular_file(path, MAX_STATE_FILE_BYTES) {
         Ok(Some(previous)) => {
-            let mut backup_name = path.as_os_str().to_os_string();
-            backup_name.push(STATE_BACKUP_SUFFIX);
-            let backup_path = PathBuf::from(backup_name);
+            let backup_path = ensure_ledger_backup_path(path).map_err(|error| {
+                PluginFailure::generic(
+                    "IoError",
+                    format!(
+                        "bitty plugin: cannot prepare backup directory for '{}': {error}",
+                        path.display()
+                    ),
+                )
+            })?;
             write_replace_atomic(&backup_path, &previous).map_err(|error| {
                 PluginFailure::generic(
                     "IoError",
@@ -8058,8 +8074,11 @@ fn run_plugin_doctor(
         warnings += 1;
         let _ = writeln!(
             output,
-            "  [warn] ledger: legacy {} is present but unused; repair moves it to {}{}",
-            LEGACY_STATE_FILE_NAME, LEGACY_STATE_FILE_NAME, STATE_BACKUP_SUFFIX
+            "  [warn] ledger: legacy {} is present but unused; repair moves it to {}/{}{}",
+            LEGACY_STATE_FILE_NAME,
+            crate::init::CONFIG_BACKUP_DIR_NAME,
+            LEGACY_STATE_FILE_NAME,
+            STATE_BACKUP_SUFFIX
         );
     }
     for diagnostic in &ledger.diagnostics {
@@ -8201,11 +8220,10 @@ fn run_plugin_doctor(
             }
             let legacy_path = legacy_state_path(state_path);
             if std::fs::symlink_metadata(&legacy_path).is_ok() {
-                let mut backup_name = legacy_path.as_os_str().to_os_string();
-                backup_name.push(STATE_BACKUP_SUFFIX);
-                let backup = PathBuf::from(backup_name);
-                match retain_legacy_backup(&legacy_path, &backup) {
-                    Ok(()) => {
+                match ensure_ledger_backup_path(&legacy_path)
+                    .and_then(|backup| retain_legacy_backup(&legacy_path, &backup).map(|()| backup))
+                {
+                    Ok(backup) => {
                         let _ =
                             writeln!(output, "  retained legacy ledger at {}", backup.display());
                     }
@@ -8919,7 +8937,8 @@ fn op_remove(state: &mut PluginState, id: &str, force: bool) -> Result<OpOutput,
     if !force {
         return Err(PluginFailure::usage(format!(
             "bitty plugin: `remove {id}` is destructive; re-run with --force \
-             (the previous manifest is backed up to {STATE_FILE_NAME}{STATE_BACKUP_SUFFIX})"
+             (the previous manifest is backed up to {}/{STATE_FILE_NAME}{STATE_BACKUP_SUFFIX})",
+            crate::init::CONFIG_BACKUP_DIR_NAME
         )));
     }
     let record = state.remove(id).ok_or_else(|| not_installed(id))?;
@@ -10189,7 +10208,9 @@ mod tests {
             vec!["terminal.semantic-read"]
         );
         assert!(!legacy.exists(), "legacy moved to its backup after commit");
-        let backup = dir.join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
+        let backup = dir
+            .join(crate::init::CONFIG_BACKUP_DIR_NAME)
+            .join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
         assert_eq!(
             std::fs::read(&backup).expect("backup readable"),
             original.as_bytes(),
@@ -10269,7 +10290,8 @@ mod tests {
             "legacy TOML must not move"
         );
         assert!(
-            !dir.join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"))
+            !dir.join(crate::init::CONFIG_BACKUP_DIR_NAME)
+                .join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"))
                 .exists(),
             "no backup may be created before the commit point"
         );
@@ -10663,7 +10685,9 @@ mod tests {
         assert!(out.contains("removed"), "{out}");
         let text = std::fs::read_to_string(&file).expect("state rewritten");
         assert!(!text.contains("shell-integration"));
-        let backup = dir.join(format!("{STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
+        let backup = dir
+            .join(crate::init::CONFIG_BACKUP_DIR_NAME)
+            .join(format!("{STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
         assert!(backup.exists(), "backup kept");
         let _ = std::fs::remove_dir_all(&dir);
     }

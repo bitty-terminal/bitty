@@ -3189,14 +3189,21 @@ fn run_config_migrate(args: &Args, format: ConfigFormat) -> i32 {
     0
 }
 
-/// Copies the current bytes to `<file>.bak-<from-version>` (or a numbered
-/// suffix when taken), using exclusive creation so a recovery copy is never
-/// overwritten.
+/// Copies the current bytes to `<backup_dir>/<file>.bak-<from-version>` (or a
+/// numbered suffix when taken) inside `<config_root>/.backups/` using exclusive
+/// creation so a recovery copy is never overwritten.
 fn write_migrate_backup(target: &std::path::Path, from: u32) -> Result<std::path::PathBuf, String> {
     let previous = std::fs::read(target).map_err(|err| {
         format!(
             "bitty config migrate: cannot read '{}' for backup: {err}",
             target.display()
+        )
+    })?;
+    let backup_dir = crate::init::config_backup_dir_for(target);
+    crate::init::ensure_config_backup_dir(&backup_dir).map_err(|err| {
+        format!(
+            "bitty config migrate: cannot prepare backup directory '{}': {err}",
+            backup_dir.display()
         )
     })?;
     let name = target.file_name().map_or_else(
@@ -3205,15 +3212,18 @@ fn write_migrate_backup(target: &std::path::Path, from: u32) -> Result<std::path
     );
     for attempt in 0..=MIGRATE_MAX_BACKUP_ATTEMPTS {
         let candidate = if attempt == 0 {
-            target.with_file_name(format!("{name}.bak-{from}"))
+            backup_dir.join(format!("{name}.bak-{from}"))
         } else {
-            target.with_file_name(format!("{name}.bak-{from}.{attempt}"))
+            backup_dir.join(format!("{name}.bak-{from}.{attempt}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
             Ok(mut file) => {
                 use std::io::Write as _;
                 file.write_all(&previous).map_err(|err| {
@@ -3240,8 +3250,8 @@ fn write_migrate_backup(target: &std::path::Path, from: u32) -> Result<std::path
         }
     }
     Err(format!(
-        "bitty config migrate: exhausted {MIGRATE_MAX_BACKUP_ATTEMPTS} backup names beside '{}'",
-        target.display()
+        "bitty config migrate: exhausted {MIGRATE_MAX_BACKUP_ATTEMPTS} backup names in '{}'",
+        backup_dir.display()
     ))
 }
 

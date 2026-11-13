@@ -901,7 +901,7 @@ fn run_use(
             use_result(&name, &selector, false, None, true),
         ));
     }
-    match write_init_config(&selector, &rewritten, true) {
+    match crate::init::write_selector_with_rolling_backup(&selector, &rewritten) {
         Ok(outcome) => {
             let mut text = String::new();
             if let Some(backup) = &outcome.backup {
@@ -2325,7 +2325,7 @@ fn apply_selector_rename(
         &update.path,
         &update.rewritten,
     )?;
-    match write_init_config(&update.path, &update.rewritten, true) {
+    match crate::init::write_selector_with_rolling_backup(&update.path, &update.rewritten) {
         Ok(outcome) => Ok(outcome.backup),
         Err(InitWriteError::Refused(message)) => Err(Failure::invalid(format!(
             "bitty config profile rename: cannot update the persisted selector '{}': {message}",
@@ -3292,12 +3292,42 @@ fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
     }
 }
 
-/// Copies one regular profile file to a collision-free
-/// `<name>.lua.bak-<epoch>` sibling, syncs it, and returns its path.
-///
-/// The backup is created exclusively, so an existing backup is never
-/// overwritten; a same-second collision gets a `-<n>` suffix. The source is
-/// inspected without following symlinks and bounded by the loader limit.
+const PROFILE_MAX_RETAINED_BACKUPS: usize = 5;
+
+/// Retains at most [`PROFILE_MAX_RETAINED_BACKUPS`] timestamped backups for
+/// `file_name` inside `backup_dir`, deleting the oldest surplus copies.
+fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str) {
+    let prefix = format!("{file_name}.bak-");
+    let Ok(entries) = std::fs::read_dir(backup_dir) else {
+        return;
+    };
+    let mut matching = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        matching.push((modified, name, entry.path()));
+    }
+    if matching.len() <= PROFILE_MAX_RETAINED_BACKUPS {
+        return;
+    }
+    matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let excess = matching.len() - PROFILE_MAX_RETAINED_BACKUPS;
+    for (_, _, old_path) in matching.into_iter().take(excess) {
+        let _ = std::fs::remove_file(old_path);
+    }
+}
+
+/// Copies one regular profile file into `<config_root>/.backups/profiles/` with
+/// owner-only permissions, syncs it, prunes surplus copies, and returns its path.
 fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
     // Open without following the final component where the platform supports
     // it, so a symlink swapped in after the caller's check cannot redirect
@@ -3338,6 +3368,15 @@ fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
     source
         .read_to_end(&mut bytes)
         .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
+
+    let backup_dir = crate::init::config_backup_dir_for(path);
+    crate::init::ensure_config_backup_dir(&backup_dir).map_err(|err| {
+        io_failure(
+            verb,
+            &format!("prepare backup directory '{}'", backup_dir.display()),
+            &err,
+        )
+    })?;
     let name = path.file_name().map_or_else(
         || String::from("profile.lua"),
         |name| name.to_string_lossy().into_owned(),
@@ -3348,15 +3387,18 @@ fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
         .unwrap_or(0);
     for attempt in 0..PROFILE_MAX_BACKUP_ATTEMPTS {
         let candidate = if attempt == 0 {
-            path.with_file_name(format!("{name}.bak-{stamp}"))
+            backup_dir.join(format!("{name}.bak-{stamp}"))
         } else {
-            path.with_file_name(format!("{name}.bak-{stamp}-{attempt}"))
+            backup_dir.join(format!("{name}.bak-{stamp}-{attempt}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
             Ok(mut file) => {
                 let result = file.write_all(&bytes).and_then(|()| file.sync_all());
                 if let Err(err) = result {
@@ -3368,8 +3410,8 @@ fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
                         &err,
                     ));
                 }
-                let _ = std::fs::set_permissions(&candidate, metadata.permissions());
                 sync_parent_dir(&candidate);
+                prune_excess_profile_backups(&backup_dir, &name);
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -3383,8 +3425,8 @@ fn backup_profile_file(verb: &str, path: &Path) -> Result<PathBuf, Failure> {
         }
     }
     Err(Failure::io(format!(
-        "bitty config profile {verb}: exhausted {PROFILE_MAX_BACKUP_ATTEMPTS} backup names beside '{}'",
-        path.display()
+        "bitty config profile {verb}: exhausted {PROFILE_MAX_BACKUP_ATTEMPTS} backup names in '{}'",
+        backup_dir.display()
     )))
 }
 
@@ -5114,15 +5156,25 @@ impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter
             return Ok(ConfigApplyOutcome::Unchanged);
         }
         if rendered.existed {
-            // One rolling owner-only `.bak`, replaced atomically from the
-            // bytes already read. No collision search and no path re-read:
-            // repeated writes can never exhaust backup names or split the
-            // recovery copy across `.bak.N` files.
-            let name = self.target.file_name().map_or_else(
-                || String::from("init.lua"),
-                |name| name.to_string_lossy().into_owned(),
-            );
-            let backup = self.target.with_file_name(format!("{name}.bak"));
+            // One rolling owner-only `.bak` inside `<config_root>/.backups/`,
+            // replaced atomically from the bytes already read. No collision
+            // search and no path re-read: repeated writes can never exhaust
+            // backup names or split the recovery copy across `.bak.N` files.
+            let backup_dir = crate::init::config_backup_dir_for(&self.target);
+            if let Err(failure) = crate::init::ensure_config_backup_dir(&backup_dir)
+                .map_err(|err| write_failure(ProfileWriteError::Io(err)))
+            {
+                log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                return Err(failure);
+            }
+            let backup = crate::init::config_backup_path_for(&self.target);
+            if let Ok(meta) = std::fs::symlink_metadata(&backup) {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    let failure = ConfigWriteFailure::Io;
+                    log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                    return Err(failure);
+                }
+            }
             if let Err(failure) = write_profile_atomic_with(&backup, &rendered.previous, None, true)
                 .map_err(write_failure)
             {
@@ -7764,7 +7816,7 @@ mod tests {
             assert_eq!(mode, 0o600, "user-layer writes are owner-only");
         }
         assert!(
-            !dir.join("init.lua.bak").exists(),
+            !crate::init::config_backup_path_for(&path).exists(),
             "a brand-new layer has no previous bytes to back up"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -7818,12 +7870,13 @@ mod tests {
         );
         assert!(content.contains("size = 12.5"), "{content}");
         // Recovery copy is the exact previous bytes.
-        let backup = std::fs::read(dir.join("init.lua.bak")).expect("backup");
+        let backup_path = crate::init::config_backup_path_for(&path);
+        let backup = std::fs::read(&backup_path).expect("backup");
         assert_eq!(backup, before, "the .bak holds the previous bytes");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.join("init.lua.bak"))
+            let mode = std::fs::metadata(&backup_path)
                 .expect("backup meta")
                 .permissions()
                 .mode()
@@ -7979,7 +8032,10 @@ mod tests {
             original,
             "a refused validation leaves the previous bytes"
         );
-        assert!(!dir.join("init.lua.bak").exists(), "no backup on refusal");
+        assert!(
+            !crate::init::config_backup_path_for(&path).exists(),
+            "no backup on refusal"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8070,13 +8126,15 @@ mod tests {
         }
         let content = std::fs::read_to_string(&path).expect("layer");
         assert!(content.contains("scrollback = 2100"), "{content}");
-        let backup = std::fs::read_to_string(dir.join("init.lua.bak")).expect("one backup");
+        let backup_dir = crate::init::config_backup_dir_for(&path);
+        let backup = std::fs::read_to_string(crate::init::config_backup_path_for(&path))
+            .expect("one backup");
         assert!(
             backup.contains("scrollback = 2099"),
             "the rolling backup holds the previous bytes: {backup}"
         );
-        let backups: Vec<String> = std::fs::read_dir(&dir)
-            .expect("dir")
+        let backups: Vec<String> = std::fs::read_dir(&backup_dir)
+            .expect("backups dir")
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains(".bak"))
@@ -8226,8 +8284,8 @@ mod tests {
             preset: Some(String::from("minimal")),
         };
         run_create(&args, &opts, &profiles_dir, "work").expect("create --force");
-        let has_work_backup = std::fs::read_dir(&profiles_dir)
-            .expect("read profiles")
+        let has_work_backup = std::fs::read_dir(crate::init::config_backup_dir_for(&work_path))
+            .expect("read backup profiles")
             .filter_map(Result::ok)
             .any(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();

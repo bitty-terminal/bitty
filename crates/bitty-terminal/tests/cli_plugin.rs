@@ -237,7 +237,10 @@ fn plugin_full_lifecycle_live() {
     assert!(stdout(&output).contains("removed"), "{}", stdout(&output));
     let state = std::fs::read_to_string(state_file(&home)).expect("state rewritten");
     assert!(!state.contains(PLUGIN), "{state}");
-    let backup = home.join("bitty").join("bitty-plugins.lua.bak");
+    let backup = home
+        .join("bitty")
+        .join(".backups")
+        .join("bitty-plugins.lua.bak");
     assert!(backup.exists(), "backup must be kept");
 
     // CTX-0293: the capability-grant ledger, its backup, and the managed
@@ -1923,7 +1926,10 @@ fn plugin_ledger_migrates_legacy_toml_once() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(ledger.is_file(), "Lua ledger written by migration");
     assert!(!legacy.exists(), "legacy TOML moved aside");
-    let backup = home.join("bitty").join("bitty-plugins.toml.bak");
+    let backup = home
+        .join("bitty")
+        .join(".backups")
+        .join("bitty-plugins.toml.bak");
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup"),
         body,
@@ -1978,7 +1984,10 @@ fn plugin_ledger_migrates_long_capabilities_without_corruption() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(ledger.is_file(), "Lua ledger written");
     assert!(!legacy.exists(), "legacy TOML moved aside");
-    let backup = home.join("bitty").join("bitty-plugins.toml.bak");
+    let backup = home
+        .join("bitty")
+        .join(".backups")
+        .join("bitty-plugins.toml.bak");
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup"),
         body,
@@ -2050,7 +2059,10 @@ fn plugin_doctor_migrates_a_legacy_ledger_on_repair() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(ledger.is_file(), "repair writes the Lua ledger");
     assert!(!legacy.exists(), "legacy moved aside");
-    let backup = home.join("bitty").join("bitty-plugins.toml.bak");
+    let backup = home
+        .join("bitty")
+        .join(".backups")
+        .join("bitty-plugins.toml.bak");
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup"),
         body,
@@ -2079,7 +2091,11 @@ fn plugin_doctor_repair_is_a_noop_for_a_current_ledger() {
     );
     assert_eq!(std::fs::read(&ledger).expect("ledger bytes"), before);
     assert!(
-        !home.join("bitty").join("bitty-plugins.lua.bak").exists(),
+        !home
+            .join("bitty")
+            .join(".backups")
+            .join("bitty-plugins.lua.bak")
+            .exists(),
         "a healthy ledger must not churn its backup every repair"
     );
     let _ = std::fs::remove_dir_all(&home);

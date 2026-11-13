@@ -231,7 +231,6 @@ impl AppConfigManage {
         let digest = candidate_digest(content.as_bytes());
         Ok(PreparedProfileUse {
             content,
-            previous_exists: previous.is_some(),
             rendered,
             candidate_digest: digest,
             changed,
@@ -287,7 +286,6 @@ fn truncate_list_rows<T>(rows: &mut Vec<T>, row_bytes: impl Fn(&T) -> usize) -> 
 /// One prepared profile switch (no write performed).
 struct PreparedProfileUse {
     content: String,
-    previous_exists: bool,
     rendered: String,
     candidate_digest: String,
     changed: bool,
@@ -504,15 +502,16 @@ impl ConfigWriteBackend for AppConfigManage {
         if !prepared.changed {
             return Ok(ConfigApplyOutcome::Unchanged);
         }
-        crate::init::write_init_config(&self.target, &prepared.content, prepared.previous_exists)
-            .map_err(|error| {
-            let mapped = match error {
-                crate::init::InitWriteError::Refused(_) => ConfigWriteFailure::Invalid,
-                crate::init::InitWriteError::Io(_) => ConfigWriteFailure::Io,
-            };
-            log_refusal(plugin_id, "profiles.use", mapped);
-            mapped
-        })?;
+        crate::init::write_selector_with_rolling_backup(&self.target, &prepared.content).map_err(
+            |error| {
+                let mapped = match error {
+                    crate::init::InitWriteError::Refused(_) => ConfigWriteFailure::Invalid,
+                    crate::init::InitWriteError::Io(_) => ConfigWriteFailure::Io,
+                };
+                log_refusal(plugin_id, "profiles.use", mapped);
+                mapped
+            },
+        )?;
         // bitty#2814 / bitty#2848: the selector is committed; whether the
         // running table follows live is a classification of the *prospective*
         // resolution, not a property of the write. The classification never
@@ -1036,7 +1035,7 @@ mod tests {
         );
         let saved = std::fs::read_to_string(dir.join("bitty-plugins.lua")).expect("ledger");
         assert!(saved.contains("enabled = true"));
-        assert!(dir.join("bitty-plugins.lua.bak").exists());
+        assert!(dir.join(".backups").join("bitty-plugins.lua.bak").exists());
 
         // Replaying the same token after the change re-renders the same
         // candidate and reports a no-op; the runtime's one-shot gate is what
@@ -1125,8 +1124,8 @@ mod tests {
                 .iter()
                 .any(|row| row.name == "default" && row.active)
         );
-        let backups: Vec<_> = std::fs::read_dir(&dir)
-            .expect("dir")
+        let backups: Vec<_> = std::fs::read_dir(dir.join(".backups"))
+            .expect("backups dir")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
             .collect();
@@ -1868,8 +1867,8 @@ mod tests {
         assert!(replaced.replaced);
         assert!(replaced.backed_up);
         assert_eq!(replaced.preset.as_deref(), Some("light"));
-        let has_work_backup = std::fs::read_dir(dir.join("profiles"))
-            .expect("read profiles")
+        let has_work_backup = std::fs::read_dir(dir.join(".backups").join("profiles"))
+            .expect("read backup profiles")
             .filter_map(Result::ok)
             .any(|entry| {
                 entry
@@ -1996,8 +1995,8 @@ mod tests {
         assert!(deleted.backed_up);
         assert!(!deleted.was_active);
         assert!(!dir.join("profiles/child.lua").exists());
-        let has_child_backup = std::fs::read_dir(dir.join("profiles"))
-            .expect("read profiles")
+        let has_child_backup = std::fs::read_dir(dir.join(".backups").join("profiles"))
+            .expect("read backup profiles")
             .filter_map(Result::ok)
             .any(|entry| {
                 entry

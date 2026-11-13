@@ -371,7 +371,10 @@ fn use_preserves_selector_overrides_and_backs_up() {
         "activation preserves user overrides:\n{rewritten}"
     );
     assert!(
-        selector_path.with_extension("lua.bak").exists(),
+        config_dir(&root)
+            .join(".backups")
+            .join("init.lua.bak")
+            .exists(),
         "activation keeps a recoverable backup"
     );
 
@@ -415,7 +418,10 @@ fn legacy_init_is_never_replaced_even_with_force_and_can_migrate() {
     assert!(selector.contains("format = \"bitty-profile-v1\""));
     assert!(selector.contains("profile = \"default\""));
     assert!(
-        init_path(&root).with_extension("lua.bak").exists(),
+        config_dir(&root)
+            .join(".backups")
+            .join("init.lua.bak")
+            .exists(),
         "legacy bytes stay recoverable"
     );
     let check = run_bitty(&root, &["config", "check"]);
@@ -600,8 +606,13 @@ fn migrate_after_default_profile_seed_has_a_safe_path() {
         legacy
     );
     assert_eq!(
-        std::fs::read_to_string(profile_path(&root, "default").with_extension("lua.bak"))
-            .expect("seeded profile backup"),
+        std::fs::read_to_string(
+            config_dir(&root)
+                .join(".backups")
+                .join("profiles")
+                .join("default.lua.bak")
+        )
+        .expect("seeded profile backup"),
         seeded
     );
     let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
@@ -646,8 +657,10 @@ fn migrate_reuses_an_identical_destination_profile() {
         legacy
     );
     assert!(
-        !profile_path(&root, "default")
-            .with_extension("lua.bak")
+        !config_dir(&root)
+            .join(".backups")
+            .join("profiles")
+            .join("default.lua.bak")
             .exists(),
         "an identical destination is reused, not rewritten"
     );
@@ -856,7 +869,11 @@ fn preset_reinit_requires_force_and_backs_up_atomically() {
         original
     );
     assert!(
-        !target.with_extension("lua.bak").exists(),
+        !config_dir(&root)
+            .join(".backups")
+            .join("profiles")
+            .join("dark.lua.bak")
+            .exists(),
         "a refusal creates no backup"
     );
 
@@ -868,7 +885,10 @@ fn preset_reinit_requires_force_and_backs_up_atomically() {
         &run_bitty(&root, &["init", "--profile", "dark", "--force"]),
         "force seed dark",
     );
-    let backup = target.with_extension("lua.bak");
+    let backup = config_dir(&root)
+        .join(".backups")
+        .join("profiles")
+        .join("dark.lua.bak");
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup body"),
         edited,
@@ -915,8 +935,9 @@ fn named_profile_reinit_backups_are_collision_free() {
     );
     let second = std::fs::read_to_string(&target).expect("work body 2");
     assert_ne!(first, second, "forced re-init applies the new value flags");
+    let profile_backups = config_dir(&root).join(".backups").join("profiles");
     assert_eq!(
-        std::fs::read_to_string(target.with_extension("lua.bak")).expect("first backup"),
+        std::fs::read_to_string(profile_backups.join("work.lua.bak")).expect("first backup"),
         first
     );
     assert_ok(
@@ -934,14 +955,14 @@ fn named_profile_reinit_backups_are_collision_free() {
         ),
         "force work again",
     );
-    let second_backup = config_dir(&root).join("profiles").join("work.lua.bak.1");
+    let second_backup = profile_backups.join("work.lua.bak.1");
     assert_eq!(
         std::fs::read_to_string(&second_backup).expect("second backup"),
         second,
         "a second forced write never overwrites the sole recovery copy"
     );
     assert_eq!(
-        std::fs::read_to_string(target.with_extension("lua.bak")).expect("first backup intact"),
+        std::fs::read_to_string(profile_backups.join("work.lua.bak")).expect("first backup intact"),
         first
     );
     let _ = std::fs::remove_dir_all(&root);

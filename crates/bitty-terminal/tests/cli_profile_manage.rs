@@ -233,11 +233,14 @@ const PIN_BASE: &str = r##"return {
 }
 "##;
 
-/// Timestamped `<name>.lua.bak-*` siblings left beside a profile.
+/// Timestamped `<name>.lua.bak-*` copies stored under `<config_root>/.backups/profiles/`.
 fn profile_backups(root: &Path, name: &str) -> Vec<PathBuf> {
     let prefix = format!("{name}.lua.bak-");
-    std::fs::read_dir(root.join("bitty").join("profiles"))
-        .expect("profiles dir")
+    let backup_dir = root.join("bitty").join(".backups").join("profiles");
+    let Ok(entries) = std::fs::read_dir(&backup_dir) else {
+        return Vec::new();
+    };
+    entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -539,11 +542,18 @@ fn use_switches_the_selector_and_is_idempotent() {
     );
     let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
     assert!(selector.contains("profile = \"beta\""), "{selector}");
-    let backups_before = std::fs::read_dir(root.join("bitty"))
+    let backups_before = std::fs::read_dir(root.join("bitty").join(".backups"))
+        .expect("backups dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        .count();
+    assert_eq!(backups_before, 1, "selector backup lives in .backups");
+    let root_bak = std::fs::read_dir(root.join("bitty"))
         .expect("bitty dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
+    assert_eq!(root_bak, 0, "top-level config dir stays free of .bak files");
 
     let again = run_bitty(&root, &["config", "profile", "use", "beta"]);
     assert_ok(&again, "use already active");
@@ -552,8 +562,8 @@ fn use_switches_the_selector_and_is_idempotent() {
         "no-op message: {}",
         stdout(&again)
     );
-    let backups_after = std::fs::read_dir(root.join("bitty"))
-        .expect("bitty dir")
+    let backups_after = std::fs::read_dir(root.join("bitty").join(".backups"))
+        .expect("backups dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
@@ -2452,5 +2462,95 @@ fn delete_leaves_a_timestamped_backup_and_force_removes_default() {
         "a forced default delete keeps a backup"
     );
     assert_no_temp_files(&root, "delete backup");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_use_rolling_backup_never_exhausts_across_70_switches() {
+    let root = scratch_root("rolling-70-switches");
+    write_profile(
+        &root,
+        "alpha",
+        "return { font = { family = \"monospace\", size = 12 } }\n",
+    );
+    write_profile(
+        &root,
+        "beta",
+        "return { font = { family = \"monospace\", size = 14 } }\n",
+    );
+    write_selector(&root, "alpha");
+
+    for step in 0..70 {
+        let target = if step % 2 == 0 { "beta" } else { "alpha" };
+        let output = run_bitty(&root, &["config", "profile", "use", target]);
+        assert_ok(&output, &format!("switch #{step} to {target}"));
+    }
+
+    let root_bak_count = std::fs::read_dir(root.join("bitty"))
+        .expect("bitty dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        .count();
+    assert_eq!(
+        root_bak_count, 0,
+        "top-level config dir must stay free of .bak files"
+    );
+
+    let backup_names: Vec<String> = std::fs::read_dir(root.join("bitty").join(".backups"))
+        .expect(".backups dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        backup_names,
+        vec![String::from("init.lua.bak")],
+        "rolling selector backup must stay a single init.lua.bak: {backup_names:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_delete_backups_live_in_dot_backups_and_prune_beyond_cap() {
+    let root = scratch_root("delete-prune-cap");
+    for cycle in 0..7 {
+        let body = format!("return {{ font = {{ size = {} }} }}\n", 10 + cycle);
+        write_profile(&root, "scratch", &body);
+        let deleted = run_bitty(&root, &["config", "profile", "delete", "scratch"]);
+        assert_ok(&deleted, &format!("delete cycle {cycle}"));
+    }
+
+    let profiles_bak_count = std::fs::read_dir(root.join("bitty").join("profiles"))
+        .expect("profiles dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        .count();
+    assert_eq!(
+        profiles_bak_count, 0,
+        "profiles/ must stay free of .bak files"
+    );
+
+    let retained = profile_backups(&root, "scratch");
+    assert_eq!(
+        retained.len(),
+        5,
+        "at most 5 timestamped backups may be retained per profile: {retained:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in &retained {
+            let mode = std::fs::metadata(path)
+                .expect("backup metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "retained backup '{}' must be 0600",
+                path.display()
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

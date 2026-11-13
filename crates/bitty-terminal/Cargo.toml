@@ -87,6 +87,8 @@ sha2 = { workspace = true }
 # and kill path (CTX-1479); `user` is the watchdog's owner checks (CTX-1472).
 # No other feature changes behavior.
 nix = { workspace = true, features = ["fs", "poll", "process", "signal", "term", "user"] }
+# Terminal window-size queries for interactive CLI pickers use safe `tcgetwinsize`.
+rustix = { workspace = true, features = ["termios"] }
 # bitty#2830: `SIGUSR1` hang capture uses the safe `flag` registration; the
 # binary stays `#![forbid(unsafe_code)]`.
 signal-hook = { workspace = true }

@@ -8661,6 +8661,654 @@ fn init_key_loop_inplace_repaints_with_cursor_up() {
 }
 
 #[test]
+fn init_picker_window_bounds_28_themes_and_keeps_cursor_visible() {
+    let presets = bitty_config::theme::list_presets();
+    assert!(presets.len() >= 28, "expected at least 28 theme presets");
+    let options: Vec<_> = presets.iter().copied().map(theme_option).collect();
+    let mut keys = vec![b'j'; 15];
+    keys.extend([b'k'; 3]);
+    keys.push(b'\r');
+    let mut input = std::io::BufReader::new(keys.as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let result = crate::init::init_picker_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        "Theme [dark]:",
+        &options,
+        0,
+        6,
+        false,
+        false,
+        crate::init::init_parse_theme_answer,
+        &mut history,
+        true,
+        &mut wait,
+        None,
+    );
+    assert_eq!(
+        result.expect("Enter selects cursor=12"),
+        options[12].value_text
+    );
+
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    let expected_end = "\x1b[10A\r\x1b[J\x1b[?25h";
+    assert!(
+        printed.ends_with(expected_end),
+        "expected exit erase sequence, got tail: {:?}",
+        &printed[printed.len().saturating_sub(64)..]
+    );
+    let body = printed
+        .strip_prefix("\x1b[?25l")
+        .expect("cursor hide")
+        .strip_suffix(expected_end)
+        .expect("exit erase");
+    let frames: Vec<&str> = body.split("\x1b[10A").collect();
+    assert_eq!(frames.len(), 19, "1 initial + 15 j + 3 k frames");
+    for (frame_idx, frame) in frames.iter().enumerate() {
+        let lines: Vec<&str> = frame.lines().collect();
+        assert_eq!(lines.len(), 10, "frame {frame_idx} height bounded: {frame}");
+        assert!(
+            lines.iter().any(|line| line.contains("> ")),
+            "frame {frame_idx} keeps cursor visible:\n{frame}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("of {} options", options.len()))),
+            "frame {frame_idx} shows scroll range:\n{frame}"
+        );
+    }
+    assert!(
+        frames.last().expect("last frame").contains("10-15 of "),
+        "cursor 12 window shifted cleanly:\n{}",
+        frames.last().expect("last frame")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_picker_max_visible_clamps_short_and_tall_windows() {
+    assert_eq!(crate::init::init_picker_rows_for_window(0), 3);
+    assert_eq!(
+        crate::init::init_picker_rows_for_window(5),
+        3,
+        "shorter than the chrome reservation still paints the minimum"
+    );
+    assert_eq!(crate::init::init_picker_rows_for_window(11), 3);
+    assert_eq!(crate::init::init_picker_rows_for_window(13), 5);
+    assert_eq!(crate::init::init_picker_rows_for_window(18), 10);
+    assert_eq!(crate::init::init_picker_rows_for_window(40), 10);
+    assert_eq!(crate::init::init_picker_rows_for_window(u16::MAX), 10);
+}
+
+#[test]
+fn init_picker_window_keeps_height_and_clamps_the_tail() {
+    assert_eq!(crate::init::init_picker_window(0, 0, 10), (0, 0));
+    assert_eq!(crate::init::init_picker_window(5, 1, 0), (0, 5));
+    assert_eq!(crate::init::init_picker_window(5, 4, 10), (0, 5));
+    assert_eq!(crate::init::init_picker_window(28, 12, 6), (9, 15));
+    assert_eq!(
+        crate::init::init_picker_window(28, 27, 6),
+        (22, 28),
+        "the tail clamp keeps the window height constant at the end of the list"
+    );
+    assert_eq!(
+        crate::init::init_picker_window(28, 99, 6),
+        (22, 28),
+        "an out-of-range cursor is bounded before the window is computed"
+    );
+}
+
+#[test]
+fn init_picker_shrinking_frame_erases_the_stale_notice_row() {
+    let presets = bitty_config::theme::list_presets();
+    let options: Vec<_> = presets.iter().copied().map(theme_option).collect();
+    // "zz" + Enter fails the theme parse, so the frame gains a notice row;
+    // 'k' clears the notice, so the next frame is one row shorter and the
+    // stale notice row has to be erased rather than left behind.
+    let mut keys: Vec<u8> = b"zz\r".to_vec();
+    keys.push(b'k');
+    keys.push(0x03);
+    let mut input = std::io::BufReader::new(keys.as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let _ = crate::init::init_picker_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        "Theme [dark]:",
+        &options,
+        0,
+        6,
+        false,
+        false,
+        crate::init::init_parse_theme_answer,
+        &mut history,
+        true,
+        &mut wait,
+        None,
+    );
+    let printed = String::from_utf8(output).expect("picker output is UTF-8");
+    // Exactly two shrunken frames: the notice frame -> cleared frame, and the
+    // final frame -> abort cleanup. The loop-exit erase also writes `\r\x1b[J`,
+    // so a bare `contains` would stay green if the in-repaint erase vanished.
+    assert_eq!(
+        printed.matches("\r\x1b[J").count(),
+        2,
+        "each shorter frame must clear the rows the previous one painted: {printed:?}"
+    );
+}
+
+#[test]
+fn init_multiselect_inplace_erases_block_on_confirm_and_cancel() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.plugin-{idx:02}"))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled,
+        installed: Vec::new(),
+        needs_network: Vec::new(),
+        warning: None,
+    };
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+
+    // Confirm path: Space selects first item, Enter confirms and erases menu.
+    let mut input = std::io::BufReader::new(b" \r".as_slice());
+    let mut output = Vec::new();
+    let selected = crate::init::init_multiselect_key_loop_with_max_visible(
+        &mut input,
+        &mut output,
+        &inventory,
+        5,
+        false,
+        true,
+        &mut wait,
+    )
+    .expect("Space + Enter confirms selection");
+    assert_eq!(selected, vec![String::from("bundled.plugin-00")]);
+    let confirm_out = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        confirm_out.contains("1-5 of 12 bundled plugins"),
+        "expected windowed bundled summary, got:\n{confirm_out}"
+    );
+    assert!(
+        confirm_out.ends_with("\r\x1b[J\x1b[?25h"),
+        "confirm erases menu block before showing cursor:\n{confirm_out}"
+    );
+
+    // Cancel path (`0x03` / Ctrl-C byte): returns cancelled error and erases menu.
+    let mut cancel_in = std::io::BufReader::new([0x03u8].as_slice());
+    let mut cancel_out = Vec::new();
+    let err = crate::init::init_multiselect_key_loop_with_max_visible(
+        &mut cancel_in,
+        &mut cancel_out,
+        &inventory,
+        5,
+        false,
+        true,
+        &mut wait,
+    )
+    .expect_err("0x03 cancels multiselect");
+    assert!(err.contains("cancelled"), "unexpected error: {err}");
+    let cancel_str = String::from_utf8(cancel_out).expect("UTF-8");
+    assert!(
+        cancel_str.ends_with("\r\x1b[J\x1b[?25h"),
+        "cancel erases menu block before showing cursor:\n{cancel_str}"
+    );
+}
+
+#[test]
+fn init_multiselect_budget_fits_24_row_and_short_terminals_with_installed_plugins() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.plugin-{idx:02}"))
+        .collect();
+    let installed: Vec<_> = (0..9)
+        .map(|idx| init_installed(&format!("inst.plugin-{idx:02}"), "1.0.0", true))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled: bundled.clone(),
+        installed,
+        needs_network: vec![String::from("official.remote")],
+        warning: None,
+    };
+    let selected = vec![false; bundled.len()];
+
+    for rows in [24u16, 16u16, 12u16] {
+        let (bundled_max, installed_cap) =
+            crate::init::init_multiselect_budget_for_window(&inventory, rows);
+        let block = crate::init::init_multiselect_block(
+            &inventory,
+            bundled.len() - 1,
+            bundled_max,
+            installed_cap,
+            &selected,
+            false,
+        );
+        assert!(
+            block.len() < rows as usize,
+            "rows={rows}: frame length {} exceeded safe budget {}:\n{}",
+            block.len(),
+            rows - 1,
+            block.join("\n")
+        );
+        assert!(
+            block.iter().any(|line| line.contains("bundled.plugin-11")),
+            "rows={rows}: cursor item must stay visible:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Tight viewport collapses installed rows into a single summary entry.
+    let (_, tight_installed_cap) = crate::init::init_multiselect_budget_for_window(&inventory, 12);
+    assert_eq!(tight_installed_cap, 0);
+}
+
+#[test]
+fn init_fit_preview_line_bounds_width_and_step_preview_clears_prior_rows() {
+    let fitted = crate::init::init_fit_preview_line(
+        "  (preview: theme=\"catppuccin-mocha\", font=\"JetBrainsMono Nerd Font\" 14pt, gaps 6/12, border 2, radius 8)",
+        Some(80),
+    );
+    assert!(
+        crate::init::init_display_width(&fitted) <= 79,
+        "fitted preview exceeded 79 cells: {fitted:?}"
+    );
+    assert!(fitted.ends_with("..."), "expected ellipsis: {fitted:?}");
+
+    let sip_prefix = "  ".to_string() + &"\u{20000}".repeat(22);
+    let fitted_sip = crate::init::init_fit_preview_line(&sip_prefix, Some(40));
+    assert!(
+        crate::init::init_visible_display_width(&fitted_sip) <= 39,
+        "SIP U+20000 preview must stay <= 39 cells (width 2 per glyph): {fitted_sip:?}"
+    );
+    assert!(
+        fitted_sip.ends_with("..."),
+        "expected SIP preview truncation at 40 cols: {fitted_sip:?}"
+    );
+
+    let mut preview = crate::init::InitPreview::enabled(bitty_config::fallback_builtin());
+    preview.apply_font_family("JetBrainsMono Nerd Font");
+    preview.apply_font_size(14.0);
+    let mut output = Vec::new();
+    let mut prev_rows = 0usize;
+    // Narrow 50-col step prints a 2-row preview, then a wider or second update
+    // must erase all prior rows via `\x1b[2A\r\x1b[J` when `prev_rows == 2`
+    // (`max_cols: None` skips truncation so rows > 1 can also be simulated or
+    // we can force prev_rows = 2 directly for the wrap-erasure check).
+    crate::init::init_emit_step_preview_echo_for_cols(
+        &mut output,
+        &preview,
+        false,
+        true,
+        &mut prev_rows,
+        Some(80),
+    );
+    assert_eq!(prev_rows, 1);
+
+    // Simulate a prior preview that wrapped onto 2 physical rows (e.g., after
+    // a terminal resize narrower) and confirm the update moves up 2 rows.
+    prev_rows = 2;
+    crate::init::init_emit_step_preview_echo_for_cols(
+        &mut output,
+        &preview,
+        false,
+        true,
+        &mut prev_rows,
+        Some(80),
+    );
+    let rendered = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        rendered.contains("\x1b[2A\r\x1b[J"),
+        "wrapped preview must move up all prior physical rows: {rendered:?}"
+    );
+}
+
+#[test]
+fn init_multiselect_viewport_accounts_for_40_col_wrapping_9_row_fallback_and_live_resize() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.very-long-plugin-name-{idx:02}"))
+        .collect();
+    let installed: Vec<_> = (0..9)
+        .map(|idx| init_installed(&format!("inst.plugin-{idx:02}"), "1.0.0", true))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled: bundled.clone(),
+        installed,
+        needs_network: vec![String::from("official.remote")],
+        warning: Some(String::from(
+            "marketplace cache is stale on narrow terminals and wraps cleanly",
+        )),
+    };
+    let selected = vec![false; bundled.len()];
+    // Independent oracle: these fixtures paint without color, so every frame
+    // line is plain text and its wrapped height follows from the cell width.
+    let wrapped_rows = |block: &[String], cols: u16| -> usize {
+        block
+            .iter()
+            .map(|line| {
+                crate::init::init_display_width(line)
+                    .max(1)
+                    .div_ceil(usize::from(cols))
+            })
+            .sum()
+    };
+
+    for (rows, cols) in [(24u16, 40u16), (9, 80), (9, 40)] {
+        let (max_visible, secondary) =
+            crate::init::init_multiselect_layout_for_viewport(&inventory, rows, Some(cols));
+        let block = crate::init::init_multiselect_block_with_layout(
+            &inventory,
+            bundled.len() - 1,
+            max_visible,
+            secondary,
+            &selected,
+            false,
+        );
+        let physical = wrapped_rows(&block, cols);
+        assert!(
+            physical <= usize::from(rows).saturating_sub(1),
+            "rows={rows}, cols={cols}: physical rows {physical} exceeded budget {}:\n{}",
+            usize::from(rows).saturating_sub(1),
+            block.join("\n")
+        );
+        assert!(
+            block
+                .iter()
+                .any(|line| line.contains("bundled.very-long-plugin-name-11")),
+            "rows={rows}, cols={cols}: cursor item must stay visible:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Budgeting logical lines alone overflows 24x40 here, so the fitted layout
+    // above is what keeps the cursor row on screen.
+    let unbounded = crate::init::init_multiselect_block_with_layout(
+        &inventory,
+        bundled.len() - 1,
+        10,
+        crate::init::InitSecondaryGroups::Shown { installed_cap: 8 },
+        &selected,
+        false,
+    );
+    assert!(
+        wrapped_rows(&unbounded, 40) > 23,
+        "fixture must overflow 24x40 without physical-row budgeting: {}",
+        wrapped_rows(&unbounded, 40)
+    );
+
+    // Repaint and cleanup move up by PHYSICAL rows: the wrapped 40-column frame
+    // must erase by its wrapped height, not by its logical line count.
+    let (visible, secondary) =
+        crate::init::init_multiselect_layout_for_viewport(&inventory, 24, Some(40));
+    let first_frame = crate::init::init_multiselect_block_with_layout(
+        &inventory, 0, visible, secondary, &selected, false,
+    );
+    let first_frame_rows = wrapped_rows(&first_frame, 40);
+    assert!(
+        first_frame_rows > first_frame.len(),
+        "fixture must wrap at 40 columns ({first_frame_rows} rows over {} lines)",
+        first_frame.len()
+    );
+    let mut narrow_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut narrow_output = Vec::new();
+    let chosen = crate::init::init_multiselect_key_loop_with_viewport(
+        &mut narrow_input,
+        &mut narrow_output,
+        &inventory,
+        &mut || Some((24, Some(40))),
+        false,
+        true,
+        &mut |_| false,
+    )
+    .expect("multiselect key loop succeeds at 40 columns");
+    assert!(chosen.is_empty());
+    let painted = String::from_utf8(narrow_output).expect("UTF-8");
+    assert!(
+        painted.contains(&format!("\x1b[{first_frame_rows}A")),
+        "repaint and cleanup must move up {first_frame_rows} physical rows: {painted:?}"
+    );
+
+    // Live resize mid-navigation (24x80 -> 12x80) recomputes the budget: the
+    // installed preview that fits 24 rows no longer fits 12.
+    let mut resize_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut resize_output = Vec::new();
+    let mut multi_frame = 0usize;
+    crate::init::init_multiselect_key_loop_with_viewport(
+        &mut resize_input,
+        &mut resize_output,
+        &inventory,
+        &mut || {
+            multi_frame += 1;
+            if multi_frame == 1 {
+                Some((24, Some(80)))
+            } else {
+                Some((12, Some(80)))
+            }
+        },
+        false,
+        true,
+        &mut |_| false,
+    )
+    .expect("multiselect key loop succeeds across live resize");
+    let multi_rendered = String::from_utf8(resize_output).expect("UTF-8");
+    assert_eq!(
+        multi_rendered
+            .matches("Installed (already present locally):")
+            .count(),
+        1,
+        "a 24 -> 12 row shrink must drop the installed preview from later frames: {multi_rendered:?}"
+    );
+
+    // The picker recomputes its option window the same way (24x80 -> 10x80).
+    let options: Vec<crate::init::InitOptionItem> = (0..15)
+        .map(|idx| crate::init::InitOptionItem {
+            label: format!("option-item-{idx:02} (alias-a, alias-b)"),
+            value_text: format!("option-item-{idx:02}"),
+            style_fg: None,
+            style_bg: None,
+        })
+        .collect();
+    let mut picker_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut picker_output = Vec::new();
+    let mut picker_history = Vec::new();
+    let mut picker_frame = 0usize;
+    let picked = crate::init::init_picker_key_loop_with_viewport(
+        &mut picker_input,
+        &mut picker_output,
+        "Theme",
+        &options,
+        0,
+        &mut || {
+            picker_frame += 1;
+            if picker_frame == 1 {
+                Some((24, Some(80)))
+            } else {
+                Some((10, Some(80)))
+            }
+        },
+        false,
+        false,
+        |raw| Ok(raw.to_string()),
+        &mut picker_history,
+        true,
+        &mut |_| false,
+        None,
+    )
+    .expect("picker key loop succeeds across live resize");
+    assert_eq!(picked, "option-item-01");
+    let picker_rendered = String::from_utf8(picker_output).expect("UTF-8");
+    assert!(
+        picker_rendered.contains("1-10 of 15"),
+        "a 24-row terminal must show the full 10-option window: {picker_rendered:?}"
+    );
+    assert!(
+        picker_rendered.contains("1-3 of 15"),
+        "a 24 -> 10 row shrink must shrink the option window: {picker_rendered:?}"
+    );
+}
+
+// CTX-1807: physical-row budgeting must model the greedy deferred wrap a real
+// VT performs. A total-cell division (`width.div_ceil(cols)`) over-counts
+// one-cell remainders and, more importantly, under-counts a two-cell glyph
+// that meets the right edge: the terminal wastes the last cell and continues
+// on the next row. The same number drives the `\x1b[NA` in-place repaint and
+// both exit erases, so an undercount drifts every repaint one row down.
+#[test]
+fn init_line_physical_rows_models_greedy_wrap_for_wide_glyphs() {
+    let wide = "\u{754c}".repeat(40);
+    let option_line = format!("> {wide}");
+    // "> " occupies cells 1-2, nineteen 2-cell glyphs fill cells 3-40, the
+    // twentieth cannot use column 41 alone and opens row 2, and the remaining
+    // twenty fill rows 2-3: three physical rows, where div_ceil(82, 41) = 2.
+    assert_eq!(
+        crate::init::init_line_physical_rows(&option_line, Some(41)),
+        3,
+        "40 wide glyphs after a 2-cell marker need 3 rows at 41 columns"
+    );
+    assert_eq!(
+        crate::init::init_frame_physical_rows(std::slice::from_ref(&option_line), Some(41)),
+        3
+    );
+    // Narrower windows: a wide glyph never shares the single leftover cell.
+    let ten_wide = "\u{754c}".repeat(10);
+    assert_eq!(crate::init::init_line_physical_rows(&ten_wide, Some(3)), 10);
+    assert_eq!(
+        crate::init::init_line_physical_rows(&"\u{754c}".repeat(3), Some(3)),
+        3
+    );
+    // Narrow text keeps the plain ceil(cells / cols) answer, exact fits included.
+    let ascii = "a".repeat(41);
+    assert_eq!(crate::init::init_line_physical_rows(&ascii, Some(41)), 1);
+    assert_eq!(crate::init::init_line_physical_rows(&ascii, Some(40)), 2);
+    // ANSI styling and combining marks take no cells at all.
+    let styled = format!("\x1b[36m{}\x1b[0m", "\u{754c}".repeat(3));
+    assert_eq!(crate::init::init_line_physical_rows(&styled, Some(3)), 3);
+    let combining = format!("e{}", "\u{301}".repeat(80));
+    assert_eq!(crate::init::init_line_physical_rows(&combining, Some(1)), 1);
+    // Unknown or degenerate widths keep the one-row floor.
+    assert_eq!(crate::init::init_line_physical_rows(&option_line, None), 1);
+    assert_eq!(
+        crate::init::init_line_physical_rows(&option_line, Some(0)),
+        1
+    );
+    assert_eq!(crate::init::init_line_physical_rows("", Some(41)), 1);
+}
+
+// CTX-1807: the picker's irreducible frame is prompt + one entry + range
+// indicator + hint + typed echo (five lines, six with a live preview), so a
+// 5- or 6-row terminal cannot fit the full chrome and the retired
+// `max_visible <= 1` escape painted it anyway, scrolling the prompt and the
+// cursor entry off screen. The frame must shed the preview first, then the
+// range indicator/hint, and only then the typed echo.
+#[test]
+fn init_picker_frame_fits_five_and_six_row_viewports() {
+    let options: Vec<crate::init::InitOptionItem> = (0..15)
+        .map(|idx| crate::init::InitOptionItem {
+            label: format!("option-item-{idx:02}"),
+            value_text: format!("option-item-{idx:02}"),
+            style_fg: None,
+            style_bg: None,
+        })
+        .collect();
+    // Independent oracle: every fixture line is single-width ASCII, so a greedy
+    // wrap is exactly ceil(cells / cols).
+    let physical = |block: &[String], cols: u16| -> usize {
+        block
+            .iter()
+            .map(|line| {
+                crate::init::init_display_width(line)
+                    .max(1)
+                    .div_ceil(usize::from(cols))
+            })
+            .sum()
+    };
+    let preview = "  preview: theme text painted in its own colors";
+    let fit = |max_visible: usize, safe_rows: usize, preview: Option<&str>| {
+        crate::init::init_fit_picker_frame(
+            |visible, chrome| {
+                crate::init::init_picker_block(
+                    "Theme", &options, 0, visible, false, false, "", preview, None, chrome,
+                )
+            },
+            max_visible,
+            safe_rows,
+            Some(80),
+        )
+    };
+
+    // 6 rows leave 5: the preview line is what must go, not the entry.
+    let six_rows = fit(3, 5, Some(preview));
+    assert!(physical(&six_rows, 80) <= 5, "{six_rows:#?}");
+    assert_eq!(six_rows.first().map(String::as_str), Some("Theme"));
+    assert!(six_rows.iter().any(|line| line.contains("option-item-00")));
+    assert!(
+        !six_rows.iter().any(|line| line.contains("preview:")),
+        "the preview must be retired before the entry: {six_rows:#?}"
+    );
+    assert!(six_rows.iter().any(|line| line.contains("(typed: ")));
+
+    // 5 rows leave 4: the range indicator and hint go as well.
+    let five_rows = fit(3, 4, Some(preview));
+    assert!(physical(&five_rows, 80) <= 4, "{five_rows:#?}");
+    assert_eq!(five_rows.first().map(String::as_str), Some("Theme"));
+    assert!(five_rows.iter().any(|line| line.contains("option-item-00")));
+    assert!(
+        !five_rows.iter().any(|line| line.contains("of 15 options")),
+        "the range indicator must be retired at 4 usable rows: {five_rows:#?}"
+    );
+    assert!(
+        !five_rows.iter().any(|line| line.contains("j/k")),
+        "the key hint must be retired at 4 usable rows: {five_rows:#?}"
+    );
+    assert!(five_rows.iter().any(|line| line.contains("(typed: ")));
+
+    // Two rows cannot hold a prompt plus even one entry; the floor stays usable
+    // rather than painting an empty frame.
+    let two_rows = fit(3, 1, Some(preview));
+    assert_eq!(two_rows.first().map(String::as_str), Some("Theme"));
+    assert!(two_rows.iter().any(|line| line.contains("option-item-00")));
+
+    // End to end: a 5-row window paints 4 rows, so the next frame moves up 4.
+    let mut input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut output = Vec::new();
+    let mut history = Vec::new();
+    let picked = crate::init::init_picker_key_loop_with_viewport(
+        &mut input,
+        &mut output,
+        "Theme",
+        &options,
+        0,
+        &mut || Some((5, Some(80))),
+        false,
+        false,
+        |raw| Ok(raw.to_string()),
+        &mut history,
+        true,
+        &mut |_| false,
+        Some(&mut |_| Some(String::from(preview))),
+    )
+    .expect("picker key loop succeeds on a 5-row terminal");
+    assert_eq!(picked, "option-item-01");
+    let painted = String::from_utf8(output).expect("UTF-8");
+    assert!(
+        painted.contains("\x1b[4A"),
+        "a 5-row terminal must repaint the 4-row frame: {painted:?}"
+    );
+    assert!(
+        !painted.contains("j/k or arrows move"),
+        "a 5-row terminal cannot afford the key hint: {painted:?}"
+    );
+}
+
+#[test]
 fn init_color_enabled_impl_matches_convention() {
     // Pure decision table: explicit flag, NO_COLOR, dumb terminal, or piped
     // stdout disables; otherwise color is allowed.
@@ -8953,7 +9601,7 @@ fn init_preview_never_writes_config_file() {
     );
     assert!(!target.exists(), "cancel creates no config file");
     assert!(
-        !target.with_extension("lua.bak").exists(),
+        !crate::init::config_backup_path_for(&target).exists(),
         "cancel creates no backup"
     );
 
@@ -8973,7 +9621,7 @@ fn init_preview_never_writes_config_file() {
         "-- existing\n"
     );
     assert!(
-        !target.with_extension("lua.bak").exists(),
+        !crate::init::config_backup_path_for(&target).exists(),
         "cancel writes no backup"
     );
 
@@ -10564,7 +11212,7 @@ fn init_write_new_refuse_force_backup_idempotent() {
     let outcome = write_init_config(&target, &updated_content, true).expect("forced write");
     assert!(outcome.updated);
     let backup = outcome.backup.expect("backup path");
-    assert_eq!(backup, target.with_extension("lua.bak"));
+    assert_eq!(backup, crate::init::config_backup_path_for(&target));
     assert_eq!(
         std::fs::read_to_string(&backup).expect("backup bytes"),
         content
@@ -10740,7 +11388,7 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
     });
     let outcome = write_init_config(&target, &second, true).expect("first forced write");
     let backup = outcome.backup.expect("backup path");
-    assert_eq!(backup, target.with_extension("lua.bak"));
+    assert_eq!(backup, crate::init::config_backup_path_for(&target));
     assert_eq!(std::fs::read_to_string(&backup).expect("backup"), first);
 
     // A second forced write never overwrites the sole recovery copy.
@@ -10750,7 +11398,7 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
     });
     let outcome = write_init_config(&target, &third, true).expect("second forced write");
     let second_backup = outcome.backup.expect("second backup path");
-    assert_eq!(second_backup, dir.join("init.lua.bak.1"));
+    assert_eq!(second_backup, dir.join(".backups").join("init.lua.bak.1"));
     assert_eq!(
         std::fs::read_to_string(&second_backup).expect("second backup"),
         second
@@ -10772,8 +11420,9 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
 
     // Invalid generated content is refused before any mutation: the target
     // keeps its bytes and no new backup is created.
-    let backups_before = std::fs::read_dir(&dir)
-        .expect("read dir")
+    let backup_dir = crate::init::config_backup_dir_for(&target);
+    let backups_before = std::fs::read_dir(&backup_dir)
+        .expect("read backup dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
@@ -10784,8 +11433,8 @@ fn init_write_backups_are_collision_free_and_fail_closed() {
         std::fs::read_to_string(&target).expect("target intact"),
         third
     );
-    let backups_after = std::fs::read_dir(&dir)
-        .expect("read dir")
+    let backups_after = std::fs::read_dir(&backup_dir)
+        .expect("read backup dir")
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().contains(".bak"))
         .count();
@@ -10910,12 +11559,12 @@ fn init_dispatch_yes_force_idempotent() {
         run_init_subcommand_with_io(&args, &sh_env, &mut input, &mut output),
         0
     );
-    let backup = target.with_extension("lua.bak");
+    let backup = crate::init::config_backup_path_for(&target);
     assert_eq!(
         std::fs::read_to_string(&backup).expect("selector backup"),
         written_selector
     );
-    let profile_backup = profile.with_extension("lua.bak");
+    let profile_backup = crate::init::config_backup_path_for(&profile);
     assert_eq!(
         std::fs::read_to_string(&profile_backup).expect("profile backup"),
         written_profile

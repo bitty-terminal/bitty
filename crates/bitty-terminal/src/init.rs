@@ -17,6 +17,27 @@ pub(crate) const INIT_MAX_ATTEMPTS: usize = 3;
 /// Default generated profile name (CTX-1404 / issue #2187).
 pub(crate) const DEFAULT_PROFILE_NAME: &str = "default";
 
+/// Subdirectory under the active configuration root holding retained `.bak` copies.
+pub(crate) const CONFIG_BACKUP_DIR_NAME: &str = ".backups";
+
+/// Default maximum visible option rows in `bitty init` interactive pickers
+/// when terminal height cannot be queried or fits comfortably.
+const INIT_PICKER_DEFAULT_MAX_VISIBLE: usize = 10;
+
+/// Minimum visible option rows even in very short terminal windows.
+///
+/// Read only by the Unix live-terminal clamp: non-Unix binaries fall back to
+/// `INIT_PICKER_DEFAULT_MAX_VISIBLE`, hence the dead-code allowance there.
+#[cfg_attr(not(unix), allow(dead_code))]
+const INIT_PICKER_MIN_VISIBLE: usize = 3;
+
+/// Lines reserved for the picker header, hint, preview, typed row, and
+/// completed-step banner so the rendered frame stays inside the viewport.
+///
+/// Same Unix-only read site as `INIT_PICKER_MIN_VISIBLE`.
+#[cfg_attr(not(unix), allow(dead_code))]
+const INIT_PICKER_CHROME_ROWS: usize = 8;
+
 /// Bounded collision search for a recoverable `.bak` sibling.
 const INIT_MAX_BACKUP_ATTEMPTS: u32 = 100;
 
@@ -2305,9 +2326,12 @@ pub(crate) struct InitRawGuard {
     original_flags: nix::fcntl::OFlag,
 }
 
-/// Enters cbreak mode on stdin. `None` when stdin has no termios to take
-/// (piped, closed, or setup failed): the caller keeps the line loop. A
-/// half-applied setup restores what it changed before returning `None`.
+/// Enters cbreak mode on stdin without terminal signals (`ISIG` cleared) so
+/// `Ctrl-C` delivers `0x03` into the picker key loops for frame cleanup and
+/// `Drop`-based restoration instead of raising `SIGINT`. `None` when stdin has
+/// no termios to take (piped, closed, or setup failed): the caller keeps the
+/// line loop. A half-applied setup restores what it changed before returning
+/// `None`.
 #[cfg(unix)]
 pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
     use std::os::unix::io::AsFd as _;
@@ -2315,9 +2339,11 @@ pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
     let fd = stdin.as_fd();
     let original_termios = nix::sys::termios::tcgetattr(fd).ok()?;
     let mut single = original_termios.clone();
-    single
-        .local_flags
-        .remove(nix::sys::termios::LocalFlags::ICANON | nix::sys::termios::LocalFlags::ECHO);
+    single.local_flags.remove(
+        nix::sys::termios::LocalFlags::ICANON
+            | nix::sys::termios::LocalFlags::ECHO
+            | nix::sys::termios::LocalFlags::ISIG,
+    );
     nix::sys::termios::tcsetattr(fd, nix::sys::termios::SetArg::TCSADRAIN, &single).ok()?;
     let flags_raw = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).ok()?;
     let original_flags = nix::fcntl::OFlag::from_bits_truncate(flags_raw);
@@ -2415,30 +2441,154 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
 /// preview-free (every non-theme step, and every non-interactive run).
 pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
 
-/// Renders one key-loop picker frame: `prompt`, every entry with the cursor
-/// marker, the navigation hint, the optional live preview line, and the typed
-/// line. The typed line is always present (even empty) so in-place repaints
-/// keep a constant frame height; a step that passes a preview line must pass
-/// one on every frame (`init_theme_preview_strip` falls back to the running
-/// preview theme) for the same reason.
+/// Queries the live Unix terminal window dimensions `(rows, optional cols)`
+/// when repainting in place and `ws_row > 0`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_live_terminal_winsize(inplace: bool) -> Option<(u16, Option<u16>)> {
+    #[cfg(unix)]
+    if inplace {
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
+            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
+        if let Ok(ws) = winsize {
+            if ws.ws_row > 0 {
+                return Some((ws.ws_row, (ws.ws_col > 0).then_some(ws.ws_col)));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = inplace;
+    None
+}
+
+/// Bounded visible option rows for a terminal `rows` high.
+///
+/// Reserves the picker chrome and clamps into
+/// `[INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE]`, so a short
+/// window still paints a usable window and a tall one never over-renders.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_picker_rows_for_window(rows: u16) -> usize {
+    (rows as usize)
+        .saturating_sub(INIT_PICKER_CHROME_ROWS)
+        .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE)
+}
+
+/// Repaints an interactive picker/multiselect block in place, moving up
+/// `rendered` physical rows and returning the newly painted physical height.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_paint_inplace_frame(
+    output: &mut dyn std::io::Write,
+    block: &[String],
+    inplace: bool,
+    rendered: usize,
+    cols: Option<u16>,
+) -> usize {
+    let new_physical = if inplace {
+        init_frame_physical_rows(block, cols)
+    } else {
+        block.len()
+    };
+    if inplace && rendered > 0 {
+        let _ = write!(output, "\x1b[{rendered}A");
+    }
+    for line in block {
+        if inplace {
+            if init_line_physical_rows(line, cols) > 1 {
+                let _ = write!(output, "\r\x1b[K{line}\x1b[K\n");
+            } else {
+                let _ = write!(output, "\r\x1b[K{line}\n");
+            }
+        } else {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+    if inplace && rendered > new_physical {
+        let _ = write!(output, "\r\x1b[J");
+    }
+    let _ = output.flush();
+    new_physical
+}
+
+/// Returns the inclusive-start, exclusive-end sliding window keeping `cursor`
+/// centered when `total > max_visible` and keeping window height constant.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_picker_window(
+    total: usize,
+    cursor: usize,
+    max_visible: usize,
+) -> (usize, usize) {
+    if total == 0 || max_visible == 0 || total <= max_visible {
+        return (0, total);
+    }
+    let bounded_cursor = cursor.min(total - 1);
+    let half = max_visible / 2;
+    let mut start = bounded_cursor.saturating_sub(half);
+    if start + max_visible > total {
+        start = total - max_visible;
+    }
+    (start, start + max_visible)
+}
+
+/// Chrome tiers a picker frame retires, in order, until it fits a short
+/// viewport: the live preview and reprompt notice go first, then the window
+/// range indicator and key hint, then the typed-input echo. The prompt and the
+/// windowed entries always stay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum InitPickerChrome {
+    /// Every line: prompt, entries, range indicator, hint, preview, notice, typed.
+    Full,
+    /// Drops the live preview line and any reprompt notice.
+    Compact,
+    /// Prompt, entries and the typed-input echo only.
+    Essential,
+    /// Prompt and the windowed entries only; the smallest frame available.
+    Bare,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl InitPickerChrome {
+    /// Tiers in retirement order, most complete first.
+    const TIERS: [Self; 4] = [Self::Full, Self::Compact, Self::Essential, Self::Bare];
+    fn shows_optional_lines(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    fn shows_navigation_lines(self) -> bool {
+        matches!(self, Self::Full | Self::Compact)
+    }
+
+    fn shows_typed_input(self) -> bool {
+        matches!(self, Self::Full | Self::Compact | Self::Essential)
+    }
+}
+
+/// Renders one key-loop picker frame: `prompt`, the windowed entries with the
+/// cursor marker, an optional window range indicator, the navigation hint, the
+/// optional live preview line, and the typed line.
+///
+/// `chrome` selects how much optional decoration the frame carries, so a short
+/// viewport can drop the preview, hint and typed echo before losing entries.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
 #[cfg_attr(not(unix), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
-fn init_picker_block(
+pub(crate) fn init_picker_block(
     prompt: &str,
     options: &[InitOptionItem],
     cursor: usize,
+    max_visible: usize,
     color: bool,
     numbered: bool,
     typed: &str,
     preview_line: Option<&str>,
     notice: Option<&str>,
+    chrome: InitPickerChrome,
 ) -> Vec<String> {
-    let mut block = Vec::with_capacity(options.len() + 4);
+    let (start, end) = init_picker_window(options.len(), cursor, max_visible);
+    let mut block = Vec::with_capacity((end - start) + 5);
     block.push(prompt.to_string());
-    for (index, item) in options.iter().enumerate() {
+    for (index, item) in options.iter().enumerate().take(end).skip(start) {
         let selected = index == cursor;
         let marker = if selected {
             if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
@@ -2452,19 +2602,65 @@ fn init_picker_block(
             block.push(format!("{marker} {label}"));
         }
     }
-    if numbered {
-        block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
-    } else {
-        block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+    if chrome.shows_navigation_lines() && (start > 0 || end < options.len()) {
+        block.push(format!(
+            "  ({}-{end} of {} options — scroll with j/k or arrows)",
+            start + 1,
+            options.len()
+        ));
     }
-    if let Some(line) = preview_line {
-        block.push(line.to_string());
+    if chrome.shows_navigation_lines() {
+        if numbered {
+            block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
+        } else {
+            block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+        }
     }
-    if let Some(message) = notice {
-        block.push(message.to_string());
+    if chrome.shows_optional_lines() {
+        if let Some(line) = preview_line {
+            block.push(line.to_string());
+        }
+        if let Some(message) = notice {
+            block.push(message.to_string());
+        }
     }
-    block.push(format!("  (typed: {typed})"));
+    if chrome.shows_typed_input() {
+        block.push(format!("  (typed: {typed})"));
+    }
     block
+}
+
+/// Picks the tallest picker frame `render` can build that fits `safe_rows`
+/// physical rows at `cols`.
+///
+/// Entries are retired first (the sliding window keeps the cursor entry
+/// visible), then [`InitPickerChrome::Compact`] drops the preview/notice,
+/// [`InitPickerChrome::Essential`] drops the range indicator and hint, and
+/// [`InitPickerChrome::Bare`] drops the typed-input echo. When even one entry
+/// cannot fit (a window shorter than two rows, or an entry wider than the
+/// terminal) the smallest renderable frame is returned, because a picker still
+/// needs a prompt and an entry to be usable.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_fit_picker_frame(
+    mut render: impl FnMut(usize, InitPickerChrome) -> Vec<String>,
+    max_visible: usize,
+    safe_rows: usize,
+    cols: Option<u16>,
+) -> Vec<String> {
+    for chrome in InitPickerChrome::TIERS {
+        let mut visible = max_visible.max(1);
+        loop {
+            let block = render(visible, chrome);
+            if init_frame_physical_rows(&block, cols) <= safe_rows {
+                return block;
+            }
+            if visible <= 1 {
+                break;
+            }
+            visible -= 1;
+        }
+    }
+    render(1, InitPickerChrome::Bare)
 }
 
 /// Runs one key-loop submit: the typed buffer wins, else the cursor entry;
@@ -2569,6 +2765,115 @@ pub(crate) fn init_picker_key_loop<T>(
     history: &mut Vec<String>,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_impl(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        None,
+        &mut || init_live_terminal_winsize(inplace),
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+/// [`init_picker_key_loop`] with an explicit fixed `max_visible` window bound.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_picker_key_loop_with_max_visible<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    max_visible: usize,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_impl(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        Some(max_visible),
+        &mut || None,
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+/// [`init_picker_key_loop`] driven by an injectable live viewport probe for
+/// resize-during-navigation tests.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_picker_key_loop_with_viewport<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_impl(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        None,
+        query_winsize,
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn init_picker_key_loop_impl<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    fixed_max_visible: Option<usize>,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
     mut preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
@@ -2587,28 +2892,58 @@ pub(crate) fn init_picker_key_loop<T>(
             Some(hook) => hook(&options[cursor]),
             None => None,
         };
-        let block = init_picker_block(
-            prompt,
-            options,
-            cursor,
-            color,
-            numbered,
-            &typed,
-            preview_line.as_deref(),
-            notice.as_deref(),
-        );
-        if inplace && rendered > 0 {
-            let _ = write!(output, "\x1b[{rendered}A");
-        }
-        for line in &block {
-            if inplace {
-                let _ = write!(output, "\r\x1b[K{line}\n");
-            } else {
-                let _ = writeln!(output, "{line}");
+        let (max_visible, window) = match fixed_max_visible {
+            Some(explicit) => (explicit, None),
+            None => match query_winsize() {
+                Some((rows, cols)) => (
+                    init_picker_rows_for_window(rows).min(options.len()).max(1),
+                    Some((rows, cols)),
+                ),
+                None => (INIT_PICKER_DEFAULT_MAX_VISIBLE, None),
+            },
+        };
+        // Fit the frame to the live viewport in PHYSICAL rows (wrapped lines
+        // included). Entries retire before the chrome, and the chrome tiers
+        // below keep the prompt plus the cursor entry on screen even when the
+        // window is shorter than the full picker frame.
+        let block = match window {
+            Some((rows, Some(cols))) => {
+                let safe_rows = usize::from(rows).saturating_sub(1).max(1);
+                init_fit_picker_frame(
+                    |visible, chrome| {
+                        init_picker_block(
+                            prompt,
+                            options,
+                            cursor,
+                            visible,
+                            color,
+                            numbered,
+                            &typed,
+                            preview_line.as_deref(),
+                            notice.as_deref(),
+                            chrome,
+                        )
+                    },
+                    max_visible,
+                    safe_rows,
+                    Some(cols),
+                )
             }
-        }
-        let _ = output.flush();
-        rendered = block.len();
+            _ => init_picker_block(
+                prompt,
+                options,
+                cursor,
+                max_visible,
+                color,
+                numbered,
+                &typed,
+                preview_line.as_deref(),
+                notice.as_deref(),
+                InitPickerChrome::Full,
+            ),
+        };
+        let cols = window.and_then(|(_, cols)| cols);
+        rendered = init_paint_inplace_frame(output, &block, inplace, rendered, cols);
         // One key: a lone byte, or an `ESC`-led burst.
         let Some(first) = init_key_read_byte(&mut *input) else {
             break Err("bitty init: aborted (end of input)".to_string());
@@ -2696,6 +3031,7 @@ pub(crate) fn init_picker_key_loop<T>(
                     break done;
                 }
             }
+            0x03 => break Err("bitty init: aborted (cancelled)".to_string()),
             0x04 => break Err("bitty init: aborted (end of input)".to_string()),
             0x7f | 0x08 => {
                 if typed.pop().is_some() {
@@ -2741,6 +3077,9 @@ pub(crate) fn init_picker_key_loop<T>(
         }
     };
     if inplace {
+        if rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A\r\x1b[J");
+        }
         let _ = write!(output, "\x1b[?25h");
         let _ = output.flush();
     }
@@ -2918,41 +3257,224 @@ fn init_plugin_inventory_groups(
     inventory: &InitPluginInventory,
     bundled_row: &dyn Fn(usize, &str) -> String,
 ) -> Vec<String> {
+    init_plugin_inventory_groups_windowed(inventory, None, bundled_row)
+}
+
+/// Secondary-group display mode for bounded multiselect frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum InitSecondaryGroups {
+    /// Full inventory groups with up to `installed_cap` installed rows (or a
+    /// one-line installed summary when `installed_cap == 0`).
+    Shown { installed_cap: usize },
+    /// Prompt + bundled rows (+ scroll range) + key hint only, omitting secondary
+    /// groups when narrow/short terminals cannot fit all sections physically.
+    Collapsed,
+    /// Only the bundled row window when even `Collapsed` exceeds tiny viewports.
+    Minimal,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_probe_inventory(inventory: &InitPluginInventory) -> InitPluginInventory {
+    let widest_id = inventory
+        .bundled
+        .iter()
+        .max_by_key(|id| init_visible_display_width(id))
+        .cloned()
+        .unwrap_or_default();
+    InitPluginInventory {
+        bundled: vec![widest_id; inventory.bundled.len()],
+        installed: inventory.installed.clone(),
+        needs_network: inventory.needs_network.clone(),
+        warning: inventory.warning.clone(),
+    }
+}
+
+/// Computes `(bundled_max_visible, secondary_groups_layout)` for an interactive
+/// multiselect frame on a terminal of `(rows, cols)`, counting physical wrapped
+/// terminal rows (`init_frame_physical_rows`) so narrow or short viewports never
+/// scroll the cursor off-screen or miscount CSI cursor-up distances.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_layout_for_viewport(
+    inventory: &InitPluginInventory,
+    rows: u16,
+    cols: Option<u16>,
+) -> (usize, InitSecondaryGroups) {
+    let safe_rows = (rows as usize).saturating_sub(1).max(1);
+    let probe = init_multiselect_probe_inventory(inventory);
+    let selected = vec![false; probe.bundled.len()];
+    let max_bundled_budget = if probe.bundled.is_empty() {
+        1
+    } else {
+        INIT_PICKER_DEFAULT_MAX_VISIBLE.min(probe.bundled.len())
+    };
+    let min_bundled = if probe.bundled.is_empty() {
+        1
+    } else {
+        INIT_PICKER_MIN_VISIBLE.min(probe.bundled.len()).max(1)
+    };
+
+    let fits = |bundled_max: usize, secondary: InitSecondaryGroups| -> bool {
+        let block =
+            init_multiselect_block_with_layout(&probe, 0, bundled_max, secondary, &selected, false);
+        init_frame_physical_rows(&block, cols) <= safe_rows
+    };
+
+    let max_installed = INIT_PLUGIN_INSTALLED_ROWS_MAX.min(probe.installed.len());
+    for cap in (0..=max_installed).rev() {
+        let secondary = InitSecondaryGroups::Shown { installed_cap: cap };
+        if fits(min_bundled, secondary) {
+            for bundled_max in (min_bundled..=max_bundled_budget).rev() {
+                if fits(bundled_max, secondary) {
+                    return (bundled_max, secondary);
+                }
+            }
+            return (min_bundled, secondary);
+        }
+    }
+
+    for bundled_max in (1..=max_bundled_budget).rev() {
+        if fits(bundled_max, InitSecondaryGroups::Collapsed) {
+            return (bundled_max, InitSecondaryGroups::Collapsed);
+        }
+    }
+
+    for bundled_max in (1..=max_bundled_budget).rev() {
+        if fits(bundled_max, InitSecondaryGroups::Minimal) {
+            return (bundled_max, InitSecondaryGroups::Minimal);
+        }
+    }
+
+    (1, InitSecondaryGroups::Minimal)
+}
+
+/// Computes `(bundled_max_visible, installed_cap)` assuming an unwrapped viewport.
+#[cfg(test)]
+pub(crate) fn init_multiselect_budget_for_window(
+    inventory: &InitPluginInventory,
+    rows: u16,
+) -> (usize, usize) {
+    let (bundled_max, secondary) = init_multiselect_layout_for_viewport(inventory, rows, None);
+    let installed_cap = match secondary {
+        InitSecondaryGroups::Shown { installed_cap } => installed_cap,
+        InitSecondaryGroups::Collapsed | InitSecondaryGroups::Minimal => 0,
+    };
+    (bundled_max, installed_cap)
+}
+
+/// Queries live Unix terminal dimensions for the multiselect budget.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_layout(
+    inventory: &InitPluginInventory,
+    inplace: bool,
+) -> (usize, InitSecondaryGroups, Option<u16>) {
+    if let Some((rows, cols)) = init_live_terminal_winsize(inplace) {
+        let (bundled_max, secondary) = init_multiselect_layout_for_viewport(inventory, rows, cols);
+        return (bundled_max, secondary, cols);
+    }
+    (
+        INIT_PICKER_DEFAULT_MAX_VISIBLE,
+        InitSecondaryGroups::Shown {
+            installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        },
+        None,
+    )
+}
+
+/// Renders only the bundled group (without secondary groups) for collapsed/minimal
+/// viewports.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_plugin_bundled_rows_only(
+    inventory: &InitPluginInventory,
+    cursor: usize,
+    max_visible: usize,
+    bundled_row: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if inventory.bundled.is_empty() {
+        lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
+    } else {
+        let (start, end) = init_picker_window(inventory.bundled.len(), cursor, max_visible);
+        for (index, id) in inventory.bundled.iter().enumerate().take(end).skip(start) {
+            lines.push(bundled_row(index, id));
+        }
+        if start > 0 || end < inventory.bundled.len() {
+            lines.push(format!(
+                "    ({}-{end} of {} bundled plugins)",
+                start + 1,
+                inventory.bundled.len()
+            ));
+        }
+    }
+    lines
+}
+
+/// Renders the three inventory groups with an optional sliding window.
+///
+/// Bounds [`InitPluginInventory::bundled`] and [`InitPluginInventory::installed`]
+/// to `(cursor, bundled_max_visible, installed_cap)` when interactive windowing
+/// is enabled.
+fn init_plugin_inventory_groups_windowed(
+    inventory: &InitPluginInventory,
+    window: Option<(usize, usize, usize)>,
+    bundled_row: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(INIT_PLUGIN_BUNDLED_HEADER.to_string());
     if inventory.bundled.is_empty() {
         lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
     } else {
-        for (index, id) in inventory.bundled.iter().enumerate() {
+        let (start, end) = match window {
+            Some((cursor, max_visible, _)) => {
+                init_picker_window(inventory.bundled.len(), cursor, max_visible)
+            }
+            None => (0, inventory.bundled.len()),
+        };
+        for (index, id) in inventory.bundled.iter().enumerate().take(end).skip(start) {
             lines.push(bundled_row(index, id));
+        }
+        if start > 0 || end < inventory.bundled.len() {
+            lines.push(format!(
+                "    ({}-{end} of {} bundled plugins)",
+                start + 1,
+                inventory.bundled.len()
+            ));
         }
     }
     lines.push(INIT_PLUGIN_INSTALLED_HEADER.to_string());
     if inventory.installed.is_empty() {
         lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
     } else {
-        for plugin in inventory
-            .installed
-            .iter()
-            .take(INIT_PLUGIN_INSTALLED_ROWS_MAX)
-        {
+        let installed_cap = match window {
+            Some((_, _, cap)) => cap,
+            None => INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        };
+        if installed_cap == 0 {
+            let count = inventory.installed.len();
             lines.push(format!(
-                "    - {} {} ({})",
-                plugin.id,
-                plugin.version,
-                if plugin.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "    - {count} installed plugin{} (bitty plugin list)",
+                if count == 1 { "" } else { "s" }
             ));
-        }
-        if inventory.installed.len() > INIT_PLUGIN_INSTALLED_ROWS_MAX {
-            let hidden = inventory.installed.len() - INIT_PLUGIN_INSTALLED_ROWS_MAX;
-            lines.push(format!(
-                "    - +{hidden} more installed plugin{} (bitty plugin list)",
-                if hidden == 1 { "" } else { "s" }
-            ));
+        } else {
+            for plugin in inventory.installed.iter().take(installed_cap) {
+                lines.push(format!(
+                    "    - {} {} ({})",
+                    plugin.id,
+                    plugin.version,
+                    if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ));
+            }
+            if inventory.installed.len() > installed_cap {
+                let hidden = inventory.installed.len() - installed_cap;
+                lines.push(format!(
+                    "    - +{hidden} more installed plugin{} (bitty plugin list)",
+                    if hidden == 1 { "" } else { "s" }
+                ));
+            }
         }
     }
     lines.push(INIT_PLUGIN_NETWORK_HEADER.to_string());
@@ -2977,23 +3499,17 @@ fn init_plugin_inventory_groups(
     lines
 }
 
-/// Renders one multi-select frame: the prompt, the three inventory groups
-/// (with one `[ ]`/`[x]` row per bundled id and the `>` cursor marker), then
-/// the key hint. The frame height is stable for the whole session, so
-/// in-place repaints stay aligned.
-///
-/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
-/// through tests, hence the dead-code allowance there.)
+/// Renders one multi-select frame with explicit [`InitSecondaryGroups`] control.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn init_multiselect_block(
+pub(crate) fn init_multiselect_block_with_layout(
     inventory: &InitPluginInventory,
     cursor: usize,
+    max_visible: usize,
+    secondary: InitSecondaryGroups,
     selected: &[bool],
     color: bool,
 ) -> Vec<String> {
-    let mut block = Vec::new();
-    block.push(INIT_PLUGIN_PROMPT.to_string());
-    block.extend(init_plugin_inventory_groups(inventory, &|index, id| {
+    let format_bundled = |index: usize, id: &str| {
         let is_cursor = index == cursor;
         let marker = if is_cursor {
             if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
@@ -3011,9 +3527,60 @@ fn init_multiselect_block(
             id.to_string()
         };
         format!("{marker} {checkbox} {label}")
-    }));
-    block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+    };
+    let mut block = Vec::new();
+    match secondary {
+        InitSecondaryGroups::Shown { installed_cap } => {
+            block.push(INIT_PLUGIN_PROMPT.to_string());
+            block.extend(init_plugin_inventory_groups_windowed(
+                inventory,
+                Some((cursor, max_visible, installed_cap)),
+                &format_bundled,
+            ));
+            block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+        }
+        InitSecondaryGroups::Collapsed => {
+            block.push(INIT_PLUGIN_PROMPT.to_string());
+            block.extend(init_plugin_bundled_rows_only(
+                inventory,
+                cursor,
+                max_visible,
+                &format_bundled,
+            ));
+            block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+        }
+        InitSecondaryGroups::Minimal => {
+            block.extend(init_plugin_bundled_rows_only(
+                inventory,
+                cursor,
+                max_visible,
+                &format_bundled,
+            ));
+        }
+    }
     block
+}
+
+/// Renders one multi-select frame: the prompt, the three inventory groups
+/// (with one `[ ]`/`[x]` row per bundled id and the `>` cursor marker), then
+/// the key hint.
+#[cfg(test)]
+pub(crate) fn init_multiselect_block(
+    inventory: &InitPluginInventory,
+    cursor: usize,
+    max_visible: usize,
+    installed_cap: usize,
+    selected: &[bool],
+    color: bool,
+) -> Vec<String> {
+    init_multiselect_block_with_layout(
+        inventory,
+        cursor,
+        max_visible,
+        InitSecondaryGroups::Shown { installed_cap },
+        selected,
+        color,
+    )
 }
 
 /// Selected ids in catalog order (empty when nothing is checked).
@@ -3056,6 +3623,97 @@ pub(crate) fn init_multiselect_key_loop(
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_impl(
+        input,
+        output,
+        inventory,
+        &mut |inv| init_multiselect_layout(inv, inplace),
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+/// [`init_multiselect_key_loop`] with an explicit bundled window bound.
+#[cfg(test)]
+pub(crate) fn init_multiselect_key_loop_with_max_visible(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    max_visible: usize,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_impl(
+        input,
+        output,
+        inventory,
+        &mut |_| {
+            (
+                max_visible,
+                InitSecondaryGroups::Shown {
+                    installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+                },
+                None,
+            )
+        },
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+/// [`init_multiselect_key_loop`] driven by an injectable live viewport probe for
+/// resize-during-navigation tests.
+#[cfg(test)]
+pub(crate) fn init_multiselect_key_loop_with_viewport(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_impl(
+        input,
+        output,
+        inventory,
+        &mut |inv| match query_winsize() {
+            Some((rows, cols)) => {
+                let (max_visible, secondary) =
+                    init_multiselect_layout_for_viewport(inv, rows, cols);
+                (max_visible, secondary, cols)
+            }
+            None => (
+                INIT_PICKER_DEFAULT_MAX_VISIBLE,
+                InitSecondaryGroups::Shown {
+                    installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+                },
+                None,
+            ),
+        },
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+type InitMultiselectLayoutFn<'a> =
+    &'a mut dyn FnMut(&InitPluginInventory) -> (usize, InitSecondaryGroups, Option<u16>);
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_key_loop_impl(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    layout_for_frame: InitMultiselectLayoutFn<'_>,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
     let ids = &inventory.bundled;
     assert!(!ids.is_empty(), "plugin list must not be empty");
     let mut cursor = 0usize;
@@ -3065,19 +3723,16 @@ pub(crate) fn init_multiselect_key_loop(
     }
     let mut rendered: usize = 0;
     let result = loop {
-        let block = init_multiselect_block(inventory, cursor, &selected, color);
-        if inplace && rendered > 0 {
-            let _ = write!(output, "\x1b[{rendered}A");
-        }
-        for line in &block {
-            if inplace {
-                let _ = write!(output, "\r\x1b[K{line}\n");
-            } else {
-                let _ = writeln!(output, "{line}");
-            }
-        }
-        let _ = output.flush();
-        rendered = block.len();
+        let (max_visible, secondary, cols) = layout_for_frame(inventory);
+        let block = init_multiselect_block_with_layout(
+            inventory,
+            cursor,
+            max_visible,
+            secondary,
+            &selected,
+            color,
+        );
+        rendered = init_paint_inplace_frame(output, &block, inplace, rendered, cols);
         // One key: a lone byte, or an `ESC`-led burst.
         let Some(first) = init_key_read_byte(&mut *input) else {
             break Err("bitty init: aborted (end of input)".to_string());
@@ -3129,6 +3784,7 @@ pub(crate) fn init_multiselect_key_loop(
         }
         match first {
             b'\r' | b'\n' => break Ok(init_multiselect_selection(ids, &selected)),
+            0x03 => break Err("bitty init: aborted (cancelled)".to_string()),
             0x04 => break Err("bitty init: aborted (end of input)".to_string()),
             b' ' => selected[cursor] = !selected[cursor],
             b'j' | b'J' => cursor = (cursor + 1) % ids.len(),
@@ -3137,6 +3793,9 @@ pub(crate) fn init_multiselect_key_loop(
         }
     };
     if inplace {
+        if rendered > 0 {
+            let _ = write!(output, "\x1b[{rendered}A\r\x1b[J");
+        }
         let _ = write!(output, "\x1b[?25h");
         let _ = output.flush();
     }
@@ -3694,9 +4353,139 @@ fn init_preview_runtime(
 /// touched. Gated on an enabled preview; a disabled preview prints nothing.
 /// Styling resolves with `resolve_theme_with_status` (no stderr), so an
 /// unknown seeded theme still echoes its stored name in default colors.
-fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
+fn init_char_display_width(ch: char) -> usize {
+    if ch.is_control() {
+        0
+    } else {
+        usize::from(bitty_term_state::char_cell_width(ch))
+    }
+}
+
+/// Terminal cell width for an unstyled single-line string computed via Core's
+/// UCD `East_Asian_Width` + zero-width tables (`bitty_term_state::char_cell_width`).
+pub(crate) fn init_display_width(text: &str) -> usize {
+    text.chars().map(init_char_display_width).sum()
+}
+
+/// Calls `visit` with the cell width of every printable glyph in `text`,
+/// skipping ANSI CSI escape sequences (`\x1b[...<final byte>`).
+fn init_for_each_visible_width(text: &str, mut visit: impl FnMut(usize)) {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for seq in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&seq) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        visit(init_char_display_width(ch));
+    }
+}
+
+/// Terminal cell width of a single line after stripping ANSI CSI escape
+/// sequences (`\x1b[...<final byte>`).
+pub(crate) fn init_visible_display_width(text: &str) -> usize {
+    let mut width = 0usize;
+    init_for_each_visible_width(text, |glyph| width = width.saturating_add(glyph));
+    width
+}
+
+/// Number of physical terminal rows occupied by `line` at `cols` columns.
+///
+/// Simulates the greedy deferred wrap a VT performs: cells accumulate on the
+/// current row, and a glyph that does not fit the remaining cells starts the
+/// next row, so a two-cell East Asian glyph never straddles the right edge and
+/// leaves the leftover cell blank. Combining marks and ANSI styling take no
+/// cells. Empty, styling-only and `cols`-less lines occupy one row.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_line_physical_rows(line: &str, cols: Option<u16>) -> usize {
+    let Some(cols) = cols.map(usize::from).filter(|&c| c > 0) else {
+        return 1;
+    };
+    let mut wraps = 0usize;
+    let mut used = 0usize;
+    let mut painted = false;
+    init_for_each_visible_width(line, |glyph| {
+        if glyph == 0 {
+            return;
+        }
+        painted = true;
+        if used > 0 && used + glyph > cols {
+            wraps += 1;
+            used = 0;
+        }
+        // A glyph wider than the whole terminal still occupies one row; clamp
+        // so the following glyph opens the next one.
+        used = (used + glyph).min(cols);
+    });
+    if painted { wraps + 1 } else { 1 }
+}
+
+/// Total physical terminal rows occupied by a block of lines at `cols` columns.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_frame_physical_rows(block: &[String], cols: Option<u16>) -> usize {
+    block
+        .iter()
+        .map(|line| init_line_physical_rows(line, cols))
+        .sum()
+}
+
+/// Constrains an unstyled preview line to `max_cols.saturating_sub(1)`
+/// terminal cells when `max_cols` is known, appending `...` on truncation so
+/// the live status preview stays on one physical row whenever the terminal is
+/// reasonably wide.
+pub(crate) fn init_fit_preview_line(line: &str, max_cols: Option<usize>) -> String {
+    let Some(cols) = max_cols.filter(|&cols| cols > 1) else {
+        return line.to_string();
+    };
+    let budget = cols - 1;
+    if init_display_width(line) <= budget {
+        return line.to_string();
+    }
+    if budget <= 3 {
+        return line.chars().take(budget).collect();
+    }
+    let prefix_budget = budget - 3;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in line.chars() {
+        let ch_width = init_char_display_width(ch);
+        if used + ch_width > prefix_budget {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn init_terminal_columns() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
+            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
+        if let Ok(ws) = winsize {
+            if ws.ws_col > 0 {
+                return Some(ws.ws_col as usize);
+            }
+        }
+    }
+    None
+}
+
+fn init_format_preview_echo_for_cols(
+    preview: &InitPreview,
+    color: bool,
+    max_cols: Option<usize>,
+) -> Option<(String, usize)> {
     if !preview.is_enabled() {
-        return;
+        return None;
     }
     let current = preview.current();
     let (resolved, _) =
@@ -3706,7 +4495,7 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     } else {
         format!("{}", current.font.size)
     };
-    let line = format!(
+    let raw_line = format!(
         "  (preview: theme={:?}, font={:?} {}pt, gaps {}/{}, border {}, radius {})",
         current.appearance.theme.as_deref().unwrap_or("default"),
         current.font.family,
@@ -3716,13 +4505,73 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
         current.decoration.border,
         current.decoration.radius,
     );
+    let fitted = init_fit_preview_line(&raw_line, max_cols);
+    let physical_rows = match max_cols.filter(|&cols| cols > 0) {
+        Some(cols) => init_display_width(&fitted).max(1).div_ceil(cols),
+        None => 1,
+    };
     let item = InitOptionItem {
-        label: line,
+        label: fitted,
         value_text: String::new(),
         style_fg: Some(resolved.foreground),
         style_bg: Some(resolved.background),
     };
-    let _ = writeln!(output, "{}", init_style_label(&item, false, color));
+    Some((init_style_label(&item, false, color), physical_rows))
+}
+
+fn init_format_preview_echo(preview: &InitPreview, color: bool) -> Option<String> {
+    init_format_preview_echo_for_cols(preview, color, None).map(|(styled, _)| styled)
+}
+
+fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview, color: bool) {
+    if let Some(styled) = init_format_preview_echo(preview, color) {
+        let _ = writeln!(output, "{styled}");
+    }
+}
+
+pub(crate) fn init_emit_step_preview_echo_for_cols(
+    output: &mut dyn std::io::Write,
+    preview: &InitPreview,
+    color: bool,
+    inplace_steps: bool,
+    prev_preview_rows: &mut usize,
+    max_cols: Option<usize>,
+) {
+    if !inplace_steps {
+        init_emit_preview_echo(output, preview, color);
+        return;
+    }
+    let Some((styled, rows)) = init_format_preview_echo_for_cols(preview, color, max_cols) else {
+        return;
+    };
+    if *prev_preview_rows > 0 {
+        let _ = write!(
+            output,
+            "\x1b[{rows}A\r\x1b[J{styled}\n",
+            rows = *prev_preview_rows
+        );
+    } else {
+        let _ = write!(output, "\r\x1b[K{styled}\n");
+    }
+    *prev_preview_rows = rows;
+    let _ = output.flush();
+}
+
+fn init_emit_step_preview_echo(
+    output: &mut dyn std::io::Write,
+    preview: &InitPreview,
+    color: bool,
+    inplace_steps: bool,
+    prev_preview_rows: &mut usize,
+) {
+    init_emit_step_preview_echo_for_cols(
+        output,
+        preview,
+        color,
+        inplace_steps,
+        prev_preview_rows,
+        init_terminal_columns(),
+    );
 }
 
 /// Push only the theme half of the preview overlay through the live-adopt
@@ -3996,7 +4845,14 @@ fn run_init_interactive_impl(
     if let (Some(active), Some(runtime)) = (preview.as_deref(), live.as_mut()) {
         let _ = init_preview_push_live(runtime, active);
     }
-    let _ = writeln!(output, "\nShell:");
+    #[cfg(unix)]
+    let inplace_steps = tty_interactive && nix::sys::termios::tcgetattr(std::io::stdin()).is_ok();
+    #[cfg(not(unix))]
+    let inplace_steps = false;
+    let mut preview_rows: usize = 0;
+    if !inplace_steps {
+        let _ = writeln!(output, "\nShell:");
+    }
     let shell_options: Vec<InitOptionItem> = candidates
         .iter()
         .enumerate()
@@ -4035,7 +4891,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let theme = match &overrides.theme {
         Some(theme) => theme.clone(),
@@ -4115,7 +4971,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let font_family = match &overrides.font_family {
         Some(family) => family.clone(),
@@ -4173,7 +5029,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let font_size = match overrides.font_size {
         Some(size) => size,
@@ -4236,12 +5092,14 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
-    let _ = writeln!(
-        output,
-        "\nDecoration (logical pixels; 0 disables; see RFC-0001):"
-    );
+    if !inplace_steps {
+        let _ = writeln!(
+            output,
+            "\nDecoration (logical pixels; 0 disables; see RFC-0001):"
+        );
+    }
     let gaps_in = match overrides.gaps_in {
         Some(value) => value,
         None => {
@@ -4306,7 +5164,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let gaps_out = match overrides.gaps_out {
         Some(value) => value,
@@ -4372,7 +5230,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let border = match overrides.border {
         Some(value) => value,
@@ -4437,7 +5295,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let radius = match overrides.radius {
         Some(value) => value,
@@ -4503,9 +5361,11 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
-    let _ = writeln!(output, "\nBehavior:");
+    if !inplace_steps {
+        let _ = writeln!(output, "\nBehavior:");
+    }
     let scrollback = match overrides.scrollback {
         Some(value) => value,
         None => {
@@ -4556,7 +5416,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let close_confirm = match overrides.close_confirm {
         Some(mode) => mode,
@@ -4611,7 +5471,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     let preset_options = vec![
         InitOptionItem {
@@ -4651,7 +5511,7 @@ fn run_init_interactive_impl(
         let _ = init_preview_push_live(runtime, active);
     }
     if let Some(active) = preview.as_deref() {
-        init_emit_preview_echo(output, active, color);
+        init_emit_step_preview_echo(output, active, color, inplace_steps, &mut preview_rows);
     }
     Ok(InitAnswers {
         shell,
@@ -4782,8 +5642,211 @@ pub(crate) fn write_init_config(
     })
 }
 
-/// Copies the current bytes to a collision-free `<name>.bak[.N]` sibling
-/// using `create_new` so the sole recovery copy is never overwritten.
+/// Resolves the centralized `.backups/` directory for `target`.
+///
+/// Profiles under `<config_root>/profiles/` map to `<config_root>/.backups/profiles/`
+/// so all backups live inside one `<config_root>/.backups/` hierarchy rather than
+/// cluttering `profiles/` or `<config_root>/`.
+pub(crate) fn config_backup_dir_for(target: &std::path::Path) -> std::path::PathBuf {
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    if parent.file_name().is_some_and(|name| name == "profiles") {
+        if let Some(config_root) = parent.parent() {
+            let root = if config_root.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                config_root
+            };
+            return root.join(CONFIG_BACKUP_DIR_NAME).join("profiles");
+        }
+    }
+    parent.join(CONFIG_BACKUP_DIR_NAME)
+}
+
+/// Returns the canonical `<backup_dir>/<file_name>.bak` path for `target`.
+pub(crate) fn config_backup_path_for(target: &std::path::Path) -> std::path::PathBuf {
+    let name = target.file_name().map_or_else(
+        || "config.lua".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    config_backup_dir_for(target).join(format!("{name}.bak"))
+}
+
+fn ensure_single_backup_dir(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "backup directory '{}' is not a regular directory",
+                        dir.display()
+                    ),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            match builder.create(dir) {
+                Ok(()) => Ok(()),
+                Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let meta = std::fs::symlink_metadata(dir)?;
+                    if meta.file_type().is_symlink() || !meta.is_dir() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!(
+                                "backup directory '{}' is not a regular directory",
+                                dir.display()
+                            ),
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(create_err) => Err(create_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Ensures `backup_dir` (and `.backups` parent for `.backups/profiles`) exists
+/// as a non-symlink owner-only (`0700` on Unix) directory.
+pub(crate) fn ensure_config_backup_dir(backup_dir: &std::path::Path) -> Result<(), std::io::Error> {
+    if backup_dir
+        .file_name()
+        .is_some_and(|name| name == "profiles")
+    {
+        if let Some(root_backups) = backup_dir.parent() {
+            if !root_backups.as_os_str().is_empty() {
+                ensure_single_backup_dir(root_backups)?;
+            }
+        }
+    }
+    ensure_single_backup_dir(backup_dir)
+}
+
+/// Writes `content` to `target`, preserving any previous selector bytes in a
+/// single rolling `<config_root>/.backups/<selector>.bak` copy instead of
+/// accumulating `.bak.N` siblings across repeated profile switches.
+pub(crate) fn write_selector_with_rolling_backup(
+    target: &std::path::Path,
+    content: &str,
+) -> Result<InitWriteOutcome, InitWriteError> {
+    {
+        let source = bitty_config::plan::ConfigSource::new(
+            bitty_config::plan::LayerKind::User,
+            Some(target.display().to_string()),
+        );
+        bitty_config::file::parse_lua_config(content, &source).map_err(|err| {
+            InitWriteError::Refused(format!(
+                "bitty init: generated config is invalid ({err}) — refusing to write"
+            ))
+        })?;
+    }
+    let existing = match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: refusing to write through symlink '{}'",
+                    target.display()
+                )));
+            }
+            if !meta.is_file() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: '{}' is not a regular file; refusing to replace it",
+                    target.display()
+                )));
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(InitWriteError::Io(format!(
+                "bitty init: cannot inspect '{}': {err}",
+                target.display()
+            )));
+        }
+    };
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                InitWriteError::Io(format!(
+                    "bitty init: cannot create '{}': {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    let backup = if existing {
+        let meta = std::fs::metadata(target).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot inspect '{}': {err}",
+                target.display()
+            ))
+        })?;
+        if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+            return Err(InitWriteError::Refused(format!(
+                "bitty init: '{}' exceeds {} bytes; refusing to back up and replace it",
+                target.display(),
+                bitty_config::file::MAX_CONFIG_FILE_BYTES
+            )));
+        }
+        let previous = std::fs::read_to_string(target).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot read '{}': {err}",
+                target.display()
+            ))
+        })?;
+        let backup_dir = config_backup_dir_for(target);
+        ensure_config_backup_dir(&backup_dir).map_err(|err| {
+            InitWriteError::Io(format!(
+                "bitty init: cannot prepare backup directory '{}': {err}",
+                backup_dir.display()
+            ))
+        })?;
+        let backup_path = config_backup_path_for(target);
+        if let Ok(meta) = std::fs::symlink_metadata(&backup_path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(InitWriteError::Refused(format!(
+                    "bitty init: refusing to overwrite non-regular backup '{}'",
+                    backup_path.display()
+                )));
+            }
+        }
+        replace_atomically(&backup_path, &previous)?;
+        Some(backup_path)
+    } else {
+        None
+    };
+    if existing {
+        replace_atomically(target, content)?;
+    } else {
+        create_new_exclusively(target, content)?;
+    }
+    Ok(InitWriteOutcome {
+        path: target.to_path_buf(),
+        backup,
+        updated: existing,
+    })
+}
+
+/// Copies the current bytes to a collision-free `<backup_dir>/<name>.bak[.N]`
+/// path inside `<config_root>/.backups/` using `create_new` so an older
+/// recovery copy is never overwritten.
 fn write_recoverable_backup(
     target: &std::path::Path,
 ) -> Result<std::path::PathBuf, InitWriteError> {
@@ -4806,15 +5869,22 @@ fn write_recoverable_backup(
             target.display()
         ))
     })?;
+    let backup_dir = config_backup_dir_for(target);
+    ensure_config_backup_dir(&backup_dir).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot prepare backup directory '{}': {err}",
+            backup_dir.display()
+        ))
+    })?;
     let name = target.file_name().map_or_else(
         || "config.lua".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
     for attempt in 0..=INIT_MAX_BACKUP_ATTEMPTS {
         let candidate = if attempt == 0 {
-            target.with_file_name(format!("{name}.bak"))
+            backup_dir.join(format!("{name}.bak"))
         } else {
-            target.with_file_name(format!("{name}.bak.{attempt}"))
+            backup_dir.join(format!("{name}.bak.{attempt}"))
         };
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -4833,6 +5903,13 @@ fn write_recoverable_backup(
                         candidate.display()
                     ))
                 })?;
+                sync_parent_dir(&candidate);
+                if backup_dir
+                    .file_name()
+                    .is_some_and(|dir_name| dir_name == "profiles")
+                {
+                    crate::profile::prune_excess_profile_backups(&backup_dir, &name, &candidate);
+                }
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -4845,8 +5922,8 @@ fn write_recoverable_backup(
         }
     }
     Err(InitWriteError::Io(format!(
-        "bitty init: exhausted {INIT_MAX_BACKUP_ATTEMPTS} backup names beside '{}'; remove an old .bak file",
-        target.display()
+        "bitty init: exhausted {INIT_MAX_BACKUP_ATTEMPTS} backup names in '{}'; remove an old .bak file",
+        backup_dir.display()
     )))
 }
 
@@ -5533,9 +6610,9 @@ pub(crate) fn init_prompt_plugin_selection(
     #[cfg(unix)]
     if tty_interactive {
         if let Some(_raw) = init_raw_guard() {
-            // One blank separator above the frame; the frame itself starts
-            // at column 0 so in-place cursor-up repaints stay aligned.
-            let _ = writeln!(output);
+            // Ensure the frame starts at column 0 without adding an orphan
+            // blank line that remains after the multiselect erases itself.
+            let _ = write!(output, "\r");
             let _ = output.flush();
             return init_multiselect_key_loop(
                 input,

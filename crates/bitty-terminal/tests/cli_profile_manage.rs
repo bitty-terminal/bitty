@@ -2586,3 +2586,87 @@ fn profile_backup_preserves_new_candidate_when_existing_backups_have_future_mtim
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn profile_retention_caps_mixed_init_and_profile_backup_formats_at_five() {
+    let root = scratch_root("mixed-backup-retention");
+    let backup_dir = root.join("bitty").join(".backups").join("profiles");
+    let all_work_backups = || -> Vec<PathBuf> {
+        std::fs::read_dir(&backup_dir)
+            .expect("profiles backup dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name == "work.lua.bak"
+                            || name.starts_with("work.lua.bak.")
+                            || name.starts_with("work.lua.bak-")
+                    })
+            })
+            .collect()
+    };
+
+    assert_ok(
+        &run_bitty(
+            &root,
+            &["init", "--yes", "--profile", "work", "--font-size", "12"],
+        ),
+        "initial work init",
+    );
+
+    for size in 13..=18 {
+        let size_arg = size.to_string();
+        assert_ok(
+            &run_bitty(
+                &root,
+                &[
+                    "init",
+                    "--yes",
+                    "--profile",
+                    "work",
+                    "--font-size",
+                    &size_arg,
+                    "--force",
+                ],
+            ),
+            &format!("forced work init {size}"),
+        );
+    }
+
+    let after_init = all_work_backups();
+    assert_eq!(
+        after_init.len(),
+        5,
+        "forced init backups for a profile must prune to 5: {after_init:?}"
+    );
+
+    let final_delete_body = "return { font = { size = 21 } }\n";
+    for cycle in 0..2 {
+        let body = if cycle == 1 {
+            final_delete_body.to_string()
+        } else {
+            format!("return {{ font = {{ size = {} }} }}\n", 20 + cycle)
+        };
+        write_profile(&root, "work", &body);
+        assert_ok(
+            &run_bitty(&root, &["config", "profile", "delete", "work"]),
+            &format!("delete work profile cycle {cycle}"),
+        );
+    }
+
+    let after_delete = all_work_backups();
+    assert_eq!(
+        after_delete.len(),
+        5,
+        "mixed .bak / .bak.N / .bak-<stamp> backups must prune to 5: {after_delete:?}"
+    );
+    assert!(
+        after_delete
+            .iter()
+            .any(|path| std::fs::read_to_string(path).ok().as_deref() == Some(final_delete_body)),
+        "most recent delete backup must survive mixed pruning: {after_delete:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -8923,6 +8923,17 @@ fn init_fit_preview_line_bounds_width_and_step_preview_clears_prior_rows() {
     );
     assert!(fitted.ends_with("..."), "expected ellipsis: {fitted:?}");
 
+    let sip_prefix = "  ".to_string() + &"\u{20000}".repeat(22);
+    let fitted_sip = crate::init::init_fit_preview_line(&sip_prefix, Some(40));
+    assert!(
+        crate::init::init_visible_display_width(&fitted_sip) <= 39,
+        "SIP U+20000 preview must stay <= 39 cells (width 2 per glyph): {fitted_sip:?}"
+    );
+    assert!(
+        fitted_sip.ends_with("..."),
+        "expected SIP preview truncation at 40 cols: {fitted_sip:?}"
+    );
+
     let mut preview = crate::init::InitPreview::enabled(bitty_config::fallback_builtin());
     preview.apply_font_family("JetBrainsMono Nerd Font");
     preview.apply_font_size(14.0);
@@ -8957,6 +8968,190 @@ fn init_fit_preview_line_bounds_width_and_step_preview_clears_prior_rows() {
     assert!(
         rendered.contains("\x1b[2A\r\x1b[J"),
         "wrapped preview must move up all prior physical rows: {rendered:?}"
+    );
+}
+
+#[test]
+fn init_multiselect_viewport_accounts_for_40_col_wrapping_9_row_fallback_and_live_resize() {
+    let bundled: Vec<String> = (0..12)
+        .map(|idx| format!("bundled.very-long-plugin-name-{idx:02}"))
+        .collect();
+    let installed: Vec<_> = (0..9)
+        .map(|idx| init_installed(&format!("inst.plugin-{idx:02}"), "1.0.0", true))
+        .collect();
+    let inventory = crate::init::InitPluginInventory {
+        bundled: bundled.clone(),
+        installed,
+        needs_network: vec![String::from("official.remote")],
+        warning: Some(String::from(
+            "marketplace cache is stale on narrow terminals and wraps cleanly",
+        )),
+    };
+    let selected = vec![false; bundled.len()];
+    // Independent oracle: these fixtures paint without color, so every frame
+    // line is plain text and its wrapped height follows from the cell width.
+    let wrapped_rows = |block: &[String], cols: u16| -> usize {
+        block
+            .iter()
+            .map(|line| {
+                crate::init::init_display_width(line)
+                    .max(1)
+                    .div_ceil(usize::from(cols))
+            })
+            .sum()
+    };
+
+    for (rows, cols) in [(24u16, 40u16), (9, 80), (9, 40)] {
+        let (max_visible, secondary) =
+            crate::init::init_multiselect_layout_for_viewport(&inventory, rows, Some(cols));
+        let block = crate::init::init_multiselect_block_with_layout(
+            &inventory,
+            bundled.len() - 1,
+            max_visible,
+            secondary,
+            &selected,
+            false,
+        );
+        let physical = wrapped_rows(&block, cols);
+        assert!(
+            physical <= usize::from(rows).saturating_sub(1),
+            "rows={rows}, cols={cols}: physical rows {physical} exceeded budget {}:\n{}",
+            usize::from(rows).saturating_sub(1),
+            block.join("\n")
+        );
+        assert!(
+            block
+                .iter()
+                .any(|line| line.contains("bundled.very-long-plugin-name-11")),
+            "rows={rows}, cols={cols}: cursor item must stay visible:\n{}",
+            block.join("\n")
+        );
+    }
+
+    // Budgeting logical lines alone overflows 24x40 here, so the fitted layout
+    // above is what keeps the cursor row on screen.
+    let unbounded = crate::init::init_multiselect_block_with_layout(
+        &inventory,
+        bundled.len() - 1,
+        10,
+        crate::init::InitSecondaryGroups::Shown { installed_cap: 8 },
+        &selected,
+        false,
+    );
+    assert!(
+        wrapped_rows(&unbounded, 40) > 23,
+        "fixture must overflow 24x40 without physical-row budgeting: {}",
+        wrapped_rows(&unbounded, 40)
+    );
+
+    // Repaint and cleanup move up by PHYSICAL rows: the wrapped 40-column frame
+    // must erase by its wrapped height, not by its logical line count.
+    let (visible, secondary) =
+        crate::init::init_multiselect_layout_for_viewport(&inventory, 24, Some(40));
+    let first_frame = crate::init::init_multiselect_block_with_layout(
+        &inventory, 0, visible, secondary, &selected, false,
+    );
+    let first_frame_rows = wrapped_rows(&first_frame, 40);
+    assert!(
+        first_frame_rows > first_frame.len(),
+        "fixture must wrap at 40 columns ({first_frame_rows} rows over {} lines)",
+        first_frame.len()
+    );
+    let mut narrow_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut narrow_output = Vec::new();
+    let chosen = crate::init::init_multiselect_key_loop_with_viewport(
+        &mut narrow_input,
+        &mut narrow_output,
+        &inventory,
+        &mut || Some((24, Some(40))),
+        false,
+        true,
+        &mut |_| false,
+    )
+    .expect("multiselect key loop succeeds at 40 columns");
+    assert!(chosen.is_empty());
+    let painted = String::from_utf8(narrow_output).expect("UTF-8");
+    assert!(
+        painted.contains(&format!("\x1b[{first_frame_rows}A")),
+        "repaint and cleanup must move up {first_frame_rows} physical rows: {painted:?}"
+    );
+
+    // Live resize mid-navigation (24x80 -> 12x80) recomputes the budget: the
+    // installed preview that fits 24 rows no longer fits 12.
+    let mut resize_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut resize_output = Vec::new();
+    let mut multi_frame = 0usize;
+    crate::init::init_multiselect_key_loop_with_viewport(
+        &mut resize_input,
+        &mut resize_output,
+        &inventory,
+        &mut || {
+            multi_frame += 1;
+            if multi_frame == 1 {
+                Some((24, Some(80)))
+            } else {
+                Some((12, Some(80)))
+            }
+        },
+        false,
+        true,
+        &mut |_| false,
+    )
+    .expect("multiselect key loop succeeds across live resize");
+    let multi_rendered = String::from_utf8(resize_output).expect("UTF-8");
+    assert_eq!(
+        multi_rendered
+            .matches("Installed (already present locally):")
+            .count(),
+        1,
+        "a 24 -> 12 row shrink must drop the installed preview from later frames: {multi_rendered:?}"
+    );
+
+    // The picker recomputes its option window the same way (24x80 -> 10x80).
+    let options: Vec<crate::init::InitOptionItem> = (0..15)
+        .map(|idx| crate::init::InitOptionItem {
+            label: format!("option-item-{idx:02} (alias-a, alias-b)"),
+            value_text: format!("option-item-{idx:02}"),
+            style_fg: None,
+            style_bg: None,
+        })
+        .collect();
+    let mut picker_input = std::io::Cursor::new(b"j\n".to_vec());
+    let mut picker_output = Vec::new();
+    let mut picker_history = Vec::new();
+    let mut picker_frame = 0usize;
+    let picked = crate::init::init_picker_key_loop_with_viewport(
+        &mut picker_input,
+        &mut picker_output,
+        "Theme",
+        &options,
+        0,
+        &mut || {
+            picker_frame += 1;
+            if picker_frame == 1 {
+                Some((24, Some(80)))
+            } else {
+                Some((10, Some(80)))
+            }
+        },
+        false,
+        false,
+        |raw| Ok(raw.to_string()),
+        &mut picker_history,
+        true,
+        &mut |_| false,
+        None,
+    )
+    .expect("picker key loop succeeds across live resize");
+    assert_eq!(picked, "option-item-01");
+    let picker_rendered = String::from_utf8(picker_output).expect("UTF-8");
+    assert!(
+        picker_rendered.contains("1-10 of 15"),
+        "a 24-row terminal must show the full 10-option window: {picker_rendered:?}"
+    );
+    assert!(
+        picker_rendered.contains("1-3 of 15"),
+        "a 24 -> 10 row shrink must shrink the option window: {picker_rendered:?}"
     );
 }
 

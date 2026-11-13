@@ -3295,11 +3295,24 @@ fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
 const PROFILE_MAX_RETAINED_BACKUPS: usize = 5;
 
 /// Retains at most [`PROFILE_MAX_RETAINED_BACKUPS`] timestamped backups for
-/// Enforces [`PROFILE_MAX_RETAINED_BACKUPS`] per profile stem by removing the
-/// oldest surplus `*.bak-*` copies inside `backup_dir`, while never deleting
+/// Returns `true` when `name` is any retained backup for profile `file_name`:
+/// timestamped (`<file>.bak-<stamp>`), initial (`<file>.bak`), or indexed
+/// (`<file>.bak.<N>`).
+pub(crate) fn is_profile_backup_name(name: &str, file_name: &str) -> bool {
+    if name == format!("{file_name}.bak") {
+        return true;
+    }
+    if name.starts_with(&format!("{file_name}.bak-")) {
+        return true;
+    }
+    name.strip_prefix(&format!("{file_name}.bak."))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Enforces [`PROFILE_MAX_RETAINED_BACKUPS`] per profile stem across all
+/// retained backup naming formats inside `backup_dir`, while never deleting
 /// `keep_path` (even if older entries carry future modification timestamps).
-fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str, keep_path: &Path) {
-    let prefix = format!("{file_name}.bak-");
+pub(crate) fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str, keep_path: &Path) {
     let Ok(entries) = std::fs::read_dir(backup_dir) else {
         return;
     };
@@ -3311,7 +3324,7 @@ fn prune_excess_profile_backups(backup_dir: &Path, file_name: &str, keep_path: &
             continue;
         }
         let name = os_name.to_string_lossy().into_owned();
-        if !name.starts_with(&prefix) {
+        if !is_profile_backup_name(&name, file_name) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {

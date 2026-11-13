@@ -2441,39 +2441,71 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
 /// preview-free (every non-theme step, and every non-interactive run).
 pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
 
-/// Bounded visible option rows for a terminal `rows` high.
-///
-/// Reserves the picker chrome and clamps into
-/// `[INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE]`, so a short
-/// window still paints a usable window and a tall one never over-renders.
-#[cfg(unix)]
-pub(crate) fn init_picker_rows_for_window(rows: u16) -> usize {
-    (rows as usize)
-        .saturating_sub(INIT_PICKER_CHROME_ROWS)
-        .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE)
-}
-
-/// Computes the visible option row count for interactive pickers.
-///
-/// Queries the live Unix terminal row count via `rustix::termios::tcgetwinsize`
-/// when repainting in place, clamping to `[3, 10]` after reserving chrome rows
-/// so long option catalogs (such as the 28 theme presets) never scroll past
-/// the top of a short window.
+/// Queries the live Unix terminal window dimensions `(rows, optional cols)`
+/// when repainting in place and `ws_row > 0`.
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn init_picker_max_visible(inplace: bool) -> usize {
+fn init_live_terminal_winsize(inplace: bool) -> Option<(u16, Option<u16>)> {
     #[cfg(unix)]
     if inplace {
         let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
             .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
         if let Ok(ws) = winsize {
             if ws.ws_row > 0 {
-                return init_picker_rows_for_window(ws.ws_row);
+                return Some((ws.ws_row, (ws.ws_col > 0).then_some(ws.ws_col)));
             }
         }
     }
     #[cfg(not(unix))]
     let _ = inplace;
-    INIT_PICKER_DEFAULT_MAX_VISIBLE
+    None
+}
+
+/// Bounded visible option rows for a terminal `rows` high.
+///
+/// Reserves the picker chrome and clamps into
+/// `[INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE]`, so a short
+/// window still paints a usable window and a tall one never over-renders.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_picker_rows_for_window(rows: u16) -> usize {
+    (rows as usize)
+        .saturating_sub(INIT_PICKER_CHROME_ROWS)
+        .clamp(INIT_PICKER_MIN_VISIBLE, INIT_PICKER_DEFAULT_MAX_VISIBLE)
+}
+
+/// Repaints an interactive picker/multiselect block in place, moving up
+/// `rendered` physical rows and returning the newly painted physical height.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_paint_inplace_frame(
+    output: &mut dyn std::io::Write,
+    block: &[String],
+    inplace: bool,
+    rendered: usize,
+    cols: Option<u16>,
+) -> usize {
+    let new_physical = if inplace {
+        init_frame_physical_rows(block, cols)
+    } else {
+        block.len()
+    };
+    if inplace && rendered > 0 {
+        let _ = write!(output, "\x1b[{rendered}A");
+    }
+    for line in block {
+        if inplace {
+            if init_line_physical_rows(line, cols) > 1 {
+                let _ = write!(output, "\r\x1b[K{line}\x1b[K\n");
+            } else {
+                let _ = write!(output, "\r\x1b[K{line}\n");
+            }
+        } else {
+            let _ = writeln!(output, "{line}");
+        }
+    }
+    if inplace && rendered > new_physical {
+        let _ = write!(output, "\r\x1b[J");
+    }
+    let _ = output.flush();
+    new_physical
 }
 
 /// Returns the inclusive-start, exclusive-end sliding window keeping `cursor`
@@ -2658,13 +2690,14 @@ pub(crate) fn init_picker_key_loop<T>(
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
     preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
-    init_picker_key_loop_with_max_visible(
+    init_picker_key_loop_impl(
         input,
         output,
         prompt,
         options,
         default_index,
-        init_picker_max_visible(inplace),
+        None,
+        &mut || init_live_terminal_winsize(inplace),
         color,
         numbered,
         parse,
@@ -2675,8 +2708,8 @@ pub(crate) fn init_picker_key_loop<T>(
     )
 }
 
-/// [`init_picker_key_loop`] with an explicit `max_visible` window bound.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// [`init_picker_key_loop`] with an explicit fixed `max_visible` window bound.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init_picker_key_loop_with_max_visible<T>(
     input: &mut dyn std::io::BufRead,
@@ -2685,6 +2718,79 @@ pub(crate) fn init_picker_key_loop_with_max_visible<T>(
     options: &[InitOptionItem],
     default_index: usize,
     max_visible: usize,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_impl(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        Some(max_visible),
+        &mut || None,
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+/// [`init_picker_key_loop`] driven by an injectable live viewport probe for
+/// resize-during-navigation tests.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn init_picker_key_loop_with_viewport<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
+    color: bool,
+    numbered: bool,
+    parse: impl Fn(&str) -> Result<T, String>,
+    history: &mut Vec<String>,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    preview: Option<InitPickerPreviewLine<'_>>,
+) -> Result<T, String> {
+    init_picker_key_loop_impl(
+        input,
+        output,
+        prompt,
+        options,
+        default_index,
+        None,
+        query_winsize,
+        color,
+        numbered,
+        parse,
+        history,
+        inplace,
+        wait_for_more,
+        preview,
+    )
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn init_picker_key_loop_impl<T>(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    prompt: &str,
+    options: &[InitOptionItem],
+    default_index: usize,
+    fixed_max_visible: Option<usize>,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
     color: bool,
     numbered: bool,
     parse: impl Fn(&str) -> Result<T, String>,
@@ -2709,32 +2815,42 @@ pub(crate) fn init_picker_key_loop_with_max_visible<T>(
             Some(hook) => hook(&options[cursor]),
             None => None,
         };
-        let block = init_picker_block(
-            prompt,
-            options,
-            cursor,
-            max_visible,
-            color,
-            numbered,
-            &typed,
-            preview_line.as_deref(),
-            notice.as_deref(),
-        );
-        if inplace && rendered > 0 {
-            let _ = write!(output, "\x1b[{rendered}A");
-        }
-        for line in &block {
-            if inplace {
-                let _ = write!(output, "\r\x1b[K{line}\n");
-            } else {
-                let _ = writeln!(output, "{line}");
+        let (mut max_visible, window) = match fixed_max_visible {
+            Some(explicit) => (explicit, None),
+            None => match query_winsize() {
+                Some((rows, cols)) => (
+                    init_picker_rows_for_window(rows).min(options.len()).max(1),
+                    Some((rows, cols)),
+                ),
+                None => (INIT_PICKER_DEFAULT_MAX_VISIBLE, None),
+            },
+        };
+        // Fit the frame to the live viewport in PHYSICAL rows (wrapped lines
+        // included) and retire option rows before the chrome, so the cursor
+        // entry stays on screen after a mid-session resize.
+        let block = loop {
+            let block = init_picker_block(
+                prompt,
+                options,
+                cursor,
+                max_visible,
+                color,
+                numbered,
+                &typed,
+                preview_line.as_deref(),
+                notice.as_deref(),
+            );
+            let Some((rows, Some(cols))) = window else {
+                break block;
+            };
+            let safe_rows = usize::from(rows).saturating_sub(1).max(1);
+            if init_frame_physical_rows(&block, Some(cols)) <= safe_rows || max_visible <= 1 {
+                break block;
             }
-        }
-        if inplace && rendered > block.len() {
-            let _ = write!(output, "\r\x1b[J");
-        }
-        let _ = output.flush();
-        rendered = block.len();
+            max_visible -= 1;
+        };
+        let cols = window.and_then(|(_, cols)| cols);
+        rendered = init_paint_inplace_frame(output, &block, inplace, rendered, cols);
         // One key: a lone byte, or an `ESC`-led burst.
         let Some(first) = init_key_read_byte(&mut *input) else {
             break Err("bitty init: aborted (end of input)".to_string());
@@ -3051,86 +3167,160 @@ fn init_plugin_inventory_groups(
     init_plugin_inventory_groups_windowed(inventory, None, bundled_row)
 }
 
-/// Renders the three inventory groups with an optional sliding window
-/// Computes `(bundled_max_visible, installed_cap)` for an interactive
-/// multiselect frame on a terminal of `rows` lines, subtracting prompt,
-/// headers, installed preview, network summary, optional warning, and hint
-/// rows so the complete frame never overflows the viewport.
+/// Secondary-group display mode for bounded multiselect frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum InitSecondaryGroups {
+    /// Full inventory groups with up to `installed_cap` installed rows (or a
+    /// one-line installed summary when `installed_cap == 0`).
+    Shown { installed_cap: usize },
+    /// Prompt + bundled rows (+ scroll range) + key hint only, omitting secondary
+    /// groups when narrow/short terminals cannot fit all sections physically.
+    Collapsed,
+    /// Only the bundled row window when even `Collapsed` exceeds tiny viewports.
+    Minimal,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_probe_inventory(inventory: &InitPluginInventory) -> InitPluginInventory {
+    let widest_id = inventory
+        .bundled
+        .iter()
+        .max_by_key(|id| init_visible_display_width(id))
+        .cloned()
+        .unwrap_or_default();
+    InitPluginInventory {
+        bundled: vec![widest_id; inventory.bundled.len()],
+        installed: inventory.installed.clone(),
+        needs_network: inventory.needs_network.clone(),
+        warning: inventory.warning.clone(),
+    }
+}
+
+/// Computes `(bundled_max_visible, secondary_groups_layout)` for an interactive
+/// multiselect frame on a terminal of `(rows, cols)`, counting physical wrapped
+/// terminal rows (`init_frame_physical_rows`) so narrow or short viewports never
+/// scroll the cursor off-screen or miscount CSI cursor-up distances.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_layout_for_viewport(
+    inventory: &InitPluginInventory,
+    rows: u16,
+    cols: Option<u16>,
+) -> (usize, InitSecondaryGroups) {
+    let safe_rows = (rows as usize).saturating_sub(1).max(1);
+    let probe = init_multiselect_probe_inventory(inventory);
+    let selected = vec![false; probe.bundled.len()];
+    let max_bundled_budget = if probe.bundled.is_empty() {
+        1
+    } else {
+        INIT_PICKER_DEFAULT_MAX_VISIBLE.min(probe.bundled.len())
+    };
+    let min_bundled = if probe.bundled.is_empty() {
+        1
+    } else {
+        INIT_PICKER_MIN_VISIBLE.min(probe.bundled.len()).max(1)
+    };
+
+    let fits = |bundled_max: usize, secondary: InitSecondaryGroups| -> bool {
+        let block =
+            init_multiselect_block_with_layout(&probe, 0, bundled_max, secondary, &selected, false);
+        init_frame_physical_rows(&block, cols) <= safe_rows
+    };
+
+    let max_installed = INIT_PLUGIN_INSTALLED_ROWS_MAX.min(probe.installed.len());
+    for cap in (0..=max_installed).rev() {
+        let secondary = InitSecondaryGroups::Shown { installed_cap: cap };
+        if fits(min_bundled, secondary) {
+            for bundled_max in (min_bundled..=max_bundled_budget).rev() {
+                if fits(bundled_max, secondary) {
+                    return (bundled_max, secondary);
+                }
+            }
+            return (min_bundled, secondary);
+        }
+    }
+
+    for bundled_max in (1..=max_bundled_budget).rev() {
+        if fits(bundled_max, InitSecondaryGroups::Collapsed) {
+            return (bundled_max, InitSecondaryGroups::Collapsed);
+        }
+    }
+
+    for bundled_max in (1..=max_bundled_budget).rev() {
+        if fits(bundled_max, InitSecondaryGroups::Minimal) {
+            return (bundled_max, InitSecondaryGroups::Minimal);
+        }
+    }
+
+    (1, InitSecondaryGroups::Minimal)
+}
+
+/// Computes `(bundled_max_visible, installed_cap)` assuming an unwrapped viewport.
+#[cfg(test)]
 pub(crate) fn init_multiselect_budget_for_window(
     inventory: &InitPluginInventory,
     rows: u16,
 ) -> (usize, usize) {
-    // Leave one margin row because every line ends with `\n`; writing a full
-    // `rows` lines would scroll line 1 into scrollback.
-    let safe_rows = (rows as usize).saturating_sub(1);
-    let fixed_chrome = 6 + usize::from(inventory.warning.is_some());
-    let remaining = safe_rows.saturating_sub(fixed_chrome);
-
-    let min_bundled = INIT_PICKER_MIN_VISIBLE.min(inventory.bundled.len());
-    let min_bundled_lines = if inventory.bundled.is_empty() {
-        1
-    } else {
-        min_bundled + usize::from(inventory.bundled.len() > min_bundled)
+    let (bundled_max, secondary) = init_multiselect_layout_for_viewport(inventory, rows, None);
+    let installed_cap = match secondary {
+        InitSecondaryGroups::Shown { installed_cap } => installed_cap,
+        InitSecondaryGroups::Collapsed | InitSecondaryGroups::Minimal => 0,
     };
-    let for_installed = remaining.saturating_sub(min_bundled_lines);
-
-    let (installed_cap, installed_lines) = if inventory.installed.is_empty() {
-        (0, 1)
-    } else if for_installed <= 1 {
-        // Collapse to a single summary line when vertical space is tight.
-        (0, 1)
-    } else if inventory.installed.len() <= INIT_PLUGIN_INSTALLED_ROWS_MAX
-        && inventory.installed.len() <= for_installed
-    {
-        let shown = inventory.installed.len();
-        (shown, shown)
-    } else {
-        let shown = (for_installed - 1)
-            .min(INIT_PLUGIN_INSTALLED_ROWS_MAX)
-            .min(inventory.installed.len().saturating_sub(1))
-            .max(1);
-        (shown, shown + 1)
-    };
-
-    let for_bundled = remaining.saturating_sub(installed_lines);
-    let bundled_max_visible = if inventory.bundled.is_empty() {
-        1
-    } else if inventory.bundled.len() <= for_bundled.min(INIT_PICKER_DEFAULT_MAX_VISIBLE) {
-        inventory.bundled.len()
-    } else {
-        for_bundled
-            .saturating_sub(1)
-            .clamp(1, INIT_PICKER_DEFAULT_MAX_VISIBLE)
-    };
-
-    (bundled_max_visible, installed_cap)
+    (bundled_max, installed_cap)
 }
 
 /// Queries live Unix terminal dimensions for the multiselect budget.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn init_multiselect_budget(inventory: &InitPluginInventory, inplace: bool) -> (usize, usize) {
-    #[cfg(unix)]
-    if inplace {
-        let winsize = rustix::termios::tcgetwinsize(std::io::stdout())
-            .or_else(|_| rustix::termios::tcgetwinsize(std::io::stdin()));
-        if let Ok(ws) = winsize {
-            if ws.ws_row > 0 {
-                return init_multiselect_budget_for_window(inventory, ws.ws_row);
-            }
-        }
+fn init_multiselect_layout(
+    inventory: &InitPluginInventory,
+    inplace: bool,
+) -> (usize, InitSecondaryGroups, Option<u16>) {
+    if let Some((rows, cols)) = init_live_terminal_winsize(inplace) {
+        let (bundled_max, secondary) = init_multiselect_layout_for_viewport(inventory, rows, cols);
+        return (bundled_max, secondary, cols);
     }
-    #[cfg(not(unix))]
-    let _ = (inventory, inplace);
     (
         INIT_PICKER_DEFAULT_MAX_VISIBLE,
-        INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        InitSecondaryGroups::Shown {
+            installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        },
+        None,
     )
 }
 
-/// Variant of [`init_plugin_inventory_groups`] that bounds [`InitPluginInventory::bundled`]
-/// and [`InitPluginInventory::installed`] to `(cursor, bundled_max_visible, installed_cap)`
-/// when interactive windowing is enabled.
+/// Renders only the bundled group (without secondary groups) for collapsed/minimal
+/// viewports.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_plugin_bundled_rows_only(
+    inventory: &InitPluginInventory,
+    cursor: usize,
+    max_visible: usize,
+    bundled_row: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if inventory.bundled.is_empty() {
+        lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
+    } else {
+        let (start, end) = init_picker_window(inventory.bundled.len(), cursor, max_visible);
+        for (index, id) in inventory.bundled.iter().enumerate().take(end).skip(start) {
+            lines.push(bundled_row(index, id));
+        }
+        if start > 0 || end < inventory.bundled.len() {
+            lines.push(format!(
+                "    ({}-{end} of {} bundled plugins)",
+                start + 1,
+                inventory.bundled.len()
+            ));
+        }
+    }
+    lines
+}
+
+/// Renders the three inventory groups with an optional sliding window.
+///
+/// Bounds [`InitPluginInventory::bundled`] and [`InitPluginInventory::installed`]
+/// to `(cursor, bundled_max_visible, installed_cap)` when interactive windowing
+/// is enabled.
 fn init_plugin_inventory_groups_windowed(
     inventory: &InitPluginInventory,
     window: Option<(usize, usize, usize)>,
@@ -3216,14 +3406,72 @@ fn init_plugin_inventory_groups_windowed(
     lines
 }
 
+/// Renders one multi-select frame with explicit [`InitSecondaryGroups`] control.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_multiselect_block_with_layout(
+    inventory: &InitPluginInventory,
+    cursor: usize,
+    max_visible: usize,
+    secondary: InitSecondaryGroups,
+    selected: &[bool],
+    color: bool,
+) -> Vec<String> {
+    let format_bundled = |index: usize, id: &str| {
+        let is_cursor = index == cursor;
+        let marker = if is_cursor {
+            if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
+        } else {
+            " "
+        };
+        let checkbox = if selected.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let label = if color && is_cursor {
+            format!("\u{1b}[1m{id}\u{1b}[0m")
+        } else {
+            id.to_string()
+        };
+        format!("{marker} {checkbox} {label}")
+    };
+    let mut block = Vec::new();
+    match secondary {
+        InitSecondaryGroups::Shown { installed_cap } => {
+            block.push(INIT_PLUGIN_PROMPT.to_string());
+            block.extend(init_plugin_inventory_groups_windowed(
+                inventory,
+                Some((cursor, max_visible, installed_cap)),
+                &format_bundled,
+            ));
+            block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+        }
+        InitSecondaryGroups::Collapsed => {
+            block.push(INIT_PLUGIN_PROMPT.to_string());
+            block.extend(init_plugin_bundled_rows_only(
+                inventory,
+                cursor,
+                max_visible,
+                &format_bundled,
+            ));
+            block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
+        }
+        InitSecondaryGroups::Minimal => {
+            block.extend(init_plugin_bundled_rows_only(
+                inventory,
+                cursor,
+                max_visible,
+                &format_bundled,
+            ));
+        }
+    }
+    block
+}
+
 /// Renders one multi-select frame: the prompt, the three inventory groups
 /// (with one `[ ]`/`[x]` row per bundled id and the `>` cursor marker), then
-/// the key hint. The frame height is stable for the whole session, so
-/// in-place repaints stay aligned.
-///
-/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
-/// through tests, hence the dead-code allowance there.)
-#[cfg_attr(not(unix), allow(dead_code))]
+/// the key hint.
+#[cfg(test)]
 pub(crate) fn init_multiselect_block(
     inventory: &InitPluginInventory,
     cursor: usize,
@@ -3232,33 +3480,14 @@ pub(crate) fn init_multiselect_block(
     selected: &[bool],
     color: bool,
 ) -> Vec<String> {
-    let mut block = Vec::new();
-    block.push(INIT_PLUGIN_PROMPT.to_string());
-    block.extend(init_plugin_inventory_groups_windowed(
+    init_multiselect_block_with_layout(
         inventory,
-        Some((cursor, max_visible, installed_cap)),
-        &|index, id| {
-            let is_cursor = index == cursor;
-            let marker = if is_cursor {
-                if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
-            } else {
-                " "
-            };
-            let checkbox = if selected.get(index).copied().unwrap_or(false) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let label = if color && is_cursor {
-                format!("\u{1b}[1m{id}\u{1b}[0m")
-            } else {
-                id.to_string()
-            };
-            format!("{marker} {checkbox} {label}")
-        },
-    ));
-    block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
-    block
+        cursor,
+        max_visible,
+        InitSecondaryGroups::Shown { installed_cap },
+        selected,
+        color,
+    )
 }
 
 /// Selected ids in catalog order (empty when nothing is checked).
@@ -3301,13 +3530,11 @@ pub(crate) fn init_multiselect_key_loop(
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
-    let (max_visible, installed_cap) = init_multiselect_budget(inventory, inplace);
-    init_multiselect_key_loop_with_budget(
+    init_multiselect_key_loop_impl(
         input,
         output,
         inventory,
-        max_visible,
-        installed_cap,
+        &mut |inv| init_multiselect_layout(inv, inplace),
         color,
         inplace,
         wait_for_more,
@@ -3325,27 +3552,71 @@ pub(crate) fn init_multiselect_key_loop_with_max_visible(
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
-    init_multiselect_key_loop_with_budget(
+    init_multiselect_key_loop_impl(
         input,
         output,
         inventory,
-        max_visible,
-        INIT_PLUGIN_INSTALLED_ROWS_MAX,
+        &mut |_| {
+            (
+                max_visible,
+                InitSecondaryGroups::Shown {
+                    installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+                },
+                None,
+            )
+        },
         color,
         inplace,
         wait_for_more,
     )
 }
 
-/// [`init_multiselect_key_loop`] with explicit `(max_visible, installed_cap)` bounds.
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn init_multiselect_key_loop_with_budget(
+/// [`init_multiselect_key_loop`] driven by an injectable live viewport probe for
+/// resize-during-navigation tests.
+#[cfg(test)]
+pub(crate) fn init_multiselect_key_loop_with_viewport(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     inventory: &InitPluginInventory,
-    max_visible: usize,
-    installed_cap: usize,
+    query_winsize: &mut dyn FnMut() -> Option<(u16, Option<u16>)>,
+    color: bool,
+    inplace: bool,
+    wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+) -> Result<Vec<String>, String> {
+    init_multiselect_key_loop_impl(
+        input,
+        output,
+        inventory,
+        &mut |inv| match query_winsize() {
+            Some((rows, cols)) => {
+                let (max_visible, secondary) =
+                    init_multiselect_layout_for_viewport(inv, rows, cols);
+                (max_visible, secondary, cols)
+            }
+            None => (
+                INIT_PICKER_DEFAULT_MAX_VISIBLE,
+                InitSecondaryGroups::Shown {
+                    installed_cap: INIT_PLUGIN_INSTALLED_ROWS_MAX,
+                },
+                None,
+            ),
+        },
+        color,
+        inplace,
+        wait_for_more,
+    )
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+type InitMultiselectLayoutFn<'a> =
+    &'a mut dyn FnMut(&InitPluginInventory) -> (usize, InitSecondaryGroups, Option<u16>);
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn init_multiselect_key_loop_impl(
+    input: &mut dyn std::io::BufRead,
+    output: &mut dyn std::io::Write,
+    inventory: &InitPluginInventory,
+    layout_for_frame: InitMultiselectLayoutFn<'_>,
     color: bool,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
@@ -3359,29 +3630,16 @@ pub(crate) fn init_multiselect_key_loop_with_budget(
     }
     let mut rendered: usize = 0;
     let result = loop {
-        let block = init_multiselect_block(
+        let (max_visible, secondary, cols) = layout_for_frame(inventory);
+        let block = init_multiselect_block_with_layout(
             inventory,
             cursor,
             max_visible,
-            installed_cap,
+            secondary,
             &selected,
             color,
         );
-        if inplace && rendered > 0 {
-            let _ = write!(output, "\x1b[{rendered}A");
-        }
-        for line in &block {
-            if inplace {
-                let _ = write!(output, "\r\x1b[K{line}\n");
-            } else {
-                let _ = writeln!(output, "{line}");
-            }
-        }
-        if inplace && rendered > block.len() {
-            let _ = write!(output, "\r\x1b[J");
-        }
-        let _ = output.flush();
-        rendered = block.len();
+        rendered = init_paint_inplace_frame(output, &block, inplace, rendered, cols);
         // One key: a lone byte, or an `ESC`-led burst.
         let Some(first) = init_key_read_byte(&mut *input) else {
             break Err("bitty init: aborted (end of input)".to_string());
@@ -4003,29 +4261,59 @@ fn init_preview_runtime(
 /// Styling resolves with `resolve_theme_with_status` (no stderr), so an
 /// unknown seeded theme still echoes its stored name in default colors.
 fn init_char_display_width(ch: char) -> usize {
-    if matches!(
-        ch as u32,
-        0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3040..=0xA4CF
-            | 0xAC00..=0xD7AF
-            | 0xF900..=0xFAFF
-            | 0xFE10..=0xFE6F
-            | 0xFF01..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1FAFF
-    ) {
-        2
+    if ch.is_control() {
+        0
     } else {
-        1
+        usize::from(bitty_term_state::char_cell_width(ch))
     }
 }
 
-/// Conservative terminal cell width for an unstyled single-line string
-/// (BMP CJK/fullwidth/emoji blocks count as 2 columns; other printable
-/// scalar values count as 1 column).
+/// Terminal cell width for an unstyled single-line string computed via Core's
+/// UCD `East_Asian_Width` + zero-width tables (`bitty_term_state::char_cell_width`).
 pub(crate) fn init_display_width(text: &str) -> usize {
     text.chars().map(init_char_display_width).sum()
+}
+
+/// Terminal cell width of a single line after stripping ANSI CSI escape
+/// sequences (`\x1b[...<final byte>`).
+pub(crate) fn init_visible_display_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for seq in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&seq) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width = width.saturating_add(init_char_display_width(ch));
+    }
+    width
+}
+
+/// Number of physical terminal rows occupied by `line` at `cols` columns
+/// (empty/short lines occupy 1 row; long lines wrap at `cols`).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_line_physical_rows(line: &str, cols: Option<u16>) -> usize {
+    let Some(cols) = cols.map(usize::from).filter(|&c| c > 0) else {
+        return 1;
+    };
+    let width = init_visible_display_width(line);
+    if width == 0 { 1 } else { width.div_ceil(cols) }
+}
+
+/// Total physical terminal rows occupied by a block of lines at `cols` columns.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn init_frame_physical_rows(block: &[String], cols: Option<u16>) -> usize {
+    block
+        .iter()
+        .map(|line| init_line_physical_rows(line, cols))
+        .sum()
 }
 
 /// Constrains an unstyled preview line to `max_cols.saturating_sub(1)`
@@ -5497,6 +5785,12 @@ fn write_recoverable_backup(
                     ))
                 })?;
                 sync_parent_dir(&candidate);
+                if backup_dir
+                    .file_name()
+                    .is_some_and(|dir_name| dir_name == "profiles")
+                {
+                    crate::profile::prune_excess_profile_backups(&backup_dir, &name, &candidate);
+                }
                 return Ok(candidate);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,

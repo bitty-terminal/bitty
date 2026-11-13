@@ -130,6 +130,18 @@ fn map_loop_error(error: EventLoopError) -> PlatformError {
     }
 }
 
+/// Whether the process already owns the platform's full OS-window allowance
+/// (bitty#1765, slice 4).
+///
+/// [`EventContext::create_window`] refuses a creation at this point instead of
+/// trusting the caller: the composition root's own registry is bounded by the
+/// same constant ([`crate::MAX_OS_WINDOWS`]), so the two can never disagree, and
+/// a runaway creation path stops before a second/third window is handed out
+/// rather than after the OS handle budget is spent.
+fn at_window_ceiling(live: usize) -> bool {
+    live >= crate::MAX_OS_WINDOWS
+}
+
 /// Loop- and window-facing operations granted to an [`AppHandler`].
 ///
 /// Borrowed per callback; methods are cheap and never block.
@@ -200,6 +212,16 @@ impl EventContext<'_> {
         };
         let blur_radius = config.blur_radius();
         let attributes = config.into_attributes();
+        // bitty#1765 (slice 4): the platform enforces its own OS-window ceiling
+        // instead of trusting the composition root's registry. Both are the
+        // same constant, so this only fires on a runaway creation path — and
+        // then it fires before a winit window is created, never after.
+        if at_window_ceiling(registry.len()) {
+            return Err(PlatformError::WindowCreation(format!(
+                "platform window ceiling reached ({})",
+                crate::MAX_OS_WINDOWS
+            )));
+        }
         let window = event_loop
             .create_window(attributes)
             .map_err(|error| PlatformError::WindowCreation(error.to_string()))?;
@@ -946,6 +968,14 @@ impl Registry {
         owned
     }
 
+    /// Number of windows this crate currently owns (bitty#1765, slice 4).
+    ///
+    /// Shrinks when the loop reports `Destroyed` (`unregister`), so the count is
+    /// live windows, not windows ever created.
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
     fn register_probe(&mut self, upstream: &WinitWindowId, probe: Arc<Mutex<OcclusionProbe>>) {
         self.probes.insert(*upstream, probe);
     }
@@ -1442,6 +1472,26 @@ mod tests {
         assert!(
             attributes.window_icon.is_some(),
             "WindowConfig::into_attributes must attach window_icon"
+        );
+    }
+
+    #[test]
+    fn the_window_ceiling_admits_below_the_bound_and_refuses_at_it() {
+        // bitty#1765 (slice 4): the platform's own guard, so a creation path
+        // that bypasses the composition root's registry cannot exceed the
+        // OS-window allowance.
+        assert!(!at_window_ceiling(0), "an empty process may open a window");
+        assert!(
+            !at_window_ceiling(crate::MAX_OS_WINDOWS - 1),
+            "the last free slot is still usable"
+        );
+        assert!(
+            at_window_ceiling(crate::MAX_OS_WINDOWS),
+            "a process at the ceiling must be refused, not handed one more"
+        );
+        assert!(
+            at_window_ceiling(crate::MAX_OS_WINDOWS + 1),
+            "over-capacity is refused too (no arithmetic shortcut)"
         );
     }
 }

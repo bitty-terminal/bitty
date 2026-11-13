@@ -294,6 +294,7 @@ pub mod scene;
 pub mod shaped;
 pub mod telemetry;
 pub mod window;
+pub mod windows;
 
 #[cfg(feature = "sw-fallback")]
 pub mod software;

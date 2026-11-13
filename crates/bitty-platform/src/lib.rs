@@ -162,3 +162,13 @@ pub use keyboard::{
 pub use notification::{BellSink, OsBellSink, OsDeliveryOutcome, OsDeliverySkip};
 pub use surface::{DisplayServer, SurfaceTarget, map_resize_to_surface_extent};
 pub use url::{URL_MAX_LEN, ValidatedUrl, validate_file_url, validate_url};
+
+/// Process-wide ceiling on simultaneously open OS windows (bitty#1765).
+///
+/// One window per workspace is the accepted ceiling, so the bound reuses the
+/// workspace ceiling rather than inventing a second one: an application that
+/// cannot hold more than this many workspaces has no use for more windows.
+/// Both the composition root's window registry and the renderer's per-window
+/// surface fleet bound themselves here, so the two can never disagree about
+/// how many windows exist.
+pub const MAX_OS_WINDOWS: usize = 16;

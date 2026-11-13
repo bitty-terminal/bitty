@@ -29,11 +29,14 @@
 //!
 //! # Honest scope
 //!
-//! Registering a row is not the same as presenting it. Only the primary
-//! window carries a renderer surface in this slice
-//! ([`SurfaceState::Attached`]); a second row is registered
-//! [`SurfaceState::Unattached`] with its attachment point retained, because
-//! per-window renderer/swapchain work is explicitly out of this slice.
+//! Registering a row is not the same as presenting it. A newly admitted
+//! secondary window is registered [`SurfaceState::Unattached`] and the app
+//! flips it to [`SurfaceState::Attached`] only after the runtime reports that
+//! it created *and* configured a wgpu surface for that window
+//! (`TerminalApp::attach_secondary_surface`). A row that stays `Unattached` is
+//! therefore an accurate statement — the platform refused the surface, or the
+//! process has no owned GPU context to create one with — and never a window the
+//! app believes it is painting.
 
 #![forbid(unsafe_code)]
 
@@ -43,10 +46,13 @@ use bitty_platform::{SurfaceTarget, WindowHandle, WindowId};
 
 /// Upper bound on simultaneously registered windows.
 ///
-/// Mirrors `bitty_runtime::MAX_WORKSPACES_PER_WINDOW`: one window per
-/// workspace is the accepted ceiling, and a bounded registry is what makes an
-/// unbounded `new_window` request impossible.
-pub(crate) const MAX_WINDOWS: usize = 16;
+/// The platform's own OS-window ceiling
+/// ([`bitty_platform::MAX_OS_WINDOWS`]): the registry and the renderer's
+/// per-window surface fleet bound themselves from one constant, so they can
+/// never disagree about how many windows exist. One window per workspace is
+/// the accepted ceiling, and a bounded registry is what makes an unbounded
+/// `new_window` request impossible.
+pub(crate) const MAX_WINDOWS: usize = bitty_platform::MAX_OS_WINDOWS;
 
 /// Renderer attachment state of one registered window's surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -268,8 +274,9 @@ impl<H: WindowIdentity> WindowRegistry<H> {
     /// single-window behaviour and a typed refusal reaches the caller's log.
     ///
     /// A newly admitted window is registered [`SurfaceState::Unattached`]: the
-    /// attachment point is retained, but no renderer surface owns it yet
-    /// (per-window renderer work is out of this slice).
+    /// attachment point is retained, and the caller flips the row to
+    /// [`SurfaceState::Attached`] once the renderer created and configured a
+    /// surface for it ([`Self::mark_attached`]).
     pub(crate) fn admit<E>(
         &mut self,
         outcome: Result<(H, Option<SurfaceTarget>), E>,
@@ -327,6 +334,31 @@ impl<H> WindowRegistry<H> {
             let _ = write!(&mut out, "{}:{surface}:{}", row.id.get(), row.state.label());
         }
         out
+    }
+
+    /// Records whether the shared renderer presents `window`'s surface
+    /// (bitty#1765, slice 2).
+    ///
+    /// The row state is the app's honest record of what the renderer did with
+    /// that window: a window whose surface the runtime created and configured
+    /// is [`SurfaceState::Attached`], one whose attach was refused is
+    /// [`SurfaceState::Unattached`]. Returns `false` and changes nothing for an
+    /// unknown identity, so a stale event can never relabel a live window.
+    pub(crate) fn set_surface_state(&mut self, id: WindowId, state: SurfaceState) -> bool {
+        match self.rows.iter_mut().find(|row| row.id == id) {
+            Some(row) => {
+                row.state = state;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Marks `window` as presented by the shared renderer.
+    ///
+    /// Convenience over [`Self::set_surface_state`] for the attach path.
+    pub(crate) fn mark_attached(&mut self, id: WindowId) -> bool {
+        self.set_surface_state(id, SurfaceState::Attached)
     }
 
     /// Shared insert path: capacity and duplicate checks happen before any
@@ -539,6 +571,47 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.summary(), before);
         assert_eq!(registry.active(), Some(first));
+    }
+
+    #[test]
+    fn naming_a_surface_state_flips_only_that_row() {
+        let mut registry = WindowRegistry::new();
+        let first = registry
+            .register_primary(window(1), None, SurfaceState::Attached)
+            .unwrap();
+        let second = registry.admit(Ok::<_, ()>((window(2), None))).unwrap();
+        assert_eq!(
+            registry.get(second).map(|row| row.state),
+            Some(SurfaceState::Unattached)
+        );
+        assert!(
+            registry.mark_attached(second),
+            "a registered row accepts it"
+        );
+        assert_eq!(
+            registry.get(second).map(|row| row.state),
+            Some(SurfaceState::Attached),
+            "the renderer now presents the second window"
+        );
+        assert_eq!(
+            registry.get(first).map(|row| row.state),
+            Some(SurfaceState::Attached),
+            "the primary's own state is untouched"
+        );
+        assert_eq!(
+            registry.summary(),
+            "1:no-surface:attached,2:no-surface:attached"
+        );
+        // A surface the renderer released again demotes the row honestly.
+        assert!(registry.set_surface_state(second, SurfaceState::Unattached));
+        assert_eq!(
+            registry.get(second).map(|row| row.state),
+            Some(SurfaceState::Unattached)
+        );
+        assert!(
+            !registry.mark_attached(id(99)),
+            "an identity this process never registered is never relabelled"
+        );
     }
 
     #[test]

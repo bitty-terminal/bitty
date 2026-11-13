@@ -1424,17 +1424,7 @@ impl Surface {
             });
         }
         match &self.kind {
-            SurfaceKind::Headless => {
-                let mut state = self.state.lock().expect("surface state poisoned");
-                let config =
-                    SurfaceConfig::new(extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?
-                        .with_opacity(state.opacity);
-                state.config = Some(config);
-                state.headless_extent = Some(extent);
-                state.wgpu_config = Some(synthesize_wgpu_config(&config));
-                state.alpha_supported = true;
-                Ok(())
-            }
+            SurfaceKind::Headless => self.configure_headless_inner(extent),
             SurfaceKind::Gpu { surface, .. } => {
                 let opacity = self.state.lock().expect("surface state poisoned").opacity;
                 let caps = surface.get_capabilities(&ctx.adapter);
@@ -1452,6 +1442,58 @@ impl Surface {
                 Ok(())
             }
         }
+    }
+
+    /// Stores the headless fake's deterministic configuration for `extent`.
+    ///
+    /// Adapter-free by construction: the fake contacts no driver, so the
+    /// extent/format/present-mode/opacity bookkeeping is the whole operation.
+    /// Both [`Self::configure_inner`] and
+    /// [`Self::configure_headless_with_opacity`] route through here, so the
+    /// adapter-free entry can never drift from the configure path.
+    fn configure_headless_inner(&self, extent: PhysicalSize) -> Result<(), RenderError> {
+        if extent.width() == 0 || extent.height() == 0 {
+            return Err(RenderError::InvalidInput {
+                reason: "surface extent must be non-zero",
+            });
+        }
+        let mut state = self.state.lock().expect("surface state poisoned");
+        let config = SurfaceConfig::new(extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?
+            .with_opacity(state.opacity);
+        state.config = Some(config);
+        state.headless_extent = Some(extent);
+        state.wgpu_config = Some(synthesize_wgpu_config(&config));
+        state.alpha_supported = true;
+        Ok(())
+    }
+
+    /// Configures a headless fake for `extent` and `opacity` without an
+    /// adapter.
+    ///
+    /// The adapter-free mirror of [`Self::configure_with_opacity`], for the
+    /// same reason [`Self::headless_present_color`] exists next to the GPU
+    /// present: a headless surface's configuration is plain bookkeeping, so a
+    /// caller that owns only headless fakes (CI, the headless runtime, the
+    /// per-window surface fleet's tests) can reconfigure one without
+    /// manufacturing a [`GpuContext`] it does not have.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceConfigure`] when this surface is not the
+    ///   headless fake: a real swap chain can only be configured against the
+    ///   device that created it, so this never silently skips configuring one.
+    /// - [`RenderError::InvalidInput`] for a zero extent.
+    pub fn configure_headless_with_opacity(
+        &self,
+        extent: PhysicalSize,
+        opacity: f32,
+    ) -> Result<(), RenderError> {
+        if !self.is_headless() {
+            return Err(RenderError::SurfaceConfigure(
+                "configure_headless called on a real surface".into(),
+            ));
+        }
+        self.with_opacity_restored_on_err(opacity, || self.configure_headless_inner(extent))
     }
 
     /// Reconfigures the surface for `new_extent`, skipping zero-sized

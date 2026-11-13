@@ -1677,6 +1677,140 @@ mod tests {
         assert_eq!(error.category, "usage", "{error:?}");
     }
 
+    /// CTX-1814 (review of #3140, mutation M4): the `view.manage` gate inside
+    /// `handle_new_window`.
+    ///
+    /// A connection whose live grant has the MCP read-only shape
+    /// ([`bitty_ipc::ScopeSet::mcp_default`]: `view.inspect`, no `view.manage`)
+    /// must be refused by the handler itself — with the typed `scope` /
+    /// `ScopeDenied` pair `ctl::render` maps to the CLI's permission exit — and
+    /// the refusal must land *before* the request lane is offered anything.
+    ///
+    /// Mutation: forcing the `!scopes.contains(Scope::ViewManage)` branch in
+    /// `handle_new_window` to `false` sends the request into
+    /// [`crate::ctl::new_window::request`], which no app thread services here;
+    /// the dispatch then answers `transport`/`Unavailable` and this test fails.
+    /// The grant is issued by the real [`bitty_ipc::ctl::ControlAuthority`], so
+    /// `current_authorization()` reads live authority scopes exactly as a
+    /// served connection does — no test-only scope shortcut.
+    #[cfg(unix)]
+    #[test]
+    fn new_window_denies_a_connection_without_view_manage_before_the_lane() {
+        use std::os::unix::net::UnixStream;
+
+        let _lane = crate::ctl::new_window::test_lane_lock();
+        crate::ctl::new_window::clear_for_tests();
+
+        let granted = bitty_ipc::ScopeSet::mcp_default();
+        assert!(
+            !granted.contains(bitty_ipc::Scope::ViewManage),
+            "fixture precondition: the MCP read-only default carries no view.manage"
+        );
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let authority = bitty_ipc::ctl::ControlAuthority::new();
+        let grant = authority
+            .open_connection(
+                granted.clone(),
+                bitty_ipc::ctl::TerminalCapabilities::from_scopes(&granted),
+            )
+            .expect("connection grant");
+        // The peer end stays open for the dispatch-time peer recheck.
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(&server, grant);
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        assert!(
+            context.authority_required(),
+            "the grant must be the live authority under test"
+        );
+
+        let request = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/newWindow","version":"1.0"}"#,
+        )
+        .expect("request");
+        let error = build_dispatcher(false)
+            .dispatch(&context, &request)
+            .expect_err("a connection without view.manage must be refused");
+
+        assert_eq!(error.category, "scope", "{error:?}");
+        assert_eq!(error.code, "ScopeDenied", "{error:?}");
+        assert!(
+            error.message.contains("view.manage"),
+            "the denial must name the missing scope: {error:?}"
+        );
+        assert!(
+            crate::ctl::new_window::claim().is_none(),
+            "the refused request must never be offered to the app thread"
+        );
+    }
+
+    /// Positive control for the test above (CTX-1814): the same request on a
+    /// connection that *does* carry `view.manage` (`ScopeSet::cli_default`)
+    /// passes the gate and lands on the lane, which is where the authorization
+    /// decision ends. Driven through the same `build_dispatcher` table and a
+    /// real authority grant, so only the granted scope differs.
+    #[cfg(unix)]
+    #[test]
+    fn new_window_reaches_the_lane_when_the_grant_carries_view_manage() {
+        use std::os::unix::net::UnixStream;
+
+        let _lane = crate::ctl::new_window::test_lane_lock();
+        crate::ctl::new_window::clear_for_tests();
+
+        let granted = bitty_ipc::ScopeSet::cli_default();
+        assert!(
+            granted.contains(bitty_ipc::Scope::ViewManage),
+            "fixture precondition: the CLI default carries view.manage"
+        );
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let authority = bitty_ipc::ctl::ControlAuthority::new();
+        let grant = authority
+            .open_connection(
+                granted.clone(),
+                bitty_ipc::ctl::TerminalCapabilities::from_scopes(&granted),
+            )
+            .expect("connection grant");
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(&server, grant);
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+
+        let request = bitty_ipc::devtools::parse_request(
+            br#"{"id":2,"method":"bitty.debug/newWindow","version":"1.0"}"#,
+        )
+        .expect("request");
+        let dispatcher = build_dispatcher(false);
+        let caller = std::thread::spawn(move || dispatcher.dispatch(&context, &request));
+
+        // The handler blocks on the lane; claim it here and answer as the app
+        // thread would on its next event turn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let held = loop {
+            if let Some(held) = crate::ctl::new_window::claim() {
+                break held;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an authorized request never reached the lane"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        held.complete(crate::ctl::new_window::NewWindowReply::Admitted { windows: 2 });
+        assert_eq!(
+            caller
+                .join()
+                .expect("handler thread")
+                .expect("an authorized request is admitted"),
+            "{\"requested\":true,\"windows\":2}"
+        );
+    }
+
     /// Issue #2773: the test-mode IPC slice must serve the plugin runtime it
     /// attached before the loop, and only its addressable rows. The fixture
     /// activates one plugin, then fails a second one against a rejected

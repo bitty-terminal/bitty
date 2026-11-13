@@ -1208,7 +1208,7 @@ fn extract_object_body(text: &str, key: &str) -> Option<String> {
 mod tests {
     use super::{NEW_WINDOW_SKEW_MESSAGE, reload_exit, render_outcome, render_reload_table};
     use crate::ctl::{
-        CtlFormat, CtlIpcOutcome, CtlRequest, CtlTargeting, EXIT_COMPAT, ResolvedTarget,
+        CtlFormat, CtlIpcOutcome, CtlRequest, CtlTargeting, EXIT_COMPAT, EXIT_PERM, ResolvedTarget,
     };
 
     /// bitty#1765 (slice 5): an instance that predates `window new` answers
@@ -1243,6 +1243,51 @@ mod tests {
             EXIT_COMPAT,
             "protocol skew is exit 5: {}",
             NEW_WINDOW_SKEW_MESSAGE
+        );
+    }
+
+    /// CTX-1814 (review of #3140): a connection without `view.manage` is
+    /// refused by the `new-window` handler with the `scope`/`ScopeDenied` pair,
+    /// and that pair is the CLI's permission exit — `bitty ctl window new`
+    /// reports it as `Denied` (exit 7), never as a transport failure or a
+    /// conflict. The handler-side test in `ipc_serve` pins which pair is
+    /// produced; this pins what the CLI does with it.
+    #[test]
+    fn window_new_reports_a_scope_denial_as_permission_denied() {
+        let outcome = CtlIpcOutcome {
+            ok: false,
+            result_json: String::new(),
+            category: String::from("scope"),
+            code: String::from("ScopeDenied"),
+            message: String::from(
+                "permission denied: scope 'view.manage' for bitty.debug/newWindow \
+                 (needs elevation via BITTY_CTL_ELEVATE)",
+            ),
+        };
+        let target = ResolvedTarget {
+            socket_path: String::from("/run/user/0/bitty/default.sock"),
+            instance: String::from("default"),
+        };
+        let targeting = CtlTargeting {
+            socket: None,
+            instance: None,
+            format: CtlFormat::Json,
+        };
+        assert_eq!(
+            super::class_for_server_error(&outcome.category, &outcome.code),
+            "Denied",
+            "a view.manage denial is a permission error, not an unavailable instance"
+        );
+        assert_eq!(
+            render_outcome(
+                &outcome,
+                "core.window.new",
+                &targeting,
+                &CtlRequest::NewWindow,
+                &target
+            ),
+            EXIT_PERM,
+            "a scope denial on window new is exit 7"
         );
     }
 

@@ -17,6 +17,7 @@
 //!   original scalar write path keeps one implementation.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use bitty_config::{ConfigSource, LayerKind, MergedConfig};
 use bitty_runtime::plugin_runtime::writable_setting;
@@ -27,8 +28,8 @@ use bitty_runtime::plugin_runtime::{
     PluginEnabledRendering, PluginList, PluginListRow, ProfileCloneOptions, ProfileCloneOutcome,
     ProfileCreateOptions, ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome,
     ProfileLifecycleRendering, ProfileList, ProfileListRow, ProfileRenameOptions,
-    ProfileRenameOutcome, ProfileUseRendering, ProfileWriteFailure, candidate_digest,
-    list_row_bytes,
+    ProfileRenameOutcome, ProfileUseRendering, ProfileWriteFailure, WheelMutationRendering,
+    WheelSettingValue, WheelSnapshot, candidate_digest, list_row_bytes,
 };
 
 use crate::config_cli::ConfigValue;
@@ -60,6 +61,12 @@ pub(crate) struct AppConfigManage {
     store_root: Option<PathBuf>,
     /// The scalar user-layer writer reused for `config.preview`/`config.set`.
     writer: UserLayerConfigWriter,
+    /// `$XDG_CONFIG_HOME/wheel` root for non-evaluating Layer 1 inspection (CTX-1817).
+    wheel_config_dir: Option<PathBuf>,
+    /// `$XDG_DATA_HOME/wheel` root for Layer 0.5 private JSON stores (CTX-1817).
+    wheel_data_dir: Option<PathBuf>,
+    /// Boolean environment probe for `auth_source = "env"` attribution (CTX-1817).
+    wheel_env_probe: Rc<dyn Fn(&str) -> bool>,
 }
 
 impl AppConfigManage {
@@ -78,6 +85,14 @@ impl AppConfigManage {
             UserLayerConfigWriter::new(config_dir.clone(), target.clone(), active_profile.clone())?;
         let profiles_dir = config_dir.join(bitty_config::file::PROFILES_DIR_NAME);
         let ledger_path = config_dir.join(bitty_config::plugin_ledger::LEDGER_FILE_NAME);
+        let wheel_config_dir = config_dir.parent().map(|parent| parent.join("wheel"));
+        let wheel_data_dir = crate::plugin_runtime::data_home_for(
+            std::env::var("XDG_DATA_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+        .map(|base| base.join("wheel"));
+        let wheel_env_probe =
+            Rc::new(|key: &str| std::env::var_os(key).is_some_and(|val| !val.is_empty()));
         Some(Self {
             target,
             profiles_dir,
@@ -85,7 +100,27 @@ impl AppConfigManage {
             active_profile,
             store_root,
             writer,
+            wheel_config_dir,
+            wheel_data_dir,
+            wheel_env_probe,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wheel_roots(
+        mut self,
+        wheel_config_dir: Option<PathBuf>,
+        wheel_data_dir: Option<PathBuf>,
+    ) -> Self {
+        self.wheel_config_dir = wheel_config_dir;
+        self.wheel_data_dir = wheel_data_dir;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wheel_env_probe(mut self, probe: Rc<dyn Fn(&str) -> bool>) -> Self {
+        self.wheel_env_probe = probe;
+        self
     }
 
     /// The scalar writer bound to the profile the running table reflects
@@ -716,6 +751,123 @@ impl ConfigWriteBackend for AppConfigManage {
         .inspect_err(|failure| {
             log_profile_refusal(plugin_id, "profiles.delete", failure);
         })
+    }
+
+    fn wheel_get(&self, _plugin_id: &str) -> Result<WheelSnapshot, ConfigReadFailure> {
+        crate::wheel_manage::read_wheel_snapshot(
+            self.wheel_config_dir.as_deref(),
+            self.wheel_data_dir.as_deref(),
+            &*self.wheel_env_probe,
+        )
+    }
+
+    fn preview_wheel_set(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &WheelSettingValue,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        crate::wheel_manage::preview_wheel_set(self.wheel_data_dir.as_deref(), key, value)
+            .inspect_err(|&failure| log_refusal(plugin_id, "wheel.preview", failure))
+    }
+
+    fn apply_wheel_set(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: &WheelSettingValue,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        crate::wheel_manage::apply_wheel_set(
+            self.wheel_data_dir.as_deref(),
+            key,
+            value,
+            expected_candidate_digest,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.set", failure))
+    }
+
+    fn preview_wheel_auth_set(
+        &self,
+        plugin_id: &str,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        crate::wheel_manage::preview_wheel_auth_set(
+            self.wheel_data_dir.as_deref(),
+            provider,
+            api_key,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.preview_auth_set", failure))
+    }
+
+    fn apply_wheel_auth_set(
+        &self,
+        plugin_id: &str,
+        provider: &str,
+        api_key: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        crate::wheel_manage::apply_wheel_auth_set(
+            self.wheel_data_dir.as_deref(),
+            provider,
+            api_key,
+            expected_candidate_digest,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.auth_set", failure))
+    }
+
+    fn preview_wheel_auth_remove(
+        &self,
+        plugin_id: &str,
+        provider: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        crate::wheel_manage::preview_wheel_auth_remove(self.wheel_data_dir.as_deref(), provider)
+            .inspect_err(|&failure| log_refusal(plugin_id, "wheel.preview_auth_remove", failure))
+    }
+
+    fn apply_wheel_auth_remove(
+        &self,
+        plugin_id: &str,
+        provider: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        crate::wheel_manage::apply_wheel_auth_remove(
+            self.wheel_data_dir.as_deref(),
+            provider,
+            expected_candidate_digest,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.auth_remove", failure))
+    }
+
+    fn preview_wheel_resolve_approval(
+        &self,
+        plugin_id: &str,
+        id: &str,
+        decision: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        crate::wheel_manage::preview_wheel_resolve_approval(
+            self.wheel_data_dir.as_deref(),
+            id,
+            decision,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.preview_resolve_approval", failure))
+    }
+
+    fn apply_wheel_resolve_approval(
+        &self,
+        plugin_id: &str,
+        id: &str,
+        decision: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        crate::wheel_manage::apply_wheel_resolve_approval(
+            self.wheel_data_dir.as_deref(),
+            id,
+            decision,
+            expected_candidate_digest,
+        )
+        .inspect_err(|&failure| log_refusal(plugin_id, "wheel.resolve_approval", failure))
     }
 }
 
@@ -2005,6 +2157,53 @@ mod tests {
                     .starts_with("child.lua.bak-")
             });
         assert!(has_child_backup, "delete must keep a timestamped backup");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn app_config_manage_wheel_roots_and_env_probe_roundtrip() {
+        let dir = scratch("wheel-roots");
+        let wheel_cfg = dir.join("wheel-config");
+        let wheel_data = dir.join("wheel-data");
+        std::fs::create_dir_all(&wheel_cfg).expect("wheel-config");
+        std::fs::create_dir_all(&wheel_data).expect("wheel-data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&wheel_cfg, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&wheel_data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let backend = backend(&dir, None)
+            .with_wheel_roots(Some(wheel_cfg), Some(wheel_data))
+            .with_wheel_env_probe(Rc::new(|var| var == "OPENAI_API_KEY"));
+
+        let prev = backend
+            .preview_wheel_set(
+                "p",
+                "default_provider",
+                &bitty_runtime::plugin_runtime::WheelSettingValue::Text("openai".to_string()),
+            )
+            .expect("preview default_provider");
+        assert!(prev.changed);
+        backend
+            .apply_wheel_set(
+                "p",
+                "default_provider",
+                &bitty_runtime::plugin_runtime::WheelSettingValue::Text("openai".to_string()),
+                &prev.candidate_digest,
+            )
+            .expect("apply default_provider");
+
+        let snap = backend.wheel_get("p").expect("wheel_get");
+        assert_eq!(snap.default_provider, "openai");
+        let openai = snap
+            .providers
+            .iter()
+            .find(|row| row.name == "openai")
+            .expect("openai row");
+        assert!(openai.has_auth);
+        assert_eq!(openai.auth_source, "env");
 
         let _ = std::fs::remove_dir_all(dir);
     }

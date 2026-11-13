@@ -1491,6 +1491,99 @@ pub trait HostServices {
         let _ = (name, opts_or_digest, digest, expiry);
         Err(BridgeError::not_implemented("bitty.profiles.delete"))
     }
+    /// Read bounded Wheel configuration, providers, permissions, and approvals
+    /// for `bitty.wheel.get` / `bitty.config.wheel.get` (CTX-1817).
+    fn wheel_get(&self) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.wheel.get"))
+    }
+    /// Render one Wheel setting candidate for `bitty.wheel.preview` (CTX-1817).
+    fn wheel_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let _ = (key, value);
+        Err(BridgeError::not_implemented("bitty.wheel.preview"))
+    }
+    /// Apply one approved Wheel setting change for `bitty.wheel.set` (CTX-1817).
+    fn wheel_set(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (key, value, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.wheel.set"))
+    }
+    /// Render one Wheel provider credential write candidate with redacted preview
+    /// for `bitty.wheel.preview_auth_set` (CTX-1817).
+    fn wheel_preview_auth_set(
+        &self,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let _ = (provider, api_key);
+        Err(BridgeError::not_implemented("bitty.wheel.preview_auth_set"))
+    }
+    /// Apply one approved Wheel provider credential write for
+    /// `bitty.wheel.auth_set` (CTX-1817).
+    fn wheel_auth_set(
+        &self,
+        provider: &str,
+        api_key: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (provider, api_key, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.wheel.auth_set"))
+    }
+    /// Render one Wheel provider credential removal candidate for
+    /// `bitty.wheel.preview_auth_remove` (CTX-1817).
+    fn wheel_preview_auth_remove(
+        &self,
+        provider: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let _ = provider;
+        Err(BridgeError::not_implemented(
+            "bitty.wheel.preview_auth_remove",
+        ))
+    }
+    /// Apply one approved Wheel provider credential removal for
+    /// `bitty.wheel.auth_remove` (CTX-1817).
+    fn wheel_auth_remove(
+        &self,
+        provider: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (provider, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.wheel.auth_remove"))
+    }
+    /// Render one Wheel pending approval resolution candidate for
+    /// `bitty.wheel.preview_resolve_approval` (CTX-1817).
+    fn wheel_preview_resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let _ = (id, decision);
+        Err(BridgeError::not_implemented(
+            "bitty.wheel.preview_resolve_approval",
+        ))
+    }
+    /// Apply one approved Wheel pending approval resolution for
+    /// `bitty.wheel.resolve_approval` (CTX-1817).
+    fn wheel_resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (id, decision, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.wheel.resolve_approval"))
+    }
     /// Read one host environment variable for `bitty.env.get` (CTX-0330).
     ///
     /// Host-mediated and grant-gated: the implementation must return
@@ -8020,6 +8113,513 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .set(ctx, "profiles", profiles_ro)
         .expect("config table accepts 'profiles'");
 
+    let wheel = Table::new(&ctx);
+    wheel
+        .set(
+            ctx,
+            "get",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(0), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.get takes no arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let snapshot = state
+                        .bounded(|_expiry| state.services.wheel_get())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, snapshot.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'get'");
+    wheel
+        .set(
+            ctx,
+            "preview",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.preview takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let key = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(key)) => key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.preview key must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let value = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let (digest, rendered, keys, changed) = state
+                        .bounded(|_expiry| state.services.wheel_preview(&key, &value))
+                        .map_err(|error| error.to_error(ctx))?;
+                    let keys_arr =
+                        LuaValue::array(keys.into_iter().map(LuaValue::String).collect());
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            ("keys", keys_arr.clone()),
+                            ("changed_keys", keys_arr),
+                            ("changed", LuaValue::Bool(changed)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'preview'");
+    wheel
+        .set(
+            ctx,
+            "set",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.set takes exactly three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let key = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(key)) => key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.set key must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let value = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let digest = match LuaValue::from_lua(stack.get(2), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "wheel.set approval must be the digest from wheel.preview",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.wheel_set(&key, &value, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (changed, reload) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("key", LuaValue::String(key)),
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'set'");
+    wheel
+        .set(
+            ctx,
+            "preview_auth_set",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.preview_auth_set takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let provider = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(provider)) => provider,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.preview_auth_set provider must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let api_key = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(api_key)) => api_key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_VALUE",
+                                "wheel.preview_auth_set api_key must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (digest, rendered, keys, changed) = state
+                        .bounded(|_expiry| {
+                            state.services.wheel_preview_auth_set(&provider, &api_key)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    let keys_arr =
+                        LuaValue::array(keys.into_iter().map(LuaValue::String).collect());
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            ("keys", keys_arr.clone()),
+                            ("changed_keys", keys_arr),
+                            ("changed", LuaValue::Bool(changed)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'preview_auth_set'");
+    wheel
+        .set(
+            ctx,
+            "auth_set",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.auth_set takes exactly three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let provider = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(provider)) => provider,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.auth_set provider must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let api_key = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(api_key)) => api_key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_VALUE",
+                                "wheel.auth_set api_key must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let digest = match LuaValue::from_lua(stack.get(2), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "wheel.auth_set approval must be the digest from wheel.preview_auth_set",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .wheel_auth_set(&provider, &api_key, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (changed, reload) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("provider", LuaValue::String(provider)),
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'auth_set'");
+    wheel
+        .set(
+            ctx,
+            "preview_auth_remove",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(1), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.preview_auth_remove takes exactly one argument",
+                        )
+                        .to_error(ctx));
+                    }
+                    let provider = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(provider)) => provider,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.preview_auth_remove provider must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (digest, rendered, keys, changed) = state
+                        .bounded(|_expiry| state.services.wheel_preview_auth_remove(&provider))
+                        .map_err(|error| error.to_error(ctx))?;
+                    let keys_arr =
+                        LuaValue::array(keys.into_iter().map(LuaValue::String).collect());
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            ("keys", keys_arr.clone()),
+                            ("changed_keys", keys_arr),
+                            ("changed", LuaValue::Bool(changed)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'preview_auth_remove'");
+    wheel
+        .set(
+            ctx,
+            "auth_remove",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.auth_remove takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let provider = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(provider)) => provider,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.auth_remove provider must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let digest = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "wheel.auth_remove approval must be the digest from wheel.preview_auth_remove",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .wheel_auth_remove(&provider, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (changed, reload) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("provider", LuaValue::String(provider)),
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'auth_remove'");
+    wheel
+        .set(
+            ctx,
+            "preview_resolve_approval",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.preview_resolve_approval takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let id = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(id)) => id,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.preview_resolve_approval id must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let decision = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(decision)) => decision,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_VALUE",
+                                "wheel.preview_resolve_approval decision must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (digest, rendered, keys, changed) = state
+                        .bounded(|_expiry| {
+                            state
+                                .services
+                                .wheel_preview_resolve_approval(&id, &decision)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    let keys_arr =
+                        LuaValue::array(keys.into_iter().map(LuaValue::String).collect());
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            ("keys", keys_arr.clone()),
+                            ("changed_keys", keys_arr),
+                            ("changed", LuaValue::Bool(changed)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'preview_resolve_approval'");
+    wheel
+        .set(
+            ctx,
+            "resolve_approval",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "wheel.resolve_approval takes exactly three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let id = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(id)) => id,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "wheel.resolve_approval id must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let decision = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(decision)) => decision,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_VALUE",
+                                "wheel.resolve_approval decision must be a string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let digest = match LuaValue::from_lua(stack.get(2), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "wheel.resolve_approval approval must be the digest from wheel.preview_resolve_approval",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .wheel_resolve_approval(&id, &decision, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (changed, reload) = outcome.map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("id", LuaValue::String(id)),
+                            ("decision", LuaValue::String(decision)),
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("wheel table accepts 'resolve_approval'");
+    let wheel_ro = readonly_table(ctx, wheel);
+    config
+        .set(ctx, "wheel", wheel_ro)
+        .expect("config table accepts 'wheel'");
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -8078,6 +8678,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts plugins");
     root.set(ctx, "profiles", profiles_ro)
         .expect("root accepts profiles");
+    root.set(ctx, "wheel", wheel_ro)
+        .expect("root accepts wheel");
     root.set(ctx, "component", readonly_table(ctx, component))
         .expect("root accepts component");
     Value::Table(readonly_table(ctx, root))

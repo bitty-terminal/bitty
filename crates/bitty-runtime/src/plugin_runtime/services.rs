@@ -66,11 +66,11 @@ use super::config_write::{
     ConfigSettingValue, ConfigSourceList, ConfigValueRow, ConfigWriteBackend, ConfigWriteGate,
     PluginList, ProfileCloneOptions, ProfileCloneOutcome, ProfileCreateOptions,
     ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome, ProfileLifecycleRendering,
-    ProfileList, ProfileRenameOptions, ProfileRenameOutcome, ProfileWriteFailure, approval_digest,
-    check_list_bounds, check_manage_rendering, check_result_rows, config_backend_error,
-    config_invalid_request, config_key_error, config_limit_exceeded, config_read_error,
-    config_unavailable, list_row_bytes, manage_approval_digest, redact_config_value,
-    writable_setting,
+    ProfileList, ProfileRenameOptions, ProfileRenameOutcome, ProfileWriteFailure,
+    WheelSettingValue, WheelSnapshot, approval_digest, check_list_bounds, check_manage_rendering,
+    check_result_rows, config_backend_error, config_invalid_request, config_key_error,
+    config_limit_exceeded, config_read_error, config_unavailable, config_value_error,
+    list_row_bytes, manage_approval_digest, redact_config_value, writable_setting,
 };
 use super::history::{
     HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
@@ -4082,6 +4082,185 @@ fn validate_list_string(label: &str, value: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Built-in Wheel provider ids recognized by `bitty.wheel`.
+const WHEEL_PROVIDER_IDS: &[&str] = &[
+    "opencode-go",
+    "openai",
+    "anthropic",
+    "deepseek",
+    "openrouter",
+    "ollama",
+];
+
+/// Built-in Wheel tool names recognized by `permissions.<tool>`.
+const WHEEL_TOOL_NAMES: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "bash",
+];
+
+/// Validate a Wheel provider id against the built-in catalog.
+fn validate_wheel_provider_name(provider: &str) -> Result<(), BridgeError> {
+    if !WHEEL_PROVIDER_IDS.contains(&provider) {
+        return Err(config_invalid_request("unknown wheel provider"));
+    }
+    Ok(())
+}
+
+/// Validate a Wheel provider id for credential mutations (`ollama` is keyless).
+fn validate_wheel_auth_provider(provider: &str) -> Result<(), BridgeError> {
+    validate_wheel_provider_name(provider)?;
+    if provider == "ollama" {
+        return Err(config_invalid_request(
+            "wheel provider 'ollama' does not use an API key",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a Wheel model identifier (allows single `/` for OpenRouter-style slugs,
+/// rejects `\`, `..`, leading/trailing `/`, control chars, or surrounding whitespace).
+fn validate_wheel_model_string(model: &str, allow_empty: bool) -> Result<(), BridgeError> {
+    if model.is_empty() {
+        if allow_empty {
+            return Ok(());
+        }
+        return Err(config_value_error("wheel model must be non-empty"));
+    }
+    if model.len() > CONFIG_LIST_MAX_STRING_BYTES
+        || model.trim() != model
+        || model.chars().any(char::is_control)
+        || model.contains('\\')
+        || model.contains("..")
+        || model.starts_with('/')
+        || model.ends_with('/')
+        || model.contains("//")
+    {
+        return Err(config_value_error("wheel model identifier is invalid"));
+    }
+    Ok(())
+}
+
+/// Validate one `(key, value)` pair for `bitty.wheel.preview` / `bitty.wheel.set`.
+fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingValue, BridgeError> {
+    match key {
+        "default_provider" => {
+            let LuaValue::String(provider) = value else {
+                return Err(config_value_error(
+                    "wheel default_provider must be a string",
+                ));
+            };
+            validate_wheel_provider_name(provider)
+                .map_err(|_| config_value_error("unknown wheel default_provider"))?;
+            Ok(WheelSettingValue::Text(provider.clone()))
+        }
+        "default_model" => {
+            let LuaValue::String(model) = value else {
+                return Err(config_value_error("wheel default_model must be a string"));
+            };
+            validate_wheel_model_string(model, true)?;
+            Ok(WheelSettingValue::Text(model.clone()))
+        }
+        "thinking_enabled" => {
+            let LuaValue::Bool(flag) = value else {
+                return Err(config_value_error(
+                    "wheel thinking_enabled must be a boolean",
+                ));
+            };
+            Ok(WheelSettingValue::Bool(*flag))
+        }
+        "thinking_gear" => {
+            let LuaValue::String(gear) = value else {
+                return Err(config_value_error("wheel thinking_gear must be a string"));
+            };
+            if !matches!(gear.as_str(), "off" | "low" | "medium" | "high" | "xhigh") {
+                return Err(config_value_error(
+                    "wheel thinking_gear must be off, low, medium, high, or xhigh",
+                ));
+            }
+            Ok(WheelSettingValue::Text(gear.clone()))
+        }
+        "approval_mode" => {
+            let LuaValue::String(mode) = value else {
+                return Err(config_value_error("wheel approval_mode must be a string"));
+            };
+            if !matches!(
+                mode.as_str(),
+                "prompt" | "dashboard" | "auto-allow" | "auto-deny"
+            ) {
+                return Err(config_value_error(
+                    "wheel approval_mode must be prompt, dashboard, auto-allow, or auto-deny",
+                ));
+            }
+            Ok(WheelSettingValue::Text(mode.clone()))
+        }
+        _ if key.starts_with("permissions.") => {
+            let tool = &key["permissions.".len()..];
+            if !WHEEL_TOOL_NAMES.contains(&tool) {
+                return Err(config_key_error());
+            }
+            let LuaValue::String(mode) = value else {
+                return Err(config_value_error("wheel permission mode must be a string"));
+            };
+            if !matches!(mode.as_str(), "auto" | "ask" | "deny") {
+                return Err(config_value_error(
+                    "wheel permission mode must be auto, ask, or deny",
+                ));
+            }
+            Ok(WheelSettingValue::Text(mode.clone()))
+        }
+        _ if key.starts_with("providers.") && key.ends_with(".model") => {
+            let provider = &key["providers.".len()..key.len() - ".model".len()];
+            if !WHEEL_PROVIDER_IDS.contains(&provider) {
+                return Err(config_key_error());
+            }
+            let LuaValue::String(model) = value else {
+                return Err(config_value_error("wheel provider model must be a string"));
+            };
+            validate_wheel_model_string(model, false)?;
+            Ok(WheelSettingValue::Text(model.clone()))
+        }
+        _ => Err(config_key_error()),
+    }
+}
+
+/// Validate a raw API key for `wheel.preview_auth_set` / `wheel.auth_set`
+/// without echoing the secret in any error message.
+fn validate_wheel_api_key(api_key: &str) -> Result<(), BridgeError> {
+    if api_key.is_empty()
+        || api_key.len() > 512
+        || api_key.trim() != api_key
+        || api_key.chars().any(char::is_control)
+    {
+        return Err(config_value_error(
+            "wheel api_key must be 1..512 printable bytes without surrounding whitespace",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a Wheel approval request id and decision.
+fn validate_wheel_approval(id: &str, decision: &str) -> Result<(), BridgeError> {
+    if id.is_empty()
+        || id.len() > 64
+        || id.contains("..")
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(config_invalid_request("wheel approval id is invalid"));
+    }
+    if !matches!(decision, "allow_once" | "allow_session" | "deny") {
+        return Err(config_value_error(
+            "wheel approval decision must be allow_once, allow_session, or deny",
+        ));
+    }
+    Ok(())
+}
+
 /// Inherent `config.manage` core (CTX-1613, bitty#2393).
 ///
 /// Split from the [`HostServices`] impl so tests can inject a start
@@ -5015,6 +5194,312 @@ impl PluginServices {
             .apply_profile_delete(&self.plugin_id, &name, &options, &candidate_digest)
             .map_err(ProfileWriteFailure::into_bridge_error)
     }
+
+    /// `bitty.wheel.get`: bounded Wheel settings, providers, permissions, and approvals (CTX-1817).
+    fn wheel_get(&self) -> Result<WheelSnapshot, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let backend = self.config_backend_or_unavailable()?;
+        self.config_admit(started)?;
+        let snapshot = backend
+            .wheel_get(&self.plugin_id)
+            .map_err(config_read_error)?;
+        let row_count = snapshot
+            .providers
+            .len()
+            .saturating_add(snapshot.permissions.len())
+            .saturating_add(snapshot.approvals.len());
+        let bytes = 64usize
+            .saturating_add(snapshot.providers.len().saturating_mul(64))
+            .saturating_add(snapshot.permissions.len().saturating_mul(16))
+            .saturating_add(snapshot.approvals.len().saturating_mul(64));
+        check_list_bounds(row_count, bytes)?;
+        self.config_charge_result_bytes(started, bytes)?;
+        Ok(snapshot)
+    }
+
+    /// `bitty.wheel.preview`: render one Wheel setting change candidate (CTX-1817).
+    fn wheel_preview(&self, key: &str, value: &LuaValue) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let typed = validate_wheel_setting(key, value)?;
+        self.config_charge(started, key.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_wheel_set(&self.plugin_id, key, &typed)
+            .map_err(|failure| config_backend_error(failure, key))?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::WheelSetting {
+            key: key.to_string(),
+            value: typed,
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: rendering.changed,
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.wheel.set`: apply one approved Wheel setting change (CTX-1817).
+    fn wheel_set_with_expiry(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        let typed = validate_wheel_setting(key, value)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, key.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::WheelSetting {
+            key: key.to_string(),
+            value: typed.clone(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("wheel.set"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_wheel_set(&self.plugin_id, key, &typed, &candidate_digest) {
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, key)),
+        }
+    }
+
+    /// `bitty.wheel.preview_auth_set`: render one redacted credential write candidate (CTX-1817).
+    fn wheel_preview_auth_set(
+        &self,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        validate_wheel_auth_provider(provider)?;
+        validate_wheel_api_key(api_key)?;
+        self.config_charge(started, provider.len() + 32)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_wheel_auth_set(&self.plugin_id, provider, api_key)
+            .map_err(|failure| config_backend_error(failure, provider))?;
+        if rendering.rendered.contains(api_key) || !rendering.rendered.contains("***REDACTED***") {
+            return Err(config_invalid_request(
+                "wheel.preview_auth_set rendering must redact secret values",
+            ));
+        }
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let secret_digest = bitty_package::integrity::sha256_hex(api_key.as_bytes());
+        let target = ConfigApprovalTarget::WheelAuthSet {
+            provider: provider.to_string(),
+            secret_digest,
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: rendering.changed,
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.wheel.auth_set`: apply one approved credential write (CTX-1817).
+    fn wheel_auth_set_with_expiry(
+        &self,
+        provider: &str,
+        api_key: &str,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        validate_wheel_auth_provider(provider)?;
+        validate_wheel_api_key(api_key)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, provider.len() + 32)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let secret_digest = bitty_package::integrity::sha256_hex(api_key.as_bytes());
+        let target = ConfigApprovalTarget::WheelAuthSet {
+            provider: provider.to_string(),
+            secret_digest,
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("wheel.auth_set"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_wheel_auth_set(&self.plugin_id, provider, api_key, &candidate_digest) {
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, provider)),
+        }
+    }
+
+    /// `bitty.wheel.preview_auth_remove`: render one credential removal candidate (CTX-1817).
+    fn wheel_preview_auth_remove(&self, provider: &str) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        validate_wheel_auth_provider(provider)?;
+        self.config_charge(started, provider.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_wheel_auth_remove(&self.plugin_id, provider)
+            .map_err(|failure| config_backend_error(failure, provider))?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::WheelAuthRemove {
+            provider: provider.to_string(),
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: rendering.changed,
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.wheel.auth_remove`: apply one approved credential removal (CTX-1817).
+    fn wheel_auth_remove_with_expiry(
+        &self,
+        provider: &str,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        validate_wheel_auth_provider(provider)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, provider.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::WheelAuthRemove {
+            provider: provider.to_string(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("wheel.auth_remove"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_wheel_auth_remove(&self.plugin_id, provider, &candidate_digest) {
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, provider)),
+        }
+    }
+
+    /// `bitty.wheel.preview_resolve_approval`: render one approval resolution candidate (CTX-1817).
+    fn wheel_preview_resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+    ) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        validate_wheel_approval(id, decision)?;
+        self.config_charge(started, id.len() + decision.len() + 16)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_wheel_resolve_approval(&self.plugin_id, id, decision)
+            .map_err(|failure| config_backend_error(failure, id))?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::WheelResolveApproval {
+            id: id.to_string(),
+            decision: decision.to_string(),
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: rendering.changed,
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.wheel.resolve_approval`: apply one approved pending approval resolution (CTX-1817).
+    fn wheel_resolve_approval_with_expiry(
+        &self,
+        id: &str,
+        decision: &str,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        validate_wheel_approval(id, decision)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, id.len() + decision.len() + 16)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::WheelResolveApproval {
+            id: id.to_string(),
+            decision: decision.to_string(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("wheel.resolve_approval"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_wheel_resolve_approval(&self.plugin_id, id, decision, &candidate_digest)
+        {
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, id)),
+        }
+    }
 }
 
 /// Wire shape for one `config.get` row.
@@ -5210,6 +5695,73 @@ fn profile_delete_outcome_value(outcome: ProfileDeleteOutcome) -> LuaValue {
         ("backed_up", LuaValue::Bool(outcome.backed_up)),
         ("was_active", LuaValue::Bool(outcome.was_active)),
         ("reload", LuaValue::String("none".to_string())),
+    ])
+}
+
+/// Wire shape for `bitty.wheel.get` / `bitty.config.wheel.get` (CTX-1817).
+fn wheel_snapshot_value(snapshot: WheelSnapshot) -> LuaValue {
+    let providers: Vec<LuaValue> = snapshot
+        .providers
+        .into_iter()
+        .map(|row| {
+            LuaValue::table([
+                ("name", LuaValue::String(row.name)),
+                ("label", LuaValue::String(row.label)),
+                ("protocol", LuaValue::String(row.protocol)),
+                ("default_model", LuaValue::String(row.default_model)),
+                ("model", LuaValue::String(row.model)),
+                ("model_source", LuaValue::String(row.model_source)),
+                ("auth_env", LuaValue::String(row.auth_env)),
+                ("has_auth", LuaValue::Bool(row.has_auth)),
+                ("auth_source", LuaValue::String(row.auth_source)),
+                ("base_url", LuaValue::String(row.base_url)),
+            ])
+        })
+        .collect();
+    let permissions: Vec<LuaValue> = snapshot
+        .permissions
+        .into_iter()
+        .map(|row| {
+            LuaValue::table([
+                ("tool", LuaValue::String(row.tool)),
+                ("mode", LuaValue::String(row.mode)),
+            ])
+        })
+        .collect();
+    let approvals: Vec<LuaValue> = snapshot
+        .approvals
+        .into_iter()
+        .map(|row| {
+            LuaValue::table([
+                ("id", LuaValue::String(row.id)),
+                ("session_id", LuaValue::String(row.session_id)),
+                ("tool", LuaValue::String(row.tool)),
+                ("risk", LuaValue::String(row.risk)),
+                ("summary", LuaValue::String(row.summary)),
+                ("status", LuaValue::String(row.status)),
+                (
+                    "decision",
+                    row.decision.map_or(LuaValue::Nil, LuaValue::String),
+                ),
+                ("created_at", LuaValue::Integer(row.created_at)),
+            ])
+        })
+        .collect();
+    LuaValue::table([
+        (
+            "default_provider",
+            LuaValue::String(snapshot.default_provider),
+        ),
+        ("default_model", LuaValue::String(snapshot.default_model)),
+        (
+            "thinking_enabled",
+            LuaValue::Bool(snapshot.thinking_enabled),
+        ),
+        ("thinking_gear", LuaValue::String(snapshot.thinking_gear)),
+        ("approval_mode", LuaValue::String(snapshot.approval_mode)),
+        ("providers", LuaValue::array(providers)),
+        ("permissions", LuaValue::array(permissions)),
+        ("approvals", LuaValue::array(approvals)),
     ])
 }
 
@@ -5467,6 +6019,125 @@ impl HostServices for PluginServices {
             expiry,
         )?;
         Ok((true, profile_delete_outcome_value(outcome)))
+    }
+
+    fn wheel_get(&self) -> Result<LuaValue, BridgeError> {
+        let snapshot = PluginServices::wheel_get(self)?;
+        Ok(wheel_snapshot_value(snapshot))
+    }
+
+    fn wheel_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let token = PluginServices::wheel_preview(self, key, value)?;
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
+    }
+
+    fn wheel_set(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        PluginServices::wheel_set_with_expiry(self, key, value, digest, Instant::now(), expiry)
+    }
+
+    fn wheel_preview_auth_set(
+        &self,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let token = PluginServices::wheel_preview_auth_set(self, provider, api_key)?;
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
+    }
+
+    fn wheel_auth_set(
+        &self,
+        provider: &str,
+        api_key: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        PluginServices::wheel_auth_set_with_expiry(
+            self,
+            provider,
+            api_key,
+            digest,
+            Instant::now(),
+            expiry,
+        )
+    }
+
+    fn wheel_preview_auth_remove(
+        &self,
+        provider: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let token = PluginServices::wheel_preview_auth_remove(self, provider)?;
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
+    }
+
+    fn wheel_auth_remove(
+        &self,
+        provider: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        PluginServices::wheel_auth_remove_with_expiry(
+            self,
+            provider,
+            digest,
+            Instant::now(),
+            expiry,
+        )
+    }
+
+    fn wheel_preview_resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let token = PluginServices::wheel_preview_resolve_approval(self, id, decision)?;
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
+    }
+
+    fn wheel_resolve_approval(
+        &self,
+        id: &str,
+        decision: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        PluginServices::wheel_resolve_approval_with_expiry(
+            self,
+            id,
+            decision,
+            digest,
+            Instant::now(),
+            expiry,
+        )
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {

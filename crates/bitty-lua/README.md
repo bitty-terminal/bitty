@@ -86,14 +86,14 @@ closes a view therefore had to reuse one fixed set of handles for its whole
 generation, because a mount per open would exhaust the 64-block registry after
 eight cycles. `bitty.ui.unmount` is the release primitive.
 
-| Item         | Contract                                                                                                                                                                                                                                       |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument     | An integer handle this generation received from `bitty.ui.mount`: a v1 band/overlay block or a `terminal`-slot rich scene. A non-integer is `E_UI_COMPONENT_INVALID`.                                                                             |
-| Result       | `true` when a handle this generation held was released; `false` for a stale, foreign, or unknown handle — the `ui.update` contract, so a cleanup path never has to tell "already gone" apart from an error.                                       |
-| Grant        | `ui.rich`, the same grant `mount`/`update` need. Without it the call is refused with `E_CAPABILITY_DENIED` and the block stays mounted.                                                                                                          |
-| Release      | A band/overlay block leaves the registry and its retained-string bytes are refunded to the 2 MiB aggregate; a `terminal`-slot scene is detached and its Core-owned panel retired. The handle is never re-minted, so `update`/`unmount` on it keep reporting `false`. |
-| Capture      | A live focusable-overlay capture handle reports `false` and changes nothing: that surface is owned by `bitty.ui.overlay.release`, which also ends the input-capture session, so releasing the block alone would orphan a capture.                  |
-| Teardown     | Unchanged: suspend, unload, disable, crash, and reload still drop the whole registry. `unmount` is the per-block release, not a replacement for generation teardown.                                                                              |
+| Item     | Contract                                                                                                                                                                                                                                                             |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument | An integer handle this generation received from `bitty.ui.mount`: a v1 band/overlay block or a `terminal`-slot rich scene. A non-integer is `E_UI_COMPONENT_INVALID`.                                                                                                |
+| Result   | `true` when a handle this generation held was released; `false` for a stale, foreign, or unknown handle — the `ui.update` contract, so a cleanup path never has to tell "already gone" apart from an error.                                                          |
+| Grant    | `ui.rich`, the same grant `mount`/`update` need. Without it the call is refused with `E_CAPABILITY_DENIED` and the block stays mounted.                                                                                                                              |
+| Release  | A band/overlay block leaves the registry and its retained-string bytes are refunded to the 2 MiB aggregate; a `terminal`-slot scene is detached and its Core-owned panel retired. The handle is never re-minted, so `update`/`unmount` on it keep reporting `false`. |
+| Capture  | A live focusable-overlay capture handle reports `false` and changes nothing: that surface is owned by `bitty.ui.overlay.release`, which also ends the input-capture session, so releasing the block alone would orphan a capture.                                    |
+| Teardown | Unchanged: suspend, unload, disable, crash, and reload still drop the whole registry. `unmount` is the per-block release, not a replacement for generation teardown.                                                                                                 |
 
 The caps are unchanged (64 blocks and 2 MiB of retained strings per plugin
 generation); `unmount` makes them reclaimable inside a generation instead of
@@ -113,11 +113,11 @@ unfocused (for example on `focus.changed`). `bitty.ui.state(handle)` queries the
 mounted block's live state under the same `ui.rich` grant as `mount`, `update`,
 and `unmount`.
 
-| Item     | Contract                                                                                                                                                                                                                                       |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Argument | An integer handle this generation received from `bitty.ui.mount`. A non-integer fails closed with `E_UI_COMPONENT_INVALID`.                                                                                                                    |
-| Result   | `{ presented = boolean, focused = boolean }` for a live handle owned by this generation; `nil` for a stale, unmounted, foreign, or unknown handle (matching the `ui.update`/`ui.unmount` stale-handle contract).                                |
-| Grant    | `ui.rich`, the same grant `mount`/`update`/`unmount` need. Without it the call fails closed with `E_CAPABILITY_DENIED`.                                                                                                                        |
+| Item     | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Argument | An integer handle this generation received from `bitty.ui.mount`. A non-integer fails closed with `E_UI_COMPONENT_INVALID`.                                                                                                                                                                                                                                                                                                                                                                                          |
+| Result   | `{ presented = boolean, focused = boolean }` for a live handle owned by this generation; `nil` for a stale, unmounted, foreign, or unknown handle (matching the `ui.update`/`ui.unmount` stale-handle contract).                                                                                                                                                                                                                                                                                                     |
+| Grant    | `ui.rich`, the same grant `mount`/`update`/`unmount` need. Without it the call fails closed with `E_CAPABILITY_DENIED`.                                                                                                                                                                                                                                                                                                                                                                                              |
 | Slots    | `top`/`bottom`/`tabline`: `presented` is `true` when the band is non-empty (reserves its row and paints), and `focused` is `presented and window_focused`. `overlay`: `presented` is `true` while the block owns capture or the presentation overlay session, and `focused` is `true` only while it owns capture and the window is focused. `terminal`: `presented` is `true` while the rich scene is attached, and `focused` is `true` when the scene's panel view is the focused target and the window is focused. |
 
 ## Lua surface: `process.spawn` working directory (CTX-1715)
@@ -148,15 +148,15 @@ between observation and spawn is a refusal, not a redirect. Where the platform
 cannot prove a child's cwd (macOS, the BSDs, Windows), the `pane` semantic is
 refused rather than resolved from the report.
 
-| Item                      | Contract                                                                                                                                                                                                                                                                                                                                    |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cwd`                     | Optional string. `"pane"` is the only accepted value. An absolute or relative path, `~`, `..`, a symlink target, an empty string, and a wrong-case token are all `E_DEF_INVALID` before the host call.                                                                                                                                      |
-| Unknown options           | `E_DEF_INVALID`; no option is ever silently ignored. A table mixing `cwd = "pane"` with an unknown key is refused regardless of key order.                                                                                                                                                                                                  |
-| `E_SPAWN_CWD_UNAVAILABLE` | The host has no pane binding, the focused view has no terminal session, the focused pane has no provable PTY-child working directory (no child, a reaped child, an unreadable or deleted kernel cwd, or a platform without a kernel cwd query), or the directory changed identity before the spawn. The spawn never falls back to the host process cwd and never to the pane's `OSC 7` report.         |
-| Unchanged refusals        | The `-C`, `--git-dir`, and `--work-tree` argv denials and the `[tools.git]` executable allowlist are unchanged; they close argv-selected directories, not repository metadata (see below).                                                                                                                                                  |
-| Not a filesystem grant    | The pane directory is a **starting directory**, not an `fs` grant. `process.spawn:git` is itself a repository-read capability: the child reads the pane tree with the user's OS authority, not through the plugin's `fs` grants. The plugin API's reads still follow `fs.read`/`fs.write`, and the inherited exec confinement is unchanged. |
-| Reload-free               | The source is read per call, so changing the pane directory changes the result without reloading the plugin.                                                                                                                                                                                                                                |
-| Unchanged calls           | Omitting the option keeps the host default (no child cwd), so existing calls stay valid.                                                                                                                                                                                                                                                    |
+| Item                      | Contract                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cwd`                     | Optional string. `"pane"` is the only accepted value. An absolute or relative path, `~`, `..`, a symlink target, an empty string, and a wrong-case token are all `E_DEF_INVALID` before the host call.                                                                                                                                                                                         |
+| Unknown options           | `E_DEF_INVALID`; no option is ever silently ignored. A table mixing `cwd = "pane"` with an unknown key is refused regardless of key order.                                                                                                                                                                                                                                                     |
+| `E_SPAWN_CWD_UNAVAILABLE` | The host has no pane binding, the focused view has no terminal session, the focused pane has no provable PTY-child working directory (no child, a reaped child, an unreadable or deleted kernel cwd, or a platform without a kernel cwd query), or the directory changed identity before the spawn. The spawn never falls back to the host process cwd and never to the pane's `OSC 7` report. |
+| Unchanged refusals        | The `-C`, `--git-dir`, and `--work-tree` argv denials and the `[tools.git]` executable allowlist are unchanged; they close argv-selected directories, not repository metadata (see below).                                                                                                                                                                                                     |
+| Not a filesystem grant    | The pane directory is a **starting directory**, not an `fs` grant. `process.spawn:git` is itself a repository-read capability: the child reads the pane tree with the user's OS authority, not through the plugin's `fs` grants. The plugin API's reads still follow `fs.read`/`fs.write`, and the inherited exec confinement is unchanged.                                                    |
+| Reload-free               | The source is read per call, so changing the pane directory changes the result without reloading the plugin.                                                                                                                                                                                                                                                                                   |
+| Unchanged calls           | Omitting the option keeps the host default (no child cwd), so existing calls stay valid.                                                                                                                                                                                                                                                                                                       |
 
 **Repository metadata is a separate channel.** The `-C`, `--git-dir`, and
 `--work-tree` denials close argv-selected directories, not repository
@@ -186,17 +186,17 @@ a consumed, expired, or wrong-target token fails with the same code (a digest
 that is not lowercase SHA-256 hex is `E_CONFIG_APPROVAL_MISMATCH`). All calls
 require the recorded `config.manage` grant.
 
-| Verb | Arguments | Result |
-| ---- | --------- | ------ |
-| `list` | none | `rows` and the identical `profiles` array (`{ name, active }`), `active`, `count`, `truncated`. |
-| `preview_create` | `name[, opts]` | `digest`, `rendered`, `changed`, `changed_keys`, `replaces_existing`, `selector_updated = false`, `active`. |
-| `create` | `name[, opts][, digest]` | `name`, `created`, `changed`, `replaced`, `backed_up`, `extends`, `preset`, `reload = "none"`. |
-| `preview_clone` | `src, dst[, opts]` | Preview shape above (`selector_updated = false`). |
-| `clone` | `src, dst[, opts][, digest]` | `source`, `name`, `target`, `cloned`, `changed`, `replaced`, `backed_up`, `extends`, `reload = "none"`. |
-| `preview_rename` | `old, new[, opts]` | Preview shape above; `selector_updated` says whether the persisted selector will be rewritten. |
-| `rename` | `old, new[, opts][, digest]` | `old_name`, `new_name`, `name`, `renamed`, `changed`, `replaced`, `backed_up`, `selector_updated`, `reload` (`"auto"` when the selector moved, else `"none"`). |
-| `preview_delete` | `name[, opts]` | Preview shape above; `active` flags the currently persisted profile. |
-| `delete` | `name[, opts][, digest]` | `name`, `deleted`, `changed`, `backed_up`, `was_active`, `reload = "none"`. |
+| Verb             | Arguments                    | Result                                                                                                                                                         |
+| ---------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list`           | none                         | `rows` and the identical `profiles` array (`{ name, active }`), `active`, `count`, `truncated`.                                                                |
+| `preview_create` | `name[, opts]`               | `digest`, `rendered`, `changed`, `changed_keys`, `replaces_existing`, `selector_updated = false`, `active`.                                                    |
+| `create`         | `name[, opts][, digest]`     | `name`, `created`, `changed`, `replaced`, `backed_up`, `extends`, `preset`, `reload = "none"`.                                                                 |
+| `preview_clone`  | `src, dst[, opts]`           | Preview shape above (`selector_updated = false`).                                                                                                              |
+| `clone`          | `src, dst[, opts][, digest]` | `source`, `name`, `target`, `cloned`, `changed`, `replaced`, `backed_up`, `extends`, `reload = "none"`.                                                        |
+| `preview_rename` | `old, new[, opts]`           | Preview shape above; `selector_updated` says whether the persisted selector will be rewritten.                                                                 |
+| `rename`         | `old, new[, opts][, digest]` | `old_name`, `new_name`, `name`, `renamed`, `changed`, `replaced`, `backed_up`, `selector_updated`, `reload` (`"auto"` when the selector moved, else `"none"`). |
+| `preview_delete` | `name[, opts]`               | Preview shape above; `active` flags the currently persisted profile.                                                                                           |
+| `delete`         | `name[, opts][, digest]`     | `name`, `deleted`, `changed`, `backed_up`, `was_active`, `reload = "none"`.                                                                                    |
 
 Options are a closed table: an unknown key, a non-boolean `force`, or a
 non-table argument is `E_PROFILE_USAGE`, never ignored. `preview_create`
@@ -214,12 +214,12 @@ returns `active`, `changed`, `reload = "auto"`, and `pending_restart`.
 
 `force` semantics:
 
-| Verb | Without `force` | With `force` |
-| ---- | --------------- | ------------ |
-| `create` | an existing destination is `E_PROFILE_CONFLICT`. | the destination is backed up as `<name>.lua.bak-<epoch>` and replaced. |
-| `clone` | an existing destination is `E_PROFILE_CONFLICT`. | same backup-then-replace behaviour. |
-| `rename` | an existing destination is `E_PROFILE_CONFLICT`. | the destination is backed up and replaced; the source is then renamed and the persisted selector rewritten when it named the source (the selector is backed up too). |
-| `delete` | the active profile and the reserved `default` are `E_PROFILE_CONFLICT`. | the active profile and/or `default.lua` may be removed; a timestamped backup is always kept. |
+| Verb     | Without `force`                                                         | With `force`                                                                                                                                                         |
+| -------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create` | an existing destination is `E_PROFILE_CONFLICT`.                        | the destination is backed up as `<name>.lua.bak-<epoch>` and replaced.                                                                                               |
+| `clone`  | an existing destination is `E_PROFILE_CONFLICT`.                        | same backup-then-replace behaviour.                                                                                                                                  |
+| `rename` | an existing destination is `E_PROFILE_CONFLICT`.                        | the destination is backed up and replaced; the source is then renamed and the persisted selector rewritten when it named the source (the selector is backed up too). |
+| `delete` | the active profile and the reserved `default` are `E_PROFILE_CONFLICT`. | the active profile and/or `default.lua` may be removed; a timestamped backup is always kept.                                                                         |
 
 Independently of `force`, a profile that another profile extends cannot be
 deleted or renamed (`E_PROFILE_CONFLICT` naming the dependents), and `default`
@@ -236,21 +236,30 @@ explicit acknowledgement; a plugin that wants to avoid the dangling state must
 `default.lua`, which is only the implicit base profile when no profile is
 selected.
 
-| Code | Meaning |
-| ---- | ------- |
-| `E_CAPABILITY_DENIED` | the generation holds no recorded `config.manage` grant. |
-| `E_CONFIG_UNAVAILABLE` | no writable profile backend is installed. |
-| `E_CONFIG_APPROVAL_REQUIRED` | missing, replayed, expired, or wrong-target digest (apply calls). |
-| `E_CONFIG_APPROVAL_MISMATCH` | a digest is not a lowercase SHA-256 hex string, or the trailing and embedded digests disagree. |
-| `E_CONFIG_STALE` | the candidate bytes moved between preview and apply. |
-| `E_PROFILE_USAGE` | malformed arguments: non-table options, unknown option key, wrong value type, or `from` combined with `preset`. |
-| `E_PROFILE_INVALID` | invalid profile name, unknown preset, profile body that fails validation, unrewritable selector, or a selector update that cannot be validated. |
-| `E_PROFILE_CONFLICT` | reserved `default` where it is refused, an existing target without `force`, active-profile delete without `force`, or an `extends` dependent. |
-| `E_PROFILE_NOT_FOUND` | the source or target profile does not exist. |
-| `E_PROFILE_IO` | a filesystem operation failed; the previous bytes are preserved where a rollback was possible. |
-| `E_PROFILE_INTERNAL` | a rollback or restore invariant failed; the payload names the operation, never a path. |
-| `E_DEF_INVALID` | wrong arity or a non-string name argument. |
-| `E_DEF_LIMIT` / `E_TIMEOUT` | the `config.manage` call/byte budget or the authorization deadline was exceeded. |
+| Code                         | Meaning                                                                                                                                         |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`        | the generation holds no recorded `config.manage` grant.                                                                                         |
+| `E_CONFIG_UNAVAILABLE`       | no writable profile backend is installed.                                                                                                       |
+| `E_CONFIG_APPROVAL_REQUIRED` | missing, replayed, expired, or wrong-target digest (apply calls).                                                                               |
+| `E_CONFIG_APPROVAL_MISMATCH` | a digest is not a lowercase SHA-256 hex string, or the trailing and embedded digests disagree.                                                  |
+| `E_CONFIG_STALE`             | the candidate bytes moved between preview and apply.                                                                                            |
+| `E_PROFILE_USAGE`            | malformed arguments: non-table options, unknown option key, wrong value type, or `from` combined with `preset`.                                 |
+| `E_PROFILE_INVALID`          | invalid profile name, unknown preset, profile body that fails validation, unrewritable selector, or a selector update that cannot be validated. |
+| `E_PROFILE_CONFLICT`         | reserved `default` where it is refused, an existing target without `force`, active-profile delete without `force`, or an `extends` dependent.   |
+| `E_PROFILE_NOT_FOUND`        | the source or target profile does not exist.                                                                                                    |
+| `E_PROFILE_IO`               | a filesystem operation failed; the previous bytes are preserved where a rollback was possible.                                                  |
+| `E_PROFILE_INTERNAL`         | a rollback or restore invariant failed; the payload names the operation, never a path.                                                          |
+| `E_DEF_INVALID`              | wrong arity or a non-string name argument.                                                                                                      |
+| `E_DEF_LIMIT` / `E_TIMEOUT`  | the `config.manage` call/byte budget or the authorization deadline was exceeded.                                                                |
+
+## Lua surface: Wheel management (`bitty.wheel` / `bitty.config.wheel`, CTX-1817)
+
+`bitty.wheel` (also mounted at `bitty.config.wheel`) exposes bounded read/write management of `$XDG_DATA_HOME/wheel/{settings.json,credentials.json,approvals.json}` to plugins holding the `config.manage` grant:
+
+- `get()` returns `{ default_provider, default_model, thinking_enabled, thinking_gear, approval_mode, providers, permissions, approvals }` with boolean/source-only credential attribution (`env` > `global_config` > `data_credentials` > `none`).
+- `preview(key, value)` / `set(key, value, digest)` mutate `settings.json` (`default_provider`, `default_model`, `thinking_enabled`, `thinking_gear`, `approval_mode`, `permissions.<tool>`, `providers.<name>.model`).
+- `preview_auth_set(provider, api_key)` / `auth_set(provider, api_key, digest)` and `preview_auth_remove(provider)` / `auth_remove(provider, digest)` mutate `credentials.json` (`0700`/`0600`) with `"***REDACTED***"` previews and SHA-256 secret-digest binding.
+- `preview_resolve_approval(id, decision)` / `resolve_approval(id, decision, digest)` resolve pending entries in `approvals.json` (`allow_once`, `allow_session`, `deny`).
 
 ## Evidence
 

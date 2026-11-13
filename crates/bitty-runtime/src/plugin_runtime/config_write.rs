@@ -899,6 +899,124 @@ impl ProfileWriteFailure {
     }
 }
 
+/// One typed scalar value for `bitty.wheel.preview` / `bitty.wheel.set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WheelSettingValue {
+    /// Free text (`default_provider`, `default_model`, `thinking_gear`, `approval_mode`, `permissions.<tool>`, `providers.<name>.model`).
+    Text(String),
+    /// Boolean (`thinking_enabled`).
+    Bool(bool),
+}
+
+impl WheelSettingValue {
+    /// Stable kind label (`text` or `bool`).
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Text(_) => "text",
+            Self::Bool(_) => "bool",
+        }
+    }
+
+    /// Deterministic literal rendering for the approval preimage.
+    #[must_use]
+    pub fn render_literal(&self) -> String {
+        match self {
+            Self::Text(text) => format!("{text:?}"),
+            Self::Bool(flag) => flag.to_string(),
+        }
+    }
+}
+
+/// One provider row in [`WheelSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WheelProviderRow {
+    /// Canonical provider id (`opencode-go`, `openai`, `anthropic`, `deepseek`, `openrouter`, `ollama`).
+    pub name: String,
+    /// Human display label.
+    pub label: String,
+    /// Wire protocol (`openai_compat` or `anthropic_messages`).
+    pub protocol: String,
+    /// Built-in default model for this provider.
+    pub default_model: String,
+    /// Effective model for this provider.
+    pub model: String,
+    /// Source attribution (`global_config`, `data_settings`, `default`).
+    pub model_source: String,
+    /// Environment variable name (`""` for keyless local providers such as `ollama`).
+    pub auth_env: String,
+    /// Whether an API key is configured in any layer (or keyless provider).
+    pub has_auth: bool,
+    /// Source attribution (`env`, `global_config`, `data_credentials`, `none`) — never exposes secret text.
+    pub auth_source: String,
+    /// Base URL for the provider endpoint.
+    pub base_url: String,
+}
+
+/// One tool permission row in [`WheelSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WheelPermissionRow {
+    /// Canonical tool name (`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `bash`).
+    pub tool: String,
+    /// Permission mode (`auto`, `ask`, `deny`).
+    pub mode: String,
+}
+
+/// One cross-process approval row in [`WheelSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WheelApprovalRow {
+    /// Unique approval request id.
+    pub id: String,
+    /// Session id that created the request.
+    pub session_id: String,
+    /// Tool name requesting approval.
+    pub tool: String,
+    /// Risk tier (`low`, `medium`, `high`, `critical`).
+    pub risk: String,
+    /// Bounded human-readable summary of the call.
+    pub summary: String,
+    /// Current status (`pending` or `resolved`).
+    pub status: String,
+    /// Recorded decision (`allow_once`, `allow_session`, `deny`) when resolved.
+    pub decision: Option<String>,
+    /// Unix timestamp (seconds) when the request was enqueued.
+    pub created_at: i64,
+}
+
+/// Bounded read-only snapshot returned by `bitty.wheel.get()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WheelSnapshot {
+    /// Active default provider id.
+    pub default_provider: String,
+    /// Active default model override (`""` when following provider default).
+    pub default_model: String,
+    /// Whether extended thinking is enabled.
+    pub thinking_enabled: bool,
+    /// Active thinking gear (`off`, `low`, `medium`, `high`, `xhigh`).
+    pub thinking_gear: String,
+    /// Active approval mode (`prompt`, `dashboard`, `auto-allow`, `auto-deny`).
+    pub approval_mode: String,
+    /// Built-in provider catalog rows in deterministic order.
+    pub providers: Vec<WheelProviderRow>,
+    /// Tool permission rows in deterministic order.
+    pub permissions: Vec<WheelPermissionRow>,
+    /// Cross-process approval queue rows.
+    pub approvals: Vec<WheelApprovalRow>,
+}
+
+/// One backend-rendered Wheel mutation candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WheelMutationRendering {
+    /// Logical keys changed by this candidate.
+    pub changed_keys: Vec<String>,
+    /// Exact bounded preview diff (`***REDACTED***` for secret writes).
+    pub rendered: String,
+    /// SHA-256 hex digest of the candidate postimage bytes.
+    pub candidate_digest: String,
+    /// Whether the candidate changes persisted state.
+    pub changed: bool,
+}
+
 /// One host-issued manage-write token for a non-scalar intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigManageToken {
@@ -1014,6 +1132,35 @@ pub enum ConfigApprovalTarget {
         /// Validated delete options.
         options: ProfileDeleteOptions,
     },
+    /// One Wheel setting change (`wheel.set`).
+    WheelSetting {
+        /// Validated Wheel setting key.
+        key: String,
+        /// Typed value.
+        value: WheelSettingValue,
+    },
+    /// One Wheel provider credential write (`wheel.auth_set`).
+    ///
+    /// Binds only the SHA-256 hex digest of the secret bytes so the raw secret
+    /// is never retained in memory by [`ConfigWriteGate`].
+    WheelAuthSet {
+        /// Validated provider name.
+        provider: String,
+        /// SHA-256 hex digest of the API key bytes.
+        secret_digest: String,
+    },
+    /// One Wheel provider credential removal (`wheel.auth_remove`).
+    WheelAuthRemove {
+        /// Validated provider name.
+        provider: String,
+    },
+    /// One Wheel pending approval resolution (`wheel.resolve_approval`).
+    WheelResolveApproval {
+        /// Validated approval id.
+        id: String,
+        /// Validated decision (`allow_once`, `allow_session`, `deny`).
+        decision: String,
+    },
 }
 
 impl ConfigApprovalTarget {
@@ -1044,6 +1191,19 @@ impl ConfigApprovalTarget {
             }
             Self::ProfileDelete { name, options } => {
                 format!("profile-delete\0{name}\0{}", options.force)
+            }
+            Self::WheelSetting { key, value } => format!(
+                "wheel-setting\0{key}\0{}\0{}",
+                value.kind(),
+                value.render_literal()
+            ),
+            Self::WheelAuthSet {
+                provider,
+                secret_digest,
+            } => format!("wheel-auth-set\0{provider}\0{secret_digest}"),
+            Self::WheelAuthRemove { provider } => format!("wheel-auth-remove\0{provider}"),
+            Self::WheelResolveApproval { id, decision } => {
+                format!("wheel-resolve-approval\0{id}\0{decision}")
             }
         }
     }
@@ -1375,6 +1535,129 @@ pub trait ConfigWriteBackend {
         _expected_candidate_digest: &str,
     ) -> Result<ProfileDeleteOutcome, ProfileWriteFailure> {
         Err(ProfileWriteFailure::unavailable())
+    }
+
+    /// Read bounded Wheel configuration, provider status, permissions, and approvals (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigReadFailure`].
+    fn wheel_get(&self, _plugin_id: &str) -> Result<WheelSnapshot, ConfigReadFailure> {
+        Err(ConfigReadFailure::Unavailable)
+    }
+
+    /// Render one Wheel setting candidate without writing (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn preview_wheel_set(
+        &self,
+        _plugin_id: &str,
+        _key: &str,
+        _value: &WheelSettingValue,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Apply one approved Wheel setting change (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn apply_wheel_set(
+        &self,
+        _plugin_id: &str,
+        _key: &str,
+        _value: &WheelSettingValue,
+        _expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Render one Wheel provider credential write candidate with redacted preview (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn preview_wheel_auth_set(
+        &self,
+        _plugin_id: &str,
+        _provider: &str,
+        _api_key: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Apply one approved Wheel provider credential write (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn apply_wheel_auth_set(
+        &self,
+        _plugin_id: &str,
+        _provider: &str,
+        _api_key: &str,
+        _expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Render one Wheel provider credential removal candidate (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn preview_wheel_auth_remove(
+        &self,
+        _plugin_id: &str,
+        _provider: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Apply one approved Wheel provider credential removal (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn apply_wheel_auth_remove(
+        &self,
+        _plugin_id: &str,
+        _provider: &str,
+        _expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Render one Wheel pending approval resolution candidate (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn preview_wheel_resolve_approval(
+        &self,
+        _plugin_id: &str,
+        _id: &str,
+        _decision: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
+    }
+
+    /// Apply one approved Wheel pending approval resolution (CTX-1817).
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn apply_wheel_resolve_approval(
+        &self,
+        _plugin_id: &str,
+        _id: &str,
+        _decision: &str,
+        _expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        Err(ConfigWriteFailure::Unavailable)
     }
 }
 

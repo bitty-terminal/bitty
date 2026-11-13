@@ -25,7 +25,9 @@ use bitty_runtime::plugin_runtime::{
     ProfileCreateOptions, ProfileCreateOutcome, ProfileDeleteOptions, ProfileDeleteOutcome,
     ProfileFailureKind, ProfileLifecycleRendering, ProfileList, ProfileListRow,
     ProfileRenameOptions, ProfileRenameOutcome, ProfileUseRendering, ProfileWriteFailure,
-    SnapshotSource, SourceClass, candidate_digest, content_digest, manifest_toml, write_index,
+    SnapshotSource, SourceClass, WheelApprovalRow, WheelMutationRendering, WheelPermissionRow,
+    WheelProviderRow, WheelSettingValue, WheelSnapshot, candidate_digest, content_digest,
+    manifest_toml, write_index,
 };
 
 struct NoSnapshot;
@@ -347,6 +349,165 @@ impl ConfigWriteBackend for RecordingBackend {
             name: name.to_string(),
             backed_up: true,
             was_active: false,
+        })
+    }
+
+    fn wheel_get(&self, _plugin_id: &str) -> Result<WheelSnapshot, ConfigReadFailure> {
+        Ok(WheelSnapshot {
+            default_provider: String::from("opencode-go"),
+            default_model: String::new(),
+            thinking_enabled: false,
+            thinking_gear: String::from("medium"),
+            approval_mode: String::from("prompt"),
+            providers: vec![WheelProviderRow {
+                name: String::from("opencode-go"),
+                label: String::from("OpenCode Go"),
+                protocol: String::from("openai_compat"),
+                default_model: String::from("glm-5.1"),
+                model: String::from("glm-5.1"),
+                model_source: String::from("default"),
+                auth_env: String::from("OPENCODE_API_KEY"),
+                has_auth: false,
+                auth_source: String::from("none"),
+                base_url: String::from("https://opencode.ai/zen/go/v1"),
+            }],
+            permissions: vec![WheelPermissionRow {
+                tool: String::from("bash"),
+                mode: String::from("ask"),
+            }],
+            approvals: vec![WheelApprovalRow {
+                id: String::from("apr-1"),
+                session_id: String::from("sess-1"),
+                tool: String::from("bash"),
+                risk: String::from("high"),
+                summary: String::from("cargo test"),
+                status: String::from("pending"),
+                decision: None,
+                created_at: 1_700_000_000,
+            }],
+        })
+    }
+
+    fn preview_wheel_set(
+        &self,
+        _plugin_id: &str,
+        key: &str,
+        value: &WheelSettingValue,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        let rendered = format!("{key} = {}", value.render_literal());
+        Ok(WheelMutationRendering {
+            changed_keys: vec![key.to_string()],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+        })
+    }
+
+    fn apply_wheel_set(
+        &self,
+        _plugin_id: &str,
+        key: &str,
+        value: &WheelSettingValue,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = format!("{key} = {}", value.render_literal());
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
+    }
+
+    fn preview_wheel_auth_set(
+        &self,
+        _plugin_id: &str,
+        provider: &str,
+        api_key: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        let candidate = format!("{provider}:{api_key}");
+        let rendered = format!("providers.{provider}.api_key = \"***REDACTED***\"");
+        Ok(WheelMutationRendering {
+            changed_keys: vec![format!("providers.{provider}.api_key")],
+            candidate_digest: candidate_digest(candidate.as_bytes()),
+            rendered,
+            changed: true,
+        })
+    }
+
+    fn apply_wheel_auth_set(
+        &self,
+        _plugin_id: &str,
+        provider: &str,
+        api_key: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let candidate = format!("{provider}:{api_key}");
+        if candidate_digest(candidate.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
+    }
+
+    fn preview_wheel_auth_remove(
+        &self,
+        _plugin_id: &str,
+        provider: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        let rendered = format!("- providers.{provider}.api_key = \"***REDACTED***\"");
+        Ok(WheelMutationRendering {
+            changed_keys: vec![format!("providers.{provider}.api_key")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+        })
+    }
+
+    fn apply_wheel_auth_remove(
+        &self,
+        _plugin_id: &str,
+        provider: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = format!("- providers.{provider}.api_key = \"***REDACTED***\"");
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
+    }
+
+    fn preview_wheel_resolve_approval(
+        &self,
+        _plugin_id: &str,
+        id: &str,
+        decision: &str,
+    ) -> Result<WheelMutationRendering, ConfigWriteFailure> {
+        let rendered = format!("approvals.{id}.decision = {decision:?}");
+        Ok(WheelMutationRendering {
+            changed_keys: vec![format!("approvals.{id}.decision")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+        })
+    }
+
+    fn apply_wheel_resolve_approval(
+        &self,
+        _plugin_id: &str,
+        id: &str,
+        decision: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = format!("approvals.{id}.decision = {decision:?}");
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
         })
     }
 
@@ -1355,4 +1516,72 @@ mod overlay_write_credit {
         );
         assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
     }
+}
+
+#[test]
+fn wheel_bridge_enforces_grant_redaction_and_one_shot_digests() {
+    let store = temp_dir("wheel-store");
+    let init = r#"
+bitty.commands.register({ id = "wheel_flow", title = "Wheel flow", run = function()
+    assert(bitty.wheel == bitty.config.wheel, "bitty.wheel must alias bitty.config.wheel")
+    local snap = bitty.wheel.get()
+    assert(snap.default_provider == "opencode-go")
+    assert(snap.thinking_enabled == false)
+    assert(snap.thinking_gear == "medium")
+    assert(#snap.providers == 1 and snap.providers[1].name == "opencode-go")
+    assert(#snap.approvals == 1 and snap.approvals[1].id == "apr-1")
+
+    local p_set = bitty.wheel.preview("thinking_enabled", true)
+    assert(p_set.changed == true)
+    local r_set = bitty.wheel.set("thinking_enabled", true, p_set.digest)
+    assert(r_set.changed == true and r_set.reload == "auto")
+
+    -- Replaying the one-shot digest must fail closed
+    local ok_replay, err_replay = pcall(function()
+        return bitty.wheel.set("thinking_enabled", true, p_set.digest)
+    end)
+    assert(not ok_replay and err_replay.code == "E_CONFIG_APPROVAL_REQUIRED")
+
+    -- Secret preview must be redacted and bound to the exact secret digest
+    local raw_secret = "sk-wheel-vm-secret-999"
+    local p_auth = bitty.wheel.preview_auth_set("opencode-go", raw_secret)
+    assert(not string.find(p_auth.rendered, raw_secret, 1, true))
+    assert(string.find(p_auth.rendered, "***REDACTED***", 1, true) ~= nil)
+
+    -- Attempting to use p_auth.digest with a different secret must fail closed
+    local ok_wrong_secret, err_wrong = pcall(function()
+        return bitty.wheel.auth_set("opencode-go", "sk-different-secret", p_auth.digest)
+    end)
+    assert(not ok_wrong_secret and err_wrong.code == "E_CONFIG_APPROVAL_REQUIRED")
+
+    -- Re-issue preview and apply with matching secret
+    local p_auth2 = bitty.wheel.preview_auth_set("opencode-go", raw_secret)
+    local r_auth = bitty.wheel.auth_set("opencode-go", raw_secret, p_auth2.digest)
+    assert(r_auth.changed == true and r_auth.provider == "opencode-go")
+
+    -- Approval resolution
+    local p_apr = bitty.wheel.preview_resolve_approval("apr-1", "allow_once")
+    local r_apr = bitty.wheel.resolve_approval("apr-1", "allow_once", p_apr.digest)
+    assert(r_apr.changed == true and r_apr.id == "apr-1" and r_apr.decision == "allow_once")
+
+    return "ok"
+end })
+"#;
+    let record = write_store_package(
+        &store,
+        "xuepoo.wheelprobe",
+        &["config.manage"],
+        &["wheel_flow"],
+        init,
+    );
+    write_index(&store, &[record]).expect("store index");
+    let backend = Rc::new(RecordingBackend::default());
+    let mut rt = runtime(Some(store), None, Some(backend));
+    rt.discover();
+    for (id, result) in rt.activate_discovered() {
+        result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+    }
+    let out = common::settle_dispatch(&mut rt, &pid("xuepoo.wheelprobe"), "wheel_flow", &[])
+        .expect_string("wheel_flow");
+    assert_eq!(out, "ok");
 }

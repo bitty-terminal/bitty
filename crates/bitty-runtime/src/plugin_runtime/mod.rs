@@ -102,10 +102,11 @@ pub use config_write::{
     ProfileCloneOptions, ProfileCloneOutcome, ProfileCreateOptions, ProfileCreateOutcome,
     ProfileDeleteOptions, ProfileDeleteOutcome, ProfileFailureKind, ProfileLifecycleRendering,
     ProfileList, ProfileListRow, ProfileRenameOptions, ProfileRenameOutcome, ProfileUseRendering,
-    ProfileWriteFailure, approval_digest, approval_preimage, candidate_digest, check_list_bounds,
-    check_manage_rendering, config_invalid_request, config_limit_exceeded, config_read_error,
-    list_row_bytes, manage_approval_digest, redact_config_value, secret_shaped_config_key,
-    writable_setting,
+    ProfileWriteFailure, WheelApprovalRow, WheelMutationRendering, WheelPermissionRow,
+    WheelProviderRow, WheelSettingValue, WheelSnapshot, approval_digest, approval_preimage,
+    candidate_digest, check_list_bounds, check_manage_rendering, config_invalid_request,
+    config_limit_exceeded, config_read_error, list_row_bytes, manage_approval_digest,
+    redact_config_value, secret_shaped_config_key, writable_setting,
 };
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,

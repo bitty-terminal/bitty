@@ -279,6 +279,7 @@ mod storage_backends;
 mod storage_component_host;
 mod upgrade;
 mod version;
+mod wheel_manage;
 
 mod list;
 mod plugin;

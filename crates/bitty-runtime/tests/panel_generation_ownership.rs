@@ -48,8 +48,8 @@
 //! | Residual 7(a), no owner on an epoch edge (bitty#2476) | here — `an_allocation_epoch_edge_retains_no_owner_from_the_previous_edge`, `a_bind_after_an_allocation_epoch_edge_is_not_measured_against_the_previous_owner` |
 //! | PGO-22(d) through the edge, no widening | here — `a_refused_edge_bind_leaves_the_container_unbound_without_widening_its_grants` |
 //! | PGO-6, reload racing a mount (bitty#2476 residual 9) | here — `a_mount_that_races_a_reload_commits_nothing_and_the_successor_mounts_cleanly` |
-//! | PGO-9, capability gate on a guessed `PanelId` (bitty#2476 residual 9) | here — `a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access`; the deny-by-default half is also pinned by `tests/cw_contracts.rs:127` |
-//! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, grants, MRU, overlays, counts) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment) |
+//! | PGO-9, capability gate on a guessed `PanelId` (bitty#2476 residual 9) | here — `a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access`; the deny-by-default half is pinned by `tests/panel_rebind.rs:412`, `a_denied_plugin_presents_unavailable_and_stops_after_one_record` (a capability outside the committed resolution is refused at `require_panel_capability`) |
+//! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, MRU and focus, overlays, tombstone, counts, read with a second container left in the workspace so the MRU entry is observable) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment). The live **grant row** is not covered by either: no accessor reads it once the record is gone — see the first row's rustdoc for what that would take |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
 //! Still without a row in this crate: PGO-4/PGO-5/PGO-20 (crash and disable
@@ -1313,16 +1313,25 @@ fn a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access() {
 }
 
 /// PGO-13 (bitty#2476 residual 9): a disposal reclaims every registry-owned
-/// family and returns the panel counts to the pre-creation baseline.
+/// family it can be observed to own.
 ///
 /// This is FS-P4's reclaim criterion read structurally. PB-3's tolerance is a
 /// wall-clock budget for a session that has recycled generations; the counts
 /// asserted here are the state a disposal either releases or leaks, so exact
 /// equality with the baseline is inside any non-negative tolerance. The
-/// container is disposed while it still holds a queue, a command, a grant row,
-/// an MRU entry, and an attributed overlay — every registry-owned family the row
-/// names — and each is asserted non-baseline before the disposal, so the
+/// container is disposed while it still holds a queue, a command, a live grant
+/// row, an MRU entry, and an attributed overlay — every registry-owned family
+/// the row names — and each is asserted non-baseline before the disposal, so the
 /// reclaimed assertion is not vacuous.
+///
+/// A second container shares the workspace, because the MRU entry is only
+/// observable while the bucket outlives the disposal: disposing the only panel
+/// empties the bucket, and `dispose_panel` then drops the whole focus tracker,
+/// so a disposal that never calls `PanelFocus::on_panel_hidden` reads exactly
+/// the same. Here the focused panel is disposed while a sibling stays in the
+/// bucket, so the tracker survives with the disposed `PanelId` still in it
+/// unless the call runs: without it `mru_order` answers `[disposed, sibling]`
+/// and `focused_panel` keeps naming the disposed panel.
 ///
 /// The container never binds a controller here: on a bound panel the public
 /// verbs are addressed by the controller generation while `subscribe`, focus,
@@ -1332,13 +1341,29 @@ fn a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access() {
 /// `tests/panel_grant_ceiling.rs:182` and `tests/panel_unbind_release.rs` cover.
 ///
 /// Fails for a disposal that leaves any one family behind: the queue, the
-/// command, the grant row, the MRU entry, the attributed overlay, the workspace
-/// bucket, the dropped tombstone, or the panel count.
+/// command, the MRU entry, the focus that entry carried, the attributed overlay,
+/// the workspace bucket, the dropped tombstone, or the panel count.
+///
+/// **Not covered here, and not claimed:** a live grant row that survives the
+/// disposal. [`PanelRegistry::is_panel_capability_granted`] resolves its key
+/// through the panel record (`resolved_grant_generation`), and `dispose_panel`
+/// removes the record, so it answers `false` for a leaked row exactly as it does
+/// for a released one. Deleting both removals of the row —
+/// `release_generation_scope`'s `self.capabilities.remove(&(panel_id, generation))`
+/// and the epoch sweep in `sweep_allocation_epoch_families` — leaves the row in
+/// the table and this row green. The panel id is never reused
+/// (`next_panel_raw` is monotonic), so no later container can expose it either.
+/// Seeing that leak needs a public accessor for the live grant rows by
+/// `PanelId` — a `live_grant_row_count(panel_id)` or a raw row read — which the
+/// registry does not expose. The two `is_panel_capability_granted` assertions
+/// below are the accessor's post-disposal answer only, never evidence that the
+/// row went.
 #[test]
 fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline() {
     let mut reg = registry();
     let ws = WorkspaceId::new(21);
     let view = ViewId::new(41);
+    let sibling_view = ViewId::new(42);
     let command = "acme.notes:open";
     let topic = reg.declare_topic("acme.notes:status").expect("topic");
 
@@ -1379,11 +1404,30 @@ fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline(
         )
         .expect("attributed overlay");
 
+    // The sibling keeps the workspace bucket alive across the disposal, which is
+    // what makes the MRU assertion below able to fail. Focus ends on `handle`,
+    // so the disposed panel is the one the tracker has to forget and repoint.
+    let sibling = reg
+        .create_panel(PanelType::Helper, Some(ws))
+        .expect("create the sibling panel");
+    let sibling_epoch = sibling.generation;
+    reg.mount_panel(sibling.id, sibling_epoch, sibling_view)
+        .expect("mount the sibling panel");
+    reg.focus_panel(sibling.id, sibling_epoch, ws)
+        .expect("focus the sibling");
+    reg.focus_panel(handle.id, epoch, ws)
+        .expect("focus the disposed panel again");
+
     // The container really holds every family before the disposal.
-    assert_eq!(reg.panel_count(), 1);
+    assert_eq!(reg.panel_count(), 2, "the sibling is live too");
     assert_eq!(reg.attributed_workspace_count(), 1);
-    assert_eq!(reg.mru_order(ws), vec![handle.id]);
+    assert_eq!(
+        reg.mru_order(ws),
+        vec![handle.id, sibling.id],
+        "both containers hold an MRU entry, the disposed one first"
+    );
     assert_eq!(reg.focused_panel(ws), Some(handle.id));
+    assert_eq!(reg.panels_for_workspace(ws), vec![handle.id, sibling.id]);
     assert_eq!(reg.command_owner(command), Some(handle.id));
     assert_eq!(reg.bus_events_for_panel(handle.id), 1);
     assert_eq!(reg.attributed_overlay_count(), 1);
@@ -1393,16 +1437,29 @@ fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline(
 
     assert_eq!(
         reg.panel_count(),
-        0,
-        "the container count returns to baseline"
+        1,
+        "the disposed container count drops and the sibling stays"
     );
     assert_eq!(
         reg.attributed_workspace_count(),
-        0,
-        "the workspace bucket went with its last panel"
+        1,
+        "the workspace bucket outlives the disposed panel while the sibling is in it"
     );
-    assert_eq!(reg.mru_order(ws), Vec::new(), "the MRU entry is released");
-    assert_eq!(reg.focused_panel(ws), None, "and it holds no focus");
+    assert_eq!(
+        reg.mru_order(ws),
+        vec![sibling.id],
+        "the MRU entry goes with the container even though the bucket stays"
+    );
+    assert_eq!(
+        reg.focused_panel(ws),
+        Some(sibling.id),
+        "focus moves to the next MRU entry instead of naming the disposed panel"
+    );
+    assert_eq!(
+        reg.panels_for_workspace(ws),
+        vec![sibling.id],
+        "the workspace bucket no longer names the disposed panel"
+    );
     assert_eq!(
         reg.command_owner(command),
         None,
@@ -1421,9 +1478,11 @@ fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline(
     );
     assert!(reg.overlay_attribution_of(overlay).is_none());
     assert_eq!(reg.overlay_len(), 0, "no surface outlives the container");
+    // The record is what resolves the key, so this is the accessor's
+    // post-disposal answer, not a read of the grant table (see the rustdoc).
     assert!(
         !reg.is_panel_capability_granted(handle.id, epoch, CREATE),
-        "the grant row is released"
+        "the retired handle resolves no grant"
     );
     assert!(!reg.is_panel_capability_granted(handle.id, epoch, "panel.provider"));
     assert_eq!(
@@ -1445,6 +1504,24 @@ fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline(
         ),
         "the retired handle names nothing"
     );
+
+    // The last panel of the workspace takes the bucket and the tracker with it,
+    // so the pre-creation baseline is reached by the per-container reclaim and
+    // not by the sibling's presence hiding a leak.
+    reg.dispose_panel(sibling.id, sibling_epoch)
+        .expect("dispose the sibling");
+    assert_eq!(
+        reg.panel_count(),
+        0,
+        "the container count returns to baseline"
+    );
+    assert_eq!(
+        reg.attributed_workspace_count(),
+        0,
+        "the workspace bucket went with its last panel"
+    );
+    assert_eq!(reg.mru_order(ws), Vec::new(), "and the MRU with it");
+    assert_eq!(reg.focused_panel(ws), None, "and it holds no focus");
 }
 
 /// PGO-13, the half the facade owns: the lease entry and the live placement

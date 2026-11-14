@@ -399,10 +399,12 @@ impl Runtime {
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let compressed_len = payload.len();
         let origin = self.kitty_origin;
-        if self
-            .kitty_images
-            .reclaim_for_runtime_store(origin, decoded.rgba.len())
-        {
+        let stashed = self.stashed_kitty_image_ids(origin);
+        if self.kitty_images.reclaim_for_runtime_store(
+            origin,
+            decoded.rgba.len(),
+            &self.all_stashed_kitty_image_ids(),
+        ) {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
             self.cold_queue
@@ -410,12 +412,14 @@ impl Runtime {
         }
         let id = self
             .kitty_images
-            .store_for_origin(
+            .store_for_origin_with_wire_protected(
                 decoded.width,
                 decoded.height,
                 decoded.rgba,
                 compressed_len,
                 origin,
+                0,
+                &stashed,
             )
             .map_err(KittyImageError::Placement)?;
         // S6 (#1849): a store may evict same-origin images, so drop cached
@@ -445,10 +449,12 @@ impl Runtime {
             .decode_transmit_owned(format, width_s, height_v, payload)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let origin = self.kitty_origin;
-        if self
-            .kitty_images
-            .reclaim_for_runtime_store(origin, decoded.rgba.len())
-        {
+        let stashed = self.stashed_kitty_image_ids(origin);
+        if self.kitty_images.reclaim_for_runtime_store(
+            origin,
+            decoded.rgba.len(),
+            &self.all_stashed_kitty_image_ids(),
+        ) {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
             self.cold_queue
@@ -456,12 +462,14 @@ impl Runtime {
         }
         let id = self
             .kitty_images
-            .store_for_origin(
+            .store_for_origin_with_wire_protected(
                 decoded.width,
                 decoded.height,
                 decoded.rgba,
                 wire_len,
                 origin,
+                0,
+                &stashed,
             )
             .map_err(KittyImageError::Placement)?;
         // S6 (#1849): a store may evict same-origin images, so drop cached
@@ -1896,6 +1904,7 @@ impl Runtime {
             let stash = KittyAltStash {
                 placements: self.kitty_images.take_placements_for(origin),
                 virtuals: self.kitty_images.take_virtuals_for(origin),
+                images: self.kitty_images.image_ids_for_origin(origin),
             };
             // Defensive: a fresh alt plane owns no entries of its own.
             self.kitty_images.clear_origin(origin);
@@ -1923,12 +1932,22 @@ impl Runtime {
 
     /// Stored image ids referenced by `origin`'s detached main-screen stash
     /// while the alternate screen is active (issue #3159).
+    ///
+    /// `KittyAltStash::images` covers every bitmap the main plane owned at
+    /// the transition — including images stored but never placed, whose ids
+    /// no descriptor names (issue #3161 R5) — and the descriptor-derived ids
+    /// below cover bodiless prototypes that resolve to a root through the
+    /// live layer.
     fn stashed_kitty_image_ids(&self, origin: Option<u64>) -> Vec<bitty_rich::KittyImageId> {
         let Some(stash) = self.kitty_alt_stash.get(&origin) else {
             return Vec::new();
         };
-        let mut ids: Vec<bitty_rich::KittyImageId> =
-            stash.placements.iter().map(|p| p.image).collect();
+        let mut ids: Vec<bitty_rich::KittyImageId> = stash.images.clone();
+        for placement in &stash.placements {
+            if !ids.contains(&placement.image) {
+                ids.push(placement.image);
+            }
+        }
         for proto in &stash.virtuals {
             if let Some(id) = proto.image {
                 if !ids.contains(&id) {
@@ -1938,6 +1957,25 @@ impl Runtime {
                 .kitty_images
                 .find_root_for_origin(origin, proto.wire_image)
             {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// [`Self::stashed_kitty_image_ids`] over every origin's stash.
+    ///
+    /// Store reclamation at global saturation evicts across origins
+    /// (issue #3161), so a pane's transmit can drop another pane's dormant
+    /// main-plane image. The whole stash population is therefore protected
+    /// from reclamation, not just the transmitting origin's.
+    fn all_stashed_kitty_image_ids(&self) -> Vec<bitty_rich::KittyImageId> {
+        let origins: Vec<Option<u64>> = self.kitty_alt_stash.keys().copied().collect();
+        let mut ids: Vec<bitty_rich::KittyImageId> = Vec::new();
+        for origin in origins {
+            for id in self.stashed_kitty_image_ids(origin) {
                 if !ids.contains(&id) {
                     ids.push(id);
                 }

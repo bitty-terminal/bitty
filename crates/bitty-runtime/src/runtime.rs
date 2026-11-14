@@ -575,11 +575,14 @@ pub struct TargetAnchorSummary {
 /// so the main entries are detached here at the transition and re-attached
 /// on leave. Images (and their wire-id mappings) stay in the shared store
 /// under the normal caps; only the tiny placement/prototype descriptors
-/// move.
+/// move. `images` snapshots the main plane's stored image ids at the
+/// transition (bitty#3161) so the store never evicts a bitmap this dormant
+/// layer still owns, including images that were stored but never placed.
 #[derive(Default)]
 struct KittyAltStash {
     placements: Vec<bitty_rich::KittyPlacement>,
     virtuals: Vec<bitty_rich::KittyVirtualPrototype>,
+    images: Vec<bitty_rich::KittyImageId>,
 }
 
 /// Bounded retry state after a GPU present failure (issue #2570).

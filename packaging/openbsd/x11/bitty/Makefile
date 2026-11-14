@@ -15,7 +15,7 @@
 
 COMMENT =	GPU-accelerated terminal emulator with panes and Lua extensions
 
-V =		0.0.40
+V =		0.0.41
 DISTNAME =	bitty-${V}
 PKGNAME =	bitty-${V}
 CATEGORIES =	x11

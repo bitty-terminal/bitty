@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "3307ffa446477cf3f9b76e037c59100899c49fe9";
+pub const SOURCE_REVISION: &str = "78a95def7af284f5dcb1b896def3372e6a347cea";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -88,8 +88,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.dashboard",
         name: "Dashboard",
         repository: "https://github.com/bitty-terminal/dashboard.git",
-        pin: "3b84b7e13913381a8de636ab6db9abef417063c8",
-        manifest_hash: "sha256:ffb3532cea97e4417aa70f51aa3f3d4fe422ef41154d1efb82c9395d15578095",
+        pin: "6a239b8d197882d8113460769f21fe51946670a0",
+        manifest_hash: "sha256:05e56da4a4eaac51cf53d87cfab93a71ba21541c456d7ed992e163e15d9e8c4f",
         compat_bitty: Some(">=0.0.26"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only configuration and status dashboard over bitty.runtime.inspect(): plugins, extensions, settings, profiles, and diagnostics in one panel.",

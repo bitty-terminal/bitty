@@ -780,14 +780,17 @@ fn cleanup_stale_stage_dirs(dir: &Path) {
     }
 }
 
-/// Reclaim a dead-owner `.approvals.lock` without renaming `lock_dir` or
-/// removing an ownerless directory.
+/// Reclaim a dead-owner or interrupted-teardown `.approvals.lock` without
+/// renaming `lock_dir`.
 ///
-/// Reclamation only unlinks a verified-dead `owner.<token>` (or legacy `owner`)
-/// file observed in `lock_dir` and then calls `remove_dir(lock_dir)` only when
-/// a dead entry was unlinked, which the OS kernel guarantees fails with
-/// `ENOTEMPTY` if another contender has already published a replacement lock
-/// containing a different `owner.<new_token>` entry.
+/// Because both Bitty Core and the Wheel CLI publish locks atomically from a
+/// pre-populated `.approvals.lock.stage.<token>` directory, a newly acquired
+/// lock is never empty. An empty `.approvals.lock` directory (`!saw_any_entry`)
+/// can only exist after a previous holder or reclaimer already unlinked its
+/// `owner.<token>` entry and was interrupted before `remove_dir(lock_dir)`.
+/// Calling `remove_dir(lock_dir)` is kernel-enforced to remove only an empty
+/// directory and fails with `ENOTEMPTY` if another contender has already
+/// published a replacement lock containing `owner.<new_token>`.
 fn try_reclaim_stale_lock_with_hook<R>(
     dir: &Path,
     lock_dir: &Path,
@@ -800,15 +803,20 @@ where
     let Ok(entries) = std::fs::read_dir(lock_dir) else {
         return false;
     };
+    let mut saw_any_entry = false;
     let mut unlinked_dead_entry = false;
-    for entry in entries.take(16).flatten() {
+    for entry_res in entries.take(16) {
+        saw_any_entry = true;
+        let Ok(entry) = entry_res else {
+            return false;
+        };
         let entry_path = entry.path();
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+            return false;
         };
         if name == "owner" {
             let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
-                continue;
+                return false;
             };
             if is_lock_owner_alive(owner_pid) {
                 return false;
@@ -826,7 +834,7 @@ where
             }
         } else if name.starts_with("owner.") {
             let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
-                continue;
+                return false;
             };
             if is_lock_owner_alive(owner_pid) {
                 return false;
@@ -835,12 +843,15 @@ where
             if std::fs::remove_file(&entry_path).is_ok() {
                 unlinked_dead_entry = true;
             }
+        } else {
+            return false;
         }
     }
-    if unlinked_dead_entry && std::fs::remove_dir(lock_dir).is_ok() {
+    let can_remove_dir = unlinked_dead_entry || !saw_any_entry;
+    if can_remove_dir && std::fs::remove_dir(lock_dir).is_ok() {
         return true;
     }
-    unlinked_dead_entry && !lock_dir.exists()
+    can_remove_dir && !lock_dir.exists()
 }
 
 struct WheelStoreLockGuard {
@@ -2192,6 +2203,27 @@ mod tests {
         .unwrap();
         assert!(!lock_dir.exists());
         assert!(!dead_stage_dir.exists());
+
+        // Simulate interruption between `remove_file(owner.<token>)` and
+        // `remove_dir(.approvals.lock)` during lock teardown or reclamation.
+        prepare_staged_lock_dir(&dead_stage_dir, "owner.interrupted", self_pid).unwrap();
+        assert!(publish_staged_lock_dir(&dead_stage_dir, &lock_dir));
+        std::fs::remove_file(lock_dir.join("owner.interrupted")).unwrap();
+        assert!(lock_dir.exists());
+        let prev_empty = preview_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("terminal".to_string()),
+        )
+        .unwrap();
+        apply_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("terminal".to_string()),
+            &prev_empty.candidate_digest,
+        )
+        .unwrap();
+        assert!(!lock_dir.exists());
 
         // 2. Concurrent contenders racing to reclaim a dead-owner lock never delete
         //    another contender's replacement lock.

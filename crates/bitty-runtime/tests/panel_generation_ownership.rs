@@ -12,8 +12,8 @@
 //! through the same entry points a generation swap will use, not through a
 //! test-only binder.
 //!
-//! The three `..._generation_edge_...` rows at the end drive the **plugin
-//! runtime's** generation edge (`PluginRuntime::reload` / `PluginRuntime::dispose`,
+//! The `..._generation_edge_...` rows at the end drive the **plugin runtime's**
+//! generation edge (`PluginRuntime::reload` / `PluginRuntime::dispose`,
 //! residuals 2 and 4) with
 //! [`PanelGenerationPort`](bitty_runtime::plugin_runtime::PanelGenerationPort)
 //! installed, so the caller of the production bind is the edge and not the
@@ -21,6 +21,12 @@
 //! installs (`crates/bitty-terminal/src/plugin_runtime.rs`), so what they pin is
 //! the wiring: an edge that never calls the bind, or one that presents a
 //! placeholder without the release, fails them.
+//!
+//! The two `pgo_4_...` / `pgo_20_...` rows drive the fifth edge instead: a
+//! callback inside a live generation exhausts its own budget, the host records
+//! the terminal verdict, and `PluginRuntime::rollback` -- the function a failed
+//! activation also reaches -- ends the generation. That path is where a crash
+//! is released, and it reaches the same installed port.
 //!
 //! # Coverage map
 //!
@@ -43,6 +49,8 @@
 //! | PGO-22(d), owner mismatch | here — `a_bind_by_another_owner_is_refused_as_a_lost_ceiling`; the tombstone-side twin (a tombstone stamped under a foreign owner while the record names another) can only be built by violating the table invariant, so it stays in `registry::panel::grant_ceiling_tests` |
 //! | PGO-23 | `tests/panel_grant_ceiling.rs:182` (disposal drops the tombstone), `tests/panel_unbind_release.rs` (the four released families), `crates/bitty-ui/src/panel_recovery.rs` (the placeholder reasons) |
 //! | PGO-23, edge-driven (bitty#2476 residual 4) | here — `a_generation_edge_with_no_successor_presents_the_placeholder_after_the_release` |
+//! | PGO-4, crash-driven (bitty#2476 residual 4) | here — `pgo_4_a_crash_inside_a_callback_presents_crashed_and_contains_the_damage`; the crash is a callback stopped by the generation's own RC-1 instruction budget, so the producer of `crashed` is `PluginRuntime::rollback` (`src/plugin_runtime/mod.rs:5109`, port call at `:5155`), not the test |
+//! | PGO-20, crash arm (bitty#2476 residual 4) | here — `pgo_20_a_crashed_generation_is_bounded_and_loses_its_authority_at_the_next_bind`; the disable arm is **not** homed, see the blocking note below |
 //! | PGO-1/PGO-2, edge-driven (bitty#2476 residual 2) | here — `the_generation_edge_rebinds_the_container_and_moves_the_controller` |
 //! | Residual 7, per-owner retention | here — `a_tombstone_is_retained_for_the_owner_that_stamped_it` |
 //! | Residual 7(a), no owner on an epoch edge (bitty#2476) | here — `an_allocation_epoch_edge_retains_no_owner_from_the_previous_edge`, `a_bind_after_an_allocation_epoch_edge_is_not_measured_against_the_previous_owner` |
@@ -52,15 +60,37 @@
 //! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, MRU and focus, overlays, tombstone, counts, read with a second container left in the workspace so the MRU entry is observable) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment). The live **grant row** is not covered by either: no accessor reads it once the record is gone — see the first row's rustdoc for what that would take |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
-//! Still without a row in this crate: PGO-4/PGO-5/PGO-20 (crash and disable
-//! recovery driven by the plugin host). Two rows are named here with the seam
-//! that blocks them rather than implied covered:
+//! Still without a row in this crate: PGO-5 and the disable arm of PGO-20
+//! (`disabled` on a live generation, then a re-enable that rebinds). Each row
+//! below is named here with the seam that blocks it rather than implied
+//! covered:
 //!
+//! - **PGO-5, PGO-20 disable arm** (`disabled` placeholder, then a re-enable
+//!   that rebinds): the reason token has exactly one production producer —
+//!   `dispose_inner` called from `recover_wall_failed_plugins`
+//!   (`src/plugin_runtime/mod.rs:3934`, branch at `:3970`, dispose at `:3974`)
+//!   — and that pass only selects a generation that is `Failed` with
+//!   `FailureClass::WallSliceTimeout`. Nothing else turns a *live* generation
+//!   into a `disabled` one: `PluginRuntime` has no disable entry (`suspend`
+//!   parks a generation and asks the port for nothing, and `dispose` names
+//!   `unloaded`), `package::set_enabled` (`src/plugin_runtime/package.rs:1441`) only writes
+//!   the store index, `discover_inner` skips a disabled record without touching
+//!   a live entry (`mod.rs:2852`), and the application classes a plugin-set
+//!   change as `restart-required` because "the plugin set is not part of the
+//!   config plan and has no live apply path"
+//!   (`crates/bitty-terminal/src/config_reload.rs:128`). A test that produced
+//!   `disabled` therefore has to invent the disable, and the only route that
+//!   exists (crash first, then disable the index) reaches the release with the
+//!   containers already unbound by the crash edge, so `disabled` cannot be
+//!   presented on a container this generation still holds. Homing the row needs
+//!   a live disable entry and a live enable/rebind path in the plugin host, not
+//!   a test-side reason token; `PGO-4`/`PGO-20`'s crash arm cover the fault
+//!   direction that *is* reachable.
 //! - **PGO-11** (provider version records): no production path presents
 //!   `incompatible` — `PlaceholderReason::Incompatible` has no producer
-//!   (`dispose_inner` passes only `Unloaded`/`Disabled`/`Reloaded`, and
-//!   `PanelRegistry::present_placeholder` takes the reason token from its
-//!   caller), and the only versioned provider record,
+//!   (`dispose_inner` passes `Unloaded`/`Disabled`/`Reloaded`, `rollback` passes
+//!   `Crashed`, and `PanelRegistry::present_placeholder` takes the reason token
+//!   from its caller), and the only versioned provider record,
 //!   `PanelProviderManifest`, refuses every version other than 1 at
 //!   `registry/provider.rs:138`, so there is no newer-provider-over-older-record
 //!   direction and no tolerant reader to drive. The persisted panel manifest
@@ -98,8 +128,8 @@ use std::rc::Rc;
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::PluginId;
 use bitty_runtime::plugin_runtime::{
-    PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort, PluginRuntime,
-    PluginRuntimeConfig, SettingsSource, SnapshotSource, controller_generation,
+    LifecycleState, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort,
+    PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource, controller_generation,
 };
 use bitty_runtime::{
     Generation, UiRect, ViewId,
@@ -661,6 +691,22 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn write_plugin(root: &Path, id: &str, capabilities: &[&str]) {
+    write_plugin_with(root, id, capabilities, "", "bitty = bitty or {}\n");
+}
+
+/// Write one development package.
+///
+/// `extra_manifest` is appended after the `[capabilities]` table (a trailing
+/// section such as `[limits]`), and `init` becomes `lua/init.lua`. The plain
+/// edge fixtures pass nothing and a one-line body, so their packages are the
+/// ones they always were.
+fn write_plugin_with(
+    root: &Path,
+    id: &str,
+    capabilities: &[&str],
+    extra_manifest: &str,
+    init: &str,
+) {
     let plugin = root.join(id);
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
     let caps = capabilities
@@ -682,11 +728,11 @@ plugin-api = "^1.0"
 
 [capabilities]
 {caps}
-"#
+{extra_manifest}"#
         ),
     )
     .expect("manifest");
-    std::fs::write(plugin.join("lua/init.lua"), "bitty = bitty or {}\n").expect("init");
+    std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
 }
 
 /// The port the composition root installs, reduced to the two delegations it
@@ -1062,6 +1108,406 @@ fn a_refused_edge_bind_leaves_the_container_unbound_without_widening_its_grants(
         granted_set(registry, panel, successor),
         empty(),
         "every verb from the successor generation is refused for want of a row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bitty#2476 residuals 4 and 5: crash recovery driven by the plugin host
+// ---------------------------------------------------------------------------
+//
+// The two rows below end a generation the way a fault does, not the way a user
+// does: a callback inside a live generation exhausts its own budget, the VM
+// stops it, and the host funnels the terminal verdict through
+// `PluginRuntime::rollback`. That is the crash path -- the same function a
+// generation that died in `init.lua` reaches -- and it is the one place the
+// crash release is owed, because a crash is not a reload and has no successor.
+
+/// Fuel the crashing fixture's timer body may burn before the host stops it.
+///
+/// Small enough that the crash costs the instruction ceiling rather than the
+/// five seconds an RC-1 wall verdict needs, and well above what two closure
+/// definitions cost `init.lua`.
+const CRASH_FUEL_INSTRUCTIONS: u64 = 200_000;
+
+/// A package whose activation arms one timer that never returns on its own.
+///
+/// The manifest carries the panel family plus a `[limits]` fuel ceiling, so the
+/// crash is a real RC-1 budget stop inside a real callback: no test-side
+/// `fail_runtime_*` call, no injected `SuspendReason`, no widened budget.
+fn write_crashing_plugin(root: &Path, id: &str) {
+    write_plugin_with(
+        root,
+        id,
+        &["panel.create", "panel.focus"],
+        &format!("[limits]\nfuel_instructions = {CRASH_FUEL_INSTRUCTIONS}\n\n"),
+        r#"bitty = bitty or {}
+bitty.timers.create(10, function()
+  local n = 0
+  while true do n = n + 1 end
+end)
+"#,
+    );
+}
+
+/// The crash fixture: one plugin whose timer kills its own live generation, one
+/// sibling plugin that is untouched by it, and the installed edge port.
+///
+/// The sibling exists for FS-P2 containment: a crash is supposed to reach the
+/// owning generation and nothing else, so the row asserts on a second plugin's
+/// binding and grants as well as on the crashed one's.
+fn crash_fixture(
+    tag: &str,
+    id: &str,
+    sibling_id: &str,
+) -> (PluginRuntime, PluginId, PluginId, Rc<RefCell<PanelRuntime>>) {
+    let root = temp_dir(tag);
+    write_crashing_plugin(&root, id);
+    write_plugin(&root, sibling_id, &["panel.create", "panel.focus"]);
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(temp_dir(&format!("{tag}-data"))),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root],
+        settings: Rc::new(MapSettings::default()),
+        snapshot: Rc::new(StaticSnapshot),
+    });
+    runtime.discover();
+    let plugin = owner(id);
+    let sibling = owner(sibling_id);
+    runtime
+        .activate(&plugin)
+        .expect("activate the crashing fixture");
+    runtime
+        .activate(&sibling)
+        .expect("activate the sibling fixture");
+    let panels = Rc::new(RefCell::new(host()));
+    runtime.set_panel_generation_port(Some(Rc::new(EdgePort {
+        panels: Rc::clone(&panels),
+    })));
+    (runtime, plugin, sibling, panels)
+}
+
+/// Kill the crashing fixture's live generation from inside a callback.
+///
+/// The fixture armed one timer whose body never returns; the pump drives it
+/// under the generation's own `[limits]` fuel, the VM stops it with
+/// `InstructionBudgetExceeded`, and `fail_runtime_on_suspend` hands that verdict
+/// to `fail_runtime_classified`, which rolls the generation back. Nothing here
+/// chooses the failure: the host does, from a callback it really ran.
+fn crash_the_live_generation(runtime: &mut PluginRuntime, plugin: &PluginId) {
+    let deadline = runtime
+        .timer_deadline()
+        .expect("activation armed the crashing timer");
+    assert_eq!(
+        runtime.pump_due_timers_at(deadline),
+        1,
+        "the crashing callback started and was counted"
+    );
+    match runtime.state(plugin) {
+        Some(LifecycleState::Failed(reason)) => assert!(
+            reason.contains("RC-1 instructions"),
+            "the crash names the budget that stopped it: {reason}"
+        ),
+        other => panic!("a callback that exhausts its budget ends the generation, got {other:?}"),
+    }
+}
+
+/// PGO-4: a crash inside a callback keeps the container, names the crash, and
+/// reaches no other generation.
+///
+/// The generation dies the way a fault makes it die -- a callback that exhausts
+/// its own RC-1 instruction budget -- and everything the row asks for is read
+/// back through the registry the verbs use:
+///
+/// - the container is **unbound**, not disposed and not silently still owned by
+///   the dead generation, and it presents the closed reason `crashed` naming the
+///   generation the crash ended;
+/// - the release ran at that edge (the tombstone carries the released set, the
+///   release record names the same generation, the generation's grant row is
+///   empty), so the placeholder became visible only after the four families
+///   were released -- OQ-084 A.2's ordering, read as a snapshot because the row
+///   cannot observe wall-clock order;
+/// - one recovery record exists and the counter is `1`, not two: the edge is
+///   the crash's only presenter, and no per-tick path re-presents it
+///   (Decision E rule 1: one placeholder, one record, no respawn);
+/// - the container keeps its `PanelId`, attachment, title, and description,
+///   because a fault must not destroy the user's structure;
+/// - the **sibling** plugin's container is still bound to its own generation
+///   with its own grants, and the crash's edge report attempted exactly one
+///   container -- FS-P2 containment, and "only the owning generation is
+///   affected".
+///
+/// Fails for the pre-fix tree, where `rollback` released the generation's own
+/// content but never asked the panel port: the crashed generation stayed bound,
+/// kept `{panel.create, panel.focus}`, and presented no placeholder at all (a
+/// silent orphan Decision E forbids). Fails as well for a release that presents
+/// the placeholder before the tombstone/families, for one that disposes the
+/// container instead of unbinding it, and for one that reaches a sibling.
+#[test]
+fn pgo_4_a_crash_inside_a_callback_presents_crashed_and_contains_the_damage() {
+    let (mut runtime, plugin, sibling, panels) =
+        crash_fixture("crash", "acme.edgecrash", "acme.edgecrashsibling");
+    let (panel, epoch) = bound_container(&panels, &plugin, 9, 15);
+    let (sibling_panel, _sibling_epoch) = bound_container(&panels, &sibling, 10, 16);
+    let ended = controller_generation(1);
+    let sibling_controller = controller_generation(1);
+
+    crash_the_live_generation(&mut runtime, &plugin);
+
+    let host_ref = panels.borrow();
+    let registry = host_ref.registry();
+    // Disposition: unbound, container kept.
+    assert_eq!(
+        registry.controller_generation(panel),
+        None,
+        "the crashed generation no longer binds its container"
+    );
+    let placeholder = registry
+        .placeholder(panel)
+        .expect("a crashed generation leaves a placeholder, never a silent orphan");
+    assert_eq!(
+        placeholder.reason(),
+        PlaceholderReason::Crashed,
+        "the reason token names the crash, not a user action nobody took"
+    );
+    assert_eq!(
+        placeholder.unbound_generation(),
+        Some(ended),
+        "the placeholder names the generation the crash ended"
+    );
+    // Ordering, read as the state the edge left behind.
+    let release = registry
+        .unbind_release_record(panel)
+        .expect("the crash edge ran the release before the placeholder");
+    assert_eq!(release.generation, ended);
+    assert_eq!(
+        release.grants, 2,
+        "both panel grants were released before the placeholder became visible"
+    );
+    assert_eq!(
+        granted_set(registry, panel, ended),
+        empty(),
+        "no grant row of the crashed generation survives it"
+    );
+    let ceiling = registry
+        .retained_grant_ceiling(panel)
+        .expect("the crash edge writes the retired-ceiling tombstone");
+    assert_eq!(ceiling.ended_generation, ended);
+    assert_eq!(ceiling.owner, Some(plugin.clone()));
+    assert_eq!(ceiling.grants, set(&[CREATE, FOCUS]));
+    // Bounded recovery: one record, one count, for the generation that ended.
+    assert_eq!(
+        registry.recovery_attempts(panel, ended, PlaceholderReason::Crashed),
+        1,
+        "exactly one FS-4-style record for the crash"
+    );
+    assert_eq!(
+        registry.recovery_records(panel).len(),
+        1,
+        "and the edge did not present the placeholder twice"
+    );
+    // The container keeps the facts that are not content.
+    assert_eq!(
+        host_ref.placement_view_of(panel),
+        Some(ViewId::new(15)),
+        "a crash keeps the view attachment"
+    );
+    assert_eq!(
+        host_ref
+            .panel_description(panel, epoch)
+            .expect("live container"),
+        (Some("Notes".to_string()), Some("acme notes".to_string())),
+        "a crash keeps the title and the description"
+    );
+    // FS-P2 containment: the sibling generation is untouched.
+    assert_eq!(
+        registry.controller_generation(sibling_panel),
+        Some(sibling_controller),
+        "a crash reaches only the owning generation"
+    );
+    assert!(
+        registry.placeholder(sibling_panel).is_none(),
+        "the sibling panel is not unbound by another plugin's crash"
+    );
+    assert_eq!(
+        granted_set(registry, sibling_panel, sibling_controller),
+        set(&[CREATE, FOCUS]),
+        "the sibling keeps its own authority"
+    );
+    drop(host_ref);
+
+    let edge = runtime.last_panel_edge().expect("the crash ran an edge");
+    assert_eq!(
+        (edge.attempted, edge.refused_count()),
+        (1, 0),
+        "the crash edge attempted exactly the crashed generation's container: {edge:?}"
+    );
+    assert_eq!(edge.committed, vec![panel]);
+}
+
+/// PGO-20, crash arm: bounded recovery, then no authority from the crashed
+/// generation survives the next bind.
+///
+/// The crash half of the row, on the same production path as `PGO-4`:
+///
+/// - the placeholder names `crashed`, and the registry holds **one** recovery
+///   record for it, not one per tick;
+/// - no respawn inside the driver's window: the timer the generation armed is
+///   dropped with it (`timer_deadline` is empty), a recovery pass selects
+///   nothing (an instruction stop is not the transient wall class
+///   `recover_wall_failed_plugins` retries), and a second pass still selects
+///   nothing while the placeholder stays `crashed` and the counter stays `1`;
+/// - container, title, attachment, and focus history are intact: the focused
+///   panel is still the focused one and the MRU order is unchanged;
+/// - the next bind is a *new* generation's bind: the container is rebound to
+///   the successor, the placeholder is gone, and the crashed generation holds
+///   nothing -- its row is empty before and after the bind, so no authority of
+///   generation `N` survives into `N+1`.
+///
+/// The disable half of `PGO-20` (`disabled` on a live generation, then a
+/// re-enable that rebinds) is **not** in this row: no production path disables a
+/// live generation that still binds containers, so the reason token has no
+/// producer for this shape. See the file's rustdoc for the blocking symbols.
+///
+/// Fails for the pre-fix tree at the first assertion (`rollback` presented no
+/// placeholder, so `registry.placeholder(panel)` is `None`), and for a fix that
+/// re-presents on every tick, respawns the generation, or lets the crashed
+/// generation's grant row survive the successor's bind.
+#[test]
+fn pgo_20_a_crashed_generation_is_bounded_and_loses_its_authority_at_the_next_bind() {
+    let (mut runtime, plugin, _sibling, panels) =
+        crash_fixture("crashbounded", "acme.edgecrashbounded", "acme.edgecrashsib");
+    // Two containers in one workspace, so focus and the MRU order are facts the
+    // crash has to preserve rather than leave unobserved.
+    let workspace = WorkspaceId::new(11);
+    let (first, first_epoch) = bound_container(&panels, &plugin, 11, 17);
+    let (second, second_epoch) = bound_container(&panels, &plugin, 11, 18);
+    panels
+        .borrow_mut()
+        .focus_panel(first, first_epoch, workspace)
+        .expect("focus the first container");
+    panels
+        .borrow_mut()
+        .focus_panel(second, second_epoch, workspace)
+        .expect("focus the second container");
+    let ended = controller_generation(1);
+    let successor = controller_generation(2);
+
+    crash_the_live_generation(&mut runtime, &plugin);
+
+    {
+        let host_ref = panels.borrow();
+        let registry = host_ref.registry();
+        for panel in [first, second] {
+            let placeholder = registry
+                .placeholder(panel)
+                .expect("every container of the crashed generation presents a placeholder");
+            assert_eq!(placeholder.reason(), PlaceholderReason::Crashed);
+            assert_eq!(placeholder.unbound_generation(), Some(ended));
+            assert_eq!(
+                registry.recovery_attempts(panel, ended, PlaceholderReason::Crashed),
+                1,
+                "one record per container, not one per container per tick"
+            );
+            assert_eq!(registry.recovery_records(panel).len(), 1);
+            assert_eq!(
+                registry.controller_generation(panel),
+                None,
+                "the crashed generation keeps neither container"
+            );
+        }
+        // The container facts a crash must not destroy.
+        assert_eq!(
+            registry.focused_panel(workspace),
+            Some(second),
+            "the focus history survives the crash"
+        );
+        let mut mru = registry.mru_order(workspace);
+        mru.sort_unstable();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(mru, expected, "the MRU order keeps the containers it had");
+        assert_eq!(
+            host_ref.placement_view_of(first),
+            Some(ViewId::new(17)),
+            "the attachment survives the crash"
+        );
+    }
+
+    // No respawn inside the driver's window.
+    assert_eq!(
+        runtime.timer_deadline(),
+        None,
+        "the crashed generation's timer is dropped with it"
+    );
+    assert_eq!(
+        runtime.recover_wall_failed_plugins(),
+        0,
+        "an instruction stop is not a transient wall timeout, so nothing is respawned"
+    );
+    assert_eq!(
+        runtime.recover_wall_failed_plugins(),
+        0,
+        "and a second pass still selects nothing"
+    );
+    {
+        let host_ref = panels.borrow();
+        let registry = host_ref.registry();
+        assert_eq!(
+            registry.placeholder(first).expect("placeholder").reason(),
+            PlaceholderReason::Crashed,
+            "the bounded recovery leaves the reason it started with"
+        );
+        assert_eq!(
+            registry.recovery_attempts(first, ended, PlaceholderReason::Crashed),
+            1,
+            "and neither pass presented the placeholder again"
+        );
+        assert_eq!(
+            granted_set(registry, first, ended),
+            empty(),
+            "the crashed generation holds nothing before the bind"
+        );
+    }
+
+    // The next bind belongs to a new generation, and inherits nothing.
+    runtime.reload(&plugin).expect("reload after the crash");
+    {
+        let host_ref = panels.borrow();
+        let registry = host_ref.registry();
+        for panel in [first, second] {
+            assert_eq!(
+                registry.controller_generation(panel),
+                Some(successor),
+                "the successor generation rebound the container"
+            );
+            assert!(
+                registry.placeholder(panel).is_none(),
+                "a bound container presents no placeholder"
+            );
+            assert_eq!(
+                granted_set(registry, panel, ended),
+                empty(),
+                "no authority of the crashed generation survives the next bind"
+            );
+            assert_eq!(
+                granted_set(registry, panel, successor),
+                set(&[CREATE, FOCUS]),
+                "the successor holds its own resolution bounded by the crashed ceiling"
+            );
+        }
+        assert_eq!(
+            registry.last_controller_generation(first),
+            Some(ended),
+            "the crashed generation is retained as the predecessor, not as a binding"
+        );
+    }
+    let edge = runtime.last_panel_edge().expect("the reload ran an edge");
+    assert_eq!(
+        (edge.attempted, edge.refused_count()),
+        (2, 0),
+        "the successor's bind enumerated both containers: {edge:?}"
     );
 }
 

@@ -5095,9 +5095,23 @@ impl PluginRuntime {
     /// locally, clearing the VM and services. Idempotent: safe whether or not
     /// the policy half committed, and whether or not the host entry exists.
     ///
+    /// A rollback ends the generation, so it runs the same panel generation edge
+    /// a dispose does, with [`PlaceholderReason::Crashed`]: a generation that
+    /// never reached a runnable state -- or one that died inside a callback --
+    /// must not keep the containers it still binds, and the placeholder it
+    /// leaves names the crash rather than a user action nobody took (OQ-084 A.2,
+    /// E; bitty#2476 residuals 4 and 5). The port is asked after the
+    /// generation's own content release (`clear_ui_blocks`) and before the entry
+    /// is reused, exactly as `dispose_inner` orders it; a port the app did not
+    /// install leaves this a no-op.
+    ///
     /// [`Failed`]: LifecycleState::Failed
     fn rollback(&mut self, id: &PluginId, message: String) {
         let _ = self.host.remove(id);
+        // The generation this rollback ends, read before the entry is rewritten
+        // (the field is not advanced here, but reading it first keeps the edge
+        // call independent of everything the block below drops).
+        let ended = self.entries.get(id).map(|entry| entry.generation);
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
@@ -5127,6 +5141,18 @@ impl PluginRuntime {
             }
             entry.services = None;
             entry.budgets = None;
+        }
+        // bitty#2476 residuals 4 and 5: the rollback is the fifth event that
+        // ends a generation (dispose, unload/disable through `dispose_inner`,
+        // the reload teardown, and this one). The entry borrow ends above, so
+        // the edge can run here -- after `clear_ui_blocks` released the
+        // generation's own content and before the entry is reused -- and the
+        // containers this generation still drives are released and left
+        // presenting `crashed` with no successor, because a fault is not a
+        // reload (OQ-084 A.2, E.1: a crash keeps the container and names the
+        // reason instead of respawning).
+        if let Some(ended) = ended {
+            self.release_panel_generation(id, ended, PlaceholderReason::Crashed);
         }
         // CTX-0941: a failed activation is a release. A generation that
         // acquired the transient capture during `init.lua` must never keep it
@@ -6054,6 +6080,73 @@ mod tests {
                 && memory.contains(&format!("used_bytes={}", memory_limit + 1))
                 && memory.contains(&format!("limit_bytes={memory_limit}")),
             "{memory}"
+        );
+    }
+
+    /// A rollback is a generation edge, so the installed port is asked for the
+    /// generation it ends with the `crashed` reason.
+    ///
+    /// The failure class test above pins what a rollback records about the
+    /// generation; this pins what it tells the panel host. A crash inside a
+    /// callback and a generation that never finished `init.lua` both land in
+    /// `rollback`, and either leaves the containers it bound unbound-and-named
+    /// rather than silently bound to a dead generation (PGO-4/PGO-20).
+    ///
+    /// Fails for the pre-fix rollback, which asked the port for nothing: the
+    /// containers of a crashed generation kept their binding, their grant row,
+    /// and no placeholder.
+    #[test]
+    fn rollback_runs_the_generation_edge_with_the_crashed_reason() {
+        struct RecordingPort(Rc<RefCell<Vec<(PluginId, PluginGeneration, PlaceholderReason)>>>);
+        impl PanelGenerationPort for RecordingPort {
+            fn release_generation(&self, edge: PanelEdgeRelease<'_>) -> PanelEdgeReport {
+                self.0
+                    .borrow_mut()
+                    .push((edge.owner.clone(), edge.ended, edge.reason));
+                PanelEdgeReport::default()
+            }
+
+            fn bind_successor(&self, _edge: PanelEdgeBind<'_>) -> PanelEdgeReport {
+                PanelEdgeReport::default()
+            }
+        }
+
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig::default());
+        let manifest = manifest_toml::parse_manifest(
+            br#"[plugin]
+id = "bitty-featured.rollback-edge"
+name = "Rollback edge fixture"
+version = "0.0.1"
+description = "Rollback runs the panel generation edge"
+[compat]
+plugin-api = "^1.0"
+"#,
+        )
+        .expect("in-memory manifest");
+        let id = manifest.id().clone();
+        runtime.insert_package(
+            id.clone(),
+            PluginPackage {
+                manifest,
+                module_root: PathBuf::new(),
+                source_class: SourceClass::LocalPath,
+                unverified: true,
+                granted: None,
+            },
+        );
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        runtime.set_panel_generation_port(Some(Rc::new(RecordingPort(Rc::clone(&seen)))));
+        runtime.entries.get_mut(&id).expect("entry").generation = 7;
+
+        runtime.rollback(
+            &id,
+            "RC-1 instructions: used=200000, budget=100".to_string(),
+        );
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[(id, 7, PlaceholderReason::Crashed)],
+            "one edge, for the generation the rollback ended, naming the crash"
         );
     }
 

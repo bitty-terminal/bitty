@@ -32,9 +32,8 @@ the determinism contract are documented in `src/lib.rs`.
   native loader (pinned by `tests/readiness_mirror.rs`:
   `stdlib_allowlist_denies_ambient_authority`). The `0.2.0` pin adds the
   `xpcall` message handler with forwarded arguments, `coroutine.wrap` /
-  `coroutine.isyieldable`, function replacements and `%1`-`%9`
-  backreferences in `string.gsub`, and exact Lua 5.4 integer/float
-  comparison and negative-shift semantics (pinned by
+  `coroutine.isyieldable`, and function replacements in `string.gsub`,
+  plus exact Lua 5.4 integer/float comparison and negative-shift semantics (pinned by
   `phodopus_v0_2_0_lua54_surface_in_sandboxed_vm` in `src/lib.rs`).
 - Plugin VMs build only through the fail-closed gate (`src/gate.rs`:
   `PluginVmBuilder`/`build_plugin_vm` require explicit RC-1/RC-2 budgets);

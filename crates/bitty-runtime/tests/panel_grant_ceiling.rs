@@ -17,12 +17,15 @@
 //! - panel disposal drops the tombstone with the container, so a later panel is
 //!   a first bind and not a reload of the retired identity;
 //! - the table holds one entry per panel and is bounded by the live-panel
-//!   budget, so another panel's edge can never evict a protected ceiling.
+//!   budget, so another panel's edge can never evict a protected ceiling; a
+//!   panel's next edge replaces its own entry whatever owner stamped the
+//!   previous one, so the table never holds two entries for one panel.
 //!
 //! The lost-tombstone refusal is also unit-tested inside `registry::panel`,
 //! where the invariant can be violated deliberately; the public path never
 //! produces that state.
 
+use bitty_plugin_host::PluginId;
 use bitty_runtime::registry::{
     Generation, MAX_PANELS_PER_WINDOW, MAX_RETAINED_GRANT_CEILINGS, PanelError, PanelId,
     PanelRegistry, PanelRegistryConfig, PanelType,
@@ -556,6 +559,165 @@ fn many_panel_edges_do_not_evict_a_long_lived_panels_ceiling() {
         "no consent-free widening survived the pressure"
     );
     assert_eq!(reg.error_count("CeilingLost"), 0);
+}
+
+/// One panel after two facts, so a test can drive further edges from it: the
+/// allocation-epoch edge an unbound container's release ends (stamped `None`),
+/// then the first controller bind that follows it (stamped `acme.notes`). The
+/// two tombstones therefore carry different keys for one panel.
+///
+/// Returns the panel, its allocation epoch, the controller generation that
+/// ended, and the owner that ended it.
+fn panel_after_an_epoch_edge_and_a_controller_bind(
+    reg: &mut PanelRegistry,
+    view: u64,
+) -> (PanelId, Generation, Generation, PluginId) {
+    let (panel, epoch) = bound_panel(reg, &[CREATE], view);
+    // Edge one: nothing is bound, so the record's binding key is the allocation
+    // epoch and the tombstone is stamped `(None, panel)`.
+    assert!(
+        reg.release_generation_scope(panel, epoch)
+            .expect("allocation-epoch edge"),
+        "the epoch row is released"
+    );
+    let controller = epoch.next().expect("controller generation");
+    let acme = PluginId::new("acme.notes").expect("valid plugin id");
+    // The bind reads the epoch tombstone as its predecessor, so its ceiling is
+    // `{panel.create}` and the controller row holds exactly that.
+    reg.rebind_panel(
+        panel,
+        controller,
+        &acme,
+        &set(&[CREATE, FOCUS]),
+        &BTreeSet::new(),
+    )
+    .expect("first controller bind");
+    (panel, epoch, controller, acme)
+}
+
+/// OQ-084 A.2 (bitty#2476 residual 9(b)): a panel's next edge replaces its own
+/// tombstone, whatever owner stamped the previous one.
+///
+/// Two edges on the same panel are stamped under two different keys — the
+/// allocation epoch's edge under `(None, panel)` and the controller
+/// generation's edge under `(acme.notes, panel)` — so a table that only inserted
+/// would hold two rows for one panel. The contract is one: the older row is
+/// replaced, the retained ceiling is the latest edge's, and the successor reads
+/// that one rather than whichever row sorts first.
+///
+/// Fails when the replace is deleted: the count becomes two, the retained
+/// ceiling is still the epoch edge's (an empty owner sorts ahead of
+/// `acme.notes`), and the successor's phase 0 refuses it as `CeilingLost`
+/// because the owner the record names no longer matches the tombstone it finds.
+#[test]
+fn a_panels_next_edge_replaces_its_own_tombstone_across_owners() {
+    let mut reg = registry();
+    let (panel, _epoch, controller, acme) =
+        panel_after_an_epoch_edge_and_a_controller_bind(&mut reg, 40);
+    assert_eq!(
+        reg.retained_grant_ceiling_count(),
+        1,
+        "the epoch edge holds the panel's only entry"
+    );
+
+    assert!(
+        reg.release_generation_scope(panel, controller)
+            .expect("controller edge"),
+        "the controller's row is released"
+    );
+
+    assert_eq!(
+        reg.retained_grant_ceiling_count(),
+        1,
+        "the panel still holds one entry, not one per owner"
+    );
+    let ceiling = reg
+        .retained_grant_ceiling(panel)
+        .expect("the panel keeps a tombstone");
+    assert_eq!(
+        ceiling.ended_generation, controller,
+        "the retained ceiling is the latest edge's, not the older one's"
+    );
+    assert_eq!(
+        ceiling.owner,
+        Some(acme.clone()),
+        "and it is keyed under the owner that stamped it"
+    );
+    assert_eq!(
+        ceiling.grants,
+        set(&[CREATE]),
+        "with the set that edge released"
+    );
+
+    // The successor's phase 0 reads the panel's one entry, so the older epoch
+    // tombstone cannot shadow the ceiling the record names.
+    let successor = controller.next().expect("successor generation");
+    let bound = reg
+        .rebind_panel(
+            panel,
+            successor,
+            &acme,
+            &set(&[CREATE, FOCUS]),
+            &BTreeSet::new(),
+        )
+        .expect("the successor reads the latest edge's tombstone");
+    assert_eq!(bound.predecessor_generation(), Some(controller));
+    assert_eq!(bound.grants(), &set(&[CREATE]));
+    assert_eq!(reg.error_count("CeilingLost"), 0);
+    assert_eq!(reg.retained_grant_ceiling_count(), 1);
+}
+
+/// OQ-084 A.2 (bitty#2476 residual 9(b)): the replace is what keeps one live
+/// panel's repeated edges inside the table bound.
+///
+/// The table's capacity is `min(max_panels_per_window, MAX_RETAINED_GRANT_CEILINGS)`,
+/// so a registry configured for one panel has room for exactly one entry. Two
+/// edges of that one panel both have to store, which only a replace permits;
+/// without it the second edge is refused `ResourceExhausted` and the release
+/// keeps the live row, even though no other panel competes for the space.
+///
+/// Fails when the replace is deleted: the second edge returns
+/// `Err(ResourceExhausted)` and bumps `RetiredCeilingTableFull`, and so does the
+/// third.
+#[test]
+fn a_panels_repeated_edges_stay_inside_the_table_bound() {
+    let mut reg = registry_with_max_panels(1);
+    let (panel, _epoch, controller, acme) =
+        panel_after_an_epoch_edge_and_a_controller_bind(&mut reg, 41);
+    assert_eq!(reg.retained_grant_ceiling_count(), 1);
+
+    assert_eq!(
+        reg.release_generation_scope(panel, controller),
+        Ok(true),
+        "the panel's second edge replaces its own tombstone instead of growing \
+         the table"
+    );
+
+    // A same-panel third edge, through the bind that reads the second: the
+    // panel's edges never accumulate against the bound, so a single-panel
+    // registry can absorb an unbounded number of them.
+    let successor = controller.next().expect("successor generation");
+    reg.rebind_panel(panel, successor, &acme, &set(&[CREATE]), &BTreeSet::new())
+        .expect("the successor reads the one entry");
+    assert_eq!(
+        reg.release_generation_scope(panel, successor),
+        Ok(true),
+        "the third edge stores over the second"
+    );
+
+    assert_eq!(reg.retained_grant_ceiling_count(), 1);
+    assert_eq!(
+        reg.error_count("RetiredCeilingTableFull"),
+        0,
+        "no edge of the panel was refused for want of room"
+    );
+    assert_eq!(
+        reg.retained_grant_ceiling(panel)
+            .expect("the panel keeps a tombstone")
+            .ended_generation,
+        successor,
+        "the entry names the latest edge"
+    );
 }
 
 #[test]

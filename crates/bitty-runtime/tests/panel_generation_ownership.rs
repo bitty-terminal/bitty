@@ -45,6 +45,7 @@
 //! | PGO-23, edge-driven (bitty#2476 residual 4) | here — `a_generation_edge_with_no_successor_presents_the_placeholder_after_the_release` |
 //! | PGO-1/PGO-2, edge-driven (bitty#2476 residual 2) | here — `the_generation_edge_rebinds_the_container_and_moves_the_controller` |
 //! | Residual 7, per-owner retention | here — `a_tombstone_is_retained_for_the_owner_that_stamped_it` |
+//! | Residual 7(a), no owner on an epoch edge (bitty#2476) | here — `an_allocation_epoch_edge_retains_no_owner_from_the_previous_edge`, `a_bind_after_an_allocation_epoch_edge_is_not_measured_against_the_previous_owner` |
 //! | PGO-22(d) through the edge, no widening | here — `a_refused_edge_bind_leaves_the_container_unbound_without_widening_its_grants` |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
@@ -251,6 +252,135 @@ fn a_bind_by_another_owner_is_refused_as_a_lost_ceiling() {
         .rebind_panel(panel, n1, &acme, &set(&[CREATE, FOCUS]), &empty())
         .expect("the predecessor's own owner still binds");
     assert_eq!(adopted.grants(), &set(&[CREATE, FOCUS]));
+}
+
+/// Residual 7(a) (bitty#2476): an edge that ends the allocation epoch retains
+/// no owner, so the record cannot name a plugin this edge never had.
+///
+/// The sequence is the ordinary one on a container whose controller left: the
+/// controller generation's edge stamps `acme.notes`, then a writer that holds no
+/// controller (the epoch is the binding key while nothing is bound) reaches a
+/// second edge under the allocation epoch. `PanelRecord::last_controller_owner`
+/// is `None` "on an edge that ended the allocation epoch instead of a bound
+/// controller", and the tombstone is keyed with that same `None`.
+///
+/// Fails for an implementation that copies the record's retained owner forward
+/// (`bound_owner.or(last_ended_owner)`): the record then names `acme.notes`
+/// after an edge that ended no binding, and the tombstone is keyed
+/// `(acme.notes, PanelId)` instead of `(None, PanelId)`.
+#[test]
+fn an_allocation_epoch_edge_retains_no_owner_from_the_previous_edge() {
+    let mut reg = registry();
+    let (panel, epoch, n) = mounted_panel(&mut reg, 34);
+    let acme = owner("acme.notes");
+    reg.rebind_panel(panel, n, &acme, &set(&[CREATE, FOCUS]), &empty())
+        .expect("first bind");
+    reg.release_generation_scope(panel, n)
+        .expect("generation edge");
+    assert_eq!(
+        reg.last_controller_owner(panel),
+        Some(&acme),
+        "the controller's own edge stamps the owner of the binding it ends"
+    );
+
+    // While nothing is bound the record's binding key is the allocation epoch,
+    // so this edge ends the epoch and no binding. The grant is the shape a
+    // writer without a controller leaves: it is keyed by the epoch.
+    reg.grant_panel_capability(panel, epoch, FOCUS)
+        .expect("an unbound container's row is keyed by the epoch");
+    reg.release_generation_scope(panel, epoch)
+        .expect("allocation-epoch edge");
+
+    assert_eq!(
+        reg.last_controller_owner(panel),
+        None,
+        "an edge that ended no binding has no owner to retain: the previous \
+         controller's owner is not carried forward"
+    );
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        Some(epoch),
+        "the epoch edge is still an edge, and its generation is retained"
+    );
+    let ceiling = reg
+        .retained_grant_ceiling(panel)
+        .expect("the epoch edge writes its own tombstone");
+    assert_eq!(ceiling.ended_generation, epoch);
+    assert_eq!(
+        ceiling.owner, None,
+        "the tombstone is keyed under the owner this edge had, which is none"
+    );
+    assert_eq!(
+        ceiling.grants,
+        set(&[FOCUS]),
+        "the epoch edge's ceiling is the epoch row it released, not the \
+         controller's"
+    );
+}
+
+/// Residual 7(a) (bitty#2476): the record and the tombstone name a phantom
+/// predecessor only if the epoch edge copies an owner forward — and that
+/// phantom refuses the next legitimate bind through the cross-owner
+/// `CeilingLost` fence.
+///
+/// The bind after the epoch edge presents another owner than the one that left
+/// before it. That is not cross-plugin adoption of a ceiling (`N-13`, `B.6`):
+/// the predecessor the record names is the allocation epoch, which no plugin
+/// owns. [`PanelRegistry::rebind_panel`] therefore has no owner to compare and
+/// binds; the successor's ceiling is the epoch edge's `{panel.focus}`, so
+/// nothing of the previous controller's set survives either.
+///
+/// Fails for the pre-fix code: `last_controller_owner` still names
+/// `acme.notes`, phase 0 refuses the bind as `CeilingLost`, and the container
+/// stays unbound with an error counter of 1.
+#[test]
+fn a_bind_after_an_allocation_epoch_edge_is_not_measured_against_the_previous_owner() {
+    let mut reg = registry();
+    let (panel, epoch, n) = mounted_panel(&mut reg, 35);
+    let acme = owner("acme.notes");
+    reg.rebind_panel(panel, n, &acme, &set(&[CREATE, FOCUS]), &empty())
+        .expect("first bind");
+    reg.release_generation_scope(panel, n)
+        .expect("generation edge");
+    reg.grant_panel_capability(panel, epoch, FOCUS)
+        .expect("an unbound container's row is keyed by the epoch");
+    reg.release_generation_scope(panel, epoch)
+        .expect("allocation-epoch edge");
+
+    let beta = owner("beta.tasks");
+    let n1 = n.next().expect("successor generation");
+    let bound = reg
+        .rebind_panel(panel, n1, &beta, &set(&[CREATE, FOCUS]), &empty())
+        .expect(
+            "the predecessor the record names is the allocation epoch, which no \
+             plugin owns, so there is no foreign ceiling to refuse",
+        );
+
+    assert_eq!(
+        reg.error_count("CeilingLost"),
+        0,
+        "the bind is not measured against an owner that left before the epoch edge"
+    );
+    assert_eq!(
+        bound.predecessor_generation(),
+        Some(epoch),
+        "provenance names the epoch edge, the edge the record actually retains"
+    );
+    assert_eq!(
+        bound.grants(),
+        &set(&[FOCUS]),
+        "the successor is bounded by the epoch edge's ceiling, so nothing of \
+         the previous controller's set is adopted"
+    );
+    assert_eq!(reg.controller_generation(panel), Some(n1));
+    assert!(
+        reg.is_panel_capability_granted(panel, n1, FOCUS),
+        "the successor holds the ceiling it was handed"
+    );
+    assert!(
+        !reg.is_panel_capability_granted(panel, n1, CREATE),
+        "the epoch edge never held `panel.create`, so the successor cannot either"
+    );
 }
 
 /// `N -> N+1 -> N`: a retired generation is not rebound while its successor is

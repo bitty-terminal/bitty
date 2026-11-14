@@ -1292,6 +1292,50 @@ impl LayoutNode {
             .and_then(|path| path.last().map(|(axis, _)| *axis))
     }
 
+    /// Toggles the axis of the innermost `Split` enclosing leaf `id`
+    /// (`Horizontal` <-> `Vertical`, Hyprland `togglesplit` parity).
+    ///
+    /// Preserves split ratios, child ordering, and `ViewId`s; `Stack` and
+    /// `Overlay` wrappers are transparent. Returns the new [`SplitAxis`] when
+    /// an enclosing split was flipped, or `None` when `id` is absent or has no
+    /// enclosing `Split` (single-leaf root). Pure, total, O(n).
+    pub fn toggle_parent_split_axis(&mut self, id: ViewId) -> Option<SplitAxis> {
+        fn walk(node: &mut LayoutNode, id: ViewId) -> Option<Option<SplitAxis>> {
+            match node {
+                LayoutNode::Leaf(v) => (v.id() == id).then_some(None),
+                LayoutNode::Split {
+                    axis,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let found = walk(first, id).or_else(|| walk(second, id))?;
+                    if let Some(flipped) = found {
+                        return Some(Some(flipped));
+                    }
+                    let next_axis = match *axis {
+                        SplitAxis::Horizontal => SplitAxis::Vertical,
+                        SplitAxis::Vertical => SplitAxis::Horizontal,
+                    };
+                    *axis = next_axis;
+                    Some(Some(next_axis))
+                }
+                LayoutNode::Stack(children) => {
+                    for child in children {
+                        if let Some(res) = walk(child, id) {
+                            return Some(res);
+                        }
+                    }
+                    None
+                }
+                LayoutNode::Overlay { base, overlay, .. } => {
+                    walk(base, id).or_else(|| walk(overlay, id))
+                }
+            }
+        }
+        walk(self, id).flatten()
+    }
+
     /// Checks the structural invariants every committed tiling tree holds.
     ///
     /// - at least one leaf (a fully drained tree is a tombstone),
@@ -4998,5 +5042,47 @@ mod tests {
             2.5,
         );
         assert_eq!(tree_d2.layout(wide), tree_s2.layout(wide));
+    }
+
+    #[test]
+    fn toggle_parent_split_axis_flips_innermost_enclosing_split() {
+        let mut single = LayoutNode::leaf(view(1, 80, 24));
+        assert_eq!(single.toggle_parent_split_axis(ViewId::new(1)), None);
+
+        let mut nested = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.6,
+                LayoutNode::leaf(view(2, 40, 12)),
+                LayoutNode::leaf(view(3, 40, 12)),
+            ),
+        );
+        // Flipping leaf 3's parent flips only the inner split (Vertical -> Horizontal).
+        assert_eq!(
+            nested.toggle_parent_split_axis(ViewId::new(3)),
+            Some(SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            nested.leaf_parent_axis(ViewId::new(3)),
+            Some(SplitAxis::Horizontal)
+        );
+        assert_eq!(
+            nested.leaf_parent_axis(ViewId::new(1)),
+            Some(SplitAxis::Horizontal)
+        );
+        // Flipping leaf 1's parent flips the outer split (Horizontal -> Vertical).
+        assert_eq!(
+            nested.toggle_parent_split_axis(ViewId::new(1)),
+            Some(SplitAxis::Vertical)
+        );
+        assert_eq!(
+            nested.leaf_parent_axis(ViewId::new(1)),
+            Some(SplitAxis::Vertical)
+        );
+        // Unknown leaf returns None without mutating.
+        assert_eq!(nested.toggle_parent_split_axis(ViewId::new(99)), None);
     }
 }

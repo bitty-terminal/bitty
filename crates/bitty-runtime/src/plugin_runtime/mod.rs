@@ -3560,12 +3560,18 @@ impl PluginRuntime {
         match outcome {
             bitty_lua::BoundedExecution::Completed => {}
             bitty_lua::BoundedExecution::Suspended(reason) => {
+                let is_wall_timeout = matches!(reason, SuspendReason::WallClockExceeded { .. });
                 let message = format!("init.lua suspended: {reason:?}");
                 let error = PluginRuntimeError::Capture {
                     plugin: id.to_string(),
                     detail: message.clone(),
                 };
                 self.rollback(id, error.to_string());
+                if is_wall_timeout {
+                    if let Some(entry) = self.entries.get_mut(id) {
+                        entry.failure_class = FailureClass::WallSliceTimeout;
+                    }
+                }
                 return Err(error);
             }
             bitty_lua::BoundedExecution::RuntimeError(message) => {
@@ -3989,6 +3995,7 @@ impl PluginRuntime {
                     if let Some(entry) = self.entries.get_mut(&id) {
                         if entry.state == LifecycleState::Disposed {
                             entry.state = LifecycleState::Failed(prev_reason);
+                            entry.failure_class = FailureClass::WallSliceTimeout;
                         }
                     }
                 }
@@ -4222,6 +4229,9 @@ impl PluginRuntime {
                     ),
                 });
             }
+        }
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.wall_recovery_attempts = 0;
         }
         Ok(result)
     }
@@ -4468,6 +4478,11 @@ impl PluginRuntime {
                         }
                         None => Ok(value),
                     };
+                    if outcome.is_ok() {
+                        if let Some(entry) = self.entries.get_mut(&id) {
+                            entry.wall_recovery_attempts = 0;
+                        }
+                    }
                     completed.push(ParkedCommandCompletion {
                         plugin: id,
                         command: parked.command,
@@ -4654,13 +4669,25 @@ impl PluginRuntime {
             let Ok(mut vm) = vm.try_borrow_mut() else {
                 continue;
             };
+            let mut any_ok = false;
             for handler in handlers {
                 if vm
                     .call_function(&handler, std::slice::from_ref(envelope))
                     .is_ok()
                 {
                     delivered += 1;
+                    any_ok = true;
                 }
+            }
+            drop(vm);
+            if any_ok
+                && entry.vm.as_ref().is_some_and(|v| {
+                    v.try_borrow()
+                        .ok()
+                        .is_some_and(|r| r.suspend_reason().is_none())
+                })
+            {
+                entry.wall_recovery_attempts = 0;
             }
         }
         self.sync_callback_timers(Instant::now());

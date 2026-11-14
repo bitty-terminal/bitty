@@ -310,6 +310,8 @@ use spawn::{
 };
 use terminal_app::TerminalApp;
 
+use bitty_ui::a11y_host::A11ySettings;
+
 #[cfg(test)]
 use bitty_runtime::{LayoutNode, SplitAxis, UiRect, View, ViewId};
 #[cfg(test)]
@@ -1466,6 +1468,17 @@ fn main() {
         eprintln!("{message}");
         std::process::exit(code);
     }
+    // bitty#1768: the accessibility projection is default-off core policy. The
+    // opt-in is read here (env transport until the configuration key and the
+    // consent gesture land), and `--safe` suppresses an enabled request
+    // instead of exposing a tree — the same shape as the demo pump.
+    let a11y_requested = observability::a11y_screen_reader_from_env();
+    let a11y_exposure = observability::a11y_exposure_allowed(args.safe, a11y_requested);
+    if a11y_requested && !a11y_exposure {
+        logging::warn(|| {
+            String::from("bitty: accessibility projection suppressed in --safe (safe-mode clean)")
+        });
+    }
     let mut app = TerminalApp::with_theme(
         runtime,
         &app_config.theme_name,
@@ -1512,7 +1525,10 @@ fn main() {
     .with_focused_workspace(focused_workspace)
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
     // cutover selects the retained Core path without consulting a VM.
-    .with_safe_mode(args.safe);
+    .with_safe_mode(args.safe)
+    // bitty#1768: install the default-off accessibility projection decided
+    // above. Disabled settings keep the app's inert bridge.
+    .with_a11y_settings(A11ySettings::new().with_screen_reader(a11y_exposure));
     // CTX-1719: the windowed path deferred the shell spawn above; hand the
     // recipe to the app so the first committed window grid sizes the PTY.
     if defer_startup_spawn {

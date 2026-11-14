@@ -504,6 +504,7 @@ dependencies = [
  "bitty-storage 0.0.1 (git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177)",
  "bitty-term-state",
  "bitty-test-support",
+ "bitty-ui",
  "bitty-vt",
  "bitty-winjob",
  "embed-resource",

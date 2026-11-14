@@ -35,6 +35,7 @@
 //! | `bitty dev capture\|synthesize\|dump\|overlay` | `dev-tools` cargo feature | off (exit 1 + [`crate::dev::TOOLS_DISABLED_MESSAGE`]) | local-only, clean |
 //! | Per-frame `bitty tick` stderr lines | `--verbose` / `--log-level debug\|trace` / `BITTY_LOG` / `RUST_LOG` | off (quiet) | allowed (local diagnostics, never a trace artifact) |
 //! | Synthetic demo pump | `BITTY_DEMO_PUMP=1` | off | suppressed ([`demo_pump_allowed`]) |
+//! | Accessibility projection (bitty#1768) | `BITTY_A11Y_SCREEN_READER=1` ([`A11Y_SCREEN_READER_ENV`]) | off (no host, no adapter, no ingest) | suppressed ([`a11y_exposure_allowed`]) |
 //! | Real-window first-frame marker | `BITTY_PERF_STARTUP_MARKER` env | off | never fabricates (headless guard) |
 //! | `bitty-observability` implementation, exporters, metrics pipeline | canonical API linked by the composition root only (zero dependencies) | off | not loaded |
 //! | Input recording, clipboard / raw environment capture, trace files | separate opt-ins that do not exist in Core | off | off |
@@ -285,6 +286,45 @@ pub(crate) fn redact_text_for_stderr(text: &str) -> Cow<'_, str> {
 /// shows only the real shell. Non-safe behavior is unchanged.
 #[must_use]
 pub(crate) fn demo_pump_allowed(safe: bool, env_enabled: bool) -> bool {
+    env_enabled && !safe
+}
+
+/// Environment knob requesting the accessibility projection (bitty#1768).
+///
+/// Temporary transport for the opt-in until the configuration key and the
+/// user consent gesture that the accepted accessibility contract requires
+/// land; it grants no new authority.
+pub(crate) const A11Y_SCREEN_READER_ENV: &str = "BITTY_A11Y_SCREEN_READER";
+
+/// Pure opt-in parse for the accessibility projection (bitty#1768).
+///
+/// Default off: only `1`/`true` (case-insensitive, trimmed) requests the
+/// projection. Pure over the injected value so tests never touch the
+/// environment; the startup path injects the real variable.
+#[must_use]
+pub(crate) fn a11y_screen_reader_from_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_lowercase).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Reads the process environment for the accessibility opt-in.
+///
+/// Impure (reads env); total (unset/unparsable means disabled).
+#[must_use]
+pub(crate) fn a11y_screen_reader_from_env() -> bool {
+    a11y_screen_reader_from_value(std::env::var(A11Y_SCREEN_READER_ENV).ok().as_deref())
+}
+
+/// Safe-mode-clean accessibility-exposure decision (bitty#1768).
+///
+/// Like the demo pump, the accessibility projection is opt-in policy that
+/// must never attach in `--safe` recovery: safe mode exists to start from a
+/// minimal surface, so an enabled request is suppressed instead of exposing a
+/// tree. Non-safe behavior is unchanged.
+#[must_use]
+pub(crate) fn a11y_exposure_allowed(safe: bool, env_enabled: bool) -> bool {
     env_enabled && !safe
 }
 
@@ -569,5 +609,39 @@ mod tests {
         assert!(demo_pump_allowed(false, true));
         assert!(!demo_pump_allowed(true, false));
         assert!(!demo_pump_allowed(true, true));
+    }
+
+    /// bitty#1768: the accessibility projection is opt-in, total over the
+    /// environment, and never attaches in `--safe`.
+    #[test]
+    fn a11y_exposure_is_opt_in_and_safe_mode_clean() {
+        // Default off: unset or anything unexpected leaves the projection off.
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+            Some("2"),
+        ] {
+            assert!(
+                !a11y_screen_reader_from_value(value),
+                "value {value:?} must not request the projection"
+            );
+        }
+        for value in [Some("1"), Some("true"), Some(" TRUE "), Some("True")] {
+            assert!(
+                a11y_screen_reader_from_value(value),
+                "value {value:?} must request the projection"
+            );
+        }
+        assert!(!a11y_exposure_allowed(false, false));
+        assert!(a11y_exposure_allowed(false, true));
+        assert!(!a11y_exposure_allowed(true, false));
+        assert!(
+            !a11y_exposure_allowed(true, true),
+            "safe mode suppresses an enabled request instead of exposing a tree"
+        );
+        assert_eq!(A11Y_SCREEN_READER_ENV, "BITTY_A11Y_SCREEN_READER");
     }
 }

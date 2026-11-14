@@ -23,10 +23,16 @@
 //!   Notices are one-shot: the next [`bitty_a11y::Adapter::ingest_host`] read
 //!   reports every pending notice once and clears it, so a reused host never
 //!   re-delivers a transition (#2352).
+//! - [`A11ySnapshotBridge`] — the session owner of the live projection
+//!   (bitty#1768). It constructs `Adapter` only when
+//!   [`A11ySettings::screen_reader`] is set, refreshes it from committed
+//!   terminal snapshots on the composition root's present path, and releases
+//!   it on shutdown. Disabled settings allocate no host and no adapter.
 //! - [`A11ySettings`] — core-owned reduced-motion plus high-contrast
 //!   composition over [`MotionSpec`] and theme
-//!   tokens. The extension crate is dependency-free and cannot own these; they
-//!   stay here by construction and never take plugin input.
+//!   tokens, plus the exposure flag the bridge reads. The extension crate is
+//!   dependency-free and cannot own these; they stay here by construction and
+//!   never take plugin input.
 //!
 //! Bounded inputs (fail-closed, never silently truncated, except the
 //! announcement queue's documented drop-oldest overflow):
@@ -61,10 +67,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use bitty_a11y::{
-    A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
-    InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
-    MAX_PENDING_ANNOUNCEMENTS, MAX_SNAPSHOT_NODES, Snapshot, SnapshotBuilder, SnapshotHost,
-    TextRun,
+    A11yError, Adapter, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, Generation,
+    HandleMap, InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
+    MAX_PENDING_ANNOUNCEMENTS, MAX_SNAPSHOT_NODES, NodeView, Snapshot, SnapshotBuilder,
+    SnapshotHost, TextRun,
 };
 // Re-exported so Core callers (the runtime scene projection) can name the
 // extension scene vocabulary through this module only; `bitty_a11y` stays
@@ -1213,34 +1219,216 @@ impl SnapshotHost for UiSnapshotHost {
 }
 
 // ---------------------------------------------------------------------------
+// Live adapter owner (bitty#1768)
+// ---------------------------------------------------------------------------
+
+/// Owner of the live accessibility projection derived from Core state.
+///
+/// This is the production half of the seam. The composition root builds one
+/// bridge per session, feeds each committed terminal snapshot into
+/// [`Self::refresh`] on its existing snapshot/present path, and drops it on
+/// exit through [`Self::shutdown`]. `bitty-a11y`'s [`Adapter`] owns the live
+/// projection; the bridge owns that adapter, the reusable [`UiSnapshotHost`],
+/// and the generation counter that makes every refresh a structural change.
+///
+/// # Default off
+///
+/// A bridge built from a disabled [`A11ySettings`] (the default) allocates no
+/// host and no adapter. [`Self::is_active`] is then `false`, [`Self::refresh`]
+/// returns [`Ok`] after a single branch, and every reader below reports the
+/// empty value. A disabled session therefore pays one boolean check per
+/// candidate refresh: no snapshot is built, no tree is derived, and no
+/// backend, thread, timer, or wakeup is created.
+///
+/// # Reuse
+///
+/// The host is rebuilt from each incoming snapshot (the projection is derived
+/// and never retained), while the adapter keeps the live generation and the
+/// one-shot announcement queue, so a reused bridge advances the generation
+/// monotonically and reports each notice once (#2352).
+///
+/// # Not covered here
+///
+/// No platform backend ships with the bridge: [`Self::refresh`] never calls
+/// [`Adapter::expose_to`], so no assistive technology observes the tree yet.
+/// The projection is also terminal-leaf only — title, text runs, cursor
+/// position, and cursor visibility through [`UiSnapshotHost::from_terminal`];
+/// chrome, scene, interactive, focus, and selection nodes stay a follow-up.
+pub struct A11ySnapshotBridge {
+    /// Live projection; [`None`] is the disabled state (nothing allocated).
+    inner: Option<BridgeInner>,
+    /// Successful ingests this bridge performed, kept after
+    /// [`Self::shutdown`] so a session can report what it exposed.
+    ingests: u64,
+}
+
+/// Allocated half of an active bridge.
+struct BridgeInner {
+    host: UiSnapshotHost,
+    adapter: Adapter,
+    next_generation: Generation,
+}
+
+impl A11ySnapshotBridge {
+    /// Builds the bridge for `settings`.
+    ///
+    /// Disabled settings (the default, see [`A11ySettings::screen_reader`])
+    /// build no host and no adapter; use [`Self::disabled`] for that state
+    /// explicitly.
+    #[must_use]
+    pub fn new(settings: A11ySettings) -> Self {
+        if !settings.screen_reader() {
+            return Self::disabled();
+        }
+        Self {
+            inner: Some(BridgeInner {
+                host: UiSnapshotHost::new(FALLBACK_ACCESSIBLE_NAME, FALLBACK_ACCESSIBLE_NAME),
+                adapter: Adapter::new(),
+                next_generation: Generation::initial(),
+            }),
+            ingests: 0,
+        }
+    }
+
+    /// Builds an inert bridge: no host, no adapter, no ingest.
+    ///
+    /// This is the default state of every composition-root session.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            inner: None,
+            ingests: 0,
+        }
+    }
+
+    /// Whether this bridge holds a live adapter.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    /// Feeds one committed terminal snapshot into the live projection.
+    ///
+    /// Each call rebuilds the host from `snapshot` and ingests it at the
+    /// bridge's next generation, so the adapter swaps the tree atomically and
+    /// retires the previous generation. While disabled this is a no-op that
+    /// returns [`Ok`]: no host is built, no ingest runs, and
+    /// [`Self::ingest_count`] does not move.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the ingest refusals of [`Adapter::ingest_host`]
+    /// ([`A11yError::TooManyNodes`], [`A11yError::UnmappedSceneKind`],
+    /// [`A11yError::InvalidStructure`], [`A11yError::FocusMismatch`],
+    /// [`A11yError::AnnouncementTooLong`], [`A11yError::StaleGeneration`]).
+    /// Nothing swaps on error, and the generation only advances after a
+    /// successful ingest, so a failed refresh leaves the previous tree live
+    /// rather than exposing a partial one.
+    pub fn refresh(&mut self, snapshot: &bitty_term_state::Snapshot) -> Result<(), A11yError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        inner.host = UiSnapshotHost::from_terminal(snapshot);
+        let generation = inner.next_generation;
+        inner.adapter.ingest_host(&inner.host, generation, None)?;
+        inner.next_generation = generation.advance();
+        self.ingests = self.ingests.saturating_add(1);
+        Ok(())
+    }
+
+    /// Releases the live projection.
+    ///
+    /// Idempotent: the adapter is dropped, so no tree stays exposed after the
+    /// session ends and a later [`Self::refresh`] cannot resurrect one. The
+    /// ingest counter keeps its last value as session evidence.
+    pub fn shutdown(&mut self) {
+        self.inner = None;
+    }
+
+    /// Successful ingests performed since construction.
+    #[must_use]
+    pub fn ingest_count(&self) -> u64 {
+        self.ingests
+    }
+
+    /// Nodes in the live projection (0 while disabled or before the first
+    /// ingest).
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.live_snapshot().map_or(0, Snapshot::len)
+    }
+
+    /// Terminal text rows in the live projection.
+    #[must_use]
+    pub fn terminal_row_count(&self) -> usize {
+        let Some(snapshot) = self.live_snapshot() else {
+            return 0;
+        };
+        snapshot
+            .preorder()
+            .filter(|handle| matches!(snapshot.get(*handle), Some(NodeView::TerminalRow { .. })))
+            .count()
+    }
+
+    /// Generation of the live projection, or [`None`] before the first ingest.
+    #[must_use]
+    pub fn live_generation(&self) -> Option<u64> {
+        self.live_snapshot()
+            .map(|snapshot| snapshot.generation().as_u64())
+    }
+
+    /// Whether the live projection exposes an element named `label`.
+    #[must_use]
+    pub fn exposes_label(&self, label: &str) -> bool {
+        self.live_snapshot()
+            .is_some_and(|snapshot| snapshot.lookup_label(label).is_some())
+    }
+
+    /// The live projection, if any.
+    fn live_snapshot(&self) -> Option<&Snapshot> {
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.adapter.snapshot())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings composition: core-owned, never plugin-overridable
 // ---------------------------------------------------------------------------
 //
 // Both flags are constructed from core configuration only
 // (`appearance.animations.reduced_motion`, the high-contrast theme switch):
 // no constructor takes a plugin handle, plugin layer, or plugin token, so
-// a plugin cannot override either flag by construction.
+// a plugin cannot override either flag by construction. The exposure flag
+// (`screen_reader`) follows the same rule: it selects whether the live
+// accessibility projection is built, and it is set by the composition root
+// from core policy only.
 
-/// Accessibility settings composing core motion and theme choices.
+/// Accessibility settings composing core motion, theme, and exposure choices.
 ///
 /// `reduced_motion` collapses every animation to its final committed
 /// state (see [`A11ySettings::resolve_motion`]); `high_contrast` selects
 /// the compliant outline pair (see
-/// [`A11ySettings::high_contrast_outlines`]). Both default off.
+/// [`A11ySettings::high_contrast_outlines`]); `screen_reader` requests the
+/// live accessibility projection ([`A11ySnapshotBridge`]) for assistive
+/// technology. All three default off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct A11ySettings {
     reduced_motion: bool,
     high_contrast: bool,
+    screen_reader: bool,
 }
 
 impl A11ySettings {
-    /// Starts with both flags off (animations resolve as authored, theme
-    /// tokens resolve through the normal cascade).
+    /// Starts with every flag off (animations resolve as authored, theme
+    /// tokens resolve through the normal cascade, and no accessibility
+    /// projection is built).
     #[must_use]
     pub const fn new() -> Self {
         Self {
             reduced_motion: false,
             high_contrast: false,
+            screen_reader: false,
         }
     }
 
@@ -1268,6 +1456,24 @@ impl A11ySettings {
     #[must_use]
     pub const fn high_contrast(self) -> bool {
         self.high_contrast
+    }
+
+    /// Sets the core screen-reader exposure flag (builder).
+    ///
+    /// Off by default. The composition root is the only production caller and
+    /// decides it from core policy (never plugin input), which is what
+    /// [`A11ySnapshotBridge::new`] turns into a live projection.
+    #[must_use]
+    pub const fn with_screen_reader(mut self, screen_reader: bool) -> Self {
+        self.screen_reader = screen_reader;
+        self
+    }
+
+    /// Whether the live accessibility projection is built for assistive
+    /// technology.
+    #[must_use]
+    pub const fn screen_reader(self) -> bool {
+        self.screen_reader
     }
 
     /// Resolves `spec` under the reduced-motion flag: when set, the
@@ -1689,5 +1895,133 @@ mod tests {
         transport.receive_error = Some(io::ErrorKind::TimedOut);
         let result = ComponentSnapshotHost::connect(transport, component_config());
         assert!(matches!(result, Err(ComponentHostError::Deadline)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live adapter owner (bitty#1768): default-off lifecycle
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    use bitty_term_state::{State, TerminalAction};
+    use bitty_vt::{ControlChar, GraphemeCell};
+
+    /// A committed terminal snapshot carrying two readable rows and a title.
+    fn tree_snapshot() -> bitty_term_state::Snapshot {
+        let mut state = State::new();
+        for c in "hello".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+        for c in "world".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(c)));
+        }
+        state.apply(&TerminalAction::OscTitle {
+            text: "editor".into(),
+        });
+        state.snapshot()
+    }
+
+    fn enabled_bridge() -> A11ySnapshotBridge {
+        A11ySnapshotBridge::new(A11ySettings::new().with_screen_reader(true))
+    }
+
+    #[test]
+    fn screen_reader_flag_defaults_off_and_is_a_builder() {
+        let defaults = A11ySettings::default();
+        assert_eq!(defaults, A11ySettings::new());
+        assert!(!defaults.screen_reader());
+        assert!(!defaults.with_reduced_motion(true).screen_reader());
+        let enabled = defaults.with_screen_reader(true);
+        assert!(enabled.screen_reader());
+        assert_eq!(enabled, enabled.with_screen_reader(true));
+        // The flag composes with, and never replaces, the other two.
+        let all = enabled.with_reduced_motion(true).with_high_contrast(true);
+        assert!(all.screen_reader() && all.reduced_motion() && all.high_contrast());
+    }
+
+    #[test]
+    fn disabled_bridge_allocates_nothing_and_never_ingests() {
+        // The default settings are the production default: a disabled bridge
+        // must be inert, so the composition root can hold one unconditionally.
+        let terminal = tree_snapshot();
+        let mut bridge = A11ySnapshotBridge::new(A11ySettings::new());
+        assert!(!bridge.is_active());
+        for _ in 0..4 {
+            bridge
+                .refresh(&terminal)
+                .expect("a disabled refresh never fails and never ingests");
+        }
+        assert_eq!(bridge.ingest_count(), 0, "no ingest may run while disabled");
+        assert_eq!(bridge.node_count(), 0);
+        assert_eq!(bridge.terminal_row_count(), 0);
+        assert_eq!(bridge.live_generation(), None);
+        assert!(!bridge.exposes_label("editor"));
+        assert!(!bridge.exposes_label(FALLBACK_ACCESSIBLE_NAME));
+    }
+
+    #[test]
+    fn enabled_bridge_ingests_the_committed_terminal_tree() {
+        let terminal = tree_snapshot();
+        let mut bridge = enabled_bridge();
+        assert!(bridge.is_active());
+        bridge.refresh(&terminal).expect("terminal ingest");
+        assert_eq!(bridge.ingest_count(), 1);
+        assert_eq!(bridge.live_generation(), Some(0));
+        // Root group + terminal leaf + the two readable rows.
+        assert!(bridge.node_count() >= 4, "{}", bridge.node_count());
+        assert_eq!(bridge.terminal_row_count(), 2);
+        assert!(
+            bridge.exposes_label("editor"),
+            "the PTY title names the leaf"
+        );
+        assert!(!bridge.exposes_label("no-such-name"));
+    }
+
+    #[test]
+    fn refresh_advances_the_generation_on_every_ingest() {
+        let terminal = tree_snapshot();
+        let mut bridge = enabled_bridge();
+        bridge.refresh(&terminal).expect("first ingest");
+        bridge.refresh(&terminal).expect("second ingest");
+        bridge.refresh(&terminal).expect("third ingest");
+        assert_eq!(bridge.ingest_count(), 3);
+        assert_eq!(
+            bridge.live_generation(),
+            Some(2),
+            "each refresh is one structural change"
+        );
+    }
+
+    #[test]
+    fn shutdown_releases_the_projection_and_refuses_to_resurrect_it() {
+        let terminal = tree_snapshot();
+        let mut bridge = enabled_bridge();
+        bridge.refresh(&terminal).expect("ingest");
+        assert!(bridge.is_active());
+        bridge.shutdown();
+        assert!(!bridge.is_active(), "the adapter must be dropped");
+        assert_eq!(bridge.node_count(), 0, "no tree stays exposed");
+        assert_eq!(bridge.live_generation(), None);
+        let before = bridge.ingest_count();
+        bridge
+            .refresh(&terminal)
+            .expect("a shut-down bridge is inert, not an error");
+        assert_eq!(bridge.ingest_count(), before, "ingest stays stopped");
+        assert_eq!(bridge.node_count(), 0);
+        // Idempotent: a second release is not an error and changes nothing.
+        bridge.shutdown();
+        assert!(!bridge.is_active());
+    }
+
+    #[test]
+    fn disabled_bridge_shutdown_is_a_no_op() {
+        let mut bridge = A11ySnapshotBridge::disabled();
+        bridge.shutdown();
+        assert!(!bridge.is_active());
+        assert_eq!(bridge.ingest_count(), 0);
     }
 }

@@ -72,6 +72,12 @@ bitty-plugin-host = { version = "0.0.42", path = "../bitty-plugin-host" }
 bitty-runtime = { version = "0.0.42", path = "../bitty-runtime" }
 bitty-render = { version = "0.0.42", path = "../bitty-render" }
 bitty-rich = { version = "0.0.42", path = "../bitty-rich" }
+# bitty#1768: the composition root owns the accessibility projection's
+# lifecycle. `bitty-ui` is the only Core crate that links the pinned
+# `bitty-a11y` seam (W-147 `SOURCE_SEAM_FILES`), so naming the bridge there
+# keeps every `bitty_a11y` identifier inside `a11y_host.rs` and adds no
+# extension edge to this crate.
+bitty-ui = { version = "0.0.42", path = "../bitty-ui" }
 bitty-term-state = { version = "0.0.42", path = "../bitty-term-state" }
 bitty-vt = { version = "0.0.42", path = "../bitty-vt" }
 pollster = { workspace = true }

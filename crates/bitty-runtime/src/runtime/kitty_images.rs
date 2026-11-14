@@ -399,6 +399,8 @@ impl Runtime {
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let compressed_len = payload.len();
         let origin = self.kitty_origin;
+        self.kitty_images
+            .reclaim_for_runtime_store(origin, decoded.rgba.len());
         let id = self
             .kitty_images
             .store_for_origin(
@@ -436,6 +438,8 @@ impl Runtime {
             .decode_transmit_owned(format, width_s, height_v, payload)
             .map_err(|err| KittyImageError::Decode(bitty_rich::KittyPrecheckError::from(err)))?;
         let origin = self.kitty_origin;
+        self.kitty_images
+            .reclaim_for_runtime_store(origin, decoded.rgba.len());
         let id = self
             .kitty_images
             .store_for_origin(
@@ -556,6 +560,9 @@ impl Runtime {
         // detaches the main plane; leaving alt drops alt and restores main.
         self.sync_kitty_screen();
         if action.displays() {
+            Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+            self.kitty_images
+                .reclaim_for_runtime_placement(self.kitty_origin, false);
             // Atomic transmit-and-display (S5, #1849): preflight placement
             // admission before decoding/storing, so a placement-quota
             // refusal stores nothing and never discards FIFO-evicted
@@ -571,6 +578,8 @@ impl Runtime {
         // `a=f`/`a=c` commands resolve this image as their animation
         // target (no-op for anonymous transmits).
         self.kitty_images.set_wire_image(image, wire_image);
+        self.kitty_images
+            .prune_superseded_wire_images(self.kitty_origin, wire_image, image);
         // Issue #2875: a spanless `a=p` that drained before these pixels
         // landed can be sized and recorded now (no-op when none wait).
         self.flush_pending_kitty_places(wire_image);
@@ -789,6 +798,9 @@ impl Runtime {
         // #2442: target the screen the grid currently shows.
         self.sync_kitty_screen();
         if action.displays() {
+            Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+            self.kitty_images
+                .reclaim_for_runtime_placement(self.kitty_origin, false);
             // Atomic transmit-and-display (S5, #1849): preflight placement
             // admission before decoding/storing, so a placement-quota
             // refusal stores nothing and never discards FIFO-evicted
@@ -803,6 +815,8 @@ impl Runtime {
         // S1 (#1849): tag the stored root with its wire `i=` id (see the
         // borrowed seam above).
         self.kitty_images.set_wire_image(image, wire_image);
+        self.kitty_images
+            .prune_superseded_wire_images(self.kitty_origin, wire_image, image);
         // Issue #2875: replay any spanless `a=p` waiting on these pixels.
         self.flush_pending_kitty_places(wire_image);
         if !action.displays() {
@@ -895,6 +909,9 @@ impl Runtime {
         let action = bitty_rich::KittyAction::from_a(action_a);
         self.sync_kitty_screen();
         if action.displays() {
+            Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+            self.kitty_images
+                .reclaim_for_runtime_placement(self.kitty_origin, false);
             self.kitty_images
                 .check_placement_quota_for_origin(self.kitty_origin)
                 .map_err(KittyImageError::Placement)?;
@@ -903,6 +920,8 @@ impl Runtime {
         let image =
             self.kitty_transmit_image_owned(format_f, width_s, height_v, payload, compressed_len)?;
         self.kitty_images.set_wire_image(image, wire_image);
+        self.kitty_images
+            .prune_superseded_wire_images(self.kitty_origin, wire_image, image);
         // Issue #2875: the async local-medium completion path is where a
         // spanless `a=p` waiting on these pixels is replayed.
         self.flush_pending_kitty_places(wire_image);
@@ -1010,6 +1029,15 @@ impl Runtime {
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
         // #2442: register into the plane the grid currently shows.
         self.sync_kitty_screen();
+        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+        let replaced = if wire_image != 0 {
+            self.kitty_images
+                .remove_by_wire_image(self.kitty_origin, wire_image)
+        } else {
+            false
+        };
+        self.kitty_images
+            .reclaim_for_runtime_placement(self.kitty_origin, true);
         // Atomic virtual transmit (S5, #1849): preflight prototype
         // admission before decoding/storing, so a quota refusal stores
         // nothing and never discards FIFO-evicted images (a post-store
@@ -1054,6 +1082,12 @@ impl Runtime {
                 base,
             )
             .map_err(KittyImageError::Placement)?;
+        if replaced {
+            self.pending_full_redraw = true;
+            let generation = self.state.generation();
+            self.cold_queue
+                .push(crate::ColdEvent::Damage { generation });
+        }
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
     }
 
@@ -1081,6 +1115,15 @@ impl Runtime {
         scrollback_base: usize,
     ) -> Result<KittyDisplayOutcome, KittyImageError> {
         self.sync_kitty_screen();
+        Self::precheck_transmit(format_f, width_s, height_v, payload.len())?;
+        let replaced = if wire_image != 0 {
+            self.kitty_images
+                .remove_by_wire_image(self.kitty_origin, wire_image)
+        } else {
+            false
+        };
+        self.kitty_images
+            .reclaim_for_runtime_placement(self.kitty_origin, true);
         self.kitty_images
             .check_virtual_quota_for_origin(self.kitty_origin)
             .map_err(KittyImageError::Placement)?;
@@ -1114,6 +1157,12 @@ impl Runtime {
                 scrollback_base,
             )
             .map_err(KittyImageError::Placement)?;
+        if replaced {
+            self.pending_full_redraw = true;
+            let generation = self.state.generation();
+            self.cold_queue
+                .push(crate::ColdEvent::Damage { generation });
+        }
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
     }
     /// Stored animation frame count for one origin-scoped wire identity
@@ -2124,6 +2173,8 @@ impl Runtime {
             width: metrics.width,
             height: metrics.height,
         };
+        self.kitty_images
+            .reclaim_for_runtime_placement(self.kitty_origin, false);
         let placed = match (anchor, relative) {
             (Some((anchor_col, anchor_row)), _) => self.kitty_images.display_for_origin_with_wire(
                 image,
@@ -2562,13 +2613,18 @@ impl Runtime {
     /// `ERROR` may be conservative (never the reverse).
     fn kitty_probe_admittable(&self, decoded_bytes: Option<usize>) -> bool {
         let layer = &self.kitty_images;
-        if layer.len().saturating_add(1) > bitty_rich::KITTY_PLACE_MAX_IMAGES {
+        if decoded_bytes.is_some_and(|d| d > bitty_rich::KITTY_PLACE_MAX_BYTES) {
             return false;
         }
-        if let Some(decoded) = decoded_bytes {
-            if layer.total_bytes().saturating_add(decoded) > bitty_rich::KITTY_PLACE_MAX_BYTES {
-                return false;
-            }
+        let store_full = layer.len().saturating_add(1) > bitty_rich::KITTY_PLACE_MAX_IMAGES
+            || decoded_bytes.is_some_and(|d| {
+                layer.total_bytes().saturating_add(d) > bitty_rich::KITTY_PLACE_MAX_BYTES
+            });
+        if store_full {
+            let origin_count = layer.image_count_for_origin(self.kitty_origin);
+            return layer.placement_len() > 0
+                || layer.virtual_len() > 0
+                || (origin_count > 0 && origin_count < bitty_rich::KITTY_PER_ORIGIN_MAX_IMAGES);
         }
         true
     }

@@ -2204,6 +2204,229 @@ impl KittyImageLayer {
         removed
     }
 
+    /// Removes every stored image, placement, and virtual prototype matching
+    /// `(origin, wire_image)` (issue #3159).
+    ///
+    /// Used by the runtime when a combined `a=T,U=1,i=<id>` re-transmits an
+    /// explicit non-zero wire image id on `origin`, so repeated inline-image
+    /// or animated-mascot updates replace the previous frame in place instead
+    /// of leaking images and virtual prototypes until per-origin or global
+    /// quotas lock out the pane. Anonymous (`wire_image == 0`) is a no-op.
+    pub fn remove_by_wire_image(&mut self, origin: Option<u64>, wire_image: u32) -> bool {
+        if wire_image == 0 {
+            return false;
+        }
+        let dead: Vec<KittyImageId> = self
+            .images
+            .iter()
+            .filter(|img| img.origin == origin && img.wire_image == wire_image)
+            .map(|img| img.id)
+            .collect();
+        let before_images = self.images.len();
+        let before_items = self.placements.len() + self.virtual_protos.len();
+        if !dead.is_empty() {
+            let mut freed_bytes = 0usize;
+            self.images.retain(|img| {
+                if img.origin == origin && img.wire_image == wire_image {
+                    freed_bytes = freed_bytes.saturating_add(img.stored_bytes());
+                    false
+                } else {
+                    true
+                }
+            });
+            self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
+        }
+        self.placements.retain(|p| {
+            !(p.origin == origin && p.wire_image == wire_image) && !dead.contains(&p.image)
+        });
+        self.virtual_protos.retain(|v| {
+            !(v.origin == origin && v.wire_image == wire_image)
+                && v.image.is_none_or(|id| !dead.contains(&id))
+        });
+        self.cascade_relative_orphans();
+        self.images.len() != before_images
+            || (self.placements.len() + self.virtual_protos.len()) != before_items
+    }
+
+    /// Drops older stored images for `(origin, wire_image)` other than `keep`
+    /// that have no remaining blit placement or linked virtual prototype
+    /// (issue #3159).
+    pub fn prune_superseded_wire_images(
+        &mut self,
+        origin: Option<u64>,
+        wire_image: u32,
+        keep: KittyImageId,
+    ) -> bool {
+        if wire_image == 0 {
+            return false;
+        }
+        let dead: Vec<KittyImageId> = self
+            .images
+            .iter()
+            .filter(|img| {
+                img.origin == origin
+                    && img.wire_image == wire_image
+                    && img.id != keep
+                    && !self.placements.iter().any(|p| p.image == img.id)
+                    && !self.virtual_protos.iter().any(|v| v.image == Some(img.id))
+            })
+            .map(|img| img.id)
+            .collect();
+        if dead.is_empty() {
+            return false;
+        }
+        let mut freed_bytes = 0usize;
+        self.images.retain(|img| {
+            if dead.contains(&img.id) {
+                freed_bytes = freed_bytes.saturating_add(img.stored_bytes());
+                false
+            } else {
+                true
+            }
+        });
+        self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
+        true
+    }
+
+    /// Reclaims store capacity for a runtime transmit when global image or
+    /// byte bounds would otherwise refuse after own-origin FIFO eviction
+    /// (issue #3159).
+    ///
+    /// Long-running multi-pane sessions can collectively reach
+    /// [`KITTY_PLACE_MAX_IMAGES`] (64) or [`KITTY_PLACE_MAX_BYTES`] (320 MiB)
+    /// while no single origin has reached its 64-image per-origin FIFO
+    /// threshold. Reclaiming the oldest unreferenced image first, then the
+    /// transmitting origin's oldest image, and finally the oldest global
+    /// image keeps active panes functional without raising memory bounds.
+    pub fn reclaim_for_runtime_store(
+        &mut self,
+        origin: Option<u64>,
+        incoming_bytes: usize,
+    ) -> bool {
+        if incoming_bytes > KITTY_PLACE_MAX_BYTES {
+            return false;
+        }
+        let mut sim_evict_count = 0usize;
+        let mut sim_freed_bytes = 0usize;
+        let mut kept_count = self.image_count_for_origin(origin);
+        let mut kept_bytes = self.bytes_for_origin(origin);
+        for img in &self.images {
+            if kept_count.saturating_add(1) <= KITTY_PER_ORIGIN_MAX_IMAGES
+                && kept_bytes.saturating_add(incoming_bytes) <= KITTY_PER_ORIGIN_MAX_BYTES
+            {
+                break;
+            }
+            if img.origin == origin {
+                sim_evict_count = sim_evict_count.saturating_add(1);
+                sim_freed_bytes = sim_freed_bytes.saturating_add(img.stored_bytes());
+                kept_count = kept_count.saturating_sub(1);
+                kept_bytes = kept_bytes.saturating_sub(img.stored_bytes());
+            }
+        }
+        let global_len_after = self.images.len().saturating_sub(sim_evict_count);
+        let global_bytes_after = self.total_bytes.saturating_sub(sim_freed_bytes);
+        if global_len_after.saturating_add(1) <= KITTY_PLACE_MAX_IMAGES
+            && global_bytes_after.saturating_add(incoming_bytes) <= KITTY_PLACE_MAX_BYTES
+        {
+            return false;
+        }
+        let mut evicted = false;
+        while self.images.len().saturating_add(1) > KITTY_PLACE_MAX_IMAGES
+            || self.total_bytes.saturating_add(incoming_bytes) > KITTY_PLACE_MAX_BYTES
+        {
+            let candidate = self
+                .images
+                .iter()
+                .find(|img| {
+                    !self.placements.iter().any(|p| p.image == img.id)
+                        && !self.virtual_protos.iter().any(|v| v.image == Some(img.id))
+                })
+                .or_else(|| self.images.iter().find(|img| img.origin == origin))
+                .or_else(|| self.images.front())
+                .map(|img| img.id);
+            let Some(id) = candidate else {
+                break;
+            };
+            if !self.remove(id) {
+                break;
+            }
+            evicted = true;
+        }
+        evicted
+    }
+
+    /// Reclaims placement/prototype budget for a runtime display or virtual
+    /// registration when cross-kind per-origin sharing or multi-origin global
+    /// saturation would otherwise refuse (issue #3159).
+    pub fn reclaim_for_runtime_placement(
+        &mut self,
+        origin: Option<u64>,
+        for_virtual: bool,
+    ) -> bool {
+        let mut evicted = false;
+        let own_placements = self.placement_count_for_origin(origin);
+        let own_virtuals = self.virtual_count_for_origin(origin);
+        let own_total = own_placements + own_virtuals;
+        if own_total >= KITTY_PER_ORIGIN_MAX_PLACEMENTS {
+            if !for_virtual && own_placements == 0 {
+                if let Some(pos) = self.virtual_protos.iter().position(|v| v.origin == origin) {
+                    self.virtual_protos.remove(pos);
+                    evicted = true;
+                }
+            } else if for_virtual && own_virtuals == 0 {
+                if let Some(pos) = self.placements.iter().position(|p| p.origin == origin) {
+                    self.placements.remove(pos);
+                    self.cascade_relative_orphans();
+                    evicted = true;
+                }
+            }
+        }
+        loop {
+            let own_placements = self.placement_count_for_origin(origin);
+            let own_virtuals = self.virtual_count_for_origin(origin);
+            let own_total = own_placements + own_virtuals;
+            let own_evictable = if for_virtual {
+                own_virtuals
+            } else {
+                own_placements
+            };
+            let evict_own = own_total >= KITTY_PER_ORIGIN_MAX_PLACEMENTS && own_evictable > 0;
+            let global_total = self.placements.len() + self.virtual_protos.len();
+            let global_len_after = global_total.saturating_sub(usize::from(evict_own));
+            let virtual_cap_exceeded = for_virtual
+                && self.virtual_protos.len() >= KITTY_VIRTUAL_MAX_ITEMS
+                && own_virtuals == 0;
+            if global_len_after < KITTY_PLACE_MAX_ITEMS && !virtual_cap_exceeded {
+                break;
+            }
+            if virtual_cap_exceeded {
+                if self.virtual_protos.pop_front().is_some() {
+                    evicted = true;
+                    continue;
+                }
+                break;
+            }
+            if let Some(pos) = self.virtual_protos.iter().position(|v| v.origin == origin) {
+                self.virtual_protos.remove(pos);
+                evicted = true;
+            } else if let Some(pos) = self.placements.iter().position(|p| p.origin == origin) {
+                self.placements.remove(pos);
+                self.cascade_relative_orphans();
+                evicted = true;
+            } else if !self.virtual_protos.is_empty() {
+                self.virtual_protos.pop_front();
+                evicted = true;
+            } else if !self.placements.is_empty() {
+                self.placements.pop_front();
+                self.cascade_relative_orphans();
+                evicted = true;
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
     /// Places a stored image at the cursor cell.
     ///
     /// `cols`/`rows` are the explicit `c=`/`r=` spans (0 or absent derives

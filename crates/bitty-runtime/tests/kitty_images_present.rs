@@ -1638,3 +1638,100 @@ fn unicode_virtual_zero_dimension_span_keeps_the_stored_aspect() {
         "the whole fitted image is opaque: {count}"
     );
 }
+
+#[test]
+fn long_running_virtual_and_multi_pane_chafa_never_lock_out_3159() {
+    // Issue #3159:
+    // 1. Repeated `a=T,U=1,i=42` frames (e.g. hermes inline-image or animated
+    //    mascot updates) must replace the prior `(origin, 42)` image and
+    //    prototype in place instead of accumulating 32 prototypes and 64
+    //    stored images.
+    // 2. When an origin holds 32 distinct `U=1` virtual prototypes, a direct
+    //    `chafa -f kitty` (`a=T`) blit placement on that origin must reclaim
+    //    one slot and paint instead of failing with `QuotaExceeded`.
+    // 3. When multiple panes collectively exceed the 64-image global cap
+    //    without any single pane reaching 64 images, `a=q` support probes
+    //    must still reply `OK` and subsequent `chafa -f kitty` transmissions
+    //    must reclaim and display.
+    let mut rt = make_runtime();
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    rt.tick();
+
+    let encoded = base64(&red_2x2());
+    for _ in 0..80 {
+        let seq = format!("\x1b_Ga=T,U=1,f=32,s=2,v=2,i=42,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+        rt.handle_pty_bytes(seq.as_bytes());
+    }
+    assert_eq!(
+        rt.kitty_image_count(),
+        1,
+        "repeated a=T,U=1 with the same wire_image must replace the previous image"
+    );
+    assert_eq!(
+        rt.kitty_virtual_count(),
+        1,
+        "repeated a=T,U=1 with the same wire_image must replace the previous prototype"
+    );
+
+    // Fill all 32 virtual prototype slots on the primary origin with distinct
+    // image ids, then emit a direct `chafa -f kitty` (`a=T`) blit placement.
+    for id in 100..132u32 {
+        let seq = format!("\x1b_Ga=T,U=1,f=32,s=2,v=2,i={id},c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+        rt.handle_pty_bytes(seq.as_bytes());
+    }
+    assert_eq!(rt.kitty_virtual_count(), 32);
+    let chafa_blit = format!("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(chafa_blit.as_bytes());
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "direct chafa -f kitty blit must reclaim one cross-kind slot and display"
+    );
+
+    // Multi-pane global store saturation: split a second pane so neither
+    // origin individually reaches 64 images when the global store hits 64.
+    #[cfg(unix)]
+    {
+        use bitty_runtime::{LayoutNode, SplitAxis, View};
+        let primary = ViewId::new(1);
+        let pane = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(pane, 80, 24)),
+        ));
+        rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 60"], 40, 24)
+            .expect("spawn pane shell");
+        for _ in 0..40 {
+            rt.handle_pane_bytes(pane, chafa_blit.as_bytes());
+        }
+        assert_eq!(
+            rt.kitty_image_count(),
+            bitty_rich::KITTY_PLACE_MAX_IMAGES,
+            "global store stays bounded at 64 images across multiple panes"
+        );
+    }
+
+    // Support probe (`a=q`) followed by `a=T` display on the primary pane must
+    // reply `OK` and render even when the global 64-image store is full across
+    // multiple panes.
+    let _ = rt.take_replies();
+    let probe = format!("\x1b_Gi=31,f=32,s=2,v=2,a=q,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(probe.as_bytes());
+    let replies: Vec<Vec<u8>> = rt.take_replies().into_iter().map(|b| b.to_vec()).collect();
+    assert_eq!(
+        replies,
+        vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()],
+        "support probe must reply OK in an active multi-pane display session"
+    );
+    rt.handle_pty_bytes(chafa_blit.as_bytes());
+    assert!(
+        rt.tick().is_some(),
+        "subsequent chafa -f kitty display must present after multi-pane reclamation"
+    );
+    assert!(
+        rt.kitty_last_frame_images() >= 1,
+        "subsequent chafa -f kitty display must composite into the frame"
+    );
+}

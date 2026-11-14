@@ -134,11 +134,22 @@ jobs:
       # budget and nextest's slow-timeout would kill a legitimate campaign.
       # Each step gets a bound of its own nominal driving time plus a fixed
       # margin, so a wedge ends that step while the job timeout still has room
-      # for the remaining steps.
-      - name: Run presentation and plugin planes
+      # for the remaining steps. The campaign count is ENUMERATED from the test
+      # binary instead of assumed: a new `#[ignore]`d campaign must not silently
+      # exceed the step budget. The assumed-two form failed every nightly from
+      # 2026-11-04 on, when the idle-baseline campaign became the third one and
+      # the step was TERMed mid-campaign (exit 124).
+      - name: Run runtime planes
         run: |
           set -euo pipefail
-          limit=$(( BITTY_SOAK_CAMPAIGN_SECS * 2 + 180 ))
+          campaigns=$(cargo test --locked -p bitty-runtime --test soak_campaign \
+            -- --ignored --list 2>/dev/null | grep -c ': test$' || true)
+          if [ "${campaigns}" -lt 1 ]; then
+            echo "::error::no ignored soak campaigns enumerated for bitty-runtime"
+            exit 1
+          fi
+          limit=$(( BITTY_SOAK_CAMPAIGN_SECS * campaigns + 180 ))
+          echo "bitty-runtime soak campaigns: ${campaigns} (step budget ${limit}s)"
           timeout --signal=TERM "${limit}s" \
             cargo test --locked -p bitty-runtime --test soak_campaign \
               -- --ignored --nocapture --test-threads=1 2>&1 \
@@ -147,7 +158,14 @@ jobs:
       - name: Run daemon event plane
         run: |
           set -euo pipefail
-          limit=$(( BITTY_SOAK_CAMPAIGN_SECS + 180 ))
+          campaigns=$(cargo test --locked -p bitty-daemon --test soak_campaign \
+            -- --ignored --list 2>/dev/null | grep -c ': test$' || true)
+          if [ "${campaigns}" -lt 1 ]; then
+            echo "::error::no ignored soak campaigns enumerated for bitty-daemon"
+            exit 1
+          fi
+          limit=$(( BITTY_SOAK_CAMPAIGN_SECS * campaigns + 180 ))
+          echo "bitty-daemon soak campaigns: ${campaigns} (step budget ${limit}s)"
           timeout --signal=TERM "${limit}s" \
             cargo test --locked -p bitty-daemon --test soak_campaign \
               -- --ignored --nocapture --test-threads=1 2>&1 \

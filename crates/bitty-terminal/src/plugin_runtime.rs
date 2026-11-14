@@ -680,7 +680,8 @@ pub(crate) fn startup_pin_backend(
 /// read from the Core-published `focused_workspace` cell. With no presented
 /// workspace or no focused leaf, the create fails closed with
 /// `E_UI_UNAVAILABLE` before any record is allocated; the plugin cannot supply
-/// or influence the id because `panel.create` carries only a type string.
+/// or influence the id, because the plugin half of `panel.create` carries only
+/// a type string and the origin the runtime attaches is read-only context.
 ///
 /// OQ-084 follow-up `(e)` (bitty#2476): the create also writes the container's
 /// **first** controller binding, from the
@@ -693,7 +694,10 @@ pub(crate) fn startup_pin_backend(
 /// container had no owner anywhere in the tree and the edge could not name it,
 /// so a reload or dispose left it running unbound. A refused bind retires the
 /// record it just allocated and fails the call, so no unowned container
-/// survives a failed create.
+/// survives a failed create. If that retirement itself refuses, the refusal is
+/// reported in the same error rather than discarded: the primary diagnosis is
+/// still the bind, and the disposal note is the evidence that a record may be
+/// left behind.
 pub(crate) fn startup_panel_create_backend(
     panels: Rc<RefCell<PanelRuntime>>,
     focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
@@ -748,13 +752,20 @@ pub(crate) fn startup_panel_create_backend(
         ) {
             // Fail closed: a container with no owner is exactly the state this
             // binding exists to prevent, so the record it was allocated in does
-            // not outlive the refusal.
-            let _ = host.dispose_panel(handle.id, handle.generation);
-            return Err(BridgeError::new(
-                "runtime",
-                E_UI_UNAVAILABLE,
-                format!("panel.create could not record its controller binding: {error}"),
-            ));
+            // not outlive the refusal. A disposal that refuses is reported with
+            // the bind refusal rather than dropped: the bind stays the primary
+            // diagnosis and the disposal note is the only evidence that an
+            // unowned record may still be live.
+            let reason = match host.dispose_panel(handle.id, handle.generation) {
+                Ok(()) => {
+                    format!("panel.create could not record its controller binding: {error}")
+                }
+                Err(dispose_error) => format!(
+                    "panel.create could not record its controller binding: {error}; \
+                     the allocated record also refused disposal: {dispose_error}"
+                ),
+            };
+            return Err(BridgeError::new("runtime", E_UI_UNAVAILABLE, reason));
         }
         Ok((handle.id.0, handle.generation.get()))
     })
@@ -787,7 +798,9 @@ pub(crate) fn startup_panel_create_backend(
 /// displacement) or because its edge already ended it and the record retained
 /// the pair (the reload case, where the release ran first). A container that
 /// never bound a controller is not this port's to move: `bitty.panel.create`
-/// carries no owner (OQ-084 follow-up (e)), so nothing in the tree names one.
+/// writes that first binding itself from the creating generation (OQ-084
+/// follow-up (e)), and a create that cannot is refused and its record retired,
+/// so nothing reaches an edge both unbound and unnamed.
 ///
 /// Nothing here grants authority. The capability set a bind installs is the
 /// successor's own activation resolution intersected with the predecessor's
@@ -3342,6 +3355,51 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             panels.borrow().panel_count(),
             1,
             "rejected types allocate nothing"
+        );
+    }
+
+    #[test]
+    fn startup_panel_create_backend_retires_the_record_when_the_first_bind_is_refused() {
+        // OQ-084 follow-up (e), fail closed: a refused first bind must not
+        // leave an unowned container behind. `terminal.capture` is not a
+        // `panel` family capability, so the bind's own re-validation is the one
+        // fence a freshly allocated `Created` record can reach; the create
+        // answers the typed `E_UI_UNAVAILABLE` and the record it allocated does
+        // not outlive the refusal.
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
+        ));
+        let workspace = WorkspaceId::new(7);
+        let backend =
+            startup_panel_create_backend(Rc::clone(&panels), Rc::new(Cell::new(Some(workspace))));
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.createtest").expect("id");
+        let requested: BTreeSet<String> = ["terminal.capture".to_string()].into_iter().collect();
+        let origin = PanelCreateOrigin {
+            owner: &owner,
+            generation: 4,
+            requested: &requested,
+        };
+        let error = backend("rich", origin).expect_err("a refused first bind fails the create");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert!(
+            error
+                .message
+                .contains("could not record its controller binding"),
+            "the refusal names the bind: {}",
+            error.message
+        );
+        assert_eq!(
+            panels.borrow().panel_count(),
+            0,
+            "the record allocated for the refusal does not outlive it"
+        );
+        assert!(
+            panels
+                .borrow()
+                .registry()
+                .panels_bound_to(&owner, controller_generation(4))
+                .is_empty(),
+            "no binding survives the refused create"
         );
     }
 

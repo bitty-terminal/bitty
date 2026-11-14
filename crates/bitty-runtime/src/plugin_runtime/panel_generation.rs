@@ -188,8 +188,9 @@ impl PanelEdgeReport {
 
     /// Whether the edge found no container to act on. A generation that never
     /// bound a controller leaves the panel host untouched, which is not a
-    /// failure: `bitty.panel.create` containers carry no owner until a bind
-    /// writes one (OQ-084 follow-up (e)).
+    /// failure: a container carries an owner only once a bind writes one, and
+    /// for a `bitty.panel.create` container that bind is the create itself
+    /// (OQ-084 follow-up (e)).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.attempted == 0

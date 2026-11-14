@@ -187,10 +187,10 @@ pub enum PanelError {
     /// the record already binds, both land here. While `PanelRecord::binding`
     /// is `None` the allocation epoch is the accepted key, so every call site on
     /// a panel that never bound a controller is unaffected. The generation edge
-    /// only ever rebinds a container that already carries a binding; nothing
-    /// writes a container's first binding yet (`bitty.panel.create` carries no
-    /// `PluginId` and no generation, OQ-084 follow-up (e)), so tests mint that
-    /// one.
+    /// only ever rebinds a container that already carries a binding, and the
+    /// create verb writes the first one (the creating generation, OQ-084
+    /// follow-up (e)), so a record with no binding is simply one no writer has
+    /// reached yet.
     ControllerConflict {
         panel_id: PanelId,
         /// The generation the record's binding names, or `None` while no
@@ -613,10 +613,10 @@ struct PanelRecord {
     /// half a binding nor an owner and a controller generation that came from
     /// different binds.
     ///
-    /// `None` until a bind writes one. The generation edge rebinds a container
-    /// that already carries a binding; nothing in the tree writes the *first*
-    /// binding of a `bitty.panel.create` container, because the create seam
-    /// carries no owner (OQ-084 follow-up (e)).
+    /// `None` until a bind writes one — which for a `bitty.panel.create`
+    /// container is the create itself, naming the creating generation (OQ-084
+    /// follow-up (e)). The generation edge rebinds a container that already
+    /// carries a binding.
     binding: Option<PanelBinding>,
     /// Most recently ended controller generation, retained across the unbind
     /// edge (OQ-084 D.2 phase 0).
@@ -1691,9 +1691,8 @@ impl PanelRegistry {
     /// and behaves exactly as it did before the fence existed. Both new refusals
     /// become reachable only on a panel that carries a binding: the generation
     /// edge rebinds such a container through the panel-generation port when the
-    /// app installs one, and nothing writes a container's first binding yet
-    /// (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
-    /// follow-up (e)), so tests mint that one.
+    /// app installs one, and `bitty.panel.create` writes the first binding from
+    /// the creating generation (OQ-084 follow-up (e)).
     ///
     /// Applied at the mount surface, which is the one C.5 names; the remaining
     /// panel verbs are wired by residual 2's phase 1/phase 2 work.
@@ -2280,10 +2279,12 @@ impl PanelRegistry {
     /// generation's own content release, which is exactly the edge A.2
     /// describes — and because this method performs the unbind release itself,
     /// the release always completes before the placeholder becomes visible.
-    /// A generation that never bound a container presents nothing, because
-    /// nothing in the tree names its panels (OQ-084 follow-up (e)), and a
-    /// generation whose edge already ran is refused by the controller fence
-    /// rather than released twice.
+    /// A generation that never bound a container presents nothing, because no
+    /// container names it: `bitty.panel.create` binds each container it creates
+    /// to its creating generation (OQ-084 follow-up (e)) and retires the record
+    /// when that bind is refused, so no live container is left ownerless for an
+    /// edge to find. A generation whose edge already ran is refused by the
+    /// controller fence rather than released twice.
     ///
     /// # Errors
     /// `NotFound`, `RegistryDisposed`, `RecoveryReasonRejected`,
@@ -3286,12 +3287,13 @@ impl PanelRegistry {
     /// The controller generation the panel record currently binds (OQ-084 A.3,
     /// D.2 phase 2 step 2), or `None` while no controller is bound.
     ///
-    /// Read-only: it answers `Some` only for a panel whose generation edge (or a
-    /// test) wrote a binding, and `None` for a container that never bound a
-    /// controller — including every `bitty.panel.create` container, whose first
-    /// bind has no writer yet (OQ-084 follow-up (e)). It names the binding in
-    /// force, not the allocation epoch (`generation` on the record, which never
-    /// moves) and not the predecessor ([`Self::last_controller_generation`]).
+    /// Read-only: it answers `Some` only for a panel whose binding a writer
+    /// installed — `bitty.panel.create` for a container's first one (OQ-084
+    /// follow-up (e)), the generation edge for a rebind, a test otherwise — and
+    /// `None` for a container that has not bound a controller yet. It names the
+    /// binding in force, not the allocation epoch (`generation` on the record,
+    /// which never moves) and not the predecessor
+    /// ([`Self::last_controller_generation`]).
     #[must_use]
     pub fn controller_generation(&self, panel_id: PanelId) -> Option<Generation> {
         self.panels
@@ -3772,9 +3774,10 @@ impl PanelRegistry {
     /// enumerates the panels whose record retained the predecessor pair
     /// ([`Self::panels_ended_at`]) or still binds it
     /// ([`Self::panels_bound_to`]). A container that has never bound a
-    /// controller has no owner anywhere in the tree — `bitty.panel.create`
-    /// hands the host a type string and nothing else — so the first bind of
-    /// such a container is not part of this wiring (OQ-084 follow-up (e)).
+    /// controller is not part of this wiring: `bitty.panel.create` binds it to
+    /// its creating generation directly (OQ-084 follow-up (e)) and retires the
+    /// record when that bind is refused, so no unbound container reaches a
+    /// generation edge.
     ///
     /// **Obligations on the wiring that installs this bind.** Steps 3 and 5
     /// are the reason residual 2 leaves work behind, so the activation-time
@@ -4064,9 +4067,10 @@ impl PanelRegistry {
     ///
     /// The phase 2 step 2 writer is `rebind_panel`, which the generation edge
     /// reaches through the panel-generation port for a container that already
-    /// carries a binding. A container's first binding still has no live writer
-    /// (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
-    /// follow-up (e)), so this helper mints one here.
+    /// carries a binding, and which `bitty.panel.create` reaches directly for
+    /// the first one (the creating generation, OQ-084 follow-up (e)). Tests that
+    /// need a binding without going through either writer mint one with this
+    /// helper.
     #[cfg(test)]
     fn bind_controller_generation_for_test(
         &mut self,
@@ -4785,10 +4789,10 @@ mod rebind_panel_tests {
 /// Shape tests for the controller binding (OQ-084 D.2 phase 2, bitty#2476
 /// residual 1).
 ///
-/// The record carries the shape; a container's first binding still has no live
-/// writer (`bitty.panel.create` carries no `PluginId` and no generation, OQ-084
-/// follow-up (e)), so these tests mint the binding directly and prove what the
-/// grant table does once one exists.
+/// The record carries the shape; the create verb writes the first binding in
+/// production (the creating generation, OQ-084 follow-up (e)), and these tests
+/// mint the binding directly and prove what the grant table does once one
+/// exists.
 #[cfg(test)]
 mod controller_binding_shape_tests {
     use super::*;

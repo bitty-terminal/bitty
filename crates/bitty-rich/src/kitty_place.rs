@@ -1287,6 +1287,21 @@ impl KittyImageLayer {
             .count()
     }
 
+    /// Stored image ids of one origin, oldest first (issue #3161).
+    ///
+    /// Used by the runtime to snapshot the images an alternate-screen
+    /// transition detaches: the descriptors move to the stash while the
+    /// bitmaps stay here, so the caller keeps the ids to protect them from
+    /// eviction. Bounded by [`KITTY_PLACE_MAX_IMAGES`].
+    #[must_use]
+    pub fn image_ids_for_origin(&self, origin: Option<u64>) -> Vec<KittyImageId> {
+        self.images
+            .iter()
+            .filter(|img| img.origin == origin)
+            .map(|img| img.id)
+            .collect()
+    }
+
     /// Decoded RGBA bytes held by one origin (S5, #1849).
     ///
     /// Summed with saturating arithmetic over the bounded store, so the
@@ -1567,6 +1582,46 @@ impl KittyImageLayer {
         origin: Option<u64>,
         wire_image: u32,
     ) -> Result<KittyImageId, KittyPlacementError> {
+        self.store_for_origin_with_wire_protected(
+            width,
+            height,
+            rgba,
+            compressed_len,
+            origin,
+            wire_image,
+            &[],
+        )
+    }
+
+    /// [`KittyImageLayer::store_for_origin_with_wire`] with store ids the
+    /// per-origin FIFO must never evict (issue #3161).
+    ///
+    /// While an origin's alternate screen is active, its main-plane images
+    /// stay in this store but their placements and prototypes are detached
+    /// into the runtime's stash, so they retain the oldest position in the
+    /// per-origin FIFO while looking unreferenced here. An alt-screen
+    /// transmit storm on the same origin would therefore drop exactly the
+    /// images the restored main plane still needs. `protected_images` are
+    /// skipped as FIFO victims; when the per-origin quota cannot be met
+    /// without them, the store refuses with
+    /// [`KittyPlacementError::QuotaExceeded`] rather than silently
+    /// exceeding the cap or blanking a stashed image.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`KittyImageLayer::store_for_origin`], plus the protected
+    /// refusal above.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_for_origin_with_wire_protected(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        compressed_len: usize,
+        origin: Option<u64>,
+        wire_image: u32,
+        protected_images: &[KittyImageId],
+    ) -> Result<KittyImageId, KittyPlacementError> {
         checked_bitmap(width, height, rgba.len())?;
         let bytes = rgba.len();
         if bytes > KITTY_PLACE_MAX_BYTES {
@@ -1588,7 +1643,7 @@ impl KittyImageLayer {
             {
                 break;
             }
-            if img.origin == origin {
+            if img.origin == origin && !protected_images.contains(&img.id) {
                 evict.push(img.id);
                 // S1 (#1849): eviction frees the whole animation (root
                 // plus every appended frame), never one frame.
@@ -1596,6 +1651,13 @@ impl KittyImageLayer {
                 kept_count = kept_count.saturating_sub(1);
                 kept_bytes = kept_bytes.saturating_sub(img.stored_bytes());
             }
+        }
+        // Issue #3161: stash-protected images may make the per-origin quota
+        // unreachable. Refuse instead of exceeding the cap or dropping one.
+        if kept_count.saturating_add(1) > KITTY_PER_ORIGIN_MAX_IMAGES
+            || kept_bytes.saturating_add(bytes) > KITTY_PER_ORIGIN_MAX_BYTES
+        {
+            return Err(KittyPlacementError::QuotaExceeded);
         }
         // Global pressure from other origins refuses instead of evicting a
         // victim (no cross-origin eviction).
@@ -2215,6 +2277,14 @@ impl KittyImageLayer {
     /// quotas lock out the pane. Images referenced by `kitty_alt_stash`
     /// (`protected_images`) stay stored so leaving the alternate screen can
     /// restore the main plane intact. Anonymous (`wire_image == 0`) is a no-op.
+    ///
+    /// R3 (bitty#3161): the delete is scoped to the wire image id, so an
+    /// `i=` carrying several `p=` placements loses its siblings too. That is
+    /// intentional — `i=` names the image content, a re-transmit supersedes
+    /// that content for every placement addressing it, and the surviving
+    /// descriptors would otherwise paint a bitmap this store no longer
+    /// holds. Clients with several placements of one image simply re-place
+    /// them after a re-transmit.
     pub fn remove_by_wire_image(
         &mut self,
         origin: Option<u64>,
@@ -2346,15 +2416,25 @@ impl KittyImageLayer {
     /// (issue #3159).
     ///
     /// Long-running multi-pane sessions can collectively reach
-    /// [`KITTY_PLACE_MAX_IMAGES`] (64) or [`KITTY_PLACE_MAX_BYTES`] (320 MiB)
+    /// [`KITTY_PLACE_MAX_IMAGES`] (64) or [`KITTY_PLACE_MAX_BYTES`] (256 MiB)
     /// while no single origin has reached its 64-image per-origin FIFO
     /// threshold. Reclaiming the oldest unreferenced image first, then the
     /// transmitting origin's oldest image, and finally the oldest global
     /// image keeps active panes functional without raising memory bounds.
+    ///
+    /// `protected_images` are never eviction victims (issue #3161): while an
+    /// origin's alternate screen is active its main-plane images have no live
+    /// placement or prototype here (those are detached into the runtime's
+    /// stash), so they would otherwise look unreferenced and be the first
+    /// victims at global saturation. A protected image left without a victim
+    /// ends the scan; the caller's own store admission then fails closed with
+    /// [`KittyPlacementError::QuotaExceeded`] instead of blanking a restored
+    /// plane.
     pub fn reclaim_for_runtime_store(
         &mut self,
         origin: Option<u64>,
         incoming_bytes: usize,
+        protected_images: &[KittyImageId],
     ) -> bool {
         if incoming_bytes > KITTY_PLACE_MAX_BYTES {
             return false;
@@ -2391,11 +2471,20 @@ impl KittyImageLayer {
                 .images
                 .iter()
                 .find(|img| {
-                    !self.placements.iter().any(|p| p.image == img.id)
+                    !protected_images.contains(&img.id)
+                        && !self.placements.iter().any(|p| p.image == img.id)
                         && !self.virtual_protos.iter().any(|v| v.image == Some(img.id))
                 })
-                .or_else(|| self.images.iter().find(|img| img.origin == origin))
-                .or_else(|| self.images.front())
+                .or_else(|| {
+                    self.images
+                        .iter()
+                        .find(|img| img.origin == origin && !protected_images.contains(&img.id))
+                })
+                .or_else(|| {
+                    self.images
+                        .iter()
+                        .find(|img| !protected_images.contains(&img.id))
+                })
                 .map(|img| img.id);
             let Some(id) = candidate else {
                 break;

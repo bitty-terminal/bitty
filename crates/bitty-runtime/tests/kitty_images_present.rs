@@ -1770,3 +1770,202 @@ fn long_running_virtual_and_multi_pane_chafa_never_lock_out_3159() {
         "restored main-screen placement must still resolve its preserved image"
     );
 }
+
+/// Issue #3161 (R1), same-origin shape: an alt-screen transmit storm on the
+/// origin that owns the stash must never drop the dormant main-plane image.
+///
+/// The reviewer's repro on the merged #3160 head: a main-plane `i=5`
+/// placement is stashed by `?1049h`, then 79 alt transmits push the store to
+/// its 64-image ceiling. Because the stashed image holds no live placement
+/// or prototype, both reclamation paths (the per-origin FIFO in
+/// `store_for_origin_with_wire` and the cross-origin scan in
+/// `reclaim_for_runtime_store`) treated it as the oldest dead entry and took
+/// it, so `?1049l` restored a placement whose bitmap was gone
+/// (`last_frame_images == 0`).
+#[test]
+fn alt_screen_stash_survives_same_origin_store_reclamation_3161() {
+    let mut rt = make_runtime();
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    rt.tick();
+    let encoded = base64(&red_2x2());
+
+    let main = format!("\x1b_Ga=T,f=32,s=2,v=2,i=5,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(main.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        1,
+        "the main placement moves into the stash, not out of the plane count"
+    );
+
+    for id in 100..179u32 {
+        let seq = format!("\x1b_Ga=t,f=32,s=2,v=2,i={id},q=2,m=0;{encoded}\x1b\\");
+        rt.handle_pty_bytes(seq.as_bytes());
+    }
+    assert_eq!(
+        rt.kitty_image_count(),
+        bitty_rich::KITTY_PLACE_MAX_IMAGES,
+        "the store stays bounded while the alt plane churns through images"
+    );
+
+    rt.handle_pty_bytes(b"\x1b[?1049l");
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "stashed main-plane image must survive same-origin alt store pressure"
+    );
+}
+
+/// Issue #3161 (R1), cross-origin shape: another pane's transmissions at
+/// global store saturation must not reclaim a stashed main-plane image.
+///
+/// `reclaim_for_runtime_store` evicts globally, so a second pane filling the
+/// 64-image store used to take the focused pane's dormant main-plane bitmap
+/// (it is the first unreferenced entry on the shared store) and the restored
+/// main plane painted nothing.
+#[cfg(unix)]
+#[test]
+fn alt_screen_stash_survives_cross_origin_store_reclamation_3161() {
+    use bitty_runtime::{LayoutNode, SplitAxis, View};
+
+    let mut rt = make_runtime();
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    rt.tick();
+    let encoded = base64(&red_2x2());
+
+    let main = format!("\x1b_Ga=T,f=32,s=2,v=2,i=5,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(main.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+
+    let primary = ViewId::new(1);
+    let pane = ViewId::new(2);
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(primary, 80, 24)),
+        LayoutNode::leaf(View::new(pane, 80, 24)),
+    ));
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 60"], 40, 24)
+        .expect("spawn pane shell");
+    for id in 200..300u32 {
+        let seq = format!("\x1b_Ga=t,f=32,s=2,v=2,i={id},q=2,m=0;{encoded}\x1b\\");
+        rt.handle_pane_bytes(pane, seq.as_bytes());
+    }
+    assert_eq!(
+        rt.kitty_image_count(),
+        bitty_rich::KITTY_PLACE_MAX_IMAGES,
+        "cross-origin reclamation keeps the shared store at its cap"
+    );
+
+    rt.handle_pty_bytes(b"\x1b[?1049l");
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "a sibling pane's store pressure must not reclaim a stashed main image"
+    );
+}
+
+/// Issue #3161 (R5): a main-plane image that was stored but never placed is
+/// still stash-protected across a same-wire-id alt retransmit.
+///
+/// `a=t,i=7` (transmit only) leaves no placement to name the bitmap, so the
+/// stash's descriptor scan alone missed it and an alt-plane `a=t,i=7`
+/// re-transmit dropped it through `remove_by_wire_image`, leaving a later
+/// main-plane `a=p,i=7` to resolve nothing. The stash snapshots the origin's
+/// stored image ids at the transition, so the unplaced bitmap survives.
+#[test]
+fn stored_but_unplaced_main_image_survives_alt_retransmit_3161() {
+    let mut rt = make_runtime();
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    rt.tick();
+    let encoded = base64(&red_2x2());
+    let transmit_only = format!("\x1b_Ga=t,f=32,s=2,v=2,i=7,q=2,m=0;{encoded}\x1b\\");
+
+    rt.handle_pty_bytes(transmit_only.as_bytes());
+    assert_eq!(rt.kitty_image_count(), 1);
+    assert_eq!(rt.kitty_placement_count(), 0);
+
+    rt.handle_pty_bytes(b"\x1b[?1049h");
+    rt.handle_pty_bytes(transmit_only.as_bytes());
+    assert_eq!(
+        rt.kitty_image_count(),
+        2,
+        "the alt re-transmit stores its own bitmap without dropping the stashed one"
+    );
+
+    rt.handle_pty_bytes(b"\x1b[?1049l");
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=7,c=2,r=2,C=1\x1b\\");
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "leaving the alt screen must still resolve a stored-but-unplaced image"
+    );
+}
+
+/// Issue #3161 (R2): an origin with no images of its own gets `OK` for an
+/// `a=q` support probe the store can accommodate by reclaiming another
+/// origin's unreferenced image.
+///
+/// `kitty_probe_admittable` refuses only when no eviction at all is
+/// possible. Its admission predicate is `origin_count <
+/// KITTY_PER_ORIGIN_MAX_IMAGES` (not `origin_count > 0 && ...`): a session
+/// that has transmitted nothing yet is exactly the one that needs the answer,
+/// and the follow-up transmit proves the reply was truthful.
+#[cfg(unix)]
+#[test]
+fn empty_origin_probe_is_admitted_when_the_store_can_reclaim_3161() {
+    use bitty_runtime::{LayoutNode, SplitAxis, View};
+
+    let mut rt = make_runtime();
+    rt.set_min_present_interval(std::time::Duration::ZERO);
+    rt.tick();
+    let encoded = base64(&red_2x2());
+
+    let primary = ViewId::new(1);
+    let pane = ViewId::new(2);
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(primary, 80, 24)),
+        LayoutNode::leaf(View::new(pane, 80, 24)),
+    ));
+    rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 60"], 40, 24)
+        .expect("spawn pane shell");
+    // The pane alone holds every store slot, all of them unplaced and
+    // therefore reclaimable. The primary origin has no images of its own.
+    for id in 200..264u32 {
+        let seq = format!("\x1b_Ga=t,f=32,s=2,v=2,i={id},q=2,m=0;{encoded}\x1b\\");
+        rt.handle_pane_bytes(pane, seq.as_bytes());
+    }
+    assert_eq!(rt.kitty_image_count(), bitty_rich::KITTY_PLACE_MAX_IMAGES);
+    assert_eq!(rt.kitty_placement_count(), 0);
+
+    let _ = rt.take_replies();
+    let probe = format!("\x1b_Gi=31,f=32,s=2,v=2,a=q,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(probe.as_bytes());
+    let replies: Vec<Vec<u8>> = rt.take_replies().into_iter().map(|b| b.to_vec()).collect();
+    assert_eq!(
+        replies,
+        vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()],
+        "an origin with no images of its own must still be admitted when a victim exists"
+    );
+
+    let display = format!("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    rt.handle_pty_bytes(display.as_bytes());
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_image_count(),
+        bitty_rich::KITTY_PLACE_MAX_IMAGES,
+        "the admitted transmit reclaims one slot instead of overflowing the cap"
+    );
+    assert!(
+        rt.kitty_last_frame_images() >= 1,
+        "the admitted transmit must composite into the frame"
+    );
+}

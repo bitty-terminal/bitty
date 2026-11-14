@@ -15,6 +15,7 @@
 //! environment (or `$HOME`), never literals.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -679,12 +680,29 @@ pub(crate) fn startup_pin_backend(
 /// read from the Core-published `focused_workspace` cell. With no presented
 /// workspace or no focused leaf, the create fails closed with
 /// `E_UI_UNAVAILABLE` before any record is allocated; the plugin cannot supply
-/// or influence the id because `panel.create` carries only a type string.
+/// or influence the id, because the plugin half of `panel.create` carries only
+/// a type string and the origin the runtime attaches is read-only context.
+///
+/// OQ-084 follow-up `(e)` (bitty#2476): the create also writes the container's
+/// **first** controller binding, from the
+/// [`PanelCreateOrigin`](bitty_runtime::plugin_runtime::PanelCreateOrigin) the
+/// runtime hands over — the executing `(PluginId, generation)` pair plus that
+/// generation's own `panel` resolution. This is the same bind the generation
+/// edge uses (`PanelRuntime::rebind_panel`, D.2), reached here in D.1's
+/// absent-`P` case: the panel has no predecessor, the consent set is empty, so
+/// the bind commits exactly `R` and widens nothing (`PGO-17`). Without it the
+/// container had no owner anywhere in the tree and the edge could not name it,
+/// so a reload or dispose left it running unbound. A refused bind retires the
+/// record it just allocated and fails the call, so no unowned container
+/// survives a failed create. If that retirement itself refuses, the refusal is
+/// reported in the same error rather than discarded: the primary diagnosis is
+/// still the bind, and the disposal note is the evidence that a record may be
+/// left behind.
 pub(crate) fn startup_panel_create_backend(
     panels: Rc<RefCell<PanelRuntime>>,
     focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
 ) -> PanelCreateHandler {
-    Rc::new(move |panel_type| {
+    Rc::new(move |panel_type, origin| {
         let parsed = PanelType::parse(panel_type).ok_or_else(|| {
             BridgeError::new(
                 "validation",
@@ -706,10 +724,9 @@ pub(crate) fn startup_panel_create_backend(
                 "panel.create has no presented workspace with a focused view",
             )
         })?;
-        panels
-            .borrow_mut()
+        let mut host = panels.borrow_mut();
+        let handle = host
             .create_panel(parsed, Some(workspace))
-            .map(|handle| (handle.id.0, handle.generation.get()))
             .map_err(|error| match error {
                 PanelError::TooManyPanels { max, .. } => BridgeError::new(
                     "budget",
@@ -722,7 +739,35 @@ pub(crate) fn startup_panel_create_backend(
                     format!("unknown panel type '{value}'"),
                 ),
                 _ => BridgeError::not_implemented("bitty.panel.create"),
-            })
+            })?;
+        // The first binding. No permission-diff consent answers on this path, so
+        // the empty set denies every widening rather than granting it (D.1).
+        let consented = BTreeSet::new();
+        if let Err(error) = host.rebind_panel(
+            handle.id,
+            controller_generation(origin.generation),
+            origin.owner,
+            origin.requested,
+            &consented,
+        ) {
+            // Fail closed: a container with no owner is exactly the state this
+            // binding exists to prevent, so the record it was allocated in does
+            // not outlive the refusal. A disposal that refuses is reported with
+            // the bind refusal rather than dropped: the bind stays the primary
+            // diagnosis and the disposal note is the only evidence that an
+            // unowned record may still be live.
+            let reason = match host.dispose_panel(handle.id, handle.generation) {
+                Ok(()) => {
+                    format!("panel.create could not record its controller binding: {error}")
+                }
+                Err(dispose_error) => format!(
+                    "panel.create could not record its controller binding: {error}; \
+                     the allocated record also refused disposal: {dispose_error}"
+                ),
+            };
+            return Err(BridgeError::new("runtime", E_UI_UNAVAILABLE, reason));
+        }
+        Ok((handle.id.0, handle.generation.get()))
     })
 }
 
@@ -753,7 +798,9 @@ pub(crate) fn startup_panel_create_backend(
 /// displacement) or because its edge already ended it and the record retained
 /// the pair (the reload case, where the release ran first). A container that
 /// never bound a controller is not this port's to move: `bitty.panel.create`
-/// carries no owner (OQ-084 follow-up (e)), so nothing in the tree names one.
+/// writes that first binding itself from the creating generation (OQ-084
+/// follow-up (e)), and a create that cannot is refused and its record retired,
+/// so nothing reaches an edge both unbound and unnamed.
 ///
 /// Nothing here grants authority. The capability set a bind installs is the
 /// successor's own activation resolution intersected with the predecessor's
@@ -1339,6 +1386,7 @@ mod tests {
     use super::*;
     use crate::test_support::{PARK_RESUME_TICKS, settle_dispatch};
     use bitty_runtime::Runtime;
+    use bitty_runtime::plugin_runtime::PanelCreateOrigin;
     use bitty_runtime::registry::{Generation, PanelId, PanelState};
     use bitty_runtime::{LayoutNode, SplitAxis, UiRect, View};
 
@@ -3250,33 +3298,108 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
 
     #[test]
     fn startup_panel_create_backend_allocates_registry_records() {
-        // Handler contract: allocate a `Created` record of the parsed type
-        // and return its raw `(id, generation)`; unsupported types allocate
-        // nothing.
+        // Handler contract: allocate a `Created` record of the parsed type,
+        // name the creating generation as its first controller binding
+        // (bitty#2476 follow-up (e)), and return its raw `(id, generation)`;
+        // unsupported types allocate nothing.
         let panels = Rc::new(RefCell::new(
             PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
         ));
         let workspace = WorkspaceId::new(7);
         let backend =
             startup_panel_create_backend(Rc::clone(&panels), Rc::new(Cell::new(Some(workspace))));
-        let (id, generation) = backend("rich").expect("rich allocates");
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.createtest").expect("id");
+        let requested: BTreeSet<String> = ["panel.create".to_string()].into_iter().collect();
+        let origin = PanelCreateOrigin {
+            owner: &owner,
+            generation: 4,
+            requested: &requested,
+        };
+        let (id, generation) = backend("rich", origin).expect("rich allocates");
+        let panel = PanelId(id);
         assert_eq!(panels.borrow().panel_count(), 1);
+        assert_eq!(
+            panels.borrow().registry().controller_generation(panel),
+            Some(controller_generation(4)),
+            "the creating generation is the container's first controller binding"
+        );
         assert_eq!(
             panels
                 .borrow()
-                .panel_state(PanelId(id), Generation(generation))
-                .expect("live handle"),
+                .panel_state(panel, Generation(generation))
+                .expect("the handle read is keyed by the allocation epoch"),
             PanelState::Created,
             "creation allocates only; the host mounts"
         );
+        assert_eq!(
+            panels.borrow().panel_state(panel, controller_generation(4)),
+            Err(PanelError::StaleHandle {
+                id_raw: id,
+                expected_generation: Generation(generation),
+                found_generation: controller_generation(4),
+            }),
+            "a controller generation is not a panel handle: the two counters never substitute"
+        );
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.createtest").expect("id");
+        let requested: BTreeSet<String> = ["panel.create".to_string()].into_iter().collect();
         for unsupported in ["terminal", "bogus"] {
-            let error = backend(unsupported).expect_err("unsupported type must fail");
+            let origin = PanelCreateOrigin {
+                owner: &owner,
+                generation: 4,
+                requested: &requested,
+            };
+            let error = backend(unsupported, origin).expect_err("unsupported type must fail");
             assert_eq!(error.code, "E_DEF_INVALID", "{unsupported}");
         }
         assert_eq!(
             panels.borrow().panel_count(),
             1,
             "rejected types allocate nothing"
+        );
+    }
+
+    #[test]
+    fn startup_panel_create_backend_retires_the_record_when_the_first_bind_is_refused() {
+        // OQ-084 follow-up (e), fail closed: a refused first bind must not
+        // leave an unowned container behind. `terminal.capture` is not a
+        // `panel` family capability, so the bind's own re-validation is the one
+        // fence a freshly allocated `Created` record can reach; the create
+        // answers the typed `E_UI_UNAVAILABLE` and the record it allocated does
+        // not outlive the refusal.
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
+        ));
+        let workspace = WorkspaceId::new(7);
+        let backend =
+            startup_panel_create_backend(Rc::clone(&panels), Rc::new(Cell::new(Some(workspace))));
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.createtest").expect("id");
+        let requested: BTreeSet<String> = ["terminal.capture".to_string()].into_iter().collect();
+        let origin = PanelCreateOrigin {
+            owner: &owner,
+            generation: 4,
+            requested: &requested,
+        };
+        let error = backend("rich", origin).expect_err("a refused first bind fails the create");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert!(
+            error
+                .message
+                .contains("could not record its controller binding"),
+            "the refusal names the bind: {}",
+            error.message
+        );
+        assert_eq!(
+            panels.borrow().panel_count(),
+            0,
+            "the record allocated for the refusal does not outlive it"
+        );
+        assert!(
+            panels
+                .borrow()
+                .registry()
+                .panels_bound_to(&owner, controller_generation(4))
+                .is_empty(),
+            "no binding survives the refused create"
         );
     }
 
@@ -3290,7 +3413,14 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         ));
         let presented = Rc::new(Cell::new(None));
         let backend = startup_panel_create_backend(Rc::clone(&panels), Rc::clone(&presented));
-        let error = backend("rich").expect_err("no workspace must fail closed");
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.createtest").expect("id");
+        let requested: BTreeSet<String> = ["panel.create".to_string()].into_iter().collect();
+        let origin = PanelCreateOrigin {
+            owner: &owner,
+            generation: 2,
+            requested: &requested,
+        };
+        let error = backend("rich", origin).expect_err("no workspace must fail closed");
         assert_eq!(error.class, "runtime");
         assert_eq!(error.code, E_UI_UNAVAILABLE);
         assert_eq!(
@@ -3300,8 +3430,16 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         );
 
         presented.set(Some(WorkspaceId::new(3)));
-        backend("rich").expect("a published workspace resolves");
+        let (id, _generation) = backend("rich", origin).expect("a published workspace resolves");
         assert_eq!(panels.borrow().panel_count(), 1);
+        assert_eq!(
+            panels
+                .borrow()
+                .registry()
+                .controller_generation(PanelId(id)),
+            Some(controller_generation(2)),
+            "the create that succeeds writes its first binding too"
+        );
     }
 
     /// The activation generation the runtime publishes for `id`.
@@ -3415,6 +3553,146 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             runtime.last_panel_edge().map(|report| report.attempted),
             Some(1),
             "the reload issued exactly one bind through the app-installed port"
+        );
+    }
+
+    #[test]
+    fn a_container_created_through_the_verb_is_named_at_the_generation_edge() {
+        // bitty#2476 follow-up (e): `bitty.panel.create` threads the creating
+        // plugin's identity and controller generation, so the container it
+        // allocates carries a first binding and the generation edge can name
+        // it. This drives the real composition root end to end: the verb goes
+        // through the Lua bridge and the production create backend, the
+        // container is created by the plugin's own generation, and both edges
+        // are answered by the installed `AppPanelGenerationPort`.
+        //
+        // It would fail if the create seam dropped the owner or the generation
+        // (no binding is written), if the backend mapped the allocation epoch
+        // instead of the controller generation, or if the port enumerated
+        // nothing — the state follow-up (e) recorded.
+        let root = pin_test_dir("edge-create");
+        write_panel_probe(&root, "xuepoo.edgecreate", &["panel.create", "panel.focus"]);
+        let live = Runtime::with_defaults().expect("defaults must build");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: None,
+            focused_workspace: live.focused_workspace_id(),
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let panels = session
+            .panels
+            .clone()
+            .expect("the composition root installs the panel host");
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgecreate").expect("id");
+        let mut runtime = session.runtime;
+
+        let first = installed_generation(&runtime, id.as_str());
+        let created = dispatch_panel(&mut runtime, id.as_str(), "create_rich");
+        let (raw_id, allocation_epoch) = parse_panel_handle(&created, "created container");
+        let panel = PanelId(raw_id);
+
+        // The first binding names the creating generation, and the container is
+        // findable by that pair — the enumeration the edge uses.
+        assert_eq!(
+            panels.borrow().registry().controller_generation(panel),
+            Some(controller_generation(first)),
+            "the create wrote the creating generation as the first binding"
+        );
+        assert_eq!(
+            panels
+                .borrow()
+                .registry()
+                .panels_bound_to(&id, controller_generation(first)),
+            vec![panel],
+            "the container is enumerated under its creating owner and generation"
+        );
+        assert!(
+            allocation_epoch != controller_generation(first).get(),
+            "the binding never reuses the allocation epoch ({allocation_epoch})"
+        );
+
+        // The host mounts through the binding the create wrote, which is the
+        // accepted key while a controller is bound.
+        panels
+            .borrow_mut()
+            .mount_panel(panel, controller_generation(first), ViewId::new(51))
+            .expect("mount through the binding");
+
+        runtime.reload(&id).expect("reload");
+
+        let successor = installed_generation(&runtime, id.as_str());
+        assert_eq!(
+            successor,
+            first + 1,
+            "one reload activates the plugin exactly once: {first} -> {successor}"
+        );
+        // The successor bind is the most recent edge: it reached the port with
+        // exactly this container and moved the binding without disposing it.
+        let bound = runtime
+            .last_panel_edge()
+            .cloned()
+            .expect("the reload ran the bind edge through the installed port");
+        assert_eq!(
+            bound.attempted, 1,
+            "the port enumerated the created container"
+        );
+        assert_eq!(bound.committed, vec![panel], "the bind committed it");
+        assert_eq!(bound.refused_count(), 0, "nothing was refused");
+        assert_eq!(
+            panels.borrow().registry().controller_generation(panel),
+            Some(controller_generation(successor)),
+            "the container is now driven by the successor generation"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(panel),
+            Some(ViewId::new(51)),
+            "a rebind keeps the container's attachment (D.3)"
+        );
+
+        // The terminal edge: disposing the creating generation must release the
+        // container it created, leaving it unbound with the placeholder rather
+        // than a silent orphan.
+        runtime.dispose(&id).expect("dispose");
+        let released = runtime
+            .last_panel_edge()
+            .cloned()
+            .expect("the dispose ran the release edge through the installed port");
+        assert_eq!(
+            released.attempted, 1,
+            "the release edge reached the created container"
+        );
+        assert_eq!(released.committed, vec![panel], "the release committed it");
+        assert_eq!(
+            panels.borrow().registry().controller_generation(panel),
+            None,
+            "the container is unbound after its controller ended"
+        );
+        assert_eq!(
+            panels
+                .borrow()
+                .registry()
+                .placeholder_reason(panel)
+                .map(|reason| reason.as_str().to_string()),
+            Some("unloaded".to_string()),
+            "the container presents the Decision E placeholder naming the end"
+        );
+        assert_eq!(
+            panels.borrow().panel_count(),
+            1,
+            "the container survives its creating generation"
         );
     }
 

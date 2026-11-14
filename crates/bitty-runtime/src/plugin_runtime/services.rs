@@ -83,6 +83,7 @@ use super::fs_list::{FsListBackend, FsListEntry};
 use super::overlay::{
     DEFAULT_RELEASE_REASON, OVERLAY_CAPTURE_TIMEOUT_MS, OverlayCapture, is_owner_release_reason,
 };
+use super::panel_generation::PluginGeneration;
 use super::presentation_overlay::PresentationOverlay;
 use super::store::{self, PluginStore};
 
@@ -822,21 +823,58 @@ fn background_format_name(format: BackgroundFormat) -> &'static str {
 /// closed with `E_NOT_IMPLEMENTED`.
 pub type PanelPinHandler = Rc<dyn Fn(u64, bool) -> Result<bool, BridgeError>>;
 
+/// The plugin generation a `bitty.panel.create` call executes for (bitty#2476
+/// follow-up `(e)`).
+///
+/// OQ-084 splits a panel's life in two: the container is workspace-owned and
+/// persistent, while the controller binding is generation-owned. Until this
+/// value existed the create seam handed the host a type string and nothing
+/// else, so a container allocated through the verb carried no owner: the
+/// generation edge could not name it, and a reload or dispose left it running
+/// with nothing bounding it.
+///
+/// Everything here is decided by the runtime, never by the plugin: the owner
+/// and the generation are the executing `(PluginId, generation)` pair, and
+/// `requested` is the same closed `panel`-family resolution this generation
+/// resolved at activation ([`PluginServices::panel_family_resolution`]). A
+/// backend writes the container's **first** binding from this pair through the
+/// panel host's own bind (OQ-084 D.1: a panel with no predecessor grants `R`
+/// whole because `panel.create` is the authorization), so every later edge
+/// enumerates the container instead of guessing. Nothing here widens a grant:
+/// the permission-diff consent set stays empty on this path, so every
+/// widening stays denied (`PGO-17`).
+#[derive(Clone, Copy, Debug)]
+pub struct PanelCreateOrigin<'a> {
+    /// The plugin whose generation is executing the verb.
+    pub owner: &'a PluginId,
+    /// The activation generation executing the verb — OQ-084's *controller*
+    /// generation, the same counter the generation edge names. It is **not**
+    /// the panel allocation epoch the verb returns to Lua.
+    pub generation: PluginGeneration,
+    /// The generation's own panel-scoped resolution (D.1's `R`), captured at
+    /// activation and never widened afterwards. Empty for a generation that
+    /// resolved no `panel` family.
+    pub requested: &'a BTreeSet<String>,
+}
+
 /// Synchronous panel-creation backend for one plugin generation (CTX-1214,
 /// Issue #2085).
 ///
 /// Receives the Lua-validated panel type name (`rich`, `browser`, `helper`,
 /// or `canvas` — never `terminal`; the [`PluginServices::panel_create`]
 /// gate rejects PTY-backed types before the backend runs, so a backend
-/// never mints process-spawn authority) and returns the raw `(panel_id,
-/// generation)` pair for the freshly allocated registry record. The record
-/// starts in `Created` state: mounting and focusing stay host-driven
-/// (layout authority never crosses into the plugin), so the backend
-/// allocates only. Registry exhaustion maps to `E_DEF_LIMIT`; a disposed
-/// or otherwise unservable host maps to `E_NOT_IMPLEMENTED`. Tests inject
-/// canned closures over a real `PanelRegistry`; `None` (no backend) fails
-/// closed with `E_NOT_IMPLEMENTED`.
-pub type PanelCreateHandler = Rc<dyn Fn(&str) -> Result<(u64, u64), BridgeError>>;
+/// never mints process-spawn authority) plus the executing generation's
+/// [`PanelCreateOrigin`], and returns the raw `(panel_id, generation)` pair
+/// for the freshly allocated registry record. The record starts in `Created`
+/// state: mounting and focusing stay host-driven (layout authority never
+/// crosses into the plugin), so the backend allocates only — and, when it owns
+/// a panel host that can record a controller, names the creating generation as
+/// the container's first binding. Registry exhaustion maps to `E_DEF_LIMIT`; a
+/// disposed or otherwise unservable host maps to `E_NOT_IMPLEMENTED`. Tests
+/// inject canned closures over a real `PanelRegistry`; `None` (no backend)
+/// fails closed with `E_NOT_IMPLEMENTED`.
+pub type PanelCreateHandler =
+    Rc<dyn Fn(&str, PanelCreateOrigin<'_>) -> Result<(u64, u64), BridgeError>>;
 
 /// Settings source that has no settings.
 #[derive(Debug, Default)]
@@ -7761,7 +7799,23 @@ impl HostServices for PluginServices {
                 ));
             }
         }
-        backend(panel_type)
+        // bitty#2476 follow-up (e): the seam used to hand the host a type
+        // string and nothing else, so a container created through this verb
+        // carried no owner and the generation edge could not name it. The
+        // origin is the executing `(PluginId, generation)` pair plus this
+        // generation's own closed `panel` resolution — the same `R` the edge's
+        // successor bind presents — and it carries no consent set, so the first
+        // bind can install only what this generation was granted at activation
+        // (OQ-084 D.1, `PGO-17`).
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        let requested = self.panel_family_resolution();
+        let origin = PanelCreateOrigin {
+            owner: &owner,
+            generation: self.ui_epoch.get(),
+            requested: &requested,
+        };
+        backend(panel_type, origin)
     }
 
     fn panel_close(&self, panel_id: u64) -> Result<bool, BridgeError> {
@@ -8238,10 +8292,12 @@ mod tests {
         granted.set_panel_access(true, false);
         let seen = Rc::new(RefCell::new(Vec::new()));
         let tapped = seen.clone();
-        granted.set_panel_create_backend(Some(Rc::new(move |panel_type: &str| {
-            tapped.borrow_mut().push(panel_type.to_string());
-            Ok((7, 3))
-        })));
+        granted.set_panel_create_backend(Some(Rc::new(
+            move |panel_type: &str, _origin: PanelCreateOrigin<'_>| {
+                tapped.borrow_mut().push(panel_type.to_string());
+                Ok((7, 3))
+            },
+        )));
         assert_eq!(granted.panel_create("rich").expect("rich creates"), (7, 3));
         assert_eq!(
             granted.panel_create("helper").expect("helper creates"),
@@ -8259,6 +8315,54 @@ mod tests {
     }
 
     #[test]
+    fn panel_create_hands_the_backend_the_executing_generation() {
+        // bitty#2476 follow-up (e): the seam carries the creating plugin's
+        // identity and controller generation, not only a type string. Without
+        // the pair the host cannot write the container's first binding, so the
+        // generation edge can never name it. The resolution handed over is this
+        // generation's own closed `panel` set — never the predecessor's and
+        // never a union — and there is no consent channel on this path, so a
+        // first bind can install only what activation granted.
+        let granted = services();
+        granted.set_panel_access(true, false);
+        granted.set_ui_epoch(9);
+        granted.set_panel_family_resolution(
+            ["panel.create", "panel.focus"]
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        );
+        let captured = Rc::new(RefCell::new(None));
+        let sink = captured.clone();
+        granted.set_panel_create_backend(Some(Rc::new(
+            move |_panel_type: &str, origin: PanelCreateOrigin<'_>| {
+                *sink.borrow_mut() = Some((
+                    origin.owner.as_str().to_string(),
+                    origin.generation,
+                    origin.requested.clone(),
+                ));
+                Ok((4, 2))
+            },
+        )));
+        granted.panel_create("rich").expect("rich creates");
+        let (owner, generation, requested) =
+            captured.borrow().clone().expect("the backend ran once");
+        assert_eq!(owner, "xuepoo.test", "the executing plugin names the owner");
+        assert_eq!(
+            generation, 9,
+            "the activation generation is the controller generation, not the allocation epoch"
+        );
+        assert_eq!(
+            requested,
+            ["panel.create", "panel.focus"]
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect::<BTreeSet<String>>(),
+            "the first bind's R is this generation's own resolution"
+        );
+    }
+
+    #[test]
     fn panel_create_denies_before_backend_without_grant() {
         // Grant gate first: even with a backend installed, an ungranted
         // generation fails closed with `E_CAPABILITY_DENIED` and the backend
@@ -8266,10 +8370,12 @@ mod tests {
         let denied = services();
         let called = Rc::new(RefCell::new(false));
         let flag = called.clone();
-        denied.set_panel_create_backend(Some(Rc::new(move |_: &str| {
-            *flag.borrow_mut() = true;
-            Ok((1, 1))
-        })));
+        denied.set_panel_create_backend(Some(Rc::new(
+            move |_: &str, _origin: PanelCreateOrigin<'_>| {
+                *flag.borrow_mut() = true;
+                Ok((1, 1))
+            },
+        )));
         let error = denied.panel_create("rich").expect_err("denied");
         assert_eq!(error.code, "E_CAPABILITY_DENIED");
         assert_eq!(error.message, "capability 'panel.create' is not granted");

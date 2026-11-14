@@ -2691,16 +2691,15 @@ impl Runtime {
             // let its old deadline win over the reveal's next-frame queue;
             // hidden ticks also must not re-arm it.
             self.suspend_surface_retry();
-            // bitty#2989: a hide that retained work is unambiguous - the
-            // reveal frame re-presents it and re-arms the bound after that
-            // commit. A hide that retained *nothing* is not: the 300 ms
-            // starvation probe infers occlusion from an unanswered redraw,
-            // which is the same evidence a dropped frame leaves behind, and
-            // nothing would ever repaint a falsely-occluded surface. Keep the
-            // bound armed so it can disambiguate at its deadline.
-            if retained {
-                self.clear_present_confirmation();
-            }
+            // bitty#2989 / bitty#3155: keep `present_confirm_at` armed across a
+            // hide transition whether or not terminal output was retained since
+            // the last commit. When the 300 ms redraw-starvation probe infers
+            // synthetic occlusion during an active TUI burst (`retained == true`),
+            // `win.request_redraw()` alone cannot unstick a Wayland surface
+            // whose `FrameCallbackState::Requested` is waiting on a commit; the
+            // confirmation bound's single speculative reopen submits one real
+            // frame commit at `PRESENT_CONFIRM_BOUND` (and closes the gate back
+            // if the compositor still does not confirm it, per bitty#3116).
             // Retain the cancelled presentation as damage, exactly as before,
             // and arm the bounded self-heal only when something real was
             // retained (bitty#2830 hypothesis 2). A clean hide arms nothing.
@@ -14466,6 +14465,43 @@ mod async_present_tests {
         let repair =
             tick_until_committed(&mut runtime, TEST_WAIT).expect("the corrective frame commits");
         assert!(repair.frame > first.frame, "a new frame reached the worker");
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn a_hide_with_retained_damage_keeps_present_confirm_deadline_3155() {
+        let _guard = unconfirmed_guard();
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"first");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+
+        // Fresh PTY output arrives during the starvation window before the
+        // 300ms false-occlusion probe fires, so `retained` is true at hide time.
+        runtime.handle_pty_bytes(b"second");
+        let occluded_at = deadline
+            .checked_sub(PRESENT_CONFIRM_BOUND)
+            .and_then(|start| start.checked_add(std::time::Duration::from_millis(300)))
+            .expect("the occlusion edge lands inside the bound");
+        runtime.set_surface_visibility_at(occluded_at, false);
+        assert!(
+            !runtime.is_surface_visible(),
+            "the synthetic edge closed the gate"
+        );
+        assert_eq!(
+            runtime.present_confirm_deadline(),
+            Some(deadline),
+            "a hide with retained damage must still preserve present_confirm_at so the 750ms speculative reopen can unstick a stranded Wayland frame callback"
+        );
         assert!(runtime.shutdown());
     }
 

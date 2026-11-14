@@ -256,6 +256,12 @@ impl WindowState {
             FrameCallbackState::None => {
                 self.frame_callback_state = FrameCallbackState::Requested;
                 surface.frame(&self.queue_handle, surface.clone());
+                // Flush the `wl_surface.frame` request to the Wayland socket
+                // before returning from `pre_present_notify()` so an off-thread
+                // Vulkan presenter calling `vkQueuePresentKHR` (`wl_surface.commit`)
+                // cannot commit the surface before the frame callback request
+                // reaches the compositor (bitty#3155).
+                let _ = self.connection.flush();
             },
             FrameCallbackState::Received | FrameCallbackState::Requested => (),
         }

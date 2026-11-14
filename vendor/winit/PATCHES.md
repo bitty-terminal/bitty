@@ -39,10 +39,13 @@ from the digest pinned below. See [Integrity](#integrity).
 | Patch 3         | `patches/0003-wayland-dispatch-pending-on-shared-display.diff`                        |
 | Patch 3 SHA-256 | `82a294870c8a44f47005284f4edba41cf3d902a5b9a2559895fec6ef0bd6b237`                    |
 | Patch 3 origin  | local fix for Wayland ANR and suspended-workspace frame callback handling (#3096, #3116) |
+| Patch 4         | `patches/0004-wayland-flush-frame-callback-before-present.diff`                       |
+| Patch 4 SHA-256 | `f7d05a910f566c9569a8f0a731948558f4704fbc5896bca7a5006616ffdcd6f5`                    |
+| Patch 4 origin  | local fix to flush `wl_surface.frame` before off-thread `vkQueuePresentKHR` commit (#3155) |
 | Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`             |
 | Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                 |
 | Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                    |
-| Tree digest     | `7304ebac85a1c90e7bae4bb647eb98610fc3d48ab6165aad67ba45cbae97d3b9`                    |
+| Tree digest     | `621d115a3e0d761832465cd1b38fcd787ce232c772c61684ccdd9aafc333118a`                    |
 
 The PR base equals the released `0.30.13` commit, which is why the patch applies
 to the crates.io source without offsets. Only the five files below differ from

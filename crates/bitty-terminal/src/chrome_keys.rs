@@ -1444,6 +1444,34 @@ impl TerminalApp {
                     self.runtime.leaf_count()
                 );
             }
+            A::MoveSplit(dir) => {
+                self.restore_zoom();
+                let focus = split_dir_to_focus(dir);
+                if self.runtime.move_focused_panel(focus) {
+                    eprintln!(
+                        "bitty: keymap move_split:{} -> focused={:?} leafs={}",
+                        dir.canonical(),
+                        self.runtime.focused_view(),
+                        self.runtime.leaf_count()
+                    );
+                } else {
+                    eprintln!(
+                        "warning: keymap move_split:{} found no target in direction — ignoring",
+                        dir.canonical()
+                    );
+                }
+            }
+            A::ToggleSplit => {
+                self.restore_zoom();
+                if let Some(axis) = self.runtime.toggle_focused_split_axis() {
+                    eprintln!(
+                        "bitty: keymap toggle_split -> axis={axis:?} focused={:?}",
+                        self.runtime.focused_view()
+                    );
+                } else {
+                    eprintln!("warning: keymap toggle_split has no enclosing split — ignoring");
+                }
+            }
             A::FocusNext => {
                 self.restore_zoom();
                 let next = self.runtime.move_focus(FocusDirection::Next);
@@ -9153,7 +9181,7 @@ claims = []
             &root,
             SUGGESTION_OWNER,
             &[SUGGESTION_COMMAND],
-            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[("ctrl+alt+y", SUGGESTION_QUALIFIED)],
             &[SUGGESTION_COMMAND],
         );
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
@@ -9161,7 +9189,7 @@ claims = []
             .expect("defaults");
         let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
-            key: KeyName::Char('k'),
+            key: KeyName::Char('y'),
             ctrl: true,
             alt: true,
             shift: false,
@@ -9181,7 +9209,7 @@ claims = []
         // invocations are deferred to the cold phase (CTX-1324), so the
         // dispatch lands on the next cold pump.
         let _ = app.intercept_chrome_key(&modifier_event(true, true, false, false));
-        assert!(app.intercept_chrome_key(&char_press("k", "k", false)));
+        assert!(app.intercept_chrome_key(&char_press("y", "y", false)));
         assert_eq!(app.pump_cold_commands(), 1, "one deferred command ran");
         assert_eq!(
             app.runtime.notification_banner().as_deref(),
@@ -9204,13 +9232,13 @@ claims = []
             &root,
             SUGGESTION_OWNER,
             &[SUGGESTION_COMMAND],
-            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[("ctrl+alt+y", SUGGESTION_QUALIFIED)],
             &[SUGGESTION_COMMAND],
         );
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let effective = bitty_config::EffectiveConfig {
             keymaps: vec![KeymapEntry {
-                chord: "ctrl+alt+k".into(),
+                chord: "ctrl+alt+y".into(),
                 action: "toggle_zoom".into(),
                 context: "global".into(),
             }],
@@ -9219,7 +9247,7 @@ claims = []
         let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
         let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
-            key: KeyName::Char('k'),
+            key: KeyName::Char('y'),
             ctrl: true,
             alt: true,
             shift: false,
@@ -9370,9 +9398,9 @@ claims = []
             SUGGESTION_OWNER,
             &[SUGGESTION_COMMAND],
             &[
-                ("ctrl+alt+k", SUGGESTION_QUALIFIED),
-                ("ctrl+alt+j", SUGGESTION_COMMAND),
-                ("ctrl+alt+l", "bitty-featured.other:toggle-help"),
+                ("ctrl+alt+y", SUGGESTION_QUALIFIED),
+                ("ctrl+alt+u", SUGGESTION_COMMAND),
+                ("ctrl+alt+i", "bitty-featured.other:toggle-help"),
                 ("ctrl+alt+m", "bitty-featured.help-fixture:missing"),
             ],
             &[SUGGESTION_COMMAND],
@@ -9389,14 +9417,14 @@ claims = []
             super_held: false,
         };
         assert_eq!(
-            app.match_plugin_binding(key('k')),
+            app.match_plugin_binding(key('y')),
             Some(ChromeAction::InvokeCommand(
                 SUGGESTION_QUALIFIED.to_string().into()
             ))
         );
         for (c, tag) in [
-            ('j', "unqualified"),
-            ('l', "foreign"),
+            ('u', "unqualified"),
+            ('i', "foreign"),
             ('m', "unregistered"),
         ] {
             assert_eq!(
@@ -9502,7 +9530,7 @@ claims = []
             &root,
             SUGGESTION_OWNER,
             &[SUGGESTION_COMMAND],
-            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[("ctrl+alt+y", SUGGESTION_QUALIFIED)],
             &[SUGGESTION_COMMAND],
         );
         let (plugin_runtime, pid) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
@@ -9510,7 +9538,7 @@ claims = []
             .expect("defaults");
         let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
-            key: KeyName::Char('k'),
+            key: KeyName::Char('y'),
             ctrl: true,
             alt: true,
             shift: false,
@@ -9589,7 +9617,7 @@ claims = []
             .expect("defaults");
         let app = app_with_keymaps(maps);
         let chord = KeyRef {
-            key: KeyName::Char('k'),
+            key: KeyName::Char('y'),
             ctrl: true,
             alt: true,
             shift: false,
@@ -9702,7 +9730,7 @@ claims = []
             &root,
             SUGGESTION_OWNER,
             &[SUGGESTION_COMMAND],
-            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[("ctrl+alt+y", SUGGESTION_QUALIFIED)],
             &[SUGGESTION_COMMAND],
         );
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
@@ -9710,7 +9738,7 @@ claims = []
             .expect("defaults");
         let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
-            key: KeyName::Char('k'),
+            key: KeyName::Char('y'),
             ctrl: true,
             alt: true,
             shift: false,
@@ -11542,6 +11570,51 @@ claims = []
             app.runtime.layout().leaf_count(),
             2,
             "new_split while a pinned panel is focused must split the tiled base"
+        );
+    }
+
+    #[test]
+    fn chrome_move_split_and_toggle_split_swap_tiles_nudge_floats_and_flip_axis_3155() {
+        use bitty_config::{ChromeAction, SplitDir};
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+
+        // Tiled swap: moving leaf 1 right swaps it with leaf 2 and keeps focus on leaf 1.
+        app.apply_chrome_action(ChromeAction::MoveSplit(SplitDir::Right));
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(2), ViewId::new(1)]
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+
+        // ToggleSplit flips the enclosing Horizontal split to Vertical.
+        assert_eq!(
+            app.runtime.layout().leaf_parent_axis(ViewId::new(1)),
+            Some(SplitAxis::Horizontal)
+        );
+        app.apply_chrome_action(ChromeAction::ToggleSplit);
+        assert_eq!(
+            app.runtime.layout().leaf_parent_axis(ViewId::new(1)),
+            Some(SplitAxis::Vertical)
+        );
+
+        // Floating nudge: detaching leaf 1 and moving it right nudges its anchored rect.
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert!(app.runtime.floated_views().contains(&ViewId::new(1)));
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let before = app
+            .runtime
+            .anchored_overlay_cell_rect(ViewId::new(1))
+            .expect("float rect");
+        app.apply_chrome_action(ChromeAction::MoveSplit(SplitDir::Right));
+        let after = app
+            .runtime
+            .anchored_overlay_cell_rect(ViewId::new(1))
+            .expect("float rect after move");
+        assert!(
+            after.x > before.x,
+            "move_split:right on focused float must nudge x rightward ({before:?} -> {after:?})"
         );
     }
 }

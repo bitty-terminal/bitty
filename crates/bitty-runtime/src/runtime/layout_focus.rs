@@ -52,6 +52,10 @@ pub struct PanelSplitPlan {
 pub(crate) const PIN_CASCADE_DX: u16 = 3;
 pub(crate) const PIN_CASCADE_DY: u16 = 2;
 
+/// Step size in container cells for one keyboard `move_split:<dir>` nudge on an
+/// anchored floating or pinned panel (issue #3155).
+pub const FLOAT_KEYBOARD_MOVE_STEP_CELLS: i32 = 4;
+
 /// Anchored geometry plus the permitted Alt+drag re-anchor range for one
 /// composited pinned or detached-float leaf (CTX-1081, CodeRabbit 1893
 /// follow-up; CTX-1147 reuses it for detached floats).
@@ -3385,6 +3389,124 @@ impl Runtime {
             self.set_focus(id);
         }
         next
+    }
+
+    /// Moves or swaps the focused panel in `dir` within the active workspace
+    /// (Hyprland `movewindow`/`swapwindow` parity, issue #3155).
+    ///
+    /// - When the focused view is a pinned or detached-floating panel, nudges
+    ///   its stored re-anchor offset by [`FLOAT_KEYBOARD_MOVE_STEP_CELLS`]
+    ///   along `dir`, clamped to its permitted container bounds.
+    /// - When the focused view is an in-tree structural overlay, nudges its
+    ///   overlay bounds by [`FLOAT_KEYBOARD_MOVE_STEP_CELLS`] inside the
+    ///   container.
+    /// - When the focused view is a tiled leaf, resolves the spatial tiled
+    ///   neighbor in `dir` via `focus_spatial_neighbor` and swaps the
+    ///   two leaves in place ([`LayoutNode::swap_leaves`]), preserving split
+    ///   ratios, pane sessions, and focus on the moved panel.
+    ///
+    /// Returns `true` when the panel moved or swapped, or `false` when no
+    /// neighbor exists in `dir` or a floating panel is already clamped against
+    /// the container edge.
+    pub fn move_focused_panel(&mut self, dir: FocusDirection) -> bool {
+        let Some(focused) = self.focused_view() else {
+            return false;
+        };
+        let (step_dx, step_dy) = match dir {
+            FocusDirection::Left => (-FLOAT_KEYBOARD_MOVE_STEP_CELLS, 0),
+            FocusDirection::Right => (FLOAT_KEYBOARD_MOVE_STEP_CELLS, 0),
+            FocusDirection::Up => (0, -FLOAT_KEYBOARD_MOVE_STEP_CELLS),
+            FocusDirection::Down => (0, FLOAT_KEYBOARD_MOVE_STEP_CELLS),
+            FocusDirection::Next | FocusDirection::Prev => return false,
+        };
+        let now = std::time::Instant::now();
+        if self.pinned.contains(focused) {
+            let Some(anchor) = self.pinned_anchor(focused) else {
+                return false;
+            };
+            let (cur_dx, cur_dy) = self.pinned_offsets.get(&focused).copied().unwrap_or((0, 0));
+            let stored_dx = cur_dx
+                .saturating_add(step_dx)
+                .clamp(anchor.dx_range.0, anchor.dx_range.1);
+            let stored_dy = cur_dy
+                .saturating_add(step_dy)
+                .clamp(anchor.dy_range.0, anchor.dy_range.1);
+            if (stored_dx, stored_dy) == (cur_dx, cur_dy) {
+                return false;
+            }
+            self.pinned_offsets.insert(focused, (stored_dx, stored_dy));
+            self.pending_full_redraw = true;
+            self.trigger_animation(AnimationKind::Move, Some(focused), now);
+            return true;
+        }
+        if self.floats.contains(focused) {
+            let Some(anchor) = self.float_anchor(focused) else {
+                return false;
+            };
+            let (cur_dx, cur_dy) = self.float_offsets.get(&focused).copied().unwrap_or((0, 0));
+            let stored_dx = cur_dx
+                .saturating_add(step_dx)
+                .clamp(anchor.dx_range.0, anchor.dx_range.1);
+            let stored_dy = cur_dy
+                .saturating_add(step_dy)
+                .clamp(anchor.dy_range.0, anchor.dy_range.1);
+            if (stored_dx, stored_dy) == (cur_dx, cur_dy) {
+                return false;
+            }
+            self.float_offsets.insert(focused, (stored_dx, stored_dy));
+            self.pending_full_redraw = true;
+            self.trigger_animation(AnimationKind::Move, Some(focused), now);
+            return true;
+        }
+        if let Some(before) = self.layout.overlay_bounds_containing(focused) {
+            if !self
+                .layout
+                .move_overlay_containing(focused, step_dx, step_dy, self.container)
+            {
+                return false;
+            }
+            if self.layout.overlay_bounds_containing(focused) == Some(before) {
+                return false;
+            }
+            self.pending_full_redraw = true;
+            self.trigger_animation(AnimationKind::Move, Some(focused), now);
+            return true;
+        }
+        let tiled_ids = self.layout.leaf_ids();
+        if !tiled_ids.contains(&focused) {
+            return false;
+        }
+        let Some(neighbor) = self.focus_spatial_neighbor(&tiled_ids, dir) else {
+            return false;
+        };
+        let mut next = self.layout.clone();
+        if !next.swap_leaves(focused, neighbor) {
+            return false;
+        }
+        self.set_layout_committed(next);
+        self.set_focus(focused);
+        self.trigger_animation(AnimationKind::Move, Some(focused), now);
+        true
+    }
+
+    /// Toggles the enclosing split axis (`Horizontal` <-> `Vertical`) of the
+    /// focused tiled panel (Hyprland `togglesplit` parity, issue #3155).
+    ///
+    /// Returns the new [`SplitAxis`] when an enclosing split was flipped, or
+    /// `None` when nothing is focused, the focused panel is floating/pinned, or
+    /// the workspace has only a single tiled leaf.
+    pub fn toggle_focused_split_axis(&mut self) -> Option<SplitAxis> {
+        let focused = self.focused_view()?;
+        let mut next = self.layout.clone();
+        let axis = next.toggle_parent_split_axis(focused)?;
+        self.set_layout_committed(next);
+        self.set_focus(focused);
+        self.trigger_animation(
+            AnimationKind::Move,
+            Some(focused),
+            std::time::Instant::now(),
+        );
+        Some(axis)
     }
 
     /// All panels participating in keyboard focus, in stable cycle order.

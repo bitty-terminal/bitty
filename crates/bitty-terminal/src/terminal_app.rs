@@ -2721,6 +2721,7 @@ impl TerminalApp {
             ]);
             let _delivered = plugin_runtime.deliver_event("config.reloaded", &payload);
         }
+        let _ = plugin_runtime.recover_wall_failed_plugins();
     }
 
     /// Queues one `process.exited` edge (issue #1828).
@@ -6325,9 +6326,9 @@ impl TerminalApp {
                 // already covers (CTX-1788, PR #3109 round-2 F4).
                 let _ = self.runtime.poll_presenter_acks();
                 self.watchdog_phase(Phase::ColdCommands);
-                let delivered = self.pump_cold_commands();
+                let _delivered = self.pump_cold_commands();
                 let presented = self.drive_tick().is_some();
-                if presented || delivered > 0 {
+                if presented {
                     if let Some(win) = self.window.handle.as_ref() {
                         win.request_redraw();
                     }

@@ -789,6 +789,22 @@ impl From<&str> for CommandInvocation {
 pub enum ChromeAction {
     /// Move focus spatially (`goto_split:left`, ...).
     GotoSplit(SplitDir),
+    /// Move or swap the focused panel in a direction within the active
+    /// workspace (`move_split:left`, ..., aliases `move_panel:<dir>`,
+    /// `swap_split:<dir>`, `movewindow:<dir>`, `swapwindow:<dir>`; issue #3155).
+    ///
+    /// Default bindings: `ctrl+alt+h/j/k/l` and `ctrl+alt+left/down/up/right`
+    /// (Mod-aware via the `alt` slot; `ctrl+super+h/j/k/l` and
+    /// `ctrl+super+arrows` under `mod_key = "super"`). Tiled leaves swap in
+    /// place with their spatial neighbor; floating and pinned panels nudge by
+    /// 4 container cells inside the container bounds.
+    MoveSplit(SplitDir),
+    /// Toggle the enclosing split axis between horizontal and vertical
+    /// (`toggle_split`, aliases `togglesplit`, `split_toggle`; issue #3155,
+    /// Hyprland `togglesplit` parity).
+    ///
+    /// Default binding: `alt+s` (`super+s` under `mod_key = "super"`).
+    ToggleSplit,
     /// Split the focused pane (`new_split:right`, ...).
     NewSplit(SplitDir),
     /// Open a new panel with Hyprland-dwindle semantics (`new_panel`).
@@ -1100,6 +1116,14 @@ impl ChromeAction {
                 let dir = require_dir_arg(arg, trimmed)?;
                 Ok(Self::GotoSplit(dir))
             }
+            "move_split" | "move_panel" | "swap_split" | "movewindow" | "swapwindow" => {
+                let dir = require_dir_arg(arg, trimmed)?;
+                Ok(Self::MoveSplit(dir))
+            }
+            "toggle_split" | "togglesplit" | "split_toggle" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::ToggleSplit)
+            }
             "new_split" => {
                 let dir = require_dir_arg(arg, trimmed)?;
                 Ok(Self::NewSplit(dir))
@@ -1313,6 +1337,8 @@ impl ChromeAction {
     pub fn canonical(&self) -> String {
         match self {
             Self::GotoSplit(d) => format!("goto_split:{}", d.canonical()),
+            Self::MoveSplit(d) => format!("move_split:{}", d.canonical()),
+            Self::ToggleSplit => "toggle_split".to_string(),
             Self::NewSplit(d) => format!("new_split:{}", d.canonical()),
             Self::NewPanel => "new_panel".to_string(),
             Self::ResizeSplit(d) => format!("resize_split:{}", d.canonical()),
@@ -1369,6 +1395,8 @@ impl ChromeAction {
     pub fn description(&self) -> &'static str {
         match self {
             Self::GotoSplit(_) => "Move focus spatially to the neighboring pane.",
+            Self::MoveSplit(_) => "Move or swap the focused panel in a direction.",
+            Self::ToggleSplit => "Toggle the enclosing split axis between horizontal and vertical.",
             Self::NewSplit(_) => "Split the focused pane in a direction.",
             Self::NewPanel => "Open a new panel with smart split axis.",
             Self::ResizeSplit(_) => "Nudge the enclosing split ratio.",
@@ -1453,6 +1481,8 @@ impl ChromeAction {
 pub fn all_chrome_actions() -> Vec<ChromeAction> {
     vec![
         ChromeAction::GotoSplit(SplitDir::Left),
+        ChromeAction::MoveSplit(SplitDir::Left),
+        ChromeAction::ToggleSplit,
         ChromeAction::NewSplit(SplitDir::Left),
         ChromeAction::NewPanel,
         ChromeAction::ResizeSplit(SplitDir::Left),
@@ -1611,7 +1641,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, new_window, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, new_window, command:<owner:command>";
 
 /// Plugin id that owns the help/which-key overlay after the Core retirement
 /// (ADR-0014 / issue #2397).
@@ -2031,10 +2061,17 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("ctrl+shift+alt+9", "workspace_swap:9"),
     ("alt+u", "scroll_page_down"),
     ("alt+i", "scroll_page_up"),
-    ("ctrl+alt+left", "goto_split:left"),
-    ("ctrl+alt+right", "goto_split:right"),
-    ("ctrl+alt+up", "goto_split:up"),
-    ("ctrl+alt+down", "goto_split:down"),
+    // Issue #3155: Ctrl+Mod+hjkl and Ctrl+Mod+arrows move/swap the focused
+    // panel in place within the active workspace (Hyprland movewindow/swapwindow
+    // parity; Mod+hjkl and Mod+arrows already own focus navigation).
+    ("ctrl+alt+h", "move_split:left"),
+    ("ctrl+alt+j", "move_split:down"),
+    ("ctrl+alt+k", "move_split:up"),
+    ("ctrl+alt+l", "move_split:right"),
+    ("ctrl+alt+left", "move_split:left"),
+    ("ctrl+alt+right", "move_split:right"),
+    ("ctrl+alt+up", "move_split:up"),
+    ("ctrl+alt+down", "move_split:down"),
     ("ctrl+tab", "focus_next"),
     ("ctrl+shift+tab", "focus_prev"),
     ("shift+alt+h", "new_split:left"),
@@ -2095,6 +2132,10 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // is unusable there. Carries the Mod slot so a Super flip rebinds to
     // `super+a`. User-overridable via the `context + chord` merge rule.
     ("alt+a", "toggle_floating"),
+    // Issue #3155: Mod+s toggles the enclosing split axis between horizontal
+    // and vertical (Hyprland `togglesplit` parity; rebinds to `super+s` under
+    // `mod_key = "super"`).
+    ("alt+s", "toggle_split"),
     ("alt+t", "workspace_new"),
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
@@ -2906,7 +2947,7 @@ mod tests {
                     super_held: true,
                 }
             ),
-            Some(ChromeAction::GotoSplit(SplitDir::Left))
+            Some(ChromeAction::MoveSplit(SplitDir::Left))
         );
         // ... the old Alt chords are unbound (back to the shell) ...
         assert_eq!(
@@ -4037,8 +4078,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                95,
-                "35 shipped + 4 workspace-entry chords + 4 resize chords + 16 arrow aliases + 7 zoom chords + 9 move chords + 9 swap chords + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle + 2 issue-3122 clipboard chords (W-144 retired copy-mode + search; issue #2397 retired the 4 Core help chords)"
+                100,
+                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -4900,14 +4941,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                95,
-                "no new shipped defaults under mod {:?} (35 shipped + 4 workspace + 4 resize + 16 arrow + 9 move + 9 swap + 7 zoom + 1 CTX-0766 rechord + 1 issue-1444 close-view + 3 CTX-0952 prompt chords + 1 CTX-0962 floating-toggle + 1 issue-1776 close-view + 2 CTX-1100 occupied-cycle + 2 issue-3122 clipboard chords)",
+                100,
+                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                95 + entries.len(),
+                100 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -5864,6 +5905,51 @@ mod tests {
             match_keymap(&custom_maps, z_alt),
             Some(ChromeAction::NewPanel),
             "user rebind of alt+z overrides default ToggleZoom"
+        );
+    }
+
+    #[test]
+    fn move_split_and_toggle_split_parse_aliases_and_resolve_defaults() {
+        for alias in [
+            "move_split:left",
+            "move_panel:left",
+            "swap_split:left",
+            "movewindow:left",
+            "swapwindow:left",
+        ] {
+            let parsed = ChromeAction::parse(alias).expect("move_split alias parses");
+            assert_eq!(parsed, ChromeAction::MoveSplit(SplitDir::Left));
+            assert_eq!(parsed.canonical(), "move_split:left");
+        }
+        assert!(ChromeAction::parse("move_split").is_err());
+
+        for alias in ["toggle_split", "togglesplit", "split_toggle"] {
+            let parsed = ChromeAction::parse(alias).expect("toggle_split alias parses");
+            assert_eq!(parsed, ChromeAction::ToggleSplit);
+            assert_eq!(parsed.canonical(), "toggle_split");
+        }
+        assert!(ChromeAction::parse("toggle_split:left").is_err());
+
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('h'), true, true, false)),
+            Some(ChromeAction::MoveSplit(SplitDir::Left))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('j'), true, true, false)),
+            Some(ChromeAction::MoveSplit(SplitDir::Down))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('k'), true, true, false)),
+            Some(ChromeAction::MoveSplit(SplitDir::Up))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('l'), true, true, false)),
+            Some(ChromeAction::MoveSplit(SplitDir::Right))
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('s'), false, true, false)),
+            Some(ChromeAction::ToggleSplit)
         );
     }
 }

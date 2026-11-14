@@ -12,6 +12,7 @@ use bitty_platform::{
 use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, OverlayKeyChord, PluginRuntime, WorkspaceRequest};
 use bitty_runtime::{Runtime, ViewId, WorkspaceId, WorkspaceSummary};
+use bitty_ui::a11y_host::{A11ySettings, A11ySnapshotBridge};
 
 use crate::crash_report;
 use crate::ctl;
@@ -1155,6 +1156,17 @@ pub(crate) struct TerminalApp {
     pending_input_commands: std::collections::VecDeque<bitty_config::ChromeAction>,
     /// Cumulative dropped input-path command invocations (CTX-1324).
     pending_input_commands_dropped: u64,
+    /// Live accessibility projection owner (bitty#1768).
+    ///
+    /// Default off: [`A11ySnapshotBridge::disabled`] holds no host and no
+    /// adapter, so the per-tick candidate refresh costs one boolean check and
+    /// builds no snapshot. The composition root enables it through
+    /// [`Self::with_a11y_settings`] from core policy only (never plugin input),
+    /// and [`Self::shutdown_runtime`] releases it on every exit path.
+    a11y: A11ySnapshotBridge,
+    /// One-shot latch so a refused accessibility ingest reports once instead
+    /// of on every frame (bitty#1768).
+    a11y_refresh_warned: bool,
 }
 
 /// Queued process-exit edge (issue #1828; bounded, see
@@ -1277,6 +1289,8 @@ impl TerminalApp {
             shell_exit_poll: None,
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
+            a11y: A11ySnapshotBridge::disabled(),
+            a11y_refresh_warned: false,
         }
     }
 
@@ -1347,6 +1361,8 @@ impl TerminalApp {
             shell_exit_poll: None,
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
+            a11y: A11ySnapshotBridge::disabled(),
+            a11y_refresh_warned: false,
         }
     }
 
@@ -1939,6 +1955,68 @@ impl TerminalApp {
         self
     }
 
+    /// Installs the accessibility projection settings (bitty#1768).
+    ///
+    /// The composition root decides `settings` from core policy only (the
+    /// opt-in plus the safe-mode veto, see
+    /// [`crate::observability::a11y_exposure_allowed`]); no plugin input
+    /// reaches this method. Disabled settings keep the app's default-off
+    /// bridge: no host, no adapter, no ingest, and no extra snapshot per
+    /// tick.
+    pub(crate) fn with_a11y_settings(mut self, settings: A11ySettings) -> Self {
+        self.a11y = A11ySnapshotBridge::new(settings);
+        self.a11y_refresh_warned = false;
+        self
+    }
+
+    /// Shuts the runtime down after releasing the accessibility projection.
+    ///
+    /// Every session-exit path calls this instead of `Runtime::shutdown` so
+    /// the accessibility adapter is dropped first (bitty#1768): no tree stays
+    /// exposed after the session ends, and a backend added later cannot be
+    /// left holding a generation the runtime has already torn down.
+    fn shutdown_runtime(&mut self) {
+        self.a11y.shutdown();
+        self.runtime.shutdown();
+    }
+
+    /// Whether the accessibility projection is active (bitty#1768).
+    #[cfg(test)]
+    pub(crate) fn a11y_is_active(&self) -> bool {
+        self.a11y.is_active()
+    }
+
+    /// Successful accessibility ingests so far (bitty#1768).
+    #[cfg(test)]
+    pub(crate) fn a11y_ingest_count(&self) -> u64 {
+        self.a11y.ingest_count()
+    }
+
+    /// Nodes in the live accessibility projection (bitty#1768).
+    #[cfg(test)]
+    pub(crate) fn a11y_node_count(&self) -> usize {
+        self.a11y.node_count()
+    }
+
+    /// Terminal text rows in the live accessibility projection (bitty#1768).
+    #[cfg(test)]
+    pub(crate) fn a11y_terminal_row_count(&self) -> usize {
+        self.a11y.terminal_row_count()
+    }
+
+    /// Reports a refused accessibility ingest once per session (bitty#1768).
+    ///
+    /// The adapter fails closed, so nothing swaps and no partial tree is
+    /// exposed; the only Core action is one warning. A per-frame repeat would
+    /// flood stderr for a condition the projection bounds have to fix.
+    fn report_a11y_refresh_failure(&mut self, err: &impl std::fmt::Display) {
+        if self.a11y_refresh_warned {
+            return;
+        }
+        self.a11y_refresh_warned = true;
+        crate::logging::warn(|| format!("bitty: accessibility projection refresh refused: {err}"));
+    }
+
     /// Composer ownership for this input path (W-103 S-5 cutover rule,
     /// retained through E-CUT retirement CTX-0968).
     ///
@@ -2525,6 +2603,20 @@ impl TerminalApp {
             // and opt-in gated inside the provider.
             if let Some(history) = self.live_history.as_ref() {
                 crate::plugin_runtime::capture_history(&self.runtime, history);
+            }
+            // bitty#1768: refresh the accessibility projection from the frame
+            // this tick just committed. Default off: `is_active()` is one
+            // boolean check, and a disabled session builds no snapshot, owns no
+            // adapter, and runs no ingest. When active this is the single
+            // production call site of `A11ySnapshotBridge::refresh`, ordered
+            // with the other post-commit publications and inside the same
+            // `!hold_snapshot` gate so a synchronized update never exposes a
+            // half-written grid.
+            if self.a11y.is_active() {
+                let snapshot = self.runtime.snapshot();
+                if let Err(err) = self.a11y.refresh(&snapshot) {
+                    self.report_a11y_refresh_failure(&err);
+                }
             }
         }
         self.watchdog_phase(Phase::CursorSync);
@@ -5868,7 +5960,7 @@ impl TerminalApp {
         if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
             self.save_session_best_effort("shell-exit");
             self.teardown_windows();
-            self.runtime.shutdown();
+            self.shutdown_runtime();
             crash_report::record_exit(crash_report::ExitReason::ShellExit);
             ctx.exit();
             return;
@@ -5891,7 +5983,7 @@ impl TerminalApp {
                     });
                     self.save_session_best_effort("close-view");
                     self.teardown_windows();
-                    self.runtime.shutdown();
+                    self.shutdown_runtime();
                     crash_report::record_exit(crash_report::ExitReason::CloseView);
                     ctx.exit();
                 }
@@ -5956,7 +6048,7 @@ impl TerminalApp {
             self.watchdog_phase(Phase::Shutdown);
             self.save_session_best_effort("exit");
             self.teardown_windows();
-            self.runtime.shutdown();
+            self.shutdown_runtime();
             let reason = match &event {
                 PlatformEvent::Window {
                     kind: WindowEventKind::CloseRequested | WindowEventKind::Closed,
@@ -5978,7 +6070,7 @@ impl TerminalApp {
             crate::logging::info(|| "bitty: exit requested (mouse chrome action)".to_string());
             self.save_session_best_effort("mouse-action");
             self.teardown_windows();
-            self.runtime.shutdown();
+            self.shutdown_runtime();
             crash_report::record_exit(crash_report::ExitReason::MouseAction);
             ctx.exit();
             return;
@@ -6295,7 +6387,7 @@ impl TerminalApp {
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");
                     self.teardown_windows();
-                    self.runtime.shutdown();
+                    self.shutdown_runtime();
                     crash_report::record_exit(crash_report::ExitReason::ShellExit);
                     ctx.exit();
                     return;
@@ -6495,7 +6587,7 @@ impl TerminalApp {
             PlatformEvent::Exiting => {
                 self.save_session_best_effort("loop-exiting");
                 self.teardown_windows();
-                self.runtime.shutdown();
+                self.shutdown_runtime();
                 crash_report::record_exit(crash_report::ExitReason::LoopExiting);
                 ctx.exit();
             }
@@ -7313,5 +7405,106 @@ mod lifecycle_log_budget_tests {
             LifecycleLogAdmission::Suppressed,
             "the production budget must not admit past its bound"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accessibility projection wiring (bitty#1768)
+// ---------------------------------------------------------------------------
+
+/// The composition root owns the accessibility projection's lifecycle.
+///
+/// These tests pin the two properties the wiring must keep: a default session
+/// never builds or feeds the projection (one boolean check per tick, no
+/// snapshot, no ingest), and an enabled session ingests the tree the tick just
+/// committed and releases it on the exit path.
+#[cfg(test)]
+mod a11y_bridge_1768_tests {
+    use super::*;
+
+    /// A headless app on a real `Runtime` with default policy (default off).
+    fn test_app() -> TerminalApp {
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("default keymaps");
+        TerminalApp::with_theme(
+            Runtime::with_defaults().expect("runtime"),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+    }
+
+    /// The same app with the accessibility opt-in applied.
+    fn enabled_app() -> TerminalApp {
+        test_app().with_a11y_settings(A11ySettings::new().with_screen_reader(true))
+    }
+
+    /// Writes PTY bytes through the real runtime and drives one cold tick.
+    fn write_and_tick(app: &mut TerminalApp) {
+        app.runtime.handle_pty_bytes(b"hello world\r\nsecond row");
+        let _ = app.drive_tick();
+    }
+
+    #[test]
+    fn default_session_never_builds_the_projection() {
+        let mut app = test_app();
+        assert!(!app.a11y_is_active(), "the projection is default off");
+        for tick in 0..3 {
+            write_and_tick(&mut app);
+            assert_eq!(
+                app.a11y_ingest_count(),
+                0,
+                "tick {tick}: a disabled session must not ingest"
+            );
+        }
+        assert_eq!(app.a11y_node_count(), 0);
+        assert_eq!(app.a11y_terminal_row_count(), 0);
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_builder() {
+        let disabled = test_app().with_a11y_settings(A11ySettings::new());
+        assert!(!disabled.a11y_is_active());
+        let enabled = enabled_app();
+        assert!(enabled.a11y_is_active());
+    }
+
+    #[test]
+    fn enabled_session_ingests_the_committed_terminal_tree() {
+        let mut app = enabled_app();
+        assert_eq!(
+            app.a11y_ingest_count(),
+            0,
+            "nothing is ingested before the first tick"
+        );
+        write_and_tick(&mut app);
+        assert!(
+            app.a11y_ingest_count() >= 1,
+            "the present path refreshes the projection"
+        );
+        // Root group plus the terminal leaf at least.
+        assert!(app.a11y_node_count() >= 2, "{}", app.a11y_node_count());
+        assert!(
+            app.a11y_terminal_row_count() >= 1,
+            "the committed grid must reach the tree: {}",
+            app.a11y_terminal_row_count()
+        );
+        let first = app.a11y_ingest_count();
+        write_and_tick(&mut app);
+        assert!(
+            app.a11y_ingest_count() > first,
+            "a second committed frame refreshes again"
+        );
+    }
+
+    #[test]
+    fn exit_path_releases_the_projection() {
+        let mut app = enabled_app();
+        write_and_tick(&mut app);
+        assert!(app.a11y_is_active());
+        app.shutdown_runtime();
+        assert!(!app.a11y_is_active(), "the exit path drops the adapter");
+        assert_eq!(app.a11y_node_count(), 0, "no tree stays exposed");
     }
 }

@@ -152,14 +152,14 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
     KeymapSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification,
-    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCreateHandler, PanelPinHandler,
-    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedSubmitRequest,
-    QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger,
-    ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource, SharedTargetAnnotations,
-    SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue,
-    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps,
-    UnavailableSnapshot, UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue,
-    WorkspaceSource, keymap_row, keymap_rows,
+    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCreateHandler, PanelCreateOrigin,
+    PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest,
+    QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY,
+    ServiceCallLedger, ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource,
+    SharedTargetAnnotations, SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource,
+    TerminalSubmitQueue, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
+    UnavailableKeymaps, UnavailableSnapshot, UnavailableTargets, UnavailableWorkspaces,
+    WorkspaceRequestQueue, WorkspaceSource, keymap_row, keymap_rows,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the

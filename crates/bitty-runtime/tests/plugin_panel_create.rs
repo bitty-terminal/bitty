@@ -15,6 +15,7 @@
 mod common;
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -60,7 +61,7 @@ impl SnapshotSource for NoSnapshot {
 /// to the bounded `E_DEF_LIMIT`; an unservable host maps to
 /// `E_NOT_IMPLEMENTED`.
 fn create_backend(panels: Rc<RefCell<PanelRegistry>>) -> PanelCreateHandler {
-    Rc::new(move |panel_type| {
+    Rc::new(move |panel_type, _origin| {
         let parsed = PanelType::parse(panel_type).ok_or_else(|| {
             BridgeError::new(
                 "validation",
@@ -314,6 +315,70 @@ fn granted_create_focuses_zero_pty_panel_end_to_end() {
     assert_eq!(panels.borrow().panel_count(), 2);
     assert_eq!(terminals.terminal_count(), 0, "still zero PTY");
     assert_eq!(panels.borrow().focused_panel(workspace), Some(panel_id));
+}
+
+#[test]
+fn the_create_seam_names_the_executing_generation() {
+    // bitty#2476 follow-up (e): the seam carries the creating plugin's identity
+    // and controller generation, not only a type string. Without the pair no
+    // container can be named at the generation edge, so this asserts the three
+    // facts a first bind needs: the owner, the activation generation (read from
+    // the runtime's own published row, not from an assumed activation count),
+    // and the generation's own closed `panel` resolution.
+    let panels = Rc::new(RefCell::new(
+        PanelRegistry::new(PanelRegistryConfig::default()).expect("panel registry"),
+    ));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let sink = seen.clone();
+    let backend: PanelCreateHandler = Rc::new(move |panel_type, origin| {
+        sink.borrow_mut().push((
+            origin.owner.as_str().to_string(),
+            origin.generation,
+            origin.requested.clone(),
+        ));
+        let parsed = PanelType::parse(panel_type).expect("native type");
+        let handle = panels
+            .borrow_mut()
+            .create_panel(parsed, None)
+            .expect("registry admits one panel");
+        Ok((handle.id.0, handle.generation.get()))
+    });
+    let root = temp_dir("origin");
+    write_plugin(
+        &root,
+        "xuepoo.createorigin",
+        &["panel.create"],
+        PROBE_COMMANDS,
+        PROBE,
+    );
+    let mut rt = runtime(root, Some(backend));
+    activate_all(&mut rt);
+    let id = pid("xuepoo.createorigin");
+    let installed = rt
+        .debug_plugins()
+        .into_iter()
+        .find(|row| row.id == id.as_str())
+        .map(|row| row.generation)
+        .expect("the runtime publishes one row per discovered plugin");
+
+    parse_handle(&run(&mut rt, &id, "create_rich"));
+
+    let captured = seen.borrow();
+    assert_eq!(captured.len(), 1, "one create reaches the backend once");
+    let (owner, generation, requested) = captured[0].clone();
+    assert_eq!(owner, id.as_str(), "the executing plugin names the owner");
+    assert_eq!(
+        generation, installed,
+        "the executing activation generation, not the panel allocation epoch"
+    );
+    assert_eq!(
+        requested,
+        ["panel.create"]
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect::<BTreeSet<String>>(),
+        "the first bind's R is the generation's own panel resolution"
+    );
 }
 
 #[test]

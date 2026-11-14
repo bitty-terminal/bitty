@@ -654,6 +654,9 @@ fn read_lock_owner_pid(owner_file: &Path) -> Option<u32> {
 
 /// Check whether `pid` is still alive (`false` only when definitively dead).
 fn is_lock_owner_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
     #[cfg(unix)]
     {
         let Ok(raw_pid) = i32::try_from(pid) else {
@@ -666,10 +669,166 @@ fn is_lock_owner_alive(pid: u32) -> bool {
             Err(_) => true,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        bitty_winjob::process_is_running(pid).unwrap_or(true)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
+    }
+}
+
+fn create_private_lock_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(WHEEL_DIR_MODE);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+fn publish_lock_owner(lock_dir: &Path, owner_file: &Path, pid: u32) -> std::io::Result<()> {
+    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_owner = lock_dir.join(format!("owner.tmp.{pid}.{seq}"));
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(WHEEL_FILE_MODE)
+                .open(&tmp_owner)?;
+            file.write_all(format!("{pid}\n").as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp_owner, format!("{pid}\n"))?;
+        }
+        std::fs::rename(&tmp_owner, owner_file)
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp_owner);
+    }
+    write_res
+}
+
+fn remove_lock_dir_contents(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.take(16).flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+struct ReclaimLockGuard {
+    reclaim_dir: std::path::PathBuf,
+    owner_file: std::path::PathBuf,
+}
+
+impl Drop for ReclaimLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.owner_file);
+        remove_lock_dir_contents(&self.reclaim_dir);
+    }
+}
+
+impl ReclaimLockGuard {
+    fn try_acquire(dir: &Path, pid: u32) -> Option<Self> {
+        let reclaim_dir = dir.join(".approvals.reclaim.lock");
+        let owner_file = reclaim_dir.join("owner");
+        if create_private_lock_dir(&reclaim_dir).is_err() {
+            let stale_reclaim = match read_lock_owner_pid(&owner_file) {
+                Some(reclaim_pid) => !is_lock_owner_alive(reclaim_pid),
+                None => std::fs::symlink_metadata(&reclaim_dir)
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                    .is_ok_and(|age| {
+                        age >= std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 8)
+                    }),
+            };
+            if stale_reclaim {
+                let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let stale_dir = dir.join(format!(".approvals.reclaim.stale.{pid}.{seq}"));
+                if std::fs::rename(&reclaim_dir, &stale_dir).is_ok() {
+                    remove_lock_dir_contents(&stale_dir);
+                }
+            }
+            if create_private_lock_dir(&reclaim_dir).is_err() {
+                return None;
+            }
+        }
+        if publish_lock_owner(&reclaim_dir, &owner_file, pid).is_err() {
+            remove_lock_dir_contents(&reclaim_dir);
+            return None;
+        }
+        Some(Self {
+            reclaim_dir,
+            owner_file,
+        })
+    }
+}
+
+/// Atomically reclaim a dead-owner or interrupted ownerless `.approvals.lock`
+/// while preserving lock identity so a replacement lock is never deleted.
+fn try_reclaim_stale_lock(dir: &Path, lock_dir: &Path, owner_file: &Path, pid: u32) -> bool {
+    let Some(_reclaim_guard) = ReclaimLockGuard::try_acquire(dir, pid) else {
+        return false;
+    };
+    let expected_dead_owner = match read_lock_owner_pid(owner_file) {
+        Some(owner_pid) => {
+            if is_lock_owner_alive(owner_pid) {
+                return false;
+            }
+            Some(owner_pid)
+        }
+        None => {
+            // Coordinate with a concurrent acquirer that just created `lock_dir`
+            // and is in the middle of publishing `owner`.
+            std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 2));
+            if std::fs::symlink_metadata(lock_dir).is_err() {
+                return false;
+            }
+            match read_lock_owner_pid(owner_file) {
+                Some(owner_pid) if is_lock_owner_alive(owner_pid) => return false,
+                Some(owner_pid) => Some(owner_pid),
+                None => None,
+            }
+        }
+    };
+    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stale_dir = dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stale.{pid}.{seq}"));
+    if std::fs::rename(lock_dir, &stale_dir).is_err() {
+        return false;
+    }
+    let stale_owner = read_lock_owner_pid(&stale_dir.join("owner"));
+    let may_remove = match (expected_dead_owner, stale_owner) {
+        (_, None) => true,
+        (Some(expected), Some(actual)) if actual == expected => true,
+        (_, Some(actual)) => !is_lock_owner_alive(actual),
+    };
+    if may_remove {
+        remove_lock_dir_contents(&stale_dir);
+        true
+    } else {
+        if std::fs::rename(&stale_dir, lock_dir).is_err() {
+            // Another contender already created a replacement lock; only remove
+            // the displaced directory if its recorded owner is no longer alive.
+            if stale_owner.is_none_or(|actual| !is_lock_owner_alive(actual)) {
+                remove_lock_dir_contents(&stale_dir);
+            }
+        }
+        false
     }
 }
 
@@ -687,7 +846,7 @@ impl Drop for WheelStoreLockGuard {
             }
         }
         let _ = std::fs::remove_file(&self.owner_file);
-        let _ = std::fs::remove_dir(&self.lock_dir);
+        remove_lock_dir_contents(&self.lock_dir);
     }
 }
 
@@ -703,32 +862,21 @@ where
 
     let mut acquired = false;
     for attempt in 1..=WHEEL_LOCK_MAX_ATTEMPTS {
-        let create_res = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                let mut builder = std::fs::DirBuilder::new();
-                builder.mode(WHEEL_DIR_MODE);
-                builder.create(&lock_dir)
+        if create_private_lock_dir(&lock_dir).is_ok() {
+            if publish_lock_owner(&lock_dir, &owner_file, pid).is_err() {
+                remove_lock_dir_contents(&lock_dir);
+                return Err(ConfigWriteFailure::Io);
             }
-            #[cfg(not(unix))]
-            {
-                std::fs::create_dir(&lock_dir)
+            if read_lock_owner_pid(&owner_file) == Some(pid) {
+                acquired = true;
+                break;
             }
-        };
-        if create_res.is_ok() {
-            let _ = std::fs::write(&owner_file, format!("{pid}\n"));
-            acquired = true;
-            break;
+            remove_lock_dir_contents(&lock_dir);
         }
-        if attempt >= WHEEL_LOCK_RECLAIM_ATTEMPT {
-            if let Some(owner_pid) = read_lock_owner_pid(&owner_file) {
-                if !is_lock_owner_alive(owner_pid) {
-                    let _ = std::fs::remove_file(&owner_file);
-                    let _ = std::fs::remove_dir(&lock_dir);
-                    continue;
-                }
-            }
+        if attempt >= WHEEL_LOCK_RECLAIM_ATTEMPT
+            && try_reclaim_stale_lock(dir, &lock_dir, &owner_file, pid)
+        {
+            continue;
         }
         std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS));
     }
@@ -1961,6 +2109,68 @@ mod tests {
             .unwrap_err(),
             ConfigWriteFailure::Invalid
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclaims_ownerless_and_concurrent_stale_store_locks() {
+        let root = temp_dir("lock-reclaim");
+        let data_dir = root.join("data-wheel");
+        ensure_private_dir(&data_dir).unwrap();
+
+        // 1. Ownerless lock (interrupted before publishing `owner`) is reclaimed.
+        let lock_dir = data_dir.join(WHEEL_LOCK_DIR_NAME);
+        create_private_lock_dir(&lock_dir).unwrap();
+        let prev = preview_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+        )
+        .unwrap();
+        apply_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+            &prev.candidate_digest,
+        )
+        .unwrap();
+        assert!(!lock_dir.exists());
+
+        // 2. Concurrent contenders racing to reclaim a dead-owner lock never delete
+        //    another contender's replacement lock.
+        create_private_lock_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner"), "99999999\n").unwrap();
+
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlap = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let dir_clone = data_dir.clone();
+            let active_clone = std::sync::Arc::clone(&active);
+            let overlap_clone = std::sync::Arc::clone(&overlap);
+            handles.push(std::thread::spawn(move || {
+                with_wheel_store_lock(&dir_clone, || {
+                    let prev_active =
+                        active_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if prev_active > 0 {
+                        overlap_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    active_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            !overlap.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent stale-lock reclamation allowed overlapping lock holders"
+        );
+        assert!(!lock_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -557,14 +557,18 @@ impl LayoutProvider for NoopTiler {
     }
 }
 
-/// Dwindle provider: recursive `H`/`V` binary splits following Hyprland's
-/// `dwindle` layout (`force_split = 0`, `default_split_ratio = 1.0`).
+/// Dwindle provider: recursive `H`/`V` binary splits as a deterministic,
+/// Hyprland-inspired `dwindle` approximation (`default_split_ratio = 1.0`).
 ///
 /// The first view is outermost; each remaining view splits the bottom-right
 /// remainder (`second` child), with the axis alternating per depth from the
 /// opening axis chosen by the area aspect (tall stacks first, wide/square
-/// starts side-by-side). Unlike [`SpiralProvider`], `dwindle` always places
-/// new views on the right/bottom side rather than rotating 4-way clockwise.
+/// starts side-by-side). Unlike Hyprland's runtime `dwindle` (which re-evaluates
+/// each parent container's aspect ratio and follows cursor position under
+/// `force_split = 0`), this provider uses the area aspect only for the opening
+/// axis and deterministically alternates axes down the right/bottom remainder.
+/// Unlike [`SpiralProvider`], `dwindle` always places new views on the
+/// right/bottom side rather than rotating 4-way clockwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DwindleProvider {
     name: ProviderName,

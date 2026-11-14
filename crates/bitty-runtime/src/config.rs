@@ -1308,9 +1308,9 @@ pub enum PanelLayoutMode {
     /// focused slot is too small (issue #2571 review).
     #[default]
     Spiral,
-    /// Hyprland-style `dwindle` (`force_split = 0`, `default_split_ratio = 1.0`):
-    /// always splits the focused pane Right or Down according to its
-    /// container-normalized aspect ratio.
+    /// Hyprland-inspired `dwindle` (`default_split_ratio = 1.0`, deterministic
+    /// right/bottom placement): always splits the focused pane Right or Down
+    /// according to its container-normalized aspect ratio.
     Dwindle,
     /// Bisect the largest-area panel (CTX-0964, #1698): pick the leaf with
     /// the largest `width * height` allocation (first in solver order on

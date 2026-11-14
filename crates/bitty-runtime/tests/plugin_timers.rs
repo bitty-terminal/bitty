@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use bitty_lua::{
     BridgeError, ComponentBridgeRequest, ComponentMethod, LuaValue, RC1_WALL_CLOCK_BUDGET_MS,
 };
+use bitty_plugin_host::budgets::{BudgetValues, PluginBudgetFile};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     CoreTargetInfo, LifecycleState, MAX_WALL_RECOVERY_ATTEMPTS, PluginRuntime, PluginRuntimeConfig,
@@ -825,6 +826,20 @@ fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
     // dispatch. A timer drive that never started must not claim the callback
     // exceeded a budget; it reports the refusal and still fails the
     // generation.
+    //
+    // CTX-1827 (#3158): the original vehicle was a *wall* overrun inside an
+    // event handler. D4 now fails the generation at that dispatch site
+    // (`fail_runtime_on_wall_terminal`, plugin_runtime/mod.rs:5072, called
+    // from `deliver_event` mod.rs:4733, `dispatch_command` mod.rs:4232, and
+    // `pump_parked_commands` mod.rs:4528), so the timer pump no longer sees a
+    // wall-suspended-but-`Active` generation; that contract is pinned by
+    // `terminal_wall_timeout_through_an_event_handler_fails_the_generation`
+    // in `rc1_wall_recovery.rs`. `Drive::Terminal` (mod.rs:2496) must still be
+    // reachable, and it is: D4 records *only* wall verdicts, so an instruction
+    // (or memory) verdict is still contained at the dispatch site and leaves
+    // `Active` + a terminal VM + no failure class - exactly the state the pump
+    // refuses. This test drives that surviving vehicle, so the F4/F5 intent
+    // holds: the refusal is not a phantom fire, and the generation still dies.
     let data = temp_dir("foreign-suspend");
     let root = temp_dir("foreign-suspend-root");
     let id = PluginId::new("bitty-featured.foreign-suspend").expect("id");
@@ -841,6 +856,19 @@ fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
         "#,
     );
     let mut rt = runtime(data.clone(), vec![root.clone()]);
+    // Tighten only the instruction dimension, and far below the harness wall
+    // budget: instructions are counted exactly, so `while true do end` reaches
+    // this cap in ~2 ms against a 500 ms wall - a ~250x margin that holds on a
+    // loaded runner, unlike a timing-based overrun. The fixture's `init.lua`
+    // needs a few thousand instructions, so activation still fits (the same
+    // order of magnitude `plugin_budgets` uses for a tightened activation).
+    rt.set_budget_overrides(PluginBudgetFile {
+        default: BudgetValues {
+            fuel_instructions: Some(100_000),
+            ..BudgetValues::default()
+        },
+        ..PluginBudgetFile::default()
+    });
     rt.discover();
     rt.activate(&id).expect("activate");
     let deadline = rt.timer_deadline().expect("armed");
@@ -852,7 +880,12 @@ fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
         0,
         "the overrun event handler does not complete"
     );
-    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(
+        rt.state(&id),
+        Some(&LifecycleState::Active),
+        "an instruction verdict is not a wall slice: the dispatch site keeps the \
+         generation Active with a terminal VM"
+    );
     assert_eq!(rt.pump_due_timers_at(deadline), 0);
     let reason = match rt.state(&id) {
         Some(LifecycleState::Failed(reason)) => reason.clone(),
@@ -865,6 +898,10 @@ fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
     assert!(
         reason.contains("budget"),
         "refusal must still name the suspension budget: {reason}"
+    );
+    assert!(
+        reason.contains("RC-1 instructions"),
+        "the refusal names the suspension that caused it, not a timer overrun: {reason}"
     );
     assert_eq!(rt.timer_deadline(), None);
     assert_eq!(rt.pump_due_timers_at(deadline), 0);

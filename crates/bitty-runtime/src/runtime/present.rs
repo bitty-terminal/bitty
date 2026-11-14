@@ -2391,7 +2391,7 @@ impl Runtime {
     /// failed-present retry owns - clears it, so the embedder must arm this wake
     /// whether or not the surface is visible. That expiry is what gives a
     /// false-positive occlusion during a streaming burst its single bounded
-    /// speculative reopen at [`PRESENT_CONFIRM_BOUND`].
+    /// speculative reopen at `PRESENT_CONFIRM_BOUND`.
     #[must_use]
     pub fn present_confirm_deadline(&self) -> Option<std::time::Instant> {
         // A hide does not clear the bound: the deadline has to outlive the

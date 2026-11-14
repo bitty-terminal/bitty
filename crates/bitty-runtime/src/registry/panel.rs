@@ -621,11 +621,15 @@ struct PanelRecord {
     /// Most recently ended controller generation, retained across the unbind
     /// edge (OQ-084 D.2 phase 0).
     ///
-    /// `None` until the panel's first controller generation ends. Phase 0 uses
-    /// it to distinguish "never bound" (the first bind commits `R`) from "a
-    /// previous controller ended but its retired-ceiling tombstone is missing"
-    /// This is the predecessor read, not the live binding:
-    /// `controller_generation` names the binding in force now.
+    /// `None` until the panel's first controller generation ends, or until an
+    /// allocation-epoch edge ends a panel that had no controller at all. Phase 0
+    /// uses it to distinguish "never bound" (the first bind commits `R`) from "a
+    /// previous controller ended but its retired-ceiling tombstone is missing".
+    /// An edge that ended the allocation epoch instead of a binding leaves the
+    /// field as the last controller edge wrote it: the epoch is never a
+    /// controller generation (B.1/B.2), so it never replaces this value
+    /// (bitty#2476 residual 7(f)). This is the predecessor read, not the live
+    /// binding: `controller_generation` names the binding in force now.
     last_controller_generation: Option<Generation>,
     /// The plugin that owned the most recently ended controller generation,
     /// retained beside [`Self::last_controller_generation`] (OQ-084 A.2,
@@ -638,10 +642,13 @@ struct PanelRecord {
     /// field while no controller is bound: the binding is gone by then, so
     /// `record.owner()` no longer names the predecessor.
     ///
-    /// `None` before the first edge and on an edge that ended the allocation
-    /// epoch instead of a bound controller — an unbound panel has no owner to
-    /// stamp. Written and retained with `last_controller_generation`, never on
-    /// its own.
+    /// `None` before the first edge, after panel disposal, and on a panel whose
+    /// only ended edge is an allocation-epoch one — an edge that ended no
+    /// binding has no owner to stamp. An edge that ended the allocation epoch
+    /// after a controller edge stamps neither half of the pair, so it leaves
+    /// this field and `last_controller_generation` exactly as the controller
+    /// edge wrote them (bitty#2476 residual 7(f)). Written and retained with
+    /// `last_controller_generation`, never on its own.
     last_controller_owner: Option<bitty_plugin_host::PluginId>,
     /// The placeholder presented while no controller is bound (OQ-084 E,
     /// bitty#2476 residual 4).
@@ -2959,7 +2966,26 @@ impl PanelRegistry {
     /// unbound generation holds no live row at all, which is why the duplicate
     /// is detected from the retained `ended_generation` rather than from the
     /// presence of a row: absence alone cannot tell "held nothing" from
-    /// "already released".
+    /// "already released". An edge that kept a controller predecessor has no
+    /// tombstone of its own to be named by, so its repeat is recognised from the
+    /// [`GenerationReleaseRecord`] the first pass wrote.
+    ///
+    /// An edge that ended the allocation epoch ended no controller binding, so
+    /// it also leaves the record's controller predecessor pair — and the
+    /// tombstone stamped with that pair — exactly as the last controller edge
+    /// wrote them (bitty#2476 residual 7(f)). The epoch is never a controller
+    /// generation (B.1/B.2), so it is not a predecessor: overwriting
+    /// `(last_controller_owner, last_controller_generation)` with
+    /// `(None, epoch)` would destroy the only pair [`Self::panels_ended_at`] can
+    /// still yield the container by, and an epoch tombstone written over the
+    /// controller's would leave that pair unreadable at phase 0, so the
+    /// generation edge's successor could neither find the container nor rebind
+    /// it. Every other effect is the same for either edge: the live row keyed by
+    /// `generation` is removed, the queued events, commands and overlays are
+    /// drained, and the [`GenerationReleaseRecord`] is written. A panel with no
+    /// controller predecessor at all is the exception: the epoch edge is then
+    /// its first, ownerless predecessor, and that is the ceiling a never-bound
+    /// panel's first bind reads.
     ///
     /// The write fails closed: if the tombstone cannot be stored, the live row
     /// is kept, no other family is released, no previous-controller generation
@@ -3034,7 +3060,17 @@ impl PanelRegistry {
         let already_ended = if bound.is_some() {
             released_generation == generation && tombstone_names_generation
         } else {
-            tombstone_names_generation || last_ended == Some(generation)
+            tombstone_names_generation
+                || last_ended == Some(generation)
+                // A kept controller predecessor leaves no tombstone of the
+                // epoch edge's own and the retained pair names the controller,
+                // so neither test above recognises the epoch edge's repeat. The
+                // release record is the "an edge ran" marker the release always
+                // writes, whatever family it released (bitty#2476 7(f)).
+                || self
+                    .release_records
+                    .get(&panel_id)
+                    .is_some_and(|record| record.generation == generation)
         };
         if already_ended {
             // `A.2`'s phase-1 repeat: this edge ran, so there is nothing to
@@ -3042,9 +3078,15 @@ impl PanelRegistry {
             if let Some(record) = self.panels.get_mut(&panel_id.0) {
                 // The predecessor owner the first release stamped is not
                 // rewritten with the `None` the cleared binding now yields.
-                let ended_owner = bound_owner.or_else(|| record.last_controller_owner.clone());
-                record.last_controller_generation = Some(generation);
-                record.last_controller_owner = ended_owner;
+                // The rule is the first pass's (bitty#2476 residual 7(f)): an
+                // edge that ends no binding writes neither half, so a repeat
+                // epoch edge leaves a kept controller predecessor pair alone
+                // instead of mixing its generation with that edge's owner.
+                if bound.is_some() || record.last_controller_generation.is_none() {
+                    let ended_owner = bound_owner.or_else(|| record.last_controller_owner.clone());
+                    record.last_controller_generation = Some(generation);
+                    record.last_controller_owner = ended_owner;
+                }
                 record.release_controller_binding(generation);
             }
             return Ok(self.capabilities.remove(&(panel_id, generation)).is_some());
@@ -3070,22 +3112,51 @@ impl PanelRegistry {
         // bind from another plugin would then be refused as `CeilingLost`
         // against that phantom predecessor (bitty#2476 residual 7(a)).
         let ended_owner = bound_owner;
+        // bitty#2476 residual 7(f): whether this edge ends a bound controller.
+        // The binding-key check above proved `released_generation == generation`
+        // and that key is the binding's own generation when one is bound, so
+        // this is true exactly for the edge that ended a controller binding.
+        let ends_bound_controller = bound == Some(generation);
+        // An edge that ends the allocation epoch ends no binding, and the epoch
+        // is never a controller generation (B.1/B.2), so such an edge has no
+        // predecessor fact of its own to record. When the panel already carries
+        // one it must leave it alone: the pair
+        // `(last_controller_generation, last_controller_owner)` and the
+        // tombstone stamped with it are one fact (`N-13`: the owner is "written
+        // and retained with" the generation, never on its own), and once the
+        // release cleared the binding they are the only thing that still names
+        // the ended generation — [`Self::panels_ended_at`] is what the
+        // generation edge's successor bind enumerates. Overwriting them with
+        // `(None, epoch)` would hand the container to nobody, and a tombstone
+        // for the epoch would contradict the pair it left behind, so the
+        // successor's own bind would then be refused `CeilingLost` against a
+        // lost ceiling. The pair and its ceiling survive together or neither
+        // can be read. A panel that never bound a controller has no such
+        // predecessor: the epoch edge is its first, ownerless predecessor, and
+        // this edge stamps one.
+        let keeps_controller_predecessor = !ends_bound_controller && last_ended.is_some();
         // A controller generation that held no grant has no row; that is a
         // ceiling of `∅`, not an absent predecessor. Store the tombstone before
         // deleting the row so a failed write leaves the live row (and every
         // other family) in place.
-        if let Err(error) = self.retain_grant_ceiling(
-            panel_id,
-            ended_owner.as_ref(),
-            generation,
-            held.clone().unwrap_or_default(),
-        ) {
-            self.bump_error("RetiredCeilingTableFull");
-            return Err(error);
+        if !keeps_controller_predecessor {
+            if let Err(error) = self.retain_grant_ceiling(
+                panel_id,
+                ended_owner.as_ref(),
+                generation,
+                held.clone().unwrap_or_default(),
+            ) {
+                self.bump_error("RetiredCeilingTableFull");
+                return Err(error);
+            }
         }
         if let Some(record) = self.panels.get_mut(&panel_id.0) {
-            record.last_controller_generation = Some(generation);
-            record.last_controller_owner = ended_owner;
+            // Same edge, same reason: an epoch edge that keeps a controller
+            // predecessor writes neither half of the pair.
+            if !keeps_controller_predecessor {
+                record.last_controller_generation = Some(generation);
+                record.last_controller_owner = ended_owner;
+            }
             record.release_controller_binding(generation);
         }
         let grants = held.map_or(0, |set| set.len());
@@ -3197,8 +3268,10 @@ impl PanelRegistry {
 
     /// The plugin that owned the most recently ended controller generation
     /// (OQ-084 A.2, D.2 phase 0), or `None` before the first edge, after panel
-    /// disposal, and after an edge that ended the allocation epoch instead of a
-    /// bound controller.
+    /// disposal, and on a panel whose only ended edge is an allocation-epoch
+    /// one. An edge that ended no binding stamps no owner, and an edge that
+    /// ended the allocation epoch after a controller edge leaves that
+    /// controller's pair in place (bitty#2476 residual 7(f)).
     ///
     /// The tombstone this registry holds for the panel is stamped with the same
     /// owner, which is what makes a tombstone under another owner decidable as

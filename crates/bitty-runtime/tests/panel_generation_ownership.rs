@@ -47,15 +47,38 @@
 //! | Residual 7, per-owner retention | here — `a_tombstone_is_retained_for_the_owner_that_stamped_it` |
 //! | Residual 7(a), no owner on an epoch edge (bitty#2476) | here — `an_allocation_epoch_edge_retains_no_owner_from_the_previous_edge`, `a_bind_after_an_allocation_epoch_edge_is_not_measured_against_the_previous_owner` |
 //! | PGO-22(d) through the edge, no widening | here — `a_refused_edge_bind_leaves_the_container_unbound_without_widening_its_grants` |
+//! | PGO-6, reload racing a mount (bitty#2476 residual 9) | here — `a_mount_that_races_a_reload_commits_nothing_and_the_successor_mounts_cleanly` |
+//! | PGO-9, capability gate on a guessed `PanelId` (bitty#2476 residual 9) | here — `a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access`; the deny-by-default half is pinned by `tests/panel_rebind.rs:412`, `a_denied_plugin_presents_unavailable_and_stops_after_one_record` (a capability outside the committed resolution is refused at `require_panel_capability`) |
+//! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, MRU and focus, overlays, tombstone, counts, read with a second container left in the workspace so the MRU entry is observable) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment). The live **grant row** is not covered by either: no accessor reads it once the record is gone — see the first row's rustdoc for what that would take |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
 //! Still without a row in this crate: PGO-4/PGO-5/PGO-20 (crash and disable
-//! recovery driven by the plugin host), PGO-6 (reload racing a mount), PGO-9
-//! (`PanelId` guessing across every verb), PGO-11 (provider version records),
-//! PGO-13 (disposal reclaim against the PB-3 tolerance), and PGO-15 (verbs from
-//! a displaced generation, whose refusal variant the record and the fence do not
-//! yet spell the same way). Naming them here keeps the matrix honest about what
-//! it covers instead of implying all twenty-three rows live in one file.
+//! recovery driven by the plugin host). Two rows are named here with the seam
+//! that blocks them rather than implied covered:
+//!
+//! - **PGO-11** (provider version records): no production path presents
+//!   `incompatible` — `PlaceholderReason::Incompatible` has no producer
+//!   (`dispose_inner` passes only `Unloaded`/`Disabled`/`Reloaded`, and
+//!   `PanelRegistry::present_placeholder` takes the reason token from its
+//!   caller), and the only versioned provider record,
+//!   `PanelProviderManifest`, refuses every version other than 1 at
+//!   `registry/provider.rs:138`, so there is no newer-provider-over-older-record
+//!   direction and no tolerant reader to drive. The persisted panel manifest
+//!   (`bitty-ui/src/panel_persist.rs:367`) has a version gate and unknown-field
+//!   tolerance, but it carries identity, not provider content.
+//! - **PGO-15** (verbs from a displaced generation): only `mount_panel`
+//!   (`registry/panel.rs:1930`, fence call `:1952`) and `present_placeholder`
+//!   (`:2294`, fence call `:2348`) revalidate at use through
+//!   `panel_state_at_controller_fence` (`:1699`); every other verb resolves
+//!   through `get_panel`/`get_panel_mut` (`:1754`/`:1776`), which compares the
+//!   presented generation to the allocation epoch and answers `StaleHandle`, so
+//!   the row's "refused with `ControllerConflict`" does not hold for the whole
+//!   verb set. Its read half has no accessor either: queued events (`:1224`) and
+//!   the panel scene slot (`registry/host.rs:1217`) are keyed by panel, not by
+//!   generation.
+//!
+//! Naming them here keeps the matrix honest about what it covers instead of
+//! implying all twenty-three rows live in one file.
 //!
 //! # What these rows pin
 //!
@@ -79,10 +102,10 @@ use bitty_runtime::plugin_runtime::{
     PluginRuntimeConfig, SettingsSource, SnapshotSource, controller_generation,
 };
 use bitty_runtime::{
-    Generation, ViewId,
+    Generation, UiRect, ViewId,
     registry::{
-        PanelError, PanelId, PanelRegistry, PanelRegistryConfig, PanelRuntime, PanelType,
-        PlaceholderReason, WorkspaceId,
+        BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelId, PanelRegistry,
+        PanelRegistryConfig, PanelRuntime, PanelType, PlaceholderReason, WorkspaceId,
     },
 };
 
@@ -1039,5 +1062,544 @@ fn a_refused_edge_bind_leaves_the_container_unbound_without_widening_its_grants(
         granted_set(registry, panel, successor),
         empty(),
         "every verb from the successor generation is refused for want of a row"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bitty#2476 residual 9: PGO-6, PGO-9, PGO-13
+// ---------------------------------------------------------------------------
+//
+// The rows above drive the bind and the generation edge. These three drive the
+// third actor in the ownership model: a caller that is *not* the edge — a mount
+// that started before the edge ran, a plugin guessing another plugin's panel,
+// and the disposal that ends a container. All three go through production entry
+// points (`mount_panel`, `subscribe`/`publish`/`require_panel_capability`,
+// `dispose_panel`), not a test-only binder.
+
+/// PGO-6 (bitty#2476 residual 9): a mount that raced a reload commits nothing.
+///
+/// The reload disposes generation `N` and binds `N+1`; a mount issued while `N`
+/// was still the controller arrives afterwards. Two presentations reach the
+/// fence and both must fail closed:
+///
+/// - `N`, the generation the in-flight caller was driving — its binding ended,
+///   so the fence answers `ControllerReleased`;
+/// - the container's allocation epoch, the identity a caller held while the
+///   reload was still disposing `N` — the record binds `N+1` now, so the fence
+///   answers `ControllerConflict`.
+///
+/// The epoch arm is the one the pre-fence tree committed: `mount_panel`
+/// validated against the allocation epoch alone, so a mount that started before
+/// the edge succeeded after it and attached a view to a container another
+/// generation had just bound. The row's remaining claims are what the refusal
+/// owes: the racing view ends unbound, the panel keeps its pre-mount state, and
+/// the successor mounts cleanly on that same view afterwards.
+///
+/// Fails for the pre-fence tree (the epoch mount commits and the successor's
+/// mount then finds the view taken), for a fence that answers `StaleHandle` for
+/// a released controller generation instead of `ControllerReleased`, and for a
+/// refusal that writes the placement mirror or the panel state before refusing.
+#[test]
+fn a_mount_that_races_a_reload_commits_nothing_and_the_successor_mounts_cleanly() {
+    let (mut runtime, plugin, panels) = edge_fixture("mountrace", "acme.mountrace");
+    let (panel, epoch) = bound_container(&panels, &plugin, 8, 14);
+    let ended = controller_generation(1);
+    let successor = controller_generation(2);
+
+    // The container goes back to `Suspended` before the reload, so the race is
+    // decidable: a mount onto an attached panel is refused for being mounted,
+    // not for the generation it presents.
+    panels
+        .borrow_mut()
+        .unmount_panel(panel, epoch)
+        .expect("unmount before the reload");
+    let before = panels
+        .borrow()
+        .registry()
+        .panel_state(panel, epoch)
+        .expect("live container");
+
+    runtime.reload(&plugin).expect("reload");
+    assert_eq!(
+        panels.borrow().registry().controller_generation(panel),
+        Some(successor),
+        "the edge moved the binding, so a racing mount is measured against it"
+    );
+
+    let race_view = ViewId::new(21);
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .mount_panel(panel, ended, race_view)
+            .expect_err("a mount from the generation the reload disposed is refused"),
+        PanelError::ControllerReleased {
+            panel_id: panel,
+            released_generation: ended,
+        },
+        "the fence names the caller's own ended binding instead of a generic stale handle"
+    );
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .mount_panel(panel, epoch, race_view)
+            .expect_err(
+                "a mount carrying the allocation epoch is refused while a controller is bound"
+            ),
+        PanelError::ControllerConflict {
+            panel_id: panel,
+            bound_generation: Some(successor),
+            presented_generation: epoch,
+        },
+        "the epoch was the accepted key before the edge; afterwards the record binds N+1"
+    );
+
+    let host_ref = panels.borrow();
+    let registry = host_ref.registry();
+    assert_eq!(
+        registry.panel_state(panel, epoch).expect("live container"),
+        before,
+        "neither refused mount touched the panel state"
+    );
+    assert_eq!(
+        registry.panel_view(panel, epoch).expect("live container"),
+        None,
+        "the container keeps its pre-mount, unattached state"
+    );
+    assert_eq!(
+        host_ref.placement_panel_of(race_view),
+        None,
+        "the racing view ends unbound: no attachment map holds it"
+    );
+    assert_eq!(
+        host_ref.placement_len(),
+        0,
+        "and the refusing path bound no other view"
+    );
+    assert_eq!(
+        registry.controller_generation(panel),
+        Some(successor),
+        "the refusals moved no binding"
+    );
+    assert_eq!(
+        registry.error_count("ControllerReleased"),
+        1,
+        "the ended-binding arm ran exactly once"
+    );
+    assert_eq!(
+        registry.error_count("ControllerConflict"),
+        1,
+        "and the epoch arm ran exactly once"
+    );
+    drop(host_ref);
+
+    panels
+        .borrow_mut()
+        .mount_panel(panel, successor, race_view)
+        .expect("the successor generation mounts cleanly afterwards");
+    let host_ref = panels.borrow();
+    assert_eq!(
+        host_ref.placement_panel_of(race_view),
+        Some(panel),
+        "the view the racing mount was refused is usable by the generation that owns the panel"
+    );
+    assert_eq!(
+        host_ref.placement_view_of(panel),
+        Some(race_view),
+        "and the attachment belongs to the successor's mount"
+    );
+}
+
+/// PGO-9 (bitty#2476 residual 9): a guessed `PanelId` is answered at the grant
+/// gate, before any state is read.
+///
+/// Every capability-gated panel verb funnels through
+/// [`PanelRegistry::require_panel_capability`] — the two bus verbs call it
+/// directly, and `panel.create`, `panel.focus`, and `panel.overlay` are the same
+/// row's families — and the row is keyed `(PanelId, accepted generation)`. A
+/// caller that guesses a live `PanelId` therefore gets nothing:
+///
+/// - without a grant, every family is denied and the bus verbs queue nothing;
+/// - the denial precedes the record read: the same call for a `PanelId` that
+///   never existed answers `CapabilityDenied`, not `NotFound`, which a gate that
+///   resolved the panel first could not do;
+/// - with a grant, a verb naming *another generation* of the same panel is
+///   still denied while the accepted generation works — the lookup is
+///   generation-scoped, not panel-scoped.
+///
+/// Fails for a gate that resolves grants by panel alone (the foreign generation
+/// would inherit the granted row), for one that reads the record before checking
+/// the grant (a guessed id would answer `NotFound`), and for a denial that still
+/// publishes.
+#[test]
+fn a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access() {
+    let mut runtime = host();
+    let handle = runtime
+        .create_panel(PanelType::Helper, Some(WorkspaceId::new(9)))
+        .expect("create panel");
+    let epoch = handle.generation;
+    let topic = runtime.declare_topic("acme.notes:status").expect("topic");
+    let payload = BoundedPayload::try_new("busy").expect("payload");
+
+    // No grant: every capability-gated family is denied for the live panel.
+    assert!(matches!(
+        runtime.subscribe(handle.id, epoch, &topic),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+    assert!(matches!(
+        runtime.publish(handle.id, epoch, &topic, payload.clone()),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+    for capability in PANEL_FAMILY {
+        assert!(
+            matches!(
+                runtime
+                    .registry()
+                    .require_panel_capability(handle.id, epoch, capability),
+                Err(PanelError::CapabilityDenied { .. })
+            ),
+            "ungranted {capability} is denied"
+        );
+    }
+    assert_eq!(
+        runtime.bus_total_events(),
+        0,
+        "a denied verb queues nothing"
+    );
+
+    // Before any state access: an id that never existed is denied by the same
+    // gate, so no record lookup can have run for it.
+    let phantom = PanelId::new(handle.id.get() + 10_000);
+    assert!(
+        matches!(
+            runtime.subscribe(phantom, epoch, &topic),
+            Err(PanelError::CapabilityDenied { .. })
+        ),
+        "the gate answers before the record is resolved, so a guessed id is denied rather than NotFound"
+    );
+    assert!(matches!(
+        runtime
+            .registry()
+            .require_panel_capability(phantom, epoch, OVERLAY),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+
+    // Granted at the accepted key: the verb works there and nowhere else.
+    runtime
+        .grant_capability(handle.id, epoch, "panel.provider")
+        .expect("grant the bus capability at the accepted key");
+    runtime
+        .subscribe(handle.id, epoch, &topic)
+        .expect("the accepted generation subscribes");
+    let foreign = epoch.next().expect("a generation this panel never held");
+    assert!(
+        matches!(
+            runtime.subscribe(handle.id, foreign, &topic),
+            Err(PanelError::CapabilityDenied { .. })
+        ),
+        "another generation of the same panel inherits nothing from the granted row"
+    );
+    assert!(matches!(
+        runtime.publish(handle.id, foreign, &topic, payload.clone()),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+    runtime
+        .publish(handle.id, epoch, &topic, payload)
+        .expect("the accepted generation publishes");
+    assert_eq!(
+        runtime.bus_total_events(),
+        1,
+        "exactly the granted publish queued, so neither denial emitted"
+    );
+}
+
+/// PGO-13 (bitty#2476 residual 9): a disposal reclaims every registry-owned
+/// family it can be observed to own.
+///
+/// This is FS-P4's reclaim criterion read structurally. PB-3's tolerance is a
+/// wall-clock budget for a session that has recycled generations; the counts
+/// asserted here are the state a disposal either releases or leaks, so exact
+/// equality with the baseline is inside any non-negative tolerance. The
+/// container is disposed while it still holds a queue, a command, a live grant
+/// row, an MRU entry, and an attributed overlay — every registry-owned family
+/// the row names — and each is asserted non-baseline before the disposal, so the
+/// reclaimed assertion is not vacuous.
+///
+/// A second container shares the workspace, because the MRU entry is only
+/// observable while the bucket outlives the disposal: disposing the only panel
+/// empties the bucket, and `dispose_panel` then drops the whole focus tracker,
+/// so a disposal that never calls `PanelFocus::on_panel_hidden` reads exactly
+/// the same. Here the focused panel is disposed while a sibling stays in the
+/// bucket, so the tracker survives with the disposed `PanelId` still in it
+/// unless the call runs: without it `mru_order` answers `[disposed, sibling]`
+/// and `focused_panel` keeps naming the disposed panel.
+///
+/// The container never binds a controller here: on a bound panel the public
+/// verbs are addressed by the controller generation while `subscribe`, focus,
+/// and command registration validate the allocation epoch, so this is the one
+/// state in which all the families can coexist. The bound panel's disposal runs
+/// the same release for the controller key, which
+/// `tests/panel_grant_ceiling.rs:182` and `tests/panel_unbind_release.rs` cover.
+///
+/// Fails for a disposal that leaves any one family behind: the queue, the
+/// command, the MRU entry, the focus that entry carried, the attributed overlay,
+/// the workspace bucket, the dropped tombstone, or the panel count.
+///
+/// **Not covered here, and not claimed:** a live grant row that survives the
+/// disposal. [`PanelRegistry::is_panel_capability_granted`] resolves its key
+/// through the panel record (`resolved_grant_generation`), and `dispose_panel`
+/// removes the record, so it answers `false` for a leaked row exactly as it does
+/// for a released one. Deleting both removals of the row —
+/// `release_generation_scope`'s `self.capabilities.remove(&(panel_id, generation))`
+/// and the epoch sweep in `sweep_allocation_epoch_families` — leaves the row in
+/// the table and this row green. The panel id is never reused
+/// (`next_panel_raw` is monotonic), so no later container can expose it either.
+/// Seeing that leak needs a public accessor for the live grant rows by
+/// `PanelId` — a `live_grant_row_count(panel_id)` or a raw row read — which the
+/// registry does not expose. The two `is_panel_capability_granted` assertions
+/// below are the accessor's post-disposal answer only, never evidence that the
+/// row went.
+#[test]
+fn a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline() {
+    let mut reg = registry();
+    let ws = WorkspaceId::new(21);
+    let view = ViewId::new(41);
+    let sibling_view = ViewId::new(42);
+    let command = "acme.notes:open";
+    let topic = reg.declare_topic("acme.notes:status").expect("topic");
+
+    // Baseline: what a session holds with no container of this kind.
+    assert_eq!(reg.panel_count(), 0);
+    assert_eq!(reg.attributed_workspace_count(), 0);
+    assert_eq!(reg.bus_total_events(), 0);
+    assert_eq!(reg.attributed_overlay_count(), 0);
+    assert_eq!(reg.overlay_len(), 0);
+    assert_eq!(reg.retained_grant_ceiling_count(), 0);
+    assert!(reg.command_owner(command).is_none());
+
+    let handle = reg
+        .create_panel(PanelType::Rich, Some(ws))
+        .expect("create panel");
+    let epoch = handle.generation;
+    reg.mount_panel(handle.id, epoch, view)
+        .expect("mount panel");
+    reg.grant_panel_capability(handle.id, epoch, CREATE)
+        .expect("grant create");
+    reg.grant_panel_capability(handle.id, epoch, "panel.provider")
+        .expect("grant the bus capability");
+    reg.register_command(handle.id, epoch, command)
+        .expect("register command");
+    reg.focus_panel(handle.id, epoch, ws).expect("focus panel");
+    reg.subscribe(handle.id, epoch, &topic)
+        .expect("subscribe the panel");
+    reg.publish(&topic, BoundedPayload::try_new("busy").expect("payload"))
+        .expect("publish to the subscriber");
+    let overlay = reg
+        .create_panel_overlay(
+            handle.id,
+            epoch,
+            OverlayKind::NonModal,
+            UiRect::new(0, 0, 30, 8),
+            "note",
+            None,
+        )
+        .expect("attributed overlay");
+
+    // The sibling keeps the workspace bucket alive across the disposal, which is
+    // what makes the MRU assertion below able to fail. Focus ends on `handle`,
+    // so the disposed panel is the one the tracker has to forget and repoint.
+    let sibling = reg
+        .create_panel(PanelType::Helper, Some(ws))
+        .expect("create the sibling panel");
+    let sibling_epoch = sibling.generation;
+    reg.mount_panel(sibling.id, sibling_epoch, sibling_view)
+        .expect("mount the sibling panel");
+    reg.focus_panel(sibling.id, sibling_epoch, ws)
+        .expect("focus the sibling");
+    reg.focus_panel(handle.id, epoch, ws)
+        .expect("focus the disposed panel again");
+
+    // The container really holds every family before the disposal.
+    assert_eq!(reg.panel_count(), 2, "the sibling is live too");
+    assert_eq!(reg.attributed_workspace_count(), 1);
+    assert_eq!(
+        reg.mru_order(ws),
+        vec![handle.id, sibling.id],
+        "both containers hold an MRU entry, the disposed one first"
+    );
+    assert_eq!(reg.focused_panel(ws), Some(handle.id));
+    assert_eq!(reg.panels_for_workspace(ws), vec![handle.id, sibling.id]);
+    assert_eq!(reg.command_owner(command), Some(handle.id));
+    assert_eq!(reg.bus_events_for_panel(handle.id), 1);
+    assert_eq!(reg.attributed_overlay_count(), 1);
+    assert!(reg.is_panel_capability_granted(handle.id, epoch, CREATE));
+
+    reg.dispose_panel(handle.id, epoch).expect("dispose panel");
+
+    assert_eq!(
+        reg.panel_count(),
+        1,
+        "the disposed container count drops and the sibling stays"
+    );
+    assert_eq!(
+        reg.attributed_workspace_count(),
+        1,
+        "the workspace bucket outlives the disposed panel while the sibling is in it"
+    );
+    assert_eq!(
+        reg.mru_order(ws),
+        vec![sibling.id],
+        "the MRU entry goes with the container even though the bucket stays"
+    );
+    assert_eq!(
+        reg.focused_panel(ws),
+        Some(sibling.id),
+        "focus moves to the next MRU entry instead of naming the disposed panel"
+    );
+    assert_eq!(
+        reg.panels_for_workspace(ws),
+        vec![sibling.id],
+        "the workspace bucket no longer names the disposed panel"
+    );
+    assert_eq!(
+        reg.command_owner(command),
+        None,
+        "the command the panel registered is unregistered"
+    );
+    assert_eq!(
+        reg.bus_events_for_panel(handle.id),
+        0,
+        "the panel's queue is drained"
+    );
+    assert_eq!(reg.bus_total_events(), 0, "and nothing else is left queued");
+    assert_eq!(
+        reg.attributed_overlay_count(),
+        0,
+        "the attributed overlay is dismissed with its attribution"
+    );
+    assert!(reg.overlay_attribution_of(overlay).is_none());
+    assert_eq!(reg.overlay_len(), 0, "no surface outlives the container");
+    // The record is what resolves the key, so this is the accessor's
+    // post-disposal answer, not a read of the grant table (see the rustdoc).
+    assert!(
+        !reg.is_panel_capability_granted(handle.id, epoch, CREATE),
+        "the retired handle resolves no grant"
+    );
+    assert!(!reg.is_panel_capability_granted(handle.id, epoch, "panel.provider"));
+    assert_eq!(
+        reg.retained_grant_ceiling_count(),
+        0,
+        "the tombstone the disposal's own release wrote is dropped with the container"
+    );
+    assert!(reg.retained_grant_ceiling(handle.id).is_none());
+    assert_eq!(
+        reg.unbind_release_record_count(),
+        0,
+        "no release record outlives the container either"
+    );
+    assert!(reg.panel_disposal_facts(handle.id).is_none());
+    assert!(
+        matches!(
+            reg.panel_state(handle.id, epoch),
+            Err(PanelError::NotFound { .. })
+        ),
+        "the retired handle names nothing"
+    );
+
+    // The last panel of the workspace takes the bucket and the tracker with it,
+    // so the pre-creation baseline is reached by the per-container reclaim and
+    // not by the sibling's presence hiding a leak.
+    reg.dispose_panel(sibling.id, sibling_epoch)
+        .expect("dispose the sibling");
+    assert_eq!(
+        reg.panel_count(),
+        0,
+        "the container count returns to baseline"
+    );
+    assert_eq!(
+        reg.attributed_workspace_count(),
+        0,
+        "the workspace bucket went with its last panel"
+    );
+    assert_eq!(reg.mru_order(ws), Vec::new(), "and the MRU with it");
+    assert_eq!(reg.focused_panel(ws), None, "and it holds no focus");
+}
+
+/// PGO-13, the half the facade owns: the lease entry and the live placement
+/// mirror of the view attachment are released with the container.
+///
+/// Neither family lives in the registry: the lease table and the `Placement`
+/// mirror are `PanelRuntime` state, and C.8's `Focused -> Disposed` requires
+/// both to go. A live handle cannot observe its own lease after disposal,
+/// because the handle is retired, so the lease is read the one way a leak is
+/// still visible: the sweep walks every entry the table holds. A tenure that
+/// outlived its container comes back from [`PanelRuntime::sweep_expired_leases`]
+/// — that is the reclaim the disposal owes, not a `NotFound` from a record that
+/// is gone either way.
+///
+/// Fails for a disposal that retires the record but leaves the facade's mirrors:
+/// `PanelRuntime::dispose_panel` must release them after the registry commit the
+/// way the workspace sweep does, or the placement map keeps a view bound to a
+/// container that no longer exists and the lapsed tenure is still there for the
+/// next tick to sweep.
+#[test]
+fn a_disposal_releases_the_lease_entry_and_the_placement_mirror() {
+    let mut runtime = host();
+    let view = ViewId::new(42);
+    let handle = runtime
+        .create_panel(PanelType::Helper, Some(WorkspaceId::new(22)))
+        .expect("create panel");
+    let epoch = handle.generation;
+    runtime
+        .mount_panel(handle.id, epoch, view)
+        .expect("mount panel");
+    // A tenure that lapses after the disposal, so the sweep is the observer: an
+    // entry the disposal should have removed is exactly what it would return.
+    runtime
+        .acquire_panel_lease(handle.id, epoch, LeaseHolder(7), 30, 1_000)
+        .expect("acquire lease");
+
+    assert_eq!(runtime.panel_count(), 1);
+    assert_eq!(runtime.placement_len(), 1);
+    assert_eq!(runtime.placement_view_of(handle.id), Some(view));
+    assert!(
+        matches!(
+            runtime
+                .panel_lease_state(handle.id, epoch)
+                .expect("lease state"),
+            LeaseState::Occupied { .. }
+        ),
+        "the tenure exists before the disposal"
+    );
+
+    runtime
+        .dispose_panel(handle.id, epoch)
+        .expect("dispose panel");
+
+    assert_eq!(
+        runtime.panel_count(),
+        0,
+        "the container count returns to baseline"
+    );
+    assert_eq!(
+        runtime.placement_len(),
+        0,
+        "no placement mirror outlives the container"
+    );
+    assert_eq!(runtime.placement_view_of(handle.id), None);
+    assert_eq!(
+        runtime.placement_panel_of(view),
+        None,
+        "the view is unbound, not pointed at a retired container"
+    );
+    assert!(
+        runtime.sweep_expired_leases(1_031).is_empty(),
+        "the tenure the container held went with it: a leaked entry is what the first sweep would return"
+    );
+    assert!(
+        matches!(
+            runtime.panel_lease_state(handle.id, epoch),
+            Err(PanelError::NotFound { .. })
+        ),
+        "and the retired handle cannot name a live tenure"
     );
 }

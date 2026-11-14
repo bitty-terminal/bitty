@@ -480,6 +480,6 @@ MODCARGO_CRATES =	ab_glyph-0.2.32 \
 	bitty-platform-services@git+https://github.com/bitty-terminal/bitty-platform-services?rev=7c6b84b\#7c6b84b795b02afde5f4507f3f5a25d8474bf8fe \
 	bitty-storage@git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177\#7bf5177c668fb72ec683c7cb8270049f6400f204 \
 	bitty-url-detector@git+https://github.com/bitty-terminal/bitty-url-detector?rev=be035a0\#be035a0612617ee88fbfbc24ff4c2fb079f9cd7b \
-	phodopus,phodopus-gc-arena,phodopus-gc-arena-derive@git+https://github.com/bitty-terminal/phodopus?rev=91b8a2c\#91b8a2ceb77994aeaf3f8485862a400671bbed5e
+	phodopus,phodopus-gc-arena,phodopus-gc-arena-derive@git+https://github.com/bitty-terminal/phodopus?rev=f3d6a9b\#f3d6a9b8ecdf829629daa688a4adbe08259b1b81
 
 .include <bsd.port.mk>

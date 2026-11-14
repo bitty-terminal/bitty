@@ -505,11 +505,13 @@ pub struct ChromeBands {
     pub top: Vec<BandContent>,
     /// Bottom edge bands (index `0` at the window bottom, stacking upward).
     pub bottom: Vec<BandContent>,
-    /// Left edge bands (unused: no vertical band host yet; `left` mounts
-    /// fail closed at mount time under CTX-1341).
+    /// Left edge bands (index `0` at the window left, stacking rightward).
+    /// Column bands: one content row per root child, width from the scene
+    /// (issue #3165).
     pub left: Vec<BandContent>,
-    /// Right edge bands (unused: no vertical band host yet; `right` mounts
-    /// fail closed at mount time under CTX-1341).
+    /// Right edge bands (index `0` at the window right, stacking leftward).
+    /// Column bands: one content row per root child, width from the scene
+    /// (issue #3165).
     pub right: Vec<BandContent>,
 }
 
@@ -518,9 +520,8 @@ pub struct ChromeBands {
 pub struct BandContent {
     /// Owning plugin id.
     pub plugin_id: String,
-    /// Accepted slot the block was mounted into (`top` or `bottom`;
-    /// `left`/`right` fail closed at mount until vertical bands ship; see
-    /// [`band_slots`]).
+    /// Accepted slot the block was mounted into (`top`, `bottom`, `left`, or
+    /// `right`; see [`band_slots`] for the placement and band-axis policy).
     pub slot: bitty_lua::ui::UiSlot,
     /// Root UiNode tree.
     pub root: bitty_lua::ui::UiNode,
@@ -1033,8 +1034,9 @@ pub struct Runtime {
     ///
     /// Populated from `PluginRuntime::ui_blocks()` each tick after plugin
     /// runtime tick, before present. Bands are reserved for plugins that
-    /// mount `UiNode` trees to top/bottom slots via `bitty.ui.mount(slot,
-    /// tree)`; left/right mounts fail closed until vertical bands ship.
+    /// mount `UiNode` trees to the band slots via `bitty.ui.mount(slot,
+    /// tree)`: `top`/`bottom` are row bands and `left`/`right` are column
+    /// bands (issue #3165).
     /// Empty edges reserve no band. The
     /// container rect is computed from window_cells minus all reserved bands.
     /// Presentation-only: never grid truth.

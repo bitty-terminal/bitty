@@ -98,11 +98,13 @@ pub enum UiSlot {
     Top,
     /// `bottom` — bottom edge band.
     Bottom,
-    /// `left` — left edge band slot (no vertical band host yet; the mount
-    /// gate fails closed with `E_UI_UNAVAILABLE`).
+    /// `left` — left edge band slot. The host presents it as a column band
+    /// (issue #3165): the root must be column-shaped, so a row-shaped root
+    /// fails closed with `E_UI_COMPONENT_INVALID`.
     Left,
-    /// `right` — right edge band slot (no vertical band host yet; the mount
-    /// gate fails closed with `E_UI_UNAVAILABLE`).
+    /// `right` — right edge band slot. The host presents it as a column band
+    /// (issue #3165): the root must be column-shaped, so a row-shaped root
+    /// fails closed with `E_UI_COMPONENT_INVALID`.
     Right,
     /// `tabline` — exclusive-claim tab strip (reserved for panel tabs).
     Tabline,
@@ -348,6 +350,11 @@ impl std::fmt::Display for UiAnchor {
 /// row of known width. Every other mount (the focusable overlay, a future
 /// terminal-attached block) has no row to resolve against, so an `anchor`
 /// there is rejected at parse time instead of being silently ignored.
+///
+/// Issue #3165: a `left`/`right` column band is *not* a `Band` scope. Its rows
+/// are sized from the band's own width, so a group anchor has no presented row
+/// to resolve against; those mounts are validated as [`Self::Unanchored`] and
+/// an `anchor` there is a parse error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiSceneScope {
     /// A horizontal band slot (`top`/`bottom`): root-`Row` child anchors

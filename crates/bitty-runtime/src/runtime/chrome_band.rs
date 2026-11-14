@@ -126,6 +126,35 @@ pub fn min_container_rows(gaps_out_cells: u16, decoration_px: f64, cell_h: u32) 
     )
 }
 
+/// Effective minimum container columns before a vertical band may be
+/// reserved (issue #3165): the [`MIN_CONTENT_COLS`] content floor plus the
+/// outer cell gap on both sides (`layout.gaps_out`) plus the horizontal
+/// pixel decoration (`decoration_px`, both sides summed, at the live DPI
+/// scale) rounded up to whole columns at the live cell width `cell_w`.
+///
+/// The column mirror of [`min_container_rows`], so a reserved `left`/`right`
+/// band never leaves a leaf with zero content columns. Total and saturating;
+/// a zero `cell_w` counts the decoration as no columns.
+#[must_use]
+pub fn min_container_cols(gaps_out_cells: u16, decoration_px: f64, cell_w: u32) -> u16 {
+    let gaps = u32::from(gaps_out_cells).saturating_mul(2);
+    let deco_cols = if cell_w == 0 || !decoration_px.is_finite() || decoration_px <= 0.0 {
+        0
+    } else {
+        let cols = (decoration_px / f64::from(cell_w)).ceil();
+        if cols >= f64::from(u16::MAX) {
+            u32::from(u16::MAX)
+        } else {
+            cols as u32
+        }
+    };
+    saturate_u16(
+        u32::from(MIN_CONTENT_COLS)
+            .saturating_add(gaps)
+            .saturating_add(deco_cols),
+    )
+}
+
 /// Solved chrome geometry for one window grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeLayout {
@@ -246,6 +275,19 @@ mod tests {
         assert_eq!(min_container_rows(0, 28.0, 0), MIN_CONTENT_ROWS);
         assert_eq!(min_container_rows(0, f64::NAN, 22), MIN_CONTENT_ROWS);
         assert_eq!(min_container_rows(u16::MAX, 1e30, 1), u16::MAX);
+    }
+
+    #[test]
+    fn min_container_cols_counts_gaps_and_decoration() {
+        // Issue #3165: the column floor mirrors the row floor, so a vertical
+        // band is degraded away before it can leave a leaf at zero columns.
+        assert_eq!(min_container_cols(0, 0.0, 11), MIN_CONTENT_COLS);
+        // 2 * (6 + 2 + 6) px = 28 px at an 11 px cell rounds up to 3 columns.
+        assert_eq!(min_container_cols(0, 28.0, 11), MIN_CONTENT_COLS + 3);
+        assert_eq!(min_container_cols(1, 0.0, 11), MIN_CONTENT_COLS + 2);
+        assert_eq!(min_container_cols(0, 28.0, 0), MIN_CONTENT_COLS);
+        assert_eq!(min_container_cols(0, f64::NAN, 11), MIN_CONTENT_COLS);
+        assert_eq!(min_container_cols(u16::MAX, 1e30, 1), u16::MAX);
     }
 
     #[test]

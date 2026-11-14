@@ -49,7 +49,10 @@ use bitty_ui::{MAX_HINT_TARGETS, MAX_SNAPSHOT_TARGETS, MAX_TARGET_BINDINGS, MAX_
 use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_host::band_is_visible;
-use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
+use crate::runtime::band_slots::{
+    UiSlotPlacement, band_scene_direction_error, band_scene_matches, ui_slot_placement,
+    unsupported_slot_error,
+};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use crate::runtime::pane_cwd::PaneCwd;
 use bitty_plugin_host::{
@@ -6623,10 +6626,20 @@ impl HostServices for PluginServices {
         // CTX-0923: an accepted slot this host does not present fails closed
         // here, after the capability and claim gates, through the same
         // placement policy the band routing uses, so nothing is admitted and
-        // then silently dropped at render time. CTX-1341: this includes
-        // `left`/`right`, which have no vertical band host yet.
-        if let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(ui_slot) {
-            return Err(unsupported_slot_error(ui_slot, reason));
+        // then silently dropped at render time.
+        // Issue #3165: `left`/`right` are served by the vertical band host,
+        // so the placement gate admits them and the band-axis gate below
+        // decides whether this component can be stacked in that band.
+        match ui_slot_placement(ui_slot) {
+            UiSlotPlacement::Unsupported(reason) => {
+                return Err(unsupported_slot_error(ui_slot, reason));
+            }
+            UiSlotPlacement::Band(edge) => {
+                if !band_scene_matches(edge, component) {
+                    return Err(band_scene_direction_error(ui_slot, edge, component));
+                }
+            }
+            UiSlotPlacement::Overlay => {}
         }
         self.ui_blocks
             .borrow_mut()
@@ -6712,6 +6725,11 @@ impl HostServices for PluginServices {
             .borrow()
             .get(handle)
             .map(|block| match block.ui_slot() {
+                // Row bands are the only surfaces with a presented row width
+                // that resolves a declared group anchor. Issue #3165: a
+                // `left`/`right` column band sizes each row from the band, so
+                // an `anchor` there stays invalid (`Unanchored`) instead of
+                // being silently ignored.
                 UiSlot::Top | UiSlot::Bottom => UiSceneScope::Band,
                 _ => UiSceneScope::Unanchored,
             })
@@ -6720,6 +6738,20 @@ impl HostServices for PluginServices {
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
         if !self.ui_access.borrow().rich {
             return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        // Issue #3165: an update replaces a mounted band scene, so it must
+        // pass the same band-axis gate the mount did — otherwise a `left`
+        // band could be updated into a row-shaped root that has no rows to
+        // stack. A stale or foreign handle keeps the documented `Ok(false)`
+        // contract and is reported by the registry below.
+        let placement = self.ui_blocks.borrow().get(handle).map(|block| {
+            let slot = block.ui_slot();
+            (slot, ui_slot_placement(slot))
+        });
+        if let Some((slot, UiSlotPlacement::Band(edge))) = placement {
+            if !band_scene_matches(edge, component) {
+                return Err(band_scene_direction_error(slot, edge, component));
+            }
         }
         self.ui_blocks
             .borrow_mut()
@@ -10363,9 +10395,68 @@ mod tests {
                 }
             }
         }
-        // top, bottom, overlay; left/right/tabline/terminal fail closed
-        // (CTX-1341: no vertical band host, so no vertical block is retained).
-        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 3));
+        // top, bottom, left, right, overlay. `left`/`right` are served by the
+        // vertical band host (issue #3165); `tabline`/`terminal` still fail
+        // closed (CTX-1341 kept only the slots this host cannot present).
+        services.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 5));
+    }
+
+    #[test]
+    fn vertical_band_slots_refuse_a_row_shaped_scene_on_mount_and_update() {
+        // Issue #3165 acceptance 2: a column band cannot stack a horizontal
+        // scene, so the mount gate and the update gate both answer with the
+        // accepted component-error code instead of storing a block the paint
+        // path would clip. A column scene passes both.
+        let services = ui_services(rich_only());
+        let column = || {
+            UiNode::column(vec![
+                UiNode::text("cpu 42%"),
+                UiNode::row(vec![UiNode::text("mem "), UiNode::text("30%")]),
+            ])
+        };
+        let row = || UiNode::row(vec![UiNode::text("cpu"), UiNode::text("mem")]);
+        for slot in ["left", "right"] {
+            let error = services
+                .ui_mount(slot, &row())
+                .expect_err("a row-shaped root cannot fill a column band");
+            assert_eq!(error.class, "validation", "{slot}");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID", "{slot}");
+            assert!(error.message.contains(slot), "{}", error.message);
+            assert!(error.message.contains("'Row'"), "{}", error.message);
+            services.with_ui_blocks(|blocks| assert!(blocks.is_empty(), "{slot} stored nothing"));
+        }
+
+        let handle = services
+            .ui_mount("left", &column())
+            .expect("column scene mounts");
+        services.with_ui_blocks(|blocks| {
+            let block = blocks.get(handle).expect("block retained");
+            assert_eq!(block.version(), 1);
+        });
+        // A mismatched replacement is refused and leaves the last good scene.
+        let error = services
+            .ui_update(handle, &row())
+            .expect_err("an update cannot swap the band axis");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        services.with_ui_blocks(|blocks| {
+            let block = blocks.get(handle).expect("block retained");
+            assert_eq!(block.version(), 1, "refused update commits nothing");
+            assert_eq!(block.node(), &column());
+        });
+        // The matching update is served.
+        assert!(
+            services
+                .ui_update(handle, &column())
+                .expect("column update served")
+        );
+        // Row bands keep accepting a row-shaped root (behaviour unchanged).
+        services
+            .ui_mount("top", &row())
+            .expect("a row band still takes a row root");
+        // And still accept the (`Column`/`List`) roots they always flattened.
+        services
+            .ui_mount("bottom", &column())
+            .expect("a row band still takes a column root");
     }
 
     #[test]

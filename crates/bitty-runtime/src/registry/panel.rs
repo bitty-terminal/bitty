@@ -2997,29 +2997,29 @@ impl PanelRegistry {
         // is bound, or a generation the panel has already left behind, is
         // refused before any family is touched rather than releasing the wrong
         // row.
-        let (
-            released_generation,
-            bound,
-            last_ended,
-            allocation_epoch,
-            bound_owner,
-            last_ended_owner,
-        ) = match self.panels.get(&panel_id.0) {
-            Some(record) => (
-                record.grant_key_generation(),
-                record.controller_generation(),
-                record.last_controller_generation,
-                record.generation,
-                record.owner().cloned(),
-                record.last_controller_owner.clone(),
-            ),
-            None => {
-                return Err(PanelError::NotFound {
-                    kind: "panel",
-                    id_raw: panel_id.0,
-                });
-            }
-        };
+        // `record.last_controller_owner` is deliberately not read here. The
+        // owner this edge retains is the owner of the binding *this* edge ends,
+        // so it comes from the live binding alone (`bound_owner`); an edge that
+        // ends the allocation epoch ended no binding and owns nothing. Reading
+        // the record's retained owner would copy an earlier edge's owner
+        // forward (bitty#2476 residual 7(a)); the repeat branch below needs
+        // that retained value but reads it from the record itself.
+        let (released_generation, bound, last_ended, allocation_epoch, bound_owner) =
+            match self.panels.get(&panel_id.0) {
+                Some(record) => (
+                    record.grant_key_generation(),
+                    record.controller_generation(),
+                    record.last_controller_generation,
+                    record.generation,
+                    record.owner().cloned(),
+                ),
+                None => {
+                    return Err(PanelError::NotFound {
+                        kind: "panel",
+                        id_raw: panel_id.0,
+                    });
+                }
+            };
         // `A.2`'s phase-1 repeat has to be decided from the *presented*
         // generation, before the binding-key check: the first release clears the
         // binding, so the repeat would otherwise be measured against the
@@ -3062,9 +3062,14 @@ impl PanelRegistry {
         // OQ-084 A.2: the tombstone is stamped with the owner of the binding
         // this edge ends, read from the record **before** the binding is
         // released — after the release the record can no longer name it. An
-        // edge that ends the allocation epoch has no owner, so it retains the
-        // `None` this write is keyed under.
-        let ended_owner = bound_owner.or(last_ended_owner);
+        // edge that ends the allocation epoch ends no binding, so it has no
+        // owner to stamp and retains `None`, which is the field's contract
+        // ([`PanelRecord::last_controller_owner`]). Carrying an earlier edge's
+        // owner forward would key the record and the `(owner, PanelId, N)`
+        // tombstone under a plugin this edge never had, and the next legitimate
+        // bind from another plugin would then be refused as `CeilingLost`
+        // against that phantom predecessor (bitty#2476 residual 7(a)).
+        let ended_owner = bound_owner;
         // A controller generation that held no grant has no row; that is a
         // ceiling of `∅`, not an absent predecessor. Store the tombstone before
         // deleting the row so a failed write leaves the live row (and every

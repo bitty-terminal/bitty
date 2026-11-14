@@ -694,34 +694,6 @@ fn create_private_lock_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn publish_lock_owner(lock_dir: &Path, owner_file: &Path, pid: u32) -> std::io::Result<()> {
-    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_owner = lock_dir.join(format!("owner.tmp.{pid}.{seq}"));
-    let write_res = (|| -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(WHEEL_FILE_MODE)
-                .open(&tmp_owner)?;
-            file.write_all(format!("{pid}\n").as_bytes())?;
-            file.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp_owner, format!("{pid}\n"))?;
-        }
-        std::fs::rename(&tmp_owner, owner_file)
-    })();
-    if write_res.is_err() {
-        let _ = std::fs::remove_file(&tmp_owner);
-    }
-    write_res
-}
-
 fn remove_lock_dir_contents(dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.take(16).flatten() {
@@ -731,122 +703,116 @@ fn remove_lock_dir_contents(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-struct ReclaimLockGuard {
-    reclaim_dir: std::path::PathBuf,
-    owner_file: std::path::PathBuf,
-}
-
-impl Drop for ReclaimLockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.owner_file);
-        remove_lock_dir_contents(&self.reclaim_dir);
-    }
-}
-
-impl ReclaimLockGuard {
-    fn try_acquire(dir: &Path, pid: u32) -> Option<Self> {
-        let reclaim_dir = dir.join(".approvals.reclaim.lock");
-        let owner_file = reclaim_dir.join("owner");
-        if create_private_lock_dir(&reclaim_dir).is_err() {
-            let stale_reclaim = match read_lock_owner_pid(&owner_file) {
-                Some(reclaim_pid) => !is_lock_owner_alive(reclaim_pid),
-                None => std::fs::symlink_metadata(&reclaim_dir)
-                    .and_then(|m| m.modified())
-                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
-                    .is_ok_and(|age| {
-                        age >= std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 8)
-                    }),
-            };
-            if stale_reclaim {
-                let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let stale_dir = dir.join(format!(".approvals.reclaim.stale.{pid}.{seq}"));
-                if std::fs::rename(&reclaim_dir, &stale_dir).is_ok() {
-                    remove_lock_dir_contents(&stale_dir);
-                }
-            }
-            if create_private_lock_dir(&reclaim_dir).is_err() {
-                return None;
-            }
+/// Create a private staging directory and populate its unique `owner.<token>` file
+/// before the lock directory is ever published at `.approvals.lock`.
+fn prepare_staged_lock_dir(
+    stage_dir: &Path,
+    owner_filename: &str,
+    pid: u32,
+) -> std::io::Result<()> {
+    create_private_lock_dir(stage_dir)?;
+    let staged_owner = stage_dir.join(owner_filename);
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(WHEEL_FILE_MODE)
+                .open(&staged_owner)?;
+            file.write_all(format!("{pid}\n").as_bytes())?;
+            file.sync_all()
         }
-        if publish_lock_owner(&reclaim_dir, &owner_file, pid).is_err() {
-            remove_lock_dir_contents(&reclaim_dir);
-            return None;
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&staged_owner, format!("{pid}\n"))
         }
-        Some(Self {
-            reclaim_dir,
-            owner_file,
-        })
+    })();
+    if write_res.is_err() {
+        remove_lock_dir_contents(stage_dir);
     }
+    write_res
 }
 
-/// Atomically reclaim a dead-owner or interrupted ownerless `.approvals.lock`
-/// while preserving lock identity so a replacement lock is never deleted.
-fn try_reclaim_stale_lock(dir: &Path, lock_dir: &Path, owner_file: &Path, pid: u32) -> bool {
-    let Some(_reclaim_guard) = ReclaimLockGuard::try_acquire(dir, pid) else {
+/// Atomically publish a populated `stage_dir` to `lock_dir`.
+///
+/// On Unix, `rename(stage_dir, lock_dir)` succeeds only when `lock_dir` does not
+/// exist or is an empty directory, and fails with `ENOTEMPTY`/`EEXIST` whenever
+/// `lock_dir` already contains another holder's `owner*` file.
+fn publish_staged_lock_dir(stage_dir: &Path, lock_dir: &Path) -> bool {
+    std::fs::rename(stage_dir, lock_dir).is_ok()
+}
+
+/// Reclaim a dead-owner or empty `.approvals.lock` without renaming `lock_dir`.
+///
+/// Reclamation only unlinks the specific dead `owner.<token>` file observed in
+/// `lock_dir` and then calls `remove_dir(lock_dir)`, which the OS kernel
+/// guarantees fails with `ENOTEMPTY` if another contender has already published
+/// a replacement lock containing a different `owner.<new_token>` entry.
+fn try_reclaim_stale_lock_with_hook<R>(lock_dir: &Path, before_reclaim_unlink: &mut R) -> bool
+where
+    R: FnMut(&Path),
+{
+    if std::fs::remove_dir(lock_dir).is_ok() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(lock_dir) else {
         return false;
     };
-    let expected_dead_owner = match read_lock_owner_pid(owner_file) {
-        Some(owner_pid) => {
+    let mut unlinked_dead_entry = false;
+    for entry in entries.take(16).flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == "owner" {
+            let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
+                continue;
+            };
             if is_lock_owner_alive(owner_pid) {
                 return false;
             }
-            Some(owner_pid)
-        }
-        None => {
-            // Coordinate with a concurrent acquirer that just created `lock_dir`
-            // and is in the middle of publishing `owner`.
-            std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 2));
-            if std::fs::symlink_metadata(lock_dir).is_err() {
+            let tagged_path = lock_dir.join(format!("owner.dead.{owner_pid}"));
+            if std::fs::rename(&entry_path, &tagged_path).is_ok() {
+                if read_lock_owner_pid(&tagged_path) == Some(owner_pid) {
+                    before_reclaim_unlink(&tagged_path);
+                    let _ = std::fs::remove_file(&tagged_path);
+                    unlinked_dead_entry = true;
+                } else {
+                    let _ = std::fs::rename(&tagged_path, &entry_path);
+                    return false;
+                }
+            }
+        } else if name.starts_with("owner.") {
+            let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
+                continue;
+            };
+            if is_lock_owner_alive(owner_pid) {
                 return false;
             }
-            match read_lock_owner_pid(owner_file) {
-                Some(owner_pid) if is_lock_owner_alive(owner_pid) => return false,
-                Some(owner_pid) => Some(owner_pid),
-                None => None,
+            before_reclaim_unlink(&entry_path);
+            if std::fs::remove_file(&entry_path).is_ok() {
+                unlinked_dead_entry = true;
             }
         }
-    };
-    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let stale_dir = dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stale.{pid}.{seq}"));
-    if std::fs::rename(lock_dir, &stale_dir).is_err() {
-        return false;
     }
-    let stale_owner = read_lock_owner_pid(&stale_dir.join("owner"));
-    let may_remove = match (expected_dead_owner, stale_owner) {
-        (_, None) => true,
-        (Some(expected), Some(actual)) if actual == expected => true,
-        (_, Some(actual)) => !is_lock_owner_alive(actual),
-    };
-    if may_remove {
-        remove_lock_dir_contents(&stale_dir);
-        true
-    } else {
-        if std::fs::rename(&stale_dir, lock_dir).is_err() {
-            // Another contender already created a replacement lock; only remove
-            // the displaced directory if its recorded owner is no longer alive.
-            if stale_owner.is_none_or(|actual| !is_lock_owner_alive(actual)) {
-                remove_lock_dir_contents(&stale_dir);
-            }
-        }
-        false
+    if std::fs::remove_dir(lock_dir).is_ok() {
+        return true;
     }
+    unlinked_dead_entry && !lock_dir.exists()
 }
 
 struct WheelStoreLockGuard {
     lock_dir: std::path::PathBuf,
     owner_file: std::path::PathBuf,
-    pid: u32,
 }
 
 impl Drop for WheelStoreLockGuard {
     fn drop(&mut self) {
-        if let Some(recorded) = read_lock_owner_pid(&self.owner_file) {
-            if self.pid > 1 && recorded != self.pid {
-                return;
-            }
-        }
         let _ = std::fs::remove_file(&self.owner_file);
-        remove_lock_dir_contents(&self.lock_dir);
+        let _ = std::fs::remove_dir(&self.lock_dir);
     }
 }
 
@@ -855,38 +821,62 @@ fn with_wheel_store_lock<T, F>(dir: &Path, f: F) -> Result<T, ConfigWriteFailure
 where
     F: FnOnce() -> Result<T, ConfigWriteFailure>,
 {
+    with_wheel_store_lock_with_hooks(dir, |_| {}, |_| {}, f)
+}
+
+fn with_wheel_store_lock_with_hooks<T, F, P, R>(
+    dir: &Path,
+    mut before_publish: P,
+    mut before_reclaim_unlink: R,
+    f: F,
+) -> Result<T, ConfigWriteFailure>
+where
+    F: FnOnce() -> Result<T, ConfigWriteFailure>,
+    P: FnMut(usize),
+    R: FnMut(&Path),
+{
     ensure_private_dir(dir)?;
     let lock_dir = dir.join(WHEEL_LOCK_DIR_NAME);
-    let owner_file = lock_dir.join("owner");
     let pid = std::process::id();
+    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let token = format!("{pid}-{nanos}-{seq}");
+    let owner_filename = format!("owner.{token}");
+    let stage_dir = dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stage.{token}"));
 
+    if prepare_staged_lock_dir(&stage_dir, &owner_filename, pid).is_err() {
+        return Err(ConfigWriteFailure::Io);
+    }
+
+    let owner_file = lock_dir.join(&owner_filename);
     let mut acquired = false;
     for attempt in 1..=WHEEL_LOCK_MAX_ATTEMPTS {
-        if create_private_lock_dir(&lock_dir).is_ok() {
-            if publish_lock_owner(&lock_dir, &owner_file, pid).is_err() {
-                remove_lock_dir_contents(&lock_dir);
-                return Err(ConfigWriteFailure::Io);
-            }
+        before_publish(attempt);
+        if publish_staged_lock_dir(&stage_dir, &lock_dir) {
             if read_lock_owner_pid(&owner_file) == Some(pid) {
                 acquired = true;
                 break;
             }
-            remove_lock_dir_contents(&lock_dir);
+            let _ = std::fs::remove_file(&owner_file);
+            let _ = std::fs::remove_dir(&lock_dir);
+            return Err(ConfigWriteFailure::Io);
         }
         if attempt >= WHEEL_LOCK_RECLAIM_ATTEMPT
-            && try_reclaim_stale_lock(dir, &lock_dir, &owner_file, pid)
+            && try_reclaim_stale_lock_with_hook(&lock_dir, &mut before_reclaim_unlink)
         {
             continue;
         }
         std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS));
     }
     if !acquired {
+        remove_lock_dir_contents(&stage_dir);
         return Err(ConfigWriteFailure::Stale);
     }
     let _guard = WheelStoreLockGuard {
         lock_dir,
         owner_file,
-        pid,
     };
     f()
 }
@@ -2169,6 +2159,127 @@ mod tests {
         assert!(
             !overlap.load(std::sync::atomic::Ordering::SeqCst),
             "concurrent stale-lock reclamation allowed overlapping lock holders"
+        );
+        assert!(!lock_dir.exists());
+
+        // 3. Deterministic pause before lock publication: Contender A stages its
+        //    lock and pauses at a barrier before publishing to `lock_dir`.
+        //    Contender B reclaims an empty `lock_dir`, acquires the lock, and
+        //    enters the critical section before releasing Contender A. Contender A
+        //    must fail its first publish attempt, must not overwrite Contender B's
+        //    owner file, and must not enter concurrently.
+        create_private_lock_dir(&lock_dir).unwrap();
+        let paused_before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a_entered_while_b_active =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let dir_a = data_dir.clone();
+        let paused_a = std::sync::Arc::clone(&paused_before_publish);
+        let resume_a = std::sync::Arc::clone(&resume_publish);
+        let b_done_a = std::sync::Arc::clone(&b_done);
+        let overlap_a = std::sync::Arc::clone(&a_entered_while_b_active);
+        let handle_a = std::thread::spawn(move || {
+            with_wheel_store_lock_with_hooks(
+                &dir_a,
+                |attempt| {
+                    if attempt == 1 {
+                        paused_a.wait();
+                        resume_a.wait();
+                    }
+                },
+                |_| {},
+                || {
+                    if !b_done_a.load(std::sync::atomic::Ordering::SeqCst) {
+                        overlap_a.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+
+        // Wait until Contender A has prepared its staged lock and paused before publish.
+        paused_before_publish.wait();
+        with_wheel_store_lock(&data_dir, || {
+            // Wake Contender A while Contender B still holds the lock in the critical section.
+            resume_publish.wait();
+            std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 2));
+            assert!(
+                lock_dir.exists(),
+                "lock_dir must remain present while Contender B holds the lock"
+            );
+            b_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        handle_a.join().unwrap();
+        assert!(
+            !a_entered_while_b_active.load(std::sync::atomic::Ordering::SeqCst),
+            "paused acquirer entered critical section while Contender B still held the lock"
+        );
+        assert!(!lock_dir.exists());
+
+        // 4. Deterministic pause during stale-lock reclamation: seed a dead-owner
+        //    entry `owner.99999999-stale`, pause Contender 1 right before it unlinks
+        //    that stale entry, let Contender 2 reclaim the stale lock and acquire a
+        //    live replacement lock, then release Contender 1 while Contender 2 is
+        //    inside the critical section. Contender 1's delayed unlink/rmdir must not
+        //    delete Contender 2's replacement lock or allow concurrent entry.
+        create_private_lock_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner.99999999-stale"), "99999999\n").unwrap();
+        let paused_in_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let c2_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c1_overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let dir_c1 = data_dir.clone();
+        let paused_c1 = std::sync::Arc::clone(&paused_in_reclaim);
+        let resume_c1 = std::sync::Arc::clone(&resume_reclaim);
+        let c2_active_c1 = std::sync::Arc::clone(&c2_active);
+        let overlap_c1 = std::sync::Arc::clone(&c1_overlapped);
+        let mut paused_once = false;
+        let handle_c1 = std::thread::spawn(move || {
+            with_wheel_store_lock_with_hooks(
+                &dir_c1,
+                |_| {},
+                |_| {
+                    if !paused_once {
+                        paused_once = true;
+                        paused_c1.wait();
+                        resume_c1.wait();
+                    }
+                },
+                || {
+                    if c2_active_c1.load(std::sync::atomic::Ordering::SeqCst) {
+                        overlap_c1.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+
+        // Wait until Contender 1 has identified `owner.99999999-stale` as dead and paused.
+        paused_in_reclaim.wait();
+        with_wheel_store_lock(&data_dir, || {
+            c2_active.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Release Contender 1's delayed reclamation while Contender 2 holds the replacement lock.
+            resume_reclaim.wait();
+            std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS * 2));
+            assert!(
+                lock_dir.exists(),
+                "Contender 2's replacement lock must survive Contender 1's delayed reclamation"
+            );
+            c2_active.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        handle_c1.join().unwrap();
+        assert!(
+            !c1_overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "paused reclaimer entered critical section concurrently with Contender 2"
         );
         assert!(!lock_dir.exists());
 

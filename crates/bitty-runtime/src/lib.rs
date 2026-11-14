@@ -328,9 +328,9 @@ pub use bitty_ui::{
     FloatStore, Focus, FocusDirection, Gaps, LayoutNode, MIN_PANE_COLS, MIN_PANE_ROWS,
     OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE, PresentationMode,
     PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS, ResizeEdge, SCRATCHPAD_CMD_TOGGLE,
-    ScrollbarMode, SplitAxis, View, ViewId, drop_plan_for_point, largest_area_leaf,
-    largest_splittable_leaf, layout::remove_leaf, smart_split_axis, splittable_axis,
-    survivor_after_close,
+    ScrollbarMode, SplitAxis, View, ViewId, drop_plan_for_point, dwindle_split_axis,
+    largest_area_leaf, largest_splittable_leaf, layout::remove_leaf, smart_split_axis,
+    splittable_axis, survivor_after_close,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

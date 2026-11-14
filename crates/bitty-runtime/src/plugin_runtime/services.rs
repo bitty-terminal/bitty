@@ -4100,6 +4100,11 @@ const WHEEL_TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",
     "bash",
+    "fs_read",
+    "fs_write",
+    "run_command",
+    "git",
+    "network",
 ];
 
 /// Validate a Wheel provider id against the built-in catalog.
@@ -4176,9 +4181,12 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             let LuaValue::String(gear) = value else {
                 return Err(config_value_error("wheel thinking_gear must be a string"));
             };
-            if !matches!(gear.as_str(), "off" | "low" | "medium" | "high" | "xhigh") {
+            if !matches!(
+                gear.as_str(),
+                "off" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
                 return Err(config_value_error(
-                    "wheel thinking_gear must be off, low, medium, high, or xhigh",
+                    "wheel thinking_gear must be off, low, medium, high, xhigh, or max",
                 ));
             }
             Ok(WheelSettingValue::Text(gear.clone()))
@@ -4189,41 +4197,46 @@ fn validate_wheel_setting(key: &str, value: &LuaValue) -> Result<WheelSettingVal
             };
             if !matches!(
                 mode.as_str(),
-                "prompt" | "dashboard" | "auto-allow" | "auto-deny"
+                "prompt" | "terminal" | "dashboard" | "auto-allow" | "auto-deny"
             ) {
                 return Err(config_value_error(
-                    "wheel approval_mode must be prompt, dashboard, auto-allow, or auto-deny",
+                    "wheel approval_mode must be prompt, terminal, dashboard, auto-allow, or auto-deny",
                 ));
             }
             Ok(WheelSettingValue::Text(mode.clone()))
         }
-        _ if key.starts_with("permissions.") => {
-            let tool = &key["permissions.".len()..];
-            if !WHEEL_TOOL_NAMES.contains(&tool) {
-                return Err(config_key_error());
+        _ => {
+            // MSRV 1.85: `if let` guards are unstable (E0658), so the prefix-keyed
+            // settings are resolved here instead of as match guards.
+            if let Some(tool) = key.strip_prefix("permissions.") {
+                if tool.is_empty() || !WHEEL_TOOL_NAMES.contains(&tool) {
+                    return Err(config_key_error());
+                }
+                let LuaValue::String(mode) = value else {
+                    return Err(config_value_error("wheel permission mode must be a string"));
+                };
+                if !matches!(mode.as_str(), "auto" | "ask" | "deny") {
+                    return Err(config_value_error(
+                        "wheel permission mode must be auto, ask, or deny",
+                    ));
+                }
+                return Ok(WheelSettingValue::Text(mode.clone()));
             }
-            let LuaValue::String(mode) = value else {
-                return Err(config_value_error("wheel permission mode must be a string"));
-            };
-            if !matches!(mode.as_str(), "auto" | "ask" | "deny") {
-                return Err(config_value_error(
-                    "wheel permission mode must be auto, ask, or deny",
-                ));
+            if let Some(provider) = key
+                .strip_prefix("providers.")
+                .and_then(|rest| rest.strip_suffix(".model"))
+            {
+                if provider.is_empty() || !WHEEL_PROVIDER_IDS.contains(&provider) {
+                    return Err(config_key_error());
+                }
+                let LuaValue::String(model) = value else {
+                    return Err(config_value_error("wheel provider model must be a string"));
+                };
+                validate_wheel_model_string(model, false)?;
+                return Ok(WheelSettingValue::Text(model.clone()));
             }
-            Ok(WheelSettingValue::Text(mode.clone()))
+            Err(config_key_error())
         }
-        _ if key.starts_with("providers.") && key.ends_with(".model") => {
-            let provider = &key["providers.".len()..key.len() - ".model".len()];
-            if !WHEEL_PROVIDER_IDS.contains(&provider) {
-                return Err(config_key_error());
-            }
-            let LuaValue::String(model) = value else {
-                return Err(config_value_error("wheel provider model must be a string"));
-            };
-            validate_wheel_model_string(model, false)?;
-            Ok(WheelSettingValue::Text(model.clone()))
-        }
-        _ => Err(config_key_error()),
     }
 }
 
@@ -5209,10 +5222,39 @@ impl PluginServices {
             .len()
             .saturating_add(snapshot.permissions.len())
             .saturating_add(snapshot.approvals.len());
-        let bytes = 64usize
-            .saturating_add(snapshot.providers.len().saturating_mul(64))
-            .saturating_add(snapshot.permissions.len().saturating_mul(16))
-            .saturating_add(snapshot.approvals.len().saturating_mul(64));
+        let mut bytes = 64usize.saturating_add(list_row_bytes(&[
+            snapshot.default_provider.as_str(),
+            snapshot.default_model.as_str(),
+            snapshot.thinking_gear.as_str(),
+            snapshot.approval_mode.as_str(),
+        ]));
+        for row in &snapshot.providers {
+            bytes = bytes.saturating_add(list_row_bytes(&[
+                row.name.as_str(),
+                row.label.as_str(),
+                row.protocol.as_str(),
+                row.default_model.as_str(),
+                row.model.as_str(),
+                row.model_source.as_str(),
+                row.auth_env.as_str(),
+                row.auth_source.as_str(),
+                row.base_url.as_str(),
+            ]));
+        }
+        for row in &snapshot.permissions {
+            bytes = bytes.saturating_add(list_row_bytes(&[row.tool.as_str(), row.mode.as_str()]));
+        }
+        for row in &snapshot.approvals {
+            bytes = bytes.saturating_add(list_row_bytes(&[
+                row.id.as_str(),
+                row.session_id.as_str(),
+                row.tool.as_str(),
+                row.risk.as_str(),
+                row.summary.as_str(),
+                row.status.as_str(),
+                row.decision.as_deref().unwrap_or(""),
+            ]));
+        }
         check_list_bounds(row_count, bytes)?;
         self.config_charge_result_bytes(started, bytes)?;
         Ok(snapshot)
@@ -15329,5 +15371,44 @@ mod history_tests {
             );
             assert!(error.message.contains("appearance.theme"));
         }
+    }
+
+    /// The prefix-keyed Wheel settings resolve through the match fallback arm
+    /// (MSRV 1.85 has no `if let` guards), so pin the accept/refuse edges.
+    #[test]
+    fn wheel_setting_prefix_keys_resolve_through_the_fallback_arm() {
+        let mode = LuaValue::String("ask".to_owned());
+        let parsed =
+            validate_wheel_setting("permissions.bash", &mode).expect("permission key accepted");
+        assert!(matches!(parsed, WheelSettingValue::Text(ref text) if text == "ask"));
+        assert!(
+            validate_wheel_setting("permissions.not-a-tool", &mode).is_err(),
+            "unknown tool names are refused"
+        );
+        assert!(
+            validate_wheel_setting("permissions.", &mode).is_err(),
+            "an empty tool segment is refused"
+        );
+        assert!(
+            validate_wheel_setting("permissions", &mode).is_err(),
+            "the bare prefix is not a permission key"
+        );
+
+        let model = LuaValue::String("openai/gpt-5".to_owned());
+        let parsed = validate_wheel_setting("providers.openrouter.model", &model)
+            .expect("provider model key accepted");
+        assert!(matches!(parsed, WheelSettingValue::Text(ref text) if text == "openai/gpt-5"));
+        assert!(
+            validate_wheel_setting("providers.unknown.model", &model).is_err(),
+            "unknown providers are refused"
+        );
+        assert!(
+            validate_wheel_setting("providers.openrouter.endpoint", &model).is_err(),
+            "only the .model suffix is accepted"
+        );
+        assert!(
+            validate_wheel_setting("unrelated.key", &mode).is_err(),
+            "unknown keys fall through to a key error"
+        );
     }
 }

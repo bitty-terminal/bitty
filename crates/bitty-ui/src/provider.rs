@@ -10,9 +10,10 @@
 //!
 //! - [`LayoutProvider`] — the provider trait: `id`, `name`, and a pure
 //!   `propose` function of snapshot, view set, and available area.
-//! - [`ProviderName`] — validated provider names: bare `dwindle`, `master`,
-//!   and `grid` are reserved for the canonical providers; anything else
-//!   registers under a qualified `owner.name:algorithm` name.
+//! - [`ProviderName`] — validated provider names: bare `dwindle` (Hyprland-style
+//!   aspect-driven binary splits), `spiral` (dwm-fibonacci 4-way clockwise
+//!   spiral), `master`, and `grid` are reserved for the canonical providers;
+//!   anything else registers under a qualified `owner.name:algorithm` name.
 //! - [`validate_proposal`] — Core-side validation of every returned tree
 //!   (well-formedness, view-set consistency, `ratio` bounds) before commit.
 //!   Invalid proposals are rejected; the previous tree is retained by the
@@ -20,10 +21,11 @@
 //! - [`ProviderRegistry`] — name-keyed provider set with the
 //!   `layout.provider` capability gate ([`LAYOUT_PROVIDER_CAPABILITY`]).
 //!   The built-in no-op tiler ([`NoopTiler`]) needs no capability.
-//! - Canonical providers: [`DwindleProvider`], [`MasterProvider`],
-//!   [`GridProvider`]. They build trees from `H`/`V` splits and `View`
-//!   leaves only, reuse the snapshot's `View`s when available (so per-leaf
-//!   presentation modes survive a recompose), and are deterministic.
+//! - Canonical providers: [`DwindleProvider`], [`SpiralProvider`],
+//!   [`MasterProvider`], [`GridProvider`]. They build trees from `H`/`V`
+//!   splits and `View` leaves only, reuse the snapshot's `View`s when
+//!   available (so per-leaf presentation modes survive a recompose), and are
+//!   deterministic.
 //!
 //! # Role and dependency rule
 //!
@@ -555,11 +557,18 @@ impl LayoutProvider for NoopTiler {
     }
 }
 
-/// Dwindle provider: recursive `H`/`V` splits that spiral inward.
+/// Dwindle provider: recursive `H`/`V` binary splits as a deterministic,
+/// Hyprland-inspired `dwindle` approximation (`default_split_ratio = 1.0`).
 ///
-/// The first view is outermost; each remaining view splits the remainder,
-/// with the axis alternating per depth. The opening axis follows the area
-/// aspect (tall stacks first, wide/square starts side-by-side).
+/// The first view is outermost; each remaining view splits the bottom-right
+/// remainder (`second` child), with the axis alternating per depth from the
+/// opening axis chosen by the area aspect (tall stacks first, wide/square
+/// starts side-by-side). Unlike Hyprland's runtime `dwindle` (which re-evaluates
+/// each parent container's aspect ratio and follows cursor position under
+/// `force_split = 0`), this provider uses the area aspect only for the opening
+/// axis and deterministically alternates axes down the right/bottom remainder.
+/// Unlike [`SpiralProvider`], `dwindle` always places new views on the
+/// right/bottom side rather than rotating 4-way clockwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DwindleProvider {
     name: ProviderName,
@@ -600,7 +609,7 @@ impl LayoutProvider for DwindleProvider {
             return Err(LayoutError::EmptyViewSet);
         }
         // Outermost first: views[0] takes the opening axis, each deeper
-        // level flips it, so the spiral alternates per depth from the root.
+        // level flips it and splits the right/bottom remainder.
         let mut axes = Vec::with_capacity(views.len().saturating_sub(1));
         let mut axis = opening_axis(area);
         for _ in 0..views.len().saturating_sub(1) {
@@ -625,12 +634,13 @@ impl LayoutProvider for DwindleProvider {
     }
 }
 
-/// Spiral provider: recursive `H`/`V` splits that spiral inward in a 4-way
-/// clockwise rotation (Left -> Top -> Right -> Bottom).
+/// Spiral provider: dwm-fibonacci recursive `H`/`V` splits that spiral inward
+/// in a 4-way clockwise rotation (Left -> Top -> Right -> Bottom).
 ///
 /// The opening axis follows the area aspect (tall stacks first, wide/square
 /// starts side-by-side). Each deeper level flips the axis and rotates the
-/// placement side so windows wrap clockwise around the center.
+/// placement side so windows wrap clockwise around the center (distinct from
+/// Hyprland's built-in `dwindle`/`master`/`monocle`/`scrolling` layouts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpiralProvider {
     name: ProviderName,
@@ -1239,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn dwindle_spirals_with_alternating_axes() {
+    fn dwindle_splits_bottom_right_with_alternating_axes() {
         let snap = snapshot(3);
         let views = snap.views.clone();
         let tree = DwindleProvider::new()

@@ -41,6 +41,18 @@ const WHEEL_DIR_MODE: u32 = 0o700;
 /// Temp file prefix for atomic writes under `$XDG_DATA_HOME/wheel`.
 const WHEEL_TEMP_PREFIX: &str = ".bitty-wheel-";
 
+/// Lock directory name used by Wheel CLI and Core for serialized store updates.
+const WHEEL_LOCK_DIR_NAME: &str = ".approvals.lock";
+
+/// Maximum lock acquisition attempts before failing closed (`40 * 25ms = 1s`).
+const WHEEL_LOCK_MAX_ATTEMPTS: usize = 40;
+
+/// Attempt threshold at which a stale lock's recorded owner PID is checked.
+const WHEEL_LOCK_RECLAIM_ATTEMPT: usize = 10;
+
+/// Backoff sleep in milliseconds between lock acquisition attempts.
+const WHEEL_LOCK_SLEEP_MS: u64 = 25;
+
 /// Monotonic counter so concurrent temp files in one process never collide.
 static WHEEL_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -114,6 +126,21 @@ pub(crate) const BUILTIN_PERMISSIONS: &[(&str, &str)] = &[
     ("glob", "auto"),
     ("grep", "auto"),
     ("bash", "ask"),
+];
+
+/// All recognized Wheel permission tool keys (including dashboard alias keys).
+const RECOGNIZED_PERMISSION_TOOLS: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "bash",
+    "fs_read",
+    "fs_write",
+    "run_command",
+    "git",
+    "network",
 ];
 
 /// Minimal, bounded RFC 8259 JSON value representation.
@@ -268,7 +295,27 @@ impl<'a> JsonParser<'a> {
                             let hex_str = std::str::from_utf8(hex).map_err(|_| ())?;
                             let code = u16::from_str_radix(hex_str, 16).map_err(|_| ())?;
                             self.pos += 4;
-                            let ch = char::from_u32(u32::from(code)).ok_or(())?;
+                            let scalar = if (0xD800..=0xDBFF).contains(&code) {
+                                if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(());
+                                }
+                                self.pos += 2;
+                                let low_hex = self.bytes.get(self.pos..self.pos + 4).ok_or(())?;
+                                let low_str = std::str::from_utf8(low_hex).map_err(|_| ())?;
+                                let low = u16::from_str_radix(low_str, 16).map_err(|_| ())?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(());
+                                }
+                                self.pos += 4;
+                                0x10000
+                                    + (((u32::from(code) - 0xD800) << 10)
+                                        | (u32::from(low) - 0xDC00))
+                            } else if (0xDC00..=0xDFFF).contains(&code) {
+                                return Err(());
+                            } else {
+                                u32::from(code)
+                            };
+                            let ch = char::from_u32(scalar).ok_or(())?;
                             out.push(ch);
                         }
                         _ => return Err(()),
@@ -429,7 +476,11 @@ fn write_json_value(value: &JsonValue, out: &mut String) {
         JsonValue::Int(n) => out.push_str(&n.to_string()),
         JsonValue::Float(f) => {
             if f.is_finite() {
-                out.push_str(&f.to_string());
+                let s = f.to_string();
+                out.push_str(&s);
+                if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                    out.push_str(".0");
+                }
             } else {
                 out.push_str("null");
             }
@@ -531,6 +582,21 @@ fn ensure_private_dir(dir: &Path) -> Result<(), ConfigWriteFailure> {
 
 type JsonStoreFile = Option<(String, BTreeMap<String, JsonValue>)>;
 
+/// Read at most `WHEEL_MAX_FILE_BYTES + 1` bytes from one opened file handle and
+/// reject any input exceeding `WHEEL_MAX_FILE_BYTES`.
+fn read_bounded_utf8_file(path: &Path) -> Result<String, ConfigWriteFailure> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|_| ConfigWriteFailure::Io)?;
+    let mut buf = Vec::new();
+    file.take((WHEEL_MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| ConfigWriteFailure::Io)?;
+    if buf.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
+    String::from_utf8(buf).map_err(|_| ConfigWriteFailure::Invalid)
+}
+
 /// Read one private JSON store file (`settings.json`, `credentials.json`, or `approvals.json`).
 /// Returns `Ok(None)` when either the directory or the file does not exist yet.
 fn read_private_json_for_write(
@@ -562,7 +628,7 @@ fn read_private_json_for_write(
     if meta.len() > WHEEL_MAX_FILE_BYTES as u64 {
         return Err(ConfigWriteFailure::Invalid);
     }
-    let raw = std::fs::read_to_string(&path).map_err(|_| ConfigWriteFailure::Io)?;
+    let raw = read_bounded_utf8_file(&path)?;
     let parsed = parse_json(&raw).map_err(|()| ConfigWriteFailure::Invalid)?;
     let JsonValue::Object(map) = parsed else {
         return Err(ConfigWriteFailure::Invalid);
@@ -579,12 +645,299 @@ fn map_write_to_read_failure(failure: ConfigWriteFailure) -> ConfigReadFailure {
     }
 }
 
+/// Read the recorded PID from `.approvals.lock/owner*` if present and valid.
+fn read_lock_owner_pid(owner_file: &Path) -> Option<u32> {
+    let raw = read_bounded_utf8_file(owner_file).ok()?;
+    let parsed: u32 = raw.trim().parse().ok()?;
+    (parsed >= 1).then_some(parsed)
+}
+
+/// Check whether `pid` is still alive (`false` only when definitively dead).
+fn is_lock_owner_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(raw_pid) = i32::try_from(pid) else {
+            return true;
+        };
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), None) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::EPERM) => true,
+            Err(nix::errno::Errno::ESRCH) => false,
+            Err(_) => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        bitty_winjob::process_is_running(pid).unwrap_or(true)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn create_private_lock_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(WHEEL_DIR_MODE);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+fn remove_lock_dir_contents(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.take(16).flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Create a private staging directory and populate its unique `owner.<token>` file
+/// before the lock directory is ever published at `.approvals.lock`.
+///
+/// Both Bitty Core (`wheel_manage.rs`) and the Wheel CLI (`lua/wheel/config.lua`)
+/// use this staged publication protocol so neither writer ever creates an empty
+/// `.approvals.lock` directory prior to owner publication.
+fn prepare_staged_lock_dir(
+    stage_dir: &Path,
+    owner_filename: &str,
+    pid: u32,
+) -> std::io::Result<()> {
+    create_private_lock_dir(stage_dir)?;
+    let staged_owner = stage_dir.join(owner_filename);
+    let write_res = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(WHEEL_FILE_MODE)
+                .open(&staged_owner)?;
+            file.write_all(format!("{pid}\n").as_bytes())?;
+            file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&staged_owner, format!("{pid}\n"))
+        }
+    })();
+    if write_res.is_err() {
+        remove_lock_dir_contents(stage_dir);
+    }
+    write_res
+}
+
+/// Atomically publish a populated `stage_dir` to `lock_dir`.
+///
+/// Refuses to overwrite an existing `lock_dir` path (even if empty), and on
+/// concurrent `rename` attempts into a missing `lock_dir`, the OS kernel's
+/// directory rename guarantees that once the winner's non-empty `stage_dir`
+/// lands at `lock_dir`, every concurrent contender's `rename` fails with
+/// `ENOTEMPTY`/`EEXIST`.
+fn publish_staged_lock_dir(stage_dir: &Path, lock_dir: &Path) -> bool {
+    if std::fs::symlink_metadata(lock_dir).is_ok() {
+        return false;
+    }
+    std::fs::rename(stage_dir, lock_dir).is_ok()
+}
+
+/// Sweep any leftover `.approvals.lock.stage.<pid>-*` directories left behind
+/// by a process that terminated before publishing its staged lock.
+fn cleanup_stale_stage_dirs(dir: &Path) {
+    let stage_prefix = format!("{WHEEL_LOCK_DIR_NAME}.stage.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.take(32).flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(&stage_prefix) else {
+            continue;
+        };
+        let Some(pid_str) = rest.split('-').next() else {
+            continue;
+        };
+        let Ok(stage_pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if stage_pid >= 1 && !is_lock_owner_alive(stage_pid) {
+            remove_lock_dir_contents(&entry.path());
+        }
+    }
+}
+
+/// Reclaim a dead-owner `.approvals.lock` without renaming `lock_dir` or
+/// removing an ownerless directory.
+///
+/// Reclamation only unlinks a verified-dead `owner.<token>` (or legacy `owner`)
+/// file observed in `lock_dir` and then calls `remove_dir(lock_dir)` only when
+/// a dead entry was unlinked, which the OS kernel guarantees fails with
+/// `ENOTEMPTY` if another contender has already published a replacement lock
+/// containing a different `owner.<new_token>` entry.
+fn try_reclaim_stale_lock_with_hook<R>(
+    dir: &Path,
+    lock_dir: &Path,
+    before_reclaim_unlink: &mut R,
+) -> bool
+where
+    R: FnMut(&Path),
+{
+    cleanup_stale_stage_dirs(dir);
+    let Ok(entries) = std::fs::read_dir(lock_dir) else {
+        return false;
+    };
+    let mut unlinked_dead_entry = false;
+    for entry in entries.take(16).flatten() {
+        let entry_path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == "owner" {
+            let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
+                continue;
+            };
+            if is_lock_owner_alive(owner_pid) {
+                return false;
+            }
+            let tagged_path = lock_dir.join(format!("owner.dead.{owner_pid}"));
+            if std::fs::rename(&entry_path, &tagged_path).is_ok() {
+                if read_lock_owner_pid(&tagged_path) == Some(owner_pid) {
+                    before_reclaim_unlink(&tagged_path);
+                    let _ = std::fs::remove_file(&tagged_path);
+                    unlinked_dead_entry = true;
+                } else {
+                    let _ = std::fs::rename(&tagged_path, &entry_path);
+                    return false;
+                }
+            }
+        } else if name.starts_with("owner.") {
+            let Some(owner_pid) = read_lock_owner_pid(&entry_path) else {
+                continue;
+            };
+            if is_lock_owner_alive(owner_pid) {
+                return false;
+            }
+            before_reclaim_unlink(&entry_path);
+            if std::fs::remove_file(&entry_path).is_ok() {
+                unlinked_dead_entry = true;
+            }
+        }
+    }
+    if unlinked_dead_entry && std::fs::remove_dir(lock_dir).is_ok() {
+        return true;
+    }
+    unlinked_dead_entry && !lock_dir.exists()
+}
+
+struct WheelStoreLockGuard {
+    lock_dir: std::path::PathBuf,
+    owner_file: std::path::PathBuf,
+}
+
+impl Drop for WheelStoreLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.owner_file);
+        let _ = std::fs::remove_dir(&self.lock_dir);
+    }
+}
+
+/// Serialize read-check-replace mutations across processes using `.approvals.lock`.
+fn with_wheel_store_lock<T, F>(dir: &Path, f: F) -> Result<T, ConfigWriteFailure>
+where
+    F: FnOnce() -> Result<T, ConfigWriteFailure>,
+{
+    with_wheel_store_lock_with_hooks(dir, |_| {}, |_, _| {}, |_| {}, |_| {}, f)
+}
+
+fn with_wheel_store_lock_with_hooks<T, F, P, A, R, C>(
+    dir: &Path,
+    mut before_publish: P,
+    mut after_publish: A,
+    mut before_reclaim_unlink: R,
+    mut after_reclaim: C,
+    f: F,
+) -> Result<T, ConfigWriteFailure>
+where
+    F: FnOnce() -> Result<T, ConfigWriteFailure>,
+    P: FnMut(usize),
+    A: FnMut(usize, bool),
+    R: FnMut(&Path),
+    C: FnMut(bool),
+{
+    ensure_private_dir(dir)?;
+    let lock_dir = dir.join(WHEEL_LOCK_DIR_NAME);
+    let pid = std::process::id();
+    let seq = WHEEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let token = format!("{pid}-{nanos}-{seq}");
+    let owner_filename = format!("owner.{token}");
+    let stage_dir = dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stage.{token}"));
+
+    if prepare_staged_lock_dir(&stage_dir, &owner_filename, pid).is_err() {
+        return Err(ConfigWriteFailure::Io);
+    }
+
+    let owner_file = lock_dir.join(&owner_filename);
+    let mut acquired = false;
+    for attempt in 1..=WHEEL_LOCK_MAX_ATTEMPTS {
+        before_publish(attempt);
+        let published = publish_staged_lock_dir(&stage_dir, &lock_dir);
+        after_publish(attempt, published);
+        if published {
+            if read_lock_owner_pid(&owner_file) == Some(pid) {
+                acquired = true;
+                break;
+            }
+            let _ = std::fs::remove_file(&owner_file);
+            let _ = std::fs::remove_dir(&lock_dir);
+            return Err(ConfigWriteFailure::Io);
+        }
+        if attempt >= WHEEL_LOCK_RECLAIM_ATTEMPT {
+            let reclaimed =
+                try_reclaim_stale_lock_with_hook(dir, &lock_dir, &mut before_reclaim_unlink);
+            after_reclaim(reclaimed);
+            if reclaimed {
+                continue;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(WHEEL_LOCK_SLEEP_MS));
+    }
+    if !acquired {
+        remove_lock_dir_contents(&stage_dir);
+        return Err(ConfigWriteFailure::Stale);
+    }
+    let _guard = WheelStoreLockGuard {
+        lock_dir,
+        owner_file,
+    };
+    f()
+}
+
 /// Atomically write `bytes` to `dir/filename` with `0700` dir and `0600` file permissions.
 fn write_private_file_atomic(
     dir: &Path,
     filename: &str,
     bytes: &[u8],
 ) -> Result<(), ConfigWriteFailure> {
+    if bytes.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
     ensure_private_dir(dir)?;
     let target = dir.join(filename);
     match std::fs::symlink_metadata(&target) {
@@ -670,7 +1023,7 @@ fn scan_lua_assignments(path: &Path) -> BTreeMap<String, String> {
     {
         return out;
     }
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Ok(raw) = read_bounded_utf8_file(path) else {
         return out;
     };
     for line in raw.lines() {
@@ -801,20 +1154,25 @@ pub(crate) fn read_wheel_snapshot(
 
     let mut thinking_gear = global_init
         .get("thinking_gear")
-        .filter(|g| matches!(g.as_str(), "off" | "low" | "medium" | "high" | "xhigh"))
+        .filter(|g| {
+            matches!(
+                g.as_str(),
+                "off" | "low" | "medium" | "high" | "xhigh" | "max"
+            )
+        })
         .cloned()
         .or_else(|| {
             settings_map
                 .get("thinking_gear")
                 .and_then(JsonValue::as_str)
-                .filter(|g| matches!(*g, "off" | "low" | "medium" | "high" | "xhigh"))
+                .filter(|g| matches!(*g, "off" | "low" | "medium" | "high" | "xhigh" | "max"))
                 .map(str::to_string)
         })
         .or_else(|| {
             settings_map
                 .get("thinking")
                 .and_then(JsonValue::as_str)
-                .filter(|g| matches!(*g, "low" | "medium" | "high" | "xhigh"))
+                .filter(|g| matches!(*g, "low" | "medium" | "high" | "xhigh" | "max"))
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "medium".to_string());
@@ -827,7 +1185,7 @@ pub(crate) fn read_wheel_snapshot(
     {
         flag
     } else if let Some(legacy) = settings_map.get("thinking").and_then(JsonValue::as_str) {
-        matches!(legacy, "low" | "medium" | "high" | "xhigh")
+        matches!(legacy, "low" | "medium" | "high" | "xhigh" | "max")
     } else {
         false
     };
@@ -840,7 +1198,7 @@ pub(crate) fn read_wheel_snapshot(
         .filter(|m| {
             matches!(
                 m.as_str(),
-                "prompt" | "dashboard" | "auto-allow" | "auto-deny"
+                "prompt" | "terminal" | "dashboard" | "auto-allow" | "auto-deny"
             )
         })
         .cloned()
@@ -848,7 +1206,12 @@ pub(crate) fn read_wheel_snapshot(
             settings_map
                 .get("approval_mode")
                 .and_then(JsonValue::as_str)
-                .filter(|m| matches!(*m, "prompt" | "dashboard" | "auto-allow" | "auto-deny"))
+                .filter(|m| {
+                    matches!(
+                        *m,
+                        "prompt" | "terminal" | "dashboard" | "auto-allow" | "auto-deny"
+                    )
+                })
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "prompt".to_string());
@@ -914,7 +1277,7 @@ pub(crate) fn read_wheel_snapshot(
     let settings_perms = settings_map
         .get("permissions")
         .and_then(JsonValue::as_object);
-    let mut permissions = Vec::with_capacity(BUILTIN_PERMISSIONS.len());
+    let mut permissions = Vec::with_capacity(RECOGNIZED_PERMISSION_TOOLS.len());
     for &(tool, default_mode) in BUILTIN_PERMISSIONS {
         let mode = settings_perms
             .and_then(|p| p.get(tool))
@@ -925,6 +1288,20 @@ pub(crate) fn read_wheel_snapshot(
             tool: tool.to_string(),
             mode: mode.to_string(),
         });
+    }
+    if let Some(perms_obj) = settings_perms {
+        for &extra_tool in &["fs_read", "fs_write", "run_command", "git", "network"] {
+            if let Some(mode) = perms_obj
+                .get(extra_tool)
+                .and_then(JsonValue::as_str)
+                .filter(|m| matches!(*m, "auto" | "ask" | "deny"))
+            {
+                permissions.push(WheelPermissionRow {
+                    tool: extra_tool.to_string(),
+                    mode: mode.to_string(),
+                });
+            }
+        }
     }
 
     let mut approvals = Vec::new();
@@ -1033,7 +1410,12 @@ fn prepare_wheel_setting_write(
             let current_gear = map
                 .get("thinking_gear")
                 .and_then(JsonValue::as_str)
-                .filter(|g| matches!(*g, "low" | "medium" | "high" | "xhigh"))
+                .filter(|g| matches!(*g, "low" | "medium" | "high" | "xhigh" | "max"))
+                .or_else(|| {
+                    map.get("thinking")
+                        .and_then(JsonValue::as_str)
+                        .filter(|g| matches!(*g, "low" | "medium" | "high" | "xhigh" | "max"))
+                })
                 .unwrap_or("medium")
                 .to_string();
             if *enabled {
@@ -1055,6 +1437,13 @@ fn prepare_wheel_setting_write(
                 let enabled = map
                     .get("thinking_enabled")
                     .and_then(JsonValue::as_bool)
+                    .or_else(|| {
+                        map.get("thinking")
+                            .and_then(JsonValue::as_str)
+                            .map(|legacy| {
+                                matches!(legacy, "low" | "medium" | "high" | "xhigh" | "max")
+                            })
+                    })
                     .unwrap_or(false);
                 if enabled {
                     map.insert("thinking".to_string(), JsonValue::String(gear.clone()));
@@ -1064,7 +1453,12 @@ fn prepare_wheel_setting_write(
             }
         }
         (_, WheelSettingValue::Text(mode)) if key.starts_with("permissions.") => {
-            let tool = &key["permissions.".len()..];
+            let Some(tool) = key.strip_prefix("permissions.") else {
+                return Err(ConfigWriteFailure::Invalid);
+            };
+            if tool.is_empty() || !RECOGNIZED_PERMISSION_TOOLS.contains(&tool) {
+                return Err(ConfigWriteFailure::Invalid);
+            }
             let perms_entry = map
                 .entry("permissions".to_string())
                 .or_insert_with(|| JsonValue::Object(BTreeMap::new()));
@@ -1076,7 +1470,15 @@ fn prepare_wheel_setting_write(
         (_, WheelSettingValue::Text(model))
             if key.starts_with("providers.") && key.ends_with(".model") =>
         {
-            let provider = &key["providers.".len()..key.len() - ".model".len()];
+            let Some(provider) = key
+                .strip_prefix("providers.")
+                .and_then(|rest| rest.strip_suffix(".model"))
+            else {
+                return Err(ConfigWriteFailure::Invalid);
+            };
+            if provider.is_empty() || !BUILTIN_PROVIDERS.iter().any(|spec| spec.name == provider) {
+                return Err(ConfigWriteFailure::Invalid);
+            }
             let providers_entry = map
                 .entry("providers".to_string())
                 .or_insert_with(|| JsonValue::Object(BTreeMap::new()));
@@ -1095,6 +1497,9 @@ fn prepare_wheel_setting_write(
     }
 
     let serialized = serialize_json(&JsonValue::Object(map));
+    if serialized.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
     let changed = existing.is_none() || before_canonical != serialized;
     let rendered = format!("{key} = {}", value.render_literal());
     let digest = candidate_digest(serialized.as_bytes());
@@ -1133,16 +1538,18 @@ pub(crate) fn apply_wheel_set(
     expected_candidate_digest: &str,
 ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
     let data_dir = wheel_data_dir.ok_or(ConfigWriteFailure::Unavailable)?;
-    let prepared = prepare_wheel_setting_write(wheel_data_dir, key, value)?;
-    if prepared.candidate_digest != expected_candidate_digest {
-        return Err(ConfigWriteFailure::Stale);
-    }
-    if !prepared.changed {
-        return Ok(ConfigApplyOutcome::Unchanged);
-    }
-    write_private_file_atomic(data_dir, "settings.json", prepared.serialized.as_bytes())?;
-    Ok(ConfigApplyOutcome::Applied {
-        pending_restart: false,
+    with_wheel_store_lock(data_dir, || {
+        let prepared = prepare_wheel_setting_write(wheel_data_dir, key, value)?;
+        if prepared.candidate_digest != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        if !prepared.changed {
+            return Ok(ConfigApplyOutcome::Unchanged);
+        }
+        write_private_file_atomic(data_dir, "settings.json", prepared.serialized.as_bytes())?;
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
     })
 }
 
@@ -1183,6 +1590,9 @@ fn prepare_wheel_auth_set_write(
     );
 
     let serialized = serialize_json(&JsonValue::Object(map));
+    if serialized.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
     let changed = existing.is_none() || before_canonical != serialized;
     let logical_key = format!("providers.{provider}.api_key");
     let rendered = format!("{logical_key} = \"***REDACTED***\"");
@@ -1222,16 +1632,18 @@ pub(crate) fn apply_wheel_auth_set(
     expected_candidate_digest: &str,
 ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
     let data_dir = wheel_data_dir.ok_or(ConfigWriteFailure::Unavailable)?;
-    let prepared = prepare_wheel_auth_set_write(wheel_data_dir, provider, api_key)?;
-    if prepared.candidate_digest != expected_candidate_digest {
-        return Err(ConfigWriteFailure::Stale);
-    }
-    if !prepared.changed {
-        return Ok(ConfigApplyOutcome::Unchanged);
-    }
-    write_private_file_atomic(data_dir, "credentials.json", prepared.serialized.as_bytes())?;
-    Ok(ConfigApplyOutcome::Applied {
-        pending_restart: false,
+    with_wheel_store_lock(data_dir, || {
+        let prepared = prepare_wheel_auth_set_write(wheel_data_dir, provider, api_key)?;
+        if prepared.candidate_digest != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        if !prepared.changed {
+            return Ok(ConfigApplyOutcome::Unchanged);
+        }
+        write_private_file_atomic(data_dir, "credentials.json", prepared.serialized.as_bytes())?;
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
     })
 }
 
@@ -1261,6 +1673,9 @@ fn prepare_wheel_auth_remove_write(
     }
 
     let serialized = serialize_json(&JsonValue::Object(map));
+    if serialized.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
     let changed = had_key && before_canonical != serialized;
     let logical_key = format!("providers.{provider}.api_key");
     let rendered = format!("- {logical_key} = \"***REDACTED***\"");
@@ -1298,16 +1713,18 @@ pub(crate) fn apply_wheel_auth_remove(
     expected_candidate_digest: &str,
 ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
     let data_dir = wheel_data_dir.ok_or(ConfigWriteFailure::Unavailable)?;
-    let prepared = prepare_wheel_auth_remove_write(wheel_data_dir, provider)?;
-    if prepared.candidate_digest != expected_candidate_digest {
-        return Err(ConfigWriteFailure::Stale);
-    }
-    if !prepared.changed {
-        return Ok(ConfigApplyOutcome::Unchanged);
-    }
-    write_private_file_atomic(data_dir, "credentials.json", prepared.serialized.as_bytes())?;
-    Ok(ConfigApplyOutcome::Applied {
-        pending_restart: false,
+    with_wheel_store_lock(data_dir, || {
+        let prepared = prepare_wheel_auth_remove_write(wheel_data_dir, provider)?;
+        if prepared.candidate_digest != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        if !prepared.changed {
+            return Ok(ConfigApplyOutcome::Unchanged);
+        }
+        write_private_file_atomic(data_dir, "credentials.json", prepared.serialized.as_bytes())?;
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
     })
 }
 
@@ -1368,6 +1785,9 @@ fn prepare_wheel_resolve_approval_write(
     }
 
     let serialized = serialize_json(&JsonValue::Object(map));
+    if serialized.len() > WHEEL_MAX_FILE_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
     // Bind candidate_digest to the exact on-disk preimage + (id, decision) so
     // wall-clock `updated_at` advancement between preview and apply never causes
     // a false Stale failure, while any concurrent modification to approvals.json
@@ -1411,16 +1831,18 @@ pub(crate) fn apply_wheel_resolve_approval(
     expected_candidate_digest: &str,
 ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
     let data_dir = wheel_data_dir.ok_or(ConfigWriteFailure::Unavailable)?;
-    let prepared = prepare_wheel_resolve_approval_write(wheel_data_dir, id, decision)?;
-    if prepared.candidate_digest != expected_candidate_digest {
-        return Err(ConfigWriteFailure::Stale);
-    }
-    if !prepared.changed {
-        return Ok(ConfigApplyOutcome::Unchanged);
-    }
-    write_private_file_atomic(data_dir, "approvals.json", prepared.serialized.as_bytes())?;
-    Ok(ConfigApplyOutcome::Applied {
-        pending_restart: false,
+    with_wheel_store_lock(data_dir, || {
+        let prepared = prepare_wheel_resolve_approval_write(wheel_data_dir, id, decision)?;
+        if prepared.candidate_digest != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        if !prepared.changed {
+            return Ok(ConfigApplyOutcome::Unchanged);
+        }
+        write_private_file_atomic(data_dir, "approvals.json", prepared.serialized.as_bytes())?;
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
     })
 }
 
@@ -1615,6 +2037,350 @@ mod tests {
         assert_eq!(snap.approvals.len(), 1);
         assert_eq!(snap.approvals[0].status, "resolved");
         assert_eq!(snap.approvals[0].decision.as_deref(), Some("allow_once"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn json_surrogate_pairs_and_large_floats_roundtrip() {
+        // Surrogate pair \uD83D\uDE00 -> U+1F600 (😀), plus finite float 1e20
+        let raw = r#"{"emoji":"\uD83D\uDE00","extra":1e20,"schema_version":"1.0"}"#;
+        let parsed = parse_json(raw).expect("valid surrogate pair and 1e20 float");
+        let obj = parsed.as_object().expect("json object");
+        assert_eq!(obj.get("emoji").and_then(JsonValue::as_str), Some("😀"));
+        let serialized = serialize_json(&parsed);
+        let reparsed = parse_json(&serialized).expect("reparse serialized 1e20 float");
+        assert_eq!(parsed, reparsed);
+
+        // Unpaired high or low surrogates must fail closed
+        assert!(parse_json(r#"{"bad":"\uD83D"}"#).is_err());
+        assert!(parse_json(r#"{"bad":"\uDE00"}"#).is_err());
+        assert!(parse_json(r#"{"bad":"\uD83D\u0041"}"#).is_err());
+
+        // Ensure an unrelated settings update preserves a document containing 1e20
+        let root = temp_dir("float-preserve");
+        let data_dir = root.join("data-wheel");
+        ensure_private_dir(&data_dir).unwrap();
+        write_private_file_atomic(&data_dir, "settings.json", raw.as_bytes()).unwrap();
+        let prev = preview_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+        )
+        .unwrap();
+        apply_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+            &prev.candidate_digest,
+        )
+        .unwrap();
+        let snap = read_wheel_snapshot(None, Some(&data_dir), &|_| false).unwrap();
+        assert_eq!(snap.approval_mode, "dashboard");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_thinking_preserved_on_gear_change_and_invalid_keys_rejected() {
+        let root = temp_dir("legacy-thinking");
+        let data_dir = root.join("data-wheel");
+        ensure_private_dir(&data_dir).unwrap();
+
+        // Seed legacy {"thinking":"high"} without explicit thinking_enabled
+        write_private_file_atomic(
+            &data_dir,
+            "settings.json",
+            br#"{"schema_version":"1.0","thinking":"high"}"#,
+        )
+        .unwrap();
+
+        let prev = preview_wheel_set(
+            Some(&data_dir),
+            "thinking_gear",
+            &WheelSettingValue::Text("low".to_string()),
+        )
+        .unwrap();
+        apply_wheel_set(
+            Some(&data_dir),
+            "thinking_gear",
+            &WheelSettingValue::Text("low".to_string()),
+            &prev.candidate_digest,
+        )
+        .unwrap();
+
+        let snap = read_wheel_snapshot(None, Some(&data_dir), &|_| false).unwrap();
+        assert!(snap.thinking_enabled);
+        assert_eq!(snap.thinking_gear, "low");
+
+        // Overlapping prefix/suffix key "providers.model" must fail closed without panicking
+        assert_eq!(
+            preview_wheel_set(
+                Some(&data_dir),
+                "providers.model",
+                &WheelSettingValue::Text("gpt-5.4".to_string()),
+            )
+            .unwrap_err(),
+            ConfigWriteFailure::Invalid
+        );
+        assert_eq!(
+            preview_wheel_set(
+                Some(&data_dir),
+                "providers..model",
+                &WheelSettingValue::Text("gpt-5.4".to_string()),
+            )
+            .unwrap_err(),
+            ConfigWriteFailure::Invalid
+        );
+
+        // Candidate exceeding 64 KiB must be rejected before preview or write
+        let near_limit = format!(
+            r#"{{"schema_version":"1.0","pad":"{}"}}"#,
+            "a".repeat(WHEEL_MAX_FILE_BYTES - 45)
+        );
+        write_private_file_atomic(&data_dir, "settings.json", near_limit.as_bytes()).unwrap();
+        assert_eq!(
+            preview_wheel_set(
+                Some(&data_dir),
+                "default_model",
+                &WheelSettingValue::Text("x".repeat(64)),
+            )
+            .unwrap_err(),
+            ConfigWriteFailure::Invalid
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclaims_ownerless_and_concurrent_stale_store_locks() {
+        let root = temp_dir("lock-reclaim");
+        let data_dir = root.join("data-wheel");
+        ensure_private_dir(&data_dir).unwrap();
+
+        // 1. A live owner recorded in the owner file is accepted, and leftover dead
+        //    staging directories plus dead-owner locks are reclaimed cleanly. The
+        //    owner is this process so the liveness probe is portable; PID 1 is
+        //    probed additionally on Unix, where the init process always exists.
+        let self_pid = std::process::id();
+        let live_owner_file = data_dir.join("live-owner");
+        std::fs::write(&live_owner_file, format!("{self_pid}\n")).unwrap();
+        assert_eq!(read_lock_owner_pid(&live_owner_file), Some(self_pid));
+        assert!(is_lock_owner_alive(self_pid));
+        #[cfg(unix)]
+        {
+            assert!(is_lock_owner_alive(1));
+        }
+        let _ = std::fs::remove_file(&live_owner_file);
+
+        let dead_stage_dir = data_dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stage.99999999-1-1"));
+        prepare_staged_lock_dir(&dead_stage_dir, "owner.99999999-1-1", 99_999_999).unwrap();
+        let lock_dir = data_dir.join(WHEEL_LOCK_DIR_NAME);
+        create_private_lock_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner.99999999-stale-0"), "99999999\n").unwrap();
+        let prev = preview_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+        )
+        .unwrap();
+        apply_wheel_set(
+            Some(&data_dir),
+            "approval_mode",
+            &WheelSettingValue::Text("dashboard".to_string()),
+            &prev.candidate_digest,
+        )
+        .unwrap();
+        assert!(!lock_dir.exists());
+        assert!(!dead_stage_dir.exists());
+
+        // 2. Concurrent contenders racing to reclaim a dead-owner lock never delete
+        //    another contender's replacement lock.
+        create_private_lock_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner"), "99999999\n").unwrap();
+
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlap = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let dir_clone = data_dir.clone();
+            let active_clone = std::sync::Arc::clone(&active);
+            let overlap_clone = std::sync::Arc::clone(&overlap);
+            handles.push(std::thread::spawn(move || {
+                with_wheel_store_lock(&dir_clone, || {
+                    let prev_active =
+                        active_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if prev_active > 0 {
+                        overlap_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    active_clone.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            !overlap.load(std::sync::atomic::Ordering::SeqCst),
+            "concurrent stale-lock reclamation allowed overlapping lock holders"
+        );
+        assert!(!lock_dir.exists());
+
+        // 3. Deterministic pause before lock publication: Contender A stages its
+        //    lock and pauses at a barrier before publishing to `lock_dir`.
+        //    Contender B acquires the lock and enters the critical section before
+        //    releasing Contender A. Contender B waits on `after_first_publish`
+        //    while still holding the lock until Contender A has attempted its
+        //    first publication and verified that the attempt failed (`!published`).
+        let paused_before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_first_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a_first_publish_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a_entered_while_b_active =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let dir_a = data_dir.clone();
+        let paused_a = std::sync::Arc::clone(&paused_before_publish);
+        let resume_a = std::sync::Arc::clone(&resume_publish);
+        let after_pub_a = std::sync::Arc::clone(&after_first_publish);
+        let b_done_a = std::sync::Arc::clone(&b_done);
+        let first_failed_a = std::sync::Arc::clone(&a_first_publish_failed);
+        let overlap_a = std::sync::Arc::clone(&a_entered_while_b_active);
+        let handle_a = std::thread::spawn(move || {
+            with_wheel_store_lock_with_hooks(
+                &dir_a,
+                |attempt| {
+                    if attempt == 1 {
+                        paused_a.wait();
+                        resume_a.wait();
+                    }
+                },
+                |attempt, published| {
+                    if attempt == 1 {
+                        first_failed_a.store(!published, std::sync::atomic::Ordering::SeqCst);
+                        after_pub_a.wait();
+                    }
+                },
+                |_| {},
+                |_| {},
+                || {
+                    if !b_done_a.load(std::sync::atomic::Ordering::SeqCst) {
+                        overlap_a.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+
+        // Wait until Contender A has prepared its staged lock and paused before publish.
+        paused_before_publish.wait();
+        with_wheel_store_lock(&data_dir, || {
+            // Wake Contender A while Contender B holds the lock in the critical section,
+            // and wait until Contender A's first publication attempt has completed.
+            resume_publish.wait();
+            after_first_publish.wait();
+            assert!(
+                a_first_publish_failed.load(std::sync::atomic::Ordering::SeqCst),
+                "Contender A's first publish attempt must fail while Contender B holds the lock"
+            );
+            assert!(
+                lock_dir.exists(),
+                "lock_dir must remain present while Contender B holds the lock"
+            );
+            b_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        handle_a.join().unwrap();
+        assert!(
+            !a_entered_while_b_active.load(std::sync::atomic::Ordering::SeqCst),
+            "paused acquirer entered critical section while Contender B still held the lock"
+        );
+        assert!(!lock_dir.exists());
+
+        // 4. Deterministic pause during stale-lock reclamation: seed a dead-owner
+        //    entry `owner.99999999-stale`, pause Contender 1 right before it unlinks
+        //    that stale entry, let Contender 2 reclaim the stale lock and acquire a
+        //    live replacement lock, then release Contender 1 while Contender 2 is
+        //    inside the critical section and wait on `after_first_reclaim` until
+        //    Contender 1's delayed reclamation finishes before Contender 2 releases.
+        create_private_lock_dir(&lock_dir).unwrap();
+        std::fs::write(lock_dir.join("owner.99999999-stale"), "99999999\n").unwrap();
+        let paused_in_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let after_first_reclaim = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let c1_reclaim_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c2_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c1_overlapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let dir_c1 = data_dir.clone();
+        let paused_c1 = std::sync::Arc::clone(&paused_in_reclaim);
+        let resume_c1 = std::sync::Arc::clone(&resume_reclaim);
+        let after_rec_c1 = std::sync::Arc::clone(&after_first_reclaim);
+        let rec_failed_c1 = std::sync::Arc::clone(&c1_reclaim_failed);
+        let c2_active_c1 = std::sync::Arc::clone(&c2_active);
+        let overlap_c1 = std::sync::Arc::clone(&c1_overlapped);
+        let mut paused_once = false;
+        let mut notified_after_reclaim = false;
+        let handle_c1 = std::thread::spawn(move || {
+            with_wheel_store_lock_with_hooks(
+                &dir_c1,
+                |_| {},
+                |_, _| {},
+                |_| {
+                    if !paused_once {
+                        paused_once = true;
+                        paused_c1.wait();
+                        resume_c1.wait();
+                    }
+                },
+                |reclaimed| {
+                    if !notified_after_reclaim {
+                        notified_after_reclaim = true;
+                        rec_failed_c1.store(!reclaimed, std::sync::atomic::Ordering::SeqCst);
+                        after_rec_c1.wait();
+                    }
+                },
+                || {
+                    if c2_active_c1.load(std::sync::atomic::Ordering::SeqCst) {
+                        overlap_c1.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+
+        // Wait until Contender 1 has identified `owner.99999999-stale` as dead and paused.
+        paused_in_reclaim.wait();
+        with_wheel_store_lock(&data_dir, || {
+            c2_active.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Release Contender 1's delayed reclamation while Contender 2 holds the replacement lock,
+            // and wait until Contender 1's delayed reclamation attempt finishes.
+            resume_reclaim.wait();
+            after_first_reclaim.wait();
+            assert!(
+                c1_reclaim_failed.load(std::sync::atomic::Ordering::SeqCst),
+                "Contender 1's delayed reclamation must fail while Contender 2 holds the replacement lock"
+            );
+            assert!(
+                lock_dir.exists(),
+                "Contender 2's replacement lock must survive Contender 1's delayed reclamation"
+            );
+            c2_active.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        handle_c1.join().unwrap();
+        assert!(
+            !c1_overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "paused reclaimer entered critical section concurrently with Contender 2"
+        );
+        assert!(!lock_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }

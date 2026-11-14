@@ -1734,4 +1734,39 @@ fn long_running_virtual_and_multi_pane_chafa_never_lock_out_3159() {
         rt.kitty_last_frame_images() >= 1,
         "subsequent chafa -f kitty display must composite into the frame"
     );
+
+    // Main -> alt retransmit -> main: stashed main-screen images must survive
+    // same-wire-id retransmits on the alternate screen (both combined virtual
+    // `a=T,U=1,i=77` and direct `a=T,i=78`).
+    let mut rt_alt = make_runtime();
+    rt_alt.set_min_present_interval(std::time::Duration::ZERO);
+    rt_alt.tick();
+    let main_virt = format!("\x1b_Ga=T,U=1,f=32,s=2,v=2,i=77,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    let main_blit = format!("\x1b_Ga=T,f=32,s=2,v=2,i=78,c=2,r=2,q=2,m=0;{encoded}\x1b\\");
+    rt_alt.handle_pty_bytes(main_virt.as_bytes());
+    rt_alt.handle_pty_bytes(main_blit.as_bytes());
+    assert_eq!(rt_alt.kitty_image_count(), 2);
+    assert_eq!(rt_alt.kitty_virtual_count(), 1);
+    assert_eq!(rt_alt.kitty_placement_count(), 1);
+
+    // Enter alternate screen and retransmit both wire ids.
+    rt_alt.handle_pty_bytes(b"\x1b[?1049h");
+    rt_alt.handle_pty_bytes(main_virt.as_bytes());
+    rt_alt.handle_pty_bytes(main_blit.as_bytes());
+    assert!(
+        rt_alt.kitty_image_count() >= 4,
+        "stashed main-screen images must be preserved alongside alt-screen images"
+    );
+
+    // Leave alternate screen: restored main-screen placement and prototype
+    // must still have their stored images intact and paint.
+    rt_alt.handle_pty_bytes(b"\x1b[?1049l");
+    assert_eq!(rt_alt.kitty_virtual_count(), 1);
+    assert_eq!(rt_alt.kitty_placement_count(), 1);
+    assert!(rt_alt.tick().is_some());
+    assert_eq!(
+        rt_alt.kitty_last_frame_images(),
+        1,
+        "restored main-screen placement must still resolve its preserved image"
+    );
 }

@@ -2205,21 +2205,33 @@ impl KittyImageLayer {
     }
 
     /// Removes every stored image, placement, and virtual prototype matching
-    /// `(origin, wire_image)` (issue #3159).
+    /// `(origin, wire_image)` unless the stored image is in `protected_images`
+    /// (issue #3159).
     ///
     /// Used by the runtime when a combined `a=T,U=1,i=<id>` re-transmits an
     /// explicit non-zero wire image id on `origin`, so repeated inline-image
     /// or animated-mascot updates replace the previous frame in place instead
     /// of leaking images and virtual prototypes until per-origin or global
-    /// quotas lock out the pane. Anonymous (`wire_image == 0`) is a no-op.
-    pub fn remove_by_wire_image(&mut self, origin: Option<u64>, wire_image: u32) -> bool {
+    /// quotas lock out the pane. Images referenced by `kitty_alt_stash`
+    /// (`protected_images`) stay stored so leaving the alternate screen can
+    /// restore the main plane intact. Anonymous (`wire_image == 0`) is a no-op.
+    pub fn remove_by_wire_image(
+        &mut self,
+        origin: Option<u64>,
+        wire_image: u32,
+        protected_images: &[KittyImageId],
+    ) -> bool {
         if wire_image == 0 {
             return false;
         }
         let dead: Vec<KittyImageId> = self
             .images
             .iter()
-            .filter(|img| img.origin == origin && img.wire_image == wire_image)
+            .filter(|img| {
+                img.origin == origin
+                    && img.wire_image == wire_image
+                    && !protected_images.contains(&img.id)
+            })
             .map(|img| img.id)
             .collect();
         let before_images = self.images.len();
@@ -2227,7 +2239,7 @@ impl KittyImageLayer {
         if !dead.is_empty() {
             let mut freed_bytes = 0usize;
             self.images.retain(|img| {
-                if img.origin == origin && img.wire_image == wire_image {
+                if dead.contains(&img.id) {
                     freed_bytes = freed_bytes.saturating_add(img.stored_bytes());
                     false
                 } else {
@@ -2249,13 +2261,14 @@ impl KittyImageLayer {
     }
 
     /// Drops older stored images for `(origin, wire_image)` other than `keep`
-    /// that have no remaining blit placement or linked virtual prototype
-    /// (issue #3159).
+    /// that have no remaining blit placement, linked virtual prototype, or
+    /// stashed alternate-screen reference (`protected_images`) (issue #3159).
     pub fn prune_superseded_wire_images(
         &mut self,
         origin: Option<u64>,
         wire_image: u32,
         keep: KittyImageId,
+        protected_images: &[KittyImageId],
     ) -> bool {
         if wire_image == 0 {
             return false;
@@ -2267,6 +2280,7 @@ impl KittyImageLayer {
                 img.origin == origin
                     && img.wire_image == wire_image
                     && img.id != keep
+                    && !protected_images.contains(&img.id)
                     && !self.placements.iter().any(|p| p.image == img.id)
                     && !self.virtual_protos.iter().any(|v| v.image == Some(img.id))
             })
@@ -2286,6 +2300,45 @@ impl KittyImageLayer {
         });
         self.total_bytes = self.total_bytes.saturating_sub(freed_bytes);
         true
+    }
+
+    /// Whether an addressed placement (`wire_image != 0 && wire_placement != 0`)
+    /// already exists on `origin` and will be replaced in place by
+    /// `push_placement` without consuming quota (issue #3159).
+    #[must_use]
+    pub fn has_addressed_placement(
+        &self,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> bool {
+        wire_image != 0
+            && wire_placement != 0
+            && self.placements.iter().any(|p| {
+                p.origin == origin
+                    && p.wire_image == wire_image
+                    && p.wire_placement == wire_placement
+            })
+    }
+
+    /// Whether an addressed virtual prototype (`wire_image != 0 &&
+    /// wire_placement != 0`) already exists on `origin` and will be replaced
+    /// in place by [`Self::register_virtual_for_origin`] without consuming
+    /// quota (issue #3159).
+    #[must_use]
+    pub fn has_addressed_virtual(
+        &self,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> bool {
+        wire_image != 0
+            && wire_placement != 0
+            && self.virtual_protos.iter().any(|v| {
+                v.origin == origin
+                    && v.wire_image == wire_image
+                    && v.wire_placement == wire_placement
+            })
     }
 
     /// Reclaims store capacity for a runtime transmit when global image or

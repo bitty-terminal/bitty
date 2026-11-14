@@ -1425,8 +1425,13 @@ impl Runtime {
                         self.sync_kitty_screen();
                         let base = self.state.scrollback_len();
                         let origin = self.kitty_origin;
-                        self.kitty_images
-                            .reclaim_for_runtime_placement(origin, true);
+                        if !self
+                            .kitty_images
+                            .has_addressed_virtual(origin, image, placement)
+                        {
+                            self.kitty_images
+                                .reclaim_for_runtime_placement(origin, true);
+                        }
                         let _ = self.kitty_images.register_virtual_for_origin(
                             origin, image, placement, None, cols, rows, 0, 0, base,
                         );

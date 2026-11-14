@@ -2157,13 +2157,20 @@ mod tests {
         let data_dir = root.join("data-wheel");
         ensure_private_dir(&data_dir).unwrap();
 
-        // 1. PID 1 is accepted as a valid lock owner, and leftover dead staging
-        //    directories plus dead-owner locks are reclaimed cleanly.
-        let pid1_file = data_dir.join("pid1-owner");
-        std::fs::write(&pid1_file, "1\n").unwrap();
-        assert_eq!(read_lock_owner_pid(&pid1_file), Some(1));
-        assert!(is_lock_owner_alive(1));
-        let _ = std::fs::remove_file(&pid1_file);
+        // 1. A live owner recorded in the owner file is accepted, and leftover dead
+        //    staging directories plus dead-owner locks are reclaimed cleanly. The
+        //    owner is this process so the liveness probe is portable; PID 1 is
+        //    probed additionally on Unix, where the init process always exists.
+        let self_pid = std::process::id();
+        let live_owner_file = data_dir.join("live-owner");
+        std::fs::write(&live_owner_file, format!("{self_pid}\n")).unwrap();
+        assert_eq!(read_lock_owner_pid(&live_owner_file), Some(self_pid));
+        assert!(is_lock_owner_alive(self_pid));
+        #[cfg(unix)]
+        {
+            assert!(is_lock_owner_alive(1));
+        }
+        let _ = std::fs::remove_file(&live_owner_file);
 
         let dead_stage_dir = data_dir.join(format!("{WHEEL_LOCK_DIR_NAME}.stage.99999999-1-1"));
         prepare_staged_lock_dir(&dead_stage_dir, "owner.99999999-1-1", 99_999_999).unwrap();

@@ -14,7 +14,7 @@
 # Keep PORTVERSION in step with the workspace version in Cargo.toml.
 
 PORTNAME=	bitty
-PORTVERSION=	0.0.40
+PORTVERSION=	0.0.41
 CATEGORIES=	x11
 
 # Distfile is the released source tarball for the v${PORTVERSION} tag: the same

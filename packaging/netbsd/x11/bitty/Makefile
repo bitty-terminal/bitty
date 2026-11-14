@@ -14,7 +14,7 @@
 #
 # Keep DISTNAME version in step with the workspace version in Cargo.toml.
 
-DISTNAME=	bitty-0.0.40
+DISTNAME=	bitty-0.0.41
 CATEGORIES=	x11
 MASTER_SITES=	${MASTER_SITE_GITHUB:=bitty-terminal/}
 GITHUB_PROJECT=	bitty

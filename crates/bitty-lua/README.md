@@ -8,7 +8,8 @@
 ## Purpose
 
 `bitty-lua` wraps the pure-Rust `phodopus` VM (sole third-party dependency
-per `Cargo.toml`, exact git revision `f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344`)
+per `Cargo.toml`, crate version `0.2.0`, exact git revision
+`f3d6a9b8ecdf829629daa688a4adbe08259b1b81`)
 to give Bitty deterministic, bounded Lua execution for per-plugin isolation
 and, per DEC-0011, user configuration evaluation (`src/lib.rs`,
 `src/config.rs`). Each VM instance gets isolated globals with a restricted
@@ -20,16 +21,20 @@ the determinism contract are documented in `src/lib.rs`.
 
 ## Boundaries
 
-- Sole third-party dependency, per `Cargo.toml`: `phodopus` pinned at exact
-  git revision `f6aa59a16c0dd8d3f65f54043f8c3c2fe02b5344`; no
+- Sole third-party dependency, per `Cargo.toml`: `phodopus` `0.2.0`, pinned at
+  exact git revision `f3d6a9b8ecdf829629daa688a4adbe08259b1b81`; no
   network-facing dependency is declared.
-- Standard library baseline at `phodopus@f6aa59a`: in-core `utf8` and
+- Standard library baseline at `phodopus@f3d6a9b`: in-core `utf8` and
   `string.format` with proportional fuel charging, plus retained bounded
   `string.byte`/`char`, `table.concat`/`sort`, and restricted
   `os.time`/`clock`/`date` (`src/stdlib.rs`); no ambient `io` authority,
   traceback-only `debug`, text-only `load`, and empty `package.path` with no
   native loader (pinned by `tests/readiness_mirror.rs`:
-  `stdlib_allowlist_denies_ambient_authority`).
+  `stdlib_allowlist_denies_ambient_authority`). The `0.2.0` pin adds the
+  `xpcall` message handler with forwarded arguments, `coroutine.wrap` /
+  `coroutine.isyieldable`, and function replacements in `string.gsub`,
+  plus exact Lua 5.4 integer/float comparison and negative-shift semantics (pinned by
+  `phodopus_v0_2_0_lua54_surface_in_sandboxed_vm` in `src/lib.rs`).
 - Plugin VMs build only through the fail-closed gate (`src/gate.rs`:
   `PluginVmBuilder`/`build_plugin_vm` require explicit RC-1/RC-2 budgets);
   the raw constructors are deprecated and kept for the single internal
@@ -264,7 +269,7 @@ selected.
 ## Evidence
 
 - `tests/readiness_mirror.rs` (RUN-29) mirrors the Phodopus executable gate
-  (`phodopus@f6aa59a`, `crates/phodopus/tests/readiness_gate.rs`) at the
+  (`phodopus@f3d6a9b`, `crates/phodopus/tests/readiness_gate.rs`) at the
   bitty seam: RC-1 instruction/wall budgets, RC-2 quota refusal, FS-1
   denial atomicity, FS-3 fault containment, FS-5 recovery, FS-9 no-bypass,
   the stdlib allowlist, module isolation, and host-op cancellation as typed

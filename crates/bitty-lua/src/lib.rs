@@ -2629,4 +2629,61 @@ mod vm_unit_tests {
         assert!(!vm.pump_host_suspended(&stashed).expect("query works"));
         assert!(!vm.is_suspended());
     }
+
+    #[test]
+    fn phodopus_v0_2_0_lua54_surface_in_sandboxed_vm() {
+        let mut vm = LuaVm::new("xuepoo.phodopus-v0-2-0");
+        let code = r#"
+            -- xpcall error handler and forward args
+            local ok, msg = xpcall(
+                function(a, b) error("boom:" .. tostring(a + b), 0) end,
+                function(err) return "handled:" .. tostring(err) end,
+                20, 22
+            )
+            assert(ok == false and msg == "handled:boom:42")
+
+            -- rawequal, rawlen on strings, __metatable protection
+            local mt = {
+                __eq = function() return true end,
+                __len = function() return 99 end,
+                __metatable = "locked",
+                __name = "CustomBox",
+            }
+            local a = setmetatable({}, mt)
+            local b = setmetatable({}, mt)
+            assert(a == b and not rawequal(a, b))
+            assert(rawlen("hello") == 5)
+            assert(getmetatable(a) == "locked")
+            assert(string.find(tostring(a), "^CustomBox: ") == 1)
+
+            -- coroutine.wrap and coroutine.isyieldable
+            assert(not coroutine.isyieldable())
+            local next_val = coroutine.wrap(function(seed)
+                assert(coroutine.isyieldable())
+                local step = coroutine.yield(seed + 1)
+                return seed + step
+            end)
+            assert(next_val(10) == 11)
+            assert(next_val(5) == 15)
+
+            -- string.gsub with function replacement
+            local out, n = string.gsub("a1 b22", "(%a)(%d+)", function(k, v)
+                return k .. "=" .. tostring(tonumber(v) * 2)
+            end)
+            assert(out == "a=2 b=44" and n == 2)
+
+            -- exact Lua 5.4 integer/float comparisons and negative shift
+            local max_i = 9223372036854775807
+            assert(max_i ~= 9223372036854775808.0)
+            assert(max_i < 9223372036854775808.0)
+            assert((16 << -2) == 4 and (4 >> -2) == 16)
+            verified = 1
+        "#;
+        let outcome = vm.execute(code).expect("v0.2.0 surface executes cleanly");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Completed { .. }),
+            "expected Completed, got {outcome:?}"
+        );
+        assert_eq!(vm.test_global("verified"), Some(1.0));
+    }
 }

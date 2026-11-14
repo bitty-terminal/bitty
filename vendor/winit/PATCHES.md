@@ -1,9 +1,10 @@
 # Vendored `winit` patches
 
-This directory is the crates.io release `winit 0.30.13` plus the two patches
-recorded below: an upstream Wayland backport and a local CodeQL null-pointer
-hardening. The workspace consumes it through
-`[patch.crates-io]` in the repository root `Cargo.toml`; the version
+This directory is the crates.io release `winit 0.30.13` plus the four patches
+recorded below: an upstream Wayland backport, a local CodeQL null-pointer
+hardening, and two local Wayland fixes (pending-dispatch on a shared display, and
+flushing `wl_surface.frame` before an off-thread present). The workspace consumes
+it through `[patch.crates-io]` in the repository root `Cargo.toml`; the version
 requirement in `[workspace.dependencies]` stays on the released `0.30.13`, so
 dropping the patch is a deletion rather than a dependency bump.
 

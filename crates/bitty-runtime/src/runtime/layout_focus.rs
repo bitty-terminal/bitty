@@ -3403,7 +3403,10 @@ impl Runtime {
     /// - When the focused view is a tiled leaf, resolves the spatial tiled
     ///   neighbor in `dir` via `focus_spatial_neighbor` and swaps the
     ///   two leaves in place ([`LayoutNode::swap_leaves`]), preserving split
-    ///   ratios, pane sessions, and focus on the moved panel.
+    ///   ratios, pane sessions, and focus on the moved panel. In-tree
+    ///   `Overlay` leaves are never candidates (the pointer drop path refuses
+    ///   them for the same reason): a tiled pane is only ever swapped with
+    ///   another tiled pane.
     ///
     /// Returns `true` when the panel moved or swapped, or `false` when no
     /// neighbor exists in `dir` or a floating panel is already clamped against
@@ -3424,17 +3427,34 @@ impl Runtime {
             let Some(anchor) = self.pinned_anchor(focused) else {
                 return false;
             };
-            let (cur_dx, cur_dy) = self.pinned_offsets.get(&focused).copied().unwrap_or((0, 0));
-            let stored_dx = cur_dx
+            // CTX-1827 (#3157 review D3): normalize the stored offset against
+            // the *current* permitted range before stepping. A container shrink
+            // can leave a stale offset outside that range, and the read path
+            // already paints the clamped value; stepping the stale value first
+            // clamped it back into range and reported a move with no visible
+            // movement.
+            let (stored_dx, stored_dy) =
+                self.pinned_offsets.get(&focused).copied().unwrap_or((0, 0));
+            let cur_dx = stored_dx.clamp(anchor.dx_range.0, anchor.dx_range.1);
+            let cur_dy = stored_dy.clamp(anchor.dy_range.0, anchor.dy_range.1);
+            let next_dx = cur_dx
                 .saturating_add(step_dx)
                 .clamp(anchor.dx_range.0, anchor.dx_range.1);
-            let stored_dy = cur_dy
+            let next_dy = cur_dy
                 .saturating_add(step_dy)
                 .clamp(anchor.dy_range.0, anchor.dy_range.1);
-            if (stored_dx, stored_dy) == (cur_dx, cur_dy) {
+            if (next_dx, next_dy) == (cur_dx, cur_dy) {
+                // Already against the container edge in `dir`. Persist the
+                // normalization when the stored offset was stale, so a later
+                // container growth cannot resurrect a position the user never
+                // moved to; the painted geometry is unchanged, so this reports
+                // no move.
+                if (cur_dx, cur_dy) != (stored_dx, stored_dy) {
+                    self.pinned_offsets.insert(focused, (cur_dx, cur_dy));
+                }
                 return false;
             }
-            self.pinned_offsets.insert(focused, (stored_dx, stored_dy));
+            self.pinned_offsets.insert(focused, (next_dx, next_dy));
             self.pending_full_redraw = true;
             self.trigger_animation(AnimationKind::Move, Some(focused), now);
             return true;
@@ -3443,17 +3463,24 @@ impl Runtime {
             let Some(anchor) = self.float_anchor(focused) else {
                 return false;
             };
-            let (cur_dx, cur_dy) = self.float_offsets.get(&focused).copied().unwrap_or((0, 0));
-            let stored_dx = cur_dx
+            // Same normalization rule as the pinned branch above (D3).
+            let (stored_dx, stored_dy) =
+                self.float_offsets.get(&focused).copied().unwrap_or((0, 0));
+            let cur_dx = stored_dx.clamp(anchor.dx_range.0, anchor.dx_range.1);
+            let cur_dy = stored_dy.clamp(anchor.dy_range.0, anchor.dy_range.1);
+            let next_dx = cur_dx
                 .saturating_add(step_dx)
                 .clamp(anchor.dx_range.0, anchor.dx_range.1);
-            let stored_dy = cur_dy
+            let next_dy = cur_dy
                 .saturating_add(step_dy)
                 .clamp(anchor.dy_range.0, anchor.dy_range.1);
-            if (stored_dx, stored_dy) == (cur_dx, cur_dy) {
+            if (next_dx, next_dy) == (cur_dx, cur_dy) {
+                if (cur_dx, cur_dy) != (stored_dx, stored_dy) {
+                    self.float_offsets.insert(focused, (cur_dx, cur_dy));
+                }
                 return false;
             }
-            self.float_offsets.insert(focused, (stored_dx, stored_dy));
+            self.float_offsets.insert(focused, (next_dx, next_dy));
             self.pending_full_redraw = true;
             self.trigger_animation(AnimationKind::Move, Some(focused), now);
             return true;
@@ -3472,7 +3499,20 @@ impl Runtime {
             self.trigger_animation(AnimationKind::Move, Some(focused), now);
             return true;
         }
-        let tiled_ids = self.layout.leaf_ids();
+        // CTX-1827 (#3157 review D2): `leaf_ids` includes the leaves of every
+        // in-tree `Overlay`, but an overlay is never a swap partner. The
+        // pointer path already refuses an overlay drop target
+        // (`mouse_chrome::end_tiled_drag_at`: background, overlay, or self is
+        // a no-op), so the keyboard move applies the same rule here: swapping
+        // a tiled pane with an overlay would exchange the base allocation with
+        // the overlay rect. With no eligible neighbour this keeps today's
+        // safe no-op.
+        let tiled_ids: Vec<ViewId> = self
+            .layout
+            .leaf_ids()
+            .into_iter()
+            .filter(|id| self.layout.overlay_bounds_containing(*id).is_none())
+            .collect();
         if !tiled_ids.contains(&focused) {
             return false;
         }
@@ -6181,6 +6221,173 @@ mod tests {
             rt.focused_view(),
             Some(first),
             "closing the last background tiled leaf must preserve focus on the focused float"
+        );
+    }
+
+    /// A two-pane horizontal split with the primary view at the given size.
+    fn two_pane_rt(container: UiRect) -> (Runtime, ViewId, ViewId) {
+        let mut rt = Runtime::with_defaults().expect("headless runtime");
+        rt.set_container(container);
+        let first = rt.focused_view().expect("primary focus");
+        let second = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(first, 40, 23)),
+            LayoutNode::leaf(View::new(second, 40, 23)),
+        ));
+        assert!(rt.set_focus(first));
+        (rt, first, second)
+    }
+
+    /// Issue #3155's keyboard move merges into the layout through
+    /// `move_focused_panel`; the chrome_keys integration test covers the action
+    /// binding, so the merge itself is pinned here (CTX-1827 review D5b): the
+    /// swap keeps focus on the moved leaf, and a direction with no neighbour is
+    /// a safe no-op that leaves the tree untouched.
+    #[test]
+    fn move_split_swaps_tiled_leaves_and_keeps_focus_on_the_moved_leaf() {
+        let (mut rt, first, second) = two_pane_rt(UiRect::new(0, 0, 80, 24));
+
+        assert!(
+            rt.move_focused_panel(FocusDirection::Right),
+            "a tiled leaf with a neighbour to its right swaps"
+        );
+        assert_eq!(rt.layout().leaf_ids(), vec![second, first]);
+        assert_eq!(
+            rt.focused_view(),
+            Some(first),
+            "focus follows the moved panel, not the slot it left"
+        );
+
+        // The moved leaf now sits in the right column, so `Left` swaps it back:
+        // the merge is symmetric, and focus keeps following the pane.
+        assert!(rt.move_focused_panel(FocusDirection::Left));
+        assert_eq!(rt.layout().leaf_ids(), vec![first, second]);
+        assert_eq!(rt.focused_view(), Some(first));
+
+        // Nothing lies left of the leftmost leaf: a safe no-op that leaves the
+        // tree and focus exactly as they were.
+        assert!(!rt.move_focused_panel(FocusDirection::Left));
+        assert_eq!(rt.layout().leaf_ids(), vec![first, second]);
+        assert_eq!(rt.focused_view(), Some(first));
+
+        // `Next`/`Prev` are cycle directions, not moves.
+        assert!(!rt.move_focused_panel(FocusDirection::Next));
+        assert!(!rt.move_focused_panel(FocusDirection::Prev));
+        assert_eq!(rt.layout().leaf_ids(), vec![first, second]);
+    }
+
+    /// CTX-1827 (review D2): `leaf_ids` includes an in-tree `Overlay` leaf, and
+    /// its solved frame can be a few pixels nearer than the tiled sibling's, so
+    /// the unprefixed candidate list made the keyboard swap exchange a tiled
+    /// pane with an overlay. The pointer drop path already refuses an overlay
+    /// target; the keyboard move must agree.
+    #[test]
+    fn move_split_never_swaps_a_tiled_leaf_with_an_in_tree_overlay() {
+        let (mut rt, first, second) = two_pane_rt(UiRect::new(0, 0, 80, 24));
+        let overlay = ViewId::new(3);
+        // Bounds starting at the right half: the tiled leaf's frame is inset by
+        // decoration, so the overlay frame starts a few pixels earlier and won
+        // the directional race before the filter.
+        let base = rt.layout().clone();
+        rt.set_layout(LayoutNode::overlay(
+            base,
+            LayoutNode::leaf(View::new(overlay, 20, 12)),
+            UiRect::new(40, 0, 20, 12),
+        ));
+        assert!(rt.set_focus(first));
+        assert!(
+            rt.layout().overlay_bounds_containing(overlay).is_some(),
+            "the fixture's overlay leaf is an in-tree overlay"
+        );
+
+        assert!(
+            rt.move_focused_panel(FocusDirection::Right),
+            "the tiled sibling is still a valid swap partner"
+        );
+        assert_eq!(
+            rt.layout().leaf_ids(),
+            vec![second, first, overlay],
+            "the tiled pane swapped with its tiled sibling, never the overlay"
+        );
+        assert!(
+            rt.layout().overlay_bounds_containing(overlay).is_some(),
+            "the overlay leaf must stay the overlay after the move"
+        );
+        assert!(
+            rt.layout().overlay_bounds_containing(first).is_none(),
+            "the moved tiled pane must not inherit the overlay geometry"
+        );
+        assert_eq!(rt.focused_view(), Some(first));
+
+        // With no tiled sibling the overlay is the only directional candidate:
+        // the move degrades to today's safe no-op instead of swapping with it.
+        let solo = LayoutNode::overlay(
+            LayoutNode::leaf(View::new(first, 80, 23)),
+            LayoutNode::leaf(View::new(overlay, 20, 12)),
+            UiRect::new(40, 0, 20, 12),
+        );
+        rt.set_layout(solo);
+        assert!(rt.set_focus(first));
+        assert!(!rt.move_focused_panel(FocusDirection::Right));
+        assert_eq!(rt.layout().leaf_ids(), vec![first, overlay]);
+        assert!(rt.layout().overlay_bounds_containing(first).is_none());
+    }
+
+    /// CTX-1827 (review D3): a container shrink can leave the stored re-anchor
+    /// offset outside the permitted range while the painted rect is already
+    /// clamped, so stepping the stale value first normalized it and reported a
+    /// move the user could not see. Normalizing before the step makes the first
+    /// keypress move visibly.
+    #[test]
+    fn move_split_normalizes_a_stale_float_offset_before_stepping() {
+        let (mut rt, _first, second) = two_pane_rt(UiRect::new(0, 0, 80, 24));
+        rt.float_detach(second).expect("detach the second pane");
+        assert!(rt.floats.contains(second), "the pane is a detached float");
+        assert!(rt.set_focus(second));
+        let anchor = rt.float_anchor(second).expect("anchored float geometry");
+        let (min_dx, max_dx) = anchor.dx_range;
+        let step = FLOAT_KEYBOARD_MOVE_STEP_CELLS;
+        assert!(
+            max_dx - step >= min_dx,
+            "the fixture needs a range one step wide: {min_dx}..={max_dx}"
+        );
+
+        // A stale offset beyond the right edge: the painted rect is already at
+        // `max_dx`, so a leftward press must land on `max_dx - step`.
+        rt.float_offsets.insert(second, (max_dx + 10, 0));
+        let before = rt
+            .anchored_overlay_cell_rect(second)
+            .expect("the float has a composed rect");
+        assert!(rt.move_focused_panel(FocusDirection::Left));
+        let after = rt
+            .anchored_overlay_cell_rect(second)
+            .expect("the float still has a rect");
+        assert_eq!(
+            after.x + u16::try_from(step).expect("step fits a cell coordinate"),
+            before.x,
+            "the first keypress must move the panel one step, not just re-clamp \
+             the stored offset ({before:?} -> {after:?})"
+        );
+        assert_eq!(
+            rt.float_offsets.get(&second).copied(),
+            Some((max_dx - step, 0)),
+            "the stored offset is normalized against the current range"
+        );
+
+        // A press into the edge that cannot move is reported as no move: the
+        // stored offset is already normalized, so nothing is claimed that the
+        // user cannot see.
+        let mut presses = 0;
+        while rt.move_focused_panel(FocusDirection::Left) {
+            presses += 1;
+            assert!(presses < 64, "the nudge must stop at the left edge");
+        }
+        assert_eq!(
+            rt.float_offsets.get(&second).copied(),
+            Some((min_dx, 0)),
+            "the last visible step lands exactly on the permitted minimum"
         );
     }
 }

@@ -2385,16 +2385,20 @@ impl Runtime {
     /// confirmation check when it fires. `None` in the healthy steady state, so
     /// an idle window arms nothing.
     ///
-    /// It is *not* gated on visibility: a hide keeps the bound when it retained
-    /// nothing (see [`Self::set_surface_visibility_at`]), so the embedder must
-    /// arm this wake whether or not the surface is visible - that expiry is the
-    /// only counter-evidence to a false occlusion edge.
+    /// It is *not* gated on visibility: a hide keeps the bound whether or not
+    /// it retained damage (see [`Self::set_surface_visibility_at`]), and only a
+    /// settlement - a reveal, a served frame callback, or a frame the
+    /// failed-present retry owns - clears it, so the embedder must arm this wake
+    /// whether or not the surface is visible. That expiry is what gives a
+    /// false-positive occlusion during a streaming burst its single bounded
+    /// speculative reopen at [`PRESENT_CONFIRM_BOUND`].
     #[must_use]
     pub fn present_confirm_deadline(&self) -> Option<std::time::Instant> {
-        // Visibility is decided where the hide happens: a hide that retained
-        // work clears the bound (the reveal frame owns it), a hide that
-        // retained nothing keeps it so the deadline can tell a synthetic
-        // occlusion edge from a dropped frame.
+        // A hide does not clear the bound: the deadline has to outlive the
+        // synthetic occlusion edge a streaming burst produces, so a later
+        // expiry can still spend the one bounded speculative reopen. Only a
+        // reveal (`queue_reveal_repaint`), a served frame callback, or a frame
+        // the retry path owns settles it.
         self.present_confirm_at
     }
 
@@ -2432,7 +2436,9 @@ impl Runtime {
         self.arm_present_confirmation(now);
     }
 
-    /// Drops any outstanding confirmation (new surface incarnation, hide).
+    /// Drops any outstanding confirmation (new surface incarnation, a queued
+    /// reveal frame, or a frame the failed-present retry / stuck-present
+    /// recovery owns instead).
     fn clear_present_confirmation(&mut self) {
         self.present_confirm_at = None;
     }
@@ -2447,11 +2453,11 @@ impl Runtime {
     /// presented once; the next commit re-arms the bound, and a served
     /// callback clears it.
     ///
-    /// A bound can also expire while the surface is hidden, because the hide
-    /// keeps it when it retained nothing. That hide came from the platform's
-    /// starvation probe, which reads the same unanswered redraw a dropped frame
-    /// leaves behind, so the expiry is the counter-evidence and reopens the
-    /// gate **speculatively**
+    /// A bound can also expire while the surface is hidden, because a hide
+    /// keeps it whether or not it retained damage. That hide came from the
+    /// platform's starvation probe, which reads the same unanswered redraw a
+    /// dropped frame leaves behind, so the expiry is the counter-evidence and
+    /// reopens the gate **speculatively**
     /// ([`Self::speculative_present_reopen`]). A repair that commits or is
     /// confirmed proves the surface visible and settles it; one that cannot
     /// commit closes the gate again
@@ -2496,17 +2502,18 @@ impl Runtime {
             return;
         }
         if !self.surface_visible {
-            // bitty#2989: reaching an expiry while hidden means the hide
-            // retained nothing (a hide with retained work clears the bound),
-            // so no reveal frame is queued and no damage is waiting. An
-            // unanswered redraw is the only evidence the gate closed on, and
-            // a dropped frame produces exactly that evidence on a surface
-            // that is still mapped. Treat the expiry as counter-evidence:
-            // reopen the gate and queue the repair below. The reopen is
-            // speculative - if the repair does not commit, the gate closes
-            // again and the bounded hidden repair takes over, so a genuinely
-            // hidden surface costs one blind attempt per epoch instead of a
-            // retry loop.
+            // bitty#2989 / bitty#3155: the bound survives a hide, so reaching
+            // an expiry while hidden is the counter-evidence that the hide was
+            // a false-positive occlusion edge - typically a streaming burst
+            // whose redraw starvation the 300 ms probe read as synthetic
+            // occlusion. `request_redraw()` alone cannot unstick a Wayland
+            // surface whose frame callback is waiting on a commit, so treat
+            // the expiry as proof of life: reopen the gate and queue the repair
+            // below, which spends the one bounded speculative reopen. The
+            // reopen is speculative - if the repair does not commit, the gate
+            // closes again and the bounded hidden repair takes over, so a
+            // genuinely hidden surface costs one blind attempt per epoch
+            // instead of a retry loop.
             self.set_surface_visibility_at(now, true);
             self.speculative_present_reopen = true;
         }
@@ -2726,11 +2733,10 @@ impl Runtime {
     /// handler. The repair timer has done its job and must never wake a
     /// visible surface.
     ///
-    /// A confirmation bound armed for a hide that retained nothing belongs
-    /// to the hidden incarnation (bitty#3023). The reveal frame is the
-    /// stronger evidence and re-arms the bound when it commits, so keeping
-    /// the old deadline would only force a duplicate corrective repaint for
-    /// a frame the reveal already supersedes.
+    /// A confirmation bound armed before a reveal belongs to the hidden
+    /// incarnation. The reveal frame is the stronger evidence and re-arms the
+    /// bound when it commits, so keeping the old deadline would only force a
+    /// duplicate corrective repaint for a frame the reveal already supersedes.
     fn queue_reveal_repaint(&mut self, now: std::time::Instant) {
         self.coalesced_pending = true;
         self.coalesced_deadline = Some(now);

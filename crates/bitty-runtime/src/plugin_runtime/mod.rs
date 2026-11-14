@@ -4179,12 +4179,20 @@ impl PluginRuntime {
             .as_ref()
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
+        let mut terminal = None;
         let result = match vm.try_borrow_mut() {
             Ok(mut vm) => {
                 // bitty#2830: mark the callback in flight before entering the
                 // VM so a hang dump still sees the invocation it interrupted.
                 let _active = ActiveCommandGuard::new(self.hang_gauges.as_ref());
-                vm.call_function_resumable(&run, args)
+                let outcome = vm.call_function_resumable(&run, args);
+                // CTX-1827 (#3157 review D4): the borrow is the only place the
+                // terminal verdict is readable, and a terminal RC-1 wall
+                // suspension has to fail the generation, not just this call.
+                if outcome.is_err() {
+                    terminal = vm.suspend_reason().cloned();
+                }
+                outcome
             }
             Err(_) => {
                 return Err(PluginRuntimeError::Vm(format!(
@@ -4215,7 +4223,19 @@ impl PluginRuntime {
                     ),
                 });
             }
-            Err(error) => return Err(PluginRuntimeError::Vm(error.to_string())),
+            Err(error) => {
+                // CTX-1827 (#3157 review D4): a terminal RC-1 wall suspension
+                // leaves `Active` + a dead VM + no failure class, which
+                // `recover_wall_failed_plugins` cannot select. Record the same
+                // verdict the activation path records; every other error keeps
+                // its existing containment.
+                self.fail_runtime_on_wall_terminal(
+                    id,
+                    terminal.as_ref(),
+                    &format!("command '{command_id}' suspended"),
+                );
+                return Err(PluginRuntimeError::Vm(error.to_string()));
+            }
         };
         // The effective result schema is re-checked before the result
         // returns, so a misbehaving callee is contained to this invocation.
@@ -4442,12 +4462,20 @@ impl PluginRuntime {
             let Some(vm) = self.entries.get(&id).and_then(|entry| entry.vm.clone()) else {
                 continue;
             };
+            let mut terminal = None;
             let outcome = match vm.try_borrow_mut() {
                 Ok(mut vm) => {
                     // bitty#2830: a resumed parked body is still an executing
                     // plugin command for hang attribution.
                     let _active = ActiveCommandGuard::new(self.hang_gauges.as_ref());
-                    vm.resume_parked_call()
+                    let outcome = vm.resume_parked_call();
+                    // CTX-1827 (#3157 review D4): a resumed body that exhausts
+                    // the cumulative RC-1 wall envelope is terminal, and this
+                    // borrow is the only place the verdict is readable.
+                    if outcome.is_err() {
+                        terminal = vm.suspend_reason().cloned();
+                    }
+                    outcome
                 }
                 Err(_) => {
                     // A live borrow is unexpected on the cold path; keep the
@@ -4490,6 +4518,18 @@ impl PluginRuntime {
                     });
                 }
                 Err(error) => {
+                    // CTX-1827 (#3157 review D4): the resumed body died on a
+                    // terminal verdict. A wall timeout has to fail the
+                    // generation here too, or it stays `Active` with a dead VM
+                    // and no failure class and `recover_wall_failed_plugins`
+                    // never selects it. The park record was already removed
+                    // above and `resume_parked_call` dropped the executor, so
+                    // this path leaks no parked state either.
+                    self.fail_runtime_on_wall_terminal(
+                        &id,
+                        terminal.as_ref(),
+                        &format!("parked command '{}' suspended", parked.command),
+                    );
                     completed.push(ParkedCommandCompletion {
                         plugin: id,
                         command: parked.command,
@@ -4666,12 +4706,12 @@ impl PluginRuntime {
             // One mutable borrow per plugin per event: a handler that
             // re-enters this same VM through services fails closed host-side
             // (`E_SERVICE_FAILED`) instead of aliasing it.
-            let Ok(mut vm) = vm.try_borrow_mut() else {
+            let Ok(mut vm_ref) = vm.try_borrow_mut() else {
                 continue;
             };
             let mut any_ok = false;
             for handler in handlers {
-                if vm
+                if vm_ref
                     .call_function(&handler, std::slice::from_ref(envelope))
                     .is_ok()
                 {
@@ -4679,16 +4719,22 @@ impl PluginRuntime {
                     any_ok = true;
                 }
             }
-            drop(vm);
-            if any_ok
-                && entry.vm.as_ref().is_some_and(|v| {
-                    v.try_borrow()
-                        .ok()
-                        .is_some_and(|r| r.suspend_reason().is_none())
-                })
-            {
+            // CTX-1827 (#3157 review D4): a handler that exhausts the RC-1
+            // wall envelope leaves the VM terminal. Read the verdict while the
+            // borrow is still live, then fail the generation after the entry
+            // borrow ends (the reset above is its last use) - otherwise the
+            // plugin stays `Active` with a dead VM, unreachable by
+            // `recover_wall_failed_plugins`.
+            let terminal = vm_ref.suspend_reason().cloned();
+            drop(vm_ref);
+            if any_ok && terminal.is_none() {
                 entry.wall_recovery_attempts = 0;
             }
+            self.fail_runtime_on_wall_terminal(
+                &id,
+                terminal.as_ref(),
+                &format!("event handler for '{kind}' suspended"),
+            );
         }
         self.sync_callback_timers(Instant::now());
         delivered
@@ -5004,6 +5050,44 @@ impl PluginRuntime {
         self.fail_runtime_classified(id, timer_terminal_reason(reason, refused), class);
     }
 
+    /// Record a terminal RC-1 wall suspension observed outside the timer pump
+    /// (CTX-1827, #3157 review D4).
+    ///
+    /// [`Self::fail_runtime_on_suspend`] exists because the timer pump holds
+    /// the [`SuspendReason`] in hand. Command dispatch, the parked-command
+    /// pump, and event delivery reach the very same terminal VM state without
+    /// a timer anywhere in the path: the VM is dead but the generation stayed
+    /// [`Active`](LifecycleState::Active) with
+    /// [`FailureClass::Unclassified`], so
+    /// [`Self::recover_wall_failed_plugins`] never selected it and a plugin
+    /// without a timer stayed suspended until an explicit reload.
+    ///
+    /// Only a wall-clock verdict is recorded here. Every other failure keeps
+    /// exactly the handling its own path already had: a plain Lua or VM error
+    /// leaves a usable VM, and an instruction or memory verdict is
+    /// deterministic, so neither may be reclassified as a transient wall slice
+    /// and auto-retried.
+    ///
+    /// Returns whether the generation was failed.
+    fn fail_runtime_on_wall_terminal(
+        &mut self,
+        id: &PluginId,
+        reason: Option<&SuspendReason>,
+        context: &str,
+    ) -> bool {
+        match reason {
+            Some(reason @ SuspendReason::WallClockExceeded { .. }) => {
+                self.fail_runtime_classified(
+                    id,
+                    suspend_terminal_reason(context, reason),
+                    FailureClass::WallSliceTimeout,
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Roll back a failed activation attempt atomically.
     ///
     /// Purges the policy-host generation (identity, command ownership, and
@@ -5211,18 +5295,34 @@ fn timer_terminal_reason(reason: &SuspendReason, refused: bool) -> String {
     } else {
         "timer callback exceeded"
     };
+    format!("{prefix} {}", suspend_verdict_detail(reason))
+}
+
+/// Budget numbers behind a terminal suspend verdict, rendered for a failure
+/// reason.
+///
+/// The typed [`FailureClass`] is what selects a wall recovery; this text is
+/// only the human-facing attribution, so a plugin that writes the same words
+/// into a Lua error still never earns an automatic reload.
+fn suspend_verdict_detail(reason: &SuspendReason) -> String {
     match reason {
         SuspendReason::WallClockExceeded {
             elapsed_ms,
             budget_ms,
-        } => format!("{prefix} (RC-1 wall: elapsed_ms={elapsed_ms}, budget_ms={budget_ms})"),
+        } => format!("(RC-1 wall: elapsed_ms={elapsed_ms}, budget_ms={budget_ms})"),
         SuspendReason::InstructionBudgetExceeded { used, budget } => {
-            format!("{prefix} (RC-1 instructions: used={used}, budget={budget})")
+            format!("(RC-1 instructions: used={used}, budget={budget})")
         }
         SuspendReason::MemoryExceeded { used, limit } => {
-            format!("{prefix} (RC-2 memory: used_bytes={used}, limit_bytes={limit})")
+            format!("(RC-2 memory: used_bytes={used}, limit_bytes={limit})")
         }
     }
+}
+
+/// Failure reason for a non-timer callback that died on a terminal budget
+/// verdict (CTX-1827, #3157 review D4).
+fn suspend_terminal_reason(context: &str, reason: &SuspendReason) -> String {
+    format!("{context} {}", suspend_verdict_detail(reason))
 }
 
 /// Resolve the effective invocation schemas for one registered command

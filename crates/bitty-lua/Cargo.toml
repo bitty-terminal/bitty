@@ -14,7 +14,7 @@ publish = true
 workspace = true
 
 [dependencies]
-phodopus = { version = "0.2.0-alpha.1", git = "https://github.com/bitty-terminal/phodopus", rev = "91b8a2c" }
+phodopus = { version = "0.2.0", git = "https://github.com/bitty-terminal/phodopus", rev = "f3d6a9b" }
 chrono.workspace = true
 
 # bitty#2869: the configuration module loader's descriptor-anchored walk

@@ -5500,3 +5500,437 @@ mod event_wire {
         assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
     }
 }
+
+/// The `P0-AC-024`, `P0-AC-025`, and `P0-AC-026` live cells (bitty#2921).
+///
+/// These three criteria were Partially verified with the residual cells naming
+/// an adapter audit, a live DevTools endpoint, a trace/export preview, and a
+/// seeded-secret corpus. The daemon serves no DevTools endpoint and no trace
+/// export at this revision, so the cells below observe what the served loop
+/// actually decides: a fresh consumer's read-only default and its typed
+/// refusals, the untrusted label on the one content plane it can reach, the
+/// handshake's scope list for `debug.*`, and the audit segment's content under a
+/// seeded-secret corpus. Nothing here claims a cell that was not run.
+mod p0_ac_024_026 {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    use super::*;
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        text
+    }
+
+    fn hex_decode(text: &str) -> Vec<u8> {
+        assert!(text.len() % 2 == 0, "odd hex length: {text}");
+        let mut bytes = Vec::with_capacity(text.len() / 2);
+        let raw = text.as_bytes();
+        for pair in raw.chunks(2) {
+            let high = char::from(pair[0]).to_digit(16).expect("hex high nibble");
+            let low = char::from(pair[1]).to_digit(16).expect("hex low nibble");
+            bytes.push(u8::try_from(high * 16 + low).expect("hex byte"));
+        }
+        bytes
+    }
+
+    /// Every file under the audit directory, concatenated.
+    fn audit_text(root: &TempRoot) -> String {
+        let dir = root.state().join("bitty").join("audit");
+        let mut text = String::new();
+        let entries = std::fs::read_dir(&dir).expect("the audit directory exists");
+        for entry in entries {
+            let entry = entry.expect("an audit entry");
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let mut file = std::fs::File::open(&path).expect("open the audit segment");
+            let mut segment = String::new();
+            file.read_to_string(&mut segment)
+                .expect("the audit segment is UTF-8");
+            text.push_str(&segment);
+        }
+        text
+    }
+
+    #[test]
+    fn a_fresh_consumer_reads_a_labeled_untrusted_surface_and_cannot_mutate() {
+        bitty_test_support::require_pty!();
+        let root = TempRoot::new("ac024-live");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let mut session = controlled_session(&root, &mut operator, "ac024");
+        let marker = "CTX1843A-MARKER\n";
+        let written = session.creator.call(
+            "session.write",
+            json!({
+                "session_id": session.session_id.as_str(),
+                "generation": 1,
+                "data": hex_encode(marker.as_bytes()),
+            }),
+        );
+        assert_eq!(written["ok"], true, "{written}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut decoded = String::new();
+        let mut printed = false;
+        while !decoded.contains("CTX1843A-MARKER") {
+            assert!(
+                Instant::now() < deadline,
+                "the read never returned the marker: {decoded:?}"
+            );
+            let read = session.creator.call(
+                "session.read",
+                json!({
+                    "session_id": session.session_id.as_str(),
+                    "generation": 1,
+                    "max_bytes": 4096,
+                }),
+            );
+            assert_eq!(read["ok"], true, "{read}");
+            let result = read["result"].as_object().expect("a result object");
+            for key in [
+                "buffered_bytes",
+                "bytes",
+                "data",
+                "generation",
+                "session_id",
+            ] {
+                assert!(result.contains_key(key), "{key} missing from {read}");
+            }
+            assert_eq!(
+                result["is_untrusted_surface"],
+                Value::Bool(true),
+                "every content response carries the untrusted label: {read}"
+            );
+            assert!(result["is_untrusted_surface"].is_boolean());
+            if !printed {
+                println!("AC024_LIVE_READ {read}");
+                printed = true;
+            }
+            decoded.push_str(&String::from_utf8_lossy(&hex_decode(
+                result["data"].as_str().expect("hex data"),
+            )));
+            if !decoded.contains("CTX1843A-MARKER") {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        // A connection that merely negotiated holds the baseline: no host
+        // consent, no operator capability, no lease.
+        let mut consumer = Client::connect(&root.endpoint());
+        assert_eq!(consumer.negotiate(None)["ok"], true);
+        let created = consumer.call(
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": "ac024-create"}),
+        );
+        assert_eq!(created["ok"], false, "{created}");
+        assert_eq!(created["error"]["class"], "Denied", "{created}");
+        assert_eq!(created["error"]["code"], "ConsentRequired", "{created}");
+        // The session exists, but a connection with no lease is outside the
+        // visibility relation, so every target-addressed verb is the uniform
+        // NotFound rather than an oracle.
+        for (method, params) in [
+            (
+                "session.write",
+                json!({
+                    "session_id": session.session_id.as_str(),
+                    "generation": 1,
+                    "data": "41",
+                }),
+            ),
+            (
+                "session.read",
+                json!({"session_id": session.session_id.as_str(), "generation": 1}),
+            ),
+        ] {
+            let refused = consumer.call(method, params);
+            assert_eq!(refused["ok"], false, "{method}: {refused}");
+            assert_eq!(refused["error"]["class"], "NotFound", "{method}: {refused}");
+            assert_eq!(refused["error"]["code"], "NotFound", "{method}: {refused}");
+            println!("AC024_LIVE_CONSUMER {method} {refused}");
+        }
+        // `session.kill` is the operator authority, so the scope stage refuses
+        // it before any target lookup: no oracle, and no partial state.
+        let killed = consumer.call(
+            "session.kill",
+            json!({"session_id": session.session_id.as_str(), "generation": 1}),
+        );
+        assert_eq!(killed["ok"], false, "{killed}");
+        assert_eq!(killed["error"]["class"], "Denied", "{killed}");
+        assert_eq!(killed["error"]["code"], "ScopeViolation", "{killed}");
+        println!("AC024_LIVE_CONSUMER session.kill {killed}");
+        println!("AC024_LIVE_CONSUMER session.create {created}");
+
+        // An observer is inside the visibility relation and still cannot read
+        // content or write input: the content plane is controller-only.
+        let minted = session.creator.call(
+            "session.grant",
+            json!({
+                "session_id": session.session_id.as_str(),
+                "idempotency_key": "ac024-grant",
+            }),
+        );
+        assert_eq!(minted["ok"], true, "{minted}");
+        let grant = minted["result"]["grant"]
+            .as_str()
+            .expect("observer grant bearer")
+            .to_owned();
+        let mut observer = Client::connect(&root.endpoint());
+        assert_eq!(observer.negotiate(None)["ok"], true);
+        let attached = observer.call(
+            "session.attach",
+            json!({
+                "attach_role": "observer",
+                "session_id": session.session_id.as_str(),
+                "observer_grant": grant,
+            }),
+        );
+        assert_eq!(attached["ok"], true, "{attached}");
+        let observer_read = observer.call(
+            "session.read",
+            json!({
+                "session_id": session.session_id.as_str(),
+                "generation": 1,
+                "max_bytes": 4096,
+            }),
+        );
+        assert_eq!(observer_read["ok"], false, "{observer_read}");
+        assert_eq!(observer_read["error"]["class"], "Denied", "{observer_read}");
+        assert_eq!(
+            observer_read["error"]["code"], "ControllerRequired",
+            "{observer_read}"
+        );
+        let observer_write = observer.call(
+            "session.write",
+            json!({
+                "session_id": session.session_id.as_str(),
+                "generation": 1,
+                "data": "41",
+            }),
+        );
+        assert_eq!(observer_write["ok"], false, "{observer_write}");
+        assert_eq!(
+            observer_write["error"]["code"], "ControllerRequired",
+            "{observer_write}"
+        );
+        println!("AC024_LIVE_OBSERVER session.read {observer_read}");
+        println!("AC024_LIVE_OBSERVER session.write {observer_write}");
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_fresh_connection_grants_no_devtools_scope_and_the_verbs_are_not_found() {
+        let root = TempRoot::new("ac025-live");
+        let daemon = Daemon::start(&root);
+
+        // A consumer that only connected: the handshake is the scope grant.
+        let mut consumer = Client::connect(&root.endpoint());
+        let handshake = consumer.negotiate(None);
+        assert_eq!(handshake["ok"], true, "{handshake}");
+        let scopes: Vec<&str> = handshake["result"]["scopes"]
+            .as_array()
+            .expect("the handshake advertises its scopes")
+            .iter()
+            .map(|value| value.as_str().expect("a scope string"))
+            .collect();
+        assert!(
+            scopes.iter().all(|scope| !scope.starts_with("debug.")
+                && !scope.starts_with("view.")
+                && !scope.starts_with("config.")
+                && !scope.starts_with("plugin.")
+                && !scope.starts_with("ai.")),
+            "a fresh connection must not hold a DevTools, view, config, plugin, or AI scope: {scopes:?}"
+        );
+        assert_eq!(
+            scopes,
+            [
+                "session.inspect",
+                "session.attach",
+                "session.control",
+                "terminal.inspect",
+                "terminal.input",
+                "terminal.manage",
+                "process.spawn",
+            ],
+            "the baseline scope list changed"
+        );
+
+        for method in [
+            "debug.inspect",
+            "debug.trace",
+            "debug.control",
+            "debug.snapshot",
+            "debug.break",
+        ] {
+            let refused = consumer.call(method, json!({}));
+            assert_eq!(refused["ok"], false, "{method}: {refused}");
+            assert_eq!(refused["error"]["class"], "NotFound", "{method}: {refused}");
+            assert_eq!(refused["error"]["code"], "NotFound", "{method}: {refused}");
+            println!("AC025_LIVE_VERB {method} {refused}");
+        }
+        println!("AC025_LIVE_HANDSHAKE {scopes:?}");
+
+        // The operator capability is the strongest authority the daemon mints;
+        // it also reaches no DevTools verb, because the service catalog has no
+        // `debug.*` method and no scope carries one.
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        let operator_handshake = operator.negotiate(Some(&capability));
+        assert_eq!(operator_handshake["ok"], true, "{operator_handshake}");
+        let operator_scopes: Vec<&str> = operator_handshake["result"]["scopes"]
+            .as_array()
+            .expect("scopes")
+            .iter()
+            .map(|value| value.as_str().expect("a scope string"))
+            .collect();
+        assert!(
+            operator_scopes
+                .iter()
+                .all(|scope| !scope.starts_with("debug.")),
+            "the operator set adds daemon.* and never a DevTools scope: {operator_scopes:?}"
+        );
+        assert!(operator_scopes.contains(&"daemon.control"));
+        let debug_with_operator = operator.call("debug.trace", json!({}));
+        assert_eq!(debug_with_operator["ok"], false, "{debug_with_operator}");
+        assert_eq!(
+            debug_with_operator["error"]["code"], "NotFound",
+            "{debug_with_operator}"
+        );
+        println!("AC025_LIVE_OPERATOR_VERB debug.trace {debug_with_operator}");
+        println!("AC025_LIVE_OPERATOR_HANDSHAKE {operator_scopes:?}");
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_seeded_secret_never_reaches_the_audit_segment() {
+        bitty_test_support::require_pty!();
+        let root = TempRoot::new("ac026-live");
+        // The seeded corpus: a cloud key, an API key, a forge token, a private
+        // key header, a URL with an inline password, and a bearer token.
+        let seeds: Vec<String> = vec![
+            format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE"),
+            format!("{}-{}-{}", "sk", "live", "51H8xQ2eZvKYlo2C8b"),
+            format!("{}{}", "ghp_", "16CharactersLongToken0000"),
+            format!("{} {} {}", "-----BEGIN", "OPENSSH", "PRIVATE KEY-----"),
+            format!(
+                "{}://{}:{}@{}/{}",
+                "postgres", "app", "hunter2", "db.internal", "prod"
+            ),
+            format!("{} {}", "Bearer", "eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+        ];
+        let cwd = root.path.join(format!("ctx1843-cwd-{}", seeds[0]));
+        std::fs::create_dir_all(&cwd).expect("seed cwd");
+        std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod the seed cwd");
+
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+        assert_eq!(minted["ok"], true, "{minted}");
+        let host_grant = minted["result"]["grant"]
+            .as_str()
+            .expect("host grant")
+            .to_owned();
+
+        // Everything a client can supply is seeded: the terminal id, argv, env,
+        // cwd, the idempotency key, and the client correlation value.
+        let mut creator = Client::connect(&root.endpoint());
+        let correlation = seeds[5].as_str();
+        assert_eq!(
+            creator.negotiate_full(None, Some(&host_grant), Some(correlation))["ok"],
+            true
+        );
+        let created = creator.call(
+            "session.create",
+            json!({
+                "kind": "terminal",
+                "idempotency_key": format!("ctx1843-{}", seeds[1]),
+                "terminal_id": seeds[0],
+                "argv": ["/bin/sleep", "300"],
+                "cwd": cwd.to_str().expect("UTF-8 cwd"),
+                "env": [
+                    format!("CTX1843_ENV={}", seeds[2]),
+                    format!("DATABASE_URL={}", seeds[4]),
+                    format!("AWS_KEY={}", seeds[0]),
+                ],
+            }),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let session_id = created["result"]["session"]["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        // A refusal from a connection that never held host consent, so the
+        // segment holds both an applied and a refused record, then a clean stop.
+        let mut refused_consumer = Client::connect(&root.endpoint());
+        assert_eq!(refused_consumer.negotiate(None)["ok"], true);
+        let refused = refused_consumer.call(
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": "ac026-no-consent"}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "ConsentRequired", "{refused}");
+        let status = operator.call("session.status", json!({"session_id": session_id}));
+        assert_eq!(status["ok"], true, "{status}");
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+
+        // The segment is owner-private and holds records.
+        let audit_dir = root.state().join("bitty").join("audit");
+        let dir_mode = std::fs::metadata(&audit_dir)
+            .expect("audit directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the audit directory is owner-private");
+        let active = audit_dir.join("audit.log");
+        assert!(Path::new(&active).exists(), "the active segment exists");
+        let file_mode = std::fs::metadata(&active)
+            .expect("active segment")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "the audit segment is owner-private");
+
+        let text = audit_text(&root);
+        assert!(!text.is_empty(), "the sink wrote no records");
+        assert!(text.lines().count() >= 4, "expected several records");
+        println!(
+            "AC026_LIVE_MODES dir={dir_mode:04o} segment={file_mode:04o} records={}",
+            text.lines().count()
+        );
+        println!("AC026_AUDIT_BEGIN\n{text}AC026_AUDIT_END");
+        assert!(
+            text.contains("a=session.create"),
+            "the create record is missing: {text}"
+        );
+        for seed in &seeds {
+            assert!(
+                !text.contains(seed.as_str()),
+                "a seeded secret reached the audit segment: {seed}"
+            );
+            // No partial leak either: every 6-byte window of the seed is absent.
+            let window = 6;
+            for start in 0..seed.len().saturating_sub(window - 1) {
+                let slice = &seed[start..start + window];
+                assert!(
+                    !text.contains(slice),
+                    "the audit segment carries {slice:?} from a seeded secret"
+                );
+            }
+        }
+    }
+}

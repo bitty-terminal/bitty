@@ -65,11 +65,10 @@
 //!
 //! Known gaps (tracked follow-ups, not implemented here):
 //!
-//! - Column bands paint and reserve, but the interaction surfaces are still
-//!   row-only: click/scroll/hover routing, published band origins, and
-//!   per-item hit regions read [`Runtime::visible_band_row`], so a `left`/
-//!   `right` band paints its content and routes no input yet (issue #3165
-//!   follow-up). Column bands also paint no shared chrome rule.
+//! - Column bands paint, reserve, and route input (issue #3171), but a hover
+//!   tooltip anchored to a `left`/`right` band item still falls back to the
+//!   centered modal placement: [`crate::BandOverlayAnchor`] resolves its row
+//!   against a row band only.
 //! - Known divergence from the candidate rule "one plugin may hold at most
 //!   one surface per edge; a second mount on the same edge fails": several
 //!   mounts from one plugin on one edge are all kept and stack in mount

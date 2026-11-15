@@ -2569,7 +2569,7 @@ impl Runtime {
         }
         // Chrome above the grid owns its pixels even though the frame
         // solver/hit test would otherwise reach the cells beneath it.
-        if self.scrollbar_hit_at(pos) || self.plugin_band_row_hit(pos).is_some() {
+        if self.scrollbar_hit_at(pos) || self.plugin_band_cell_hit(pos).is_some() {
             return false;
         }
         let frames = self.present_frames();

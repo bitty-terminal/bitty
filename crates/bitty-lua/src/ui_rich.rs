@@ -53,6 +53,13 @@
 //! `style` is a modifier, not a tenth kind: [`UiRichNode::kind`] still reports
 //! the wrapped node's kind and [`UI_RICH_NODE_KINDS`] is unchanged.
 //!
+//! `style.border` and `Block.border` are one stroke in two units (px and
+//! cells), so a `Block` may declare one of them and never both with a
+//! non-zero width: two non-zero borders on one node would paint a rounded
+//! ring over a cell frame, the double painting the candidate record rejects
+//! for a separate `stroke` key. Both declaring is a typed
+//! `E_UI_COMPONENT_INVALID` refusal naming the two widths (bitty#3176).
+//!
 //! Presentation fields the accepted `SceneNode` schema cannot express are
 //! **rejected**, never silently dropped: `fg`, `bg`, `anchor`, `on_click`,
 //! `on_scroll`, and `on_hover` belong to the band surface, and a rich node
@@ -348,6 +355,24 @@ impl UiRichNode {
                         return Err(component_invalid("Block.border must be a table"));
                     }
                 };
+                // bitty#3176: one node paints one stroke. `Block.border` is
+                // the cell frame (cells, cap `UI_RICH_MAX_BORDER_CELLS`) and
+                // `style.border` is the pixel stroke of the `Styled` wrapper
+                // (px, cap `UI_STYLE_MAX_BORDER_PX`); both at once would paint
+                // a rounded ring plus the four-op cell frame over the same
+                // box. That is the conflicting spelling the candidate record
+                // refuses for a separate `stroke` key, so the second border is
+                // a typed refusal here rather than a precedence rule. Either
+                // spelling alone is accepted, and a zero width paints nothing
+                // so it never collides.
+                if let Some(style) = style {
+                    if style.collides_with_cell_frame(border) {
+                        return Err(component_invalid(format!(
+                            "Block declares two borders: border.width = {border} cells and style.border = {} px; declare one",
+                            style.border_px
+                        )));
+                    }
+                }
                 Ok(Self::Block {
                     border,
                     child: Box::new(child),
@@ -904,6 +929,59 @@ mod tests {
             );
             assert_eq!(node.count_nodes(), 1);
             assert_eq!(node.depth(), 1);
+        }
+    }
+
+    #[test]
+    fn a_block_refuses_a_second_border_on_the_same_node() {
+        // bitty#3176 item 1: `border = { width = N }` (cells) and
+        // `style = { border = M }` (px) are two spellings for one stroke, so a
+        // node that declares both paints a rounded ring over a cell frame.
+        // One behaviour: the pair is refused, never resolved by precedence.
+        let block = |border_width: Option<i64>, style_border: Option<i64>| {
+            let mut fields = vec![
+                ("kind", LuaValue::String("Block".to_string())),
+                ("child", text("x")),
+            ];
+            if let Some(width) = border_width {
+                fields.push((
+                    "border",
+                    LuaValue::table([("width", LuaValue::Integer(width))]),
+                ));
+            }
+            if let Some(stroke) = style_border {
+                fields.push((
+                    "style",
+                    LuaValue::table([("border", LuaValue::Integer(stroke))]),
+                ));
+            }
+            LuaValue::Table(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                    .collect(),
+            )
+        };
+
+        for (cells, px) in [(1, 1), (1, 16), (8, 2)] {
+            let error = UiRichNode::from_lua_value(&block(Some(cells), Some(px)))
+                .expect_err("two strokes on one node are refused");
+            assert_eq!(error.class, "validation");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(
+                error.message,
+                format!(
+                    "Block declares two borders: border.width = {cells} cells and \
+                     style.border = {px} px; declare one"
+                )
+            );
+        }
+
+        // Each spelling alone is accepted, and a zero width paints nothing so
+        // it composes with the other one instead of colliding.
+        for (cells, px) in [(Some(1), None), (None, Some(2)), (Some(0), Some(2))] {
+            UiRichNode::from_lua_value(&block(cells, px))
+                .unwrap_or_else(|error| panic!("{cells:?}/{px:?} must be accepted: {error}"));
         }
     }
 

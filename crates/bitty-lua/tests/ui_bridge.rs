@@ -40,6 +40,8 @@ struct UiServices {
     overlay_hides: RefCell<Vec<i64>>,
     overlay_events: RefCell<Vec<OverlayInput>>,
     snapshot_rows: Vec<TargetSnapshotRow>,
+    /// One-shot tolerated-declaration diagnostics (bitty#3176).
+    style_notices: RefCell<Vec<(String, usize)>>,
 }
 
 impl HostServices for UiServices {
@@ -99,6 +101,12 @@ impl HostServices for UiServices {
 
     fn ui_targets_snapshot(&self, max: usize) -> Result<Vec<TargetSnapshotRow>, BridgeError> {
         Ok(self.snapshot_rows.iter().take(max).cloned().collect())
+    }
+
+    fn ui_style_ignored(&self, surface: &str, nodes: usize) {
+        self.style_notices
+            .borrow_mut()
+            .push((surface.to_string(), nodes));
     }
 
     fn ui_overlay_acquire(&self, handle: i64) -> Result<(), BridgeError> {
@@ -313,6 +321,107 @@ fn mount_and_update_round_trip_validated_scene() {
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].0, 11);
     assert_eq!(updates[0].1, UiNode::text("v2"));
+}
+
+#[test]
+fn a_band_style_declaration_mounts_and_is_reported_once() {
+    // bitty#3176 item 3: the accepted additive-minor rule keeps the rich-only
+    // `style` table an ignored optional field on the v1 band surface, so the
+    // mount must still succeed; the author is told once per generation instead
+    // of being left to believe the declaration took effect.
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("style-notice");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local band = {
+          kind = "Column",
+          children = {
+            { kind = "Text", text = "a", style = { padding = 1 } },
+            { kind = "Text", text = "b", style = { border = 2 } },
+          },
+        }
+        bitty.store.set("first", bitty.ui.mount("bottom", band))
+        bitty.store.set("second", bitty.ui.mount("bottom", band))
+    "#,
+    );
+
+    // Tolerance is unchanged: both mounts landed with the style dropped.
+    assert_eq!(stored(&services, "first"), Some(LuaValue::Integer(11)));
+    assert_eq!(stored(&services, "second"), Some(LuaValue::Integer(11)));
+    let mounts = services.mounts.borrow();
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].1.count_nodes(), 3, "the style table adds no node");
+    assert_eq!(mounts[0].1.text_bytes(), 2, "and no text bytes");
+    drop(mounts);
+
+    let notices = services.style_notices.borrow();
+    assert_eq!(notices.len(), 1, "one shot per generation: {notices:?}");
+    assert_eq!(
+        notices[0],
+        ("bottom".to_string(), 2),
+        "the surface and the number of nodes that dropped a style"
+    );
+}
+
+#[test]
+fn an_update_style_declaration_reports_the_band_scope_once() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("style-update");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local handle = bitty.ui.mount("bottom", { kind = "Text", text = "a" })
+        bitty.store.set("updated", bitty.ui.update(handle, {
+          kind = "Text", text = "b", style = { padding = 1 },
+        }))
+        bitty.store.set("again", bitty.ui.update(handle, {
+          kind = "Text", text = "c", style = { padding = 2 },
+        }))
+    "#,
+    );
+    assert_eq!(stored(&services, "updated"), Some(LuaValue::Bool(true)));
+    assert_eq!(stored(&services, "again"), Some(LuaValue::Bool(true)));
+    let notices = services.style_notices.borrow();
+    assert_eq!(notices.len(), 1, "one shot per generation: {notices:?}");
+    assert_eq!(notices[0], ("band".to_string(), 1));
+}
+
+#[test]
+fn an_overlay_style_declaration_reports_the_overlay_surface() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("style-overlay");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        bitty.store.set("updated", bitty.ui.overlay.update(12, {
+          kind = "Text", text = "x", style = { radius = 4 },
+        }))
+    "#,
+    );
+    assert_eq!(stored(&services, "updated"), Some(LuaValue::Bool(true)));
+    assert_eq!(
+        *services.style_notices.borrow(),
+        vec![("overlay".to_string(), 1)]
+    );
+}
+
+#[test]
+fn a_style_free_tree_reports_nothing() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("style-quiet");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"bitty.ui.mount("top", { kind = "Text", text = "plain" })"#,
+    );
+    assert!(
+        services.style_notices.borrow().is_empty(),
+        "the diagnostic must not fire for a tree that declared no style"
+    );
 }
 
 #[test]

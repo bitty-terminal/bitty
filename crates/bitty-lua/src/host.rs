@@ -51,7 +51,10 @@ use phodopus::{
 
 use crate::keymaps::{KeymapPage, KeymapQuery};
 use crate::runtime_inspect::RuntimeInspectSnapshot;
-use crate::ui::{UiBlockState, UiNode, UiSceneScope, UiSlot, component_invalid, read_component};
+use crate::ui::{
+    UiBlockState, UiNode, UiSceneScope, UiSlot, UiTolerated, component_invalid,
+    read_component_with_tolerated,
+};
 use crate::ui_rich::{UiRichNode, read_rich_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
@@ -1991,6 +1994,22 @@ pub trait HostServices {
         None
     }
 
+    /// Report that a band/overlay mount carried a declaration this surface
+    /// tolerates but cannot host (bitty#3176).
+    ///
+    /// The one shipped case is the rich-only `style` table: the accepted
+    /// additive-minor rule keeps it an ignored optional field on the v1
+    /// surface, so the mount succeeds and paints nothing of it. The bridge
+    /// calls this **once per generation**, and only after the mount landed and
+    /// only when a node declared one, so a host that logs it cannot be turned
+    /// into a stderr amplifier by a plugin that re-mounts on every tick.
+    ///
+    /// `surface` is the slot name for a mount and the scene scope for an
+    /// update; `nodes` is how many nodes dropped the declaration. The default
+    /// is a silent no-op so a headless host stays quiet and no existing
+    /// implementation has to change.
+    fn ui_style_ignored(&self, _surface: &str, _nodes: usize) {}
+
     /// Replace a mounted block's scene subtree, incrementing its version.
     ///
     /// Returns `Ok(false)` for a stale or foreign handle; the accepted
@@ -3706,6 +3725,10 @@ struct BridgeState {
     deadline_ms: Rc<Cell<u64>>,
     spawn_deadline_ms: Rc<Cell<u64>>,
     in_call: Rc<Cell<bool>>,
+    /// One-shot latch for the tolerated-but-ignored `style` diagnostic
+    /// (bitty#3176). Per VM generation, like every other budget here: a
+    /// re-mount loop reports the drop once, never once per call.
+    style_notice_sent: Cell<bool>,
 }
 
 /// Re-entrancy guard for one bridge call: clears `in_call` on drop.
@@ -3718,6 +3741,21 @@ impl Drop for CallGuard {
 }
 
 impl BridgeState {
+    /// Report a tolerated-but-ignored declaration at most once per generation
+    /// (bitty#3176).
+    ///
+    /// Called only after a mount/update landed, so the author is never told
+    /// about a dropped field on a call that failed for another reason. The
+    /// latch is per VM, so a plugin re-mounting on every tick costs one line.
+    fn note_style_ignored(&self, surface: &str, tolerated: UiTolerated) {
+        if tolerated.is_empty() || self.style_notice_sent.get() {
+            return;
+        }
+        self.style_notice_sent.set(true);
+        self.services
+            .ui_style_ignored(surface, tolerated.rich_style_nodes());
+    }
+
     /// Enter one bridge call, rejecting re-entrant calls fail-closed.
     fn enter(&self) -> Result<CallGuard, BridgeError> {
         if self.in_call.get() {
@@ -3925,6 +3963,7 @@ impl LuaVm {
             deadline_ms: self.host_deadline_ms.clone(),
             spawn_deadline_ms: self.spawn_deadline_ms.clone(),
             in_call: self.in_bridge_call.clone(),
+            style_notice_sent: Cell::new(false),
         });
 
         self.lua.enter(|ctx| {
@@ -6454,15 +6493,19 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         })
                         .map_err(|e| e.to_error(ctx))?
                 } else {
-                    let component =
-                        read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
-                    state
+                    let (component, tolerated) = read_component_with_tolerated(stack.get(1), scope)
+                        .map_err(|e| e.to_error(ctx))?;
+                    let handle = state
                         .bounded_mutation(|expiry| {
                             state
                                 .services
                                 .ui_mount_with_expiry(&slot, &component, expiry)
                         })
-                        .map_err(|e| e.to_error(ctx))?
+                        .map_err(|e| e.to_error(ctx))?;
+                    // bitty#3176: the mount landed, so tell the author once
+                    // that a rich-only `style` table was dropped here.
+                    state.note_style_ignored(&slot, tolerated);
+                    handle
                 };
                 stack.replace(ctx, Value::Integer(handle));
                 Ok(CallbackReturn::Return)
@@ -6508,15 +6551,19 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         .services
                         .ui_scene_scope(handle)
                         .unwrap_or(UiSceneScope::Band);
-                    let component =
-                        read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
-                    state
+                    let (component, tolerated) = read_component_with_tolerated(stack.get(1), scope)
+                        .map_err(|e| e.to_error(ctx))?;
+                    let updated = state
                         .bounded_mutation(|expiry| {
                             state
                                 .services
                                 .ui_update_with_expiry(handle, &component, expiry)
                         })
-                        .map_err(|e| e.to_error(ctx))?
+                        .map_err(|e| e.to_error(ctx))?;
+                    // An update that replaced the subtree can also be the first
+                    // call to carry a dropped `style` (bitty#3176).
+                    state.note_style_ignored(scope.as_str(), tolerated);
+                    updated
                 };
                 stack.replace(ctx, Value::Boolean(updated));
                 Ok(CallbackReturn::Return)
@@ -6672,8 +6719,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     // The focusable overlay stacks rows vertically; it has no
                     // bounded row width, so anchors are rejected here
                     // (issue #2411).
-                    let component = read_component(stack.get(1), UiSceneScope::Unanchored)
-                        .map_err(|e| e.to_error(ctx))?;
+                    let (component, tolerated) =
+                        read_component_with_tolerated(stack.get(1), UiSceneScope::Unanchored)
+                            .map_err(|e| e.to_error(ctx))?;
                     let updated = state
                         .bounded_mutation(|expiry| {
                             state
@@ -6681,6 +6729,9 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                                 .ui_overlay_update_with_expiry(handle, &component, expiry)
                         })
                         .map_err(|e| e.to_error(ctx))?;
+                    // The focusable overlay is the other v1 surface that
+                    // tolerates the rich-only `style` key (bitty#3176).
+                    state.note_style_ignored("overlay", tolerated);
                     stack.replace(ctx, Value::Boolean(updated));
                     Ok(CallbackReturn::Return)
                 }

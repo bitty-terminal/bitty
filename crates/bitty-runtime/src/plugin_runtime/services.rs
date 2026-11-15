@@ -6749,6 +6749,19 @@ impl HostServices for PluginServices {
             })
     }
 
+    fn ui_style_ignored(&self, surface: &str, nodes: usize) {
+        // bitty#3176: the composed tree is already mounted, so this is a
+        // diagnostic and never an error. One bounded line per generation (the
+        // bridge one-shots the call), fixed text plus two bounded values: no
+        // producer string is echoed and no path, handle, or colour appears.
+        eprintln!(
+            "bitty: plugin {}: the rich-only 'style' table is ignored on the \
+             {surface} surface ({nodes} node(s) declared it); it applies to \
+             ui.rich 'terminal' scenes",
+            self.plugin_id
+        );
+    }
+
     fn ui_update(&self, handle: i64, component: &UiNode) -> Result<bool, BridgeError> {
         if !self.ui_access.borrow().rich {
             return Err(BridgeError::capability_denied("ui.rich"));

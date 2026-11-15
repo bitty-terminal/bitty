@@ -37,8 +37,12 @@
 //! # Boundaries
 //!
 //! - **Closed vocabulary.** Only the four keys above are accepted. An unknown
-//!   key (CSS-like spellings included) is rejected, never ignored; so is a
-//!   duplicate key and an oversized field or token name.
+//!   key (CSS-like spellings included) is rejected, never ignored; so is an
+//!   oversized field or token name. A repeated key is rejected as well, but
+//!   only a marshalled table can carry one: the Lua VM collapses duplicate
+//!   keys in a table literal before the bridge sees the value, so that arm is
+//!   a defence-in-depth guard for a hand-built value, not a path a plugin can
+//!   reach with a literal (bitty#3176).
 //! - **Theme-resolved colour.** A border names one of six `content.*` /
 //!   `state.*` tokens. A colour literal (`#RRGGBB`, `rgb()`, a named colour),
 //!   a gradient, an image, and a Core chrome token (`border.*`, `chrome.*`)
@@ -46,6 +50,13 @@
 //! - **Bounded, fail closed.** Every geometry value has an inclusive cap;
 //!   one past it is a typed rejection naming both values. There is no clamp
 //!   and no best-effort default.
+//! - **One stroke per node.** `style.border` (physical px) and a `Block`'s
+//!   own `border` (cells) are two spellings for one stroke, exactly like the
+//!   `stroke` key the candidate record refuses: two non-zero widths on one
+//!   node would paint a rounded ring and a four-op cell frame over the same
+//!   box. A `Block` that declares both is refused with a typed
+//!   `E_UI_COMPONENT_INVALID` naming both widths; a zero width paints
+//!   nothing, so it never collides (bitty#3176).
 //! - **Presentation only.** No input binding, command, capability, renderer
 //!   handle, path, image, shader, or function is representable here. The
 //!   parser is a pure cold-path function of its input: it enters no plugin VM,
@@ -300,6 +311,22 @@ impl UiNodeStyle {
     pub const fn is_flat(self) -> bool {
         self.padding_cells == 0 && self.radius_px == 0 && self.border_px == 0
     }
+
+    /// Whether this style's pixel stroke collides with a node's own cell
+    /// frame (bitty#3176).
+    ///
+    /// A `Block` paints a cell frame with `Block.border` (cells, cap
+    /// [`crate::ui_rich::UI_RICH_MAX_BORDER_CELLS`]), and a `style` declares
+    /// a pixel stroke with `border` (physical px, cap
+    /// [`UI_STYLE_MAX_BORDER_PX`]). One node paints one stroke: both non-zero
+    /// at once would draw a rounded ring *and* the four-op cell frame over the
+    /// same box, which is the double painting the candidate record refuses
+    /// when it rejects a separate `stroke` spelling for one width. A width of
+    /// `0` paints nothing, so it never collides.
+    #[must_use]
+    pub const fn collides_with_cell_frame(self, block_border_cells: u16) -> bool {
+        self.border_px > 0 && block_border_cells > 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,10 +336,15 @@ impl UiNodeStyle {
 /// Parses one `style` table into a bounded [`UiNodeStyle`].
 ///
 /// The table is the closed four-key set. Nothing else is accepted: an unknown
-/// key, a duplicate key, an oversized name, a non-integer geometry value, and
+/// key, a repeated key, an oversized name, a non-integer geometry value, and
 /// a token outside the content set all fail with the bridge's typed
 /// `E_UI_COMPONENT_INVALID` diagnostic. The input is never echoed past
 /// [`UI_STYLE_MAX_NAME_BYTES`].
+///
+/// A repeated key is only reachable from a hand-built marshalled table: the
+/// Lua VM collapses duplicate keys inside a table literal, so a plugin cannot
+/// produce one and the arm exists to keep the closed set closed at the type
+/// boundary (bitty#3176).
 ///
 /// # Errors
 ///
@@ -347,7 +379,7 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
         };
         if seen[index] {
             return Err(component_invalid(format!(
-                "duplicate scene style field '{name}'"
+                "duplicate scene style field '{name}' (only a marshalled table can repeat a key)"
             )));
         }
         seen[index] = true;
@@ -376,6 +408,12 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
 /// A float (`2.0` included), a boolean, a table, a string, and a negative
 /// integer are all the same typed refusal: the wire form is an integer, and
 /// reinterpreting a float would be a silent coercion.
+///
+/// The conversion is the check, not a fallible step after it (bitty#3176):
+/// a value that does not fit `u16` and a value past the field's cap are the
+/// same typed rejection naming the found value and the cap, so there is no
+/// length-preserving fallback for a future guard bug to fall into. A silent
+/// clamp here would be exactly what the caps exist to prevent.
 fn style_count(value: &LuaValue, field: &str, cap: u16) -> Result<u16, BridgeError> {
     let LuaValue::Integer(count) = value else {
         return Err(component_invalid(format!(
@@ -387,12 +425,18 @@ fn style_count(value: &LuaValue, field: &str, cap: u16) -> Result<u16, BridgeErr
             "invalid scene style value for field '{field}'"
         )));
     }
-    if *count > i64::from(cap) {
-        return Err(component_invalid(format!(
-            "scene style {field} exceeds cap: {count} > {cap}"
-        )));
+    let Ok(bounded) = u16::try_from(*count) else {
+        return Err(style_over_cap(field, *count, cap));
+    };
+    if bounded > cap {
+        return Err(style_over_cap(field, i64::from(bounded), cap));
     }
-    Ok(u16::try_from(*count).unwrap_or(cap))
+    Ok(bounded)
+}
+
+/// The one over-cap refusal shape: field, found value, and inclusive cap.
+fn style_over_cap(field: &str, found: i64, cap: u16) -> BridgeError {
+    component_invalid(format!("scene style {field} exceeds cap: {found} > {cap}"))
 }
 
 /// Reads the border colour token, bounded and closed.
@@ -481,6 +525,24 @@ mod tests {
             error.message,
             "scene style padding exceeds cap: 100000 > 32"
         );
+        // The conversion is the check (bitty#3176 item 2): the whole `i64`
+        // range above the cap is refused with the found value, so no input can
+        // reach a clamp and none is clamped to the cap.
+        for found in [i64::from(u16::MAX) + 1, 1_000_000_000, i64::MAX] {
+            let error = style(vec![("radius", LuaValue::Integer(found))]).expect_err("rejected");
+            assert_eq!(
+                error.message,
+                format!("scene style radius exceeds cap: {found} > 16"),
+                "no clamp: the refused value is reported verbatim"
+            );
+        }
+        // The far negative side is the invalid-value refusal, never a
+        // conversion fallback.
+        let error = style(vec![("radius", LuaValue::Integer(i64::MIN))]).expect_err("rejected");
+        assert_eq!(
+            error.message,
+            "invalid scene style value for field 'radius'"
+        );
     }
 
     #[test]
@@ -516,7 +578,14 @@ mod tests {
             ("padding", LuaValue::Integer(2)),
         ])
         .expect_err("rejected");
-        assert_eq!(error.message, "duplicate scene style field 'padding'");
+        // bitty#3176 item 5: a Lua table literal cannot repeat a key (the VM
+        // collapses it before the bridge sees the value), so the message says
+        // what the arm actually guards instead of implying a plugin can
+        // declare the same field twice.
+        assert_eq!(
+            error.message,
+            "duplicate scene style field 'padding' (only a marshalled table can repeat a key)"
+        );
         // A non-string key is refused, not coerced.
         let error = parse_node_style(&LuaValue::Table(vec![(
             LuaValue::Integer(1),
@@ -600,6 +669,22 @@ mod tests {
         .expect("inert token is accepted");
         assert!(parsed.is_flat());
         assert_eq!(parsed.border_token, UiBorderToken::Success);
+    }
+
+    #[test]
+    fn a_pixel_stroke_collides_with_a_cell_frame_only_when_both_paint() {
+        // bitty#3176 item 1: the rule is a pure function of the two widths, so
+        // the parser applies one behaviour instead of inventing a precedence.
+        let stroke = UiNodeStyle::new(0, 0, 2, UiBorderToken::Foreground);
+        assert!(stroke.collides_with_cell_frame(1));
+        assert!(stroke.collides_with_cell_frame(8));
+        assert!(
+            !stroke.collides_with_cell_frame(0),
+            "a zero-width cell frame paints nothing"
+        );
+        let no_stroke = UiNodeStyle::new(4, 6, 0, UiBorderToken::Accent);
+        assert!(!no_stroke.collides_with_cell_frame(8));
+        assert!(!UiNodeStyle::FLAT.collides_with_cell_frame(8));
     }
 
     #[test]

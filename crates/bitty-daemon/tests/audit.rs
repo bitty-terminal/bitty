@@ -3,17 +3,26 @@
 //! The ring is the bounded staging buffer; these tests prove stable event ids,
 //! visible overflow, injected timestamps, content-free records, and refusal
 //! representation without a real sink.
+//!
+//! The `P0-AC-026` half at the bottom drives the real sink write path
+//! (`AuditSink::record` -> `render_record` -> `AuditWriter::append_line`) with a
+//! capturing writer and a seeded-secret corpus, so "the redaction is enforced at
+//! the write point" is asserted where the bytes are produced instead of assumed
+//! from the record type.
 
 use bitty_daemon::audit::{
-    AUDIT_RECORD_BYTES, AuditAction, AuditActor, AuditCounts, AuditEntry, AuditEventId,
-    AuditRecord, AuditResult, AuditRing, AuditTarget, AuditTerminal, audit_ring_capacity,
+    AUDIT_RECORD_BYTES, AuditAction, AuditActor, AuditAggregate, AuditClassCount, AuditCounts,
+    AuditEntry, AuditEventId, AuditRecord, AuditResult, AuditRing, AuditTarget, AuditTerminal,
+    MAX_AGGREGATE_CLASSES, audit_ring_capacity,
 };
+use bitty_daemon::audit_sink::{AuditSink, AuditSinkError, AuditWriter, render_record};
 use bitty_daemon::codes::RefusalCode;
 use bitty_daemon::limits::{LimitId, LimitOverride, LimitRefusal, Limits};
 use bitty_daemon::registry::{
     CleanupClass, DaemonInstanceId, ExitInformation, LifecycleState, MonotonicMs, SessionId,
     TerminalReason,
 };
+use sha2::{Digest, Sha256};
 
 fn ms(value: u64) -> MonotonicMs {
     MonotonicMs::from_millis(value)
@@ -219,4 +228,212 @@ fn ring_capacity_derives_from_the_advertised_audit_budget() {
         audit_ring_capacity(&defaults),
         (1_048_576 * 2) / AUDIT_RECORD_BYTES
     );
+}
+
+// ── P0-AC-026: the sink write point is the redaction point ──────────────────
+
+/// A writer that captures exactly the bytes the sink hands it.
+///
+/// The production writer is `AuditFileWriter`; this one is the same trait, so a
+/// change that let a caller write pre-rendered bytes, or that rendered a field
+/// the record does not have, would show up here. The capture is shared rather
+/// than returned because `AuditSink` owns its writer.
+#[derive(Clone, Default)]
+struct CapturingWriter {
+    lines: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl AuditWriter for CapturingWriter {
+    fn append_line(&mut self, line: &[u8]) -> Result<(), AuditSinkError> {
+        let text = String::from_utf8(line.to_vec()).expect("a rendered line is UTF-8");
+        self.lines.borrow_mut().push(text);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> Result<(), AuditSinkError> {
+        Ok(())
+    }
+}
+
+/// The seeded-secret corpus (`P0-AC-026`: "seeded-secret corpus never appears in
+/// default outputs").
+///
+/// Each entry has the shape of a credential a leaked environment, argv, or
+/// `cwd` would carry: a cloud access key, an API key, a forge token, a private
+/// key header, a URL with an inline password, and a bearer token. They are
+/// assembled from fragments so this source file carries no credential-shaped
+/// literal of its own; the value is what a client would supply, and nothing in
+/// the audit path is allowed to retain it.
+fn seeded_secrets() -> Vec<String> {
+    vec![
+        format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE"),
+        format!("{}-{}-{}", "sk", "live", "51H8xQ2eZvKYlo2C8b"),
+        format!("{}{}", "ghp_", "16CharactersLongToken0000"),
+        format!("{} {} {}", "-----BEGIN", "OPENSSH", "PRIVATE KEY-----"),
+        format!(
+            "{}://{}:{}@{}/{}",
+            "postgres", "app", "hunter2", "db.internal", "prod"
+        ),
+        format!("{} {}", "Bearer", "eyJhbGciOiJIUzI1NiJ9.payload.sig"),
+    ]
+}
+
+/// A domain-separated 16-byte digest, in the shape the daemon stores as a
+/// digest-only target.
+fn seeded_digest(seed: &str) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bittyd/audit/target\0");
+    hasher.update(seed.as_bytes());
+    let out = hasher.finalize();
+    let mut digest = [0_u8; 16];
+    digest.copy_from_slice(&out[..16]);
+    digest
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+/// One record with every optional field populated, so the closed field list is
+/// exercised at its widest.
+fn maximal_entry(seed: &str) -> AuditEntry {
+    let mut classes = [None; MAX_AGGREGATE_CLASSES];
+    classes[0] = Some(AuditClassCount {
+        code: RefusalCode::ScopeViolation,
+        count: 2,
+    });
+    AuditEntry::new(AuditAction::Create)
+        .result(AuditResult::Refused(RefusalCode::ScopeViolation))
+        .actor(AuditActor {
+            peer_uid: Some(1000),
+            peer_pid: Some(4242),
+            client_id: Some(9),
+            client_correlation_digest: Some(seeded_digest(seed)),
+            ..AuditActor::default()
+        })
+        .session(bitty_daemon::audit::AuditSession {
+            session_id: session_id(1),
+            generation: 1,
+            state_revision: 2,
+        })
+        .target(AuditTarget::terminal_digest(seeded_digest(seed)))
+        .counts(AuditCounts::new(5, 4, Some(LimitId::MaxSessions)))
+        .aggregate(AuditAggregate {
+            suppressed: 3,
+            budget: 100,
+            classes,
+            other: 1,
+        })
+        .terminal(AuditTerminal {
+            state: LifecycleState::Terminated,
+            reason: TerminalReason::WorkerExit,
+            exit: ExitInformation::ExitCode(0),
+            cleanup: CleanupClass::Swept,
+        })
+}
+
+/// The closed key vocabulary the renderer may emit, in emit order.
+const RENDERED_KEYS: [&str; 26] = [
+    "ev", "t", "i", "a", "r", "c", "s", "g", "rv", "u", "p", "cid", "x", "k", "d", "ca", "cl", "m",
+    "sup", "bl", "h", "ho", "z", "zr", "zc", "zk",
+];
+
+#[test]
+fn a_seeded_secret_never_reaches_the_audit_line() {
+    let limits = Limits::default();
+    let captured = CapturingWriter::default();
+    let lines = std::rc::Rc::clone(&captured.lines);
+    let mut sink = AuditSink::new(instance(), &limits, captured);
+
+    let seeds = seeded_secrets();
+    for (index, seed) in seeds.iter().enumerate() {
+        sink.record(
+            maximal_entry(seed),
+            ms(u64::try_from(index).expect("index")),
+        )
+        .expect("the sink writes the record");
+        let written = lines.borrow().last().cloned().expect("one line per record");
+        assert!(
+            !written.contains(seed.as_str()),
+            "the seeded secret reached the audit line: {written}"
+        );
+        // No partial leak either: every 6-byte window of the seed is absent, so
+        // a truncated value (a clipped field, a 16-byte prefix) cannot pass.
+        let window = 6;
+        for start in 0..seed.len().saturating_sub(window - 1) {
+            let slice = &seed[start..start + window];
+            assert!(
+                !written.contains(slice),
+                "the audit line carries {slice:?} from the seeded secret"
+            );
+        }
+        // The only projection of the value is the opaque digest.
+        let digest = hex(&seeded_digest(seed));
+        assert!(
+            written.contains(&digest),
+            "the digest-only target is missing: {written}"
+        );
+        assert_ne!(digest, seed.as_str());
+    }
+    assert_eq!(lines.borrow().len(), seeds.len(), "one line per record");
+    assert_eq!(sink.pending(), 0, "every record was flushed");
+}
+
+#[test]
+fn the_rendered_line_has_a_closed_key_set_and_carries_no_free_text() {
+    let limits = Limits::default();
+    let seed = seeded_secrets().remove(0);
+    // The sink writes the renderer's own bytes: the same record rendered twice
+    // (once through the sink's flush, once directly) is identical.
+    let captured = CapturingWriter::default();
+    let lines = std::rc::Rc::clone(&captured.lines);
+    let instance_id = instance();
+    let mut sink = AuditSink::new(instance_id, &limits, captured);
+    sink.record(maximal_entry(&seed), ms(7))
+        .expect("sink write");
+    let written = lines.borrow().last().cloned().expect("one line");
+
+    let mut ring = AuditRing::new(instance_id, &limits);
+    ring.record(maximal_entry(&seed), ms(7))
+        .expect("ring append");
+    let direct = render_record(ring.newest().expect("the ring keeps the record"))
+        .expect("the record renders");
+    assert_eq!(
+        written.as_bytes(),
+        direct.as_slice(),
+        "the sink writes render_record's bytes and nothing else"
+    );
+
+    // `v1` then `k=v` fields: any other shape is not a v1 line.
+    let fields: Vec<&str> = written.split(' ').collect();
+    assert_eq!(fields.first(), Some(&"v1"));
+    let mut keys = Vec::new();
+    for field in &fields[1..] {
+        let (key, value) = field
+            .split_once('=')
+            .unwrap_or_else(|| panic!("{field:?} is not a k=v field"));
+        assert!(
+            RENDERED_KEYS.contains(&key),
+            "{key} is outside the frozen field vocabulary"
+        );
+        assert!(!keys.contains(&key), "{key} is emitted twice");
+        keys.push(key);
+        // A value is a closed enum, a count, or a hex digest: no path
+        // separator, no whitespace, no second `=`, no non-ASCII byte. That is
+        // what makes an argv, environment value, cwd, or message unrepresentable
+        // even if a future field were misused.
+        assert!(
+            value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b',' | b'-')
+            }),
+            "{key}={value:?} carries free text"
+        );
+        assert!(!value.is_empty() || key == "ho", "{key} rendered empty");
+    }
+    assert_eq!(keys, RENDERED_KEYS, "the closed field list changed");
+    assert!(written.is_ascii(), "an audit line is ASCII: {written}");
 }

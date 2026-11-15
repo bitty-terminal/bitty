@@ -3375,9 +3375,12 @@ impl PluginServices {
         // band row for a `tabline` mount: a tab strip is Core tab-projection
         // state with several entries, and its placement stays `Unsupported`.
         match slot_state_rule(block.ui_slot()) {
-            // A band paints one row per block and is hidden only by empty
-            // text (the `band_is_visible` rule the paint path uses), so
-            // `presented` is the same content gate for every row band.
+            // A band paints its flattened content and is hidden only by empty
+            // text (the `band_is_visible` rule the paint path uses). That gate
+            // is axis-neutral (bitty#2191): a row band paints one row, a column
+            // band paints one row per root child, and both paint exactly when
+            // the content has text, so `presented` is the same content gate
+            // for every band slot.
             SlotStateRule::BandVisibility => {
                 let presented = band_is_visible(block.node());
                 Some(UiBlockState {
@@ -3399,11 +3402,10 @@ impl PluginServices {
                     focused: captured && window_focused,
                 })
             }
-            // No host surface in this build: a `left`/`right` mount fails
-            // closed at admission, the `terminal` scene path never enters this
-            // registry, and `tabline` is Core tab-projection state whose host
-            // does not exist yet (issue #3166), so a retained block cannot be
-            // painted on them.
+            // No host surface in this build: the `terminal` scene path never
+            // enters this registry, and `tabline` is Core tab-projection state
+            // whose host does not exist yet (issue #3166), so a retained block
+            // cannot be painted on them.
             SlotStateRule::NeverPresented => Some(UiBlockState {
                 presented: false,
                 focused: false,

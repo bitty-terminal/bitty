@@ -53,6 +53,20 @@
 //! path, and the accessibility projection already support the kind. The
 //! mapping is a total function of the six-name content token set, so no new
 //! vocabulary enters Core here.
+//!
+//! # One stroke per node
+//!
+//! `UiRichNode::Block { border }` is the Core cell frame (cells, cap `8`) and
+//! `UiNodeStyle::border_px` is the pixel stroke carried by the `Styled`
+//! wrapper (physical px, cap `16`). This bridge maps both, because both are
+//! legal scene data on their own; it never sees both on one node, though:
+//! `bitty_lua::ui_rich` refuses a `Block` that declares two non-zero borders
+//! with a typed `E_UI_COMPONENT_INVALID` (bitty#3176). That keeps the painting
+//! honest — one rounded ring or one cell frame, never a ring over a frame —
+//! and it is the same reasoning the candidate record uses to refuse a separate
+//! `stroke` key: two spellings for one width invite conflicting declarations.
+//! A zero-width `Block.border` paints nothing, so it composes with a pixel
+//! stroke and is not refused.
 
 #![forbid(unsafe_code)]
 
@@ -212,6 +226,7 @@ pub fn mount_rich_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_lua::LuaValue;
     use bitty_rich::scene::{SceneNode, StyledSpan};
 
     fn text(value: &str) -> UiRichNode {
@@ -355,6 +370,57 @@ mod tests {
         match scene_node_of(&node) {
             SceneNode::Block { border, .. } => assert!(border.is_none()),
             other => panic!("unexpected node {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_block_with_two_borders_never_reaches_the_bridge() {
+        // bitty#3176: `Block.border` (cells, cap 8) and `style.border`
+        // (physical px, cap 16) are two spellings for one stroke, so the rich
+        // reader refuses the pair instead of letting the paint path draw a
+        // rounded ring over a four-op cell frame.
+        let two_borders = LuaValue::table([
+            ("kind", LuaValue::String("Block".to_string())),
+            ("border", LuaValue::table([("width", LuaValue::Integer(1))])),
+            ("style", LuaValue::table([("border", LuaValue::Integer(2))])),
+            (
+                "child",
+                LuaValue::table([
+                    ("kind", LuaValue::String("Text".to_string())),
+                    ("text", LuaValue::String("x".to_string())),
+                ]),
+            ),
+        ]);
+        let error = UiRichNode::from_lua_value(&two_borders).expect_err("two strokes refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert_eq!(
+            error.message,
+            "Block declares two borders: border.width = 1 cells and style.border = 2 px; declare one"
+        );
+
+        // One stroke alone still maps: the pixel stroke rides the wrapper and
+        // the node keeps no cell frame, so exactly one border is painted.
+        let pixel_stroke_only = LuaValue::table([
+            ("kind", LuaValue::String("Block".to_string())),
+            ("style", LuaValue::table([("border", LuaValue::Integer(2))])),
+            (
+                "child",
+                LuaValue::table([
+                    ("kind", LuaValue::String("Text".to_string())),
+                    ("text", LuaValue::String("x".to_string())),
+                ]),
+            ),
+        ]);
+        let node = UiRichNode::from_lua_value(&pixel_stroke_only).expect("one stroke is valid");
+        match scene_node_of(&node) {
+            SceneNode::Styled { style, child } => {
+                assert_eq!(style.border_px, 2);
+                assert!(
+                    matches!(*child, SceneNode::Block { border: None, .. }),
+                    "the wrapped block keeps no cell frame"
+                );
+            }
+            other => panic!("expected a styled wrapper, got {other:?}"),
         }
     }
 

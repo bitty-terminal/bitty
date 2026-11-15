@@ -201,6 +201,74 @@ fn an_unstyled_tree_and_a_flat_declaration_paint_the_same_list() {
         "a flat style is byte-identical to no style"
     );
     assert_eq!(flat.len(), 1);
+
+    // bitty#3176 item 6: a paint list cannot see a wrapper that paints
+    // nothing, so the node cost is asserted at this layer too. A mutant that
+    // wraps a flat style adds a wrapper node and one depth level and fails
+    // here, whether it wraps in the reader or in the bridge.
+    let flat_node = UiRichNode::from_lua_value(&styled_text_value(vec![
+        ("padding", LuaValue::Integer(0)),
+        ("radius", LuaValue::Integer(0)),
+        ("border", LuaValue::Integer(0)),
+    ]))
+    .expect("flat declaration is valid");
+    let unstyled_node = UiRichNode::from_lua_value(&text_value("ready")).expect("valid");
+    assert_eq!(flat_node.count_nodes(), 1, "no wrapper node");
+    assert_eq!(flat_node.depth(), 1, "no extra depth level");
+    assert_eq!(
+        scene_node_of(&flat_node).count_nodes(),
+        scene_node_of(&unstyled_node).count_nodes(),
+        "a flat declaration costs the same node budget as no declaration"
+    );
+    assert_eq!(
+        scene_node_of(&flat_node),
+        scene_node_of(&unstyled_node),
+        "and lowers to the same scene node"
+    );
+}
+
+#[test]
+fn a_second_border_on_one_node_is_refused_before_anything_is_painted() {
+    // bitty#3176 item 1: one node paints one stroke. `Block.border` (cells,
+    // cap 8) and `style.border` (px, cap 16) set on the same node would paint
+    // a rounded ring and the four-op cell frame over one box — the conflicting
+    // spelling the candidate record rejects for a separate `stroke` key — so
+    // the reader refuses the pair instead of choosing a precedence.
+    let child = text_value("ready");
+    let both = LuaValue::table([
+        ("kind", LuaValue::String("Block".to_string())),
+        ("border", LuaValue::table([("width", LuaValue::Integer(1))])),
+        ("style", LuaValue::table([("border", LuaValue::Integer(2))])),
+        ("child", child.clone()),
+    ]);
+    let error = UiRichNode::from_lua_value(&both).expect_err("two borders refused");
+    assert_eq!(error.class, "validation");
+    assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+    assert_eq!(
+        error.message,
+        "Block declares two borders: border.width = 1 cells and style.border = 2 px; declare one"
+    );
+
+    // One spelling alone still paints exactly one border: the pixel stroke is
+    // the only rounded op, and the cell-frame spelling paints no ring at all.
+    let pixel_stroke = LuaValue::table([
+        ("kind", LuaValue::String("Block".to_string())),
+        ("style", LuaValue::table([("border", LuaValue::Integer(2))])),
+        ("child", child.clone()),
+    ]);
+    let painted = paint_of(&read_and_mount(&pixel_stroke).expect("one stroke is valid"));
+    assert_eq!(rings(&painted), vec![(2, 0)], "one ring, no cell frame");
+
+    let cell_frame = LuaValue::table([
+        ("kind", LuaValue::String("Block".to_string())),
+        ("border", LuaValue::table([("width", LuaValue::Integer(1))])),
+        ("child", child),
+    ]);
+    let painted = paint_of(&read_and_mount(&cell_frame).expect("one frame is valid"));
+    assert!(
+        rings(&painted).is_empty(),
+        "the cell frame is not a rounded ring"
+    );
 }
 
 #[test]

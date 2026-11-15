@@ -60,6 +60,12 @@
 //! compatibility rule; hosting it here would paint nothing. Extending the v1
 //! surface is a separate accepted-extension decision.
 //!
+//! Ignoring it silently is not acceptable either (bitty#3176): the reader
+//! records every dropped `style` in [`UiTolerated`] and the mount path reports
+//! it once per generation through `HostServices::ui_style_ignored`, so the
+//! plugin author learns the declaration did not take effect. The mount itself
+//! still succeeds and the tree is unchanged — a diagnostic, never a refusal.
+//!
 //! # Budgets
 //!
 //! | ID     | Dimension                          | Bound  | Source |
@@ -508,6 +514,39 @@ impl ClickCommand {
     }
 }
 
+/// Declarations the v1 band/overlay reader tolerated without hosting
+/// (bitty#3176).
+///
+/// The v1 surface keeps the accepted additive-minor rule: an unknown optional
+/// field is ignored, never guessed, so an existing tree keeps mounting across
+/// a minor version. The bounded rich `style` table is one of those fields on
+/// this surface — it is hosted on the `terminal` slot, where a ring and a cell
+/// inset are painted — so a band/overlay node that declares it mounts
+/// unchanged with the key dropped.
+///
+/// Silently dropping it is the defect this record exists to remove: the reader
+/// counts what it dropped so the mount path can report it once, non-fatally,
+/// and the plugin author learns the declaration did not take effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UiTolerated {
+    /// Nodes that declared the rich-only `style` table.
+    rich_style_nodes: usize,
+}
+
+impl UiTolerated {
+    /// Nodes whose `style` declaration was dropped.
+    #[must_use]
+    pub const fn rich_style_nodes(self) -> usize {
+        self.rich_style_nodes
+    }
+
+    /// True when the tree lost nothing.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.rich_style_nodes == 0
+    }
+}
+
 /// One validated v1 declarative node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiNode {
@@ -823,7 +862,29 @@ impl UiNode {
     /// Same as [`Self::from_lua_value`], plus a declared `anchor` on a scene
     /// validated with [`UiSceneScope::Unanchored`].
     pub fn from_lua_value_in(value: &LuaValue, scope: UiSceneScope) -> Result<Self, BridgeError> {
-        let node = Self::from_value(value, 1, NodePlacement::Root, scope)?;
+        Self::from_lua_value_with_tolerated(value, scope).map(|(node, _tolerated)| node)
+    }
+
+    /// [`Self::from_lua_value_in`] plus the declarations this surface
+    /// tolerated without hosting (bitty#3176).
+    ///
+    /// The v1 band/overlay surface accepts the additive-minor rule: a field
+    /// this build does not know is ignored, never guessed. That keeps an
+    /// existing tree mounting, but it also means a plugin author can declare
+    /// the rich-only `style` table and see nothing happen. The reader
+    /// therefore reports what it dropped so the mount path can say so once,
+    /// non-fatally; the tree it returns is byte-identical to the one
+    /// [`Self::from_lua_value_in`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::from_lua_value_in`].
+    pub fn from_lua_value_with_tolerated(
+        value: &LuaValue,
+        scope: UiSceneScope,
+    ) -> Result<(Self, UiTolerated), BridgeError> {
+        let mut tolerated = UiTolerated::default();
+        let node = Self::from_value(value, 1, NodePlacement::Root, scope, &mut tolerated)?;
         let nodes = node.count_nodes();
         if nodes > UI_MAX_NODES {
             return Err(component_invalid(format!(
@@ -836,7 +897,7 @@ impl UiNode {
                 "component text exceeds {UI_MAX_TEXT_BYTES} bytes"
             )));
         }
-        Ok(node)
+        Ok((node, tolerated))
     }
 
     fn from_value(
@@ -844,6 +905,7 @@ impl UiNode {
         depth: usize,
         placement: NodePlacement,
         scope: UiSceneScope,
+        tolerated: &mut UiTolerated,
     ) -> Result<Self, BridgeError> {
         if depth > UI_MAX_DEPTH {
             return Err(component_invalid(format!(
@@ -861,6 +923,13 @@ impl UiNode {
             return Err(component_invalid(format!(
                 "node kind '{kind}' is excluded from Plugin API v1"
             )));
+        }
+        // bitty#3176: the rich scene vocabulary (`style`) is hosted on the
+        // `terminal` slot only. Tolerating it here keeps the accepted
+        // additive-minor rule; recording it lets the mount path tell the
+        // author once that it painted nothing.
+        if value.get("style").is_some() {
+            tolerated.rich_style_nodes += 1;
         }
 
         // Parse style attributes (CTX-0890).
@@ -914,7 +983,8 @@ impl UiNode {
                 } else {
                     NodePlacement::Nested
                 };
-                let nodes = Self::children_array(children, depth, child_placement, scope)?;
+                let nodes =
+                    Self::children_array(children, depth, child_placement, scope, tolerated)?;
                 Ok(match kind {
                     "Row" => Self::Row {
                         anchor,
@@ -957,6 +1027,7 @@ impl UiNode {
         depth: usize,
         placement: NodePlacement,
         scope: UiSceneScope,
+        tolerated: &mut UiTolerated,
     ) -> Result<Vec<Self>, BridgeError> {
         let LuaValue::Table(pairs) = value else {
             return Err(component_invalid(
@@ -985,7 +1056,13 @@ impl UiNode {
                     "component children must be a dense 1-based array",
                 ));
             }
-            nodes.push(Self::from_value(child, depth + 1, placement, scope)?);
+            nodes.push(Self::from_value(
+                child,
+                depth + 1,
+                placement,
+                scope,
+                tolerated,
+            )?);
         }
         Ok(nodes)
     }
@@ -1333,15 +1410,37 @@ pub fn component_invalid(message: impl Into<String>) -> BridgeError {
 /// `E_UI_COMPONENT_INVALID`, the only component-error code the accepted
 /// `bitty.ui.mount` / `bitty.ui.update` surface fixes.
 ///
+/// This is the toleration-blind entry point: it discards what the surface
+/// tolerated. The shipped mount/update path uses
+/// [`read_component_with_tolerated`] instead, so a dropped field is reported;
+/// keep this one for callers that only own the tree (bitty#3176).
+///
 /// # Errors
 ///
 /// [`BridgeError`] with class `validation` and code
 /// `E_UI_COMPONENT_INVALID` when the value cannot be marshalled or violates
 /// the v1 scene contract.
 pub fn read_component(value: Value<'_>, scope: UiSceneScope) -> Result<UiNode, BridgeError> {
+    read_component_with_tolerated(value, scope).map(|(node, _tolerated)| node)
+}
+
+/// [`read_component`] plus the declarations the v1 surface tolerated without
+/// hosting (bitty#3176).
+///
+/// The mount path uses this form so a rich-only `style` table on a
+/// band/overlay node is reported once instead of silently ignored; the tree
+/// is unchanged either way.
+///
+/// # Errors
+///
+/// Same as [`read_component`].
+pub fn read_component_with_tolerated(
+    value: Value<'_>,
+    scope: UiSceneScope,
+) -> Result<(UiNode, UiTolerated), BridgeError> {
     let marshalled = LuaValue::from_lua(value, UI_MARSHAL_LIMITS)
         .map_err(|error| component_invalid(error.message))?;
-    UiNode::from_lua_value_in(&marshalled, scope)
+    UiNode::from_lua_value_with_tolerated(&marshalled, scope)
 }
 
 #[cfg(test)]
@@ -2386,6 +2485,20 @@ mod tests {
         let node = UiNode::from_lua_value(&with_style).expect("still an accepted v1 tree");
         assert_eq!(node.count_nodes(), 2);
         assert_eq!(node.text_bytes(), 5);
+        // bitty#3176: tolerating the key must not also silently accept it —
+        // the reader records the drop so the mount path can report it once.
+        let (reported, tolerated) =
+            UiNode::from_lua_value_with_tolerated(&with_style, UiSceneScope::Band)
+                .expect("still an accepted v1 tree");
+        assert_eq!(reported, node, "the diagnostic never changes the tree");
+        assert_eq!(tolerated.rich_style_nodes(), 1);
+        assert!(!tolerated.is_empty());
+        // A tree with no style reports nothing.
+        let plain_reported =
+            UiNode::from_lua_value_with_tolerated(&row(vec![text("ready")]), UiSceneScope::Band)
+                .expect("plain tree")
+                .1;
+        assert!(plain_reported.is_empty());
         // Nothing of the style is retained or reinterpreted on this surface:
         // the tree is the same tree it would be without the key.
         let plain = row(vec![text("ready")]);

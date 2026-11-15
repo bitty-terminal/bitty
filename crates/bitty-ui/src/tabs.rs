@@ -30,21 +30,45 @@
 //!    "tab" `Stack` could never have been committed through the validated
 //!    layout path. The container therefore stays a pure paint-order node with
 //!    no identity and no active child, and the tab model lives here.
-//! 3. **The active tab lives in this projection, and the layout names it.**
-//!    [`TabSet`] is the Core-owned per-window projection; the committed tree
-//!    holds the active leaf and nothing else, so a save/restore cycle that
-//!    persists the layout still recovers *which* tab was active without any new
-//!    persisted field. The ordered set of inactive tabs is projection state,
-//!    not layout state; persisting a multi-tab strip would change the layout
-//!    format and is a separate slice.
-//! 4. **`tab.switch` re-attributes input-mode caches and forces a full
+//! 3. **The strip order is insertion order and no verb reorders it.** The
+//!    active tab is a separate index ([`TabSet::active_index`]), not a
+//!    position in the strip: [`TabSet::switch`] moves the index and leaves the
+//!    vector alone, so activating a tab never moves it and the strip never
+//!    reorders behind the user's back (issue #3170, residual 1). `open`
+//!    appends, `close` removes in place, and `switch` may change the active
+//!    index without touching order. Closing the *active* tab activates the
+//!    neighbour that takes its slot — the successor, or the previous tab when
+//!    the closed one was last — because the strip order is the user's page
+//!    order and a close must not jump the selection to the far end of it.
+//! 4. **Every projection is kept at the strip slot geometry.** The tabs of one
+//!    stack project one slot `Rect`, so the slot has one size, not one size per
+//!    tab. Because the committed tree holds only the active leaf, the layout
+//!    solver never visits an inactive tab — which is how a background tab used
+//!    to return at its last, stale grid size (issue #3170, residual 2).
+//!    [`TabSet::fit_slot`] stamps the slot onto *every* projection, inactive
+//!    ones included, and records it so a later [`TabSet::open`] fits the new
+//!    projection as well. Activation therefore needs no resize step: geometry
+//!    is already current when [`TabSet::switch`] makes a tab active, and the
+//!    effect still asks for a full redraw because the visible surface changes
+//!    wholesale.
+//! 5. **A multi-tab strip is not persisted, deliberately.** The layout format
+//!    carries the committed tree, and a tab stack's committed tree is a single
+//!    leaf ([`TabSet::layout`]). Persisting `n` tabs would be a layout-format
+//!    change with its own migration story, and nothing in the acceptance
+//!    criteria asks for one, so restore rebuilds a *single-tab* set from that
+//!    leaf: the `n - 1` inactive tabs are dropped on restart, by contract, and
+//!    no persisted field records them (issue #3170, residual 3). The contract
+//!    is asserted by `multi_tab_strips_are_not_persisted`; a future slice that
+//!    wants a strip back changes the format and that test, and does not add a
+//!    field here.
+//! 6. **`tab.switch` re-attributes input-mode caches and forces a full
 //!    redraw.** A switch moves focus to the activated tab exactly like the
 //!    WS-INV-19 re-home (crash-safe ordering: re-home before persist), so the
 //!    host must run `sync_mode_caches_to_focus` for the new focus, and the
 //!    visible surface changes wholesale, so nothing partial is repaintable.
 //!    [`TabEffect`] carries both facts; [`TabCommit::commit`] refuses to hand
 //!    out committed state while focus still names the outgoing tab.
-//! 5. **The `workspaceline` exclusive claim stays exactly as it is.** It gates
+//! 7. **The `workspaceline` exclusive claim stays exactly as it is.** It gates
 //!    *plugin mounts into the `tabline` UI slot*, which is a different
 //!    authority from Core-owned verbs: tab verbs mount no UI block, never
 //!    consult plugin claims, and no plugin can claim a `core.*` name because
@@ -61,14 +85,22 @@
 //! [`LayoutNode::validate_structure`] over the projected tree, then
 //! [`validate_proposal`] over that tree and the projection's own view set, then
 //! the projection-level rules a single-leaf tree cannot express (unique panels,
-//! unique views, non-empty, capped). Any failure returns a [`TabError`] and the
-//! caller's [`TabSet`] and focus are untouched, so there is no partial
-//! mutation and no orphaned leaf.
+//! unique views, non-empty, capped, active in range). Any failure returns a
+//! [`TabError`] and the caller's [`TabSet`] and focus are untouched, so there is
+//! no partial mutation and no orphaned leaf.
+//!
+//! [`TabSet::fit_slot`] is deliberately *not* a verb and not a second commit
+//! path: it changes no identity, no order, and no active index, mints no
+//! [`TabCommit`], and cannot invalidate one — it is the projection half of the
+//! step the runtime already performs when it stamps a solved allocation onto a
+//! leaf, extended to the tabs that are not in the tree. Nothing else in this
+//! module writes a view.
 //!
 //! Deterministic and headless; this module adds no crate dependency.
 
 #![forbid(unsafe_code)]
 
+use crate::geometry::Rect;
 use crate::layout::{LayoutNode, TreeViolation};
 use crate::panel::{CommandError, CommandRegistry, PanelId, QualifiedCommand};
 use crate::provider::{LayoutError, validate_proposal};
@@ -208,6 +240,11 @@ pub enum TabVerb {
 /// The host must run `sync_mode_caches_to_focus` for the new focus on the
 /// WS-INV-19 path and set `pending_full_redraw`; no verb produces a partial
 /// repaint.
+///
+/// There is deliberately no resize flag (decision 4): background projections
+/// are kept at the strip slot geometry by [`TabSet::fit_slot`], so activating a
+/// background tab never needs a resize step, and the full redraw already
+/// repaints the activated leaf at its current size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabEffect {
     /// The host must re-attribute input-mode caches to the new focus.
@@ -217,7 +254,7 @@ pub struct TabEffect {
 }
 
 impl TabEffect {
-    /// The effect every tab transition has (decision 4).
+    /// The effect every tab transition has (decision 6).
     pub const FOCUS_AND_REDRAW: Self = Self {
         reattribute_input_mode: true,
         pending_full_redraw: true,
@@ -232,6 +269,16 @@ impl TabEffect {
 pub enum TabError {
     /// A tab set must project at least one panel; an empty set is a tombstone.
     EmptyStack,
+    /// The active index does not name a tab in the strip.
+    ///
+    /// The active tab is an explicit index (decision 3), so a strip whose index
+    /// falls outside `0..len` has no active projection and no layout to commit.
+    ActiveOutOfRange {
+        /// The out-of-range index.
+        index: usize,
+        /// The number of tabs in the strip.
+        len: usize,
+    },
     /// Two tabs named the same panel; a panel projects at most once.
     DuplicatePanel {
         /// The repeated panel.
@@ -303,6 +350,9 @@ impl std::fmt::Display for TabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyStack => f.write_str("a tab stack must project at least one panel"),
+            Self::ActiveOutOfRange { index, len } => {
+                write!(f, "active tab index {index} is out of range for {len} tabs")
+            }
             Self::DuplicatePanel { panel } => write!(f, "panel projected by two tabs: {panel}"),
             Self::DuplicateView { view } => write!(f, "view projecting two tabs: {view}"),
             Self::TooManyTabs { cap, requested } => write!(
@@ -346,27 +396,42 @@ impl std::error::Error for TabError {}
 /// - at least one tab (an empty stack is a layout tombstone),
 /// - at most [`MAX_TABS_PER_STACK`] tabs,
 /// - exactly one tab per [`PanelId`] and one tab per [`ViewId`],
-/// - the **last** tab is the active one, so [`TabSet::layout`] can project the
-///   active leaf directly and `Stack`'s paint-order convention needs no active
-///   index.
+/// - [`TabSet::active_index`] is inside `0..len`.
 ///
-/// The strip order is the vector order; switching moves the target to the end,
-/// which is the active position. Nothing here is persisted in the layout
-/// format (see the module decision record).
+/// The strip order is the vector order and it is **insertion order**: no verb
+/// reorders it. The active tab is a separate index, so [`TabSet::switch`] moves
+/// only that index (decision 3) and the committed leaf is whatever
+/// [`TabSet::layout`] reads from it. Every projection, background tabs
+/// included, is kept at the strip slot geometry by [`TabSet::fit_slot`]
+/// (decision 4).
+///
+/// Nothing here reaches the layout format except the single leaf
+/// [`TabSet::layout`] emits, so a multi-tab strip is deliberately not persisted
+/// (decision 5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabSet {
     tabs: Vec<Tab>,
+    /// Index of the active tab; always inside `tabs` (`build` validates it).
+    active: usize,
+    /// The strip slot every projection was last fitted to.
+    slot: Option<Rect>,
 }
 
 impl TabSet {
-    /// Builds a tab set from `tabs` in strip order; the last entry is active.
+    /// Builds a tab set from `tabs` in strip order with `active` selected.
     ///
     /// # Errors
     ///
     /// [`TabError::EmptyStack`], [`TabError::TooManyTabs`],
-    /// [`TabError::DuplicatePanel`], or [`TabError::DuplicateView`].
-    pub fn new(tabs: Vec<Tab>) -> Result<Self, TabError> {
-        let set = Self { tabs };
+    /// [`TabError::ActiveOutOfRange`], [`TabError::DuplicatePanel`], or
+    /// [`TabError::DuplicateView`].
+    pub fn new(tabs: Vec<Tab>, active: usize) -> Result<Self, TabError> {
+        Self::build(tabs, active, None)
+    }
+
+    /// The one validated constructor; [`TabSet::new`] and every verb land here.
+    fn build(tabs: Vec<Tab>, active: usize, slot: Option<Rect>) -> Result<Self, TabError> {
+        let set = Self { tabs, active, slot };
         set.validate()?;
         Ok(set)
     }
@@ -374,10 +439,14 @@ impl TabSet {
     /// Builds a single-tab set.
     #[must_use]
     pub fn single(tab: Tab) -> Self {
-        Self { tabs: vec![tab] }
+        Self {
+            tabs: vec![tab],
+            active: 0,
+            slot: None,
+        }
     }
 
-    /// Tabs in strip order; the last entry is the active tab.
+    /// Tabs in strip order: insertion order, never reordered by a verb.
     #[must_use]
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
@@ -395,11 +464,21 @@ impl TabSet {
         self.tabs.is_empty()
     }
 
-    /// The active tab (the last entry).
+    /// Index of the active tab in strip order.
+    ///
+    /// The strip order and the active position are separate state on purpose:
+    /// activating a tab changes this index and nothing else, so the strip the
+    /// user sees keeps its order (decision 3).
+    #[must_use]
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    /// The active tab.
     #[must_use]
     pub fn active(&self) -> &Tab {
-        // `new` guarantees non-empty; `single` constructs one element.
-        &self.tabs[self.tabs.len().saturating_sub(1)]
+        // `build` validates `active < tabs.len()`; `single` sets both.
+        &self.tabs[self.active]
     }
 
     /// The active tab's panel.
@@ -417,6 +496,43 @@ impl TabSet {
     /// Strip index of `panel`, if projected.
     fn index_of(&self, panel: PanelId) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.panel == panel)
+    }
+
+    /// The strip slot the projections were last fitted to, if any.
+    ///
+    /// `None` until the host reports the slot through [`TabSet::fit_slot`];
+    /// every projection then keeps whatever geometry it was constructed with.
+    #[must_use]
+    pub fn slot_rect(&self) -> Option<Rect> {
+        self.slot
+    }
+
+    /// Fits every projection — active *and* background — to the strip slot.
+    ///
+    /// Every tab of a stack projects the same slot, so one `Rect` is the whole
+    /// geometry of the strip. A tab that is not the active leaf is not in the
+    /// committed tree, so the layout solver never visits it: without this call
+    /// it keeps the size it had when it was last active and returns at stale
+    /// geometry (decision 4). The slot is remembered so [`TabSet::open`] can
+    /// fit a projection that arrives later.
+    ///
+    /// Not a verb and not a second commit path: it changes no identity, no
+    /// order, and no active index, mints no [`TabCommit`], and cannot
+    /// invalidate one (see the module atomicity note). Returns whether any
+    /// projection's grid *size* changed — a fit that only moves the projections
+    /// to a new origin returns `false`, so a host can skip size-dependent work
+    /// when nothing was resized.
+    ///
+    /// No production caller yet: the resize path is not wired, so residual 2 is
+    /// closed at module level only. The host has to call this from the
+    /// solver-sync path; that wiring is tracked by issue #3169.
+    pub fn fit_slot(&mut self, rect: Rect) -> bool {
+        self.slot = Some(rect);
+        let mut resized = false;
+        for tab in &mut self.tabs {
+            resized |= tab.view.reflow_to_rect(rect);
+        }
+        resized
     }
 
     /// Every projected leaf, in strip order.
@@ -478,6 +594,12 @@ impl TabSet {
                 requested: self.tabs.len(),
             });
         }
+        if self.active >= self.tabs.len() {
+            return Err(TabError::ActiveOutOfRange {
+                index: self.active,
+                len: self.tabs.len(),
+            });
+        }
         let mut panels: Vec<PanelId> = Vec::with_capacity(self.tabs.len());
         let mut views: Vec<ViewId> = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
@@ -509,12 +631,17 @@ impl TabSet {
 
     /// Opens `tab` and activates it.
     ///
+    /// The tab is appended to the strip (insertion order, decision 3) and
+    /// becomes active. When the strip has been fitted to a slot, the incoming
+    /// projection is fitted to it first, so a new tab never starts at a
+    /// geometry the slot does not have (decision 4).
+    ///
     /// # Errors
     ///
     /// [`TabError::GenerationGone`] when the panel is not live,
     /// [`TabError::AlreadyOpen`] when the panel already has a tab, or any
     /// [`TabError`] from [`TabSet::validate`] on the candidate projection.
-    pub fn open(&self, tab: Tab, live: &dyn PanelLiveness) -> Result<TabCommit, TabError> {
+    pub fn open(&self, mut tab: Tab, live: &dyn PanelLiveness) -> Result<TabCommit, TabError> {
         let panel = tab.panel;
         if !live.is_live(panel) {
             return Err(TabError::GenerationGone { panel });
@@ -522,15 +649,21 @@ impl TabSet {
         if self.index_of(panel).is_some() {
             return Err(TabError::AlreadyOpen { panel });
         }
+        if let Some(slot) = self.slot {
+            tab.view.reflow_to_rect(slot);
+        }
         let mut next = self.tabs.clone();
         next.push(tab);
-        Self::transition(TabVerb::Open, next, None)
+        let active = next.len() - 1;
+        Self::transition(TabVerb::Open, next, active, self.slot, None)
     }
 
     /// Switches the active tab to `panel`.
     ///
-    /// The target moves to the end of the strip, which is the active position;
-    /// every other tab keeps its relative order.
+    /// Only the active index moves; the strip keeps its insertion order and the
+    /// target stays where it is in it (decision 3). The activated projection is
+    /// already at the strip slot geometry, so a switch needs no resize step
+    /// (decision 4).
     ///
     /// # Errors
     ///
@@ -546,21 +679,22 @@ impl TabSet {
         if !live.is_live(panel) {
             return Err(TabError::GenerationGone { panel });
         }
-        if index + 1 == self.tabs.len() {
+        if index == self.active {
             return Err(TabError::AlreadyActive { panel });
         }
-        let mut next = self.tabs.clone();
-        let tab = next.remove(index);
-        next.push(tab);
-        Self::transition(TabVerb::Switch, next, None)
+        Self::transition(TabVerb::Switch, self.tabs.clone(), index, self.slot, None)
     }
 
     /// Closes the tab projecting `panel`.
     ///
     /// Closing detaches one projection; it never destroys the panel, whose
-    /// lifecycle belongs to the panel registry. When the closed tab was active
-    /// the new last tab becomes active, which is the focus target
-    /// [`TabCommit::focus_target`] reports.
+    /// lifecycle belongs to the panel registry.
+    ///
+    /// The strip keeps its insertion order and the remaining tabs do not move
+    /// in it. Closing a background tab leaves the active tab active. Closing
+    /// the *active* tab activates the neighbour that takes its slot — the
+    /// successor, or the previous tab when the closed one was last — which is
+    /// the focus target [`TabCommit::focus_target`] reports (decision 3).
     ///
     /// A tab whose panel generation is gone is still closable: that is the
     /// repair path for a stale projection (activation is what
@@ -579,20 +713,31 @@ impl TabSet {
         }
         let mut next = self.tabs.clone();
         next.remove(index);
-        Self::transition(TabVerb::Close, next, Some(panel))
+        let active = if index < self.active {
+            // A tab before the active one shifted left; the same tab stays active.
+            self.active - 1
+        } else if index == self.active {
+            // The successor slid into the closed slot; the last tab has none.
+            index.min(next.len() - 1)
+        } else {
+            self.active
+        };
+        Self::transition(TabVerb::Close, next, active, self.slot, Some(panel))
     }
 
     /// Validates a candidate projection and stages it as a [`TabCommit`].
     ///
-    /// `Self::new` runs the whole commit gate (projection invariants, then
-    /// [`LayoutNode::validate_structure`], then [`validate_proposal`]), so a
-    /// commit only exists for a candidate that passed it.
+    /// [`TabSet::build`] runs the whole commit gate (projection invariants,
+    /// then [`LayoutNode::validate_structure`], then [`validate_proposal`]), so
+    /// a commit only exists for a candidate that passed it.
     fn transition(
         verb: TabVerb,
         tabs: Vec<Tab>,
+        active: usize,
+        slot: Option<Rect>,
         removed: Option<PanelId>,
     ) -> Result<TabCommit, TabError> {
-        let next = Self::new(tabs)?;
+        let next = Self::build(tabs, active, slot)?;
         let focus_target = next.active_panel();
         let layout = next.layout();
         Ok(TabCommit {
@@ -633,6 +778,9 @@ impl TabCommit {
     }
 
     /// The validated tree the candidate projection commits.
+    ///
+    /// Always one [`LayoutNode::Leaf`] — the activated projection — so this is
+    /// the whole of what the layout format ever sees of a tab stack (decision 5).
     #[must_use]
     pub fn layout(&self) -> &LayoutNode {
         &self.layout
@@ -708,6 +856,11 @@ impl CommittedTabs {
     }
 
     /// The tree to install for the tab slot.
+    ///
+    /// Always one [`LayoutNode::Leaf`] naming the active projection, so a
+    /// save/restore cycle recovers *which* tab was active and nothing else: the
+    /// inactive tabs are not persisted and restore rebuilds a single-tab set
+    /// from this leaf (decision 5).
     #[must_use]
     pub fn layout(&self) -> &LayoutNode {
         &self.layout
@@ -729,7 +882,7 @@ impl CommittedTabs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::SplitAxis;
+    use crate::geometry::{Size, SplitAxis};
     use crate::panel::CORE_OWNER_FAMILY;
 
     const PID: [u64; 4] = [11, 12, 13, 14];
@@ -751,8 +904,24 @@ mod tests {
         |candidate: PanelId| PID.contains(&candidate.get())
     }
 
+    /// Builds a strip in insertion order with the last tab active, which is
+    /// what opening the tabs one by one produces.
     fn set_of(indices: &[usize]) -> TabSet {
-        TabSet::new(indices.iter().map(|index| tab(*index)).collect()).expect("valid tab set")
+        let tabs = indices.iter().map(|index| tab(*index)).collect();
+        TabSet::new(tabs, indices.len() - 1).expect("valid tab set")
+    }
+
+    fn panels(set: &TabSet) -> Vec<PanelId> {
+        set.tabs().iter().map(Tab::panel).collect()
+    }
+
+    fn pid(index: usize) -> PanelId {
+        PanelId::new(PID[index])
+    }
+
+    /// Grid extent of a slot rectangle.
+    fn dims(rect: Rect) -> Size {
+        Size::new(rect.width, rect.height)
     }
 
     // -- command surface ---------------------------------------------------
@@ -968,13 +1137,16 @@ mod tests {
     #[test]
     fn tab_set_rejects_empty_and_duplicate_projections() {
         assert_eq!(
-            TabSet::new(Vec::new()).expect_err("empty"),
+            TabSet::new(Vec::new(), 0).expect_err("empty"),
             TabError::EmptyStack
         );
-        let duplicate_panel = TabSet::new(vec![
-            tab(0),
-            Tab::new(PanelId::new(PID[0]), View::new(ViewId::new(VID[1]), 80, 24)),
-        ])
+        let duplicate_panel = TabSet::new(
+            vec![
+                tab(0),
+                Tab::new(PanelId::new(PID[0]), View::new(ViewId::new(VID[1]), 80, 24)),
+            ],
+            0,
+        )
         .expect_err("one panel projects once");
         assert_eq!(
             duplicate_panel,
@@ -982,10 +1154,13 @@ mod tests {
                 panel: PanelId::new(PID[0])
             }
         );
-        let duplicate_view = TabSet::new(vec![
-            tab(0),
-            Tab::new(PanelId::new(PID[1]), View::new(ViewId::new(VID[0]), 80, 24)),
-        ])
+        let duplicate_view = TabSet::new(
+            vec![
+                tab(0),
+                Tab::new(PanelId::new(PID[1]), View::new(ViewId::new(VID[0]), 80, 24)),
+            ],
+            0,
+        )
         .expect_err("one view paints one tab");
         assert_eq!(
             duplicate_view,
@@ -993,6 +1168,22 @@ mod tests {
                 view: ViewId::new(VID[0])
             }
         );
+    }
+
+    #[test]
+    fn tab_set_rejects_an_active_index_outside_the_strip() {
+        // The active tab is an explicit index, so an out-of-range one has no
+        // projection to lay out and must be refused rather than clamped.
+        let tabs = vec![tab(0), tab(1)];
+        assert_eq!(
+            TabSet::new(tabs.clone(), 2).expect_err("past the end"),
+            TabError::ActiveOutOfRange { index: 2, len: 2 }
+        );
+        // The last valid index is accepted, so the test is not rejecting the
+        // whole range.
+        let set = TabSet::new(tabs, 1).expect("the last index is valid");
+        assert_eq!(set.active_index(), 1);
+        assert_eq!(set.active_panel(), PanelId::new(PID[1]));
     }
 
     #[test]
@@ -1006,7 +1197,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            TabSet::new(tabs).expect_err("over the cap"),
+            TabSet::new(tabs, 0).expect_err("over the cap"),
             TabError::TooManyTabs {
                 cap: MAX_TABS_PER_STACK,
                 requested: MAX_TABS_PER_STACK + 1,
@@ -1085,24 +1276,190 @@ mod tests {
     // -- switch ------------------------------------------------------------
 
     #[test]
-    fn switch_moves_the_target_to_the_active_position() {
+    fn switch_keeps_the_strip_in_insertion_order() {
+        // Decision 3: activation moves the index, not the tab. Pre-fix,
+        // `switch` moved the target to the end of the vector, which read as a
+        // user-visible reorder of the strip.
         let set = set_of(&[0, 1, 2]);
+        assert_eq!(set.active_index(), 2);
         let commit = set
             .switch(PanelId::new(PID[0]), &all_live())
             .expect("switch");
         assert_eq!(commit.verb(), TabVerb::Switch);
         assert_eq!(commit.focus_target(), PanelId::new(PID[0]));
-        let order: Vec<PanelId> = commit.next().tabs().iter().map(Tab::panel).collect();
         assert_eq!(
-            order,
-            vec![
-                PanelId::new(PID[1]),
-                PanelId::new(PID[2]),
-                PanelId::new(PID[0])
-            ]
+            panels(commit.next()),
+            vec![pid(0), pid(1), pid(2)],
+            "switch must not reorder the strip"
         );
+        assert_eq!(commit.next().active_index(), 0);
+        assert_eq!(commit.next().active_panel(), PanelId::new(PID[0]));
         assert_eq!(*commit.layout(), LayoutNode::leaf(tab(0).view().clone()));
+
+        // Switching again keeps the order too, and the previous active tab
+        // stays where it was.
+        let back = commit
+            .next()
+            .switch(PanelId::new(PID[1]), &all_live())
+            .expect("switch to the middle tab");
+        assert_eq!(panels(back.next()), vec![pid(0), pid(1), pid(2)]);
+        assert_eq!(back.next().active_index(), 1);
+        assert_eq!(back.focus_target(), PanelId::new(PID[1]));
+        // The source set is untouched.
         assert_eq!(set.active_panel(), PanelId::new(PID[2]));
+        assert_eq!(panels(&set), vec![pid(0), pid(1), pid(2)]);
+    }
+
+    #[test]
+    fn returning_to_a_background_tab_uses_the_current_slot_geometry() {
+        // Decision 4: background projections are resized with the strip, so a
+        // tab that was inactive for the whole resize comes back at the current
+        // grid size instead of the geometry it had when it was last active.
+        let mut set = set_of(&[0, 1, 2]);
+        let slot = Rect::new(0, 0, 120, 40);
+        assert!(
+            set.fit_slot(slot),
+            "a 120x40 slot resizes the 80x24 projections"
+        );
+        assert_eq!(set.slot_rect(), Some(slot));
+        for tab in set.tabs() {
+            assert_eq!(tab.view().size(), dims(slot), "every projection fits");
+        }
+        // Refitting the same slot changes nothing.
+        assert!(!set.fit_slot(slot));
+
+        // Tab 0 has been the background tab for the whole resize.
+        let commit = set
+            .switch(PanelId::new(PID[0]), &all_live())
+            .expect("switch back to the first tab");
+        let reactivated = commit
+            .next()
+            .find(PanelId::new(PID[0]))
+            .expect("tab 0 is still projected");
+        assert_eq!(reactivated.view().size(), dims(slot));
+        match commit.layout() {
+            LayoutNode::Leaf(leaf) => assert_eq!(
+                leaf.size(),
+                dims(slot),
+                "the committed leaf must carry the current geometry, not the stale one"
+            ),
+            other => panic!("a tab layout is a single leaf, got {other:?}"),
+        }
+
+        // The resize reaches the inactive projection too: `set` was never
+        // rebound from the `switch` above, so tab 2 is still active here and
+        // tab 0 is the background tab this fit has to reach.
+        let smaller = Rect::new(0, 0, 100, 30);
+        assert_eq!(
+            set.active_index(),
+            2,
+            "the switch above left `set` untouched"
+        );
+        assert!(set.fit_slot(smaller));
+        assert_eq!(
+            set.find(PanelId::new(PID[2]))
+                .expect("tab 2 is projected")
+                .view()
+                .size(),
+            dims(smaller)
+        );
+        assert_eq!(
+            set.find(PanelId::new(PID[0]))
+                .expect("tab 0 is projected")
+                .view()
+                .size(),
+            dims(smaller)
+        );
+    }
+
+    #[test]
+    fn a_tab_opened_after_a_slot_fit_arrives_at_the_slot_geometry() {
+        // The strip remembers its slot, so a projection that arrives later is
+        // fitted too — otherwise `open` would reintroduce the stale-geometry
+        // path through a different verb.
+        let mut set = set_of(&[0, 1]);
+        let slot = Rect::new(0, 0, 132, 44);
+        set.fit_slot(slot);
+        let commit = set.open(tab(2), &all_live()).expect("open");
+        let opened = commit
+            .next()
+            .find(PanelId::new(PID[2]))
+            .expect("the new tab is projected");
+        assert_eq!(opened.view().size(), dims(slot));
+        assert_eq!(commit.next().slot_rect(), Some(slot));
+        match commit.layout() {
+            LayoutNode::Leaf(leaf) => assert_eq!(leaf.size(), dims(slot)),
+            other => panic!("a tab layout is a single leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fitting_the_slot_changes_no_identity_order_or_active_tab() {
+        // `fit_slot` is a geometry stamp, not a verb: it must not be able to
+        // reorder the strip, move the active tab, or mint a commit.
+        let mut set = set_of(&[0, 1, 2]);
+        let before = panels(&set);
+        let active_before = set.active_panel();
+        assert!(set.fit_slot(Rect::new(3, 1, 90, 20)));
+        assert_eq!(panels(&set), before);
+        assert_eq!(set.active_index(), 2);
+        assert_eq!(set.active_panel(), active_before);
+        set.validate().expect("a fitted strip is still valid");
+        assert_eq!(
+            set.layout().leaf_ids(),
+            vec![ViewId::new(VID[2])],
+            "the layout still names only the active projection"
+        );
+        assert_eq!(set.len(), 3, "a fit detaches nothing");
+    }
+
+    #[test]
+    fn multi_tab_strips_are_not_persisted() {
+        // Decision 5, the explicit contract: the layout format carries the
+        // committed tree, and a tab stack's committed tree is one leaf. A strip
+        // of n tabs therefore persists as the active tab alone; restore drops
+        // the other n - 1 tabs by contract and no persisted field records them.
+        let set = set_of(&[0, 1, 2]);
+        let committed = set
+            .switch(PanelId::new(PID[0]), &all_live())
+            .expect("switch")
+            .commit(Some(PanelId::new(PID[0])))
+            .expect("focus was re-homed first");
+        let layout = committed.layout();
+        assert_eq!(
+            layout.leaf_count(),
+            1,
+            "the persisted tree carries exactly one projection"
+        );
+        assert_eq!(layout.leaf_ids(), vec![ViewId::new(VID[0])]);
+        for inactive in [VID[1], VID[2]] {
+            assert!(
+                !layout.leaf_ids().contains(&ViewId::new(inactive)),
+                "inactive view {} must not reach the layout format",
+                ViewId::new(inactive)
+            );
+        }
+
+        // Restore sees only that leaf, so it rebuilds a single-tab set.
+        let LayoutNode::Leaf(restored_leaf) = layout.clone() else {
+            panic!("a tab layout is a single leaf");
+        };
+        let restored = TabSet::single(Tab::new(PanelId::new(PID[0]), restored_leaf));
+        assert_eq!(
+            restored.len(),
+            1,
+            "restore deliberately rebuilds one tab, not the strip"
+        );
+        assert_eq!(restored.active_panel(), PanelId::new(PID[0]));
+        assert_eq!(
+            restored.layout(),
+            *layout,
+            "the restored leaf is the committed leaf"
+        );
+        // ... and the strip is not recoverable from it: the dropped tabs have
+        // no representation anywhere in the committed tree.
+        assert!(restored.find(PanelId::new(PID[1])).is_none());
+        assert!(restored.find(PanelId::new(PID[2])).is_none());
     }
 
     #[test]
@@ -1143,6 +1500,40 @@ mod tests {
     // -- close -------------------------------------------------------------
 
     #[test]
+    fn close_activates_the_neighbour_that_takes_the_closed_slot() {
+        // Decision 3: the strip is insertion order, so closing the active tab
+        // must not jump the selection to the far end of it.
+        let set = set_of(&[0, 1, 2]);
+        let middle = set
+            .switch(PanelId::new(PID[1]), &all_live())
+            .expect("activate the middle tab")
+            .next()
+            .clone();
+        assert_eq!(middle.active_index(), 1);
+        let closed = middle.close(PanelId::new(PID[1])).expect("close it");
+        // The successor slides into the closed slot and keeps the selection.
+        assert_eq!(panels(closed.next()), vec![pid(0), pid(2)]);
+        assert_eq!(closed.next().active_index(), 1);
+        assert_eq!(closed.focus_target(), PanelId::new(PID[2]));
+
+        // Closing the last tab has no successor, so the previous tab takes over.
+        let last = middle
+            .close(PanelId::new(PID[2]))
+            .expect("close the last tab");
+        assert_eq!(panels(last.next()), vec![pid(0), pid(1)]);
+        assert_eq!(last.next().active_index(), 1);
+        assert_eq!(last.focus_target(), PanelId::new(PID[1]));
+
+        // Closing before the active tab keeps the same tab active, shifted down.
+        let before = middle
+            .close(PanelId::new(PID[0]))
+            .expect("close a tab before it");
+        assert_eq!(panels(before.next()), vec![pid(1), pid(2)]);
+        assert_eq!(before.next().active_index(), 0);
+        assert_eq!(before.focus_target(), PanelId::new(PID[1]));
+    }
+
+    #[test]
     fn close_detaches_and_re_homes_focus_to_the_new_active_tab() {
         let set = set_of(&[0, 1, 2]);
         let commit = set.close(PanelId::new(PID[2])).expect("close active");
@@ -1150,6 +1541,7 @@ mod tests {
         assert_eq!(commit.removed(), Some(PanelId::new(PID[2])));
         assert_eq!(commit.focus_target(), PanelId::new(PID[1]));
         assert_eq!(commit.next().len(), 2);
+        assert_eq!(panels(commit.next()), vec![pid(0), pid(1)]);
         assert!(
             commit.next().find(PanelId::new(PID[2])).is_none(),
             "the closed projection is gone"
@@ -1160,10 +1552,11 @@ mod tests {
         assert_eq!(committed.focus(), PanelId::new(PID[1]));
         assert_eq!(committed.removed(), Some(PanelId::new(PID[2])));
 
-        // Closing a background tab keeps the active tab active.
+        // Closing a background tab keeps the active tab active and the order.
         let background = set.close(PanelId::new(PID[0])).expect("close background");
         assert_eq!(background.focus_target(), PanelId::new(PID[2]));
         assert_eq!(background.removed(), Some(PanelId::new(PID[0])));
+        assert_eq!(panels(background.next()), vec![pid(1), pid(2)]);
     }
 
     #[test]

@@ -135,7 +135,8 @@
 //!   owned by the `bar` plugin (W-104/CTX-0930): the retired Core-side
 //!   `tab_strip` projection (UX-12, `OQ-052` open) is deleted, and Core
 //!   keeps the panel/workspace mechanisms the bar builds on
-//!   (`LayoutNode::Stack` order, identity slots, persist snapshots).
+//!   (`LayoutNode::Stack` paint order, [`tabs::TabSet`] insertion order and
+//!   separate active index, identity slots, persist snapshots).
 
 //!
 //! # Determinism

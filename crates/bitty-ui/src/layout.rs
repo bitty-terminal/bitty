@@ -94,8 +94,8 @@ impl OverlayLayer {
 /// - `Stack`: paint-order stacking of co-located children. Every child gets the
 ///   full container bounds and paints in child order, last on top; the container
 ///   carries no active-child index and enforces no visibility, so a stack that
-///   must show exactly one child belongs to a projection that keeps the visible
-///   child last (panel tabs project that way — see [`crate::tabs`]).
+///   must show exactly one child belongs to a projection that emits only the
+///   visible child (panel tabs project that way — see [`crate::tabs`]).
 /// - `Overlay`: a base layer plus a floating overlay clipped to the container.
 ///   The overlay carries an [`OverlayTier`]; stacked overlays composed with
 ///   [`LayoutNode::overlay_stack`] paint in tier order (see [`OverlayTier`]
@@ -674,8 +674,9 @@ impl LayoutNode {
     /// at every `Split` (nested splits each insert their own band, matching
     /// Hyprland). `Stack` children share the full inset bounds and each keeps a
     /// live allocation (a co-located child still owns a grid), with the last
-    /// child painting on top; a stack that must show exactly one child belongs
-    /// to a projection that keeps the visible child last (panel tabs — see
+    /// child painting on top. A single-child `Stack` is not the tab model: a
+    /// tab strip commits one [`LayoutNode::Leaf`] naming the active projection
+    /// and no committed layout uses `Stack` ordering for tab identity (see
     /// [`crate::tabs`]). `Overlay` bases fill the inset bounds while the overlay
     /// subtree is laid out inside its clipped rect with inner gaps only
     /// (positioned chrome keeps its explicit position).

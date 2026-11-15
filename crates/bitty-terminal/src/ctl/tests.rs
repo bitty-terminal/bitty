@@ -624,6 +624,29 @@ fn registry_ids_are_stable() {
         "core.workspace.move"
     );
     assert_eq!(CtlRequest::ConfigReload.registry_id(), "core.config.reload");
+    // CTX-1836 (bitty#3169): the tab verbs keep their registry spelling in the
+    // `core.view.split` dot style while the verb itself is `core.tab:<verb>`.
+    assert_eq!(
+        CtlRequest::TabOpen {
+            panel_id: String::from("p:1"),
+        }
+        .registry_id(),
+        "core.tab.open"
+    );
+    assert_eq!(
+        CtlRequest::TabSwitch {
+            panel_id: String::from("p:1"),
+        }
+        .registry_id(),
+        "core.tab.switch"
+    );
+    assert_eq!(
+        CtlRequest::TabClose {
+            panel_id: String::from("p:1"),
+        }
+        .registry_id(),
+        "core.tab.close"
+    );
 }
 
 #[cfg(unix)]
@@ -1098,6 +1121,356 @@ fn control_terminal_spawn_applies_cwd_and_names_it() {
         "the spawned shell must start in the requested directory"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── CTX-1836 (bitty#3169): the Core tab verbs over the ctl surface ────────
+//
+// The tab verbs do not ride the shared control queue (the `bitty-ipc` pin's
+// scope table predates them), so these tests drive the *served* path end to
+// end through the production pieces: CLI parse → wire method + params → the
+// real `build_dispatcher(false)` table and `handle_tab_verb` (authorization,
+// server-side params parse, reply classification) → bounded lane → app service
+// turn → `Runtime::tab_apply` (the validated commit path). Nothing in the chain
+// is stubbed except the socket itself, and the dispatcher tests need a
+// socketpair for peer attestation, so they run on unix like the `newWindow`
+// precedent in `ipc_serve`.
+
+#[test]
+fn tab_verbs_parse_and_validate_panel_ids() {
+    for (verb, expected) in [
+        (
+            "open",
+            CtlRequest::TabOpen {
+                panel_id: String::from("p:2"),
+            },
+        ),
+        (
+            "switch",
+            CtlRequest::TabSwitch {
+                panel_id: String::from("p:2"),
+            },
+        ),
+        (
+            "close",
+            CtlRequest::TabClose {
+                panel_id: String::from("p:2"),
+            },
+        ),
+    ] {
+        let (req, targeting) =
+            parse_ctl_request(&words(&["tab", verb, "p:2"])).expect("must parse");
+        assert_eq!(req, expected);
+        assert_eq!(targeting.format, CtlFormat::Table);
+    }
+
+    // The panel id grammar is `p:<digits>`: a view, terminal, or workspace id
+    // is a usage error (exit 2) before any IPC, as is a missing/extra arg and a
+    // misplaced split or cwd option.
+    for bad in [
+        vec!["tab", "open", "v:1"],
+        vec!["tab", "open", "p:"],
+        vec!["tab", "open", "p:1x"],
+        vec!["tab", "open", "p:12345678901"],
+        vec!["tab", "open"],
+        vec!["tab", "open", "p:1", "p:2"],
+        vec!["tab", "switch", "--right", "p:1"],
+        vec!["tab", "close", "--cwd", "/tmp", "p:1"],
+    ] {
+        let err = parse_ctl_request(&words(&bad)).expect_err("must be a usage error");
+        assert!(
+            matches!(err, CtlParseError::Usage { .. }),
+            "{bad:?} must be usage, got {err:?}"
+        );
+    }
+
+    // An unknown tab verb is the parse-layer refusal that names the substring,
+    // never a silent fallthrough to another verb.
+    let err = parse_ctl_request(&words(&["tab", "jump", "p:1"])).expect_err("unknown verb");
+    assert!(
+        err.message().contains("unknown tab jump"),
+        "the refusal names the verb: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn tab_wire_methods_and_params_round_trip() {
+    use crate::ctl::request::{METHOD_TAB_CLOSE, METHOD_TAB_OPEN, METHOD_TAB_SWITCH};
+
+    for (raw, method) in [
+        (vec!["tab", "open", "p:3"], METHOD_TAB_OPEN),
+        (vec!["tab", "switch", "p:3"], METHOD_TAB_SWITCH),
+        (vec!["tab", "close", "p:3"], METHOD_TAB_CLOSE),
+    ] {
+        let (req, _) = parse_ctl_request(&words(&raw)).expect("must parse");
+        assert_eq!(req.wire_method(), Some(method));
+        let params = req.wire_params().expect("the panel id travels on the wire");
+        assert_eq!(
+            params,
+            String::from("{\"panel_id\":\"p:3\"}"),
+            "one stable params shape for every tab verb"
+        );
+        // The handler side parses exactly what the CLI built.
+        assert_eq!(
+            crate::ctl::parse_tab_params(Some(&params)),
+            Ok(String::from("p:3"))
+        );
+        assert_eq!(crate::ctl::parse_panel_id("p:3"), Ok(3));
+    }
+
+    // Strict params: unknown fields, wrong types, and over-long documents are
+    // typed refusals, never a defaulted target.
+    for bad in [
+        None,
+        Some("{}"),
+        Some("{\"panel\":\"p:1\"}"),
+        Some("{\"panel_id\":1}"),
+        Some("{\"panel_id\":\"v:1\"}"),
+        Some("not json"),
+    ] {
+        assert!(
+            crate::ctl::parse_tab_params(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    assert!(crate::ctl::parse_tab_params(Some("{\"panel_id\":\"p:99999999999\"}")).is_err());
+}
+
+#[test]
+fn tab_verbs_are_documented_in_usage_help_and_completion() {
+    // The resource table is the single source for shell completion; the parser
+    // is the executable authority. Both must list the three verbs.
+    let completion = crate::ctl::request::CTL_RESOURCES
+        .iter()
+        .find(|(resource, _)| *resource == "tab")
+        .expect("the resource table lists `tab`");
+    assert_eq!(completion.1, &["open", "switch", "close"]);
+    for verb in completion.1 {
+        // Every advertised pair parses with a panel id.
+        let mut raw = vec!["tab", verb, "p:1"];
+        raw.truncate(3);
+        assert!(
+            parse_ctl_request(&words(&raw)).is_ok(),
+            "completion advertises `tab {verb}` but the parser refuses it"
+        );
+    }
+    assert!(ctl_usage().contains("tab open p:N | tab switch p:N | tab close p:N"));
+    let help = ctl_help_text(false);
+    for text in ["tab open p:N", "tab switch p:N", "tab close p:N"] {
+        assert!(help.contains(text), "help must document `{text}`");
+    }
+    // The verbs are runtime verbs: the help names their Core identity and the
+    // scope they need, like every other mutating verb.
+    assert!(help.contains("core.tab:open"));
+    assert!(help.contains("view.manage"));
+}
+
+/// Headless app with two tiled panels (`p:1`, `p:2`) and focus on `p:1`.
+#[cfg(unix)]
+fn tab_test_app() -> crate::terminal_app::TerminalApp {
+    use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+
+    let mut runtime = bitty_runtime::Runtime::with_defaults().expect("headless runtime");
+    runtime.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+    ));
+    assert!(runtime.set_focus(ViewId::new(1)));
+    let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+        .expect("default maps");
+    crate::terminal_app::TerminalApp::with_theme(
+        runtime,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        crate::spawn::SpawnSpec::default(),
+    )
+}
+
+/// A serve context with the CLI default grant, as the socket path builds it.
+///
+/// The returned peer end stays open for the whole test: `dispatch` re-attests
+/// the connected peer before it runs a handler.
+#[cfg(unix)]
+fn tab_serve_context() -> (
+    bitty_ipc::devtools::ServeContext,
+    std::os::unix::net::UnixStream,
+) {
+    use std::os::unix::net::UnixStream;
+
+    let server = bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+    let granted = bitty_ipc::ScopeSet::cli_default();
+    assert!(
+        granted.contains(bitty_ipc::Scope::ViewManage),
+        "fixture precondition: the CLI default carries view.manage"
+    );
+    let authority = bitty_ipc::ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            granted.clone(),
+            bitty_ipc::ctl::TerminalCapabilities::from_scopes(&granted),
+        )
+        .expect("connection grant");
+    let (peer, stream) = UnixStream::pair().expect("socketpair");
+    let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(&server, grant);
+    let proof = context
+        .bind_connected_stream_current(&stream)
+        .expect("bound peer proof");
+    context.attest_local_peer(&proof.identity());
+    (context, peer)
+}
+
+/// Dispatches one parsed tab request through the production serve table,
+/// headlessly.
+///
+/// The real [`crate::ipc_serve`] table authorizes the connection, re-parses the
+/// params server-side and parks the request on the bounded lane; this thread
+/// answers it on the app's next event turn, exactly as `TerminalApp` does. Only
+/// the socket is absent, so the handler under test is the shipped one rather
+/// than a copy of it.
+#[cfg(unix)]
+fn dispatch_tab_request(
+    app: &mut crate::terminal_app::TerminalApp,
+    request: &CtlRequest,
+    context: &bitty_ipc::devtools::ServeContext,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    use std::time::{Duration, Instant};
+
+    let _lane = crate::ctl::tab::test_lane_lock();
+    crate::ctl::tab::reset_lane();
+
+    let method = request.wire_method().expect("tab verbs are wire verbs");
+    let params_part = request
+        .wire_params()
+        .map_or_else(String::new, |params| format!(",\"params\":{params}"));
+    let raw = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+    );
+    let wire = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request document");
+    let dispatcher = crate::ipc_serve::build_dispatcher(false);
+
+    std::thread::scope(|scope| {
+        // The handler blocks on the lane, so it runs on its own thread while
+        // this one plays the app.
+        let caller = scope.spawn(|| dispatcher.dispatch(context, &wire));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::ctl::tab::is_pending() {
+            assert!(
+                Instant::now() < deadline,
+                "the handler never reached the tab lane"
+            );
+            std::thread::yield_now();
+        }
+        assert!(app.service_tab_requests(), "one request serviced");
+        caller.join().expect("handler thread")
+    })
+}
+
+#[cfg(unix)]
+fn tab_strip(app: &crate::terminal_app::TerminalApp) -> Vec<u64> {
+    app.runtime
+        .tab_snapshot()
+        .expect("a tab request installed a strip")
+        .tabs()
+        .iter()
+        .map(|tab| tab.panel().0)
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn control_tab_verbs_drive_the_validated_commit_path() {
+    let mut app = tab_test_app();
+    assert!(app.runtime.tab_snapshot().is_none(), "lazy projection");
+    let (context, _peer) = tab_serve_context();
+
+    // close: detaches the background projection, keeps p:1 active.
+    let (close, _) = parse_ctl_request(&words(&["tab", "close", "p:2"])).expect("parses");
+    let receipt = dispatch_tab_request(&mut app, &close, &context).expect("close applied");
+    assert!(
+        receipt.contains("\"verb\":\"close\"") && receipt.contains("\"removed\":\"p:2\""),
+        "the receipt reports the committed transition: {receipt}"
+    );
+    assert_eq!(tab_strip(&app), vec![1]);
+    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+
+    // open: re-attaches the projection through the same commit gate.
+    let (open, _) = parse_ctl_request(&words(&["tab", "open", "p:2"])).expect("parses");
+    let receipt = dispatch_tab_request(&mut app, &open, &context).expect("open applied");
+    assert!(receipt.contains("\"verb\":\"open\""), "{receipt}");
+    assert_eq!(tab_strip(&app), vec![1, 2]);
+    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+
+    // switch: moves only the active index, focus follows (the commit refuses
+    // anything else).
+    let (switch, _) = parse_ctl_request(&words(&["tab", "switch", "p:1"])).expect("parses");
+    let receipt = dispatch_tab_request(&mut app, &switch, &context).expect("switch applied");
+    assert!(receipt.contains("\"verb\":\"switch\""), "{receipt}");
+    assert_eq!(tab_strip(&app), vec![1, 2], "a switch never reorders");
+    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+
+    // The layout tree is untouched: a tab verb never edits it.
+    assert_eq!(app.runtime.layout().leaf_count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn control_tab_refusals_are_typed_and_leave_state_alone() {
+    let mut app = tab_test_app();
+    let (context, _peer) = tab_serve_context();
+
+    // Unknown panel: NotFound, no strip change.
+    let (unknown, _) = parse_ctl_request(&words(&["tab", "switch", "p:9"])).expect("parses");
+    let error = dispatch_tab_request(&mut app, &unknown, &context)
+        .expect_err("an unknown panel is refused");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "NotFound"),
+        "{error:?}"
+    );
+    assert!(error.message.contains("unknown tab"), "{}", error.message);
+    assert_eq!(tab_strip(&app), vec![1, 2]);
+    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+
+    // Closing the last tab: Conflict naming the pane verb instead.
+    let (close, _) = parse_ctl_request(&words(&["tab", "close", "p:2"])).expect("parses");
+    assert!(dispatch_tab_request(&mut app, &close, &context).is_ok());
+    let (last, _) = parse_ctl_request(&words(&["tab", "close", "p:1"])).expect("parses");
+    let error =
+        dispatch_tab_request(&mut app, &last, &context).expect_err("the last tab cannot close");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "Conflict"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("close the pane instead"),
+        "the refusal names the right verb: {}",
+        error.message
+    );
+    assert_eq!(
+        tab_strip(&app),
+        vec![1],
+        "the refused close changed nothing"
+    );
+
+    // Switching the only remaining tab: the `SingleTab` refusal, reported as
+    // Conflict — never a silent success.
+    let (again, _) = parse_ctl_request(&words(&["tab", "switch", "p:1"])).expect("parses");
+    let error =
+        dispatch_tab_request(&mut app, &again, &context).expect_err("a single tab cannot switch");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "Conflict"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("single-tab stack"),
+        "{}",
+        error.message
+    );
 }
 
 #[cfg(unix)]

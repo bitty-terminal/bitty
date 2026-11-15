@@ -132,6 +132,7 @@ mod client;
 pub(crate) mod new_window;
 mod render;
 pub(crate) mod request;
+pub(crate) mod tab;
 
 // ---------------------------------------------------------------------------
 // `bitty ctl` CLI entry point (relocated from `main.rs`, CTX-0305)
@@ -239,5 +240,5 @@ pub use client::{
 pub use render::{execute_ctl, execute_reload};
 pub use request::{
     CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, METHOD_NEW_WINDOW,
-    ctl_help_text, ctl_usage, parse_ctl_request,
+    TAB_METHODS, ctl_help_text, ctl_usage, parse_ctl_request, parse_panel_id, parse_tab_params,
 };

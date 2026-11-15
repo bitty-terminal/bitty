@@ -57,6 +57,16 @@ pub fn format_failure(registry: &str, class: &str, code: &str, message: &str) ->
 pub(crate) const NEW_WINDOW_SKEW_MESSAGE: &str = "the running instance does not serve `window new` \
      (its ctl protocol predates this verb); restart the instance with this build and retry";
 
+/// Protocol-skew message for the Core tab verbs (CTX-1836, bitty#3169).
+///
+/// Same shape as [`NEW_WINDOW_SKEW_MESSAGE`]: an instance built before the tab
+/// verbs answers `UnknownMethod`, which the CLI reports as version skew (exit
+/// 5) rather than as a bad panel id. Only `UnknownMethod` counts as skew — the
+/// verbs refine "unknown panel" to `usage/NotFound`, which stays an ordinary
+/// argument failure so a live refusal is never dressed up as an upgrade prompt.
+pub(crate) const TAB_SKEW_MESSAGE: &str = "the running instance does not serve the `tab` verbs \
+     (its ctl protocol predates them); restart the instance with this build and retry";
+
 /// Map a server error `(category, code)` to the stable CLI exit code.
 ///
 /// - `usage/*` after IPC is a generic argument failure (exit 1); usage
@@ -527,6 +537,28 @@ fn render_outcome(
         }
         return EXIT_COMPAT;
     }
+    // CTX-1836 (bitty#3169): the tab verbs are served by dispatcher methods a
+    // pre-existing instance does not have either, so `UnknownMethod` is a
+    // protocol skew, not a bad argument. Unlike `window new` this branch does
+    // *not* accept `NotFound`: the tab verbs answer their own unknown-panel
+    // refusal with `usage/NotFound`, so folding the two together would report a
+    // live refusal as an upgrade prompt.
+    if matches!(
+        request,
+        CtlRequest::TabOpen { .. } | CtlRequest::TabSwitch { .. } | CtlRequest::TabClose { .. }
+    ) && outcome.code == "UnknownMethod"
+    {
+        let message = TAB_SKEW_MESSAGE;
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(registry, "VersionMismatch", "UnsupportedVersion", message)
+            );
+        } else {
+            eprintln!("bitty ctl: {message}");
+        }
+        return EXIT_COMPAT;
+    }
     if emit_json {
         println!(
             "{}",
@@ -758,6 +790,21 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         CtlRequest::InstanceList => {
             out.push_str(result_json);
             out.push('\n');
+        }
+        // CTX-1836 (bitty#3169): one line naming the verb and the panel it
+        // left active; the JSON receipt stays the machine contract.
+        CtlRequest::TabOpen { panel_id }
+        | CtlRequest::TabSwitch { panel_id }
+        | CtlRequest::TabClose { panel_id } => {
+            let verb = match request {
+                CtlRequest::TabOpen { .. } => "opened",
+                CtlRequest::TabSwitch { .. } => "switched to",
+                _ => "closed",
+            };
+            out.push_str(&format!(
+                "{verb} tab {panel_id} on {} — result: {result_json}\n",
+                target.instance
+            ));
         }
         // Consent receipts are the audit trail (issue #1520): print the
         // server receipt verbatim. A granted bearer appears here exactly
@@ -1403,5 +1450,107 @@ mod tests {
         assert_eq!(super::extract_number(r#"{"active":1abc}"#, "active"), None);
         assert_eq!(super::extract_number(r#"{"active":true}"#, "active"), None);
         assert_eq!(super::extract_number(r#"{"active":"1"}"#, "active"), None);
+    }
+
+    /// CTX-1836 (bitty#3169): an instance that predates the tab verbs answers
+    /// `UnknownMethod`; the CLI reports that as the same compat failure
+    /// `window new` uses, never as a bad panel id and never as success.
+    #[test]
+    fn tab_verbs_report_a_protocol_skew_as_a_compat_failure() {
+        let outcome = CtlIpcOutcome {
+            ok: false,
+            result_json: String::new(),
+            category: String::from("usage"),
+            code: String::from("UnknownMethod"),
+            message: String::from("unknown method bitty.debug/tabSwitch"),
+        };
+        let target = ResolvedTarget {
+            socket_path: String::from("/run/user/0/bitty/default.sock"),
+            instance: String::from("default"),
+        };
+        let targeting = CtlTargeting {
+            socket: None,
+            instance: None,
+            format: CtlFormat::Json,
+        };
+        for (request, registry) in [
+            (
+                CtlRequest::TabOpen {
+                    panel_id: String::from("p:1"),
+                },
+                "core.tab.open",
+            ),
+            (
+                CtlRequest::TabSwitch {
+                    panel_id: String::from("p:1"),
+                },
+                "core.tab.switch",
+            ),
+            (
+                CtlRequest::TabClose {
+                    panel_id: String::from("p:1"),
+                },
+                "core.tab.close",
+            ),
+        ] {
+            assert_eq!(
+                render_outcome(&outcome, registry, &targeting, &request, &target),
+                EXIT_COMPAT,
+                "protocol skew is exit 5 for {registry}: {}",
+                super::TAB_SKEW_MESSAGE
+            );
+        }
+    }
+
+    /// CTX-1836 (bitty#3169): a live tab refusal keeps its typed exit code, so
+    /// a `Conflict` (last tab, already active) is exit 8 and the verbs' own
+    /// `NotFound` (unknown panel) is the ordinary argument failure — never the
+    /// compat exit reserved for a missing method.
+    #[test]
+    fn tab_refusals_keep_their_typed_exit_codes() {
+        let target = ResolvedTarget {
+            socket_path: String::from("/run/user/0/bitty/default.sock"),
+            instance: String::from("default"),
+        };
+        let targeting = CtlTargeting {
+            socket: None,
+            instance: None,
+            format: CtlFormat::Json,
+        };
+        let request = CtlRequest::TabClose {
+            panel_id: String::from("p:1"),
+        };
+        let conflict = CtlIpcOutcome {
+            ok: false,
+            result_json: String::new(),
+            category: String::from("usage"),
+            code: String::from("Conflict"),
+            message: String::from(
+                "tab verb refused: closing PanelId(1) would leave an empty tab stack; \
+                 close the pane instead",
+            ),
+        };
+        assert_eq!(
+            render_outcome(&conflict, "core.tab.close", &targeting, &request, &target),
+            crate::ctl::EXIT_CONFLICT
+        );
+        // The verbs' unknown-panel refusal is `usage/NotFound`; it stays the
+        // ordinary argument failure and keeps the `NotFound` envelope class.
+        let missing = CtlIpcOutcome {
+            ok: false,
+            result_json: String::new(),
+            category: String::from("usage"),
+            code: String::from("NotFound"),
+            message: String::from("tab verb refused: unknown tab: PanelId(9)"),
+        };
+        assert_eq!(
+            render_outcome(&missing, "core.tab.close", &targeting, &request, &target),
+            crate::ctl::EXIT_GENERIC,
+            "a live unknown-panel refusal is not protocol skew"
+        );
+        assert_eq!(
+            super::class_for_server_error(&missing.category, &missing.code),
+            "NotFound"
+        );
     }
 }

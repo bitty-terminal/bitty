@@ -338,6 +338,90 @@ fn handle_new_window(
     ))
 }
 
+/// `bitty.debug/tabOpen|tabSwitch|tabClose` servo handler (CTX-1836,
+/// bitty#3169).
+///
+/// One handler for the three Core tab verbs: the method names the verb, the
+/// params name the panel. Authorization is the same shape the control queue
+/// applies — the handler reads the live connection authorization and requires
+/// `view.manage` (the scope `view split` needs; a tab transition moves focus
+/// and mutates the window's projection set, so it is not a read-only verb and
+/// needs no elevation), so a connection without it never reaches the app.
+///
+/// The request then travels through the bounded lane in [`crate::ctl::tab`] and
+/// is applied on the app thread by
+/// [`crate::terminal_app::TerminalApp::service_tab_requests`] through
+/// [`bitty_runtime::Runtime::tab_apply`] — the validated commit path the
+/// `core.tab:*` verbs already enforce. A verb refusal comes back as the typed
+/// `(category, code, message)` triple, never as a silent success.
+fn handle_tab_verb(
+    context: &bitty_ipc::devtools::ServeContext,
+    request: &bitty_ipc::devtools::DevtoolsRequest,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    let Some(verb) = crate::ctl::tab::verb_for_method(&request.method) else {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "usage",
+            "UnknownMethod",
+            format!("unknown tab control method {}", request.method),
+        ));
+    };
+    let scopes = match context.current_authorization() {
+        Ok(snapshot) => snapshot.scopes,
+        Err(err) => {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                format!("permission denied: {err}"),
+            ));
+        }
+    };
+    if !scopes.contains(bitty_ipc::Scope::ViewManage) {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            format!(
+                "permission denied: scope 'view.manage' for {} (needs elevation via \
+                 BITTY_CTL_ELEVATE)",
+                request.method
+            ),
+        ));
+    }
+    // Strict params: exactly one `panel_id` of the `p:N` shape. A malformed
+    // document is `InvalidParams` here, before any runtime state is read.
+    let panel_id = match crate::ctl::parse_tab_params(request.params_raw.as_deref()) {
+        Ok(panel_id) => panel_id,
+        Err(err) => {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "usage",
+                "InvalidParams",
+                format!("{} refused: {err}", verb.core_verb()),
+            ));
+        }
+    };
+    // `parse_tab_params` validated the grammar, so this cannot fail; a failure
+    // would still be a typed refusal rather than an unwrap.
+    let Ok(panel) = crate::ctl::parse_panel_id(&panel_id) else {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "usage",
+            "InvalidParams",
+            format!(
+                "{} refused: invalid panel id {panel_id:?}",
+                verb.core_verb()
+            ),
+        ));
+    };
+    let reply = crate::ctl::tab::request(verb, panel, bitty_ipc::ctl::CTL_TIMEOUT);
+    let (category, code) = reply.class();
+    match reply.applied() {
+        Some(result) => Ok(result.to_string()),
+        None => Err(bitty_ipc::devtools::HandlerError::new(
+            category,
+            code,
+            reply.message(),
+        )),
+    }
+}
+
 /// Build the dispatcher shared by the Unix and Windows serve paths.
 ///
 /// CTX-0506: test mode registers the E2E surface (`testInfo`, `testExit`);
@@ -349,7 +433,7 @@ fn handle_new_window(
 /// instead of the fail-closed stubs, on **both** tables: a normal instance
 /// serves the same read-only rows under the same elevated debug scope, and a
 /// runtime-less run keeps the typed `PluginRuntimeUnavailable` verdict.
-fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
+pub(crate) fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     let mut dispatcher = if test_mode {
         bitty_ipc::devtools::Dispatcher::with_test_mode()
     } else {
@@ -374,6 +458,19 @@ fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
         crate::logging::warn(|| {
             format!("bitty: window new unavailable: {err} (serving without it)")
         });
+    }
+    // CTX-1836 (bitty#3169): the three Core tab verbs register additively on
+    // the same table. Each handler authorizes `view.manage` itself and routes
+    // the request into the app's validated commit path through the bounded
+    // lane; an instance that fails to register a method answers the documented
+    // `NotFound`, which the CLI reports as a protocol skew rather than denying
+    // a request it never carried.
+    for method in crate::ctl::TAB_METHODS {
+        if let Err(err) = dispatcher.register(method, handle_tab_verb) {
+            crate::logging::warn(|| {
+                format!("bitty: tab verb {method} unavailable: {err} (serving without it)")
+            });
+        }
     }
     // Issue #2773: back the accepted `listPlugins`/`getPlugin` inspect methods
     // with the published runtime snapshot instead of the fail-closed stubs.
@@ -1675,6 +1772,235 @@ mod tests {
         // maps that (and `NotFound`) to the protocol-skew message and exit 5.
         assert_eq!(error.code, "UnknownMethod", "{error:?}");
         assert_eq!(error.category, "usage", "{error:?}");
+    }
+
+    /// CTX-1836 (bitty#3169): the three tab methods are registered additively on
+    /// both tables, and a table that predates them denies the method.
+    #[cfg(unix)]
+    #[test]
+    fn tab_verbs_are_registered_and_an_older_table_answers_not_found() {
+        use std::os::unix::net::UnixStream;
+
+        for test_mode in [true, false] {
+            let dispatcher = build_dispatcher(test_mode);
+            for method in crate::ctl::TAB_METHODS {
+                assert!(
+                    dispatcher.contains(method),
+                    "table (test mode {test_mode}) must register {method}"
+                );
+            }
+        }
+        let older = bitty_ipc::devtools::Dispatcher::with_defaults();
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_granted(
+            &server,
+            bitty_ipc::ScopeSet::cli_default(),
+        );
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        for method in crate::ctl::TAB_METHODS {
+            assert!(!older.contains(method), "the older table predates {method}");
+            let raw = format!(
+                "{{\"id\":1,\"method\":\"{method}\",\"params\":{{\"panel_id\":\"p:1\"}},\
+                 \"version\":\"1.0\"}}"
+            );
+            let request = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request");
+            let error = older
+                .dispatch(&context, &request)
+                .expect_err("an unregistered method must fail closed");
+            // The dispatcher names an unregistered method `UnknownMethod`, and
+            // that alone is what the CLI folds into the tab-skew message
+            // (`ctl::render`): the tab verbs answer a live refusal with
+            // `usage/NotFound`, so `NotFound` is never read as skew here.
+            assert_eq!(error.code, "UnknownMethod", "{method}: {error:?}");
+            assert_eq!(error.category, "usage", "{method}: {error:?}");
+        }
+    }
+
+    /// A serve context bound to a live [`bitty_ipc::ctl::ControlAuthority`]
+    /// grant, exactly as a served connection builds one.
+    ///
+    /// The returned peer end stays open for the whole test: `dispatch`
+    /// re-attests the connected peer before it runs a handler.
+    #[cfg(unix)]
+    fn granted_context(
+        granted: bitty_ipc::ScopeSet,
+    ) -> (
+        bitty_ipc::devtools::ServeContext,
+        std::os::unix::net::UnixStream,
+    ) {
+        use std::os::unix::net::UnixStream;
+
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let authority = bitty_ipc::ctl::ControlAuthority::new();
+        let grant = authority
+            .open_connection(
+                granted.clone(),
+                bitty_ipc::ctl::TerminalCapabilities::from_scopes(&granted),
+            )
+            .expect("connection grant");
+        let (peer, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(&server, grant);
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        assert!(
+            context.authority_required(),
+            "the grant must be the live authority under test"
+        );
+        (context, peer)
+    }
+
+    /// One framed tab request document, as `bitty ctl`'s client writes it.
+    #[cfg(unix)]
+    fn tab_request_document(method: &str, params: Option<&str>) -> String {
+        let params_part = params.map_or_else(String::new, |p| format!(",\"params\":{p}"));
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+        )
+    }
+
+    /// CTX-1836 (review of #3174, blocking 1): the `view.manage` gate inside
+    /// `handle_tab_verb`, driven through the production table.
+    ///
+    /// A connection whose live grant has the MCP read-only shape
+    /// ([`bitty_ipc::ScopeSet::mcp_default`]: `view.inspect`, no `view.manage`)
+    /// must be refused by the handler itself with the typed `scope` /
+    /// `ScopeDenied` pair the CLI maps to its permission exit, for every one of
+    /// the three verbs, and the refusal must land *before* the request lane is
+    /// offered anything: a tab verb moves focus and mutates the window's
+    /// projection set, so serving one on a read-only grant is a scope bypass.
+    ///
+    /// Mutation: inverting the `!scopes.contains(Scope::ViewManage)` branch in
+    /// `handle_tab_verb` sends the request into [`crate::ctl::tab::request`],
+    /// which no app thread services here; the dispatch then answers
+    /// `transport`/`Unavailable` and this test fails.
+    #[cfg(unix)]
+    #[test]
+    fn tab_verbs_deny_a_connection_without_view_manage_before_the_lane() {
+        let _lane = crate::ctl::tab::test_lane_lock();
+        crate::ctl::tab::reset_lane();
+
+        let granted = bitty_ipc::ScopeSet::mcp_default();
+        assert!(
+            !granted.contains(bitty_ipc::Scope::ViewManage),
+            "fixture precondition: the MCP read-only default carries no view.manage"
+        );
+        let (context, _peer) = granted_context(granted);
+        let dispatcher = build_dispatcher(false);
+        for method in crate::ctl::TAB_METHODS {
+            let raw = tab_request_document(method, Some("{\"panel_id\":\"p:1\"}"));
+            let request = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request");
+            let error = dispatcher
+                .dispatch(&context, &request)
+                .expect_err("a connection without view.manage must be refused");
+            assert_eq!(error.category, "scope", "{method}: {error:?}");
+            assert_eq!(error.code, "ScopeDenied", "{method}: {error:?}");
+            assert!(
+                error.message.contains("view.manage"),
+                "the denial must name the missing scope: {method}: {error:?}"
+            );
+            assert!(
+                crate::ctl::tab::claim().is_none(),
+                "{method}: the refused request must never be offered to the app thread"
+            );
+        }
+    }
+
+    /// The server-side params parse inside `handle_tab_verb`, on a grant that
+    /// passes the scope gate.
+    ///
+    /// A malformed document is `usage`/`InvalidParams` and stops before the
+    /// lane: the panel id is re-parsed from the wire here, so a caller cannot
+    /// smuggle a shape the CLI parser would have refused.
+    #[cfg(unix)]
+    #[test]
+    fn tab_verbs_refuse_malformed_params_before_the_lane() {
+        let _lane = crate::ctl::tab::test_lane_lock();
+        crate::ctl::tab::reset_lane();
+
+        let (context, _peer) = granted_context(bitty_ipc::ScopeSet::cli_default());
+        let dispatcher = build_dispatcher(false);
+        for params in [
+            None,
+            Some("{}"),
+            Some("{\"panel_id\":1}"),
+            Some("{\"panel_id\":\"v:1\"}"),
+            Some("{\"panel_id\":\"p:1\",\"extra\":true}"),
+            Some("{\"panel_id\":\"p:99999999999\"}"),
+        ] {
+            let method = crate::ctl::request::METHOD_TAB_SWITCH;
+            let raw = tab_request_document(method, params);
+            let request = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request");
+            let error = dispatcher
+                .dispatch(&context, &request)
+                .expect_err("a malformed document is refused");
+            assert_eq!(error.category, "usage", "{params:?}: {error:?}");
+            assert_eq!(error.code, "InvalidParams", "{params:?}: {error:?}");
+            assert!(
+                crate::ctl::tab::claim().is_none(),
+                "{params:?}: a refused request never reaches the lane"
+            );
+        }
+    }
+
+    /// Positive control for the denial above: the same request on a grant that
+    /// *does* carry `view.manage` (`ScopeSet::cli_default`) passes the gate and
+    /// lands on the lane with the verb and panel it named.
+    ///
+    /// The claim is then dropped, which is the app thread dying mid-request:
+    /// the handler must forward that as the typed `transport`/`Unavailable`
+    /// `OutcomeUnknown`, never as a receipt.
+    #[cfg(unix)]
+    #[test]
+    fn tab_verbs_reach_the_lane_when_the_grant_carries_view_manage() {
+        let _lane = crate::ctl::tab::test_lane_lock();
+        crate::ctl::tab::reset_lane();
+
+        let granted = bitty_ipc::ScopeSet::cli_default();
+        assert!(
+            granted.contains(bitty_ipc::Scope::ViewManage),
+            "fixture precondition: the CLI default carries view.manage"
+        );
+        let (context, _peer) = granted_context(granted);
+        let raw = tab_request_document(
+            crate::ctl::request::METHOD_TAB_OPEN,
+            Some("{\"panel_id\":\"p:7\"}"),
+        );
+        let request = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request");
+        let dispatcher = build_dispatcher(false);
+        let caller = std::thread::spawn(move || dispatcher.dispatch(&context, &request));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let held = loop {
+            if let Some(held) = crate::ctl::tab::claim() {
+                break held;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an authorized request never reached the lane"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(held.verb().core_verb(), bitty_ui::TAB_CMD_OPEN);
+        assert_eq!(held.panel(), 7);
+        drop(held);
+        let error = caller
+            .join()
+            .expect("handler thread")
+            .expect_err("a dropped claim is not a receipt");
+        assert_eq!(error.category, "transport", "{error:?}");
+        assert_eq!(error.code, "Unavailable", "{error:?}");
+        assert!(
+            error.message.contains("outcome unknown"),
+            "the handler must forward the lane's verdict: {error:?}"
+        );
     }
 
     /// CTX-1814 (review of #3140, mutation M4): the `view.manage` gate inside

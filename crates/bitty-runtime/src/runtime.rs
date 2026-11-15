@@ -167,6 +167,7 @@ pub mod selection;
 pub mod session;
 pub mod shell_jump;
 pub mod submit_host;
+pub mod tabs;
 pub mod workspace_memory;
 pub mod workspaces;
 
@@ -785,6 +786,16 @@ pub struct Runtime {
     /// plugin services (`bitty.ui.mount`/`ui.update` attach through it), so
     /// this is the one scene store, never a second one (CTX-1641).
     scene_host: Option<std::rc::Rc<std::cell::RefCell<crate::registry::PanelRuntime>>>,
+    /// Per-window tab projection host (CTX-1836, bitty#3169).
+    ///
+    /// Holds the Core tab verbs' only host state: the installed
+    /// [`bitty_ui::TabSet`], projected lazily from the live panel set by the
+    /// first tab request. `Runtime::tab_apply` is the single mutation path and
+    /// it installs only state a [`bitty_ui::TabCommit`] committed, so nothing
+    /// else in the runtime reads or writes a tab projection. Hosting and
+    /// painting a strip is a separate slice, so this field is inert until a
+    /// ctl or keymap request arrives.
+    tabs: self::tabs::TabHost,
     /// Report of the panel sweep the most recent workspace close ran
     /// (OQ-084 C.9).
     ///
@@ -2360,6 +2371,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            tabs: self::tabs::TabHost::default(),
             last_workspace_panel_disposal: None,
             presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),
@@ -2695,6 +2707,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            tabs: self::tabs::TabHost::default(),
             last_workspace_panel_disposal: None,
             presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),

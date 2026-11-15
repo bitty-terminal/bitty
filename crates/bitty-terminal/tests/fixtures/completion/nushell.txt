@@ -502,6 +502,50 @@ extern "bitty ctl consent" [
     --no-print-shell-init
     --no-shell-init
 ]
+extern "bitty ctl tab" [
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
 extern "bitty config" [
     --help(-h)
     --version(-V)
@@ -2622,6 +2666,9 @@ extern "bitty ctl config reload" []
 extern "bitty ctl consent grant" []
 extern "bitty ctl consent revoke" []
 extern "bitty ctl consent revoke-session" []
+extern "bitty ctl tab open" []
+extern "bitty ctl tab switch" []
+extern "bitty ctl tab close" []
 extern "bitty config path" []
 extern "bitty config check" []
 extern "bitty config show" []

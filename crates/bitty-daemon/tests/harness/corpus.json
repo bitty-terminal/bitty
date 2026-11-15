@@ -13799,6 +13799,698 @@
         "no drain ends with a session still non-terminal"
       ],
       "deferred": "The drain grace wait is still deferred: the served loop forces the remainder in the same pass and reports it through drain_forced (bitty#2957)"
+    },
+    {
+      "id": "C-26",
+      "title": "A lease heartbeat answers its owner and refuses a foreign or unknown attach with one uniform NotFound",
+      "area": "authorization",
+      "decisions": [
+        "D-07",
+        "D-12"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c26-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "c26-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c26-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "00000000000000000000000000000000"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "server_monotonic_ms",
+              "lease_expires_at_ms",
+              "attach_id"
+            ],
+            "result": {
+              "attach_id": "@controller_attach"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@observer_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "attach_id": "@observer_attach"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.attach_count": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a foreign attach id is refreshed by a heartbeat from another connection",
+        "a foreign heartbeat discloses whether the attach id exists",
+        "a refused heartbeat changes the session revision"
+      ]
+    },
+    {
+      "id": "C-27",
+      "title": "Control transfer is decided by the current controller lease, and the moved authority is observable",
+      "area": "authorization",
+      "decisions": [
+        "D-07",
+        "D-09"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c27-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "c27-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c27-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "idempotency_key": "c27-observer-transfer",
+            "target_attach_id": "@observer_attach"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "idempotency_key": "c27-controller-transfer",
+            "target_attach_id": "@observer_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "controller": "@observer_attach",
+              "previous_controller": "@controller_attach",
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 100,
+            "rows": 30
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 90,
+            "rows": 25
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.controller_present": true
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an observer transfers control away from the controller",
+        "the previous controller keeps resize authority after a transfer",
+        "a transfer leaves the same controller lease in place"
+      ]
+    },
+    {
+      "id": "C-28",
+      "title": "Only control authority revokes an observer grant, and a revoked grant can no longer attach",
+      "area": "authorization",
+      "decisions": [
+        "D-07",
+        "D-16"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "terminal_spawn"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c28-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "c28-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c28-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c28-revoke-grant"
+          },
+          "capture": {
+            "revoke_grant_id": "grant_id",
+            "revoke_grant_bearer": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@revoke_grant_id",
+              "revoked": true,
+              "not_active": false
+            }
+          }
+        },
+        {
+          "connection": "latecomer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "latecomer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@revoke_grant_bearer"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ObserverGrantRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@revoke_grant_id",
+              "revoked": false,
+              "not_active": true
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.attach_count": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an observer lease revokes a grant it does not control",
+        "a revoked grant still attaches a new observer",
+        "a second revoke reports a fresh revocation"
+      ]
     }
   ]
 }

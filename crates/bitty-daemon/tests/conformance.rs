@@ -155,7 +155,7 @@ fn the_coverage_gate_reports_the_missing_or_misplaced_vector() {
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 83, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 86, "corpus size changed");
     let mut ids = std::collections::BTreeSet::new();
     for vector in &corpus.vectors {
         assert!(
@@ -733,17 +733,23 @@ fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'s
         expected_not_compared.extend(["V-20", "V-44"]);
     }
     let expected_compared = match (real_serves_spawn, test_seams) {
-        (true, true) => 45,
-        (true, false) => 43,
+        (true, true) => 48,
+        (true, false) => 46,
         // The terminal-spawn vectors skip on the refused cell. V-48 needs no
         // process or containment plan, so it stays compared. V-52 needs a
-        // bound worker, so it joins them. C-17 resizes a bound terminal.
+        // bound worker, so it joins them. C-17 resizes a bound terminal, and
+        // C-26/C-27/C-28 need a bound controller lease to heartbeat, transfer,
+        // or revoke against.
         (false, true) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "C-17", "V-52"]);
+            expected_not_compared.extend([
+                "V-45", "V-46", "V-47", "C-17", "V-52", "C-26", "C-27", "C-28",
+            ]);
             40
         }
         (false, false) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "C-17", "V-52"]);
+            expected_not_compared.extend([
+                "V-45", "V-46", "V-47", "C-17", "V-52", "C-26", "C-27", "C-28",
+            ]);
             38
         }
     };

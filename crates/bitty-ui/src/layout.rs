@@ -94,8 +94,8 @@ impl OverlayLayer {
 /// - `Stack`: paint-order stacking of co-located children. Every child gets the
 ///   full container bounds and paints in child order, last on top; the container
 ///   carries no active-child index and enforces no visibility, so a stack that
-///   must show exactly one child belongs to a projection that keeps the visible
-///   child last (panel tabs project that way — see [`crate::tabs`]).
+///   must show exactly one child belongs to a projection that emits only the
+///   visible child (panel tabs project that way — see [`crate::tabs`]).
 /// - `Overlay`: a base layer plus a floating overlay clipped to the container.
 ///   The overlay carries an [`OverlayTier`]; stacked overlays composed with
 ///   [`LayoutNode::overlay_stack`] paint in tier order (see [`OverlayTier`]

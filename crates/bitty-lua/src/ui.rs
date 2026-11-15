@@ -106,7 +106,9 @@ pub enum UiSlot {
     /// (issue #3165): the root must be column-shaped, so a row-shaped root
     /// fails closed with `E_UI_COMPONENT_INVALID`.
     Right,
-    /// `tabline` — exclusive-claim tab strip (reserved for panel tabs).
+    /// `tabline` — exclusive-claim tab strip: the claim gates plugin mounts,
+    /// and the slot carries Core tab-projection state (nothing hosts a strip
+    /// yet, so the placement stays `Unsupported`).
     Tabline,
     /// `overlay` — Core-hosted focusable overlay (needs `ui.overlay`).
     ///

@@ -1582,7 +1582,10 @@ impl PanelRegistry {
     /// Creates a panel registry after `PanelRegistryConfig` validation.
     ///
     /// # Errors
-    /// `ResourceExhausted` for bad bounds, `GenerationExhausted` if reserved.
+    /// `ResourceExhausted` for bad bounds, `GenerationExhausted` if reserved,
+    /// `InvalidCommand` if the Core tab verbs (issue #3166) cannot be
+    /// registered on a fresh window registry (never in practice — the three
+    /// names are static and a fresh registry is empty).
     pub fn new(config: PanelRegistryConfig) -> Result<Self, PanelError> {
         config.validate()?;
         if Generation::INITIAL.is_exhausted() {
@@ -1590,6 +1593,15 @@ impl PanelRegistry {
                 current: Generation::INITIAL,
             });
         }
+        // Core tab verbs (`core.tab:open`/`switch`/`close`) belong to the
+        // window, not to a panel: they are registered once here, survive every
+        // per-panel teardown, and `register_command` can never take one.
+        let mut command_registry = UiCommandRegistry::new();
+        bitty_ui::tabs::register_tab_verbs(&mut command_registry).map_err(|error| {
+            PanelError::InvalidCommand {
+                reason: error.to_string(),
+            }
+        })?;
         Ok(Self {
             registry_generation: Generation::INITIAL,
             next_panel_raw: 1,
@@ -1600,7 +1612,7 @@ impl PanelRegistry {
             workspace_panels: HashMap::new(),
             focus_per_workspace: HashMap::new(),
             active_workspace: None,
-            command_registry: UiCommandRegistry::new(),
+            command_registry,
             overlay_manager: UiOverlayManager::new(),
             event_bus: PanelEventBus::new(BusDropPolicy::DropOldest),
             capabilities: HashMap::new(),
@@ -2689,6 +2701,14 @@ impl PanelRegistry {
                 bitty_ui::panel::CommandError::Duplicate { command, owner } => {
                     PanelError::DuplicateCommand { command, owner }
                 }
+                // The `core.` owner prefix is Core's alone, so the name is
+                // not panel-claimable; report it as an invalid registration
+                // rather than a panel conflict, carrying the reason that says
+                // the namespace is reserved (not merely that this verb is
+                // taken).
+                bitty_ui::panel::CommandError::CoreDuplicate { .. } => PanelError::InvalidCommand {
+                    reason: e.to_string(),
+                },
                 bitty_ui::panel::CommandError::TooManyCommands { max, current } => {
                     PanelError::TooManyCommands { max, current }
                 }
@@ -2701,6 +2721,15 @@ impl PanelRegistry {
     #[must_use]
     pub fn command_owner(&self, command: &str) -> Option<PanelId> {
         self.command_registry.owner_of(command)
+    }
+
+    /// Whether `command` is a window-owned Core verb (issue #3166).
+    ///
+    /// Core verbs (`core.tab:open`/`switch`/`close`) belong to the window, have
+    /// no panel owner, and survive every per-panel teardown.
+    #[must_use]
+    pub fn is_core_command(&self, command: &str) -> bool {
+        self.command_registry.is_core(command)
     }
 
     // ------------------------------------------------------------------

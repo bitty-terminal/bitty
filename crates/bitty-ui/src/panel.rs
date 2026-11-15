@@ -441,6 +441,15 @@ impl std::error::Error for OverlayError {}
 pub const MAX_COMMANDS_PER_PANEL_TYPE: usize = 32;
 pub const MAX_COMMAND_LEN: usize = 128;
 
+/// The owner family Core reserves for window-level verbs.
+///
+/// A [`QualifiedCommand`] name is `owner.name:command`, so the first dot
+/// segment of the owner is the owner *family*. `core` is Core's own family
+/// (`core.tab:open`, `core.view.split`, ...), and the whole family belongs to
+/// Core: the panel lane cannot mint any `core.*` name, not merely the verbs
+/// Core happens to have registered at the moment.
+pub const CORE_OWNER_FAMILY: &str = "core";
+
 /// Qualified command name `owner.name:command`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct QualifiedCommand(String);
@@ -533,6 +542,27 @@ impl QualifiedCommand {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The owner family: the first dot segment of the owner.
+    ///
+    /// [`QualifiedCommand::parse`] guarantees an `owner.name:command` shape, so
+    /// `core.tab:open` reports `core` and `xuepoo.git:open` reports `xuepoo`.
+    #[must_use]
+    pub fn owner_family(&self) -> &str {
+        let owner = self.0.split_once(':').map_or("", |(owner, _)| owner);
+        owner
+            .split_once('.')
+            .map_or(owner, |(family, _name)| family)
+    }
+
+    /// Whether this name lives in the Core-reserved owner family (`core.*`).
+    ///
+    /// The reservation is over the namespace, not over a list of registered
+    /// verbs: see [`CORE_OWNER_FAMILY`].
+    #[must_use]
+    pub fn is_core_namespace(&self) -> bool {
+        self.owner_family() == CORE_OWNER_FAMILY
+    }
 }
 
 impl std::fmt::Display for QualifiedCommand {
@@ -544,8 +574,23 @@ impl std::fmt::Display for QualifiedCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandError {
     Invalid(String),
-    Duplicate { command: String, owner: PanelId },
-    TooManyCommands { max: usize, current: usize },
+    Duplicate {
+        command: String,
+        owner: PanelId,
+    },
+    /// The name belongs to the Core-reserved namespace; panels and Core never
+    /// share a name.
+    ///
+    /// Raised for any [`CORE_OWNER_FAMILY`] name (`core.tab:reorder` is
+    /// reserved even before it is registered) and for an exact registered Core
+    /// verb.
+    CoreDuplicate {
+        command: String,
+    },
+    TooManyCommands {
+        max: usize,
+        current: usize,
+    },
 }
 
 impl std::fmt::Display for CommandError {
@@ -554,6 +599,12 @@ impl std::fmt::Display for CommandError {
             Self::Invalid(msg) => write!(f, "invalid command: {msg}"),
             Self::Duplicate { command, owner } => {
                 write!(f, "duplicate command '{command}' already owned by {owner}")
+            }
+            Self::CoreDuplicate { command } => {
+                write!(
+                    f,
+                    "command '{command}' is a Core verb name: the '{CORE_OWNER_FAMILY}.' owner prefix is reserved for Core"
+                )
             }
             Self::TooManyCommands { max, current } => {
                 write!(f, "too many commands: max {max}, current {current}")
@@ -565,10 +616,21 @@ impl std::fmt::Display for CommandError {
 impl std::error::Error for CommandError {}
 
 /// Command registry per window, Core-owned, generation-aware.
+///
+/// Two ownership lanes share one namespace: panel commands
+/// ([`register`](Self::register)) and Core verbs
+/// ([`register_core`](Self::register_core)). Names are unique across both, so a
+/// panel can never shadow a Core verb and vice versa; each lane keeps its own
+/// per-owner cap.
+///
+/// The split is not only "who registered first": the [`CORE_OWNER_FAMILY`]
+/// owner prefix is reserved outright, so the panel lane cannot mint a `core.*`
+/// name that Core has not registered yet.
 #[derive(Clone, Debug, Default)]
 pub struct CommandRegistry {
     commands: std::collections::HashMap<String, PanelId>,
     per_panel: std::collections::HashMap<PanelId, Vec<String>>,
+    core: Vec<String>,
 }
 
 impl CommandRegistry {
@@ -577,11 +639,18 @@ impl CommandRegistry {
         Self {
             commands: std::collections::HashMap::new(),
             per_panel: std::collections::HashMap::new(),
+            core: Vec::new(),
         }
     }
 
     /// Register a command for `panel_id`. Validates grammar and enforces
     /// `<=32` per panel type and duplicate rejection.
+    ///
+    /// The panel lane is confined to its own namespace: a [`CORE_OWNER_FAMILY`]
+    /// name is rejected with [`CommandError::CoreDuplicate`] whether or not
+    /// Core has registered that exact verb yet, so the whole `core.*` surface
+    /// stays Core's. A non-`core.` name a Core verb already holds is rejected
+    /// the same way.
     pub fn register(
         &mut self,
         panel_id: PanelId,
@@ -592,6 +661,11 @@ impl CommandRegistry {
             return Err(CommandError::Duplicate {
                 command: qc.as_str().to_string(),
                 owner: *owner,
+            });
+        }
+        if !self.panel_lane_may_register(&qc) {
+            return Err(CommandError::CoreDuplicate {
+                command: qc.as_str().to_string(),
             });
         }
         let count = self.per_panel.get(&panel_id).map_or(0, |v| v.len());
@@ -607,6 +681,67 @@ impl CommandRegistry {
             .or_default()
             .push(qc.as_str().to_string());
         Ok(qc)
+    }
+
+    /// Register a Core-owned verb (`owner.name:command`) that belongs to the
+    /// window rather than to a panel.
+    ///
+    /// Same grammar and duplicate discipline as
+    /// [`register`](Self::register); the per-owner cap is applied to the Core
+    /// lane, and Core verbs survive [`unregister_panel`](Self::unregister_panel)
+    /// because no panel owns them.
+    pub fn register_core(&mut self, raw: &str) -> Result<QualifiedCommand, CommandError> {
+        let qc = QualifiedCommand::parse(raw)?;
+        if let Some(owner) = self.commands.get(qc.as_str()) {
+            return Err(CommandError::Duplicate {
+                command: qc.as_str().to_string(),
+                owner: *owner,
+            });
+        }
+        if self.is_core(qc.as_str()) {
+            return Err(CommandError::CoreDuplicate {
+                command: qc.as_str().to_string(),
+            });
+        }
+        if self.core.len() >= MAX_COMMANDS_PER_PANEL_TYPE {
+            return Err(CommandError::TooManyCommands {
+                max: MAX_COMMANDS_PER_PANEL_TYPE,
+                current: self.core.len(),
+            });
+        }
+        self.core.push(qc.as_str().to_string());
+        Ok(qc)
+    }
+
+    /// Whether the panel lane may register `qc`.
+    ///
+    /// Two independent refusals, both reported as
+    /// [`CommandError::CoreDuplicate`]:
+    ///
+    /// - the whole Core owner family ([`CORE_OWNER_FAMILY`]) is reserved, so a
+    ///   panel cannot mint `core.tab:reorder` or `core.view:split` even though
+    ///   Core registered neither; and
+    /// - an exact Core verb outside that family (should Core ever register
+    ///   one) is equally unclaimable.
+    fn panel_lane_may_register(&self, qc: &QualifiedCommand) -> bool {
+        !qc.is_core_namespace() && !self.is_core(qc.as_str())
+    }
+
+    /// Whether `command` is a registered Core verb (exact name match).
+    ///
+    /// This is the *registered* half of the reservation. The namespace half —
+    /// every `core.*` name is Core's before it is registered — is enforced in
+    /// [`register`](Self::register) through
+    /// [`QualifiedCommand::is_core_namespace`].
+    #[must_use]
+    pub fn is_core(&self, command: &str) -> bool {
+        self.core.iter().any(|registered| registered == command)
+    }
+
+    /// The registered Core verbs, in registration order.
+    #[must_use]
+    pub fn core_commands(&self) -> &[String] {
+        &self.core
     }
 
     #[must_use]
@@ -629,12 +764,12 @@ impl CommandRegistry {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.commands.len()
+        self.commands.len() + self.core.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        self.commands.is_empty() && self.core.is_empty()
     }
 }
 

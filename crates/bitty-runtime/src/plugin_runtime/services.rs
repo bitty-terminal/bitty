@@ -50,8 +50,8 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_host::band_is_visible;
 use crate::runtime::band_slots::{
-    UiSlotPlacement, band_scene_direction_error, band_scene_matches, ui_slot_placement,
-    unsupported_slot_error,
+    SlotStateRule, UiSlotPlacement, band_scene_direction_error, band_scene_matches,
+    slot_state_rule, ui_slot_placement, unsupported_slot_error,
 };
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
 use crate::runtime::pane_cwd::PaneCwd;
@@ -3370,18 +3370,22 @@ impl PluginServices {
         }
         let blocks = self.ui_blocks.borrow();
         let block = blocks.get(handle)?;
-        match block.ui_slot() {
+        // Issue #3166: the per-slot presentation rule lives next to the
+        // placement decision (`slot_state_rule`), so `ui.state` cannot report a
+        // band row for a `tabline` mount: a tab strip is Core tab-projection
+        // state with several entries, and its placement stays `Unsupported`.
+        match slot_state_rule(block.ui_slot()) {
             // A band paints one row per block and is hidden only by empty
             // text (the `band_is_visible` rule the paint path uses), so
-            // `presented` is the same content gate for every band slot.
-            UiSlot::Top | UiSlot::Bottom | UiSlot::Tabline => {
+            // `presented` is the same content gate for every row band.
+            SlotStateRule::BandVisibility => {
                 let presented = band_is_visible(block.node());
                 Some(UiBlockState {
                     presented,
                     focused: presented && window_focused,
                 })
             }
-            UiSlot::Overlay => {
+            SlotStateRule::OverlayCapture => {
                 let captured = self
                     .overlay_capture()
                     .is_some_and(|c| c.borrow().is_owner(&self.plugin_id, handle));
@@ -3395,11 +3399,12 @@ impl PluginServices {
                     focused: captured && window_focused,
                 })
             }
-            // Every remaining slot has no band or overlay surface here: a
-            // `left`/`right` mount fails closed at admission and the
-            // `terminal` scene path never enters this registry, so a
-            // retained block cannot be painted on them.
-            UiSlot::Left | UiSlot::Right | UiSlot::Terminal => Some(UiBlockState {
+            // No host surface in this build: a `left`/`right` mount fails
+            // closed at admission, the `terminal` scene path never enters this
+            // registry, and `tabline` is Core tab-projection state whose host
+            // does not exist yet (issue #3166), so a retained block cannot be
+            // painted on them.
+            SlotStateRule::NeverPresented => Some(UiBlockState {
                 presented: false,
                 focused: false,
             }),
@@ -6611,6 +6616,15 @@ impl HostServices for PluginServices {
             // Unclaimed mounts fail closed; the register/claim reservation is
             // owned by the plugin host. CTX-0974 purged the deprecated
             // `tabline` claim alias: only `workspaceline` satisfies the gate.
+            //
+            // Issue #3166 decision 5: this claim gates *plugin mounts into the
+            // slot*, and it stays exactly as it is. Core-owned tab verbs
+            // (`core.tab:open`/`switch`/`close`) mount no UI block and never
+            // consult plugin claims, so the two authorities cannot collide:
+            // a panel lane cannot register a `core.*` name
+            // (`CommandError::CoreDuplicate`), and this gate cannot be
+            // satisfied into a hosted strip because the placement below still
+            // refuses `tabline`. Hosting a strip stays a separate slice.
             let tabline_claimed = access
                 .claims
                 .iter()

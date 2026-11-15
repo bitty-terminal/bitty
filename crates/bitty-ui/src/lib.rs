@@ -189,6 +189,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod selection;
 pub mod status_registry;
+pub mod tabs;
 pub mod target_dispatch;
 pub mod target_provider;
 pub mod targeting;
@@ -334,6 +335,10 @@ pub use search::{SearchHighlight, SearchState, search_match_to_persistent};
 pub use selection::{
     BufferPos, CellPos, PersistentSelection, Selection, SelectionKind, SelectionRange,
     is_word_char, snap_to_leading,
+};
+pub use tabs::{
+    CommittedTabs, MAX_TABS_PER_STACK, PanelLiveness, TAB_CMD_CLOSE, TAB_CMD_OPEN, TAB_CMD_SWITCH,
+    TAB_CMDS, Tab, TabCommit, TabEffect, TabError, TabSet, TabVerb, register_tab_verbs,
 };
 pub use target_dispatch::{DispatchError, MAX_TARGET_BINDINGS, TargetDispatcher};
 pub use target_provider::{

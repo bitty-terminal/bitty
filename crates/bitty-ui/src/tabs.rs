@@ -519,8 +519,13 @@ impl TabSet {
     /// Not a verb and not a second commit path: it changes no identity, no
     /// order, and no active index, mints no [`TabCommit`], and cannot
     /// invalidate one (see the module atomicity note). Returns whether any
-    /// projection's grid size changed, so a host can skip work when nothing
-    /// moved.
+    /// projection's grid *size* changed — a fit that only moves the projections
+    /// to a new origin returns `false`, so a host can skip size-dependent work
+    /// when nothing was resized.
+    ///
+    /// No production caller yet: the resize path is not wired, so residual 2 is
+    /// closed at module level only. The host has to call this from the
+    /// solver-sync path; that wiring is tracked by issue #3169.
     pub fn fit_slot(&mut self, rect: Rect) -> bool {
         self.slot = Some(rect);
         let mut resized = false;
@@ -1341,9 +1346,15 @@ mod tests {
             other => panic!("a tab layout is a single leaf, got {other:?}"),
         }
 
-        // The resize reaches the tab that is inactive *now* as well: fitting
-        // while tab 0 is active must reach tab 2.
+        // The resize reaches the inactive projection too: `set` was never
+        // rebound from the `switch` above, so tab 2 is still active here and
+        // tab 0 is the background tab this fit has to reach.
         let smaller = Rect::new(0, 0, 100, 30);
+        assert_eq!(
+            set.active_index(),
+            2,
+            "the switch above left `set` untouched"
+        );
         assert!(set.fit_slot(smaller));
         assert_eq!(
             set.find(PanelId::new(PID[2]))

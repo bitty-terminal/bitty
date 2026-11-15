@@ -338,6 +338,93 @@ fn handle_new_window(
     ))
 }
 
+/// `bitty.debug/tabOpen|tabSwitch|tabClose` servo handler (CTX-1836,
+/// bitty#3169).
+///
+/// One handler for the three Core tab verbs: the method names the verb, the
+/// params name the panel. Authorization is the same shape the control queue
+/// applies — the handler reads the live connection authorization and requires
+/// `view.manage` (the scope `view split` needs; a tab transition moves focus
+/// and mutates the window's projection set, so it is not a read-only verb and
+/// needs no elevation), so a connection without it never reaches the app.
+///
+/// The request then travels through the bounded lane in [`crate::ctl::tab`] and
+/// is applied on the app thread by
+/// [`crate::terminal_app::TerminalApp::service_tab_requests`] through
+/// [`bitty_runtime::Runtime::tab_apply`] — the validated commit path the
+/// `core.tab:*` verbs already enforce. A verb refusal comes back as the typed
+/// `(category, code, message)` triple, never as a silent success.
+///
+/// Kept alive on non-Unix builds for the Windows `-D warnings` cross-check.
+#[allow(dead_code)]
+fn handle_tab_verb(
+    context: &bitty_ipc::devtools::ServeContext,
+    request: &bitty_ipc::devtools::DevtoolsRequest,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    let Some(verb) = crate::ctl::tab::verb_for_method(&request.method) else {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "usage",
+            "UnknownMethod",
+            format!("unknown tab control method {}", request.method),
+        ));
+    };
+    let scopes = match context.current_authorization() {
+        Ok(snapshot) => snapshot.scopes,
+        Err(err) => {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "scope",
+                "Unauthenticated",
+                format!("permission denied: {err}"),
+            ));
+        }
+    };
+    if !scopes.contains(bitty_ipc::Scope::ViewManage) {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "scope",
+            "ScopeDenied",
+            format!(
+                "permission denied: scope 'view.manage' for {} (needs elevation via \
+                 BITTY_CTL_ELEVATE)",
+                request.method
+            ),
+        ));
+    }
+    // Strict params: exactly one `panel_id` of the `p:N` shape. A malformed
+    // document is `InvalidParams` here, before any runtime state is read.
+    let panel_id = match crate::ctl::parse_tab_params(request.params_raw.as_deref()) {
+        Ok(panel_id) => panel_id,
+        Err(err) => {
+            return Err(bitty_ipc::devtools::HandlerError::new(
+                "usage",
+                "InvalidParams",
+                format!("{} refused: {err}", verb.core_verb()),
+            ));
+        }
+    };
+    // `parse_tab_params` validated the grammar, so this cannot fail; a failure
+    // would still be a typed refusal rather than an unwrap.
+    let Ok(panel) = crate::ctl::parse_panel_id(&panel_id) else {
+        return Err(bitty_ipc::devtools::HandlerError::new(
+            "usage",
+            "InvalidParams",
+            format!(
+                "{} refused: invalid panel id {panel_id:?}",
+                verb.core_verb()
+            ),
+        ));
+    };
+    let reply = crate::ctl::tab::request(verb, panel, bitty_ipc::ctl::CTL_TIMEOUT);
+    let (category, code) = reply.class();
+    match reply.applied() {
+        Some(result) => Ok(result.to_string()),
+        None => Err(bitty_ipc::devtools::HandlerError::new(
+            category,
+            code,
+            reply.message(),
+        )),
+    }
+}
+
 /// Build the dispatcher shared by the Unix and Windows serve paths.
 ///
 /// CTX-0506: test mode registers the E2E surface (`testInfo`, `testExit`);
@@ -374,6 +461,19 @@ fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
         crate::logging::warn(|| {
             format!("bitty: window new unavailable: {err} (serving without it)")
         });
+    }
+    // CTX-1836 (bitty#3169): the three Core tab verbs register additively on
+    // the same table. Each handler authorizes `view.manage` itself and routes
+    // the request into the app's validated commit path through the bounded
+    // lane; an instance that fails to register a method answers the documented
+    // `NotFound`, which the CLI reports as a protocol skew rather than denying
+    // a request it never carried.
+    for method in crate::ctl::TAB_METHODS {
+        if let Err(err) = dispatcher.register(method, handle_tab_verb) {
+            crate::logging::warn(|| {
+                format!("bitty: tab verb {method} unavailable: {err} (serving without it)")
+            });
+        }
     }
     // Issue #2773: back the accepted `listPlugins`/`getPlugin` inspect methods
     // with the published runtime snapshot instead of the fail-closed stubs.
@@ -1675,6 +1775,54 @@ mod tests {
         // maps that (and `NotFound`) to the protocol-skew message and exit 5.
         assert_eq!(error.code, "UnknownMethod", "{error:?}");
         assert_eq!(error.category, "usage", "{error:?}");
+    }
+
+    /// CTX-1836 (bitty#3169): the three tab methods are registered additively on
+    /// both tables, and a table that predates them denies the method.
+    #[cfg(unix)]
+    #[test]
+    fn tab_verbs_are_registered_and_an_older_table_answers_not_found() {
+        use std::os::unix::net::UnixStream;
+
+        for test_mode in [true, false] {
+            let dispatcher = build_dispatcher(test_mode);
+            for method in crate::ctl::TAB_METHODS {
+                assert!(
+                    dispatcher.contains(method),
+                    "table (test mode {test_mode}) must register {method}"
+                );
+            }
+        }
+        let older = bitty_ipc::devtools::Dispatcher::with_defaults();
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_granted(
+            &server,
+            bitty_ipc::ScopeSet::cli_default(),
+        );
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        for method in crate::ctl::TAB_METHODS {
+            assert!(!older.contains(method), "the older table predates {method}");
+            let raw = format!(
+                "{{\"id\":1,\"method\":\"{method}\",\"params\":{{\"panel_id\":\"p:1\"}},\
+                 \"version\":\"1.0\"}}"
+            );
+            let request = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request");
+            let error = older
+                .dispatch(&context, &request)
+                .expect_err("an unregistered method must fail closed");
+            // The CLI maps `UnknownMethod`/`NotFound` to the tab-skew message
+            // and exit 5, so a pre-existing instance is never read as a bad
+            // panel id.
+            assert!(
+                matches!(error.code, "UnknownMethod" | "NotFound"),
+                "{method}: {error:?}"
+            );
+        }
     }
 
     /// CTX-1814 (review of #3140, mutation M4): the `view.manage` gate inside

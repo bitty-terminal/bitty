@@ -1403,6 +1403,27 @@ impl TerminalApp {
         self.apply_chrome_action(action)
     }
 
+    /// Runs one Core tab verb through the runtime's validated commit path and
+    /// hands back its outcome (CTX-1836, bitty#3169).
+    ///
+    /// This is the *only* app-side entry for a tab verb, shared by the keymap
+    /// chords and the `bitty ctl tab …` lane, so both surfaces enforce exactly
+    /// the same gate: [`bitty_runtime::Runtime::tab_apply`] stages the verb
+    /// through `bitty_ui::TabSet`, re-homes focus (WS-INV-19), commits with the
+    /// focus it read back (`TabCommit::commit` → `FocusNotRehomed`), installs
+    /// the committed projection, re-attributes the input-mode caches, and arms
+    /// the full redraw. Nothing here mutates the layout tree: hosting and
+    /// painting a strip is a separate slice.
+    ///
+    /// A refusal is the typed [`bitty_ui::TabError`]; the caller renders it
+    /// (a loud keymap warning, or a `Conflict`/`NotFound` ctl reply).
+    pub(crate) fn apply_tab_request(
+        &mut self,
+        request: bitty_runtime::TabRequest,
+    ) -> Result<bitty_runtime::TabOutcome, bitty_ui::TabError> {
+        self.runtime.tab_apply(request)
+    }
+
     /// Execute one bound chrome action (single owner: the PTY never sees the
     /// chord). All mutations go through existing `Runtime`/`LayoutNode` APIs;
     /// refusals warn and keep the current layout.
@@ -1594,6 +1615,35 @@ impl TerminalApp {
                 // (`TerminalApp::service_new_window_requests`), so a refusal
                 // from the platform is logged there instead of panicking here.
                 let _latched = self.request_new_window();
+            }
+            A::TabOpen | A::TabNext | A::TabClose => {
+                // bitty#3169: one keymap action set for the three Core tab
+                // verbs. Every chord resolves to a `bitty_runtime::TabRequest`
+                // and runs the *same* validated commit path the ctl surface
+                // uses (`Runtime::tab_apply` → `TabCommit::commit`), so the
+                // chord can never reach a mutation the verb would refuse.
+                // A chord carries no `p:N`, so the argument-free shapes are
+                // used: reopen the first unprojected projection, cycle to the
+                // next projection, close the active projection.
+                let (request, label) = match action {
+                    A::TabOpen => (bitty_runtime::TabRequest::OpenUnprojected, "tab_open"),
+                    A::TabNext => (bitty_runtime::TabRequest::Next, "tab_next"),
+                    _ => (bitty_runtime::TabRequest::CloseActive, "tab_close"),
+                };
+                match self.apply_tab_request(request) {
+                    Ok(outcome) => eprintln!(
+                        "bitty: keymap {label} -> {} p:{} ({} tab(s), active #{})",
+                        bitty_runtime::verb_name(outcome.verb()),
+                        outcome.focus().0,
+                        outcome.tabs().len(),
+                        outcome.active_index() + 1
+                    ),
+                    // Typed refusal, never a silent no-op: the user pressed a
+                    // bound chord and nothing changed.
+                    Err(refusal) => {
+                        eprintln!("warning: keymap {label} refused ({refusal}) — no tab changed");
+                    }
+                }
             }
             A::InvokeCommand(invocation) => {
                 let qualified = invocation.target();
@@ -11616,5 +11666,96 @@ claims = []
             after.x > before.x,
             "move_split:right on focused float must nudge x rightward ({before:?} -> {after:?})"
         );
+    }
+
+    // ── CTX-1836 (bitty#3169): the tab keymap actions ───────────────────
+
+    /// Headless app with two tiled panels (`p:1`, `p:2`), focus on `p:1`.
+    fn tab_test_app() -> TerminalApp {
+        use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut runtime = Runtime::with_defaults().expect("must build");
+        runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        ));
+        assert!(runtime.set_focus(ViewId::new(1)));
+        TerminalApp::with_theme(
+            runtime,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+    }
+
+    fn tab_strip(app: &TerminalApp) -> Vec<u64> {
+        app.runtime
+            .tab_snapshot()
+            .expect("a tab action installed a strip")
+            .tabs()
+            .iter()
+            .map(|tab| tab.panel().0)
+            .collect()
+    }
+
+    #[test]
+    fn chrome_tab_actions_use_the_same_commit_path_as_the_ctl_verbs() {
+        use bitty_config::ChromeAction;
+        let mut app = tab_test_app();
+        assert!(
+            app.runtime.tab_snapshot().is_none(),
+            "the strip is projected on the first tab action"
+        );
+
+        // `tab_next`: cycle to the next projection; focus follows the commit.
+        assert!(!app.apply_chrome_action(ChromeAction::TabNext));
+        assert_eq!(tab_strip(&app), vec![1, 2]);
+        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+
+        // `tab_close`: close the active projection (p:2), focus falls back.
+        assert!(!app.apply_chrome_action(ChromeAction::TabClose));
+        assert_eq!(tab_strip(&app), vec![1]);
+        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+
+        // `tab_open`: re-attach the projection the close detached.
+        assert!(!app.apply_chrome_action(ChromeAction::TabOpen));
+        assert_eq!(tab_strip(&app), vec![1, 2]);
+
+        // The layout is untouched: every action went through the commit gate.
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
+    }
+
+    #[test]
+    fn chrome_tab_refusals_leave_state_alone_and_never_exit() {
+        use bitty_config::ChromeAction;
+        let mut app = tab_test_app();
+
+        // `tab_close` closes the *active* projection (p:1 is focused), and the
+        // neighbour that takes its slot keeps the activation.
+        assert!(!app.apply_chrome_action(ChromeAction::TabClose));
+        assert_eq!(tab_strip(&app), vec![2], "close the active tab");
+        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+
+        // Closing the last tab is the typed `LastTab` refusal: the chord does
+        // not exit the window (that is `close_view`), and the strip is intact.
+        assert!(!app.apply_chrome_action(ChromeAction::TabClose));
+        assert_eq!(
+            tab_strip(&app),
+            vec![2],
+            "the refused close of the last tab changed nothing"
+        );
+        // `tab_next` on a single-tab stack refuses the same way.
+        assert!(!app.apply_chrome_action(ChromeAction::TabNext));
+        assert_eq!(tab_strip(&app), vec![2]);
+
+        // `tab_open` re-attaches the projection the close detached, through the
+        // same gate.
+        assert!(!app.apply_chrome_action(ChromeAction::TabOpen));
+        assert_eq!(tab_strip(&app), vec![2, 1]);
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
     }
 }

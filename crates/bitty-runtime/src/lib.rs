@@ -322,6 +322,8 @@ pub use runtime::{
     TerminalDiagnostics, UrlActivation,
 };
 
+pub use runtime::tabs::{TabHost, TabOutcome, TabRequest, panel_of_view, panel_ref, verb_name};
+
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.
 // The runtime depends on `bitty-ui` only via these owned value types; no
 // render/platform/pty coupling is introduced through them.

@@ -63,6 +63,112 @@ pub const METHOD_LIST_PANELS: &str = "bitty.debug/listPanels";
 /// carried.
 pub const METHOD_NEW_WINDOW: &str = "bitty.debug/newWindow";
 
+/// Wire methods for the Core tab verbs (CTX-1836, bitty#3169).
+///
+/// Declared here for the same reason as [`METHOD_NEW_WINDOW`]: the `bitty-ipc`
+/// pin's control-scope table is closed, so a method the pin predates is
+/// refused with `NotFound` before it is ever enqueued. The tab verbs are also
+/// `Runtime` state rather than platform state, and an instance built before
+/// this verb answers `UnknownMethod`/`NotFound`, which the CLI reports as a
+/// protocol skew (exit 5) instead of pretending the request was carried.
+///
+/// One method per Core verb, so a caller's intent is on the wire rather than in
+/// a params discriminator, and `tab` verbs never share a method with any other
+/// surface.
+pub const METHOD_TAB_OPEN: &str = "bitty.debug/tabOpen";
+
+/// Wire method for `ctl tab switch` (CTX-1836, bitty#3169).
+pub const METHOD_TAB_SWITCH: &str = "bitty.debug/tabSwitch";
+
+/// Wire method for `ctl tab close` (CTX-1836, bitty#3169).
+pub const METHOD_TAB_CLOSE: &str = "bitty.debug/tabClose";
+
+/// Every tab wire method, in canonical verb order.
+pub const TAB_METHODS: [&str; 3] = [METHOD_TAB_OPEN, METHOD_TAB_SWITCH, METHOD_TAB_CLOSE];
+
+/// Panel id grammar: `p:<1..=10 digits>`, the identity `panel list` reports.
+///
+/// Frame-agnostic and pure so the CLI parse and the server-side params parse
+/// agree on the shape; existence is resolved server-side (`NotFound`).
+///
+/// # Errors
+///
+/// A one-line diagnostic naming the expected shape.
+pub fn parse_panel_id(raw: &str) -> Result<u64, String> {
+    let digits = raw
+        .strip_prefix("p:")
+        .ok_or_else(|| format!("panel id must match ^p:[0-9]{{1,10}}$, got {raw:?}"))?;
+    if digits.is_empty() || digits.len() > 10 {
+        return Err(format!(
+            "panel id must be 1..=10 digits, got {raw:?} (expected e.g. p:1)"
+        ));
+    }
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "panel id must be ascii digits, got {raw:?} (expected e.g. p:1)"
+        ));
+    }
+    digits
+        .parse::<u64>()
+        .map_err(|_| format!("panel id does not fit a u64: {raw:?}"))
+}
+
+/// Wire params for one tab verb: `{"panel_id":"p:N"}`.
+#[must_use]
+pub fn tab_params(panel_id: &str) -> String {
+    // `panel_id` passed `parse_panel_id`, so the value is `p:` plus digits and
+    // needs no JSON escaping. Built by hand to keep the shape byte-stable.
+    format!("{{\"panel_id\":\"{panel_id}\"}}")
+}
+
+/// Parse tab params back into a validated `p:N` panel id.
+///
+/// Strict and bounded: exactly one `panel_id` string field of the accepted
+/// shape, nothing else, so a malformed or over-long document is a typed
+/// `InvalidParams` rather than a defaulted target.
+///
+/// # Errors
+///
+/// A one-line diagnostic when the document is missing, over-long, carries an
+/// unknown field, or names a panel id the grammar refuses.
+pub fn parse_tab_params(params: Option<&str>) -> Result<String, String> {
+    let raw = params.ok_or_else(|| String::from("missing params.panel_id"))?;
+    if raw.len() > bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES {
+        return Err(format!(
+            "params too large ({} bytes, max {})",
+            raw.len(),
+            bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES
+        ));
+    }
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| String::from("params must be one JSON object"))?
+        .trim();
+    let (key, value) = body
+        .split_once(':')
+        .ok_or_else(|| String::from("params must carry exactly one field: panel_id"))?;
+    if key.trim() != "\"panel_id\"" {
+        return Err(format!(
+            "unknown params field {} (only panel_id is accepted)",
+            key.trim()
+        ));
+    }
+    let value = value.trim();
+    let quoted = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| String::from("params.panel_id must be a string like \"p:1\""))?;
+    if quoted.contains('"') || quoted.contains('\\') {
+        return Err(String::from(
+            "params.panel_id must not contain quotes or escapes",
+        ));
+    }
+    parse_panel_id(quoted)?;
+    Ok(quoted.to_string())
+}
+
 /// One validated `bitty ctl` operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CtlRequest {
@@ -126,6 +232,22 @@ pub enum CtlRequest {
     },
     /// `consent revoke-session`: end the calling session with receipt.
     ConsentRevokeSession,
+    /// `tab open p:N` (bitty#3169): run the registered `core.tab:open` verb
+    /// for one panel through the host's validated commit path.
+    TabOpen {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+    },
+    /// `tab switch p:N`: run `core.tab:switch` for one projected panel.
+    TabSwitch {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+    },
+    /// `tab close p:N`: run `core.tab:close` for one projected panel.
+    TabClose {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+    },
 }
 
 impl CtlRequest {
@@ -156,6 +278,9 @@ impl CtlRequest {
             Self::ConsentGrant { .. } => "core.consent.grant",
             Self::ConsentRevoke { .. } => "core.consent.revoke_scope",
             Self::ConsentRevokeSession => "core.consent.revoke_session",
+            Self::TabOpen { .. } => "core.tab.open",
+            Self::TabSwitch { .. } => "core.tab.switch",
+            Self::TabClose { .. } => "core.tab.close",
         }
     }
 
@@ -186,6 +311,9 @@ impl CtlRequest {
             Self::ConsentGrant { .. } => Some(crate::consent::METHOD_GRANT_CONSENT_SCOPE),
             Self::ConsentRevoke { .. } => Some(crate::consent::METHOD_REVOKE_CONSENT_SCOPE),
             Self::ConsentRevokeSession => Some(crate::consent::METHOD_REVOKE_CONSENT_SESSION),
+            Self::TabOpen { .. } => Some(METHOD_TAB_OPEN),
+            Self::TabSwitch { .. } => Some(METHOD_TAB_SWITCH),
+            Self::TabClose { .. } => Some(METHOD_TAB_CLOSE),
         }
     }
 
@@ -232,6 +360,9 @@ impl CtlRequest {
             )),
             Self::ConsentRevoke { scope } => Some(format!("{{\"scope\":\"{scope}\"}}")),
             Self::ConsentRevokeSession => Some(String::from("{}")),
+            Self::TabOpen { panel_id }
+            | Self::TabSwitch { panel_id }
+            | Self::TabClose { panel_id } => Some(tab_params(panel_id)),
         }
     }
 }
@@ -274,6 +405,7 @@ pub fn ctl_usage() -> String {
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list (includes bounded memory diagnostics) | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
          \x20 workspace rename ws:N NAME | workspace move-panel POSITION\n\
+         \x20 tab open p:N | tab switch p:N | tab close p:N\n\
          \x20 config reload\n\
          \x20 consent grant --scope S [--terminal T --family F] | consent revoke --scope S\n\
          \x20 consent revoke-session\n\
@@ -329,6 +461,9 @@ pub fn ctl_help_text(verbose: bool) -> String {
          workspace move ws:N           core.workspace.move (view.manage)\n  \
          workspace rename ws:N NAME    core.workspace.rename (view.manage)\n  \
          workspace move-panel N        core.workspace.move_panel (view.manage)\n  \
+         tab open p:N                  core.tab:open (view.manage; re-attach a tab)\n  \
+         tab switch p:N                core.tab:switch (view.manage; activate a tab)\n  \
+         tab close p:N                 core.tab:close (view.manage; detach a tab)\n  \
          config reload                 core.config.reload (config.modify, elevation)\n  \
          consent grant --scope S       core.consent.grant ([--terminal T --family F])\n  \
          consent revoke --scope S      core.consent.revoke_scope\n  \
@@ -407,6 +542,7 @@ pub const CTL_RESOURCES: &[(&str, &[&str])] = &[
     ),
     ("config", &["reload"]),
     ("consent", &["grant", "revoke", "revoke-session"]),
+    ("tab", &["open", "switch", "close"]),
 ];
 
 /// Parse `tokens` (argv words after the `ctl` word) into a request plus targeting.
@@ -902,6 +1038,24 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             reject_extra(rest, "config reload")?;
             reject_ctl_options_for("config reload", split_dir.is_some(), spawn_cwd.is_some())?;
             Ok((CtlRequest::ConfigReload, targeting))
+        }
+        (Some("tab"), Some(tab_verb @ ("open" | "switch" | "close"))) => {
+            reject_ctl_options_for(
+                &format!("tab {tab_verb}"),
+                split_dir.is_some(),
+                spawn_cwd.is_some(),
+            )?;
+            let id = single_arg(rest, &format!("tab {tab_verb}"), "p:N (e.g. p:1)")?;
+            parse_panel_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid panel id {id:?}: {err}"),
+            })?;
+            let panel_id = id.to_string();
+            let request = match tab_verb {
+                "open" => CtlRequest::TabOpen { panel_id },
+                "switch" => CtlRequest::TabSwitch { panel_id },
+                _ => CtlRequest::TabClose { panel_id },
+            };
+            Ok((request, targeting))
         }
         (Some("consent"), Some("grant")) => {
             reject_extra(rest, "consent grant")?;

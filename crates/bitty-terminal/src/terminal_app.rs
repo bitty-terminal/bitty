@@ -5087,6 +5087,33 @@ impl TerminalApp {
         Some(claim)
     }
 
+    /// Services a waiting `bitty ctl tab …` request (CTX-1836, bitty#3169).
+    ///
+    /// The tab verbs are `Runtime` state, so — unlike `window new` — they need
+    /// no platform context: this claim/apply/answer step runs on any app turn.
+    /// The runtime runs the verb through the validated commit path
+    /// ([`bitty_runtime::Runtime::tab_apply`], which re-homes focus before
+    /// committing), and the waiting CLI is answered with either the committed
+    /// receipt or the typed refusal the verb produced.
+    ///
+    /// Returns whether one request was serviced.
+    pub(crate) fn service_tab_requests(&mut self) -> bool {
+        use crate::ctl::tab::TabReply;
+
+        let Some(claim) = crate::ctl::tab::claim() else {
+            return false;
+        };
+        let request = claim.verb().request(claim.panel());
+        let reply = match self.apply_tab_request(request) {
+            Ok(outcome) => TabReply::Applied {
+                result: outcome.to_json(),
+            },
+            Err(refusal) => crate::ctl::tab::refusal(&refusal),
+        };
+        claim.complete(reply);
+        true
+    }
+
     /// Creates one window per latched request, in order.
     ///
     /// Split out of [`Self::service_new_window_requests`] so the latch (with
@@ -5790,6 +5817,11 @@ impl AppHandler for TerminalApp {
             // nothing: the servo handler authorizes `view.manage` against the
             // live connection before a request is ever offered.
             crate::ctl::new_window::set_waker(Some(std::sync::Arc::clone(&wake)));
+            // CTX-1836 (bitty#3169): the `bitty ctl tab …` lane rides the same
+            // proxy for the same reason — the app services it on the turn that
+            // drains the control queue. The lane grants nothing: the servo
+            // handler authorizes `view.manage` against the live connection.
+            crate::ctl::tab::set_waker(wake.clone());
             bitty_ipc::ctl::set_control_waker(Some(wake));
         }
         crate::logging::info(|| String::from("bitty: pty wakeup armed (event-loop proxy)"));
@@ -5951,6 +5983,13 @@ impl TerminalApp {
         // command that asked for it. One integer compare when nothing is
         // latched.
         self.service_new_window_requests(ctx);
+
+        // CTX-1836 (bitty#3169): a waiting `bitty ctl tab …` request runs the
+        // Core tab verb through the runtime's validated commit path on this
+        // turn. One atomic load when nothing is parked.
+        if crate::ctl::tab::is_pending() {
+            self.service_tab_requests();
+        }
 
         // Issue #1356 / #1541: reap exited child processes across primary and
         // split pane sessions. When a split child exits, its pane is closed

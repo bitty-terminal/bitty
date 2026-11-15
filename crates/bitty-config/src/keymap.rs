@@ -1030,6 +1030,45 @@ pub enum ChromeAction {
     /// (same byte-identical discipline as [`Self::TogglePalette`]); the user
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
+    /// Open a tab for a panel the strip does not project
+    /// (`tab_open`, ghostty's `new_tab` spelling as an alias).
+    ///
+    /// A tab is 1:1 with a panel in Bitty (`bitty_ui::tabs`, issue #3166
+    /// decision 1), so this verb re-attaches the projection of a live panel a
+    /// previous close detached; it never mints a panel or a shell. Opening a
+    /// new *panel* is [`Self::NewPanel`] (default `alt+n`), which is a
+    /// different verb with a different owner surface.
+    ///
+    /// Reference behavior: ghostty and kitty both bind `new_tab` to
+    /// `ctrl+shift+t` on Linux, and that chord is free in the shipped map, so
+    /// the default matches the reference exactly. Default
+    /// `ctrl+shift+t`; manual bind needed only to change the chord.
+    TabOpen,
+    /// Switch to the next tab projection in strip order, wrapping at the end
+    /// (`tab_next`, ghostty's `next_tab` spelling as an alias).
+    ///
+    /// This is a `switch` to the successor projection, so it runs the same
+    /// validated commit path as `core.tab:switch`. Reference deviation:
+    /// ghostty binds `next_tab` to `ctrl+tab` and kitty cycles tabs on
+    /// `ctrl+shift+right`; in Bitty those chords are already owned by
+    /// `focus_next` (pane cycle) and `resize_split:right` (single-owner rule
+    /// in `DEFAULT_KEYMAPS`), so the cycle takes the free, Mod-aware
+    /// `ctrl+alt+tab` (rebinds to `ctrl+super+tab` under `mod_key = "super"`).
+    /// It never aliases `Leader` (the `leader <second>` prefix namespace stays
+    /// the user's) and never touches the shipped `Alt+N` new-panel chord.
+    TabNext,
+    /// Close one tab projection (`tab_close`, ghostty's `close_tab` spelling
+    /// as an alias).
+    ///
+    /// Detaches the projection; the panel, its pane session, and the layout
+    /// are untouched — closing a pane is [`Self::CloseView`]. The last tab of a
+    /// stack cannot be closed (a tab stack is never empty), which is a typed
+    /// refusal, never a silent no-op.
+    ///
+    /// Reference behavior: ghostty binds `close_tab` to `ctrl+shift+w` on
+    /// Linux, and that chord is free in the shipped map, so the default
+    /// matches the reference exactly.
+    TabClose,
     /// Request a new OS window (`new_window`, alias `new_os_window`;
     /// bitty#1765 slice 1).
     ///
@@ -1293,6 +1332,22 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::NewWindow)
             }
+            // bitty#3169: the Core tab verbs as chord actions. The canonical
+            // spelling mirrors the verb (`tab_open` / `tab_next` /
+            // `tab_close`); the alias of each is ghostty's action name, so a
+            // keymap carried over from ghostty parses unchanged.
+            "tab_open" | "new_tab" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TabOpen)
+            }
+            "tab_next" | "next_tab" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TabNext)
+            }
+            "tab_close" | "close_tab" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TabClose)
+            }
             "toggle_scratchpad" | "scratchpad_toggle" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::InvokeCommand(CommandInvocation::new(
@@ -1376,6 +1431,9 @@ impl ChromeAction {
             Self::ToggleFloating => "toggle_floating".to_string(),
             Self::TogglePinned => "toggle_pinned".to_string(),
             Self::NewWindow => "new_window".to_string(),
+            Self::TabOpen => "tab_open".to_string(),
+            Self::TabNext => "tab_next".to_string(),
+            Self::TabClose => "tab_close".to_string(),
             Self::InvokeCommand(invocation) => match invocation.args_json() {
                 None => format!("command:{}", invocation.target()),
                 Some(blob) => format!(
@@ -1438,6 +1496,9 @@ impl ChromeAction {
             Self::ToggleFloating => "Toggle the focused panel between tiled and floating.",
             Self::TogglePinned => "Toggle the focused panel pinned state.",
             Self::NewWindow => "Request a new OS window through the platform.",
+            Self::TabOpen => "Open a tab for a panel the strip does not project.",
+            Self::TabNext => "Switch to the next tab projection in strip order.",
+            Self::TabClose => "Close one tab projection (never the last tab).",
             Self::InvokeCommand(_) => "Invoke one registered plugin command.",
         }
     }
@@ -1519,6 +1580,9 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::TogglePalette,
         ChromeAction::ToggleFloating,
         ChromeAction::TogglePinned,
+        ChromeAction::TabOpen,
+        ChromeAction::TabNext,
+        ChromeAction::TabClose,
         ChromeAction::NewWindow,
         ChromeAction::InvokeCommand("example.owner:example-command".to_string().into()),
     ]
@@ -1641,7 +1705,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_scratchpad, new_window, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, tab_open, tab_next, tab_close, toggle_scratchpad, new_window, command:<owner:command>";
 
 /// Plugin id that owns the help/which-key overlay after the Core retirement
 /// (ADR-0014 / issue #2397).
@@ -2174,6 +2238,17 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     ("shift+alt+pageup", "jump_to_prompt:prev"),
     ("shift+alt+pagedown", "jump_to_prompt:next"),
     ("alt+o", "select_command_output"),
+    // bitty#3169: the Core tab verbs on chords. `ctrl+shift+t` /
+    // `ctrl+shift+w` are ghostty's `new_tab` / `close_tab` Linux defaults and
+    // were free in the shipped map (single-owner rule). ghostty's `next_tab`
+    // chord `ctrl+tab` is already `focus_next` (pane cycle) and kitty's
+    // `ctrl+shift+right` is already `resize_split:right`, so the tab cycle
+    // takes the free Mod-aware `ctrl+alt+tab` instead — the documented
+    // reference deviation. Nothing here touches `alt+n` (`new_panel`), and no
+    // entry aliases the user's `leader <second>` prefix namespace.
+    ("ctrl+shift+t", "tab_open"),
+    ("ctrl+alt+tab", "tab_next"),
+    ("ctrl+shift+w", "tab_close"),
 ];
 
 /// Build the shipped defaults against one [`ModKey`] (CTX-0236).
@@ -4078,8 +4153,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                100,
-                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155)"
+                103,
+                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155) + 3 tab chords (issue #3169)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -4941,14 +5016,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                100,
-                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155)",
+                103,
+                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155 + 3 tab chords, issue #3169)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                100 + entries.len(),
+                103 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -5950,6 +6025,89 @@ mod tests {
         assert_eq!(
             match_keymap(&maps, key_ref(KeyName::Char('s'), false, true, false)),
             Some(ChromeAction::ToggleSplit)
+        );
+    }
+
+    #[test]
+    fn tab_actions_parse_bind_and_use_the_reference_defaults() {
+        // bitty#3169: the three Core tab verbs are chord actions. The canonical
+        // spelling mirrors the verb; ghostty's action name is the alias, so a
+        // keymap carried over from ghostty parses unchanged.
+        for (raw, expected) in [
+            ("tab_open", ChromeAction::TabOpen),
+            ("new_tab", ChromeAction::TabOpen),
+            ("tab_next", ChromeAction::TabNext),
+            ("next_tab", ChromeAction::TabNext),
+            ("tab_close", ChromeAction::TabClose),
+            ("close_tab", ChromeAction::TabClose),
+        ] {
+            assert_eq!(ChromeAction::parse(raw).expect(raw), expected, "{raw}");
+        }
+        assert_eq!(ChromeAction::TabOpen.canonical(), "tab_open");
+        assert_eq!(ChromeAction::TabNext.canonical(), "tab_next");
+        assert_eq!(ChromeAction::TabClose.canonical(), "tab_close");
+        // They ship bound, so a fresh config reaches them without opt-in, and
+        // the catalog (`bitty list actions`) carries all three.
+        let catalog = all_chrome_actions();
+        for action in [
+            ChromeAction::TabOpen,
+            ChromeAction::TabNext,
+            ChromeAction::TabClose,
+        ] {
+            assert!(
+                !action.is_manual_bind_only(),
+                "{} must ship bound",
+                action.canonical()
+            );
+            assert!(
+                catalog.contains(&action),
+                "{} in catalog",
+                action.canonical()
+            );
+        }
+
+        // Defaults: two reference chords verbatim, one documented deviation.
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('t'), true, false, true)),
+            Some(ChromeAction::TabOpen),
+            "ctrl+shift+t is ghostty's and kitty's new_tab"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('w'), true, false, true)),
+            Some(ChromeAction::TabClose),
+            "ctrl+shift+w is ghostty's close_tab"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Tab, true, true, false)),
+            Some(ChromeAction::TabNext),
+            "ctrl+alt+tab: ghostty's ctrl+tab is focus_next here, so the cycle deviates"
+        );
+        // The shipped Alt+N new-panel namespace is untouched, and the tab
+        // chords own nothing else.
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('n'), false, true, false)),
+            Some(ChromeAction::NewPanel)
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Tab, true, false, false)),
+            Some(ChromeAction::FocusNext),
+            "ctrl+tab stays the pane cycle"
+        );
+
+        // An unknown tab action is the typed config refusal naming the field,
+        // never a silently dropped binding.
+        let err = ChromeAction::parse("tab_teleport").expect_err("unknown tab action");
+        assert_eq!(err.field(), Some("keymaps[].action"));
+        assert!(
+            err.to_string().contains("tab_teleport"),
+            "the refusal names the spelling: {err}"
+        );
+        assert!(
+            KNOWN_ACTIONS_HINT.contains("tab_open")
+                && KNOWN_ACTIONS_HINT.contains("tab_next")
+                && KNOWN_ACTIONS_HINT.contains("tab_close"),
+            "the closed-catalog hint lists the new actions"
         );
     }
 }

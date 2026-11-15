@@ -539,3 +539,233 @@ fn ctl_consent_grant_without_instance_is_unavailable() {
         stderr(&output)
     );
 }
+
+// ── P0-AC-022 live elevation matrix (CTX-1842, bitty#2921) ───────────────
+//
+// The criterion's "granted only inspect/read scope" arm, on the terminal
+// instance rather than the daemon: a real `bitty --test-mode` process serves
+// its own `0600` Unix socket and the built `bitty ctl` client drives it. Each
+// elevated verb is asked once with the shipped CLI default and once with a
+// one-scope `BITTY_CTL_ELEVATE` allowlist, so the proof is per scope: an
+// allowlist for `config.modify` must not also move `terminal.manage`.
+
+/// A live `--test-mode` instance on a private socket (CTX-1842).
+///
+/// Runs the real `Runtime` plus the real servo with no display, GPU, or event
+/// loop, exactly as `crate::test_mode` describes. The root is `0700`, the
+/// socket lives inside it, and the child is killed by its own PID on drop: no
+/// inherited `BITTY_SOCKET`, no developer instance, no host service.
+#[cfg(unix)]
+struct LiveCtl {
+    child: std::process::Child,
+    socket: String,
+    root: std::path::PathBuf,
+    stderr_log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl LiveCtl {
+    fn spawn(label: &str, elevate: Option<&str>) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/bitty-ctl-elev-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create live root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("live root mode 0700");
+        let socket = root.join("s.sock").to_string_lossy().into_owned();
+        assert!(socket.len() < 100, "socket path must fit AF_UNIX: {socket}");
+        let stderr_log = root.join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_log).expect("live stderr log");
+        let mut command = Command::new(BITTY_BIN);
+        command
+            .arg("--test-mode")
+            .env_remove("BITTY_CTL_ELEVATE")
+            .env("BITTY_SOCKET", &socket)
+            .env("BITTY_INSTANCE_ID", label)
+            .env("SHELL", "/bin/sh")
+            .env("TERM", "xterm-256color")
+            .env("XDG_CONFIG_HOME", root.as_os_str())
+            .env("XDG_DATA_HOME", root.as_os_str())
+            .env("XDG_RUNTIME_DIR", root.as_os_str())
+            .env("HOME", root.as_os_str())
+            .current_dir(root.as_path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr));
+        if let Some(scopes) = elevate {
+            command.env("BITTY_CTL_ELEVATE", scopes);
+        }
+        let child = command
+            .spawn()
+            .unwrap_or_else(|err| panic!("spawn {BITTY_BIN}: {err}"));
+        let mut live = Self {
+            child,
+            socket,
+            root,
+            stderr_log,
+        };
+        live.wait_for_socket();
+        live
+    }
+
+    fn stderr_tail(&self) -> String {
+        std::fs::read_to_string(&self.stderr_log).unwrap_or_default()
+    }
+
+    fn wait_for_socket(&mut self) {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let deadline = Duration::from_secs(20);
+        loop {
+            if std::path::Path::new(&self.socket).exists() {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                panic!(
+                    "test-mode exited early ({status}) before serving {}; stderr:\n{}",
+                    self.socket,
+                    self.stderr_tail()
+                );
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "timed out waiting for {}; stderr:\n{}",
+                self.socket,
+                self.stderr_tail()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn ctl(&self, args: &[&str]) -> Output {
+        let mut command = Command::new(BITTY_BIN);
+        command
+            .args(["ctl", "--socket", self.socket.as_str()])
+            .args(args)
+            .args(["--format", "json"])
+            .env_remove("BITTY_SOCKET")
+            .env_remove("BITTY_INSTANCE_ID");
+        command
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LiveCtl {
+    fn drop(&mut self) {
+        // Own PID only: never a pattern kill, never another instance.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Assert one `bitty ctl` cell is the CLI's permission refusal for `scope`.
+#[cfg(unix)]
+fn assert_scope_denied(live: &LiveCtl, args: &[&str], scope: &str) {
+    let output = live.ctl(args);
+    let text = stdout(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{args:?} must exit 7 (permission), stdout={text:?} stderr={:?}",
+        stderr(&output)
+    );
+    assert!(
+        text.contains("\"class\":\"Denied\"") && text.contains("\"code\":\"ScopeDenied\""),
+        "{args:?} must carry class Denied and code ScopeDenied, got {text:?}"
+    );
+    assert!(
+        text.contains(&format!("scope '{scope}'")),
+        "{args:?} must name the missing scope {scope}, got {text:?}"
+    );
+}
+
+/// Assert one `bitty ctl` cell succeeded, retrying until the test-mode drain
+/// loop services the request (it starts just after the socket appears).
+#[cfg(unix)]
+fn assert_allowed(live: &LiveCtl, args: &[&str]) -> String {
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let deadline = Duration::from_secs(20);
+    loop {
+        let output = live.ctl(args);
+        let text = stdout(&output);
+        if output.status.code() == Some(0) && text.contains("\"ok\":true") {
+            return text;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "{args:?} never succeeded; exit={:?} stdout={text:?} stderr={:?} server:\n{}",
+            output.status.code(),
+            stderr(&output),
+            live.stderr_tail()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ctl_elevation_is_per_scope_on_a_live_instance() {
+    // The shipped default: `terminal.inspect/input`, `view.inspect/manage`,
+    // `config.inspect`, `plugin.inspect` and nothing else.
+    let plain = LiveCtl::spawn("default", None);
+
+    // Read and view-manage verbs ride the default and must succeed.
+    let listed = assert_allowed(&plain, &["terminal", "list"]);
+    assert!(
+        listed.contains("\"total_lower_bound\":1"),
+        "the default instance starts with one terminal, got {listed:?}"
+    );
+    assert_allowed(&plain, &["view", "list"]);
+    assert_allowed(&plain, &["panel", "list"]);
+
+    // The four elevated verbs are refused, each naming its own scope.
+    assert_scope_denied(&plain, &["terminal", "spawn"], "terminal.manage");
+    assert_scope_denied(&plain, &["terminal", "close", "t:1"], "terminal.manage");
+    assert_scope_denied(&plain, &["workspace", "close", "ws:1"], "terminal.manage");
+    assert_scope_denied(&plain, &["config", "reload"], "config.modify");
+
+    // No partial state: the refused spawn created nothing.
+    let after = assert_allowed(&plain, &["terminal", "list"]);
+    assert!(
+        after.contains("\"total_lower_bound\":1"),
+        "a refused spawn must not create a terminal, got {after:?}"
+    );
+
+    // A one-scope allowlist elevates that scope only: `config.modify` moves the
+    // reload verb and leaves `terminal.manage` exactly where it was.
+    let config_only = LiveCtl::spawn("config-only", Some("config.modify"));
+    let reloaded = assert_allowed(&config_only, &["config", "reload"]);
+    assert!(
+        reloaded.contains("\"reloaded\":true"),
+        "an elevated reload must report its effect, got {reloaded:?}"
+    );
+    assert_scope_denied(&config_only, &["terminal", "spawn"], "terminal.manage");
+
+    // The mirror arm: `terminal.manage` moves the spawn and leaves
+    // `config.modify` denied, so neither allowlist is a blanket grant.
+    let manage_only = LiveCtl::spawn("manage-only", Some("terminal.manage"));
+    let spawned = assert_allowed(&manage_only, &["terminal", "spawn"]);
+    assert!(
+        spawned.contains("\"spawned\":true") && spawned.contains("\"terminal_id\":\"t:2\""),
+        "an elevated spawn must report the new terminal, got {spawned:?}"
+    );
+    assert_scope_denied(&manage_only, &["config", "reload"], "config.modify");
+    let two = assert_allowed(&manage_only, &["terminal", "list"]);
+    assert!(
+        two.contains("\"total_lower_bound\":2"),
+        "the elevated spawn must be visible, got {two:?}"
+    );
+}

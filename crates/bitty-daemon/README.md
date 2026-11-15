@@ -1544,6 +1544,20 @@ Corpus rules:
   remainder, the accepted result carries `drain_forced`, and the operator CLI
   exits `4` (bitty#2957). The fake records the typed
   `requires-real-cli-and-live-session` skip;
+- `C-26`–`C-28` pin the per-action scope decisions that `P0-AC-022` names as its
+  pass threshold, each on both drivers: `C-26` sends `lease.heartbeat` for a
+  foreign attach id and for an unknown one and requires the same
+  `NotFound/NotFound` (so the refusal is never an existence oracle) before the
+  owner's own two heartbeats succeed; `C-27` has an observer attempt
+  `session.control.transfer`, requires `Denied/ControllerRequired`, then
+  transfers from the controller and proves the authority moved by resizing from
+  the new controller and getting `Denied/ControllerRequired` from the old one;
+  `C-28` has an observer attempt `session.grant.revoke`
+  (`Denied/ControllerRequired`), revokes from the controller, and requires a
+  latecomer's attach with the revoked bearer to be
+  `Denied/ObserverGrantRequired` and the second revoke to report `not_active`.
+  All three need a bound controller lease, so a cell with no served containment
+  plan records the typed `cell-not-servable` skip;
 - `V-03` runs on both drivers and pins `D-01` directly: the handshake advertises
   `worker_sessions: false`, a consent-bearing worker create (with or without a
   spawn specification) answers `Denied/UnsupportedCapability`, no session record
@@ -1570,6 +1584,20 @@ The `Quality gates` job executes the fake suite and uploads its evidence; the
 Linux Tier-1 job executes the real suite and uploads
 `bittyd-conformance-linux-x86_64`. The parity check compares the two signatures
 for every shared, non-known-defect vector and fails on any divergence.
+
+## The scope-by-method matrix (`P0-AC-022`)
+
+`cargo test -p bitty-daemon --test scope_matrix --locked` walks all
+15 × 51 = 765 authorization cells of the `bitty-ipc` v1 registry, not a sample:
+the empty grant set denies every method with `ScopeDenied` naming that method's
+own required scope, a single granted scope allows exactly the methods that
+require it, the all-scopes set allows every method, and an unknown or malformed
+name stays `NotFound`/`InvalidMethod` with every scope held. It is the artifact
+`P0-AC-022` names as its pass threshold, and `-- --nocapture` prints the grid
+the dated evidence record pastes. The daemon's own `session.*`/`daemon.*`
+catalog is a separate, closed table (`src/service/scopes.rs`) with 20 methods
+over six service scopes; those live cells are the conformance corpus's, not
+this target's.
 
 ## Supervised startup (bitty#2920)
 

@@ -1675,6 +1675,7 @@ fn band_origin_for(runtime: &PluginRuntime, id: &PluginId) -> BandOrigin {
         edge,
         visible_index: 0,
         row: 0,
+        column: 0,
     }
 }
 

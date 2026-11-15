@@ -1141,16 +1141,26 @@ fn overlapping_regions_tie_break_last_registered() {
         version: 1,
     };
     let regions = vec![item("a", 0, 4), item("b", 2, 6)];
-    assert_eq!(resolve_item_region(&regions, 1).expect("a").region.id, "a");
     assert_eq!(
-        resolve_item_region(&regions, 3)
+        resolve_item_region(&regions, 10, 1).expect("a").region.id,
+        "a"
+    );
+    assert_eq!(
+        resolve_item_region(&regions, 10, 3)
             .expect("last registered wins")
             .region
             .id,
         "b"
     );
-    assert_eq!(resolve_item_region(&regions, 5).expect("b").region.id, "b");
-    assert!(resolve_item_region(&regions, 6).is_none());
+    assert_eq!(
+        resolve_item_region(&regions, 10, 5).expect("b").region.id,
+        "b"
+    );
+    assert!(resolve_item_region(&regions, 10, 6).is_none());
+    assert!(
+        resolve_item_region(&regions, 11, 1).is_none(),
+        "a region only owns the line it was charted on"
+    );
 }
 
 #[test]

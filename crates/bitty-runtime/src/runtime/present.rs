@@ -6251,9 +6251,12 @@ impl Runtime {
     ///
     /// Issue #3165: column bands (`left`/`right`) paint after the row bands
     /// through the same span renderer — one row per root child, clipped to the
-    /// band's reserved width, top-down from the row-carved container's first
-    /// row. They paint no shared chrome rule yet (a follow-up), so the
-    /// `Left`/`Right` arm of [`Self::paint_band_row`] stays a no-op.
+    /// band's granted width, top-down from the row-carved container's first
+    /// row. Issue #3171: each column band then paints one shared chrome rule
+    /// as a vertical strip on its content-facing edge
+    /// ([`Self::paint_band_column_rule`]); the `Left`/`Right` arm of
+    /// [`Self::paint_band_row`] still returns early on purpose, because the
+    /// rule belongs to the band, not to each of its content rows.
     fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
         use super::band_host::band_is_visible;
 
@@ -6293,27 +6296,19 @@ impl Runtime {
         // the content or the window edge.
         let column_area = self.band_row_container();
         let mut column_plan: Vec<ColumnBandPaint> = Vec::new();
-        for edge in [BandEdge::Left, BandEdge::Right] {
-            for (index, band) in self.visible_edge_bands(edge).into_iter().enumerate() {
-                if !band_is_visible(&band.root) {
-                    continue;
-                }
-                let Some(column) = self.visible_band_column(edge, index) else {
-                    continue;
-                };
-                let width = super::band_host::column_band_width(&band.root).min(window.width);
-                if width == 0 {
-                    continue;
-                }
-                let rows =
-                    super::band_host::column_band_rows(&band.root, usize::from(column_area.height));
-                column_plan.push(ColumnBandPaint {
-                    edge,
-                    column,
-                    width,
-                    rows,
-                });
-            }
+        for granted in self.column_band_plan() {
+            let bands = self.visible_edge_bands(granted.edge);
+            let Some(band) = bands.get(granted.visible_index) else {
+                continue;
+            };
+            let rows =
+                super::band_host::column_band_rows(&band.root, usize::from(column_area.height));
+            column_plan.push(ColumnBandPaint {
+                edge: granted.edge,
+                column: granted.column,
+                width: granted.width,
+                rows,
+            });
         }
         if plan.is_empty() && column_plan.is_empty() {
             return;
@@ -6357,6 +6352,10 @@ impl Runtime {
         // did not reserve, paints nothing and counts one violation. Each row
         // is painted by the row renderer at the band's column with the band's
         // width as the clip, so column and row bands share one span renderer.
+        //
+        // Issue #3171: each band then paints one shared chrome rule as a
+        // vertical strip on its content-facing edge, spanning the rows it
+        // actually painted (see `paint_band_column_rule`).
         let container_x_end = container.x.saturating_add(container.width);
         for band in &column_plan {
             let col_end = band.column.saturating_add(band.width);
@@ -6371,6 +6370,7 @@ impl Runtime {
                 continue;
             }
             let band_width = usize::from(band.width);
+            let mut painted_rows = 0u16;
             for (offset, (text, runs)) in band.rows.iter().enumerate() {
                 if text.is_empty() {
                     continue;
@@ -6393,7 +6393,9 @@ impl Runtime {
                     default_bg,
                     band.edge,
                 );
+                painted_rows = painted_rows.max(offset.saturating_add(1));
             }
+            self.paint_band_column_rule(pad_px, layers, band, column_area.y, painted_rows);
         }
     }
 
@@ -6515,8 +6517,11 @@ impl Runtime {
                 .saturating_add(cell_h)
                 .saturating_sub(i32::from(rule_h)),
             BandEdge::Bottom => origin_y,
-            // Issue #3165: a column band paints no shared rule yet; the
-            // content-facing column would need its own (vertical) strip.
+            // Issue #3171: a column band draws *one* vertical rule for the
+            // whole band, not one horizontal strip per content row. Drawing it
+            // here would fence every content line, so the column paint loop
+            // emits it once through `paint_band_column_rule` after painting the
+            // band's rows (same muted token, same content-facing edge).
             BandEdge::Left | BandEdge::Right => return,
         };
         let rule_x = pad_px.saturating_add(
@@ -6535,6 +6540,61 @@ impl Runtime {
             });
             layers.any_needs_draw = true;
         }
+    }
+
+    /// Paints the shared chrome rule of one painted column band
+    /// (issue #3171).
+    ///
+    /// The vertical mirror of the row rule in [`Self::paint_band_row`]: a thin
+    /// strip in [`bitty_render::chrome::ChromeTokens::border_muted`] (the token
+    /// every overlay ring uses), drawn *inside* the band's granted columns on
+    /// the edge that faces the content — the right column of a `left` band, the
+    /// left column of a `right` band, exactly as a `top` band's rule sits on its
+    /// last cell row and a `bottom` band's on its first. It spans the rows the
+    /// band actually painted, so a one-line scene gets a one-cell rule instead
+    /// of a full-height fence. Drawn once per band, never per content row.
+    fn paint_band_column_rule(
+        &mut self,
+        pad_px: i32,
+        layers: &mut FrameLayers,
+        band: &ColumnBandPaint,
+        first_row: u16,
+        rows: u16,
+    ) {
+        if band.width == 0 || rows == 0 {
+            return;
+        }
+        let live = self.live_cell_metrics();
+        let cell_w = i32::try_from(live.width).unwrap_or(i32::MAX);
+        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
+        let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
+            .scaled(self.dpi_scale());
+        let rule = chrome.border_px.max(1);
+        let rule_px = i32::from(rule);
+        let band_x = pad_px.saturating_add(i32::from(band.column).saturating_mul(cell_w));
+        let band_w = i32::from(band.width).saturating_mul(cell_w);
+        if band_w < rule_px {
+            return;
+        }
+        let rule_x = match band.edge {
+            BandEdge::Left => band_x.saturating_add(band_w).saturating_sub(rule_px),
+            BandEdge::Right => band_x,
+            // A row band's rule is drawn by `paint_band_row` itself.
+            BandEdge::Top | BandEdge::Bottom => return,
+        };
+        let rule_y = pad_px.saturating_add(i32::from(first_row).saturating_mul(cell_h));
+        let rule_h = i32::from(rows).saturating_mul(cell_h);
+        let Ok(rule_h) = u32::try_from(rule_h) else {
+            return;
+        };
+        if rule_h == 0 {
+            return;
+        }
+        layers.combined_overlay.push(bitty_render::grid::FillRect {
+            rect: bitty_render::geometry::RectPx::new(rule_x, rule_y, u32::from(rule), rule_h),
+            color: chrome.border_muted,
+        });
+        layers.any_needs_draw = true;
     }
 
     /// Core-hosted focusable-overlay surface (CTX-0943, W-28 follow-up).
@@ -10769,6 +10829,108 @@ mod plugin_overlay_paint_tests {
                 .iter()
                 .all(|glyph| glyph.color != tokens.border_muted),
             "horizontal band chrome must not paint corner glyphs over band cells"
+        );
+    }
+
+    #[test]
+    fn column_band_chrome_paints_one_vertical_muted_rule_on_its_content_edge() {
+        // Issue #3171 decision: a vertical band DOES draw the shared chrome
+        // rule — the same `border_muted` token the row rule and every overlay
+        // ring use — as one vertical strip inside its granted columns on the
+        // edge facing the content, spanning the rows it painted. It is drawn
+        // once per band, not once per content row (that would read as a fence
+        // of horizontal dividers, which is why `paint_band_row` still returns
+        // early for `Left`/`Right`).
+        let tokens_for = |rt: &Runtime| {
+            bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).scaled(rt.dpi_scale())
+        };
+
+        // Left edge: the rule is the band's last column, so the content-facing
+        // side gets the border and the window edge does not.
+        let mut rt = runtime();
+        rt.set_chrome_bands(ChromeBands {
+            left: vec![column_surface(
+                bitty_lua::ui::UiSlot::Left,
+                &["cpu 42%", "mem 30%"],
+            )],
+            ..Default::default()
+        });
+        rt.tick().expect("tick insets the container for the band");
+        let mut layers = FrameLayers::default();
+        rt.paint_chrome_bands(8, &mut layers);
+        let tokens = tokens_for(&rt);
+        let rule_px = tokens.border_px.max(1);
+        let cell_w = rt.live_cell_metrics().width;
+        let cell_h = rt.live_cell_metrics().height;
+        let column = rt
+            .visible_band_column(BandEdge::Left, 0)
+            .expect("granted column");
+        let width = rt.plugin_band_column_budget().0;
+        assert_eq!(width, 7, "two scene rows, the wider one is seven cells");
+        let rules: Vec<_> = layers
+            .combined_overlay
+            .iter()
+            .filter(|fill| {
+                fill.color == tokens.border_muted && fill.rect.width == u32::from(rule_px)
+            })
+            .collect();
+        assert_eq!(
+            rules.len(),
+            1,
+            "one vertical rule per band, never one per content row"
+        );
+        let rule = rules[0];
+        let band_end_x = 8 + i32::from(column.saturating_add(width))
+            * i32::try_from(cell_w).expect("cell width fits i32");
+        assert_eq!(
+            rule.rect.x,
+            band_end_x - i32::from(rule_px),
+            "the rule sits on the band's content-facing column"
+        );
+        assert_eq!(
+            rule.rect.height,
+            2 * cell_h,
+            "the strip spans the two painted content rows"
+        );
+        assert_eq!(
+            rule.rect.y,
+            8 + i32::from(rt.band_row_container().y) * i32::try_from(cell_h).unwrap_or(1),
+            "the strip starts at the band's first painted row"
+        );
+        assert!(
+            layers
+                .combined_glyphs
+                .iter()
+                .all(|glyph| glyph.color != tokens.border_muted),
+            "the vertical rule never overdraws band text with glyphs"
+        );
+
+        // Right edge: mirrored — the strip is the band's first column.
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        rt.set_chrome_bands(ChromeBands {
+            right: vec![column_surface(bitty_lua::ui::UiSlot::Right, &["net"])],
+            ..Default::default()
+        });
+        rt.tick().expect("tick insets the container for the band");
+        let mut layers = FrameLayers::default();
+        rt.paint_chrome_bands(8, &mut layers);
+        let tokens = tokens_for(&rt);
+        let rule_px = tokens.border_px.max(1);
+        let cell_w = rt.live_cell_metrics().width;
+        let column = rt
+            .visible_band_column(BandEdge::Right, 0)
+            .expect("granted column");
+        assert_eq!(column, window.width - 3);
+        let rule = layers
+            .combined_overlay
+            .iter()
+            .find(|fill| fill.color == tokens.border_muted && fill.rect.width == u32::from(rule_px))
+            .expect("the right band paints one vertical rule");
+        assert_eq!(
+            rule.rect.x,
+            8 + i32::from(column) * i32::try_from(cell_w).unwrap_or(1),
+            "the right band's rule is its first (content-facing) column"
         );
     }
 

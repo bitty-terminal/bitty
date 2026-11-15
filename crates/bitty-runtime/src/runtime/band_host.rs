@@ -71,7 +71,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::band_slots::BandEdge;
+use super::band_slots::{BAND_EDGES, BandAxis, BandEdge};
 use super::{BandContent, ChromeBands, Runtime};
 use bitty_lua::host::LuaValue;
 use bitty_lua::ui::{
@@ -129,6 +129,23 @@ pub const BAND_ACCENT_ANSI_INDEX: u8 = 12;
 /// table. It does not add a security ceiling; it reuses the existing
 /// fail-closed admission posture.
 pub const BAND_MAX_REGIONS: usize = 64;
+
+/// Divisor of the window width the vertical (`left`/`right`) bands may never
+/// cross together (issue #3171).
+///
+/// #3165 degraded a whole side to zero columns when its scene could not fit
+/// above the column content floor, yet the mount still succeeded: the plugin
+/// held a band that reserved, painted, and routed nothing. Scene width is not a
+/// mount-time fact either — a resize can make any scene unfittable later — so
+/// refusing at mount would be a verdict the next reflow overturns. The bound is
+/// therefore placed on the *reservation*: the content area keeps at least
+/// `1 / BAND_COLUMN_CONTENT_SHARE_DIVISOR` of the window (and never less than
+/// [`MIN_CONTENT_COLS`](super::chrome_band::MIN_CONTENT_COLS)'s effective
+/// floor, the host's `chrome_min_cols`), and a band wider than its granted
+/// share paints clipped to that share exactly as row-band text past the window
+/// width does. Written as a divisor so the integer math stays exact and
+/// symmetric: `width - width.div_ceil(2) == width / 2`.
+pub const BAND_COLUMN_CONTENT_SHARE_DIVISOR: u16 = 2;
 
 /// One flattened run of a band tree: a char-column span sharing style and
 /// click binding (CTX-0946 C1/C2).
@@ -642,12 +659,15 @@ pub fn column_band_rows(root: &UiNode, max_rows: usize) -> Vec<(String, Vec<Band
 
 /// One bounded per-item hit region emitted by a band (issue #2248).
 ///
-/// The rectangle is one row high and spans display cells `[start_col,
-/// end_col)` inside the band, already clipped to the painted window width.
-/// Core derives it from the same flattened runs the paint path uses, so
-/// there is no second geometry source. The plugin never supplies
-/// coordinates: it declares an identity beside a binding, and the host owns
-/// the rect.
+/// The rectangle is one painted line high and spans display cells `[start_col,
+/// end_col)` inside the band, already clipped to the band's granted width. Row
+/// bands are one line tall, so `row` is the band row; a column band emits one
+/// line per root child (issue #3171), so `row` is that content line's window row
+/// and `start_col` is still measured from the band's own left edge — the same
+/// in-band unit the click/scroll/hover hit-test uses. Core derives it from the
+/// same flattened runs the paint path uses, so there is no second geometry
+/// source. The plugin never supplies coordinates: it declares an identity
+/// beside a binding, and the host owns the rect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BandItemRegion {
     /// Owning plugin id (the band owner).
@@ -656,13 +676,15 @@ pub struct BandItemRegion {
     pub edge: BandEdge,
     /// Visible index on the edge (hidden bands take no index).
     pub visible_index: usize,
-    /// Window row the band paints.
+    /// Window row the band paints (the content line's row for a column band).
     pub row: u16,
     /// Declared region identity (`id` + `kind`).
     pub region: UiRegion,
-    /// First display-cell column of the region (inclusive, clipped).
+    /// First display-cell column of the region inside the band (inclusive,
+    /// clipped).
     pub start_col: usize,
-    /// One past the last display-cell column (exclusive, clipped).
+    /// One past the last display-cell column inside the band (exclusive,
+    /// clipped).
     pub end_col: usize,
     /// Exact band tree version that produced this rect.
     pub version: u32,
@@ -685,15 +707,15 @@ pub enum BandRegionError {
     },
 }
 
-/// Derives the bounded region table for one band (issue #2248).
+/// Derives the bounded region table for one row band (issue #2248).
 ///
 /// Walks the flattened runs in declaration order, keeps spans that declare a
 /// region, clips them to `window_width` display cells, and merges adjacent
 /// spans with the same identity into one rect (a container region covering
 /// several leaves is one item, not one item per leaf). Adjacent but
-/// *different* regions stay separate. The result is sorted by
-/// `start_col` by construction. More than [`BAND_MAX_REGIONS`] distinct
-/// regions refuse the whole table.
+/// *different* regions stay separate. The result is sorted by `start_col` by
+/// construction. More than [`BAND_MAX_REGIONS`] distinct regions refuse the
+/// whole table.
 pub fn band_regions_for(
     band: &BandContent,
     edge: BandEdge,
@@ -702,48 +724,101 @@ pub fn band_regions_for(
     window_width: usize,
 ) -> Result<Vec<BandItemRegion>, BandRegionError> {
     let (_, runs) = flatten_band_runs_in_width(&band.root, window_width);
+    collect_band_regions(
+        band,
+        edge,
+        visible_index,
+        window_width,
+        std::iter::once((row, runs)),
+    )
+}
+
+/// Derives the bounded region table for one column band (issue #3171).
+///
+/// The column mirror of [`band_regions_for`]: one line per direct child of the
+/// root, each clipped to the band's granted `width` cells, starting at
+/// `first_row` and bounded by `max_rows` exactly like the paint walk. The same
+/// merge and [`BAND_MAX_REGIONS`] accounting apply, so a column band can never
+/// grow a second, divergent region rule.
+pub fn column_band_regions_for(
+    band: &BandContent,
+    edge: BandEdge,
+    visible_index: usize,
+    first_row: u16,
+    width: u16,
+    max_rows: usize,
+) -> Result<Vec<BandItemRegion>, BandRegionError> {
+    let lines = column_band_rows(&band.root, max_rows)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(offset, (_, runs))| {
+            let row = first_row.checked_add(u16::try_from(offset).ok()?)?;
+            Some((row, runs))
+        });
+    collect_band_regions(band, edge, visible_index, usize::from(width), lines)
+}
+
+/// Shared region walk for both band axes (issue #3171).
+///
+/// `lines` yields `(window row, flattened spans)` in paint order; `clip_width`
+/// is the cell width the band was granted (the window width for a row band, the
+/// band's own width for a column band). Adjacency merging is per line: two
+/// lines never merge into one rect, so a column band's geometry stays one rect
+/// per painted line.
+fn collect_band_regions<I>(
+    band: &BandContent,
+    edge: BandEdge,
+    visible_index: usize,
+    clip_width: usize,
+    lines: I,
+) -> Result<Vec<BandItemRegion>, BandRegionError>
+where
+    I: IntoIterator<Item = (u16, Vec<BandRun>)>,
+{
     let mut regions: Vec<BandItemRegion> = Vec::new();
     let mut count = 0usize;
-    // Identity and end column of the trailing distinct region, used both for
-    // adjacent-merge detection and to keep counting past the cap.
-    let mut trailing: Option<(UiRegion, usize)> = None;
-    for run in runs {
-        let Some(region) = run.region else {
-            trailing = None;
-            continue;
-        };
-        let start = run.start_col.min(window_width);
-        let end = run.end_col.min(window_width);
-        if start >= end {
-            // Entirely clipped past the painted bounds; it breaks adjacency.
-            trailing = None;
-            continue;
-        }
-        if let Some((previous, previous_end)) = &trailing {
-            if previous == &region && *previous_end == start {
-                if let Some(back) = regions.last_mut() {
-                    if back.region == region {
-                        back.end_col = end;
-                    }
-                }
-                trailing = Some((region, end));
+    for (row, runs) in lines {
+        // Identity and end column of the trailing distinct region, used both
+        // for adjacent-merge detection and to keep counting past the cap.
+        let mut trailing: Option<(UiRegion, usize)> = None;
+        for run in runs {
+            let Some(region) = run.region else {
+                trailing = None;
+                continue;
+            };
+            let start = run.start_col.min(clip_width);
+            let end = run.end_col.min(clip_width);
+            if start >= end {
+                // Entirely clipped past the painted bounds; it breaks adjacency.
+                trailing = None;
                 continue;
             }
+            if let Some((previous, previous_end)) = &trailing {
+                if previous == &region && *previous_end == start {
+                    if let Some(back) = regions.last_mut() {
+                        if back.region == region {
+                            back.end_col = end;
+                        }
+                    }
+                    trailing = Some((region, end));
+                    continue;
+                }
+            }
+            count = count.saturating_add(1);
+            if regions.len() < BAND_MAX_REGIONS {
+                regions.push(BandItemRegion {
+                    plugin_id: band.plugin_id.clone(),
+                    edge,
+                    visible_index,
+                    row,
+                    region: region.clone(),
+                    start_col: start,
+                    end_col: end,
+                    version: band.version,
+                });
+            }
+            trailing = Some((region, end));
         }
-        count = count.saturating_add(1);
-        if regions.len() < BAND_MAX_REGIONS {
-            regions.push(BandItemRegion {
-                plugin_id: band.plugin_id.clone(),
-                edge,
-                visible_index,
-                row,
-                region: region.clone(),
-                start_col: start,
-                end_col: end,
-                version: band.version,
-            });
-        }
-        trailing = Some((region, end));
     }
     if count > BAND_MAX_REGIONS {
         return Err(BandRegionError::Overflow {
@@ -754,19 +829,26 @@ pub fn band_regions_for(
     Ok(regions)
 }
 
-/// Resolves a display-cell column to exactly one emitted region (issue #2248).
+/// Resolves a display-cell row and column to exactly one emitted region
+/// (issue #2248, issue #3171).
 ///
 /// Later registration wins when regions overlap ("topmost/last-registered"):
 /// emitted tables from [`band_regions_for`] are disjoint by construction, so
 /// the tie-break is a documented invariant for any future overlapping
-/// source rather than a silent first-match. A column outside every region
-/// resolves to `None` (unclaimed chrome).
+/// source rather than a silent first-match. A row band's table carries one
+/// row, so the row term is constant there; a column band's table carries one
+/// row per painted line, so the line decides which item can own the column.
+/// A cell outside every region resolves to `None` (unclaimed chrome).
 #[must_use]
-pub fn resolve_item_region(regions: &[BandItemRegion], col: usize) -> Option<&BandItemRegion> {
+pub fn resolve_item_region(
+    regions: &[BandItemRegion],
+    row: u16,
+    col: usize,
+) -> Option<&BandItemRegion> {
     regions
         .iter()
         .rev()
-        .find(|region| col >= region.start_col && col < region.end_col)
+        .find(|region| region.row == row && col >= region.start_col && col < region.end_col)
 }
 
 /// Mouse button a band region routes (issue #2248).
@@ -917,8 +999,19 @@ pub struct BandOrigin {
     pub edge: BandEdge,
     /// Visible-band index on that edge (hidden bands take no index).
     pub visible_index: u16,
-    /// Painted window row at capture time.
+    /// Painted window row at capture time (the first painted row for a column
+    /// band, which spans the row-carved container).
     pub row: u16,
+    /// Leftmost window column at capture time; `0` for a row band, which spans
+    /// the window width and has no column origin (issue #3171).
+    ///
+    /// The axis is already carried by [`Self::edge`]
+    /// ([`BandEdge::axis`]), so the geometry pair is `(row, column)` under a
+    /// known axis: a row band's freshness is its row, a column band's is the
+    /// column its granted range starts at. Keeping both on the origin means a
+    /// reflow that moves only the columns invalidates a column band's captured
+    /// actions instead of silently retargeting them.
+    pub column: u16,
 }
 
 /// One live mount projected for origin capture (CTX-1332, C-D4).
@@ -959,8 +1052,9 @@ pub struct BandFrameIdentity {
     pub version: u32,
     /// Edge the band is placed on.
     pub edge: BandEdge,
-    /// Executable origin for painted bands; `None` for hidden or vertical
-    /// bands, which are never clickable.
+    /// Executable origin for painted bands; `None` for hidden bands, which are
+    /// never clickable. Both axes publish an origin (issue #3171): a column
+    /// band's origin carries its column geometry instead of a row.
     pub origin: Option<BandOrigin>,
 }
 
@@ -1723,29 +1817,69 @@ pub struct BandHit {
     pub visible_index: usize,
     /// Window row the band paints (window cells).
     pub row: u16,
-    /// Display-cell column inside the band row, measured with the same
+    /// Display-cell column inside the band line, measured with the same
     /// [`char_cell_width`](bitty_term_state::char_cell_width) rules as
-    /// [`BandRun::start_col`]/[`BandRun::end_col`]. This is the unit every
-    /// hit-test consumer uses, including region rects (issue #2248).
+    /// [`BandRun::start_col`]/[`BandRun::end_col`]. For a row band this is the
+    /// window column (the band spans the window width); for a column band it is
+    /// measured from the band's own left edge, the same in-band unit
+    /// [`BandItemRegion::start_col`] uses. This is the unit every hit-test
+    /// consumer uses (issue #2248, issue #3171).
     pub col: usize,
 }
 
-/// A resolved band row: which visible band row owns the pointer.
+/// One band content line under a resolved [`BandCellHit`] (issue #3171).
 ///
-/// Row-level only — no text column. Press consumption uses this so the
-/// whole painted row (including the unclaimed trailing region past the
-/// text) is Core chrome; release resolution narrows through
-/// [`Runtime::plugin_band_hit`], whose text-width guard keeps a
-/// past-text release at `NoClaim` instead of saturating into the final
-/// span's claim.
+/// The shared narrowing target for click, scroll, and hover: the owning plugin,
+/// the content line's window row, the in-band column, and the flattened spans
+/// of that line — the same spans paint clips and per-item regions chart.
+struct BandLineAt {
+    edge: BandEdge,
+    visible_index: usize,
+    plugin_id: String,
+    row: u16,
+    col: usize,
+    runs: Vec<BandRun>,
+}
+
+/// A resolved band cell: which visible band owns the pointer, and the window
+/// cell the pointer is on.
+///
+/// Both axes resolve to this (issue #3171): a row band is one window row across
+/// the window width, a column band is its granted column range across the
+/// row-carved container's rows. Press consumption uses the whole granted rect —
+/// including the unclaimed trailing cells past the text — so a band press can
+/// never fall through to selection or capture; release resolution narrows
+/// through [`Runtime::plugin_band_hit`], whose text-width guard keeps a
+/// past-text release at `NoClaim` instead of saturating into the final span's
+/// claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BandRowHit {
+pub struct BandCellHit {
     /// Edge owning the band.
     pub edge: BandEdge,
-    /// Visible index on the edge (hidden bands take no row).
+    /// Visible index on the edge (hidden bands take no index).
     pub visible_index: usize,
-    /// Window row the band paints (window cells).
+    /// Window row the pointer is on (window cells).
     pub row: u16,
+    /// Window column the pointer is on (window cells).
+    pub column: u16,
+}
+
+/// One granted column band, in stacking order (issue #3171).
+///
+/// Produced by [`Runtime::column_band_plan`], the single allocation source for
+/// both vertical edges: the column budget, the exclusive-zone carve, the paint
+/// plan, hit-testing, item regions, and published origins all read it, so a
+/// band cannot be reserved at one width and painted or routed at another.
+pub(super) struct ColumnBandRect {
+    /// Edge owning the band.
+    pub(super) edge: BandEdge,
+    /// Visible index on the edge (hidden bands take no index).
+    pub(super) visible_index: usize,
+    /// First window column of the granted range.
+    pub(super) column: u16,
+    /// Granted width in cells: the band's content width when it fits its share,
+    /// the remaining share when it does not.
+    pub(super) width: u16,
 }
 
 impl Runtime {
@@ -1779,26 +1913,25 @@ impl Runtime {
         }
     }
 
-    /// Visible vertical bands on `edge`, clamped by the column budget
-    /// (issue #3165).
+    /// Visible vertical bands on `edge`, clamped by the column plan
+    /// (issue #3165, issue #3171).
     ///
     /// The column mirror of [`Self::visible_band_count`]: the number of
-    /// visible (non-empty-text) bands on `left`/`right`, or `0` when that
-    /// side's reserved width does not fit above the column content floor, or
-    /// for a horizontal (row) edge. The reserved width itself is
-    /// [`Self::plugin_band_column_budget`].
+    /// visible (non-empty-text) bands on `left`/`right` the column budget
+    /// could grant columns to, or `0` for a horizontal (row) edge or a window
+    /// too narrow for any share at all. The granted widths themselves come from
+    /// the host's column grant plan (`column_band_plan`).
     #[must_use]
     pub fn visible_band_column_count(&self, edge: BandEdge) -> u16 {
-        let (left, right) = self.plugin_band_column_budget();
-        let admitted = match edge {
-            BandEdge::Left => left,
-            BandEdge::Right => right,
-            BandEdge::Top | BandEdge::Bottom => return 0,
-        };
-        if admitted == 0 {
+        if edge.axis() != BandAxis::Column {
             return 0;
         }
-        u16::try_from(self.visible_edge_bands(edge).len()).unwrap_or(u16::MAX)
+        let count = self
+            .column_band_plan()
+            .iter()
+            .filter(|band| band.edge == edge)
+            .count();
+        u16::try_from(count).unwrap_or(u16::MAX)
     }
 
     /// Degraded-visible band budget per horizontal edge (CTX-0946 C3).
@@ -1837,36 +1970,130 @@ impl Runtime {
     }
 
     /// Width budget of the visible vertical bands per edge, in window columns
-    /// (issue #3165).
+    /// (issue #3165, issue #3171).
     ///
     /// The column mirror of [`Self::plugin_band_budget`]: `(left, right)` are
-    /// the sums of the visible bands' content widths on each side, or
-    /// `(0, 0)` when both sides together cannot fit above the column content
-    /// floor (`chrome_min_cols`, the crate-internal column mirror of the row
-    /// floor). Degrading a whole side rather than
-    /// a tail keeps the reservation and the paint plan on one number, so a
-    /// band is never reserved but unpainted (or painted but unreserved).
+    /// the columns the host's column grant plan (`column_band_plan`) gave the
+    /// visible bands on each side (their content widths when those fit the
+    /// side's share), or `(0, 0)` when no side was granted anything. The budget
+    /// is derived from that plan rather than recomputed, so the reservation and
+    /// the paint plan are one number and a band is never reserved but unpainted
+    /// (or painted but unreserved).
     #[must_use]
     pub fn plugin_band_column_budget(&self) -> (u16, u16) {
+        let plan = self.column_band_plan();
         let width = |edge| {
-            self.chrome_bands
-                .edge(edge)
-                .iter()
-                .filter(|band| band_is_visible(&band.root))
-                .map(|band| column_band_width(&band.root))
+            plan.iter()
+                .filter(|band| band.edge == edge)
+                .map(|band| band.width)
                 .fold(0u16, u16::saturating_add)
         };
-        let (left, right) = (width(BandEdge::Left), width(BandEdge::Right));
-        if left == 0 && right == 0 {
-            return (0, 0);
-        }
+        (width(BandEdge::Left), width(BandEdge::Right))
+    }
+
+    /// Granted column bands, edge-major in stacking order (issue #3171).
+    ///
+    /// One allocation policy for both vertical edges. Each side is capped at an
+    /// equal part of what the window can spare above
+    /// [`Self::chrome_min_cols`] and above the
+    /// [`BAND_COLUMN_CONTENT_SHARE_DIVISOR`] content share, so the content area
+    /// always keeps at least half the window; bands stack outward-in from the
+    /// window edge, and the band that crosses the cap is granted the remainder
+    /// instead of vanishing. A side granted zero columns (a window with no
+    /// spare column at all) paints, reserves, and routes nothing — the same
+    /// degradation a row band takes in a window too short for it — so a band is
+    /// either served, possibly clipped to its share, or the window itself is
+    /// below the content floor.
+    pub(super) fn column_band_plan(&self) -> Vec<ColumnBandRect> {
         let window = self.window_cells();
-        let want = u32::from(left).saturating_add(u32::from(right));
-        let floor = u32::from(self.chrome_min_cols());
-        if want.saturating_add(floor) > u32::from(window.width) {
-            return (0, 0);
+        if window.width == 0 {
+            return Vec::new();
         }
-        (left, right)
+        let wants: Vec<(BandEdge, Vec<u16>)> = [BandEdge::Left, BandEdge::Right]
+            .into_iter()
+            .map(|edge| {
+                let widths = self
+                    .visible_edge_bands(edge)
+                    .iter()
+                    .map(|band| column_band_width(&band.root))
+                    .collect();
+                (edge, widths)
+            })
+            .collect();
+        let sides = u32::try_from(
+            wants
+                .iter()
+                .filter(|(_, widths)| !widths.is_empty())
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        if sides == 0 {
+            return Vec::new();
+        }
+        let content = u32::from(self.chrome_min_cols())
+            .max(u32::from(window.width).div_ceil(u32::from(BAND_COLUMN_CONTENT_SHARE_DIVISOR)));
+        let Some(share) = u32::from(window.width).checked_sub(content) else {
+            return Vec::new();
+        };
+        let per_side = share / sides;
+        let mut plan = Vec::new();
+        for (edge, widths) in wants {
+            let mut offset = 0u16;
+            for (index, want) in widths.iter().enumerate() {
+                if *want == 0 {
+                    continue;
+                }
+                let remaining = per_side.saturating_sub(u32::from(offset));
+                let granted = (*want).min(u16::try_from(remaining).unwrap_or(u16::MAX));
+                if granted == 0 {
+                    break;
+                }
+                let Some(column) = ChromeBands::band_column(edge, offset, granted, window.width)
+                else {
+                    break;
+                };
+                plan.push(ColumnBandRect {
+                    edge,
+                    visible_index: index,
+                    column,
+                    width: granted,
+                });
+                offset = offset.saturating_add(granted);
+                // A band clipped to its share ends the stack: the inward bands
+                // have no columns left, and painting them over the content
+                // would defeat the share.
+                if granted < *want {
+                    break;
+                }
+            }
+        }
+        plan
+    }
+
+    /// Granted rect of visible band `index` on `edge`, in window cells
+    /// (issue #3171): `(row, column, width, height)`.
+    ///
+    /// The single geometry source both axes resolve through — paint,
+    /// hit-testing, per-item regions, and published origins all read it — so a
+    /// column band's granted width is the same number that reserves its
+    /// columns, clips its paint, and bounds its item rects. A row band is one
+    /// window row across the window width (the window column origin is `0`
+    /// because it spans the width); a column band spans the row-carved
+    /// container's rows at its granted column range. `None` for a hidden band,
+    /// an out-of-range index, or a band the budget granted nothing.
+    fn band_paint_rect(&self, edge: BandEdge, index: usize) -> Option<(u16, u16, u16, u16)> {
+        let window = self.window_cells();
+        match edge.axis() {
+            BandAxis::Row => Some((self.visible_band_row(edge, index)?, 0, window.width, 1)),
+            BandAxis::Column => {
+                let granted = self
+                    .column_band_plan()
+                    .into_iter()
+                    .find(|band| band.edge == edge && band.visible_index == index)?;
+                let area = self.band_row_container();
+                Some((area.y, granted.column, granted.width, area.height))
+            }
+        }
     }
 
     /// Window row painted by visible band `index` on `edge` (CTX-0946 C3).
@@ -1886,27 +2113,16 @@ impl Runtime {
     /// (issue #3165): the column mirror of [`Self::visible_band_row`].
     ///
     /// `index` counts visible bands only and stacks from the window edge
-    /// inward (index `0` outermost), so the band starts inward of the summed
+    /// inward (index `0` outermost), so the band starts inward of the granted
     /// widths of every visible band held outward of it on the same edge.
     /// `None` for a horizontal edge, an out-of-range index, a width of zero,
-    /// or a band degraded away by [`Self::plugin_band_column_budget`].
+    /// or a band the column plan granted nothing.
     #[must_use]
     pub fn visible_band_column(&self, edge: BandEdge, index: usize) -> Option<u16> {
-        if u64::try_from(index).unwrap_or(u64::MAX)
-            >= u64::from(self.visible_band_column_count(edge))
-        {
-            return None;
-        }
-        let bands = self.visible_edge_bands(edge);
-        let offset = bands
-            .iter()
-            .take(index)
-            .map(|band| column_band_width(&band.root))
-            .fold(0u16, u16::saturating_add);
-        let width = bands
-            .get(index)
-            .map_or(0, |band| column_band_width(&band.root));
-        ChromeBands::band_column(edge, offset, width, self.window_cells().width)
+        self.column_band_plan()
+            .into_iter()
+            .find(|band| band.edge == edge && band.visible_index == index)
+            .map(|band| band.column)
     }
 
     /// Layout container minus the budgeted horizontal bands (CTX-0946 C3).
@@ -1978,8 +2194,10 @@ impl Runtime {
     /// Whether the painted band rows violate exclusive geometry.
     ///
     /// True on any duplicate row or any band row inside the layout
-    /// container. Paint and hit-test fail closed on `true` with a
-    /// diagnostic; the budget math keeps this unreachable in practice.
+    /// container, and (issue #3171) on any granted column band whose range
+    /// reaches the layout container — the column mirror of the row backstop.
+    /// Paint and hit-test fail closed on `true` with a diagnostic; the budget
+    /// math keeps this unreachable in practice.
     ///
     /// CTX-0979: no Core bar row exists to collide with.
     #[must_use]
@@ -1996,20 +2214,26 @@ impl Runtime {
         {
             return true;
         }
-        false
+        let container_end_x = container.x.saturating_add(container.width);
+        self.column_band_plan().iter().any(|band| {
+            let end = band.column.saturating_add(band.width);
+            band.column < container_end_x && end > container.x
+        })
     }
 
-    /// Maps physical `pos` onto a painted band row, if any (CTX-0946 C1).
+    /// Maps physical `pos` onto a painted band cell, on either axis
+    /// (CTX-0946 C1, issue #3171).
     ///
-    /// Row-wide: any column inside the band's window width hits, including
-    /// the unclaimed trailing region past the text. Press consumption uses
-    /// this so a band press can never fall through to selection or capture.
-    /// Uses the same window-padding + live-cell translation the band paint
-    /// path uses, so hit-test and paint share one geometry (no second
-    /// source). Returns `None` outside every painted band row, past the
-    /// window width, or under any geometry violation (fail-closed).
+    /// Rect-wide on both axes: for a row band any column inside the window
+    /// width hits (including the unclaimed trailing region past the text), and
+    /// for a column band any row inside the band's granted column range hits.
+    /// Press consumption uses this so a band press can never fall through to
+    /// selection or capture. Both axes resolve through the host's granted band
+    /// rect (`band_paint_rect`), the same geometry the paint path uses (no
+    /// second source). Returns `None` outside every painted band rect, past the
+    /// window, or under any geometry violation (fail-closed).
     #[must_use]
-    pub fn plugin_band_row_hit(&self, pos: CursorPosition) -> Option<BandRowHit> {
+    pub fn plugin_band_cell_hit(&self, pos: CursorPosition) -> Option<BandCellHit> {
         if !pos.x.is_finite() || !pos.y.is_finite() {
             return None;
         }
@@ -2028,111 +2252,156 @@ impl Runtime {
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
         let origin_x = pad + f64::from(window.x) * cell_w;
-        let band_w = f64::from(window.width) * cell_w;
-        if pos.x < origin_x || pos.x >= origin_x + band_w {
+        // The window cell the pointer is on, in the same window-relative frame
+        // [`Self::band_paint_rect`] reports.
+        let cell_col = (pos.x - origin_x) / cell_w;
+        let cell_row = (pos.y - pad) / cell_h;
+        if !(0.0..f64::from(window.width)).contains(&cell_col)
+            || !(0.0..f64::from(window.height)).contains(&cell_row)
+        {
             return None;
         }
-        for edge in [BandEdge::Top, BandEdge::Bottom] {
-            for index in 0..self.visible_band_count(edge) {
-                let index = usize::from(index);
-                let Some(row) = self.visible_band_row(edge, index) else {
+        let column = u16::try_from(cell_col.floor() as u64).ok()?;
+        let row = u16::try_from(cell_row.floor() as u64).ok()?;
+        for edge in BAND_EDGES {
+            let count = match edge.axis() {
+                BandAxis::Row => self.visible_band_count(edge),
+                BandAxis::Column => self.visible_band_column_count(edge),
+            };
+            for index in 0..usize::from(count) {
+                let Some((band_row, band_column, width, height)) =
+                    self.band_paint_rect(edge, index)
+                else {
                     continue;
                 };
-                let origin_y = pad + f64::from(row) * cell_h;
-                if pos.y < origin_y || pos.y >= origin_y + cell_h {
+                if column < band_column || column >= band_column.saturating_add(width) {
                     continue;
                 }
-                return Some(BandRowHit {
+                if row < band_row || row >= band_row.saturating_add(height) {
+                    continue;
+                }
+                return Some(BandCellHit {
                     edge,
                     visible_index: index,
                     row,
+                    column,
                 });
             }
         }
         None
     }
 
-    /// Maps physical `pos` onto a claimed band text column, if any
-    /// (CTX-0946 C1).
+    /// Narrows a resolved [`BandCellHit`] onto the band content line under the
+    /// pointer (issue #3171).
     ///
-    /// Release resolution over [`Self::plugin_band_row_hit`]: the row must
-    /// hit, and the column must land inside the painted text width (the
-    /// paint path clips text to the window width, so the guard mirrors it).
-    /// Returns `None` past the text width — the caller counts that release
-    /// as unclaimed, never as the final span's owner.
-    #[must_use]
-    pub fn plugin_band_hit(&self, pos: CursorPosition) -> Option<BandHit> {
-        let row_hit = self.plugin_band_row_hit(pos)?;
-        let live = self.live_cell_metrics();
-        let window = self.window_cells();
-        let pad = f64::from(self.window_padding_physical());
-        let cell_w = f64::from(live.width);
-        let origin_x = pad + f64::from(window.x) * cell_w;
-        let cell_col = ((pos.x - origin_x) / cell_w).floor() as u64;
-        let bands = self.visible_edge_bands(row_hit.edge);
-        let band = bands.get(row_hit.visible_index)?;
-        // Issue #2411: the band owns its laid-out span, not the raw text
-        // width — an anchored right group ends at the inset edge.
-        let (_, runs) = flatten_band_runs_in_width(&band.root, usize::from(window.width));
-        let width_cells = u64::try_from(runs.iter().map(|run| run.end_col).max().unwrap_or(0))
-            .unwrap_or(u64::MAX);
-        let window_cells = u64::from(window.width);
-        if cell_col >= width_cells.min(window_cells) {
+    /// The axis-general form of the pre-#3171 row-only narrowing: a row band has
+    /// one line (its window row) whose in-band column is the window column; a
+    /// column band has one line per root child, the line is the pointer's row
+    /// offset inside the band, and the column is measured from the band's own
+    /// left edge. Those are exactly the spans paint clips and per-item regions
+    /// chart, so click, scroll, and hover resolve through one mapping. `None`
+    /// past the painted text width (the paint path clips text to the band
+    /// width, so the guard mirrors it), on an empty line, or for a band the
+    /// budget granted nothing.
+    fn band_line_at(&self, cell: &BandCellHit) -> Option<BandLineAt> {
+        let (origin_row, origin_column, width, height) =
+            self.band_paint_rect(cell.edge, cell.visible_index)?;
+        let bands = self.visible_edge_bands(cell.edge);
+        let band = bands.get(cell.visible_index)?;
+        let runs = match cell.edge.axis() {
+            BandAxis::Row => flatten_band_runs_in_width(&band.root, usize::from(width)).1,
+            BandAxis::Column => {
+                let offset = usize::from(cell.row.saturating_sub(origin_row));
+                let rows = column_band_rows(&band.root, usize::from(height));
+                rows.get(offset)?.1.clone()
+            }
+        };
+        let col = usize::from(cell.column.saturating_sub(origin_column));
+        let width_cells = runs
+            .iter()
+            .map(|run| run.end_col)
+            .max()
+            .unwrap_or(0)
+            .min(usize::from(width));
+        if col >= width_cells {
             return None;
         }
-        let col = usize::try_from(cell_col).unwrap_or(usize::MAX);
-        Some(BandHit {
-            edge: row_hit.edge,
-            visible_index: row_hit.visible_index,
-            row: row_hit.row,
+        Some(BandLineAt {
+            edge: cell.edge,
+            visible_index: cell.visible_index,
+            plugin_id: band.plugin_id.clone(),
+            row: cell.row,
             col,
+            runs,
+        })
+    }
+
+    /// Maps physical `pos` onto a claimed band text column, if any
+    /// (CTX-0946 C1, issue #3171).
+    ///
+    /// Release resolution over [`Self::plugin_band_cell_hit`]: the band rect
+    /// must hit, and the column must land inside the painted text width of the
+    /// line under the pointer (the paint path clips text to the band width, so
+    /// the guard mirrors it). Returns `None` past the text width — the caller
+    /// counts that release as unclaimed, never as the final span's owner.
+    #[must_use]
+    pub fn plugin_band_hit(&self, pos: CursorPosition) -> Option<BandHit> {
+        let cell = self.plugin_band_cell_hit(pos)?;
+        let line = self.band_line_at(&cell)?;
+        Some(BandHit {
+            edge: line.edge,
+            visible_index: line.visible_index,
+            row: line.row,
+            col: line.col,
         })
     }
 
     /// Emits the bounded per-item region table for one visible band
-    /// (issue #2248).
+    /// (issue #2248, issue #3171).
     ///
     /// `edge`/`visible_index` address the band in the same stacking order
-    /// paint and hit-test use; `row` comes from [`Self::visible_band_row`].
-    /// Rectangles are display-cell columns clipped to the painted window
-    /// width. Regions are derived on demand from the current tree, so a
-    /// remount or reflow can never expose stale geometry: the next call
-    /// reads the new tree. A band above [`BAND_MAX_REGIONS`] returns
+    /// paint, hit-test, and origins use; the band's granted rect comes from the
+    /// host's single band-geometry source (`band_paint_rect`). Rectangles are
+    /// display-cell columns measured from the band's own left edge and clipped
+    /// to its granted width — one row band line, or one line per column-band
+    /// root child. Regions are derived on demand from the current tree, so a
+    /// remount or reflow can never expose stale geometry: the next call reads
+    /// the new tree. A band above [`BAND_MAX_REGIONS`] returns
     /// [`BandRegionError::Overflow`] and routes nothing (fail-closed). No
     /// plugin VM is entered; this is a pure data walk.
     ///
     /// # Errors
     ///
-    /// [`BandRegionError::MissingBand`] when no visible band occupies the
-    /// index, or [`BandRegionError::Overflow`] for an over-cap band.
+    /// [`BandRegionError::MissingBand`] when no band occupies the index with a
+    /// granted rect (hidden, out of range, or granted no columns), or
+    /// [`BandRegionError::Overflow`] for an over-cap band.
     pub fn band_item_regions(
         &self,
         edge: BandEdge,
         visible_index: usize,
     ) -> Result<Vec<BandItemRegion>, BandRegionError> {
-        let row = self
-            .visible_band_row(edge, visible_index)
+        let (row, _column, width, height) = self
+            .band_paint_rect(edge, visible_index)
             .ok_or(BandRegionError::MissingBand)?;
         let bands = self.visible_edge_bands(edge);
         let band = bands
             .get(visible_index)
             .ok_or(BandRegionError::MissingBand)?;
-        band_regions_for(
-            band,
-            edge,
-            visible_index,
-            row,
-            usize::from(self.window_cells().width),
-        )
+        match edge.axis() {
+            BandAxis::Row => band_regions_for(band, edge, visible_index, row, usize::from(width)),
+            BandAxis::Column => {
+                column_band_regions_for(band, edge, visible_index, row, width, usize::from(height))
+            }
+        }
     }
 
-    /// Routes a press on a plugin band row to chrome (CTX-0946 C1,
-    /// issue #2248).
+    /// Routes a press on a plugin band to chrome (CTX-0946 C1,
+    /// issue #2248, issue #3171).
     ///
     /// Returns `true` (consume the press: no focus move, no selection, no
     /// capture report, and no clipboard paste) when the last-known cursor
-    /// sits anywhere on a painted band row — including the unclaimed
-    /// trailing region past the text — arming the one-shot
+    /// sits anywhere on a painted band rect — including the unclaimed
+    /// trailing cells past the text — arming the one-shot
     /// [`Self::band_release_swallow`] plus the stored press target so the
     /// paired release routes only onto the same item (standard button
     /// semantics). Left, right, and middle presses are consumed; back,
@@ -2149,7 +2418,7 @@ impl Runtime {
         let Some(pos) = self.last_cursor else {
             return false;
         };
-        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+        let Some(cell) = self.plugin_band_cell_hit(pos) else {
             return false;
         };
         // A different button while one is armed is still chrome *on a band
@@ -2165,10 +2434,10 @@ impl Runtime {
                 return true;
             }
         }
-        if self.band_region_overflow(row_hit.edge, row_hit.visible_index) {
+        if self.band_region_overflow(cell.edge, cell.visible_index) {
             self.band_stats.region_overflows = self.band_stats.region_overflows.saturating_add(1);
         }
-        self.band_press_target = Some(self.band_target_at(pos, &row_hit, button));
+        self.band_press_target = Some(self.band_target_at(&cell, button));
         self.band_press_button = Some(button);
         self.band_release_swallow = true;
         true
@@ -2187,45 +2456,34 @@ impl Runtime {
     /// Shared by [`Self::band_press`] and [`Self::band_release`] so both
     /// sides classify identically: past-text is `NoClaim` (the width guard
     /// in [`Self::plugin_band_hit`]). A declared region resolves to that
-    /// item; a bare interactive span keeps the legacy span target.
-    fn band_target_at(
-        &self,
-        pos: CursorPosition,
-        row_hit: &BandRowHit,
-        button: BandButton,
-    ) -> PressedBandTarget {
-        let bands = self.visible_edge_bands(row_hit.edge);
-        let Some(band) = bands.get(row_hit.visible_index) else {
+    /// item; a bare interactive span keeps the legacy span target. Both axes
+    /// resolve through [`Self::band_line_at`], so a column band's press
+    /// resolves on its own content line with the same rules a row band uses
+    /// (issue #3171).
+    fn band_target_at(&self, cell: &BandCellHit, button: BandButton) -> PressedBandTarget {
+        let Some(line) = self.band_line_at(cell) else {
             return PressedBandTarget::NoClaim;
         };
-        let owner = band.plugin_id.clone();
-        let (_, runs) =
-            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
-        let Some(hit) = self.plugin_band_hit(pos) else {
-            return PressedBandTarget::NoClaim;
-        };
-        if (hit.edge, hit.visible_index) != (row_hit.edge, row_hit.visible_index) {
-            // Unreachable (same geometry walk twice); fail closed.
-            return PressedBandTarget::NoClaim;
-        }
+        let owner = line.plugin_id;
         // Issue #2248: a declared region owns its rect. Overflow refuses the
         // whole band (fail-closed) rather than routing a partial table.
-        let regions = match self.band_item_regions(row_hit.edge, row_hit.visible_index) {
+        let regions = match self.band_item_regions(line.edge, line.visible_index) {
             Ok(regions) => regions,
             Err(BandRegionError::MissingBand) => return PressedBandTarget::NoClaim,
             Err(BandRegionError::Overflow { .. }) => return PressedBandTarget::Denied,
         };
-        let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
+        let declared =
+            resolve_item_region(&regions, line.row, line.col).map(|item| item.region.clone());
         let outcome = match declared.as_ref() {
-            Some(region) => resolve_click_for_region(&owner, &runs, region, hit.col, button),
-            None => resolve_click_in_band(&owner, &runs, hit.col, button),
+            Some(region) => resolve_click_for_region(&owner, &line.runs, region, line.col, button),
+            None => resolve_click_in_band(&owner, &line.runs, line.col, button),
         };
         match outcome {
             BandColumnOutcome::Hit(request) => {
                 let key = match request.region.clone() {
                     Some(region) => BandTargetKey::Region(region),
                     None => {
-                        let Some(run) = find_run_index(&runs, hit.col) else {
+                        let Some(run) = find_run_index(&line.runs, line.col) else {
                             // Unreachable (a Hit always owns a run); fail closed.
                             return PressedBandTarget::NoClaim;
                         };
@@ -2237,11 +2495,11 @@ impl Runtime {
                 // band); the cold pump refuses a request without one.
                 let mut request = request;
                 request.origin = self
-                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .published_band_origin(line.edge, line.visible_index)
                     .cloned();
                 PressedBandTarget::Hit {
-                    edge: row_hit.edge,
-                    visible_index: row_hit.visible_index,
+                    edge: line.edge,
+                    visible_index: line.visible_index,
                     key,
                     button,
                     request: Box::new(request),
@@ -2272,18 +2530,20 @@ impl Runtime {
     /// Returns the last presented origin for a painted band, if any
     /// (CTX-1332, C-D4/C-D5).
     ///
-    /// The origin must match the live band identity *and* the live geometry;
-    /// a replacement mount, version reset, edge move, or resize therefore
+    /// The origin must match the live band identity *and* the live geometry —
+    /// row and column, from [`Self::band_paint_rect`] — so a replacement mount,
+    /// version reset, edge move, or resize (on either axis, issue #3171)
     /// refuses the gesture instead of retargeting it.
     fn published_band_origin(&self, edge: BandEdge, visible_index: usize) -> Option<&BandOrigin> {
         let index = u16::try_from(visible_index).ok()?;
-        let row = self.visible_band_row(edge, visible_index)?;
+        let (row, column, _, _) = self.band_paint_rect(edge, visible_index)?;
         let bands = self.visible_edge_bands(edge);
         let band = bands.get(visible_index)?;
         self.published_band_origins.iter().find(|origin| {
             origin.edge == edge
                 && origin.visible_index == index
                 && origin.row == row
+                && origin.column == column
                 && origin.plugin_id == band.plugin_id
                 && origin.slot == band.slot
                 && origin.version == band.version
@@ -2324,9 +2584,10 @@ impl Runtime {
     /// Damage identity of every mounted band, including edges and executable
     /// origins (CTX-1332, C-D4/F7).
     ///
-    /// Painted bands carry their pending [`BandOrigin`]; hidden and vertical
-    /// bands carry `None` (they are never clickable) but still participate in
-    /// damage identity through plugin id, slot, version, and edge.
+    /// Painted bands carry their pending [`BandOrigin`] on either axis (issue
+    /// #3171: a column band's origin carries its column geometry); hidden bands
+    /// carry `None` (they are never clickable) but still participate in damage
+    /// identity through plugin id, slot, version, and edge.
     #[doc(hidden)]
     #[must_use]
     pub fn band_frame_identity(&self) -> Vec<BandFrameIdentity> {
@@ -2456,7 +2717,13 @@ impl Runtime {
                     // C-D4 counter/version exhaustion fails closed: never
                     // issue an origin whose version can no longer advance.
                     if version != u32::MAX && generation != 0 {
-                        if let Some(row) = self.visible_band_row(edge, usize::from(visible_index)) {
+                        // Issue #3171: both axes publish an origin through the
+                        // one granted rect, carrying the band's own geometry
+                        // (row for a row band, column for a column band) so a
+                        // reflow on either axis invalidates it.
+                        if let Some((row, column, _, _)) =
+                            self.band_paint_rect(edge, usize::from(visible_index))
+                        {
                             pending.push(BandOrigin {
                                 plugin_id,
                                 generation,
@@ -2466,6 +2733,7 @@ impl Runtime {
                                 edge,
                                 visible_index,
                                 row,
+                                column,
                             });
                         }
                     }
@@ -2536,11 +2804,11 @@ impl Runtime {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
             return true;
         };
-        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+        let Some(cell) = self.plugin_band_cell_hit(pos) else {
             self.band_stats.clicks_unclaimed = self.band_stats.clicks_unclaimed.saturating_add(1);
             return true;
         };
-        let released = self.band_target_at(pos, &row_hit, button);
+        let released = self.band_target_at(&cell, button);
         match (pressed, released) {
             (
                 Some(PressedBandTarget::Hit {
@@ -2684,35 +2952,32 @@ impl Runtime {
         let Some(pos) = self.last_cursor else {
             return ScrollTargetOutcome::OffBand;
         };
-        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+        let Some(cell) = self.plugin_band_cell_hit(pos) else {
             return ScrollTargetOutcome::OffBand;
         };
-        let bands = self.visible_edge_bands(row_hit.edge);
-        let Some(band) = bands.get(row_hit.visible_index) else {
+        // Issue #3171: the same axis-general line resolution click and hover
+        // use, so a column band's wheel tick reads its own content line.
+        let Some(line) = self.band_line_at(&cell) else {
             return ScrollTargetOutcome::Unclaimed;
         };
-        let owner = band.plugin_id.clone();
-        let (_, runs) =
-            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
-        let Some(hit) = self.plugin_band_hit(pos) else {
-            return ScrollTargetOutcome::Unclaimed;
-        };
+        let owner = line.plugin_id;
         // Issue #2248: a declared region owns its rect; an over-cap band
         // refuses the wheel (fail-closed) instead of routing a partial table.
-        let regions = match self.band_item_regions(row_hit.edge, row_hit.visible_index) {
+        let regions = match self.band_item_regions(line.edge, line.visible_index) {
             Ok(regions) => regions,
             Err(BandRegionError::MissingBand) => return ScrollTargetOutcome::Unclaimed,
             Err(BandRegionError::Overflow { .. }) => return ScrollTargetOutcome::Overflow,
         };
-        let declared = resolve_item_region(&regions, hit.col).map(|item| item.region.clone());
+        let declared =
+            resolve_item_region(&regions, line.row, line.col).map(|item| item.region.clone());
         let outcome = match declared.as_ref() {
-            Some(region) => resolve_scroll_for_region(&owner, &runs, region, hit.col),
-            None => resolve_scroll_in_band(&owner, &runs, hit.col),
+            Some(region) => resolve_scroll_for_region(&owner, &line.runs, region, line.col),
+            None => resolve_scroll_in_band(&owner, &line.runs, line.col),
         };
         match outcome {
             BandScrollOutcome::Hit(mut target) => {
                 target.origin = self
-                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .published_band_origin(line.edge, line.visible_index)
                     .cloned();
                 ScrollTargetOutcome::Hit(target)
             }
@@ -2816,32 +3081,28 @@ impl Runtime {
     }
 
     /// Resolves the hoverable region under `pos` without mutating state
-    /// (issue #2411).
+    /// (issue #2411, issue #3171).
     fn band_hover_probe(&self, pos: CursorPosition) -> HoverProbe {
-        let Some(row_hit) = self.plugin_band_row_hit(pos) else {
+        let Some(cell) = self.plugin_band_cell_hit(pos) else {
             return HoverProbe::None;
         };
-        let bands = self.visible_edge_bands(row_hit.edge);
-        let Some(band) = bands.get(row_hit.visible_index) else {
+        // Issue #3171: hover resolves on the band's own content line, the same
+        // mapping click and scroll use, so a column band hovers its items.
+        let Some(line) = self.band_line_at(&cell) else {
             return HoverProbe::None;
         };
-        let owner = band.plugin_id.clone();
-        let (_, runs) =
-            flatten_band_runs_in_width(&band.root, usize::from(self.window_cells().width));
-        let Some(hit) = self.plugin_band_hit(pos) else {
-            return HoverProbe::None;
-        };
-        match resolve_hover_in_band(&owner, &runs, hit.col) {
+        let owner = line.plugin_id;
+        match resolve_hover_in_band(&owner, &line.runs, line.col) {
             BandHoverOutcome::Target(target) => HoverProbe::Target(BandHoverState {
-                edge: row_hit.edge,
-                visible_index: row_hit.visible_index,
+                edge: line.edge,
+                visible_index: line.visible_index,
                 plugin_id: target.plugin_id,
                 region: target.region,
                 command: target.command,
                 args: target.args,
-                col: hit.col,
+                col: line.col,
                 origin: self
-                    .published_band_origin(row_hit.edge, row_hit.visible_index)
+                    .published_band_origin(line.edge, line.visible_index)
                     .cloned(),
                 announced: false,
             }),
@@ -3767,6 +4028,7 @@ mod tests {
             edge: BandEdge::Top,
             visible_index: 0,
             row: 0,
+            column: 0,
         };
         for seq in 0..COLD_ADMISSION_SELECTION_MAX {
             rt.band_click_queue.push(BandClickRequest {
@@ -3981,6 +4243,7 @@ mod tests {
             edge: BandEdge::Top,
             visible_index: 0,
             row,
+            column: 0,
         };
         let request = |origin: Option<BandOrigin>| BandHoverRequest {
             plugin_id: "test-bar".to_string(),
@@ -4145,21 +4408,68 @@ mod tests {
     }
 
     #[test]
-    fn column_budget_hides_a_side_that_cannot_fit_the_content_floor() {
+    fn column_band_wider_than_its_share_is_clipped_to_the_content_half() {
+        // Issue #3171 decision: a scene wider than its share is *clipped to
+        // the share*, not degraded to an invisible band. #3165 returned
+        // `(0, 0)` here, so a plugin held a band that reserved, painted, and
+        // routed nothing; a 79-column line in an 80-column window also left a
+        // one-column terminal. The reservation is now bounded instead, so the
+        // mount is served at the bound and the content keeps half the window.
         let mut rt = Runtime::with_defaults().expect("runtime must build");
         let window = rt.window_cells();
-        let too_wide = "x".repeat(usize::from(window.width));
+        let too_wide = "x".repeat(usize::from(window.width).saturating_sub(1));
         rt.set_chrome_bands(ChromeBands {
             left: vec![column_block("test-bar", UiSlot::Left, &[&too_wide])],
             ..Default::default()
         });
+        let share = window.width / BAND_COLUMN_CONTENT_SHARE_DIVISOR;
         assert_eq!(
             rt.plugin_band_column_budget(),
-            (0, 0),
-            "a side wider than the window degrades away instead of eating the content"
+            (share, 0),
+            "a band wider than its share is granted the share, not zero columns"
         );
+        assert_eq!(rt.visible_band_column_count(BandEdge::Left), 1);
+        assert_eq!(rt.visible_band_column(BandEdge::Left, 0), Some(0));
+        let container = rt.band_exclusive_container();
+        assert_eq!(
+            container.width,
+            window.width - share,
+            "the content keeps at least half the window"
+        );
+        assert!(
+            container.width >= crate::runtime::chrome_band::MIN_CONTENT_COLS,
+            "the content floor still holds"
+        );
+        // The band still paints and still routes: it is bounded, not invisible.
+        assert!(rt.band_item_regions(BandEdge::Left, 0).is_ok());
+    }
+
+    #[test]
+    fn column_band_degrades_only_when_the_window_has_no_spare_column() {
+        // The one remaining `(0, 0)` is a window with no column to share at
+        // all, which is the same degradation a row band takes in a window too
+        // short for it — not the "admitted then invisible" state #3165 left.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let window = rt.window_cells();
+        rt.handle_resize(bitty_platform::PhysicalSize::new(
+            rt.live_cell_size().0,
+            rt.live_cell_size()
+                .1
+                .saturating_mul(u32::from(window.height)),
+        ))
+        .expect("resize to one column");
+        assert_eq!(rt.window_cells().width, 1, "one-column window");
+        rt.set_chrome_bands(ChromeBands {
+            left: vec![column_block("test-bar", UiSlot::Left, &["x"])],
+            ..Default::default()
+        });
+        assert_eq!(rt.plugin_band_column_budget(), (0, 0));
         assert_eq!(rt.visible_band_column_count(BandEdge::Left), 0);
-        assert_eq!(rt.band_exclusive_container(), window, "no reservation");
+        assert_eq!(
+            rt.band_exclusive_container(),
+            rt.window_cells(),
+            "no reservation"
+        );
     }
 
     #[test]

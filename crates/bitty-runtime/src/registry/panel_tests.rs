@@ -339,6 +339,37 @@ fn command_registry_owner_name_command_and_duplicates() {
 }
 
 #[test]
+fn core_tab_verbs_are_registered_and_not_panel_claimable() {
+    // Issue #3166 acceptance 1: the three Core tab verbs live on the same
+    // per-window registry as panel commands, registered once at construction.
+    let mut reg = default_panel_registry();
+    for command in bitty_ui::tabs::TAB_CMDS {
+        assert!(
+            reg.is_core_command(command),
+            "{command} must be registered as a Core verb"
+        );
+        assert!(
+            reg.command_owner(command).is_none(),
+            "{command} is Core-owned, not panel-owned"
+        );
+    }
+    // A panel cannot take a Core name, and Core keeps its verbs.
+    let h = reg.create_panel(PanelType::Helper, None).unwrap();
+    let err = reg
+        .register_command(h.id, h.generation, bitty_ui::tabs::TAB_CMD_OPEN)
+        .unwrap_err();
+    assert!(
+        matches!(err, PanelError::InvalidCommand { ref reason } if reason.contains("Core verb")),
+        "expected a Core-verb collision, got {err:?}"
+    );
+    // A panel command registered under the same owner is untouched by the
+    // Core lane, and the Core lane is untouched by per-panel teardown.
+    reg.register_command(h.id, h.generation, "xuepoo.git:open")
+        .unwrap();
+    assert_eq!(reg.command_owner("xuepoo.git:open"), Some(h.id));
+}
+
+#[test]
 fn event_bus_topic_grammar_and_declared_subscribe() {
     let mut reg = default_panel_registry();
     let h = reg.create_panel(PanelType::Terminal, None).unwrap();

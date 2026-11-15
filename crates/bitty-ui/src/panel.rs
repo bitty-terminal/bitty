@@ -544,8 +544,18 @@ impl std::fmt::Display for QualifiedCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandError {
     Invalid(String),
-    Duplicate { command: String, owner: PanelId },
-    TooManyCommands { max: usize, current: usize },
+    Duplicate {
+        command: String,
+        owner: PanelId,
+    },
+    /// The name belongs to a Core verb; panels and Core never share a name.
+    CoreDuplicate {
+        command: String,
+    },
+    TooManyCommands {
+        max: usize,
+        current: usize,
+    },
 }
 
 impl std::fmt::Display for CommandError {
@@ -554,6 +564,9 @@ impl std::fmt::Display for CommandError {
             Self::Invalid(msg) => write!(f, "invalid command: {msg}"),
             Self::Duplicate { command, owner } => {
                 write!(f, "duplicate command '{command}' already owned by {owner}")
+            }
+            Self::CoreDuplicate { command } => {
+                write!(f, "command '{command}' is already a Core verb")
             }
             Self::TooManyCommands { max, current } => {
                 write!(f, "too many commands: max {max}, current {current}")
@@ -565,10 +578,17 @@ impl std::fmt::Display for CommandError {
 impl std::error::Error for CommandError {}
 
 /// Command registry per window, Core-owned, generation-aware.
+///
+/// Two ownership lanes share one namespace: panel commands
+/// ([`register`](Self::register)) and Core verbs
+/// ([`register_core`](Self::register_core)). Names are unique across both, so a
+/// panel can never shadow a Core verb and vice versa; each lane keeps its own
+/// per-owner cap.
 #[derive(Clone, Debug, Default)]
 pub struct CommandRegistry {
     commands: std::collections::HashMap<String, PanelId>,
     per_panel: std::collections::HashMap<PanelId, Vec<String>>,
+    core: Vec<String>,
 }
 
 impl CommandRegistry {
@@ -577,11 +597,16 @@ impl CommandRegistry {
         Self {
             commands: std::collections::HashMap::new(),
             per_panel: std::collections::HashMap::new(),
+            core: Vec::new(),
         }
     }
 
     /// Register a command for `panel_id`. Validates grammar and enforces
     /// `<=32` per panel type and duplicate rejection.
+    ///
+    /// A name Core already owns is rejected with
+    /// [`CommandError::CoreDuplicate`]: the Core surface is not claimable by a
+    /// panel.
     pub fn register(
         &mut self,
         panel_id: PanelId,
@@ -592,6 +617,11 @@ impl CommandRegistry {
             return Err(CommandError::Duplicate {
                 command: qc.as_str().to_string(),
                 owner: *owner,
+            });
+        }
+        if self.is_core(qc.as_str()) {
+            return Err(CommandError::CoreDuplicate {
+                command: qc.as_str().to_string(),
             });
         }
         let count = self.per_panel.get(&panel_id).map_or(0, |v| v.len());
@@ -607,6 +637,48 @@ impl CommandRegistry {
             .or_default()
             .push(qc.as_str().to_string());
         Ok(qc)
+    }
+
+    /// Register a Core-owned verb (`owner.name:command`) that belongs to the
+    /// window rather than to a panel.
+    ///
+    /// Same grammar and duplicate discipline as
+    /// [`register`](Self::register); the per-owner cap is applied to the Core
+    /// lane, and Core verbs survive [`unregister_panel`](Self::unregister_panel)
+    /// because no panel owns them.
+    pub fn register_core(&mut self, raw: &str) -> Result<QualifiedCommand, CommandError> {
+        let qc = QualifiedCommand::parse(raw)?;
+        if let Some(owner) = self.commands.get(qc.as_str()) {
+            return Err(CommandError::Duplicate {
+                command: qc.as_str().to_string(),
+                owner: *owner,
+            });
+        }
+        if self.is_core(qc.as_str()) {
+            return Err(CommandError::CoreDuplicate {
+                command: qc.as_str().to_string(),
+            });
+        }
+        if self.core.len() >= MAX_COMMANDS_PER_PANEL_TYPE {
+            return Err(CommandError::TooManyCommands {
+                max: MAX_COMMANDS_PER_PANEL_TYPE,
+                current: self.core.len(),
+            });
+        }
+        self.core.push(qc.as_str().to_string());
+        Ok(qc)
+    }
+
+    /// Whether `command` is a registered Core verb.
+    #[must_use]
+    pub fn is_core(&self, command: &str) -> bool {
+        self.core.iter().any(|registered| registered == command)
+    }
+
+    /// The registered Core verbs, in registration order.
+    #[must_use]
+    pub fn core_commands(&self) -> &[String] {
+        &self.core
     }
 
     #[must_use]
@@ -629,12 +701,12 @@ impl CommandRegistry {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.commands.len()
+        self.commands.len() + self.core.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
+        self.commands.is_empty() && self.core.is_empty()
     }
 }
 

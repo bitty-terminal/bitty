@@ -91,8 +91,11 @@ impl OverlayLayer {
 /// - `Split`: divides the container along `axis` according to `ratio` (fraction for
 ///   the `first` child; `second` gets the remainder). Ratio is clamped to
 ///   `[MIN_RATIO, MAX_RATIO]` and the split is deterministic over integers.
-/// - `Stack`: tab-like stacking where every child occupies the full container bounds;
-///   the last element is considered top-most for focus/visual order.
+/// - `Stack`: paint-order stacking of co-located children. Every child gets the
+///   full container bounds and paints in child order, last on top; the container
+///   carries no active-child index and enforces no visibility, so a stack that
+///   must show exactly one child belongs to a projection that keeps the visible
+///   child last (panel tabs project that way — see [`crate::tabs`]).
 /// - `Overlay`: a base layer plus a floating overlay clipped to the container.
 ///   The overlay carries an [`OverlayTier`]; stacked overlays composed with
 ///   [`LayoutNode::overlay_stack`] paint in tier order (see [`OverlayTier`]
@@ -115,7 +118,9 @@ pub enum LayoutNode {
         /// Second child (right or bottom).
         second: Box<LayoutNode>,
     },
-    /// Stacked children sharing the same bounds (e.g., tabs).
+    /// Co-located children sharing the same bounds, painted in child order with
+    /// the last child on top. The container holds no tab identity and no active
+    /// child; see the [`crate::tabs`] projection for panel tabs.
     Stack(Vec<LayoutNode>),
     /// Base plus overlay.
     Overlay {
@@ -667,8 +672,11 @@ impl LayoutNode {
     /// `gaps.outer` (`gaps_out`) insets `bounds` once; `gaps.inner`
     /// (`gaps_in`) reserves a background-colored band between sibling panes
     /// at every `Split` (nested splits each insert their own band, matching
-    /// Hyprland). `Stack` children share the full inset bounds (only one is
-    /// visible); `Overlay` bases fill the inset bounds while the overlay
+    /// Hyprland). `Stack` children share the full inset bounds and each keeps a
+    /// live allocation (a co-located child still owns a grid), with the last
+    /// child painting on top; a stack that must show exactly one child belongs
+    /// to a projection that keeps the visible child last (panel tabs — see
+    /// [`crate::tabs`]). `Overlay` bases fill the inset bounds while the overlay
     /// subtree is laid out inside its clipped rect with inner gaps only
     /// (positioned chrome keeps its explicit position).
     ///
@@ -3630,7 +3638,7 @@ mod tests {
     #[test]
     fn remove_leaf_collapses_split_and_stack() {
         // CW-09: removing one side of a split leaves the surviving child;
-        // removing a stacked tab keeps the other tabs in order.
+        // removing a stacked child keeps the remaining children in order.
         let mut tree = LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,

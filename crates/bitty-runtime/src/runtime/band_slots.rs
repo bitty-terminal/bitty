@@ -181,10 +181,23 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
 /// decision, so `UiBlockState`
 /// ([`crate::plugin_runtime::PluginServices::ui_block_state`]) can never report
 /// a rule that contradicts [`ui_slot_placement`].
+///
+/// Covers both band axes (bitty#2191): a *row* band (`top`/`bottom`) paints one
+/// row of its flattened content and a *column* band (`left`/`right`) paints one
+/// row per direct child of its root, but on either axis the paint walk emits
+/// exactly the non-empty content, so the one content gate below is the whole
+/// presentation rule for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotStateRule {
-    /// One-row band: presented when the block paints visible text
-    /// (`band_is_visible`), hidden when its text is empty.
+    /// Chrome band, either axis: presented when the block has visible text
+    /// (`band_is_visible`), hidden when its flattened content is empty.
+    ///
+    /// The axis decides the painted shape, not whether anything paints: a
+    /// column band's thickness is [`super::band_host::column_band_width`] (the
+    /// widest root child), so a non-empty flatten implies a non-zero width the
+    /// column plan can grant and the top-down row walk paints — and a zero
+    /// width means every child flattened to nothing, which is the same empty
+    /// content this gate refuses.
     BandVisibility,
     /// Core focusable overlay (CTX-0941): presented when the generation owns
     /// the transient input capture or an active presentation session.
@@ -195,20 +208,22 @@ pub enum SlotStateRule {
 
 /// The presentation rule for `slot`.
 ///
-/// Only `top`/`bottom` are one-row bands hidden by empty text. `tabline` is
-/// deliberately **not** in that set: a tab strip is a Core tab projection
-/// ([`bitty_ui::tabs`]) with several entries, so the band rule would be wrong
-/// even once a host exists — and its placement is
-/// [`UiSlotPlacement::Unsupported`], which [`SlotStateRule::NeverPresented`]
-/// matches.
+/// Every hosted band slot uses [`SlotStateRule::BandVisibility`], on both axes
+/// (bitty#2191): `left`/`right` stopped being unhosted when the vertical band
+/// host took them (issue #3165), so reporting them as never presented was a
+/// stale placement leftover. `tabline` is deliberately **not** in that set: a
+/// tab strip is a Core tab projection ([`bitty_ui::tabs`]) with several
+/// entries, so the band rule would be wrong even once a host exists — and its
+/// placement is [`UiSlotPlacement::Unsupported`], which
+/// [`SlotStateRule::NeverPresented`] matches.
 #[must_use]
 pub const fn slot_state_rule(slot: UiSlot) -> SlotStateRule {
     match slot {
-        UiSlot::Top | UiSlot::Bottom => SlotStateRule::BandVisibility,
-        UiSlot::Overlay => SlotStateRule::OverlayCapture,
-        UiSlot::Tabline | UiSlot::Left | UiSlot::Right | UiSlot::Terminal => {
-            SlotStateRule::NeverPresented
+        UiSlot::Top | UiSlot::Bottom | UiSlot::Left | UiSlot::Right => {
+            SlotStateRule::BandVisibility
         }
+        UiSlot::Overlay => SlotStateRule::OverlayCapture,
+        UiSlot::Tabline | UiSlot::Terminal => SlotStateRule::NeverPresented,
     }
 }
 
@@ -617,7 +632,7 @@ mod tests {
     fn tabline_has_no_band_visibility_rule() {
         // Issue #3166 acceptance 6: the `ui.state` presentation rule and the
         // placement verdict must agree. A tab strip is Core tab-projection
-        // state with several entries, so it is neither a one-row band gated by
+        // state with several entries, so it is neither a band gated by
         // `band_is_visible` nor a mountable slot.
         assert_eq!(
             slot_state_rule(UiSlot::Tabline),
@@ -627,21 +642,23 @@ mod tests {
             ui_slot_placement(UiSlot::Tabline),
             UiSlotPlacement::Unsupported(_)
         ));
-        // Every slot whose placement is unsupported reports no presentation.
         for slot in UiSlot::ALL {
-            if matches!(ui_slot_placement(slot), UiSlotPlacement::Unsupported(_)) {
-                assert_eq!(
-                    slot_state_rule(slot),
-                    SlotStateRule::NeverPresented,
-                    "{slot} is unhosted, so it can never be presented"
-                );
-            }
-            // Only the row bands use the one-row, empty-text rule.
-            let band = matches!(ui_slot_placement(slot), UiSlotPlacement::Band(edge) if edge.axis() == BandAxis::Row);
+            let placement = ui_slot_placement(slot);
+            // bitty#2191: both band axes carry the content gate. A `left`/
+            // `right` mount is painted by the vertical band host (issue
+            // #3165), so reporting it as never presented would contradict
+            // its placement — the same way `top`/`bottom` would.
             assert_eq!(
                 slot_state_rule(slot) == SlotStateRule::BandVisibility,
-                band,
-                "{slot} presentation rule must match its band axis"
+                matches!(placement, UiSlotPlacement::Band(_)),
+                "{slot} presentation rule must match its band placement"
+            );
+            // Every slot whose placement is unsupported reports no
+            // presentation, and nothing hosted does.
+            assert_eq!(
+                slot_state_rule(slot) == SlotStateRule::NeverPresented,
+                matches!(placement, UiSlotPlacement::Unsupported(_)),
+                "{slot} is unhosted exactly when it can never be presented"
             );
         }
         // The overlay capture rule stays with the Core focusable overlay.

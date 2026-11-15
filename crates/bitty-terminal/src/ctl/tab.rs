@@ -269,6 +269,13 @@ struct Slot {
     seq: u64,
     verb: TabWireVerb,
     panel: u64,
+    /// Whether the app thread has taken this request ([`claim`]).
+    ///
+    /// A claimed slot stays in place until the claim is [`TabClaim::complete`]d
+    /// or dropped, so the deadline path needs this flag (not the slot's
+    /// presence) to tell "still waiting" from "already running": only an
+    /// unclaimed slot can be withdrawn as [`TabReply::Unserviced`].
+    claimed: bool,
     /// Answers the caller exactly once (`None` once the app thread claimed
     /// it: from then on the outcome is the app's to report).
     reply: Option<SyncSender<TabReply>>,
@@ -327,6 +334,7 @@ pub(crate) fn request(verb: TabWireVerb, panel: u64, timeout: Duration) -> TabRe
             seq,
             verb,
             panel,
+            claimed: false,
             reply: Some(tx),
         });
         PENDING.store(true, Ordering::Release);
@@ -337,16 +345,27 @@ pub(crate) fn request(verb: TabWireVerb, panel: u64, timeout: Duration) -> TabRe
     match rx.recv_timeout(timeout) {
         Ok(reply) => reply,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            // Withdraw the slot if it is still ours: the app never claimed it.
-            let mut guard = lock_lane();
-            let ours = guard.slot.as_ref().is_some_and(|slot| slot.seq == seq);
-            if ours {
-                guard.slot = None;
-                PENDING.store(false, Ordering::Release);
-                TabReply::Unserviced
-            } else {
-                TabReply::OutcomeUnknown
+            // The app may have answered in the same instant the deadline
+            // fired; a reply already in the channel is the real answer.
+            if let Ok(reply) = rx.try_recv() {
+                return reply;
             }
+            let mut guard = lock_lane();
+            // Only a slot this caller still owns *and* the app has not taken
+            // can be withdrawn. A claimed slot means the verb already reached
+            // the commit path, so "no tab changed" would be a guess.
+            let claimed = match guard.slot.as_ref() {
+                Some(slot) if slot.seq == seq => slot.claimed,
+                _ => return TabReply::OutcomeUnknown,
+            };
+            if claimed {
+                // The claim owns the outcome now; it answers the (closed)
+                // channel with `OutcomeUnknown` on drop at the latest.
+                return TabReply::OutcomeUnknown;
+            }
+            guard.slot = None;
+            PENDING.store(false, Ordering::Release);
+            TabReply::Unserviced
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => TabReply::OutcomeUnknown,
     }
@@ -355,10 +374,18 @@ pub(crate) fn request(verb: TabWireVerb, panel: u64, timeout: Duration) -> TabRe
 /// Takes the waiting request, if any.
 ///
 /// The caller owns the claim and must [`TabClaim::complete`] it (dropping it
-/// answers `OutcomeUnknown`).
+/// answers `OutcomeUnknown`). A request is claimable once: the second caller
+/// gets `None`, so the lane can never run one request twice.
 pub(crate) fn claim() -> Option<TabClaim> {
+    if !PENDING.load(Ordering::Acquire) {
+        return None;
+    }
     let mut guard = lock_lane();
     let slot = guard.slot.as_mut()?;
+    if slot.claimed {
+        return None;
+    }
+    slot.claimed = true;
     let seq = slot.seq;
     let verb = slot.verb;
     let panel = slot.panel;
@@ -479,6 +506,51 @@ mod tests {
         // The first caller times out with nothing applied.
         assert_eq!(busy.join().expect("first caller"), TabReply::Unserviced);
         assert!(!is_pending(), "the withdrawn slot is gone");
+    }
+
+    /// Review of #3174, blocking 2: a deadline that fires *after* the app
+    /// claimed the request must report [`TabReply::OutcomeUnknown`], never
+    /// "no tab changed".
+    ///
+    /// Mutation: the lane used to decide "unclaimed" from `slot.seq == seq`
+    /// alone, and `claim()` left the slot in place, so this deadline withdrew a
+    /// claimed slot and answered `Unserviced` — this test fails with
+    /// `left: Unserviced, right: OutcomeUnknown`.
+    #[test]
+    fn a_deadline_after_the_claim_is_outcome_unknown() {
+        let _lane = serial_lane();
+        let handle =
+            std::thread::spawn(|| request(TabWireVerb::Open, 5, Duration::from_millis(200)));
+        let mut spins = 0;
+        while !is_pending() && spins < 10_000 {
+            std::thread::yield_now();
+            spins += 1;
+        }
+        assert!(is_pending(), "the caller parked a slot");
+        // The app takes the request well before the caller's deadline, then
+        // does not answer until after it: the outcome is no longer the
+        // caller's to assume.
+        let claimed = claim().expect("the request is claimable");
+        assert_eq!(claimed.panel(), 5);
+        assert!(
+            claim().is_none(),
+            "a claimed request is not claimable a second time"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            handle.join().expect("caller thread"),
+            TabReply::OutcomeUnknown,
+            "a claimed request is never reported as `Unserviced`"
+        );
+        assert!(
+            is_pending(),
+            "the claimed slot stays the app's until the claim answers"
+        );
+        // Completing after the caller gave up is a no-op send, never a panic.
+        claimed.complete(TabReply::Applied {
+            result: String::from("{}"),
+        });
+        assert!(!is_pending(), "the completed claim released the slot");
     }
 
     #[test]

@@ -892,4 +892,92 @@ mod tests {
         // The focus the runtime reads back after re-homing: committed.
         assert!(staged.commit(Some(PanelId::new(2))).is_ok());
     }
+
+    /// Review of #3174, non-blocking 3: `tab_apply` must commit with the focus
+    /// it reads back *after* the re-home, not with the target it asked for.
+    ///
+    /// A strip whose active tab was dropped from the live layout is the case
+    /// that tells the two apart: `set_focus` cannot land on a view the layout no
+    /// longer hosts, so the read-back is the focus the runtime still has and the
+    /// commit refuses. Mutation: replacing the read-back with the requested
+    /// target (`commit(Some(commit.focus_target()))`) commits here and this
+    /// test fails.
+    #[test]
+    fn a_re_home_that_cannot_land_keeps_focus_and_installs_nothing() {
+        let mut runtime = runtime_with_two_panels();
+        runtime
+            .tab_apply(TabRequest::Switch(PanelId::new(2)))
+            .expect("switch");
+        assert_eq!(runtime.focused_view(), Some(ViewId::new(2)));
+
+        // Drop `v:2` from the live layout: the strip still projects `p:2` and
+        // still has it active.
+        runtime.set_layout(LayoutNode::leaf(View::new(
+            ViewId::new(1),
+            GEOMETRY.0,
+            GEOMETRY.1,
+        )));
+        assert!(runtime.set_focus(ViewId::new(1)));
+        let before = strip(&runtime);
+        assert_eq!(
+            runtime.tab_snapshot().expect("installed").active_panel(),
+            PanelId::new(2),
+            "the strip keeps the activation the last commit installed"
+        );
+
+        // Closing the *background* tab keeps `p:2` active, so the re-home target
+        // is a panel the layout no longer hosts: focus cannot move there.
+        assert_eq!(
+            runtime
+                .tab_apply(TabRequest::Close(PanelId::new(1)))
+                .expect_err("a re-home that cannot land is a refusal, not a commit"),
+            TabError::FocusNotRehomed {
+                expected: PanelId::new(2),
+                actual: Some(PanelId::new(1))
+            }
+        );
+        assert_eq!(
+            runtime.focused_view(),
+            Some(ViewId::new(1)),
+            "the refused re-home left focus where it was"
+        );
+        assert_eq!(strip(&runtime), before, "a refused commit installs nothing");
+    }
+
+    /// Review of #3174, non-blocking 3: a committed transition must leave the
+    /// runtime's full-redraw request armed.
+    ///
+    /// A background close leaves focus on the active tab, so `set_focus` is a
+    /// no-op and cannot be what arms the redraw: only `tab_apply` can.
+    /// Mutation: deleting `self.pending_full_redraw = true;` from `tab_apply`
+    /// leaves the flag disarmed and this test fails.
+    #[test]
+    fn a_committed_tab_arms_the_full_redraw() {
+        let mut runtime = runtime_with_two_panels();
+        runtime
+            .tab_apply(TabRequest::Switch(PanelId::new(2)))
+            .expect("switch");
+
+        // Disarm what the switch armed, so the assertion below is about the
+        // next transition and not about leftover damage.
+        runtime.pending_full_redraw = false;
+        assert!(
+            !runtime.probe_full_redraw_armed(),
+            "precondition: the redraw request was cleared"
+        );
+
+        let outcome = runtime
+            .tab_apply(TabRequest::Close(PanelId::new(1)))
+            .expect("close the background tab");
+        assert_eq!(outcome.focus(), PanelId::new(2));
+        assert_eq!(
+            runtime.focused_view(),
+            Some(ViewId::new(2)),
+            "focus did not move, so `set_focus` armed nothing"
+        );
+        assert!(
+            runtime.probe_full_redraw_armed(),
+            "a committed tab transition must arm the full redraw"
+        );
+    }
 }

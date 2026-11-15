@@ -1127,9 +1127,13 @@ fn control_terminal_spawn_applies_cwd_and_names_it() {
 //
 // The tab verbs do not ride the shared control queue (the `bitty-ipc` pin's
 // scope table predates them), so these tests drive the *served* path end to
-// end at its own seam: CLI parse → wire method + params → handler params parse
-// → bounded lane → app service turn → `Runtime::tab_apply` (the validated
-// commit path). Nothing in the chain is stubbed except the socket itself.
+// end through the production pieces: CLI parse → wire method + params → the
+// real `build_dispatcher(false)` table and `handle_tab_verb` (authorization,
+// server-side params parse, reply classification) → bounded lane → app service
+// turn → `Runtime::tab_apply` (the validated commit path). Nothing in the chain
+// is stubbed except the socket itself, and the dispatcher tests need a
+// socketpair for peer attestation, so they run on unix like the `newWindow`
+// precedent in `ipc_serve`.
 
 #[test]
 fn tab_verbs_parse_and_validate_panel_ids() {
@@ -1262,6 +1266,7 @@ fn tab_verbs_are_documented_in_usage_help_and_completion() {
 }
 
 /// Headless app with two tiled panels (`p:1`, `p:2`) and focus on `p:1`.
+#[cfg(unix)]
 fn tab_test_app() -> crate::terminal_app::TerminalApp {
     use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
 
@@ -1284,37 +1289,86 @@ fn tab_test_app() -> crate::terminal_app::TerminalApp {
     )
 }
 
-/// Runs one parsed tab request through the served chain, headlessly.
+/// A serve context with the CLI default grant, as the socket path builds it.
 ///
-/// This mirrors [`crate::ipc_serve::handle_tab_verb`] step for step except for
-/// the socket: resolve the wire method, re-parse the params server-side, park a
-/// request on the bounded lane, and answer it on the app thread.
-fn run_tab_request(
+/// The returned peer end stays open for the whole test: `dispatch` re-attests
+/// the connected peer before it runs a handler.
+#[cfg(unix)]
+fn tab_serve_context() -> (
+    bitty_ipc::devtools::ServeContext,
+    std::os::unix::net::UnixStream,
+) {
+    use std::os::unix::net::UnixStream;
+
+    let server = bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+    let granted = bitty_ipc::ScopeSet::cli_default();
+    assert!(
+        granted.contains(bitty_ipc::Scope::ViewManage),
+        "fixture precondition: the CLI default carries view.manage"
+    );
+    let authority = bitty_ipc::ctl::ControlAuthority::new();
+    let grant = authority
+        .open_connection(
+            granted.clone(),
+            bitty_ipc::ctl::TerminalCapabilities::from_scopes(&granted),
+        )
+        .expect("connection grant");
+    let (peer, stream) = UnixStream::pair().expect("socketpair");
+    let mut context = bitty_ipc::devtools::ServeContext::with_connection_grant(&server, grant);
+    let proof = context
+        .bind_connected_stream_current(&stream)
+        .expect("bound peer proof");
+    context.attest_local_peer(&proof.identity());
+    (context, peer)
+}
+
+/// Dispatches one parsed tab request through the production serve table,
+/// headlessly.
+///
+/// The real [`crate::ipc_serve`] table authorizes the connection, re-parses the
+/// params server-side and parks the request on the bounded lane; this thread
+/// answers it on the app's next event turn, exactly as `TerminalApp` does. Only
+/// the socket is absent, so the handler under test is the shipped one rather
+/// than a copy of it.
+#[cfg(unix)]
+fn dispatch_tab_request(
     app: &mut crate::terminal_app::TerminalApp,
     request: &CtlRequest,
-) -> crate::ctl::tab::TabReply {
-    use std::time::Duration;
+    context: &bitty_ipc::devtools::ServeContext,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    use std::time::{Duration, Instant};
 
     let _lane = crate::ctl::tab::test_lane_lock();
     crate::ctl::tab::reset_lane();
+
     let method = request.wire_method().expect("tab verbs are wire verbs");
-    let verb = crate::ctl::tab::verb_for_method(method).expect("registered tab method");
-    let params = request.wire_params();
-    let panel_id = crate::ctl::parse_tab_params(params.as_deref()).expect("params parse");
-    let panel = crate::ctl::parse_panel_id(&panel_id).expect("panel id parses");
-    let handle =
-        std::thread::spawn(move || crate::ctl::tab::request(verb, panel, Duration::from_secs(10)));
-    // Wait for the caller to park its slot, then service it here.
-    let mut spins = 0;
-    while !crate::ctl::tab::is_pending() && spins < 100_000 {
-        std::thread::yield_now();
-        spins += 1;
-    }
-    assert!(crate::ctl::tab::is_pending(), "the request is parked");
-    assert!(app.service_tab_requests(), "one request serviced");
-    handle.join().expect("caller thread")
+    let params_part = request
+        .wire_params()
+        .map_or_else(String::new, |params| format!(",\"params\":{params}"));
+    let raw = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+    );
+    let wire = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request document");
+    let dispatcher = crate::ipc_serve::build_dispatcher(false);
+
+    std::thread::scope(|scope| {
+        // The handler blocks on the lane, so it runs on its own thread while
+        // this one plays the app.
+        let caller = scope.spawn(|| dispatcher.dispatch(context, &wire));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::ctl::tab::is_pending() {
+            assert!(
+                Instant::now() < deadline,
+                "the handler never reached the tab lane"
+            );
+            std::thread::yield_now();
+        }
+        assert!(app.service_tab_requests(), "one request serviced");
+        caller.join().expect("handler thread")
+    })
 }
 
+#[cfg(unix)]
 fn tab_strip(app: &crate::terminal_app::TerminalApp) -> Vec<u64> {
     app.runtime
         .tab_snapshot()
@@ -1325,15 +1379,16 @@ fn tab_strip(app: &crate::terminal_app::TerminalApp) -> Vec<u64> {
         .collect()
 }
 
+#[cfg(unix)]
 #[test]
 fn control_tab_verbs_drive_the_validated_commit_path() {
     let mut app = tab_test_app();
     assert!(app.runtime.tab_snapshot().is_none(), "lazy projection");
+    let (context, _peer) = tab_serve_context();
 
     // close: detaches the background projection, keeps p:1 active.
     let (close, _) = parse_ctl_request(&words(&["tab", "close", "p:2"])).expect("parses");
-    let reply = run_tab_request(&mut app, &close);
-    let receipt = reply.applied().expect("close applied").to_string();
+    let receipt = dispatch_tab_request(&mut app, &close, &context).expect("close applied");
     assert!(
         receipt.contains("\"verb\":\"close\"") && receipt.contains("\"removed\":\"p:2\""),
         "the receipt reports the committed transition: {receipt}"
@@ -1343,8 +1398,7 @@ fn control_tab_verbs_drive_the_validated_commit_path() {
 
     // open: re-attaches the projection through the same commit gate.
     let (open, _) = parse_ctl_request(&words(&["tab", "open", "p:2"])).expect("parses");
-    let reply = run_tab_request(&mut app, &open);
-    let receipt = reply.applied().expect("open applied").to_string();
+    let receipt = dispatch_tab_request(&mut app, &open, &context).expect("open applied");
     assert!(receipt.contains("\"verb\":\"open\""), "{receipt}");
     assert_eq!(tab_strip(&app), vec![1, 2]);
     assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
@@ -1352,13 +1406,8 @@ fn control_tab_verbs_drive_the_validated_commit_path() {
     // switch: moves only the active index, focus follows (the commit refuses
     // anything else).
     let (switch, _) = parse_ctl_request(&words(&["tab", "switch", "p:1"])).expect("parses");
-    let reply = run_tab_request(&mut app, &switch);
-    assert!(
-        reply
-            .applied()
-            .expect("switch applied")
-            .contains("\"verb\":\"switch\"")
-    );
+    let receipt = dispatch_tab_request(&mut app, &switch, &context).expect("switch applied");
+    assert!(receipt.contains("\"verb\":\"switch\""), "{receipt}");
     assert_eq!(tab_strip(&app), vec![1, 2], "a switch never reorders");
     assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
 
@@ -1366,33 +1415,40 @@ fn control_tab_verbs_drive_the_validated_commit_path() {
     assert_eq!(app.runtime.layout().leaf_count(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn control_tab_refusals_are_typed_and_leave_state_alone() {
     let mut app = tab_test_app();
+    let (context, _peer) = tab_serve_context();
 
     // Unknown panel: NotFound, no strip change.
     let (unknown, _) = parse_ctl_request(&words(&["tab", "switch", "p:9"])).expect("parses");
-    let reply = run_tab_request(&mut app, &unknown);
-    assert_eq!(reply.class(), ("usage", "NotFound"));
-    assert!(reply.applied().is_none());
-    assert!(
-        reply.message().contains("unknown tab"),
-        "{}",
-        reply.message()
+    let error = dispatch_tab_request(&mut app, &unknown, &context)
+        .expect_err("an unknown panel is refused");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "NotFound"),
+        "{error:?}"
     );
+    assert!(error.message.contains("unknown tab"), "{}", error.message);
     assert_eq!(tab_strip(&app), vec![1, 2]);
     assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
 
     // Closing the last tab: Conflict naming the pane verb instead.
     let (close, _) = parse_ctl_request(&words(&["tab", "close", "p:2"])).expect("parses");
-    assert!(run_tab_request(&mut app, &close).applied().is_some());
+    assert!(dispatch_tab_request(&mut app, &close, &context).is_ok());
     let (last, _) = parse_ctl_request(&words(&["tab", "close", "p:1"])).expect("parses");
-    let reply = run_tab_request(&mut app, &last);
-    assert_eq!(reply.class(), ("usage", "Conflict"));
+    let error =
+        dispatch_tab_request(&mut app, &last, &context).expect_err("the last tab cannot close");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "Conflict"),
+        "{error:?}"
+    );
     assert!(
-        reply.message().contains("close the pane instead"),
+        error.message.contains("close the pane instead"),
         "the refusal names the right verb: {}",
-        reply.message()
+        error.message
     );
     assert_eq!(
         tab_strip(&app),
@@ -1400,14 +1456,20 @@ fn control_tab_refusals_are_typed_and_leave_state_alone() {
         "the refused close changed nothing"
     );
 
-    // Already active: Conflict, not a silent success.
+    // Switching the only remaining tab: the `SingleTab` refusal, reported as
+    // Conflict — never a silent success.
     let (again, _) = parse_ctl_request(&words(&["tab", "switch", "p:1"])).expect("parses");
-    let reply = run_tab_request(&mut app, &again);
-    assert_eq!(reply.class(), ("usage", "Conflict"));
+    let error =
+        dispatch_tab_request(&mut app, &again, &context).expect_err("a single tab cannot switch");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "Conflict"),
+        "{error:?}"
+    );
     assert!(
-        reply.message().contains("single-tab stack"),
+        error.message.contains("single-tab stack"),
         "{}",
-        reply.message()
+        error.message
     );
 }
 

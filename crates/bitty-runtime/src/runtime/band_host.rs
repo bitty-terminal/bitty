@@ -596,6 +596,50 @@ pub fn band_is_visible(root: &UiNode) -> bool {
     !text.is_empty()
 }
 
+/// Display-cell width of a column band's content (issue #3165).
+///
+/// A column band stacks one content row per direct child of a `Column`/`List`
+/// root, so its thickness is the widest such row in display cells. An
+/// axis-neutral `Text` root (or any other root, which the mount gate refuses
+/// for `left`/`right`) is measured as one row. Saturating, so a hostile tree
+/// can never wrap the width; the caller clamps it to the window width.
+#[must_use]
+pub fn column_band_width(root: &UiNode) -> u16 {
+    let widest = match root {
+        UiNode::Column { children, .. } | UiNode::List { children, .. } => children
+            .iter()
+            .map(intrinsic_cells)
+            .fold(0usize, usize::max),
+        _ => intrinsic_cells(root),
+    };
+    u16::try_from(widest).unwrap_or(u16::MAX)
+}
+
+/// Content rows of a column band, top-down, bounded by `max_rows`
+/// (issue #3165).
+///
+/// One row per direct child of a `Column`/`List` root, each flattened under
+/// the root's own declaration (the same row stack the overlay host paints),
+/// so a root-level `fg`/`bg`/`bold` reaches its rows and a nested `Row` still
+/// joins horizontally. Any other root is its single flattened line. `max_rows`
+/// bounds the work to the rows the band can actually paint, so a scene at the
+/// `SCN-1` node ceiling never flattens rows past the screen.
+#[must_use]
+pub fn column_band_rows(root: &UiNode, max_rows: usize) -> Vec<(String, Vec<BandRun>)> {
+    let inherited = BandInherited::of(root);
+    let mut rows: Vec<(String, Vec<BandRun>)> = Vec::new();
+    match root {
+        UiNode::Column { children, .. } | UiNode::List { children, .. } => {
+            for child in children.iter().take(max_rows) {
+                rows.push(flatten_band_runs_under(child, &inherited));
+            }
+        }
+        _ if max_rows > 0 => rows.push(flatten_band_runs(root)),
+        _ => {}
+    }
+    rows
+}
+
 /// One bounded per-item hit region emitted by a band (issue #2248).
 ///
 /// The rectangle is one row high and spans display cells `[start_col,
@@ -1723,9 +1767,8 @@ impl Runtime {
     ///
     /// Counts visible bands only, clamped by the degradation budget
     /// ([`Self::plugin_band_budget`]): `0` when the window cannot hold the
-    /// bands above the content floor, or for a vertical edge (this build has
-    /// no vertical band host, so mounts to `left`/`right` fail closed and no
-    /// vertical band can exist).
+    /// bands above the content floor, or for a vertical (column) edge — column
+    /// bands reserve columns, see [`Self::visible_band_column_count`].
     #[must_use]
     pub fn visible_band_count(&self, edge: BandEdge) -> u16 {
         let (top, bottom) = self.plugin_band_budget();
@@ -1734,6 +1777,28 @@ impl Runtime {
             BandEdge::Bottom => bottom,
             BandEdge::Left | BandEdge::Right => 0,
         }
+    }
+
+    /// Visible vertical bands on `edge`, clamped by the column budget
+    /// (issue #3165).
+    ///
+    /// The column mirror of [`Self::visible_band_count`]: the number of
+    /// visible (non-empty-text) bands on `left`/`right`, or `0` when that
+    /// side's reserved width does not fit above the column content floor, or
+    /// for a horizontal (row) edge. The reserved width itself is
+    /// [`Self::plugin_band_column_budget`].
+    #[must_use]
+    pub fn visible_band_column_count(&self, edge: BandEdge) -> u16 {
+        let (left, right) = self.plugin_band_column_budget();
+        let admitted = match edge {
+            BandEdge::Left => left,
+            BandEdge::Right => right,
+            BandEdge::Top | BandEdge::Bottom => return 0,
+        };
+        if admitted == 0 {
+            return 0;
+        }
+        u16::try_from(self.visible_edge_bands(edge).len()).unwrap_or(u16::MAX)
     }
 
     /// Degraded-visible band budget per horizontal edge (CTX-0946 C3).
@@ -1771,6 +1836,39 @@ impl Runtime {
         (top, bottom)
     }
 
+    /// Width budget of the visible vertical bands per edge, in window columns
+    /// (issue #3165).
+    ///
+    /// The column mirror of [`Self::plugin_band_budget`]: `(left, right)` are
+    /// the sums of the visible bands' content widths on each side, or
+    /// `(0, 0)` when both sides together cannot fit above the column content
+    /// floor (`chrome_min_cols`, the crate-internal column mirror of the row
+    /// floor). Degrading a whole side rather than
+    /// a tail keeps the reservation and the paint plan on one number, so a
+    /// band is never reserved but unpainted (or painted but unreserved).
+    #[must_use]
+    pub fn plugin_band_column_budget(&self) -> (u16, u16) {
+        let width = |edge| {
+            self.chrome_bands
+                .edge(edge)
+                .iter()
+                .filter(|band| band_is_visible(&band.root))
+                .map(|band| column_band_width(&band.root))
+                .fold(0u16, u16::saturating_add)
+        };
+        let (left, right) = (width(BandEdge::Left), width(BandEdge::Right));
+        if left == 0 && right == 0 {
+            return (0, 0);
+        }
+        let window = self.window_cells();
+        let want = u32::from(left).saturating_add(u32::from(right));
+        let floor = u32::from(self.chrome_min_cols());
+        if want.saturating_add(floor) > u32::from(window.width) {
+            return (0, 0);
+        }
+        (left, right)
+    }
+
     /// Window row painted by visible band `index` on `edge` (CTX-0946 C3).
     ///
     /// `index` counts visible bands only (hidden bands take no row).
@@ -1784,15 +1882,46 @@ impl Runtime {
         self.plugin_band_row(edge, index)
     }
 
-    /// Layout container minus the budgeted plugin bands (CTX-0946 C3).
+    /// Leftmost window column of visible vertical band `index` on `edge`
+    /// (issue #3165): the column mirror of [`Self::visible_band_row`].
+    ///
+    /// `index` counts visible bands only and stacks from the window edge
+    /// inward (index `0` outermost), so the band starts inward of the summed
+    /// widths of every visible band held outward of it on the same edge.
+    /// `None` for a horizontal edge, an out-of-range index, a width of zero,
+    /// or a band degraded away by [`Self::plugin_band_column_budget`].
+    #[must_use]
+    pub fn visible_band_column(&self, edge: BandEdge, index: usize) -> Option<u16> {
+        if u64::try_from(index).unwrap_or(u64::MAX)
+            >= u64::from(self.visible_band_column_count(edge))
+        {
+            return None;
+        }
+        let bands = self.visible_edge_bands(edge);
+        let offset = bands
+            .iter()
+            .take(index)
+            .map(|band| column_band_width(&band.root))
+            .fold(0u16, u16::saturating_add);
+        let width = bands
+            .get(index)
+            .map_or(0, |band| column_band_width(&band.root));
+        ChromeBands::band_column(edge, offset, width, self.window_cells().width)
+    }
+
+    /// Layout container minus the budgeted horizontal bands (CTX-0946 C3).
     ///
     /// CTX-0979: Core draws no workspace display, so the container starts
     /// from the full window grid; this carves the plugin exclusive zone out
     /// of it. Falls back to the full window when the budget hides every
     /// band, so the no-plugin frame is byte-identical to before. Saturating
     /// and total.
+    ///
+    /// Issue #3165: this is the row carve only — the columns the vertical
+    /// bands own are removed by [`Self::band_exclusive_container`], and a
+    /// column band spans exactly this rect's rows.
     #[must_use]
-    pub fn band_exclusive_container(&self) -> bitty_ui::Rect {
+    pub fn band_row_container(&self) -> bitty_ui::Rect {
         let window = self.chrome_layout().container;
         let (top, bottom) = self.plugin_band_budget();
         if top == 0 && bottom == 0 {
@@ -1805,6 +1934,28 @@ impl Runtime {
             .saturating_sub(bottom);
         let height = end.saturating_sub(y);
         bitty_ui::Rect::new(window.x, y, window.width, height)
+    }
+
+    /// Layout container minus the budgeted plugin bands (CTX-0946 C3,
+    /// issue #3165 for the vertical edges).
+    ///
+    /// Horizontal bands reserve rows ([`Self::band_row_container`]) and the
+    /// vertical bands reserve their column ranges from that rect, so a
+    /// `left`/`right` band shrinks the container width exactly as a
+    /// `top`/`bottom` band shrinks its height. Falls back to the row carve
+    /// when the column budget hides every vertical band, so a window with no
+    /// vertical mount is byte-identical to before. Saturating and total.
+    #[must_use]
+    pub fn band_exclusive_container(&self) -> bitty_ui::Rect {
+        let window = self.band_row_container();
+        let (left, right) = self.plugin_band_column_budget();
+        if left == 0 && right == 0 {
+            return window;
+        }
+        let x = window.x.saturating_add(left);
+        let end = window.x.saturating_add(window.width).saturating_sub(right);
+        let width = end.saturating_sub(x);
+        bitty_ui::Rect::new(x, window.y, width, window.height)
     }
 
     /// Band rows currently painted, for overlap fail-closed checks.
@@ -3854,5 +4005,208 @@ mod tests {
         rt.queue_band_hover(request(Some(origin)));
         assert_eq!(rt.band_hover_queue.len(), 1);
         assert_eq!(rt.band_stats.hovers_routed, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Column bands (issue #3165)
+    // -----------------------------------------------------------------------
+
+    /// One column band whose root stacks `rows` top-down.
+    fn column_block(plugin: &str, slot: UiSlot, rows: &[&str]) -> BandContent {
+        BandContent {
+            plugin_id: plugin.to_string(),
+            slot,
+            root: UiNode::column(rows.iter().map(|row| UiNode::text(*row)).collect()),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn column_band_width_measures_the_widest_root_row() {
+        // The scene decides the band thickness: the widest direct child, not
+        // the sum (a sum would make every vertical band the whole window).
+        let band = column_block("test-bar", UiSlot::Left, &["ab", "abcdef", "abc"]);
+        assert_eq!(column_band_width(&band.root), 6);
+        // A nested `Row` child is measured as one row, joined horizontally.
+        let nested = UiNode::column(vec![UiNode::row(vec![
+            UiNode::text("ab"),
+            UiNode::text("cde"),
+        ])]);
+        assert_eq!(column_band_width(&nested), 5);
+        // The axis-neutral single-line root.
+        assert_eq!(column_band_width(&UiNode::text("abcd")), 4);
+        // A hidden band measures zero; it never reserves columns.
+        assert_eq!(column_band_width(&UiNode::column(Vec::new())), 0);
+        // Wide cells are two cells wide, so the band never clips them.
+        assert_eq!(column_band_width(&UiNode::text("日本")), 4);
+    }
+
+    #[test]
+    fn column_band_rows_stack_one_row_per_child_in_order() {
+        let root = UiNode::column(vec![
+            UiNode::text("cpu"),
+            UiNode::text("mem"),
+            UiNode::text("net"),
+        ]);
+        let rows = column_band_rows(&root, 8);
+        let text: Vec<&str> = rows.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(
+            text,
+            ["cpu", "mem", "net"],
+            "declaration order is paint order"
+        );
+        // The row budget bounds the work: rows past the band clip away
+        // without flattening the rest of the scene.
+        let bounded = column_band_rows(&root, 2);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(column_band_rows(&root, 0).len(), 0);
+        // A `List` root stacks identically.
+        let list = UiNode::list(vec![UiNode::text("a"), UiNode::text("b")]);
+        assert_eq!(column_band_rows(&list, 4).len(), 2);
+        // The axis-neutral `Text` root is one row.
+        let single = column_band_rows(&UiNode::text("only"), 4);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].0, "only");
+    }
+
+    #[test]
+    fn column_bands_reserve_columns_from_the_window_edge() {
+        // Acceptance 1: a mounted `left` scene owns a bounded band and its
+        // columns leave the layout container, exactly as a row band takes
+        // rows.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let window = rt.window_cells();
+        let band = column_block("test-bar", UiSlot::Left, &["cpu 42%", "mem 30%"]);
+        let width = column_band_width(&band.root);
+        assert_eq!(width, 7);
+        rt.set_chrome_bands(ChromeBands {
+            left: vec![band],
+            ..Default::default()
+        });
+
+        assert_eq!(rt.plugin_band_column_budget(), (width, 0));
+        assert_eq!(rt.visible_band_column_count(BandEdge::Left), 1);
+        assert_eq!(rt.visible_band_column(BandEdge::Left, 0), Some(0));
+        assert_eq!(rt.visible_band_column(BandEdge::Left, 1), None);
+        // No row geometry appears for a column band.
+        assert_eq!(rt.visible_band_count(BandEdge::Left), 0);
+        assert_eq!(rt.visible_band_row(BandEdge::Left, 0), None);
+
+        let container = rt.band_exclusive_container();
+        assert_eq!(
+            container.width,
+            window.width - width,
+            "content keeps the rest"
+        );
+        assert_eq!(container.height, window.height, "columns cost no rows");
+        assert_eq!(container.x, window.x + width);
+        // The row carve is untouched: a column band spans its rows.
+        assert_eq!(rt.band_row_container().width, window.width);
+    }
+
+    #[test]
+    fn right_column_bands_stack_inward_from_the_right_window_edge() {
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let window = rt.window_cells();
+        // Plugin id order decides stacking, not mount order: `aaa` (2 wide)
+        // sorts first and therefore sits outermost, at the window edge.
+        let (bands, unplaced) = ChromeBands::from_mounts([
+            (
+                "bbb".to_string(),
+                UiSlot::Right,
+                UiNode::column(vec![UiNode::text("abcd")]),
+                1,
+            ),
+            (
+                "aaa".to_string(),
+                UiSlot::Right,
+                UiNode::column(vec![UiNode::text("xy")]),
+                1,
+            ),
+        ]);
+        assert_eq!(unplaced, 0);
+        rt.set_chrome_bands(bands);
+        assert_eq!(rt.plugin_band_column_budget(), (0, 6));
+        // Index 0 is the outermost band: `aaa` occupies the last two columns,
+        // `bbb` stacks inward of it.
+        assert_eq!(
+            rt.visible_band_column(BandEdge::Right, 0),
+            Some(window.width - 2)
+        );
+        assert_eq!(
+            rt.visible_band_column(BandEdge::Right, 1),
+            Some(window.width - 6)
+        );
+        assert_eq!(
+            rt.band_exclusive_container().width,
+            window.width - 6,
+            "both bands reserve columns"
+        );
+    }
+
+    #[test]
+    fn column_budget_hides_a_side_that_cannot_fit_the_content_floor() {
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let window = rt.window_cells();
+        let too_wide = "x".repeat(usize::from(window.width));
+        rt.set_chrome_bands(ChromeBands {
+            left: vec![column_block("test-bar", UiSlot::Left, &[&too_wide])],
+            ..Default::default()
+        });
+        assert_eq!(
+            rt.plugin_band_column_budget(),
+            (0, 0),
+            "a side wider than the window degrades away instead of eating the content"
+        );
+        assert_eq!(rt.visible_band_column_count(BandEdge::Left), 0);
+        assert_eq!(rt.band_exclusive_container(), window, "no reservation");
+    }
+
+    #[test]
+    fn row_band_geometry_is_unchanged_beside_a_column_band() {
+        // Acceptance 3: `top`/`bottom` keep their rows, budget, and height
+        // carve while a vertical band reserves columns.
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let window = rt.window_cells();
+        let row_band = BandContent {
+            plugin_id: "test-bar".to_string(),
+            slot: UiSlot::Top,
+            root: UiNode::row(vec![UiNode::text("clock")]),
+            version: 1,
+        };
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![row_band],
+            ..Default::default()
+        });
+        let rows_only = rt.plugin_band_budget();
+        let row_only = rt.visible_band_row(BandEdge::Top, 0);
+        let container_rows_only = rt.band_exclusive_container();
+        assert_eq!(rows_only, (1, 0));
+        assert_eq!(row_only, Some(window.y));
+
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![BandContent {
+                plugin_id: "test-bar".to_string(),
+                slot: UiSlot::Top,
+                root: UiNode::row(vec![UiNode::text("clock")]),
+                version: 1,
+            }],
+            left: vec![column_block("side-bar", UiSlot::Left, &["cpu"])],
+            ..Default::default()
+        });
+        assert_eq!(rt.plugin_band_budget(), rows_only, "row budget unchanged");
+        assert_eq!(
+            rt.visible_band_row(BandEdge::Top, 0),
+            row_only,
+            "top band keeps its row"
+        );
+        let container = rt.band_exclusive_container();
+        assert_eq!(container.height, container_rows_only.height);
+        assert_eq!(container.y, container_rows_only.y);
+        assert_eq!(
+            container.width,
+            container_rows_only.width - 3,
+            "only the column band's width leaves the container"
+        );
     }
 }

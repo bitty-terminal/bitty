@@ -3848,6 +3848,26 @@ impl Runtime {
         )
     }
 
+    /// Effective minimum container columns before any vertical (`left`/
+    /// `right`) plugin band may be reserved (issue #3165).
+    ///
+    /// The column mirror of [`Self::chrome_min_rows`]: the
+    /// [`MIN_CONTENT_COLS`](super::chrome_band::MIN_CONTENT_COLS) content
+    /// floor plus both outer cell gaps plus the horizontal decoration ring in
+    /// live columns, so a reserved vertical band never leaves a leaf with
+    /// zero content columns.
+    pub(super) fn chrome_min_cols(&self) -> u16 {
+        let deco = self.config.decoration;
+        let deco_px = 2.0
+            * (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
+            * self.dpi_scale();
+        chrome_band::min_container_cols(
+            self.config.gaps_out,
+            deco_px,
+            self.live_cell_metrics().width,
+        )
+    }
+
     /// CTX-0979: Core draws no workspace display (Hyprland-style), so no
     /// Core bar band is ever reserved. The layout container starts from the
     /// full window grid; plugin bands carve their exclusive zone out of it

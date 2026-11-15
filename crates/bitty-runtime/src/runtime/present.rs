@@ -6248,6 +6248,12 @@ impl Runtime {
     /// geometry violation (a band overlapping another band, the Core bar, or
     /// the layout container) skips the whole band, never a partial paint,
     /// and counts a diagnostic.
+    ///
+    /// Issue #3165: column bands (`left`/`right`) paint after the row bands
+    /// through the same span renderer — one row per root child, clipped to the
+    /// band's reserved width, top-down from the row-carved container's first
+    /// row. They paint no shared chrome rule yet (a follow-up), so the
+    /// `Left`/`Right` arm of [`Self::paint_band_row`] stays a no-op.
     fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
         use super::band_host::band_is_visible;
 
@@ -6265,9 +6271,11 @@ impl Runtime {
 
         // Owned snapshot first: the renderer takes `&mut self` below.
         //
-        // Only horizontal edges exist here: `ui_slot_placement` rejects
-        // `left`/`right` at mount until a vertical band host ships
-        // (CTX-1341), so no vertical block can reach the paint plan.
+        // Issue #3165: row bands (`top`/`bottom`) and column bands
+        // (`left`/`right`) plan separately — a row band paints one window row
+        // across the window, a column band paints one row per root child
+        // inside its column range — but they share the same visibility,
+        // budget, and fail-closed rules.
         let mut plan: Vec<(BandEdge, u16, super::BandContent)> = Vec::new();
         for edge in [BandEdge::Top, BandEdge::Bottom] {
             for (index, band) in self.visible_edge_bands(edge).into_iter().enumerate() {
@@ -6280,7 +6288,34 @@ impl Runtime {
                 plan.push((edge, row, band.clone()));
             }
         }
-        if plan.is_empty() {
+        // A column band spans the row-carved container, so its row budget is
+        // that rect's height: rows past it clip away instead of painting over
+        // the content or the window edge.
+        let column_area = self.band_row_container();
+        let mut column_plan: Vec<ColumnBandPaint> = Vec::new();
+        for edge in [BandEdge::Left, BandEdge::Right] {
+            for (index, band) in self.visible_edge_bands(edge).into_iter().enumerate() {
+                if !band_is_visible(&band.root) {
+                    continue;
+                }
+                let Some(column) = self.visible_band_column(edge, index) else {
+                    continue;
+                };
+                let width = super::band_host::column_band_width(&band.root).min(window.width);
+                if width == 0 {
+                    continue;
+                }
+                let rows =
+                    super::band_host::column_band_rows(&band.root, usize::from(column_area.height));
+                column_plan.push(ColumnBandPaint {
+                    edge,
+                    column,
+                    width,
+                    rows,
+                });
+            }
+        }
+        if plan.is_empty() && column_plan.is_empty() {
             return;
         }
         // Overlap fail-closed: rows claimed twice deny every claimant on
@@ -6314,6 +6349,51 @@ impl Runtime {
                 pad_px, layers, *row, &text, &runs, band_cells, window.x, default_fg, default_bg,
                 *edge,
             );
+        }
+
+        // Issue #3165: column bands paint their row stack top-down inside the
+        // reserved column range. The same fail-closed guards apply: a band
+        // whose columns reach the layout container, or that the exclusive zone
+        // did not reserve, paints nothing and counts one violation. Each row
+        // is painted by the row renderer at the band's column with the band's
+        // width as the clip, so column and row bands share one span renderer.
+        let container_x_end = container.x.saturating_add(container.width);
+        for band in &column_plan {
+            let col_end = band.column.saturating_add(band.width);
+            if band.column < container_x_end && col_end > container.x {
+                self.band_stats.paint_violations =
+                    self.band_stats.paint_violations.saturating_add(1);
+                continue;
+            }
+            if col_end > window.x.saturating_add(window.width) {
+                self.band_stats.paint_violations =
+                    self.band_stats.paint_violations.saturating_add(1);
+                continue;
+            }
+            let band_width = usize::from(band.width);
+            for (offset, (text, runs)) in band.rows.iter().enumerate() {
+                if text.is_empty() {
+                    continue;
+                }
+                let Some(offset) = u16::try_from(offset).ok() else {
+                    break;
+                };
+                let Some(row) = column_area.y.checked_add(offset) else {
+                    break;
+                };
+                self.paint_band_row(
+                    pad_px,
+                    layers,
+                    row,
+                    text,
+                    runs,
+                    band_width,
+                    band.column,
+                    default_fg,
+                    default_bg,
+                    band.edge,
+                );
+            }
         }
     }
 
@@ -6435,6 +6515,8 @@ impl Runtime {
                 .saturating_add(cell_h)
                 .saturating_sub(i32::from(rule_h)),
             BandEdge::Bottom => origin_y,
+            // Issue #3165: a column band paints no shared rule yet; the
+            // content-facing column would need its own (vertical) strip.
             BandEdge::Left | BandEdge::Right => return,
         };
         let rule_x = pad_px.saturating_add(
@@ -8887,6 +8969,18 @@ struct OverlayPill {
     clip_cols: u16,
 }
 
+/// One planned column band paint (issue #3165).
+///
+/// `column` is the band's leftmost window cell, `width` its reserved width in
+/// columns, and `rows` its flattened content (one row per root child, top
+/// down), already bounded by the row-carved container's height.
+struct ColumnBandPaint {
+    edge: BandEdge,
+    column: u16,
+    width: u16,
+    rows: Vec<(String, Vec<band_host::BandRun>)>,
+}
+
 /// Combined draw layers assembled by the present phases (CTX-0474).
 ///
 /// The leaf pass fills the grid layers and the cursor; the overlay phases
@@ -10675,6 +10769,120 @@ mod plugin_overlay_paint_tests {
                 .iter()
                 .all(|glyph| glyph.color != tokens.border_muted),
             "horizontal band chrome must not paint corner glyphs over band cells"
+        );
+    }
+
+    /// One column band whose root stacks `rows` top-down (issue #3165).
+    fn column_surface(slot: bitty_lua::ui::UiSlot, rows: &[&str]) -> BandContent {
+        BandContent {
+            plugin_id: String::from("bitty-terminal.sidebar"),
+            slot,
+            root: bitty_lua::ui::UiNode::column(
+                rows.iter()
+                    .map(|row| bitty_lua::ui::UiNode::text(*row))
+                    .collect(),
+            ),
+            version: 1,
+        }
+    }
+
+    #[test]
+    fn column_band_paints_its_row_stack_inside_the_reserved_columns() {
+        // Issue #3165 acceptance 1: `bitty.ui.mount("left", …)` paints its
+        // scene into a bounded band — one row per root child, clipped to the
+        // band's own width, in the columns the exclusive zone reserved, and
+        // never over the content area.
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        let band = column_surface(bitty_lua::ui::UiSlot::Left, &["cpu 42%", "mem 30%"]);
+        rt.set_chrome_bands(ChromeBands {
+            left: vec![band],
+            ..Default::default()
+        });
+        rt.tick().expect("tick insets the container for the band");
+
+        assert_eq!(rt.visible_band_column(BandEdge::Left, 0), Some(window.x));
+        assert_eq!(
+            rt.container().width,
+            window.width - 7,
+            "the band reserves its seven columns"
+        );
+
+        let mut layers = FrameLayers::default();
+        rt.paint_chrome_bands(8, &mut layers);
+        assert_eq!(
+            rt.band_host_stats().paint_violations,
+            0,
+            "a reserved column band is never a geometry violation"
+        );
+        assert!(!layers.combined_overlay.is_empty(), "band paints its fills");
+        assert!(!layers.combined_glyphs.is_empty(), "band paints its text");
+
+        let cell_w = rt.live_cell_metrics().width;
+        let cell_h = rt.live_cell_metrics().height;
+        let band_px = 7 * i32::try_from(cell_w).unwrap_or(i32::MAX);
+        for fill in &layers.combined_overlay {
+            assert!(fill.rect.x >= 8, "fill starts inside the window pad");
+            assert!(
+                fill.rect.x <= 8 + band_px - i32::try_from(fill.rect.width).unwrap_or(0),
+                "fill {} leaves the band's columns",
+                fill.rect.x
+            );
+        }
+        // Two root children stack on consecutive rows from the container's
+        // first row (the renderer's baseline offset cancels in the delta).
+        let mut rows: Vec<i32> = layers
+            .combined_glyphs
+            .iter()
+            .map(|glyph| glyph.dest[1])
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows.len(), 2, "one painted row per root child");
+        assert_eq!(
+            rows[1] - rows[0],
+            i32::try_from(cell_h).unwrap_or(0),
+            "the two rows are one cell apart, top-down"
+        );
+        for glyph in &layers.combined_glyphs {
+            assert!(
+                glyph.dest[0] >= 8 && glyph.dest[0] < 8 + band_px,
+                "glyph at {} stays inside the band",
+                glyph.dest[0]
+            );
+        }
+    }
+
+    #[test]
+    fn right_column_band_paints_flush_to_the_right_window_edge() {
+        // The right edge mirrors the left: the band owns the trailing columns
+        // and the container ends where they begin.
+        let mut rt = runtime();
+        let window = rt.window_cells();
+        rt.set_chrome_bands(ChromeBands {
+            right: vec![column_surface(bitty_lua::ui::UiSlot::Right, &["net"])],
+            ..Default::default()
+        });
+        rt.tick().expect("tick insets the container for the band");
+        let expected = window.x + window.width - 3;
+        assert_eq!(rt.visible_band_column(BandEdge::Right, 0), Some(expected));
+        assert_eq!(rt.container().width, window.width - 3);
+
+        let mut layers = FrameLayers::default();
+        rt.paint_chrome_bands(8, &mut layers);
+        assert_eq!(rt.band_host_stats().paint_violations, 0);
+        assert!(
+            !layers.combined_overlay.is_empty() && !layers.combined_glyphs.is_empty(),
+            "the right band paints its fills and text"
+        );
+        let cell_w = i32::try_from(rt.live_cell_metrics().width).unwrap_or(1);
+        let start = 8 + i32::from(expected) * cell_w;
+        assert!(
+            layers
+                .combined_glyphs
+                .iter()
+                .all(|glyph| glyph.dest[0] >= start && glyph.dest[0] < start + 3 * cell_w),
+            "right band glyphs stay in the trailing columns"
         );
     }
 

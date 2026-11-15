@@ -664,28 +664,23 @@ fn bounds_fail_closed() {
 fn slot_placement_is_exhaustive() {
     // The bridge slot set and the host placement policy agree for every
     // accepted name; an unhosted slot fails with the frozen v1 code instead of
-    // returning a handle the renderer would never paint.
+    // returning a handle the renderer would never paint. Issue #3165 moved
+    // `left`/`right` from the unhosted set to their own band edges.
     assert_eq!(UiSlot::ALL.len(), 7);
     for slot in UiSlot::ALL {
         match (slot, ui_slot_placement(slot)) {
             (UiSlot::Top, UiSlotPlacement::Band(BandEdge::Top))
             | (UiSlot::Bottom, UiSlotPlacement::Band(BandEdge::Bottom))
+            | (UiSlot::Left, UiSlotPlacement::Band(BandEdge::Left))
+            | (UiSlot::Right, UiSlotPlacement::Band(BandEdge::Right))
             | (UiSlot::Overlay, UiSlotPlacement::Overlay) => {}
-            (
-                UiSlot::Left | UiSlot::Right | UiSlot::Tabline | UiSlot::Terminal,
-                UiSlotPlacement::Unsupported(_),
-            ) => {}
+            (UiSlot::Tabline | UiSlot::Terminal, UiSlotPlacement::Unsupported(_)) => {}
             (other, placement) => {
                 panic!("{other:?} placement changed without a parity decision: {placement:?}")
             }
         }
     }
-    for slot in [
-        UiSlot::Left,
-        UiSlot::Right,
-        UiSlot::Tabline,
-        UiSlot::Terminal,
-    ] {
+    for slot in [UiSlot::Tabline, UiSlot::Terminal] {
         let error = unsupported_slot_error(slot, "parity probe");
         assert_eq!(error.class, "runtime");
         assert_eq!(error.code, bitty_lua::E_UI_UNAVAILABLE);

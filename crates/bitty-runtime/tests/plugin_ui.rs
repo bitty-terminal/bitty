@@ -587,26 +587,43 @@ fn lua_band_slot_mounts_land_in_the_expected_band() {
     assert!(slots(BandEdge::Right).is_empty());
 }
 
-/// CTX-1341 / #2226: `left` and `right` used to return a successful handle
-/// even though the renderer never painted them, reserved no columns, and had
-/// no hit target. They now fail closed at mount with the existing typed
-/// `E_UI_UNAVAILABLE` code, so silent success is impossible.
+/// Issue #3165: `left`/`right` used to be refused at mount (CTX-1341/#2226)
+/// because no renderer painted them, reserved their columns, or hit-tested
+/// them. The vertical band host now serves both slots end to end: a column
+/// scene gains a handle, is routed to its own edge, and a row-shaped scene is
+/// still refused with a typed error instead of being painted horizontally
+/// down a column.
 #[test]
-fn vertical_band_slots_fail_closed_at_mount() {
+fn vertical_band_slots_mount_column_scenes_and_refuse_row_scenes() {
     let fixture = Fixture::activate(
         "vertical-slots",
         "bitty-featured.uivertical",
         &["ui.rich"],
         &[],
         r#"
-        local left_ok, left_err = pcall(bitty.ui.mount, "left", { kind = "Text", text = "left" })
-        local right_ok, right_err = pcall(bitty.ui.mount, "right", { kind = "Text", text = "right" })
+        local left_ok, left_handle = pcall(bitty.ui.mount, "left", {
+          kind = "Column",
+          children = {
+            { kind = "Text", text = "cpu 42%" },
+            { kind = "Text", text = "mem 30%" },
+          },
+        })
+        local right_ok, right_handle = pcall(bitty.ui.mount, "right", {
+          kind = "Column",
+          children = { { kind = "Text", text = "net" } },
+        })
+        local bad_ok, bad_err = pcall(bitty.ui.mount, "left", {
+          kind = "Row",
+          children = { { kind = "Text", text = "a" }, { kind = "Text", text = "b" } },
+        })
         bitty.store.set("left_ok", left_ok)
-        bitty.store.set("left_code", left_ok and "NONE" or left_err.code)
-        bitty.store.set("left_message", left_ok and "" or left_err.message)
+        bitty.store.set("left_handle", left_ok and left_handle or 0)
         bitty.store.set("right_ok", right_ok)
-        bitty.store.set("right_code", right_ok and "NONE" or right_err.code)
-        bitty.store.set("right_message", right_ok and "" or right_err.message)
+        bitty.store.set("right_handle", right_ok and right_handle or 0)
+        bitty.store.set("bad_ok", bad_ok)
+        bitty.store.set("bad_code", bad_ok and "NONE" or bad_err.code)
+        bitty.store.set("bad_class", bad_ok and "NONE" or bad_err.class)
+        bitty.store.set("bad_message", bad_ok and "" or bad_err.message)
         return {}
         "#,
     );
@@ -614,24 +631,110 @@ fn vertical_band_slots_fail_closed_at_mount() {
     for slot in ["left", "right"] {
         assert_eq!(
             store_value(&fixture.runtime, &fixture.id, &format!("{slot}_ok")),
-            Some(LuaValue::Bool(false)),
-            "{slot} mount must not succeed silently"
+            Some(LuaValue::Bool(true)),
+            "{slot} mount must return a handle"
         );
-        assert_eq!(
-            store_value(&fixture.runtime, &fixture.id, &format!("{slot}_code")),
-            Some(LuaValue::String(E_UI_UNAVAILABLE.to_string())),
-            "{slot} mount must fail with the typed code"
+        let handle = store_value(&fixture.runtime, &fixture.id, &format!("{slot}_handle"));
+        assert!(
+            matches!(handle, Some(LuaValue::Integer(handle)) if handle > 0),
+            "{slot} mount must yield a live handle, got {handle:?}"
         );
-        let message = store_value(&fixture.runtime, &fixture.id, &format!("{slot}_message"));
-        let Some(LuaValue::String(message)) = message else {
-            panic!("{slot} mount must carry an error message");
-        };
-        assert!(message.contains(&format!("'{slot}'")), "{message}");
-        assert!(message.contains("vertical band"), "{message}");
     }
 
-    // Nothing was retained: a rejected mount leaves no phantom block that
-    // could later be painted or routed.
+    // The row-shaped scene is refused, and the refusal is typed with the
+    // accepted component-error code (not the unhosted-slot code).
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "bad_ok"),
+        Some(LuaValue::Bool(false))
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "bad_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "bad_class"),
+        Some(LuaValue::String("validation".to_string()))
+    );
+    let Some(LuaValue::String(message)) = store_value(&fixture.runtime, &fixture.id, "bad_message")
+    else {
+        panic!("the refusal must carry a message");
+    };
+    assert!(message.contains("'left'"), "{message}");
+    assert!(message.contains("'Row'"), "{message}");
+
+    // Two live blocks only: the refused mount retained nothing.
+    let blocks = fixture.runtime.ui_blocks();
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    // Mounted blocks route to their own edges through the shared placement
+    // policy, with nothing leaking into a row band or the other edge.
+    let (bands, unplaced) = ChromeBands::from_mounts(
+        blocks
+            .into_iter()
+            .map(|(id, slot, node, version)| (id.as_str().to_string(), slot, node, version)),
+    );
+    assert_eq!(unplaced, 0);
+    assert_eq!(
+        bands.left.iter().map(|band| band.slot).collect::<Vec<_>>(),
+        [UiSlot::Left]
+    );
+    assert_eq!(
+        bands.right.iter().map(|band| band.slot).collect::<Vec<_>>(),
+        [UiSlot::Right]
+    );
+    assert!(bands.top.is_empty() && bands.bottom.is_empty());
+}
+
+/// Issue #3165 acceptance 1: the vertical slots inherit the same bridge
+/// bounds as the row bands — the `SCN-1` node ceiling is enforced by the one
+/// component reader, so a `left` mount over the budget is refused instead of
+/// reserving a band for a scene that cannot be painted.
+#[test]
+fn vertical_band_mount_obeys_the_shared_component_node_budget() {
+    let fixture = Fixture::activate(
+        "vertical-budget",
+        "bitty-featured.uibudget",
+        &["ui.rich"],
+        &[],
+        r#"
+        local children = {}
+        for i = 1, 2049 do
+          children[i] = { kind = "Text", text = "" }
+        end
+        local ok, err = pcall(bitty.ui.mount, "left", { kind = "Column", children = children })
+        bitty.store.set("over_ok", ok)
+        bitty.store.set("over_code", ok and "NONE" or err.code)
+
+        local depth = { kind = "Text", text = "" }
+        for _ = 1, 16 do
+          depth = { kind = "Column", children = { depth } }
+        end
+        local deep_ok, deep_err = pcall(bitty.ui.mount, "right", depth)
+        bitty.store.set("deep_ok", deep_ok)
+        bitty.store.set("deep_code", deep_ok and "NONE" or deep_err.code)
+        return {}
+        "#,
+    );
+
+    // 2049 children plus the root exceed 2048 nodes (SCN-1).
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "over_ok"),
+        Some(LuaValue::Bool(false)),
+        "the node ceiling applies to a vertical band"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "over_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    // 16 nested Column wrappers plus the leaf exceed UI_MAX_DEPTH (16).
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "deep_ok"),
+        Some(LuaValue::Bool(false)),
+        "the depth ceiling applies to a vertical band"
+    );
+    assert_eq!(
+        store_value(&fixture.runtime, &fixture.id, "deep_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
     assert!(fixture.runtime.ui_blocks().is_empty());
 }
 

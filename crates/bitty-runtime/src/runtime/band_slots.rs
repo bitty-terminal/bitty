@@ -12,10 +12,10 @@
 //!
 //! | Slot         | Placement                                              |
 //! |--------------|--------------------------------------------------------|
-//! | `top`        | top edge band                                          |
-//! | `bottom`     | bottom edge band                                       |
-//! | `left`       | rejected: no vertical band host in this build          |
-//! | `right`      | rejected: no vertical band host in this build          |
+//! | `top`        | top edge band (one row, full width)                    |
+//! | `bottom`     | bottom edge band (one row, full width)                 |
+//! | `left`       | left edge band (column-shaped, see below)              |
+//! | `right`      | right edge band (column-shaped, see below)             |
 //! | `tabline`    | rejected: reserved for PW-10 panel tabs, not a band surface |
 //! | `overlay`    | Core focusable-overlay host (CTX-0941): retained, not a band surface |
 //! | `terminal`   | v2 rich scene host only; the v1 band path is rejected  |
@@ -25,6 +25,21 @@
 //! capability and claim gates, so a plugin learns the slot is unhosted
 //! instead of rendering nothing. The message names the slot and the reason.
 //! No new code is added to the OQ-056-frozen v1 error vocabulary.
+//!
+//! Band axes (issue #3165): a **row** band (`top`/`bottom`) is one window row
+//! wide across the window and stacks its content left to right; a **column**
+//! band (`left`/`right`) owns a column range on its edge, spans the container
+//! rows, and stacks one content row per direct child of its root, top-down.
+//! A column band's width is the widest direct child of its root in display
+//! cells (clamped to the window width), so the scene decides the band
+//! thickness and the exclusive zone it reserves. A `Column`/`List` root is
+//! column-shaped, an axis-neutral `Text` root is a single row, and a `Row`
+//! root is row-shaped: mounting a row-shaped root into `left`/`right` fails
+//! closed with the accepted `E_UI_COMPONENT_INVALID` component check naming
+//! the slot and the root kind, instead of painting a horizontally composed
+//! row down a vertical band. Row bands keep their pre-#3165 flattening (a
+//! `Column`/`List` root flows left-to-right in them), so `top`/`bottom`
+//! behaviour is unchanged.
 //!
 //! `terminal` is the one slot with two readers: the v2 rich reader
 //! ([`bitty_lua::ui_rich::read_rich_component`]) and the Core scene host
@@ -38,16 +53,23 @@
 //!
 //! CTX-0979: Core draws no workspace display (Hyprland-style). Plugin bands
 //! stack from the window edge inward with no Core reservation; see
-//! [`crate::Runtime::plugin_band_row`].
+//! [`crate::Runtime::plugin_band_row`] for row bands and
+//! [`crate::Runtime::visible_band_column`] for column bands.
 //!
 //! Exclusive zone (CTX-0946 C3, closed): visible plugin bands shrink the
 //! layout container through [`Runtime::band_exclusive_container`]
 //! (see [`super::band_host`]), so no terminal cell is ever painted under a
-//! band. The reservation flows through the normal reflow path, resizing
-//! grids and PTY winsizes.
+//! band. Horizontal bands reserve rows and, since issue #3165, vertical bands
+//! reserve columns. The reservation flows through the normal reflow path,
+//! resizing grids and PTY winsizes.
 //!
 //! Known gaps (tracked follow-ups, not implemented here):
 //!
+//! - Column bands paint and reserve, but the interaction surfaces are still
+//!   row-only: click/scroll/hover routing, published band origins, and
+//!   per-item hit regions read [`Runtime::visible_band_row`], so a `left`/
+//!   `right` band paints its content and routes no input yet (issue #3165
+//!   follow-up). Column bands also paint no shared chrome rule.
 //! - Known divergence from the candidate rule "one plugin may hold at most
 //!   one surface per edge; a second mount on the same edge fails": several
 //!   mounts from one plugin on one edge are all kept and stack in mount
@@ -63,15 +85,55 @@ use super::{BandContent, ChromeBands, Runtime};
 /// Window edge carrying a chrome band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BandEdge {
-    /// Top edge (full window width).
+    /// Top edge (row band, full window width).
     Top,
-    /// Bottom edge (full window width).
+    /// Bottom edge (row band, full window width).
     Bottom,
-    /// Left edge (no vertical band host in this build; mounts fail closed).
+    /// Left edge (column band, spans the container rows).
     Left,
-    /// Right edge (no vertical band host in this build; mounts fail closed).
+    /// Right edge (column band, spans the container rows).
     Right,
 }
+
+/// Axis a band stacks its content on (issue #3165).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BandAxis {
+    /// One window row, content flowing left to right (`top`, `bottom`).
+    Row,
+    /// A column range, one content row per root child flowing top-down
+    /// (`left`, `right`).
+    Column,
+}
+
+impl BandAxis {
+    /// Host spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Row => "row",
+            Self::Column => "column",
+        }
+    }
+}
+
+impl BandEdge {
+    /// Axis this edge's band stacks on (issue #3165).
+    #[must_use]
+    pub const fn axis(self) -> BandAxis {
+        match self {
+            Self::Top | Self::Bottom => BandAxis::Row,
+            Self::Left | Self::Right => BandAxis::Column,
+        }
+    }
+}
+
+/// Every band edge, in construction order (`top`, `bottom`, `left`, `right`).
+pub const BAND_EDGES: [BandEdge; 4] = [
+    BandEdge::Top,
+    BandEdge::Bottom,
+    BandEdge::Left,
+    BandEdge::Right,
+];
 
 /// Host placement of one accepted UI slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,12 +156,11 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
     match slot {
         UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
         UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
-        // CTX-1341: no vertical band host exists yet. Admitting these mounts
-        // would return a handle the renderer can never paint, reserve, or
-        // hit-test, so they fail closed at mount time instead.
-        UiSlot::Left | UiSlot::Right => {
-            UiSlotPlacement::Unsupported("has no vertical band host in this build yet")
-        }
+        // Issue #3165: the vertical band host serves these slots. The scene
+        // axis is checked separately (`band_scene_matches`), so a row-shaped
+        // component is refused at mount instead of painted down a column.
+        UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
+        UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
         UiSlot::Tabline => UiSlotPlacement::Unsupported(
             "is reserved for panel tabs (PW-10) and has no host surface yet",
         ),
@@ -113,6 +174,42 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
             UiSlotPlacement::Unsupported("has no v1 terminal-attached band host in this build")
         }
     }
+}
+
+/// Whether `root` may paint in the band on `edge` (issue #3165).
+///
+/// A row band accepts every v1 root: its flattening walk has always laid a
+/// `Column`/`List` root out left to right (documented pre-#3165 degradation,
+/// pinned by the parity suite), so `top`/`bottom` behaviour is unchanged.
+///
+/// A column band stacks one content row per direct child of a `Column`/`List`
+/// root, and admits the axis-neutral `Text` root as a single row. A `Row` root
+/// is a horizontal composition and cannot be stacked down a column, so it is
+/// refused at mount through [`band_scene_direction_error`].
+#[must_use]
+pub fn band_scene_matches(edge: BandEdge, root: &UiNode) -> bool {
+    match edge.axis() {
+        BandAxis::Row => true,
+        BandAxis::Column => !matches!(root, UiNode::Row { .. }),
+    }
+}
+
+/// Typed refusal for a scene whose axis does not fit the band's axis
+/// (issue #3165).
+///
+/// Keeps the accepted `bitty.ui.mount` component-error vocabulary: the class
+/// is `validation` and the code `E_UI_COMPONENT_INVALID`, the same pair the
+/// bridge uses for a component that cannot be served. The mount gate calls
+/// this instead of storing a block the paint path would have to clip or
+/// transpose, so a direction mismatch is a typed error rather than garbage.
+#[must_use]
+pub fn band_scene_direction_error(slot: UiSlot, edge: BandEdge, root: &UiNode) -> BridgeError {
+    bitty_lua::ui::component_invalid(format!(
+        "UI slot '{slot}' is a {} band and cannot stack a '{}' root: a row-shaped scene \
+         would paint horizontally inside a column band, so mount a Column or List root",
+        edge.axis().as_str(),
+        root.kind()
+    ))
 }
 
 /// Typed `E_UI_UNAVAILABLE` error for an unhosted accepted slot.
@@ -173,12 +270,7 @@ impl ChromeBands {
                 UiSlotPlacement::Unsupported(_) => unplaced = unplaced.saturating_add(1),
             }
         }
-        for edge in [
-            BandEdge::Top,
-            BandEdge::Bottom,
-            BandEdge::Left,
-            BandEdge::Right,
-        ] {
+        for edge in BAND_EDGES {
             bands
                 .edge_mut(edge)
                 .sort_by(|a, b| a.plugin_id.as_bytes().cmp(b.plugin_id.as_bytes()));
@@ -189,7 +281,7 @@ impl ChromeBands {
     /// Window row (cells) painted by horizontal band `index` on `edge` in a
     /// window `window_rows` tall, stacking from the edge inward and starting
     /// inward of `reserved` rows already held on that edge; `None` for a
-    /// vertical edge or a band that does not fit.
+    /// vertical (column) edge or a band that does not fit.
     #[must_use]
     pub fn band_row(edge: BandEdge, index: usize, window_rows: u16, reserved: u16) -> Option<u16> {
         let offset = reserved.checked_add(u16::try_from(index).ok()?)?;
@@ -200,6 +292,33 @@ impl ChromeBands {
             BandEdge::Top => Some(offset),
             BandEdge::Bottom => Some(window_rows - 1 - offset),
             BandEdge::Left | BandEdge::Right => None,
+        }
+    }
+
+    /// Leftmost window column of vertical band `index` on `edge`, which
+    /// occupies `width` columns starting `offset` columns inward of the edge
+    /// (the edge-mirror of [`Self::band_row`], issue #3165).
+    ///
+    /// `offset` is the sum of the widths of the visible bands held outward of
+    /// `index` on the same edge (see
+    /// [`Runtime::visible_band_column`](crate::Runtime::visible_band_column)),
+    /// so the band never overlaps its outward neighbours. `None` for a
+    /// horizontal (row) edge, a zero width, or a band that does not fit the
+    /// window width — the caller then paints nothing rather than clipping a
+    /// band into the content area.
+    #[must_use]
+    pub fn band_column(edge: BandEdge, offset: u16, width: u16, window_cols: u16) -> Option<u16> {
+        if width == 0 {
+            return None;
+        }
+        let end = offset.checked_add(width)?;
+        if end > window_cols {
+            return None;
+        }
+        match edge {
+            BandEdge::Left => Some(offset),
+            BandEdge::Right => Some(window_cols - end),
+            BandEdge::Top | BandEdge::Bottom => None,
         }
     }
 }
@@ -220,6 +339,21 @@ impl Runtime {
         let window = self.window_cells();
         ChromeBands::band_row(edge, index, window.height, 0).map(|row| row.saturating_add(window.y))
     }
+
+    /// Window column painted by visible plugin band `index` on a vertical
+    /// `edge` (issue #3165): the column mirror of [`Self::plugin_band_row`],
+    /// translated into window cells.
+    #[must_use]
+    pub fn plugin_band_column(&self, edge: BandEdge, index: usize) -> Option<u16> {
+        if u64::try_from(index).unwrap_or(u64::MAX)
+            >= u64::from(self.visible_band_column_count(edge))
+        {
+            return None;
+        }
+        let window = self.window_cells();
+        self.visible_band_column(edge, index)
+            .map(|col| col.saturating_add(window.x))
+    }
 }
 
 #[cfg(test)]
@@ -236,8 +370,11 @@ mod tests {
             let expected = match slot {
                 UiSlot::Top => UiSlotPlacement::Band(BandEdge::Top),
                 UiSlot::Bottom => UiSlotPlacement::Band(BandEdge::Bottom),
+                // Issue #3165: the vertical band host serves `left`/`right`.
+                UiSlot::Left => UiSlotPlacement::Band(BandEdge::Left),
+                UiSlot::Right => UiSlotPlacement::Band(BandEdge::Right),
                 UiSlot::Overlay => UiSlotPlacement::Overlay,
-                UiSlot::Left | UiSlot::Right | UiSlot::Tabline | UiSlot::Terminal => {
+                UiSlot::Tabline | UiSlot::Terminal => {
                     assert!(matches!(
                         ui_slot_placement(slot),
                         UiSlotPlacement::Unsupported(_)
@@ -250,11 +387,34 @@ mod tests {
     }
 
     #[test]
+    fn band_edges_carry_their_axis() {
+        // Issue #3165: the axis is what the mount gate compares a scene
+        // against, so it must be exhaustive over the closed edge set.
+        assert_eq!(BandEdge::Top.axis(), BandAxis::Row);
+        assert_eq!(BandEdge::Bottom.axis(), BandAxis::Row);
+        assert_eq!(BandEdge::Left.axis(), BandAxis::Column);
+        assert_eq!(BandEdge::Right.axis(), BandAxis::Column);
+        assert_eq!(BandAxis::Row.as_str(), "row");
+        assert_eq!(BandAxis::Column.as_str(), "column");
+        assert_eq!(
+            BAND_EDGES,
+            [
+                BandEdge::Top,
+                BandEdge::Bottom,
+                BandEdge::Left,
+                BandEdge::Right
+            ]
+        );
+    }
+
+    #[test]
     fn from_mounts_routes_each_band_slot_to_its_edge() {
         let (bands, unplaced) = ChromeBands::from_mounts([
             block("a", UiSlot::Top),
             block("b", UiSlot::Bottom),
             block("c", UiSlot::Bottom),
+            block("d", UiSlot::Left),
+            block("e", UiSlot::Right),
         ]);
         assert_eq!(unplaced, 0);
         let ids = |edge| {
@@ -269,26 +429,32 @@ mod tests {
             ids(BandEdge::Bottom),
             [("b", UiSlot::Bottom), ("c", UiSlot::Bottom)]
         );
-        assert!(ids(BandEdge::Left).is_empty());
-        assert!(ids(BandEdge::Right).is_empty());
+        assert_eq!(ids(BandEdge::Left), [("d", UiSlot::Left)]);
+        assert_eq!(ids(BandEdge::Right), [("e", UiSlot::Right)]);
     }
 
     #[test]
-    fn vertical_slots_are_unsupported_and_never_routed_to_a_band() {
-        // CTX-1341: left/right used to map to a band that nothing painted.
-        // The placement policy now fails closed at mount, and any block that
-        // somehow reaches routing is counted as unplaced rather than stored.
-        for slot in [UiSlot::Left, UiSlot::Right] {
-            let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(slot) else {
-                panic!("{slot} must be unsupported");
+    fn vertical_slots_route_to_their_own_edge_and_never_to_a_row_band() {
+        // Issue #3165: `left`/`right` used to be refused at mount (CTX-1341,
+        // after #2234 replaced a silent no-op with a typed refusal). The
+        // vertical band host now serves them, so routing must place each
+        // block on its own edge and never leak it into a row band.
+        for (slot, edge) in [
+            (UiSlot::Left, BandEdge::Left),
+            (UiSlot::Right, BandEdge::Right),
+        ] {
+            let (bands, unplaced) = ChromeBands::from_mounts([block("v", slot)]);
+            assert_eq!(unplaced, 0, "{slot} is hosted");
+            assert_eq!(bands.edge(edge).len(), 1, "{slot} lands on its edge");
+            assert_eq!(bands.edge(edge)[0].slot, slot);
+            assert!(bands.top.is_empty() && bands.bottom.is_empty());
+            let other = if edge == BandEdge::Left {
+                BandEdge::Right
+            } else {
+                BandEdge::Left
             };
-            assert!(reason.contains("vertical band"));
+            assert!(bands.edge(other).is_empty(), "{slot} never mirrors");
         }
-        let (bands, unplaced) =
-            ChromeBands::from_mounts([block("l", UiSlot::Left), block("r", UiSlot::Right)]);
-        assert_eq!(unplaced, 2);
-        assert!(bands.top.is_empty() && bands.bottom.is_empty());
-        assert!(bands.left.is_empty() && bands.right.is_empty());
     }
 
     #[test]
@@ -343,8 +509,77 @@ mod tests {
     }
 
     #[test]
+    fn band_columns_mirror_band_rows_from_the_window_edge() {
+        // Issue #3165: the column mirror of `band_row`, addressed by the
+        // band's inward offset and its content-derived width.
+        assert_eq!(ChromeBands::band_column(BandEdge::Left, 0, 6, 80), Some(0));
+        assert_eq!(ChromeBands::band_column(BandEdge::Left, 6, 4, 80), Some(6));
+        assert_eq!(
+            ChromeBands::band_column(BandEdge::Right, 0, 6, 80),
+            Some(74)
+        );
+        assert_eq!(
+            ChromeBands::band_column(BandEdge::Right, 6, 4, 80),
+            Some(70)
+        );
+        // A band that does not fit never lands inside the content area.
+        assert_eq!(ChromeBands::band_column(BandEdge::Left, 76, 6, 80), None);
+        assert_eq!(ChromeBands::band_column(BandEdge::Right, 76, 6, 80), None);
+        assert_eq!(ChromeBands::band_column(BandEdge::Left, 0, 0, 80), None);
+        assert_eq!(ChromeBands::band_column(BandEdge::Left, 80, 1, 80), None);
+        // Row edges have no column geometry.
+        assert_eq!(ChromeBands::band_column(BandEdge::Top, 0, 6, 80), None);
+        assert_eq!(ChromeBands::band_column(BandEdge::Bottom, 0, 6, 80), None);
+        // Saturating: a hostile offset never wraps into the window.
+        assert_eq!(
+            ChromeBands::band_column(BandEdge::Left, u16::MAX, 2, 80),
+            None
+        );
+    }
+
+    #[test]
+    fn band_scene_axis_matrix_admits_column_scenes_and_refuses_row_scenes() {
+        // Issue #3165 acceptance 2: a column band stacks rows, so a
+        // `Column`/`List` root (one row per child) and the axis-neutral
+        // `Text` root are served, while a `Row` root is refused rather than
+        // transposed or silently clipped.
+        let column = UiNode::column(vec![UiNode::text("a"), UiNode::text("b")]);
+        let list = UiNode::list(vec![UiNode::text("a")]);
+        let text = UiNode::text("a");
+        let row = UiNode::row(vec![UiNode::text("a"), UiNode::text("b")]);
+        for edge in [BandEdge::Left, BandEdge::Right] {
+            assert!(band_scene_matches(edge, &column), "{edge:?} column");
+            assert!(band_scene_matches(edge, &list), "{edge:?} list");
+            assert!(band_scene_matches(edge, &text), "{edge:?} text");
+            assert!(!band_scene_matches(edge, &row), "{edge:?} row refused");
+        }
+        // Row bands keep serving every v1 root (pre-#3165 flattening).
+        for edge in [BandEdge::Top, BandEdge::Bottom] {
+            for root in [&column, &list, &text, &row] {
+                assert!(band_scene_matches(edge, root), "{edge:?} {}", root.kind());
+            }
+        }
+    }
+
+    #[test]
+    fn band_direction_error_is_typed_and_names_the_slot_and_kind() {
+        // Acceptance 2: the refusal is typed and diagnosable, not a silent
+        // clip. It keeps the accepted component-error vocabulary (no new v1
+        // code) so a plugin can tell it apart from an unhosted slot.
+        let row = UiNode::row(vec![UiNode::text("a")]);
+        let error = band_scene_direction_error(UiSlot::Left, BandEdge::Left, &row);
+        assert_eq!(error.class, "validation");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(error.message.contains("'left'"), "{}", error.message);
+        assert!(error.message.contains("'Row'"), "{}", error.message);
+        assert!(error.message.contains("column"), "{}", error.message);
+        // Not the unhosted-slot code: `left` is hosted, the scene is wrong.
+        assert_ne!(error.code, E_UI_UNAVAILABLE);
+    }
+
+    #[test]
     fn unsupported_error_is_typed() {
-        for slot in [UiSlot::Tabline, UiSlot::Left, UiSlot::Right] {
+        for slot in [UiSlot::Tabline, UiSlot::Terminal] {
             let UiSlotPlacement::Unsupported(reason) = ui_slot_placement(slot) else {
                 panic!("{slot} must be unsupported");
             };

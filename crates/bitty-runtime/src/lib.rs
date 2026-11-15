@@ -267,12 +267,14 @@ pub use runtime::band_host::{
     BandHoverTarget, BandItemRegion, BandMount, BandOrigin, BandOverlayAnchor, BandRegionError,
     BandRowHit, BandRun, BandScrollOutcome, BandScrollRequest, BandScrollTarget,
     COLD_ADMISSION_SELECTION_MAX, band_click_args_table, band_hover_args_table, band_is_visible,
-    band_regions_for, band_rows_overlap, band_scroll_args_table, flatten_band_runs,
-    flatten_band_runs_in_width, resolve_band_token, resolve_click_in_band, resolve_hover_in_band,
-    resolve_item_region, resolve_scroll_in_band, split_band_command,
+    band_regions_for, band_rows_overlap, band_scroll_args_table, column_band_rows,
+    column_band_width, flatten_band_runs, flatten_band_runs_in_width, resolve_band_token,
+    resolve_click_in_band, resolve_hover_in_band, resolve_item_region, resolve_scroll_in_band,
+    split_band_command,
 };
 pub use runtime::band_slots::{
-    BandEdge, E_UI_UNAVAILABLE, UiSlotPlacement, ui_slot_placement, unsupported_slot_error,
+    BAND_EDGES, BandAxis, BandEdge, E_UI_UNAVAILABLE, UiSlotPlacement, band_scene_direction_error,
+    band_scene_matches, ui_slot_placement, unsupported_slot_error,
 };
 pub use runtime::bell::{
     BELL_FLASH_DURATION, BellMode, KITTY_ASSEMBLED_MAX_CHARS, KITTY_PARTIALS_CAPACITY,

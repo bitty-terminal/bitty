@@ -86,6 +86,7 @@ pub mod store;
 pub mod ui;
 pub mod ui_catalog;
 pub mod ui_rich;
+pub mod ui_style;
 
 pub use config_require::{
     ConfigModuleAggregate, ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase,
@@ -141,6 +142,10 @@ pub use ui_catalog::{
     ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor,
 };
 pub use ui_rich::UiRichNode;
+pub use ui_style::{
+    UI_STYLE_FIELDS, UI_STYLE_MAX_BORDER_PX, UI_STYLE_MAX_NAME_BYTES, UI_STYLE_MAX_PADDING_CELLS,
+    UI_STYLE_MAX_RADIUS_PX, UiBorderToken, UiNodeStyle, UiStyleError, parse_node_style,
+};
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 

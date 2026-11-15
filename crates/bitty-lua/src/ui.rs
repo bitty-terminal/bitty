@@ -47,6 +47,19 @@
 //! Overlay click/scroll/hover routing is not part of the accepted contract yet
 //! and remains a design note, not a shipped claim.
 //!
+//! # Layout and style (bitty#2191)
+//!
+//! The bounded `style` table (`padding`, `radius`, `border`, `border_token`)
+//! belongs to the **rich scene** surface — the `terminal` slot, read by
+//! [`crate::ui_rich`] — because that is where a rounded ring and a cell inset
+//! are actually painted. A band or overlay node has neither, so a `style` key
+//! here stays what the accepted additive-minor rule makes it: an unknown
+//! optional field this build ignores (pinned by
+//! `crates/bitty-runtime/tests/lua_ui_parity.rs`
+//! `unknown_properties_are_tolerated`). Refusing it would narrow an accepted
+//! compatibility rule; hosting it here would paint nothing. Extending the v1
+//! surface is a separate accepted-extension decision.
+//!
 //! # Budgets
 //!
 //! | ID     | Dimension                          | Bound  | Source |
@@ -2353,5 +2366,34 @@ mod tests {
         assert!(error.message.contains("band scene"));
         assert_eq!(UiSceneScope::Band.as_str(), "band");
         assert_eq!(UiSceneScope::Unanchored.as_str(), "unanchored");
+    }
+
+    #[test]
+    fn style_is_a_rich_scene_field_and_stays_unknown_here() {
+        // bitty#2191: the bounded `style` table is hosted on the rich scene
+        // surface (the `terminal` slot), where a ring and a cell inset are
+        // painted. On the v1 band/overlay surface it stays an unknown optional
+        // field: the accepted additive-minor rule tolerates it, and this test
+        // pins that the rest of the v1 tree is unchanged by its presence.
+        let with_style = row(vec![LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("ready".to_string())),
+            (
+                "style",
+                LuaValue::table([("padding", LuaValue::Integer(1))]),
+            ),
+        ])]);
+        let node = UiNode::from_lua_value(&with_style).expect("still an accepted v1 tree");
+        assert_eq!(node.count_nodes(), 2);
+        assert_eq!(node.text_bytes(), 5);
+        // Nothing of the style is retained or reinterpreted on this surface:
+        // the tree is the same tree it would be without the key.
+        let plain = row(vec![text("ready")]);
+        assert_eq!(
+            node.retained_string_bytes(),
+            UiNode::from_lua_value(&plain)
+                .expect("plain tree")
+                .retained_string_bytes()
+        );
     }
 }

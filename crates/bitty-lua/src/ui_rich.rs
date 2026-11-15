@@ -44,6 +44,15 @@
 //! | `Image` | `placement` (positive integer placement id) | `SceneNode::Image` |
 //! | `Rule` | none | `SceneNode::Rule` |
 //!
+//! # Style (bitty#2191)
+//!
+//! Any kind may carry an optional `style` table — the bounded primitive set
+//! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`).
+//! A non-flat style lowers to the additive `SceneNode::Styled` wrapper, so the
+//! existing measure and paint path applies it; a flat one lowers to nothing.
+//! `style` is a modifier, not a tenth kind: [`UiRichNode::kind`] still reports
+//! the wrapped node's kind and [`UI_RICH_NODE_KINDS`] is unchanged.
+//!
 //! Presentation fields the accepted `SceneNode` schema cannot express are
 //! **rejected**, never silently dropped: `fg`, `bg`, `anchor`, `on_click`,
 //! `on_scroll`, and `on_hover` belong to the band surface, and a rich node
@@ -62,6 +71,7 @@
 //! | table cells | [`UI_RICH_MAX_TABLE_CELLS`] (4096) | paint budget |
 //! | border width | [`UI_RICH_MAX_BORDER_CELLS`] (8) | paint budget |
 //! | language hint | [`UI_RICH_MAX_LANG_BYTES`] (32) | bridge budget |
+//! | style padding / radius / border | `32` / `16` / `16` | [`crate::ui_style`] caps |
 //!
 //! Structural elements count against the node budget exactly like the
 //! accepted scene accounting: a table row and a table cell are separate
@@ -81,6 +91,7 @@ use crate::host::{BridgeError, LuaValue};
 use crate::ui::{
     UI_MARSHAL_LIMITS, UI_MAX_DEPTH, UI_MAX_NODES, UI_MAX_TEXT_BYTES, component_invalid,
 };
+use crate::ui_style::{UiNodeStyle, parse_node_style};
 
 /// Maximum table rows accepted by one `Table` node.
 pub const UI_RICH_MAX_TABLE_ROWS: usize = 256;
@@ -152,6 +163,19 @@ pub enum UiRichNode {
     List(Vec<UiRichNode>),
     /// Horizontal rule.
     Rule,
+    /// A node carrying a bounded layout/style declaration (bitty#2191).
+    ///
+    /// Produced by an optional `style` table on any rich kind, and mapped to
+    /// the additive `SceneNode::Styled` wrapper. It is not a wire kind: the
+    /// declaration always accompanies a `kind` field, and
+    /// [`Self::kind`] reports the wrapped node's kind. A declaration that
+    /// resolves flat is never wrapped, so it costs no node and paints nothing.
+    Styled {
+        /// Bounded style declaration (caps enforced at parse).
+        style: UiNodeStyle,
+        /// The node the declaration applies to.
+        child: Box<UiRichNode>,
+    },
 }
 
 impl UiRichNode {
@@ -168,6 +192,7 @@ impl UiRichNode {
             Self::Table { .. } => "Table",
             Self::List(_) => "List",
             Self::Rule => "Rule",
+            Self::Styled { child, .. } => child.kind(),
         }
     }
 
@@ -180,7 +205,7 @@ impl UiRichNode {
             Self::Row(children) | Self::Column(children) | Self::List(children) => {
                 1 + children.iter().map(Self::count_nodes).sum::<usize>()
             }
-            Self::Block { child, .. } => 1 + child.count_nodes(),
+            Self::Block { child, .. } | Self::Styled { child, .. } => 1 + child.count_nodes(),
         }
     }
 
@@ -197,7 +222,7 @@ impl UiRichNode {
                     1 + children.iter().map(Self::depth).max().unwrap_or(0)
                 }
             }
-            Self::Block { child, .. } => 1 + child.depth(),
+            Self::Block { child, .. } | Self::Styled { child, .. } => 1 + child.depth(),
         }
     }
 
@@ -214,7 +239,7 @@ impl UiRichNode {
             Self::Row(children) | Self::Column(children) | Self::List(children) => {
                 children.iter().map(Self::text_bytes).sum()
             }
-            Self::Block { child, .. } => child.text_bytes(),
+            Self::Block { child, .. } | Self::Styled { child, .. } => child.text_bytes(),
         }
     }
 
@@ -223,7 +248,9 @@ impl UiRichNode {
     /// Rich nodes retain only content strings (no theme tokens, command
     /// bindings, or region ids: those fields are rejected on this surface),
     /// so this equals [`Self::text_bytes`] and exists to keep one accounting
-    /// shape across both declarative surfaces.
+    /// shape across both declarative surfaces. A style declaration charges
+    /// nothing here either: its only named value is a closed content token,
+    /// which is retained as an enum, never as a string.
     #[must_use]
     pub fn retained_string_bytes(&self) -> usize {
         self.text_bytes()
@@ -238,12 +265,23 @@ impl UiRichNode {
     /// carries an unknown kind or a field the scene schema cannot express,
     /// nests deeper than [`UI_MAX_DEPTH`], or exceeds [`UI_MAX_NODES`] /
     /// [`UI_MAX_TEXT_BYTES`] or a kind-specific bound.
+    ///
+    /// A declared `style` is validated here too, and it is the reason the
+    /// depth check runs a second time after the walk: a non-flat style is a
+    /// wrapper node, so a tree at the depth ceiling that declares one is
+    /// refused instead of being admitted one level over budget.
     pub fn from_lua_value(value: &LuaValue) -> Result<Self, BridgeError> {
         let node = Self::from_value(value, 1)?;
         let nodes = node.count_nodes();
         if nodes > UI_MAX_NODES {
             return Err(component_invalid(format!(
                 "rich component node count exceeds {UI_MAX_NODES}"
+            )));
+        }
+        let depth = node.depth();
+        if depth > UI_MAX_DEPTH {
+            return Err(component_invalid(format!(
+                "rich component depth exceeds {UI_MAX_DEPTH}"
             )));
         }
         let bytes = node.text_bytes();
@@ -270,7 +308,15 @@ impl UiRichNode {
         };
         reject_band_only_fields(value)?;
 
-        match kind {
+        // bitty#2191: the bounded style declaration, if the node claims one.
+        // Parsed for every kind before the kind-specific walk so a malformed
+        // style is rejected whatever the node would have done with it.
+        let style = match value.get("style") {
+            Some(style) => Some(parse_node_style(style)?),
+            None => None,
+        };
+
+        let node = match kind {
             "Text" => {
                 let text = string_field(value, "text")?.to_string();
                 let bold = match value.get("bold") {
@@ -360,7 +406,19 @@ impl UiRichNode {
             other => Err(component_invalid(format!(
                 "unknown rich node kind '{other}'"
             ))),
-        }
+        }?;
+
+        // A flat declaration is inert: it claims no geometry, so wrapping it
+        // would charge `SCN-1`/`SCN-2` for a node that paints nothing. Only a
+        // declaration that actually insets or strokes anything becomes the
+        // additive wrapper.
+        Ok(match style {
+            Some(style) if !style.is_flat() => Self::Styled {
+                style,
+                child: Box::new(node),
+            },
+            Some(_) | None => node,
+        })
     }
 }
 
@@ -781,5 +839,171 @@ mod tests {
         .expect("parses");
         assert!(node.retained_string_bytes() <= UI_MAX_AGGREGATED_TEXT_BYTES);
         assert_eq!(node.retained_string_bytes(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Style vocabulary (bitty#2191)
+    // -----------------------------------------------------------------------
+
+    fn styled_text() -> LuaValue {
+        LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("ready".to_string())),
+            (
+                "style",
+                LuaValue::table([
+                    ("padding", LuaValue::Integer(2)),
+                    ("radius", LuaValue::Integer(6)),
+                    ("border", LuaValue::Integer(1)),
+                    (
+                        "border_token",
+                        LuaValue::String("content.accent".to_string()),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_style_declaration_wraps_the_node_it_accompanies() {
+        let node = UiRichNode::from_lua_value(&styled_text()).expect("styled text parses");
+        let UiRichNode::Styled { style, child } = &node else {
+            panic!("expected a styled wrapper, got {node:?}");
+        };
+        assert_eq!(style.padding_cells, 2);
+        assert_eq!(style.radius_px, 6);
+        assert_eq!(style.border_px, 1);
+        assert_eq!(style.border_token, crate::ui_style::UiBorderToken::Accent);
+        assert_eq!(child.kind(), "Text");
+        // The wrapper is one node and one depth level, exactly like the scene
+        // model charges it; it adds no text and no retained string bytes.
+        assert_eq!(node.kind(), "Text", "style is a modifier, not a kind");
+        assert_eq!(node.count_nodes(), 2);
+        assert_eq!(node.depth(), 2);
+        assert_eq!(node.text_bytes(), 5);
+        assert_eq!(node.retained_string_bytes(), 5);
+    }
+
+    #[test]
+    fn a_flat_declaration_costs_nothing() {
+        for style in [
+            LuaValue::table([]),
+            LuaValue::table([("padding", LuaValue::Integer(0))]),
+            LuaValue::table([("border", LuaValue::Integer(0))]),
+            LuaValue::table([("border_token", LuaValue::String("state.error".to_string()))]),
+        ] {
+            let value = LuaValue::table([
+                ("kind", LuaValue::String("Text".to_string())),
+                ("text", LuaValue::String("x".to_string())),
+                ("style", style),
+            ]);
+            let node = UiRichNode::from_lua_value(&value).expect("flat style parses");
+            assert!(
+                matches!(node, UiRichNode::Text { .. }),
+                "a flat style lowers to no wrapper"
+            );
+            assert_eq!(node.count_nodes(), 1);
+            assert_eq!(node.depth(), 1);
+        }
+    }
+
+    #[test]
+    fn a_style_declaration_is_validated_on_every_kind() {
+        // A malformed style is refused whatever the node kind is; the style is
+        // read before the kind-specific walk, so no kind becomes a blind spot.
+        for kind in UI_RICH_NODE_KINDS {
+            let mut fields = vec![
+                ("kind", LuaValue::String(kind.to_string())),
+                ("style", LuaValue::table([("gap", LuaValue::Integer(1))])),
+            ];
+            // Give each kind the content field it requires so only the style
+            // can be the reason for the refusal.
+            match kind {
+                "Text" => fields.push(("text", LuaValue::String("x".to_string()))),
+                "Block" => fields.push(("child", text("x"))),
+                "Image" => fields.push(("placement", LuaValue::Integer(1))),
+                "CodeBlock" => fields.push(("content", LuaValue::String("x".to_string()))),
+                "Table" => fields.push(("rows", LuaValue::array(Vec::new()))),
+                "Row" | "Column" | "List" => {
+                    fields.push(("children", LuaValue::array(vec![text("x")])));
+                }
+                _ => {}
+            }
+            let table = LuaValue::Table(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                    .collect(),
+            );
+            let error =
+                UiRichNode::from_lua_value(&table).expect_err("unknown style key is refused");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(
+                error.message, "unsupported scene style field 'gap'",
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_style_over_cap_is_refused_before_the_host_sees_it() {
+        for (field, value, expected) in [
+            ("padding", 33, "scene style padding exceeds cap: 33 > 32"),
+            ("radius", 17, "scene style radius exceeds cap: 17 > 16"),
+            ("border", 17, "scene style border exceeds cap: 17 > 16"),
+        ] {
+            let value_table = LuaValue::table([
+                ("kind", LuaValue::String("Text".to_string())),
+                ("text", LuaValue::String("x".to_string())),
+                (
+                    "style",
+                    LuaValue::Table(vec![(
+                        LuaValue::String(field.to_string()),
+                        LuaValue::Integer(value),
+                    )]),
+                ),
+            ]);
+            let error = UiRichNode::from_lua_value(&value_table).expect_err("refused");
+            assert_eq!(error.class, "validation");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(error.message, expected);
+        }
+    }
+
+    #[test]
+    fn a_style_wrapper_at_the_depth_ceiling_is_refused_not_admitted() {
+        // A tree that is exactly `UI_MAX_DEPTH` deep without a style.
+        let mut value = text("leaf");
+        for _ in 1..UI_MAX_DEPTH {
+            value = LuaValue::table([
+                ("kind", LuaValue::String("Column".to_string())),
+                ("children", LuaValue::array(vec![value])),
+            ]);
+        }
+        let node = UiRichNode::from_lua_value(&value).expect("at the ceiling");
+        assert_eq!(node.depth(), UI_MAX_DEPTH);
+
+        // The same tree with the innermost leaf styled is one level deeper,
+        // because the wrapper is a real scene node.
+        let styled_leaf = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("leaf".to_string())),
+            (
+                "style",
+                LuaValue::table([("padding", LuaValue::Integer(1))]),
+            ),
+        ]);
+        let mut over = styled_leaf;
+        for _ in 1..UI_MAX_DEPTH {
+            over = LuaValue::table([
+                ("kind", LuaValue::String("Column".to_string())),
+                ("children", LuaValue::array(vec![over])),
+            ]);
+        }
+        let error = UiRichNode::from_lua_value(&over).expect_err("over the ceiling");
+        assert_eq!(
+            error.message,
+            format!("rich component depth exceeds {UI_MAX_DEPTH}")
+        );
     }
 }

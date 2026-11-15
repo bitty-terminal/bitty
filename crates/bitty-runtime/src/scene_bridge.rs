@@ -45,20 +45,22 @@
 //! | `CodeBlock` | `CodeBlock` |
 //! | `Table` | `Table` |
 //! | `Rule` | `Rule` |
+//! | `Styled { style, child }` | `Styled { style, child }` |
 //!
-//! The additive v2 `SceneNode::Styled` kind is not emitted by this v1 bridge:
-//! `UiRichNode` has no style field yet and the candidate wire form is not
-//! shipped. The scene model, its admission check, the paint path, and the
-//! accessibility projection all support the kind, so a future `ui.rich`
-//! revision is a reader change with no new Core vocabulary.
+//! The additive v2 `SceneNode::Styled` kind **is** emitted, as of bitty#2191:
+//! a rich node's optional `style` table (bounded in `bitty_lua::ui_style`)
+//! lowers to the wrapper, and the scene model, its admission check, the paint
+//! path, and the accessibility projection already support the kind. The
+//! mapping is a total function of the six-name content token set, so no new
+//! vocabulary enters Core here.
 
 #![forbid(unsafe_code)]
 
-use bitty_lua::UiRichNode;
+use bitty_lua::{UiBorderToken, UiNodeStyle, UiRichNode};
 use bitty_rich::image::PlacementId;
 use bitty_rich::scene::{
-    BlockAnchor, BlockId, Border, CodeBlockModel, RichBlock, Scene, SceneError, SceneNode,
-    ScrollBehavior, StyledSpan, TableModel,
+    BlockAnchor, BlockId, Border, CodeBlockModel, ContentToken, RichBlock, Scene, SceneError,
+    SceneNode, SceneNodeStyle, ScrollBehavior, StyledSpan, TableModel,
 };
 
 /// Typed failure from the rich-scene bridge.
@@ -119,7 +121,35 @@ pub fn scene_node_of(node: &UiRichNode) -> SceneNode {
         }),
         UiRichNode::Table { rows } => SceneNode::Table(TableModel { rows: rows.clone() }),
         UiRichNode::Rule => SceneNode::Rule,
+        UiRichNode::Styled { style, child } => SceneNode::Styled {
+            style: scene_style_of(*style),
+            child: Box::new(scene_node_of(child)),
+        },
     }
+}
+
+/// Maps one bounded wire style onto the scene model's style data.
+///
+/// Total and lossless: the four primitives and the six content tokens are the
+/// same vocabulary on both sides, pinned name-for-name by
+/// `tests/scene_style_vocabulary.rs`. Caps were already enforced at parse, and
+/// the scene admission boundary re-checks them, so a value that reaches the
+/// paint path is always inside its documented range.
+#[must_use]
+fn scene_style_of(style: UiNodeStyle) -> SceneNodeStyle {
+    SceneNodeStyle::new(
+        style.padding_cells,
+        style.radius_px,
+        style.border_px,
+        match style.border_token {
+            UiBorderToken::Foreground => ContentToken::Foreground,
+            UiBorderToken::Accent => ContentToken::Accent,
+            UiBorderToken::Muted => ContentToken::Muted,
+            UiBorderToken::Error => ContentToken::Error,
+            UiBorderToken::Warning => ContentToken::Warning,
+            UiBorderToken::Success => ContentToken::Success,
+        },
+    )
 }
 
 /// Identity and provenance for one rich mount.
@@ -254,9 +284,8 @@ mod tests {
                 SceneNode::Row(_) => "row",
                 SceneNode::Column(_) => "column",
                 SceneNode::Block { .. } => "block",
-                // The v1 `ui.rich` bridge never emits the additive v2 style
-                // kind (no style field exists on `UiRichNode` yet); the arm
-                // keeps the drift test exhaustive for the scene model.
+                // bitty#2191: a styled node maps to the additive v2 kind; the
+                // arm keeps this drift test exhaustive for the scene model.
                 SceneNode::Styled { .. } => "styled",
                 SceneNode::Image(_) => "image",
                 SceneNode::CodeBlock(_) => "codeblock",
@@ -278,6 +307,43 @@ mod tests {
             }
             other => panic!("unexpected node {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_styled_node_maps_to_the_additive_kind_and_keeps_its_bounds() {
+        let style = UiNodeStyle::new(2, 6, 1, UiBorderToken::Warning);
+        let node = UiRichNode::Styled {
+            style,
+            child: Box::new(text("ready")),
+        };
+        match scene_node_of(&node) {
+            SceneNode::Styled { style, child } => {
+                assert_eq!(style.padding_cells, 2);
+                assert_eq!(style.radius_px, 6);
+                assert_eq!(style.border_px, 1);
+                assert_eq!(style.border_token, ContentToken::Warning);
+                assert!(matches!(*child, SceneNode::Text(_)));
+            }
+            other => panic!("expected a styled scene node, got {other:?}"),
+        }
+
+        // The wrapper is admitted (one node, one level) and the scene model
+        // re-checks the caps, so an over-cap value cannot ride in through a
+        // hand-built `UiRichNode`.
+        let mut scene = Scene::new();
+        mount(&mut scene, 1, &node).expect("within SCN-1..3 and the style caps");
+        assert_eq!(scene.len(), 1);
+
+        let over_cap = UiRichNode::Styled {
+            style: UiNodeStyle::new(33, 0, 0, UiBorderToken::Foreground),
+            child: Box::new(text("ready")),
+        };
+        let error = mount(&mut scene, 2, &over_cap).expect_err("refused at admission");
+        assert!(matches!(
+            error,
+            SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
+        ));
+        assert_eq!(scene.len(), 1, "last good scene retained");
     }
 
     #[test]

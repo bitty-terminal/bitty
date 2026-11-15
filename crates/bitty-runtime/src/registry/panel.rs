@@ -2701,13 +2701,14 @@ impl PanelRegistry {
                 bitty_ui::panel::CommandError::Duplicate { command, owner } => {
                     PanelError::DuplicateCommand { command, owner }
                 }
-                // Core verbs are not panel-claimable; report the collision as
-                // an invalid registration rather than a panel conflict.
-                bitty_ui::panel::CommandError::CoreDuplicate { command } => {
-                    PanelError::InvalidCommand {
-                        reason: format!("command '{command}' is already a Core verb"),
-                    }
-                }
+                // The `core.` owner prefix is Core's alone, so the name is
+                // not panel-claimable; report it as an invalid registration
+                // rather than a panel conflict, carrying the reason that says
+                // the namespace is reserved (not merely that this verb is
+                // taken).
+                bitty_ui::panel::CommandError::CoreDuplicate { .. } => PanelError::InvalidCommand {
+                    reason: e.to_string(),
+                },
                 bitty_ui::panel::CommandError::TooManyCommands { max, current } => {
                     PanelError::TooManyCommands { max, current }
                 }

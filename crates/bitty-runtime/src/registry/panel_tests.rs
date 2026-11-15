@@ -363,10 +363,52 @@ fn core_tab_verbs_are_registered_and_not_panel_claimable() {
         "expected a Core-verb collision, got {err:?}"
     );
     // A panel command registered under the same owner is untouched by the
-    // Core lane, and the Core lane is untouched by per-panel teardown.
+    // Core lane, and the Core lane survives per-panel teardown: disposing the
+    // panel drops the panel command and leaves all three Core verbs registered.
     reg.register_command(h.id, h.generation, "xuepoo.git:open")
         .unwrap();
     assert_eq!(reg.command_owner("xuepoo.git:open"), Some(h.id));
+    reg.dispose_panel(h.id, h.generation)
+        .expect("the helper panel disposes");
+    assert_eq!(
+        reg.command_owner("xuepoo.git:open"),
+        None,
+        "per-panel teardown drops the panel command"
+    );
+    for command in bitty_ui::tabs::TAB_CMDS {
+        assert!(
+            reg.is_core_command(command),
+            "{command} must survive per-panel teardown"
+        );
+    }
+    // The window registry itself is still live, so the survival above is not
+    // the trivial "everything is gone" case.
+    assert!(!reg.is_disposed());
+}
+
+#[test]
+fn panel_commands_cannot_mint_a_core_prefixed_name() {
+    // Issue #3166 AC1, negative half: the `core.` owner prefix is Core's
+    // alone, so a panel cannot register a plausible future Core verb
+    // (`core.tab:reorder`) or a real ctl request id (`core.view:split`) even
+    // though Core registers neither of those today.
+    let mut reg = default_panel_registry();
+    let h = reg.create_panel(PanelType::Helper, None).unwrap();
+    for raw in ["core.tab:reorder", "core.view:split"] {
+        let err = reg
+            .register_command(h.id, h.generation, raw)
+            .expect_err("the core. owner prefix is not panel-claimable");
+        assert!(
+            matches!(err, PanelError::InvalidCommand { ref reason } if reason.contains("reserved for Core")),
+            "{raw} must be refused as a Core-reserved name, got {err:?}"
+        );
+        assert!(reg.command_owner(raw).is_none(), "{raw} registered anyway");
+        assert!(!reg.is_core_command(raw), "{raw} is not a Core verb");
+    }
+    // The same panel still registers a non-`core.` name.
+    reg.register_command(h.id, h.generation, "xuepoo.tabs:list")
+        .expect("a non-core name still registers");
+    assert_eq!(reg.command_owner("xuepoo.tabs:list"), Some(h.id));
 }
 
 #[test]

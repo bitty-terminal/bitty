@@ -48,9 +48,11 @@
 //!    *plugin mounts into the `tabline` UI slot*, which is a different
 //!    authority from Core-owned verbs: tab verbs mount no UI block, never
 //!    consult plugin claims, and no plugin can claim a `core.*` name because
-//!    [`CommandRegistry::register`] now rejects a name Core already owns. The
-//!    slot itself keeps failing closed (`UiSlotPlacement::Unsupported`) because
-//!    hosting a tab strip is a separate slice.
+//!    [`CommandRegistry::register`] rejects the whole
+//!    [`crate::panel::CORE_OWNER_FAMILY`] owner prefix, not just the verbs Core
+//!    happens to have registered. The slot itself keeps failing closed
+//!    (`UiSlotPlacement::Unsupported`) because hosting a tab strip is a
+//!    separate slice.
 //!
 //! # Atomicity
 //!
@@ -194,10 +196,18 @@ pub enum TabVerb {
 
 /// Host-side consequences of a committed tab transition.
 ///
-/// Both flags are `true` for every verb: a verb always changes which tab is
-/// active, so focus-driven input-mode caches must be re-attributed
-/// (`sync_mode_caches_to_focus` on the WS-INV-19 path) and the visible surface
-/// changes wholesale, so a partial repaint cannot repair it.
+/// Both flags are set for every verb, which is deliberately a safe
+/// over-approximation rather than an exact prediction:
+///
+/// - `open` and `switch` always change the active tab;
+/// - `close` changes it only when the closed tab was the active one. Closing a
+///   background tab keeps the active panel (and therefore the input-mode
+///   cache) where it was, so the re-attribution is redundant but harmless, and
+///   the strip still changed, so the full redraw is still required.
+///
+/// The host must run `sync_mode_caches_to_focus` for the new focus on the
+/// WS-INV-19 path and set `pending_full_redraw`; no verb produces a partial
+/// repaint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TabEffect {
     /// The host must re-attribute input-mode caches to the new focus.
@@ -438,6 +448,23 @@ impl TabSet {
     /// [`LayoutNode::validate_structure`] over the projected tree, then
     /// [`validate_proposal`] over that tree and [`TabSet::projected_views`].
     ///
+    /// # Why the two tree validators are defence-in-depth here
+    ///
+    /// [`TabSet::layout`] always emits exactly one [`LayoutNode::Leaf`], so
+    /// neither tree validator can fail for a projection this type emits today:
+    /// a leaf is trivially structurally valid, and `validate_proposal(leaf,
+    /// [leaf])` is a one-element set equality. The invariants above the calls
+    /// are the *effective* gate; deleting the two lines would not change any
+    /// observable behaviour.
+    ///
+    /// They are kept deliberately, not because they are exercised: they are
+    /// the contract a future multi-leaf projection (a strip that lays out more
+    /// than the active tab) must satisfy, and the private
+    /// `validate_candidate` gate pins them against trees this type does not yet
+    /// emit. Replacing them with an assertion that the tree is a single leaf
+    /// would be the alternative; keeping the real validators means the
+    /// contract cannot be silently weakened when `layout()` grows.
+    ///
     /// # Errors
     ///
     /// The first [`TabError`] a check reports.
@@ -464,9 +491,19 @@ impl TabSet {
             }
             views.push(view);
         }
-        let layout = self.layout();
+        Self::validate_candidate(&self.layout(), &self.projected_views())
+    }
+
+    /// The tree half of the commit gate: structure, then proposal.
+    ///
+    /// Split out from [`TabSet::validate`] so the two validators stay
+    /// testable against candidate trees [`TabSet::layout`] does not emit
+    /// (see the note on `validate`). Production callers only ever pass
+    /// `layout()`'s output, so this is not a second gate — it is the same two
+    /// lines, in a scope a test can drive.
+    fn validate_candidate(layout: &LayoutNode, projected: &[ViewId]) -> Result<(), TabError> {
         layout.validate_structure().map_err(TabError::Structure)?;
-        validate_proposal(&layout, &self.projected_views()).map_err(TabError::Proposal)?;
+        validate_proposal(layout, projected).map_err(TabError::Proposal)?;
         Ok(())
     }
 
@@ -692,6 +729,8 @@ impl CommittedTabs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::SplitAxis;
+    use crate::panel::CORE_OWNER_FAMILY;
 
     const PID: [u64; 4] = [11, 12, 13, 14];
     const VID: [u64; 4] = [101, 102, 103, 104];
@@ -788,7 +827,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn panel_lane_cannot_register_a_core_namespaced_name() {
+        // The boundary is the namespace, not the list of verbs Core happens to
+        // have registered: a panel can mint neither a future `core.tab:*` verb
+        // nor `core.view:split` (a real ctl request id, so a panel command with
+        // that spelling would be indistinguishable from a Core surface id).
+        let mut registry = CommandRegistry::new();
+        register_tab_verbs(&mut registry).expect("Core verbs register");
+        let panel = PanelId::new(7);
+        for raw in ["core.tab:reorder", "core.view:split"] {
+            let err = registry
+                .register(panel, raw)
+                .expect_err("the core. owner prefix is Core's alone");
+            assert_eq!(
+                err,
+                CommandError::CoreDuplicate {
+                    command: raw.to_string()
+                },
+                "{raw} must be refused as Core-reserved, not as a panel duplicate"
+            );
+        }
+        // A refusal registers nothing and leaves Core untouched.
+        assert_eq!(registry.owner_of("core.tab:reorder"), None);
+        assert_eq!(registry.owner_of("core.view:split"), None);
+        assert!(!registry.is_core("core.tab:reorder"));
+        assert!(!registry.is_core("core.view:split"));
+        assert!(registry.commands_for(panel).is_empty());
+        assert_eq!(registry.len(), TAB_CMDS.len());
+    }
+
+    #[test]
+    fn core_tab_verbs_still_register_after_the_namespace_reservation() {
+        // The reservation constrains the panel lane only: Core keeps its three
+        // verbs on the same registry, through the same `register_core` path.
+        let mut registry = CommandRegistry::new();
+        let registered = register_tab_verbs(&mut registry).expect("Core keeps its own names");
+        assert_eq!(registered.len(), TAB_CMDS.len());
+        for (qc, raw) in registered.iter().zip(TAB_CMDS) {
+            assert_eq!(qc.as_str(), raw);
+            assert_eq!(qc.owner_family(), CORE_OWNER_FAMILY);
+            assert!(qc.is_core_namespace());
+            assert!(
+                registry.is_core(raw),
+                "{raw} must be a registered Core verb"
+            );
+            assert!(registry.owner_of(raw).is_none(), "{raw} is not panel-owned");
+        }
+        assert_eq!(registry.core_commands().len(), TAB_CMDS.len());
+        assert_eq!(registry.len(), TAB_CMDS.len());
+    }
+
+    #[test]
+    fn panel_lane_still_registers_non_core_names() {
+        // An owner-family check, not a substring match: only the exact `core`
+        // family is reserved, and duplicate semantics are unchanged.
+        let mut registry = CommandRegistry::new();
+        register_tab_verbs(&mut registry).expect("Core verbs register");
+        let panel = PanelId::new(7);
+        for raw in ["xuepoo.git:open", "corex.tab:reorder", "panel.core:open"] {
+            let qc = registry
+                .register(panel, raw)
+                .expect("a non-core name still registers");
+            assert_eq!(qc.as_str(), raw);
+            assert!(!qc.is_core_namespace());
+            assert_eq!(registry.owner_of(raw), Some(panel));
+        }
+        assert_eq!(registry.commands_for(panel).len(), 3);
+        // Cross-panel duplicates are still reported as panel duplicates, not as
+        // Core collisions.
+        let err = registry
+            .register(PanelId::new(8), "xuepoo.git:open")
+            .expect_err("duplicate across panels");
+        assert_eq!(
+            err,
+            CommandError::Duplicate {
+                command: "xuepoo.git:open".to_string(),
+                owner: panel,
+            }
+        );
+    }
+
     // -- projection invariants --------------------------------------------
+
+    #[test]
+    fn the_commit_gate_refuses_a_stack_shaped_candidate() {
+        // `layout()` emits a single leaf, so no `TabSet` produces this tree
+        // today. The gate must still refuse it: that is what makes
+        // "the committed tree is Stack-free" a contract instead of an
+        // accident of `layout`.
+        let candidate = LayoutNode::stack(vec![
+            LayoutNode::leaf(tab(0).view().clone()),
+            LayoutNode::leaf(tab(1).view().clone()),
+        ]);
+        let projected = vec![ViewId::new(VID[0]), ViewId::new(VID[1])];
+        let err = TabSet::validate_candidate(&candidate, &projected)
+            .expect_err("a Stack interior is not a committable tab layout");
+        assert!(
+            matches!(
+                err,
+                TabError::Proposal(LayoutError::UnsupportedNode { kind: "Stack" })
+            ),
+            "the proposal validator must refuse the Stack, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_commit_gate_refuses_a_tree_that_disagrees_with_the_projection() {
+        // Both directions of the set equality, over structurally valid trees.
+        // Only `validate_proposal` can see either, so this is the failing route
+        // the call exists for.
+        let leaf_only = LayoutNode::leaf(tab(0).view().clone());
+        let err =
+            TabSet::validate_candidate(&leaf_only, &[ViewId::new(VID[0]), ViewId::new(VID[1])])
+                .expect_err("the tree must carry every projected view");
+        assert!(
+            matches!(err, TabError::Proposal(LayoutError::MissingView { id }) if id == VID[1]),
+            "a tree that omits a projected view must be refused, got {err:?}"
+        );
+
+        let two_leaves = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(tab(0).view().clone()),
+            LayoutNode::leaf(tab(1).view().clone()),
+        );
+        let err = TabSet::validate_candidate(&two_leaves, &[ViewId::new(VID[0])])
+            .expect_err("the tree must carry no leaf outside the projection");
+        assert!(
+            matches!(err, TabError::Proposal(LayoutError::UnexpectedView { id }) if id == VID[1]),
+            "a tree that invents a leaf must be refused, got {err:?}"
+        );
+
+        // The agreeing case still passes, so the test is not asserting that the
+        // gate always fails.
+        TabSet::validate_candidate(&two_leaves, &[ViewId::new(VID[0]), ViewId::new(VID[1])])
+            .expect("a tree that matches the projection passes");
+    }
 
     #[test]
     fn tab_set_rejects_empty_and_duplicate_projections() {

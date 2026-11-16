@@ -879,6 +879,33 @@ pub struct PanelCreateOrigin<'a> {
 pub type PanelCreateHandler =
     Rc<dyn Fn(&str, PanelCreateOrigin<'_>) -> Result<(u64, u64), BridgeError>>;
 
+/// Synchronous panel-close backend for `bitty.panel.close` (CTX-1859).
+///
+/// Receives `(panel_id, owner, generation)` and enforces strict ownership
+/// before disposing the panel and queueing Dwindle leaf removal.
+pub type PanelCloseHandler = Rc<dyn Fn(u64, &PluginId, u32) -> Result<bool, BridgeError>>;
+
+/// Panel-scoped declarative UI scene backend for `bitty.panel.mount`,
+/// `bitty.panel.update`, and `bitty.panel.unmount` (CTX-1859).
+pub trait PanelSceneBackend {
+    /// Attach or replace a validated rich scene on an owned non-terminal panel.
+    fn mount_panel_scene(
+        &self,
+        panel_id: u64,
+        owner: &PluginId,
+        generation: u32,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError>;
+
+    /// Detach the rich scene from an owned non-terminal panel.
+    fn unmount_panel_scene(
+        &self,
+        panel_id: u64,
+        owner: &PluginId,
+        generation: u32,
+    ) -> Result<bool, BridgeError>;
+}
+
 /// Settings source that has no settings.
 #[derive(Debug, Default)]
 pub struct EmptySettings;
@@ -2140,6 +2167,8 @@ pub struct PluginServices {
     /// rebind cannot widen it from inside the VM.
     panel_family_resolution: RefCell<BTreeSet<String>>,
     panel_create_backend: RefCell<Option<PanelCreateHandler>>,
+    panel_close_backend: RefCell<Option<PanelCloseHandler>>,
+    panel_scene_backend: RefCell<Option<Rc<dyn PanelSceneBackend>>>,
     panel_pin_backend: RefCell<Option<PanelPinHandler>>,
     /// Whether this generation holds `platform.image-file` (CTX-1169).
     image_read_granted: Cell<bool>,
@@ -2305,6 +2334,8 @@ impl PluginServices {
             panel_focus_granted: Cell::new(false),
             panel_family_resolution: RefCell::new(BTreeSet::new()),
             panel_create_backend: RefCell::new(None),
+            panel_close_backend: RefCell::new(None),
+            panel_scene_backend: RefCell::new(None),
             panel_pin_backend: RefCell::new(None),
             image_read_granted: Cell::new(false),
             image_roots: RefCell::new(None),
@@ -2514,6 +2545,18 @@ impl PluginServices {
     /// `E_NOT_IMPLEMENTED`, like every other panel verb without a host.
     pub fn set_panel_create_backend(&self, backend: Option<PanelCreateHandler>) {
         *self.panel_create_backend.borrow_mut() = backend;
+    }
+
+    /// Attach the synchronous panel-close backend for `bitty.panel.close`
+    /// (CTX-1859).
+    pub fn set_panel_close_backend(&self, backend: Option<PanelCloseHandler>) {
+        *self.panel_close_backend.borrow_mut() = backend;
+    }
+
+    /// Attach the panel-scoped declarative scene backend for
+    /// `bitty.panel.mount` / `update` / `unmount` (CTX-1859).
+    pub fn set_panel_scene_backend(&self, backend: Option<Rc<dyn PanelSceneBackend>>) {
+        *self.panel_scene_backend.borrow_mut() = backend;
     }
 
     /// Grant `terminal.input.submit` from the activation snapshot (CTX-1239,
@@ -7883,8 +7926,58 @@ impl HostServices for PluginServices {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
         }
-        let _ = panel_id;
-        Err(BridgeError::not_implemented("bitty.panel.close"))
+        let backend = self
+            .panel_close_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.panel.close"))?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend(panel_id, &owner, self.ui_epoch.get())
+    }
+
+    fn panel_mount(
+        &self,
+        panel_id: u64,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError> {
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        let backend = self.panel_scene_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "panel scene backend is unavailable",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.mount_panel_scene(panel_id, &owner, self.ui_epoch.get(), node)
+    }
+
+    fn panel_update(
+        &self,
+        panel_id: u64,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError> {
+        self.panel_mount(panel_id, node)
+    }
+
+    fn panel_unmount(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        let backend = self.panel_scene_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "panel scene backend is unavailable",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.unmount_panel_scene(panel_id, &owner, self.ui_epoch.get())
     }
 
     fn panel_destroy(&self, panel_id: u64) -> Result<bool, BridgeError> {

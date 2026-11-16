@@ -1239,6 +1239,135 @@ impl TerminalApp {
     /// Spiral fallback; largest-area for `BisectLargest`). Spawn sizing and
     /// cwd inheritance still read the focused pane, so the fresh shell
     /// matches its neighbors.
+    /// Materialize a zero-PTY Dwindle `View` leaf for a plugin-created panel
+    /// (`ViewContent::Panel(panel_id)`) in the focused workspace (CTX-1859).
+    pub(crate) fn materialize_plugin_panel_leaf(
+        &mut self,
+        panel_id: bitty_runtime::registry::PanelId,
+        generation: bitty_runtime::registry::Generation,
+    ) {
+        let Some(scene_host) = self.runtime.scene_host() else {
+            return;
+        };
+        if !matches!(
+            scene_host.borrow().panel_state(panel_id, generation),
+            Ok(bitty_runtime::registry::PanelState::Created)
+        ) {
+            return;
+        }
+        self.restore_zoom();
+        let new_id = self.runtime.next_view_id_global();
+        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+            eprintln!("warning: plugin panel materialize refused: {err}");
+            return;
+        }
+        let mount_gen = scene_host
+            .borrow()
+            .registry()
+            .controller_generation(panel_id)
+            .unwrap_or(generation);
+        if self.runtime.layout().leaf_count() == 0 {
+            if let Err(err) = scene_host
+                .borrow_mut()
+                .mount_panel(panel_id, mount_gen, new_id)
+            {
+                eprintln!("warning: plugin panel mount failed: {err}");
+                return;
+            }
+            let layout = LayoutNode::leaf(View::new(new_id, 80, 24));
+            self.runtime.set_layout(layout);
+            self.runtime.set_focus(new_id);
+            return;
+        }
+        let Some(plan) = self.runtime.panel_split_plan() else {
+            eprintln!(
+                "warning: plugin panel create has no leaf that fits two 10x4 panes — ignoring"
+            );
+            return;
+        };
+        let mut layout = self.runtime.layout().clone();
+        if !split_focused_leaf(
+            &mut layout,
+            plan.target,
+            plan.axis,
+            new_id,
+            plan.place_new_first,
+        ) {
+            eprintln!("warning: plugin panel split found no target pane — ignoring");
+            return;
+        }
+        if let Err(err) = scene_host
+            .borrow_mut()
+            .mount_panel(panel_id, mount_gen, new_id)
+        {
+            eprintln!("warning: plugin panel mount failed: {err}");
+            return;
+        }
+        self.runtime.set_layout(layout);
+        self.runtime
+            .note_panel_split_created(new_id, plan.spiral_phase);
+        self.runtime.set_focus(new_id);
+    }
+
+    /// Remove the Dwindle `View` leaf (or floating/pinned view) hosting
+    /// `panel_id` and dispose the panel record if still live (CTX-1859).
+    pub(crate) fn close_plugin_panel_leaf(
+        &mut self,
+        panel_id: bitty_runtime::registry::PanelId,
+        hinted_view: Option<ViewId>,
+    ) {
+        let view_id = hinted_view.or_else(|| {
+            self.runtime
+                .scene_host()
+                .and_then(|host| host.borrow().placement_view_of(panel_id))
+        });
+        if let Some(view_id) = view_id {
+            self.restore_zoom();
+            if self.runtime.floated_views().contains(&view_id)
+                || self.runtime.pinned_views().contains(&view_id)
+            {
+                let _ = self.runtime.discard_floating_view(view_id);
+            } else if self.runtime.layout().find_leaf(view_id).is_some() {
+                let mut layout = self.runtime.layout().clone();
+                if self.runtime.layout().leaf_count() > 1 {
+                    if close_focused_leaf(&mut layout, view_id) {
+                        if let Some(previous) = survivor_after_close(self.runtime.layout(), view_id)
+                        {
+                            self.runtime.set_focus(previous);
+                        }
+                        self.runtime.set_layout_closing(layout, view_id);
+                    }
+                } else {
+                    layout.remove_leaf(view_id);
+                    self.runtime.set_layout_closing(layout, view_id);
+                }
+            }
+        }
+        if let Some(scene_host) = self.runtime.scene_host() {
+            let mut host = scene_host.borrow_mut();
+            if let Some(generation) = host.panel_allocation_generation(panel_id) {
+                let _ = host.dispose_panel(panel_id, generation);
+            }
+        }
+    }
+
+    /// Dispose a plugin-owned panel mounted on `view_id` when the user closes
+    /// that leaf via `CloseView` (CTX-1859).
+    fn dispose_plugin_panel_on_view(&mut self, view_id: ViewId) {
+        let Some(scene_host) = self.runtime.scene_host() else {
+            return;
+        };
+        let mut host = scene_host.borrow_mut();
+        let Some(panel_id) = host.placement_panel_of(view_id) else {
+            return;
+        };
+        if host.panel_controller_owner(panel_id).is_some() {
+            if let Some(generation) = host.panel_allocation_generation(panel_id) {
+                let _ = host.dispose_panel(panel_id, generation);
+            }
+        }
+    }
+
     fn apply_new_leaf(
         &mut self,
         target: ViewId,
@@ -1904,6 +2033,7 @@ impl TerminalApp {
                         && self.runtime.pinned_count() == 0
                         && self.runtime.workspace_count() > 1;
                     if self.runtime.discard_floating_view(focused) {
+                        self.dispose_plugin_panel_on_view(focused);
                         eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
                     }
                     if prune_after_discard {
@@ -2056,6 +2186,7 @@ impl TerminalApp {
                     if self.runtime.close_pane_session(&focused) {
                         eprintln!("bitty: keymap close_view tore down pane shell {focused:?}");
                     }
+                    self.dispose_plugin_panel_on_view(focused);
                     eprintln!(
                         "bitty: keymap close_view -> leafs={} focused={:?}",
                         self.runtime.leaf_count(),

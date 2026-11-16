@@ -518,6 +518,34 @@ impl PanelRuntime {
         self.registry.present_placeholder(id, presented, reason)
     }
 
+    /// Returns `(PanelHandle, PanelType)` for `id` only when the panel is
+    /// live, non-terminal, and currently bound to `(owner, controller_gen)`.
+    #[must_use]
+    pub fn panel_handle_if_owned_by(
+        &self,
+        id: super::panel::PanelId,
+        owner: &bitty_plugin_host::PluginId,
+        controller_gen: Generation,
+    ) -> Option<(super::panel::PanelHandle, PanelType)> {
+        self.registry
+            .panel_handle_if_owned_by(id, owner, controller_gen)
+    }
+
+    /// Returns the owning `PluginId` of a live, non-terminal panel, if bound.
+    #[must_use]
+    pub fn panel_controller_owner(
+        &self,
+        id: super::panel::PanelId,
+    ) -> Option<bitty_plugin_host::PluginId> {
+        self.registry.panel_controller_owner(id)
+    }
+
+    /// Returns the allocation generation of a live panel, if not disposed.
+    #[must_use]
+    pub fn panel_allocation_generation(&self, id: super::panel::PanelId) -> Option<Generation> {
+        self.registry.panel_allocation_generation(id)
+    }
+
     /// Releases the facade's own bindings for a panel the registry retired
     /// (RUN-21 lease entry, OQ-051 scene slot and its paint cache, and the
     /// live placement mirror of the registry's attachment).

@@ -5302,4 +5302,148 @@ error("activation fails after mounting the terminal slot scene")
         assert_eq!(app.runtime.focused_view(), Some(panel_view));
         let _ = std::fs::remove_file(&script);
     }
+
+    /// CTX-1860 (bitty#3201 review, D1): zooming a terminal pane installs the
+    /// single-leaf zoom proxy, so the runtime layout stops showing the panel
+    /// leaf while the zoom-aware window total still counts it. The two halves
+    /// of the shell-exit gate must agree: `exit` in the zoomed pane closes that
+    /// pane and keeps the panel, never `AppExiting`.
+    #[test]
+    #[cfg(unix)]
+    fn plugin_panel_zoomed_primary_exit_keeps_panel() {
+        bitty_test_support::require_pty!();
+        let _guard = crate::ctl::test_control_queue_lock();
+        let (mut app, panels) = panel_exit_app("exit-zoomed-panel");
+        let (panel_id, panel_view, primary) = create_rich_panel(&mut app, &panels);
+
+        assert!(
+            app.chrome.zoom.engage(&mut app.runtime, primary),
+            "the primary leaf must accept the zoom proxy"
+        );
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime),
+            "the fixture must be zoomed for this regression"
+        );
+        // Production state, exactly as the reviewer measured it: the runtime
+        // layout is the proxy (one leaf, no panel), the window total is not.
+        assert_eq!(
+            app.runtime.leaf_count(),
+            1,
+            "the zoom proxy must collapse the live layout to one leaf"
+        );
+        assert_eq!(
+            app.effective_window_leaf_count(),
+            2,
+            "the zoom-aware window total must still count the hidden panel leaf"
+        );
+        assert_eq!(
+            app.window_live_non_terminal_leaf_count(),
+            1,
+            "a live panel leaf behind the zoom proxy must count as live content"
+        );
+
+        let script = spawn_exiting_primary(&mut app, primary, "zoomed-panel");
+        assert_eq!(
+            reap_until_observed(&mut app),
+            crate::terminal_app::ShellExitOutcome::PaneClosed,
+            "a zoomed primary exit must close the pane and keep the live panel (bitty#3201)"
+        );
+
+        assert_eq!(
+            panels.borrow().placement_view_of(panel_id),
+            Some(panel_view),
+            "the panel placement must survive a zoomed primary exit"
+        );
+        assert_eq!(
+            panels.borrow().panel_count(),
+            1,
+            "the panel record must survive a zoomed primary exit"
+        );
+        assert!(
+            panels.borrow().panel_scene(panel_id).is_some(),
+            "the panel declarative scene must survive a zoomed primary exit"
+        );
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![panel_view],
+            "the zoom restore must bring the real tree back and drop only the dead primary"
+        );
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "closing the zoomed primary must consume the zoom entry"
+        );
+        assert_eq!(
+            app.window_live_non_terminal_leaf_count(),
+            1,
+            "the surviving panel leaf must still read as live content after the restore"
+        );
+        assert_eq!(app.runtime.pane_session_count(), 0);
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// CTX-1860 (bitty#3201 review, D2): the primary exit is one-shot, so a
+    /// window whose last leaf is removed afterwards must still be answered.
+    /// Primary exits with a live panel -> the plugin closes that panel -> the
+    /// window holds no session and no leaf and the reap pass must report
+    /// `AppExiting` instead of stranding it.
+    #[test]
+    #[cfg(unix)]
+    fn plugin_panel_close_after_primary_exit_ends_emptied_window() {
+        bitty_test_support::require_pty!();
+        let _guard = crate::ctl::test_control_queue_lock();
+        let (mut app, panels) = panel_exit_app("stranded-window");
+        let (panel_id, panel_view, primary) = create_rich_panel(&mut app, &panels);
+
+        let script = spawn_exiting_primary(&mut app, primary, "stranded-window");
+        assert_eq!(
+            reap_until_observed(&mut app),
+            crate::terminal_app::ShellExitOutcome::PaneClosed,
+            "the primary exit must close the pane, not the session"
+        );
+        assert_eq!(
+            app.runtime.primary_exit_status(),
+            None,
+            "the primary exit must already be consumed, never re-reported"
+        );
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(panel_view),
+            "the surviving panel must hold focus before the plugin closes it"
+        );
+
+        // The reviewer's sequence: the panel that outlived the shell is now
+        // closed through the production bridge and drained on the next tick.
+        let closed = dispatch_app_cmd(
+            &mut app,
+            "xuepoo.survivor",
+            "close",
+            &[("id", LuaValue::Integer(panel_id.0 as i64))],
+        )
+        .expect("panel close must succeed");
+        assert_eq!(closed, LuaValue::Bool(true));
+        // The drain that removes the leaf runs before the present decision, so
+        // an emptied window presents no frame (`None`) yet still mutates.
+        let _ = app.drive_tick();
+
+        assert!(
+            app.runtime.layout().leaf_ids().is_empty(),
+            "the window must be left with no leaf at all"
+        );
+        assert_eq!(app.runtime.pane_session_count(), 0);
+        assert_eq!(app.effective_window_leaf_count(), 0);
+        assert_eq!(app.window_live_non_terminal_leaf_count(), 0);
+        assert_eq!(
+            app.runtime.focused_view(),
+            None,
+            "an empty window has nothing to focus"
+        );
+        assert_eq!(panels.borrow().panel_count(), 0);
+
+        assert_eq!(
+            app.reap_exited_shells(),
+            crate::terminal_app::ShellExitOutcome::AppExiting,
+            "a window with no pane session and no leaf must close, not sit stranded (bitty#3201)"
+        );
+        let _ = std::fs::remove_file(&script);
+    }
 }

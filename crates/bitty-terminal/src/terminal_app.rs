@@ -4646,6 +4646,26 @@ impl TerminalApp {
         Some(tiled + floats)
     }
 
+    /// Whether the window holds nothing left that a user can see or act on
+    /// (CTX-1860, bitty#3201 review).
+    ///
+    /// True only for a fully empty window: no split pane session anywhere and
+    /// no live leaf anywhere — the zoom-aware window total of
+    /// [`Self::effective_window_leaf_count`], which counts every tiled leaf in
+    /// every slot, floats, pins, the scratchpad and the active workspace's zoom
+    /// backup. A live plugin panel leaf *is* one of those leaves, so a window
+    /// that still paints a panel always answers `false` here; this can never
+    /// end a session that has something on screen.
+    ///
+    /// Such a window is unrepairable from the keymap: `new_panel`/`new_split`
+    /// and `close_view` all need a focused leaf (`chrome_keys.rs`), and the
+    /// last leaf was removed by a plugin path that bypasses the window-close
+    /// gesture. Leaving it running means a window with zero panes that only a
+    /// WM `CloseRequested` or `Mod+T` can end (bitty#3201).
+    fn window_has_nothing_left(&self) -> bool {
+        self.runtime.pane_session_count() == 0 && self.effective_window_leaf_count() == 0
+    }
+
     /// Checks for exited shell processes across both split pane sessions and
     /// the primary session, reaping exited children and closing their panels.
     ///
@@ -4659,7 +4679,8 @@ impl TerminalApp {
     /// a first-class panel (`ViewContent::Panel`) with its own scene, focus
     /// and input route — so the session ends only when no pane session and
     /// no live panel leaf remain. See
-    /// [`Runtime::has_live_non_terminal_leaf`].
+    /// [`Self::window_live_non_terminal_leaf_count`], which reads the whole
+    /// window including the active workspace's zoom backup.
     ///
     /// Issue #1828: every reaped exit also queues a bounded `process.exited`
     /// edge (`terminal_id` + `exit_code`) for the next cold-tick delivery.
@@ -4668,6 +4689,15 @@ impl TerminalApp {
     /// the same edge but the loop shuts down without another tick, so only
     /// a surviving session observes exits. Runs on the event-loop reap path,
     /// never the PTY hot path.
+    ///
+    /// CTX-1860 (bitty#3201 review): this pass is also the second evaluation
+    /// point of the exit condition, independent of the one-shot
+    /// [`Runtime::primary_exit_status`]. A window that loses its last leaf
+    /// after the primary shell already exited (a plugin closing its panel, a
+    /// plugin suspend/crash releasing it) would otherwise sit at zero sessions
+    /// and zero leaves forever: nothing else asks the question, and neither
+    /// `new_panel`/`new_split` nor `close_view` can act without a focused
+    /// leaf. See [`Self::window_has_nothing_left`].
     pub(crate) fn reap_exited_shells(&mut self) -> ShellExitOutcome {
         // 1. Split pane sessions: poll each active session's child.
         let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_session_ids();
@@ -4684,7 +4714,7 @@ impl TerminalApp {
                 // last-leaf half of the gate is a conjunction with the panel
                 // predicate.
                 if self.effective_window_leaf_count() <= 1
-                    && !self.runtime.has_live_non_terminal_leaf()
+                    && self.window_live_non_terminal_leaf_count() == 0
                 {
                     crate::logging::info(|| {
                         format!(
@@ -4869,9 +4899,12 @@ impl TerminalApp {
         // all-terminal case (a lone primary shell closing the window) and for
         // a window whose remaining tiles are dead terminal leaves; it no
         // longer ends the session while a live panel leaf is on screen.
+        // Both halves read the same population: the count substitutes the
+        // active workspace's zoom backup, so a live panel behind a zoom proxy
+        // is not invisible here (`zoom a pane, type exit`, bitty#3201 review).
         if let Some(status) = self.runtime.primary_exit_status() {
-            let live_panel_leaf = self.runtime.has_live_non_terminal_leaf();
-            if !live_panel_leaf
+            let live_panel_leaf = self.window_live_non_terminal_leaf_count();
+            if live_panel_leaf == 0
                 && (self.runtime.pane_session_count() == 0
                     || self.effective_window_leaf_count() <= 1)
             {
@@ -4900,7 +4933,7 @@ impl TerminalApp {
                         status.code(),
                         status.signal(),
                         self.runtime.pane_session_count(),
-                        self.runtime.live_non_terminal_leaf_count()
+                        live_panel_leaf
                     )
                 });
                 if !self
@@ -4997,6 +5030,26 @@ impl TerminalApp {
                 self.push_pending_exit(primary_view.0, status.code());
                 closed_any = true;
             }
+        }
+
+        // 3. Stranded window (CTX-1860, bitty#3201 review).
+        //
+        // The primary branch above only runs while `primary_exit_status()`
+        // reports an exit, and that status is consumed exactly once. A window
+        // that then loses its last leaf — `bitty.panel.close`, or a plugin
+        // suspend/reload/crash releasing its panel through the queued
+        // `PluginPanelLayoutOp::Close` — is left with zero sessions, zero
+        // leaves and no focused view: `new_panel`/`new_split`/`close_view` all
+        // refuse without focus and no other path asks the exit question, so
+        // the window could sit there forever. Answer it here, on every reap
+        // pass, from production state only — never from the one-shot status.
+        // A window with any leaf, session or panel is untouched (see
+        // [`Self::window_has_nothing_left`]).
+        if self.window_has_nothing_left() {
+            crate::logging::info(|| {
+                String::from("bitty: window has no pane session and no live leaf — closing session")
+            });
+            return ShellExitOutcome::AppExiting;
         }
 
         if closed_any {

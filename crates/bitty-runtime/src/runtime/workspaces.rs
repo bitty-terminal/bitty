@@ -1963,7 +1963,26 @@ impl Runtime {
     /// `MAX_WORKSPACES` slots and their leaves; space is one `Vec` of view ids.
     #[must_use]
     pub fn window_view_ids(&self) -> Vec<ViewId> {
-        let mut ids: Vec<ViewId> = self.layout.leaf_ids();
+        self.window_view_ids_over(self.layout.leaf_ids())
+    }
+
+    /// [`Self::window_view_ids`] with the active slot's tiled leaves supplied
+    /// by the caller (CTX-1860, bitty#3201 review).
+    ///
+    /// A zoomed workspace's live layout is the single-leaf zoom proxy while
+    /// the real tree stays in the app's zoom state, so the app-side window
+    /// total substitutes that backup for the active slot
+    /// (`TerminalApp::effective_window_leaf_count`). A per-leaf predicate
+    /// that reads `self.layout` would then describe a different window than
+    /// the total it is conjoined with. `active_tiled` is that substitute — the
+    /// backup's leaf ids, or `self.layout.leaf_ids()` when nothing is zoomed.
+    /// Floats, pins, the scratchpad slot and every inactive stash are still
+    /// added here, so the result remains exactly the population
+    /// [`Self::window_leaf_count`] counts. Bounded like
+    /// [`Self::window_view_ids`].
+    #[must_use]
+    pub fn window_view_ids_over(&self, active_tiled: Vec<ViewId>) -> Vec<ViewId> {
+        let mut ids: Vec<ViewId> = active_tiled;
         ids.extend(self.floats.ids());
         ids.extend(self.pinned.ids());
         ids.extend(self.scratchpad.peek().map(|view| view.id()));
@@ -1993,11 +2012,24 @@ impl Runtime {
     /// headless run), and bounded by [`Self::window_view_ids`].
     #[must_use]
     pub fn live_non_terminal_leaf_count(&self) -> usize {
+        self.live_non_terminal_leaf_count_over(self.layout.leaf_ids())
+    }
+
+    /// [`Self::live_non_terminal_leaf_count`] over an explicit active-slot
+    /// tiled population (CTX-1860, bitty#3201 review).
+    ///
+    /// The caller supplies the active slot's tiled leaves because a zoomed
+    /// workspace hides its real tree behind a single-leaf proxy: see
+    /// [`Self::window_view_ids_over`]. Everything else — which ids are live
+    /// non-terminal panel leaves — is decided here, so there is one predicate
+    /// and no second population walk.
+    #[must_use]
+    pub fn live_non_terminal_leaf_count_over(&self, active_tiled: Vec<ViewId>) -> usize {
         let Some(host) = self.scene_host() else {
             return 0;
         };
         let host = host.borrow();
-        self.window_view_ids()
+        self.window_view_ids_over(active_tiled)
             .into_iter()
             .filter(|view| {
                 host.placement_panel_of(*view)
@@ -2011,7 +2043,9 @@ impl Runtime {
     ///
     /// The predicate the shell-exit gate and the last-leaf bookkeeping ask:
     /// see [`Self::live_non_terminal_leaf_count`] for what a live panel leaf
-    /// is and why a zero-PTY leaf is not inert.
+    /// is and why a zero-PTY leaf is not inert. Callers holding zoom state
+    /// must ask [`Self::live_non_terminal_leaf_count_over`] with the zoom
+    /// backup instead of this runtime-layout reading.
     #[must_use]
     pub fn has_live_non_terminal_leaf(&self) -> bool {
         self.live_non_terminal_leaf_count() > 0

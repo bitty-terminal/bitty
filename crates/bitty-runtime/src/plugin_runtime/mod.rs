@@ -649,7 +649,7 @@ impl From<bitty_plugin_host::PluginError> for PluginRuntimeError {
 pub const MAX_WALL_RECOVERY_ATTEMPTS: u32 = 3;
 
 /// Consecutive non-faulting timer ticks required before resetting
-/// [`PluginEntry::wall_recovery_attempts`] to zero.
+/// `PluginEntry::wall_recovery_attempts` to zero.
 ///
 /// Prevents a plugin that fails deterministically on its second tick from
 /// resetting its retry budget on tick 1, while allowing long-running chrome

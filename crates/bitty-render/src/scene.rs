@@ -1174,13 +1174,17 @@ impl Painter {
         let mut height = 0u16;
         let mut previous_cols = 0u16;
         for (index, child) in children.iter().enumerate() {
+            let size = self.measure(child, depth + 1)?;
             // The gap sits between two adjacent non-empty spans: an empty
-            // sibling has no end for the spacing to start after, so it adds
-            // none. It is added to the container's extent, not to a child's.
-            if index > 0 && gap_cells > 0 && previous_cols > 0 {
+            // sibling has no end for the spacing to start after and no start
+            // for it to reach, so it adds none. Measuring first is what makes
+            // the *current* span's emptiness part of the rule — checking only
+            // the previous span would charge a gap for a trailing empty sibling
+            // and widen the container past its content. It is added to the
+            // container's extent, not to a child's.
+            if index > 0 && gap_cells > 0 && previous_cols > 0 && size.cols > 0 {
                 width = width.saturating_add(gap_cells).min(cols);
             }
-            let size = self.measure(child, depth + 1)?;
             width = width.saturating_add(size.cols).min(cols);
             height = height.max(size.rows);
             previous_cols = size.cols;
@@ -1211,10 +1215,13 @@ impl Painter {
         let mut height = 0u16;
         let mut previous_rows = 0u16;
         for (index, child) in children.iter().enumerate() {
-            if index > 0 && gap_cells > 0 && previous_rows > 0 {
+            // The row rule on the vertical axis: measure first, then charge the
+            // gap only between two adjacent non-empty spans, so an empty
+            // sibling — leading, trailing, or in the middle — adds none.
+            let size = self.measure(child, depth + 1)?;
+            if index > 0 && gap_cells > 0 && previous_rows > 0 && size.rows > 0 {
                 height = height.saturating_add(gap_cells).min(rows);
             }
-            let size = self.measure(child, depth + 1)?;
             width = width.max(size.cols);
             height = height.saturating_add(size.rows).min(rows);
             previous_rows = size.rows;
@@ -1353,13 +1360,25 @@ impl Painter {
                 cap: SCENE_MAX_DEPTH,
             });
         }
-        let last = children.len().saturating_sub(1);
         let mut cursor = 0u16;
+        let mut previous_cols = 0u16;
         for (index, child) in children.iter().enumerate() {
             if cursor >= width {
                 break;
             }
             let size = self.measure(child, depth + 1)?;
+            // The gap is spent *before* the current span and only between two
+            // adjacent non-empty siblings, mirroring `measure_row`: a span
+            // whose predecessor is empty takes no gap, so paint and measure
+            // agree on where every sibling starts and no trailing gap can widen
+            // the container. Spending it here can push the cursor past the
+            // clip, so the bound is re-checked before the node is painted.
+            if index > 0 && gap_cells > 0 && previous_cols > 0 && size.cols > 0 {
+                cursor = cursor.saturating_add(gap_cells);
+                if cursor >= width {
+                    break;
+                }
+            }
             let available = width - cursor;
             // Give the child the size it measured: a `Block` paints its
             // border across exactly this extent, so handing it the whole
@@ -1374,11 +1393,7 @@ impl Painter {
                 depth + 1,
             )?;
             cursor = cursor.saturating_add(size.cols);
-            // The gap is spent after a non-empty span and only when a sibling
-            // follows it, so no trailing gap can widen the container.
-            if gap_cells > 0 && size.cols > 0 && index < last {
-                cursor = cursor.saturating_add(gap_cells);
-            }
+            previous_cols = size.cols;
         }
         Ok(())
     }
@@ -1402,13 +1417,22 @@ impl Painter {
                 cap: SCENE_MAX_DEPTH,
             });
         }
-        let last = children.len().saturating_sub(1);
         let mut cursor = 0u16;
+        let mut previous_rows = 0u16;
         for (index, child) in children.iter().enumerate() {
             if cursor >= height {
                 break;
             }
             let size = self.measure(child, depth + 1)?;
+            // The row rule on the vertical axis: spend the gap before the
+            // current non-empty span, and only when the previous laid-out span
+            // was non-empty too, so paint agrees with `measure_column`.
+            if index > 0 && gap_cells > 0 && previous_rows > 0 && size.rows > 0 {
+                cursor = cursor.saturating_add(gap_cells);
+                if cursor >= height {
+                    break;
+                }
+            }
             let available = height - cursor;
             self.paint_node(
                 child,
@@ -1419,9 +1443,7 @@ impl Painter {
                 depth + 1,
             )?;
             cursor = cursor.saturating_add(size.rows);
-            if gap_cells > 0 && size.rows > 0 && index < last {
-                cursor = cursor.saturating_add(gap_cells);
-            }
+            previous_rows = size.rows;
         }
         Ok(())
     }

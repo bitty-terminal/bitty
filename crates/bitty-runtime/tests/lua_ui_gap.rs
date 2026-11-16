@@ -32,7 +32,7 @@ use bitty_lua::ui_rich::UiRichNode;
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_render::RectPx;
 use bitty_render::grid::CellMetrics;
-use bitty_render::scene::{ScenePaint, SceneSurface};
+use bitty_render::scene::{ScenePaint, ScenePaintOp, SceneSurface};
 use bitty_rich::scene::{
     BlockAnchor, BlockId, RichBlock, Scene, SceneError, SceneNode, ScrollBehavior,
 };
@@ -369,6 +369,131 @@ fn a_gap_that_pushes_a_sibling_past_the_slot_drops_it() {
         lines(&paint),
         vec![(0, 0, "a".to_string()), (0, 31, "b".to_string())],
         "the sibling past the slot boundary is clipped, not clamped into it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Empty siblings: the gap sits only between two non-empty spans
+// ---------------------------------------------------------------------------
+
+/// Every painted border ring as `(x, y, width, height)` in physical pixels, in
+/// op order.
+fn rings(paint: &ScenePaint) -> Vec<(i32, i32, u32, u32)> {
+    paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Rounded { rect, .. } => Some((rect.x, rect.y, rect.width, rect.height)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_trailing_empty_sibling_adds_no_gap_to_the_measure() {
+    // `gap = 2` next to an empty trailing span: the empty span has no start for
+    // the spacing to reach, so the pair takes none and the container measures 1
+    // cell for its 1 cell of content. A measure that only inspects the
+    // *previous* span charges the 2 cells anyway and moves the sibling after the
+    // container to column 3 — three cells of width sold for one cell of text,
+    // which is then what a following frame draws around.
+    let trailing = styled_row_value(vec![text_value("a"), text_value("")], gap(2));
+    let outer = row_value(vec![trailing, text_value("Z")]);
+    let paint = paint_of(&read_and_mount(&outer).expect("an empty sibling is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "a".to_string()), (0, 1, "Z".to_string())],
+        "an empty trailing sibling is inert, so the container stays 1 cell wide"
+    );
+
+    // Baseline: the same tree with no gap paints the identical coordinates, so
+    // the inert declaration contributed nothing to the measure.
+    let baseline = row_value(vec![
+        row_value(vec![text_value("a"), text_value("")]),
+        text_value("Z"),
+    ]);
+    let baseline_paint = paint_of(&read_and_mount(&baseline).expect("valid"));
+    assert_eq!(
+        lines(&baseline_paint),
+        lines(&paint),
+        "a gap that has no non-empty pair to separate paints like an absent one"
+    );
+}
+
+#[test]
+fn an_empty_span_between_two_runs_leaves_them_touching() {
+    // The rule is between *adjacent* siblings: `a`, ``, `b` has no two adjacent
+    // non-empty spans, so no cell of spacing is charged and both runs are
+    // contiguous. Paint walks the same rule, so the two runs stay one cell
+    // apart-free and the container measures 2 cells, not 4.
+    let gapped = styled_row_value(
+        vec![text_value("a"), text_value(""), text_value("b")],
+        gap(2),
+    );
+    let paint = paint_of(&read_and_mount(&gapped).expect("an empty sibling is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "a".to_string()), (0, 1, "b".to_string())],
+        "an empty sibling separates nothing, so it earns no spacing"
+    );
+}
+
+#[test]
+fn a_trailing_empty_sibling_adds_no_gap_on_the_column_axis() {
+    // A text span is one row tall even when it is empty, so the empty span on
+    // this axis is a childless container: 0 rows and 0 columns.
+    let empty = || container_value("Column", Vec::new(), Vec::new());
+
+    // The defect on the vertical axis: 1 row of content must not measure 3 rows,
+    // so the sibling after the column lands on row 1 instead of row 3.
+    let trailing = styled_column_value(vec![text_value("a"), empty()], gap(2));
+    let outer = container_value("Column", vec![trailing, text_value("Z")], Vec::new());
+    let paint = paint_of(&read_and_mount(&outer).expect("an empty sibling is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "a".to_string()), (1, 0, "Z".to_string())],
+        "an empty trailing sibling is inert on the vertical axis too"
+    );
+
+    // The symmetric boundary: a *leading* empty sibling takes no gap before the
+    // first non-empty span either, so the content still starts at row 0 and the
+    // column still measures 1 row.
+    let leading = styled_column_value(vec![empty(), text_value("a")], gap(2));
+    let outer = container_value("Column", vec![leading, text_value("Z")], Vec::new());
+    let paint = paint_of(&read_and_mount(&outer).expect("an empty sibling is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "a".to_string()), (1, 0, "Z".to_string())],
+        "an empty leading sibling opens no gap at the top of the column"
+    );
+}
+
+#[test]
+fn a_bordered_container_around_the_group_frames_one_content_cell() {
+    // A border is a stroke inside the node's own measured frame, so the frame is
+    // exactly the content box: 1 cell here, never the 3 a trailing-empty span
+    // used to buy. The ring op carries that frame, so its rect is 8 px wide (one
+    // 8-px cell) and the sibling after the block still starts at column 1. On
+    // the pre-fix rule the same declaration draws a 24-px ring around one
+    // character and moves "Z" to column 3.
+    let bordered = styled_row_value(
+        vec![text_value("a"), text_value("")],
+        vec![
+            ("gap", LuaValue::Integer(2)),
+            ("border", LuaValue::Integer(1)),
+        ],
+    );
+    let outer = row_value(vec![bordered, text_value("Z")]);
+    let paint = paint_of(&read_and_mount(&outer).expect("a bordered gap is valid"));
+    assert_eq!(
+        rings(&paint),
+        vec![(0, 0, 8, 16)],
+        "the ring frames one 8x16 content cell, not three cells of nothing"
+    );
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "a".to_string()), (0, 1, "Z".to_string())],
+        "the frame and the container measure agree on the 1-cell width"
     );
 }
 

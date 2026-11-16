@@ -730,3 +730,45 @@ fn refused_scene_keeps_the_previous_frame_and_attributes_the_refusal() {
         Some(ScenePaintError::BorderTooWide { width: 9, .. })
     ));
 }
+
+#[test]
+fn floated_scene_preserves_fills_and_rounded_above_backdrop() {
+    use bitty_runtime::{LayoutNode, SplitAxis, View};
+
+    let now = Instant::now();
+    let view = ViewId::new(1);
+    let mut rt = present_runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(view, 40, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+    ));
+    rt.set_focus(view);
+
+    let (host, _) = scene_host(view, styled_ring_scene());
+    rt.install_scene_host(host);
+    rt.float_detach(view).expect("detach must succeed");
+    let stats = rt.tick_at(now).expect("floated scene frame presents");
+    assert!(stats.glyphs > 0, "scene glyphs must still paint");
+
+    let surface = presented_surface(&rt, view);
+    let rgba = rt.headless_rgba().expect("headless rgba");
+    let width = usize::try_from(rt.surface_extent().expect("surface").width()).expect("width");
+    let expected =
+        ContentPalette::from_theme_palette(&ThemePalette::bitty_dark()).color(ContentToken::Error);
+    let ring = RectPx::new(
+        surface.rect.x,
+        surface.rect.y,
+        4 * cell().width,
+        cell().height,
+    );
+    let x = ring.x + i32::try_from(ring.width / 2).expect("x fits i32");
+    let y = ring.y + 1;
+    let index = (usize::try_from(y).expect("y") * width + usize::try_from(x).expect("x")) * 4;
+    assert_eq!(
+        &rgba[index..index + 4],
+        expected,
+        "floated scene rounded ring must paint above FloatDrawLayer::backdrop"
+    );
+}

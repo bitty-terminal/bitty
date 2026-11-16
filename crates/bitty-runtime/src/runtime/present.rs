@@ -4290,6 +4290,7 @@ impl Runtime {
         fade: f32,
         higher_floats: &[bitty_render::geometry::RectPx],
         a11y: &mut bitty_ui::a11y_host::UiSnapshotHost,
+        float_layer: Option<&mut bitty_render::grid::FloatDrawLayer>,
         built: &mut CombinedLeaves,
     ) -> bool {
         let surface = bitty_render::scene::SceneSurface::new(
@@ -4331,8 +4332,19 @@ impl Runtime {
         } else {
             built.color_atlas_epoch = Some(color_epoch);
         }
-        built.fills.extend(scene.fills);
-        built.rounded.extend(scene.rounded);
+        if let Some(layer) = float_layer {
+            layer.fills.extend(scene.fills);
+            if !scene.rounded.is_empty() {
+                // Paint scene rounded boxes after backdrop/fills and before
+                // the float's outer shadow/glow/ring.
+                let chrome_rings = core::mem::take(&mut layer.rounded_fills);
+                layer.rounded_fills = scene.rounded;
+                layer.rounded_fills.extend(chrome_rings);
+            }
+        } else {
+            built.fills.extend(scene.fills);
+            built.rounded.extend(scene.rounded);
+        }
         built.glyphs.extend(scene.glyphs);
         built.needs_draw = true;
         built.scene_report.views = built.scene_report.views.saturating_add(1);
@@ -4808,6 +4820,7 @@ impl Runtime {
                         fade,
                         &higher_floats,
                         &mut scene_a11y,
+                        float_layer.as_mut(),
                         &mut built,
                     ) {
                         stale_epoch = true;
@@ -5232,9 +5245,6 @@ impl Runtime {
                 } else {
                     built.fills.extend(fills);
                 }
-                if let Some(layer) = float_layer {
-                    built.float_layers.push(layer);
-                }
                 if higher_floats.is_empty() {
                     built.glyphs.extend(glyphs);
                 } else {
@@ -5254,10 +5264,14 @@ impl Runtime {
                     fade,
                     &higher_floats,
                     &mut scene_a11y,
+                    float_layer.as_mut(),
                     &mut built,
                 ) {
                     stale_epoch = true;
                     break;
+                }
+                if let Some(layer) = float_layer {
+                    built.float_layers.push(layer);
                 }
             }
 

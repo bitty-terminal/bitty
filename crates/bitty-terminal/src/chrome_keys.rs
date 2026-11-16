@@ -254,7 +254,7 @@ impl ZoomState {
         let seq = active_workspace_seq(runtime)?;
         self.entries.get(&seq).map(|entry| match entry {
             ZoomEntry::Tree { backup, .. } => backup.leaf_ids().len(),
-            ZoomEntry::DetachedFloat { .. } => runtime.layout().leaf_ids().len() + 1,
+            ZoomEntry::DetachedFloat { .. } => runtime.layout().leaf_ids().len(),
         })
     }
 
@@ -394,11 +394,7 @@ impl ZoomState {
                 else {
                     return false;
                 };
-                if index == runtime.active_workspace_index() {
-                    runtime.unzoom_detached_float(view, saved)
-                } else {
-                    false
-                }
+                runtime.unzoom_detached_float(view, saved)
             }
         }
     }
@@ -12096,5 +12092,93 @@ claims = []
             ),
             (before.cols, before.rows, before.frame.x, before.frame.y)
         );
+    }
+
+    #[test]
+    fn zoomed_detached_float_preserves_leaf_count_and_inactive_restore() {
+        use bitty_config::ChromeAction;
+        use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+
+        let mut app = workspace_test_app();
+        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        ));
+        app.runtime.set_focus(ViewId::new(1));
+        app.runtime
+            .float_detach(ViewId::new(1))
+            .expect("detach must succeed");
+        app.runtime.set_focus(ViewId::new(1));
+
+        let before = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(1))
+            .expect("detached float frame");
+
+        // Zoom the detached float: base tree still has 1 leaf (ViewId(2)), so
+        // backup_leaf_count must be 1 (preserving StrandedLayout single-leaf
+        // guards) and effective_window_leaf_count must be 2 (1 tiled + 1 float).
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
+        assert_eq!(app.effective_window_leaf_count(), 2);
+
+        // Switching to a second workspace makes workspace 1 inactive;
+        // restore_for_view_mutation must still restore the detached float's
+        // geometry rather than dropping the entry without unzooming.
+        app.apply_chrome_action(ChromeAction::WorkspaceNew);
+        assert!(
+            app.chrome
+                .zoom
+                .restore_for_view_mutation(&mut app.runtime, ViewId::new(1)),
+            "inactive workspace detached float must unzoom cleanly"
+        );
+        app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
+        let restored = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(1))
+            .expect("restored detached float on workspace 1");
+        assert_eq!(
+            (
+                restored.cols,
+                restored.rows,
+                restored.frame.x,
+                restored.frame.y
+            ),
+            (before.cols, before.rows, before.frame.x, before.frame.y)
+        );
+    }
+
+    #[test]
+    fn zoomed_detached_float_effective_leaf_count_when_sole_pane() {
+        use bitty_config::ChromeAction;
+        use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+
+        let mut app = tab_test_app();
+        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        ));
+        app.runtime.set_focus(ViewId::new(1));
+        app.runtime
+            .float_detach(ViewId::new(1))
+            .expect("detach must succeed");
+        // Close the sole tiled leaf so the detached float is the only pane in
+        // the window, then zoom it.
+        app.runtime.set_focus(ViewId::new(2));
+        app.apply_chrome_action(ChromeAction::CloseView);
+        app.runtime.set_focus(ViewId::new(1));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(0));
+        assert_eq!(app.effective_window_leaf_count(), 1);
     }
 }

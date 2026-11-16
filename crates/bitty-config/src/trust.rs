@@ -578,6 +578,14 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: e.to_string(),
         })?;
     }
+    if let Some(f) = &plan.floating {
+        // CTX-1861: floating panel defaults are presentation-only chrome with
+        // no process authority (like `layout` and `decoration`), so project
+        // layers may set them; bounds still fail closed.
+        f.validate().map_err(|e| ConfigError::TrustViolation {
+            message: e.to_string(),
+        })?;
+    }
     if let Some(b) = &plan.scrollbar {
         // CTX-0181: the scrollbar is presentation-only chrome (like
         // auto-copy), so project layers may set it.

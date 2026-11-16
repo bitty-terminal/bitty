@@ -372,6 +372,9 @@ impl ConfigPlan {
         if let Some(d) = &self.decoration {
             d.validate()?;
         }
+        if let Some(f) = &self.floating {
+            f.validate()?;
+        }
         if let Some(views) = &self.views {
             for entry in views {
                 entry.validate()?;
@@ -438,6 +441,7 @@ impl ConfigPlan {
             && self.workspace.is_none()
             && self.chrome.is_none()
             && self.decoration.is_none()
+            && self.floating.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()

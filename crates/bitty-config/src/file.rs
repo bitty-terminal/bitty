@@ -2479,13 +2479,41 @@ fn build_plan_from_data(
     let floating = match data.floating {
         None => None,
         Some(f) => {
+            // Validate `f64` bounds before `as f32` so values like
+            // `1.00000001` do not round down to `1.0_f32` and bypass range
+            // checks (fail-closed contract).
+            let check_pos =
+                |val: Option<f64>, field: &'static str| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within (0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
+            let check_unit =
+                |val: Option<f64>, field: &'static str| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within [0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
             let cfg = FloatingConfig {
-                width: f.width.map(|v| v as f32),
-                height: f.height.map(|v| v as f32),
+                width: check_pos(f.width, "floating.width")?,
+                height: check_pos(f.height, "floating.height")?,
                 centered: f.centered,
-                x: f.x.map(|v| v as f32),
-                y: f.y.map(|v| v as f32),
-                background_opacity: f.background_opacity.map(|v| v as f32),
+                x: check_unit(f.x, "floating.x")?,
+                y: check_unit(f.y, "floating.y")?,
+                background_opacity: check_unit(
+                    f.background_opacity,
+                    "floating.background_opacity",
+                )?,
                 background: f.background,
             };
             cfg.validate()?;
@@ -8179,15 +8207,57 @@ return {
         assert_eq!(f.background_opacity, Some(0.85));
         assert_eq!(f.background.as_deref(), Some("#1A1B26"));
         assert_eq!(f.resolve_background_rgba(), Some([0x1A, 0x1B, 0x26, 0xFF]));
+        assert!(!plan.is_empty(), "plan with floating must not be empty");
+        plan.validate().expect("plan with valid floating validates");
+        assert!(crate::collect_diagnostics(&plan).is_empty());
 
-        // Invalid bounds fail closed.
+        // Merge + live reload round-trip.
+        use crate::merge::merge_layers;
+        use crate::plan::LayeredPlan;
+        use crate::reload::reconcile_live;
+        use crate::types::EffectiveConfig;
+
+        let mut override_plan = ConfigPlan::new();
+        override_plan.floating = Some(FloatingConfig {
+            width: Some(0.9),
+            ..Default::default()
+        });
+        let merged = merge_layers(vec![
+            LayeredPlan::new(source.clone(), plan.clone()),
+            LayeredPlan::new(
+                ConfigSource::new(LayerKind::Cli, None::<&str>),
+                override_plan,
+            ),
+        ])
+        .expect("merge_layers succeeds");
+        assert_eq!(merged.effective.floating.width, Some(0.9));
+        assert_eq!(merged.effective.floating.height, Some(0.7));
+        assert_eq!(merged.effective.floating.centered, Some(false));
+        let mut current = EffectiveConfig::default();
+        let applied = reconcile_live(&mut current, &merged.effective).expect("reconciles live");
+        assert!(applied.is_live());
+        assert_eq!(current.floating, merged.effective.floating);
+
+        // Plan validation and diagnostics catch invalid hand-constructed FloatingConfig.
+        let mut bad_plan = ConfigPlan::new();
+        bad_plan.floating = Some(FloatingConfig {
+            width: Some(1.5),
+            ..Default::default()
+        });
+        assert!(bad_plan.validate().is_err());
+        assert!(!crate::collect_diagnostics(&bad_plan).is_empty());
+
+        // Invalid bounds fail closed (including f64 values that would round to 1.0_f32).
         for bad in [
             r#"return { floating = { width = 0.0 } }"#,
             r#"return { floating = { width = 1.5 } }"#,
+            r#"return { floating = { width = 1.00000001 } }"#,
             r#"return { floating = { height = -0.1 } }"#,
             r#"return { floating = { x = 1.2 } }"#,
+            r#"return { floating = { x = 1.00000001 } }"#,
             r#"return { floating = { y = -0.5 } }"#,
             r#"return { floating = { background_opacity = 1.1 } }"#,
+            r#"return { floating = { background_opacity = 1.00000001 } }"#,
             r#"return { floating = { background = "not-a-hex" } }"#,
             r#"return { floating = { unknown_key = 1 } }"#,
         ] {

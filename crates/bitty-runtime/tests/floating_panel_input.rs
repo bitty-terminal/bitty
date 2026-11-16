@@ -948,3 +948,43 @@ fn floating_config_applies_size_and_position_to_toggle_floating() {
         frame.frame
     );
 }
+
+#[test]
+fn floating_config_applies_to_in_tree_presentation_mode_floating() {
+    let mut rt = Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig {
+        floating: bitty_runtime::FloatingPanelConfig {
+            width_ratio: 0.5,
+            height_ratio: 0.5,
+            centered: false,
+            x_ratio: Some(0.0),
+            y_ratio: Some(0.0),
+            ..bitty_runtime::FloatingPanelConfig::default()
+        },
+        ..bitty_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime must build");
+    let mut layout = two_pane();
+    layout
+        .find_leaf_mut(ViewId::new(1))
+        .expect("leaf 1")
+        .set_presentation(bitty_runtime::PresentationMode::Floating);
+    install(&mut rt, layout);
+
+    let frame = frame_of(&rt, ViewId::new(1));
+    let (cw, ch) = rt.live_cell_size();
+    assert!(
+        frame.frame.width <= cw * 40 && frame.frame.width >= cw * 38,
+        "expected ~50% width on in-tree float, got {} (cw={cw})",
+        frame.frame.width
+    );
+    assert!(
+        frame.frame.height <= ch * 12 && frame.frame.height >= ch * 11,
+        "expected ~50% height on in-tree float, got {} (ch={ch})",
+        frame.frame.height
+    );
+    assert!(
+        frame.frame.x <= cw as i32 && frame.frame.y <= ch as i32,
+        "top-left anchor should place in-tree float near origin, got {:?}",
+        frame.frame
+    );
+}

@@ -1381,44 +1381,57 @@ impl Runtime {
     /// Default base rect for a newly detached floating panel in container cells
     /// (CTX-1861), derived from `self.config.floating` and clamped inside
     /// `self.container`.
+    /// Computes the configured floating panel rect inside `container`
+    /// (shared by detached floats and in-tree `PresentationMode::Floating`).
     #[must_use]
-    pub(super) fn default_float_base_rect(&self) -> UiRect {
-        if self.container.is_empty() {
+    pub(super) fn configured_float_rect(
+        floating: &crate::config::FloatingPanelConfig,
+        container: UiRect,
+    ) -> UiRect {
+        if container.is_empty() {
             return UiRect::zero();
         }
-        let f = &self.config.floating;
-        let cw = self.container.width;
-        let ch = self.container.height;
-        let w = ((f32::from(cw) * f.width_ratio).round() as u16)
+        let cw = container.width;
+        let ch = container.height;
+        let w = ((f32::from(cw) * floating.width_ratio).round() as u16)
             .max(1)
             .min(cw);
-        let h = ((f32::from(ch) * f.height_ratio).round() as u16)
+        let h = ((f32::from(ch) * floating.height_ratio).round() as u16)
             .max(1)
             .min(ch);
         let avail_x = cw.saturating_sub(w);
         let avail_y = ch.saturating_sub(h);
-        let dx = if f.centered {
+        let dx = if floating.centered {
             avail_x / 2
         } else {
-            f.x_ratio
+            floating
+                .x_ratio
                 .map(|rx| (f32::from(avail_x) * rx).round() as u16)
                 .unwrap_or(avail_x / 2)
                 .min(avail_x)
         };
-        let dy = if f.centered {
+        let dy = if floating.centered {
             avail_y / 2
         } else {
-            f.y_ratio
+            floating
+                .y_ratio
                 .map(|ry| (f32::from(avail_y) * ry).round() as u16)
                 .unwrap_or(avail_y / 2)
                 .min(avail_y)
         };
         UiRect::new(
-            self.container.x.saturating_add(dx),
-            self.container.y.saturating_add(dy),
+            container.x.saturating_add(dx),
+            container.y.saturating_add(dy),
             w,
             h,
         )
+    }
+
+    /// Computes the default floating panel cell rect from `self.config.floating`
+    /// and `self.container`.
+    #[must_use]
+    pub(super) fn default_float_base_rect(&self) -> UiRect {
+        Self::configured_float_rect(&self.config.floating, self.container)
     }
 
     /// True when `id` is a workspace-detached floating panel (CTX-1861).
@@ -1458,7 +1471,7 @@ impl Runtime {
         id: ViewId,
         saved: ((i32, i32), Option<(u16, u16)>),
     ) -> bool {
-        if !self.floats.contains(id) {
+        if !self.floats.contains(id) && !self.workspaces.iter().any(|w| w.floats.contains(id)) {
             return false;
         }
         let (prev_offset, prev_size) = saved;
@@ -1866,7 +1879,7 @@ impl Runtime {
                         (dv.frame, dv.content, dv.border)
                     }
                 } else if structural.is_none() && mode_tier.is_some() {
-                    let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
+                    let float_rect = Self::configured_float_rect(&self.config.floating, area);
                     // Elevated float chrome: one extra border px so the
                     // float reads distinct from tiled base; the content
                     // inset grows with it so glyphs never sit under the

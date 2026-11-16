@@ -1085,6 +1085,26 @@ impl TerminalApp {
         }
     }
 
+    /// Zoom-aware live non-terminal panel leaf count across the whole window
+    /// (CTX-1860, bitty#3201 review).
+    ///
+    /// [`Runtime::live_non_terminal_leaf_count`] reads the runtime layout,
+    /// which while zoomed *is* the single-leaf zoom proxy; the real tree stays
+    /// in [`ZoomState`]. The shell-exit gate conjoins this predicate with
+    /// [`Self::effective_window_leaf_count`], which already substitutes that
+    /// backup, so leaving this side zoom-blind makes the two halves describe
+    /// different windows and `zoom a pane, type exit` still tears a live panel
+    /// down (bitty#3201). Substituting the backup's leaf ids here is the same
+    /// `ZoomState` read the total uses, not a second population walk.
+    pub(crate) fn window_live_non_terminal_leaf_count(&self) -> usize {
+        let active_tiled = self
+            .runtime
+            .workspace_seq_at(self.runtime.active_workspace_index())
+            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .unwrap_or_else(|| self.runtime.layout().leaf_ids());
+        self.runtime.live_non_terminal_leaf_count_over(active_tiled)
+    }
+
     /// Occupied workspace indices in index order for the occupied cycle
     /// (CTX-1100, #1904 follow-up to CodeRabbit PR #1917).
     ///

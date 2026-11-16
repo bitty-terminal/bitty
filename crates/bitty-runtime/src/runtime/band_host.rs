@@ -2108,10 +2108,10 @@ impl Runtime {
 
     /// Degraded-visible band budget per horizontal edge (CTX-0946 C3).
     ///
-    /// Derived from [`Self::row_band_selection`] so paint, hit-test, and the
-    /// content container never disagree. Multi-band plugins shed excess rows
-    /// first when `want > spare`; `(0, 0)` when there are zero spare rows or
-    /// even one row per distinct plugin cannot fit above [`Self::chrome_min_rows`].
+    /// Derived from the row-band selection so paint, hit-test, and the content
+    /// container never disagree. Multi-band plugins shed excess rows first when
+    /// `want > spare`; `(0, 0)` when there are zero spare rows or even one row
+    /// per distinct plugin cannot fit above the minimum content row floor.
     #[must_use]
     pub fn plugin_band_budget(&self) -> (u16, u16) {
         let (top, bottom) = self.row_band_selection();
@@ -2847,53 +2847,60 @@ impl Runtime {
             BandEdge::Left,
             BandEdge::Right,
         ] {
-            let bands: Vec<(String, UiSlot, u32, bool)> = self
-                .chrome_bands
-                .edge(edge)
-                .iter()
-                .map(|band| {
-                    (
-                        band.plugin_id.clone(),
-                        band.slot,
-                        band.version,
-                        band_is_visible(&band.root),
-                    )
-                })
-                .collect();
-            let mut visible_index = 0u16;
-            for (plugin_id, slot, version, visible) in bands {
-                let mount = by_key
-                    .get_mut(&(plugin_id.clone(), slot, version))
-                    .and_then(VecDeque::pop_front);
-                if !visible {
+            let edge_bands = self.chrome_bands.edge(edge);
+            // Pair mount handles against the *full* edge order first: every
+            // band consumes its own queued handle whether or not it is
+            // visible, so a hidden or shed band never shifts a later plugin's
+            // handle onto itself.
+            let mut edge_mounts: Vec<Option<(u32, i64)>> = Vec::with_capacity(edge_bands.len());
+            for band in edge_bands {
+                edge_mounts.push(
+                    by_key
+                        .get_mut(&(band.plugin_id.clone(), band.slot, band.version))
+                        .and_then(VecDeque::pop_front),
+                );
+            }
+            // Visible indices come from the kept list only, so a band the
+            // row budget shed (or one hidden by its root) can never claim a
+            // row/column that another band paints and routes.
+            let kept = self.visible_edge_bands(edge);
+            for (index, kept_band) in kept.iter().enumerate() {
+                let Some(visible_index) = u16::try_from(index).ok() else {
+                    break;
+                };
+                let Some(edge_index) = edge_bands
+                    .iter()
+                    .position(|band| std::ptr::eq(band, *kept_band))
+                else {
+                    continue;
+                };
+                let Some((generation, handle)) = edge_mounts.get(edge_index).copied().flatten()
+                else {
+                    continue;
+                };
+                // C-D4 counter/version exhaustion fails closed: never issue an
+                // origin whose version can no longer advance.
+                if kept_band.version == u32::MAX || generation == 0 {
                     continue;
                 }
-                if let Some((generation, handle)) = mount {
-                    // C-D4 counter/version exhaustion fails closed: never
-                    // issue an origin whose version can no longer advance.
-                    if version != u32::MAX && generation != 0 {
-                        // Issue #3171: both axes publish an origin through the
-                        // one granted rect, carrying the band's own geometry
-                        // (row for a row band, column for a column band) so a
-                        // reflow on either axis invalidates it.
-                        if let Some((row, column, _, _)) =
-                            self.band_paint_rect(edge, usize::from(visible_index))
-                        {
-                            pending.push(BandOrigin {
-                                plugin_id,
-                                generation,
-                                handle,
-                                slot,
-                                version,
-                                edge,
-                                visible_index,
-                                row,
-                                column,
-                            });
-                        }
-                    }
-                }
-                visible_index = visible_index.saturating_add(1);
+                // Issue #3171: both axes publish an origin through the one
+                // granted rect, carrying the band's own geometry (row for a
+                // row band, column for a column band) so a reflow on either
+                // axis invalidates it.
+                let Some((row, column, _, _)) = self.band_paint_rect(edge, index) else {
+                    continue;
+                };
+                pending.push(BandOrigin {
+                    plugin_id: kept_band.plugin_id.clone(),
+                    generation,
+                    handle,
+                    slot: kept_band.slot,
+                    version: kept_band.version,
+                    edge,
+                    visible_index,
+                    row,
+                    column,
+                });
             }
         }
         self.pending_band_origins = pending;
@@ -4689,25 +4696,61 @@ mod tests {
         let window_rows = floor.saturating_add(spare);
         rt.set_window_cells(bitty_ui::Rect::new(0, 0, 80, window_rows));
 
+        let mut blocks = Vec::new();
         let mut mounts = Vec::new();
         for row in 0..8 {
-            mounts.push((
+            blocks.push((
                 "bitty-featured.devtools".to_string(),
                 UiSlot::Bottom,
                 UiNode::row(vec![UiNode::text(format!("devtools-row-{row}"))]),
                 1,
             ));
+            mounts.push(BandMount {
+                plugin_id: "bitty-featured.devtools".to_string(),
+                slot: UiSlot::Bottom,
+                version: 1,
+                generation: 1,
+                handle: i64::from(row + 1),
+            });
         }
-        mounts.push((
+        let bar_region = UiRegion {
+            id: "clock".to_string(),
+            kind: bitty_lua::ui::UiRegionKind::Module,
+        };
+        let bar_cmd = |verb: &str| {
+            Some(ClickCommand {
+                command: format!("bitty-terminal.bar:{verb}"),
+                args: Vec::new(),
+                region: Some(bar_region.clone()),
+            })
+        };
+        blocks.push((
             "bitty-terminal.bar".to_string(),
             UiSlot::Bottom,
-            UiNode::row(vec![UiNode::text("bar-clock")]),
+            UiNode::row(vec![UiNode::Text {
+                text: "bar-clock".to_string(),
+                fg: None,
+                bg: None,
+                bold: None,
+                on_click: bar_cmd("click"),
+                on_scroll: bar_cmd("scroll"),
+                anchor: None,
+                on_hover: bar_cmd("hover"),
+            }]),
             1,
         ));
-        let (bands, unplaced) = ChromeBands::from_mounts(mounts);
+        mounts.push(BandMount {
+            plugin_id: "bitty-terminal.bar".to_string(),
+            slot: UiSlot::Bottom,
+            version: 1,
+            generation: 2,
+            handle: 99,
+        });
+
+        let (bands, unplaced) = ChromeBands::from_mounts(blocks);
         assert_eq!(unplaced, 0);
-        rt.set_chrome_bands(bands);
-        let _ = rt.tick();
+        rt.set_chrome_bands_with_mounts(bands, mounts);
+        assert!(rt.tick().is_some(), "band frame presents");
 
         assert_eq!(
             rt.plugin_band_budget(),
@@ -4716,15 +4759,86 @@ mod tests {
         );
         let kept = rt.visible_edge_bands(BandEdge::Bottom);
         assert_eq!(kept.len(), usize::from(spare));
-        assert!(
-            kept.iter()
-                .any(|band| band.plugin_id == "bitty-terminal.bar"),
-            "single-band bar must survive duplicate-row shedding from multi-band panel: {kept:?}"
-        );
+        let bar_index = kept
+            .iter()
+            .position(|band| band.plugin_id == "bitty-terminal.bar")
+            .expect("single-band bar must survive duplicate-row shedding from multi-band panel");
+        let bar_row = rt
+            .visible_band_row(BandEdge::Bottom, bar_index)
+            .expect("surviving bar has a painted row");
         assert!(
             rt.band_row_container().height >= floor,
             "content row floor stays intact"
         );
         assert!(!rt.band_geometry_violated());
+
+        let origins = rt.published_band_origins();
+        assert_eq!(
+            origins.len(),
+            usize::from(spare),
+            "only kept bands receive published origins: {origins:?}"
+        );
+        assert!(
+            origins
+                .iter()
+                .all(|o| o.plugin_id != "bitty-featured.devtools" || o.handle <= 4),
+            "shed devtools bands must never steal kept origins: {origins:?}"
+        );
+        let bar_origin = origins
+            .iter()
+            .find(|o| o.plugin_id == "bitty-terminal.bar")
+            .cloned()
+            .expect("bar keeps a live published origin");
+        assert_eq!(bar_origin.visible_index, bar_index as u16);
+        assert_eq!(bar_origin.row, bar_row);
+        assert_eq!(bar_origin.generation, 2);
+        assert_eq!(bar_origin.handle, 99);
+
+        let (cw, ch) = rt.live_cell_size();
+        let pad = f64::from(rt.window_padding_physical());
+        let bar_pos = bitty_platform::CursorPosition {
+            x: pad + 1.5 * f64::from(cw),
+            y: pad + (f64::from(bar_row) + 0.5) * f64::from(ch),
+        };
+        let off_band = bitty_platform::CursorPosition {
+            x: pad + 1.5 * f64::from(cw),
+            y: pad + 0.5 * f64::from(ch),
+        };
+
+        // Click on the kept bar routes with bar's origin.
+        rt.handle_cursor_moved(bar_pos);
+        rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        ));
+        rt.handle_mouse_input(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Released,
+        ));
+        let clicks = rt.drain_band_clicks();
+        assert_eq!(clicks.len(), 1);
+        assert_eq!(clicks[0].plugin_id, "bitty-terminal.bar");
+        assert_eq!(clicks[0].origin.as_ref(), Some(&bar_origin));
+
+        // Scroll on the kept bar routes with bar's origin.
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 1.0));
+        let scrolls = rt.drain_band_scrolls();
+        assert_eq!(scrolls.len(), 1);
+        assert_eq!(scrolls[0].plugin_id, "bitty-terminal.bar");
+        assert_eq!(scrolls[0].origin.as_ref(), Some(&bar_origin));
+
+        // Hover enter on the kept bar routes with bar's origin.
+        let _ = rt.drain_band_hovers();
+        rt.handle_cursor_moved(off_band);
+        let _ = rt.drain_band_hovers();
+        rt.handle_cursor_moved(bar_pos);
+        let enters: Vec<_> = rt
+            .drain_band_hovers()
+            .into_iter()
+            .filter(|ev| ev.phase == BandHoverPhase::Enter)
+            .collect();
+        assert_eq!(enters.len(), 1);
+        assert_eq!(enters[0].plugin_id, "bitty-terminal.bar");
+        assert_eq!(enters[0].origin.as_ref(), Some(&bar_origin));
     }
 }

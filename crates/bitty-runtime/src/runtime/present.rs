@@ -17174,10 +17174,14 @@ mod second_window_surface_tests {
         );
 
         // First prove BEL alone while hidden expires cleanly without synthesizing
-        // retained damage.
+        // retained damage. The deadline is derived from the armed instant rather
+        // than from `t0`: `handle_pty_bytes` stamps the flash with wall-clock
+        // `Instant::now()`, so a fixed slack from `t0` races a loaded test
+        // harness instead of exercising the expiry.
         rt.handle_pty_bytes(b"\x07");
-        assert!(rt.bell_notification_deadline().is_some());
-        let after_bell = t0 + crate::runtime::bell::BELL_FLASH_DURATION + Duration::from_millis(10);
+        let after_bell = rt
+            .bell_notification_deadline()
+            .expect("bell flash deadline is armed");
         assert!(rt.tick_at(after_bell).is_none());
         assert_eq!(
             rt.bell_notification_deadline(),
@@ -17188,10 +17192,9 @@ mod second_window_surface_tests {
         // Next prove OSC 9 notification banner also expires on time while hidden
         // and never leaves a past-due deadline spinning `AboutToWait`.
         rt.handle_pty_bytes(b"\x1b]9;bg notice\x07");
-        assert!(rt.bell_notification_deadline().is_some());
-        let expired = after_bell
-            + crate::runtime::bell::NOTIFICATION_BANNER_DURATION
-            + Duration::from_millis(10);
+        let expired = rt
+            .bell_notification_deadline()
+            .expect("notification banner deadline is armed");
         assert!(rt.tick_at(expired).is_none());
         assert_eq!(
             rt.bell_notification_deadline(),

@@ -14,8 +14,23 @@
 //! | --- | --- | --- | --- |
 //! | [`terminal_send_and_text_are_live_and_scope_bounded`] | `terminal send` / `terminal text` | allow + deny | live, headless `--test-mode` |
 //! | [`window_new_denies_an_ended_session_on_a_served_surface`] | `ctl window new` | deny | live, headless `--test-mode` |
-//! | [`window_new_creates_a_window_on_a_served_surface`] | `ctl window new` | allow + deny | live, windowed instance |
+//! | [`window_new_creates_a_window_on_a_served_surface`] | `ctl window new` | allow + deny | live, windowed under a test-owned compositor, `#[ignore]`d |
 //! | [`window_new_denies_a_connection_without_view_manage`] | `ctl window new` | deny | unrun, `#[ignore]`d |
+//!
+//! # Safety: this target never touches the host compositor
+//!
+//! The workspace bans host-compositor GUI testing. On 2026-09-24 a test driving
+//! the owner's live Hyprland session segfaulted Hyprland and logged the owner
+//! out, and spawning probe windows on that session is part of the ban.
+//!
+//! So the one windowed cell here is not merely best-effort: `live_instance`'s
+//! compositor resolver refuses the ambient session outright. It never reads the
+//! caller's `WAYLAND_DISPLAY`/`DISPLAY`, never globs `/run/user/<uid>`, panics
+//! when `HYPRLAND_INSTANCE_SIGNATURE` is set or when `BITTY_TEST_COMPOSITOR`
+//! resolves outside the test's own temp root, and runs a windowed `bitty` only
+//! under a compositor the test spawned itself. The cell is `#[ignore]`d as
+//! well, so a plain `cargo test` cannot open a window even on a host where a
+//! private `Xvfb` happens to be installed.
 //!
 //! # How each arm is produced
 //!
@@ -47,10 +62,12 @@
 //!   connection can be driven into lacking it. That arm needs the arbitrary
 //!   single-scope live grant of bitty#2917, and it is recorded as an
 //!   `#[ignore]`d case rather than faked.
-//! - `window new` is exercised on a windowed instance only; a host with no
-//!   compositor socket reports the cell unrun with the reason on stdout. A
-//!   headless runner is expected to print `AC022_UNRUN` there, which is not a
-//!   pass.
+//! - `window new` is exercised on a windowed instance only, and only under a
+//!   compositor the test itself owns: a private `Xvfb` it spawns (`PATH`, or
+//!   `BITTY_TEST_XVFB`), or a socket named by `BITTY_TEST_COMPOSITOR` inside
+//!   its own temp root. A host with neither reports the cell unrun with the
+//!   reason on stdout; a headless runner is expected to print `AC022_UNRUN`
+//!   there, which is not a pass.
 //! - The served `bitty.debug/listWindows` answers a single-window stub
 //!   (`crates/bitty-terminal/src/ctl/apply.rs`), so the created window's id is
 //!   observed from the request's registry count and the app's own
@@ -244,19 +261,53 @@ fn window_new_denies_an_ended_session_on_a_served_surface() {
 
 /// `ctl window new` on a served surface, allow and deny arms.
 ///
+/// # Why this cell is `#[ignore]`d, and how to run it deliberately
+///
+/// It is the only cell that opens a window, and the workspace bans
+/// host-compositor GUI testing: on 2026-09-24 a test driving the owner's live
+/// Hyprland session segfaulted Hyprland and logged the owner out, and spawning
+/// probe windows on that session is part of the ban. This test therefore has no
+/// ambient path to a display at all — `live_instance` panics on
+/// `HYPRLAND_INSTANCE_SIGNATURE`, panics on a socket outside the test's own
+/// temp root, and never falls back to the caller's `WAYLAND_DISPLAY`/`DISPLAY`
+/// or to a `/run/user/<uid>` glob. It runs only under a compositor it owns, and
+/// the `#[ignore]` keeps a plain `cargo test` from opening a window even where
+/// a private compositor happens to be installed.
+///
+/// Run it on purpose, outside the owner's session, from the lane worktree:
+///
+/// ```text
+/// # preferred: the test spawns and owns a private Xvfb
+/// cargo test -p bitty-terminal --test ac022_live_verbs --offline \
+///     -- --ignored --nocapture window_new_creates_a_window_on_a_served_surface
+///
+/// # or bring your own compositor and put its socket inside the test's root
+/// export BITTY_TEST_ROOT=/tmp/ac022-compositor
+/// XDG_RUNTIME_DIR=/tmp/ac022-compositor/ac022-window \
+///     weston --socket=wayland-0 &
+/// BITTY_TEST_COMPOSITOR=/tmp/ac022-compositor/ac022-window/wayland-0 \
+///     cargo test -p bitty-terminal --test ac022_live_verbs --offline \
+///     -- --ignored --nocapture window_new_creates_a_window_on_a_served_surface
+/// ```
+///
+/// Anything outside that root — including the ambient runtime directory — is a
+/// hard panic naming the ban, not a skip.
+///
 /// The allow arm needs a real event loop: only the windowed app owns an
 /// `EventContext`, and the headless loop reports the lane unserviced. The
-/// instance is started on the host's compositor (discovered from the
-/// environment, never hardcoded) with its own private root and socket, and the
-/// app's own `window registered id=N` record plus the registry count in the
-/// reply are what prove a window row exists — the served `window list` is a
-/// single-window stub today, so it cannot enumerate the second window.
+/// instance keeps its own private root and socket, and the app's own
+/// `window registered id=N` record plus the registry count in the reply are
+/// what prove a window row exists — the served `window list` is a single-window
+/// stub today, so it cannot enumerate the second window.
 #[test]
+#[ignore = "opens a window: it may run only under a compositor the test itself owns (private Xvfb via PATH/BITTY_TEST_XVFB, or BITTY_TEST_COMPOSITOR inside BITTY_TEST_ROOT/<tag>). The host-compositor GUI testing ban means a plain cargo test must never spawn a window; see the doc comment for the deliberate run line"]
 fn window_new_creates_a_window_on_a_served_surface() {
     let Some(mut instance) = TestInstance::spawn_graphical("ac022-window") else {
         println!(
-            "AC022_UNRUN window.new: this host exposes no compositor socket (WAYLAND_DISPLAY/DISPLAY \
-             unusable), and the new-window lane is serviced only by the windowed app; nothing was proven"
+            "AC022_UNRUN window.new: no test-owned compositor (no Xvfb on PATH or in \
+             BITTY_TEST_XVFB, and no BITTY_TEST_COMPOSITOR inside the test root), and the \
+             new-window lane is serviced only by the windowed app; nothing was proven. The \
+             host's own session is never used for this."
         );
         return;
     };

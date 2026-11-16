@@ -3972,8 +3972,28 @@ impl PluginRuntime {
     /// Throttled variant of [`Self::recover_wall_failed_plugins`] for the host
     /// cold-tick loop so transient multi-tick OS stalls do not exhaust
     /// [`MAX_WALL_RECOVERY_ATTEMPTS`] in milliseconds.
+    ///
+    /// One call spends at most one attempt per eligible plugin and always arms
+    /// that plugin's backoff window (see the private
+    /// `Self::recover_wall_failed_plugins_inner`), so the caller never has to
+    /// call [`Self::recover_wall_failed_plugins`] alongside it.
     pub fn recover_wall_failed_plugins_throttled(&mut self, now: Instant) -> usize {
         self.recover_wall_failed_plugins_inner(Some(now))
+    }
+
+    /// Clears the throttled-recovery window for every plugin, keeping the
+    /// attempt budget.
+    ///
+    /// The host calls this for an intent that legitimately deserves an
+    /// immediate retry regardless of the last backoff — a config reload, whose
+    /// new generation may not fail the way the old one did. It clears only
+    /// `wall_recovery_next_at`; [`MAX_WALL_RECOVERY_ATTEMPTS`] still bounds the
+    /// total, so a reload loop cannot donate unlimited attempts to a plugin
+    /// that fails deterministically.
+    pub fn clear_wall_recovery_throttle(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.wall_recovery_next_at = None;
+        }
     }
 
     /// Reloads any non-bundled plugin that transitioned to
@@ -3992,6 +4012,15 @@ impl PluginRuntime {
     }
 
     fn recover_wall_failed_plugins_inner(&mut self, throttled_now: Option<Instant>) -> usize {
+        // One instant for the whole pass: an unthrottled call (the explicit
+        // `recover_wall_failed_plugins` entry point) still arms the window it
+        // just consumed, so it can never be followed by a second attempt inside
+        // that window (CTX-1855 review HIGH: the host config branch used to call
+        // the unthrottled pass and then the throttled one on the same tick, and
+        // an unthrottled pass that armed nothing spent two attempt slots).
+        // Only the throttled entry point *honors* the window: an explicit
+        // unthrottled caller asked for an immediate attempt.
+        let attempt_at = throttled_now.unwrap_or_else(Instant::now);
         let candidates: Vec<(PluginId, SourceClass, String)> = self
             .entries
             .iter()
@@ -4027,10 +4056,12 @@ impl PluginRuntime {
         for (id, source_class, prev_reason) in candidates {
             if let Some(entry) = self.entries.get_mut(&id) {
                 entry.wall_recovery_attempts = entry.wall_recovery_attempts.saturating_add(1);
-                if let Some(now) = throttled_now {
-                    entry.wall_recovery_next_at =
-                        now.checked_add(Self::wall_recovery_backoff(entry.wall_recovery_attempts));
-                }
+                // Arm the backoff after *every* attempt, throttled or not: the
+                // window is what makes the next cold tick one attempt instead of
+                // two, and an unthrottled pass must never leave the plugin
+                // un-throttled for the throttled pass on the same tick.
+                entry.wall_recovery_next_at = attempt_at
+                    .checked_add(Self::wall_recovery_backoff(entry.wall_recovery_attempts));
             }
             if let Some(store_root) = self.store_root.clone() {
                 match resolution::load_index(&store_root) {
@@ -4058,6 +4089,20 @@ impl PluginRuntime {
             }
             match self.reload_inner(&id) {
                 Ok(_) => {
+                    // A clean reload proves the generation healthy: hand the
+                    // whole recovery budget back, window included. The attempt
+                    // above armed `wall_recovery_next_at`; leaving it set would
+                    // delay a real wall fault that arrives inside that window by
+                    // up to the 30 s backoff (CTX-1855 review LOW). The counters
+                    // are cleared here rather than by calling `Self::reload`
+                    // because `reload` clears them *before* the attempt, which
+                    // would hand a cap-free budget to a plugin whose reload fails
+                    // deterministically.
+                    if let Some(entry) = self.entries.get_mut(&id) {
+                        entry.wall_recovery_attempts = 0;
+                        entry.healthy_timer_ticks = 0;
+                        entry.wall_recovery_next_at = None;
+                    }
                     recovered += 1;
                 }
                 Err(_) => {

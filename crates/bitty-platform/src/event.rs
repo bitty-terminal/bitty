@@ -1355,3 +1355,142 @@ mod tests {
         );
     }
 }
+
+/// CTX-1855 review round: the end-to-end chord for the `move_split` keymaps.
+///
+/// `Ctrl+Alt+h` / `Ctrl+Alt+j` are bound to `move_split:left/down`, which match
+/// a single ASCII graphic character plus the ctrl/alt modifiers. On Linux/Wayland
+/// winit collapses those chords to the ASCII control characters they alias
+/// (`\x08` = `Backspace` = `h` with ctrl, `\n` = `Enter` = `j` with ctrl), so the
+/// chord only reaches the keymap if [`translate_key_parts`] restores the graphic
+/// key from `key_without_modifiers`.
+///
+/// These tests drive the real translation seam (never the normalizer in
+/// isolation) so the wiring is covered: the terminals' own keymap half stays in
+/// `bitty-terminal` (`chrome_keys.rs`,
+/// `ctrl_alt_h_j_match_move_split_keymaps_after_platform_normalization`).
+#[cfg(test)]
+mod chord_normalization_1855_tests {
+    use super::*;
+
+    const ALT_CTRL_COLLAPSED_H: &str = "\u{8}";
+    const ALT_CTRL_COLLAPSED_J: &str = "\n";
+
+    fn translate(collapsed: Key, base: Option<Key>) -> KeyEvent {
+        translate_key_parts(
+            collapsed,
+            base,
+            None,
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("a real key press is never dropped")
+    }
+
+    fn graphic(event: &KeyEvent) -> &str {
+        match &event.logical_key {
+            LogicalKey::Character(value) => value.as_str(),
+            other => panic!("expected a graphic key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_h_and_j_normalize_to_the_bound_ascii_keys() {
+        // The two shapes Wayland actually delivers for the bound chords: the
+        // control character alias, and the control-equivalent named key.
+        for (collapsed, base, expected) in [
+            (
+                Key::Character(SmolStr::new(ALT_CTRL_COLLAPSED_H)),
+                Key::Character(SmolStr::new("h")),
+                "h",
+            ),
+            (
+                Key::Character(SmolStr::new(ALT_CTRL_COLLAPSED_J)),
+                Key::Character(SmolStr::new("j")),
+                "j",
+            ),
+            (
+                Key::Named(WinitNamedKey::Backspace),
+                Key::Character(SmolStr::new("h")),
+                "h",
+            ),
+            (
+                Key::Named(WinitNamedKey::Enter),
+                Key::Character(SmolStr::new("j")),
+                "j",
+            ),
+        ] {
+            let event = translate(collapsed, Some(base));
+            assert_eq!(
+                graphic(&event),
+                expected,
+                "`Ctrl+Alt+{expected}` must reach the keymap as the bare graphic key"
+            );
+            assert_eq!(event.state, PressState::Pressed);
+            assert!(!event.repeat, "the chord is not a repeat");
+        }
+    }
+
+    #[test]
+    fn an_unbound_control_alias_normalizes_to_its_graphic_key_too() {
+        // `Ctrl+I` collapses to `Tab`; the rule is key-shaped, not an allowlist
+        // of the two bound chords.
+        let event = translate(
+            Key::Named(WinitNamedKey::Tab),
+            Some(Key::Character(SmolStr::new("i"))),
+        );
+        assert_eq!(graphic(&event), "i");
+    }
+
+    #[test]
+    fn real_ctrl_backspace_and_shifted_punctuation_are_untouched() {
+        // The normalizer must not rewrite a genuine `Ctrl+Backspace`: its
+        // `key_without_modifiers` is still `Named(Backspace)`, not a graphic key.
+        let backspace = translate(
+            Key::Named(WinitNamedKey::Backspace),
+            Some(Key::Named(WinitNamedKey::Backspace)),
+        );
+        assert_eq!(
+            backspace.logical_key,
+            LogicalKey::Named(NamedKey::Backspace)
+        );
+
+        // `Shift+1` is `"!"` with base `"1"`: not control-collapsed, untouched.
+        let bang = translate(
+            Key::Character(SmolStr::new("!")),
+            Some(Key::Character(SmolStr::new("1"))),
+        );
+        assert_eq!(graphic(&bang), "!");
+    }
+
+    #[test]
+    fn a_base_key_that_is_not_one_ascii_graphic_char_is_not_substituted() {
+        // Guard rails for AltGr text: a multi-character or non-ASCII base must
+        // never replace the delivered character.
+        let multi = translate(
+            Key::Character(SmolStr::new(ALT_CTRL_COLLAPSED_H)),
+            Some(Key::Character(SmolStr::new("hj"))),
+        );
+        assert_eq!(graphic(&multi), ALT_CTRL_COLLAPSED_H);
+
+        let non_ascii = translate(
+            Key::Character(SmolStr::new(ALT_CTRL_COLLAPSED_H)),
+            Some(Key::Character(SmolStr::new("é"))),
+        );
+        assert_eq!(graphic(&non_ascii), ALT_CTRL_COLLAPSED_H);
+    }
+
+    #[test]
+    fn without_a_base_key_the_collapsed_control_key_is_preserved() {
+        // Documented fallback: winit only omits `key_without_modifiers` on
+        // platforms outside this crate's supported desktop set (the `None` arm
+        // of `translate_window_event`), and this seam refuses to guess a base
+        // key from a control character. The consequence is that the chord does
+        // not reach `move_split` when no base key is supplied — a limitation, not
+        // a silent misbinding, so nothing else is rewritten instead.
+        let event = translate(Key::Character(SmolStr::new(ALT_CTRL_COLLAPSED_H)), None);
+        assert_eq!(graphic(&event), ALT_CTRL_COLLAPSED_H);
+    }
+}

@@ -2809,7 +2809,14 @@ impl TerminalApp {
             let _delivered = plugin_runtime.deliver_event("process.exited", &payload);
         }
         if let Some(reload) = config {
-            let _ = plugin_runtime.recover_wall_failed_plugins();
+            // A config reload legitimately earns an immediate retry: the new
+            // generation may not fail the way the old one did. Clear only the
+            // throttle window, never the attempt budget, so a reload loop
+            // cannot donate unlimited attempts. The single throttled pass at the
+            // tail of this function then spends exactly one attempt and re-arms
+            // the window (CTX-1855 review HIGH: an unthrottled pass here plus
+            // the throttled tail spent two slots on one tick).
+            plugin_runtime.clear_wall_recovery_throttle();
             let payload = LuaValue::table([
                 ("path", LuaValue::String(reload.path)),
                 ("kind", LuaValue::String(reload.kind)),
@@ -7551,5 +7558,285 @@ mod a11y_bridge_1768_tests {
         app.shutdown_runtime();
         assert!(!app.a11y_is_active(), "the exit path drops the adapter");
         assert_eq!(app.a11y_node_count(), 0, "no tree stays exposed");
+    }
+}
+
+/// CTX-1855 review round: the host wiring for `RC-1 wall` recovery.
+///
+/// Two invariants live only at this layer. The config-reload branch of
+/// [`TerminalApp::deliver_runtime_events`] must spend exactly one recovery
+/// attempt per tick — the runtime contract for one intent is proven in
+/// `bitty-runtime/tests/rc1_wall_recovery.rs`, the wiring is proven here, where
+/// the pre-fix code called the unthrottled pass *and* the throttled tail on the
+/// same tick and killed a wall-failed plugin after two reloads. And
+/// [`TerminalApp::plugin_timer_deadline`] must fold
+/// [`PluginRuntime::wall_recovery_deadline`] into the idle wake-min, or a
+/// wall-failed plugin is never retried while the event loop is idle.
+///
+/// The fault is cheap: a slice-only event handler spinning in pure Lua crosses
+/// the RC-1 slice (~50 ms), which is a terminal `RC-1 wall` verdict.
+#[cfg(test)]
+mod wall_recovery_wiring_1855_tests {
+    use super::*;
+    use bitty_runtime::plugin_runtime::{
+        EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    const FAULT_ID: &str = "bitty-featured.wall-window-1855";
+    const CLOCK_ID: &str = "bitty-featured.wall-clock-1855";
+
+    const FAULT_LUA: &str = r#"
+bitty.events.subscribe("terminal.opened", function(_event)
+  local n = 0
+  while true do n = n + 1 end
+end)
+"#;
+
+    /// No capability is granted: the handler must not need one.
+    struct NoSnapshot;
+
+    impl SnapshotSource for NoSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, bitty_lua::BridgeError> {
+            Err(bitty_lua::BridgeError::capability_denied(
+                "terminal.semantic-read",
+            ))
+        }
+    }
+
+    fn write_plugin(root: &std::path::Path, id: &str, body: &str, extra: &str) {
+        let plugin_dir = root.join(id);
+        std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin_dir.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Wall wiring 1855\"\nversion = \"0.1.0\"\n\
+                 description = \"CTX-1855 recovery wiring\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n[lazy]\ncommands = []\nevents = [\"terminal.opened\"{extra}]\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin_dir.join("lua/init.lua"), body).expect("init");
+    }
+
+    /// A headless app whose `FAULT_ID` plugin dies on a real `RC-1 wall` verdict,
+    /// plus (optionally) a healthy plugin holding a timer `timer_ms` out.
+    fn wall_app(
+        tag: &str,
+        timer_ms: Option<u64>,
+    ) -> (TerminalApp, std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("bitty-wall1855-{tag}-{counter}-root"));
+        let data = std::env::temp_dir().join(format!("bitty-wall1855-{tag}-{counter}-data"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        write_plugin(&root, FAULT_ID, FAULT_LUA, ", \"config.reloaded\"");
+        if let Some(timer_ms) = timer_ms {
+            write_plugin(
+                &root,
+                CLOCK_ID,
+                &format!("bitty.timers.create({timer_ms}, function() return true end)\n"),
+                "",
+            );
+        }
+        let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(data.clone()),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root.clone()],
+            settings: std::rc::Rc::new(EmptySettings),
+            snapshot: std::rc::Rc::new(NoSnapshot),
+        });
+        plugin_runtime.set_store_backend(Some(std::sync::Arc::new(
+            crate::storage_backends::StorageKvBackend::new(),
+        )));
+        plugin_runtime.discover();
+        for id in [Some(FAULT_ID), timer_ms.map(|_| CLOCK_ID)] {
+            let Some(id) = id else { continue };
+            let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+            plugin_runtime.activate(&pid).expect("activate");
+        }
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::with_defaults().expect("must build");
+        let app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime));
+        (app, root, data)
+    }
+
+    fn fault_id() -> bitty_plugin_host::manifest::PluginId {
+        bitty_plugin_host::manifest::PluginId::new(FAULT_ID).expect("valid id")
+    }
+
+    fn runtime(app: &mut TerminalApp) -> &mut PluginRuntime {
+        app.plugin_runtime.as_mut().expect("plugin runtime")
+    }
+
+    fn state(app: &TerminalApp) -> Option<LifecycleState> {
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .state(&fault_id())
+            .cloned()
+    }
+
+    /// Kill the fixture generation with a real `RC-1 wall` verdict.
+    fn fault(app: &mut TerminalApp) {
+        let payload = LuaValue::table([("terminal_id", LuaValue::Integer(1))]);
+        assert_eq!(
+            runtime(app).deliver_event("terminal.opened", &payload),
+            0,
+            "a handler that died counts no completed delivery"
+        );
+        assert!(
+            matches!(state(app), Some(LifecycleState::Failed(_))),
+            "the slice-spinning handler must fail the generation: {:?}",
+            state(app)
+        );
+    }
+
+    /// Arm the recovery window the way a failed attempt does: the module root
+    /// is gone, so the throttled pass spends one attempt and recovers nothing.
+    fn arm_window(app: &mut TerminalApp, init: &std::path::Path) -> std::time::Instant {
+        std::fs::remove_file(init).expect("the module root goes away");
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            runtime(app).recover_wall_failed_plugins_throttled(t0),
+            0,
+            "an unresolvable module root recovers nothing"
+        );
+        runtime(app)
+            .wall_recovery_deadline()
+            .expect("the attempt must arm the recovery window")
+    }
+
+    fn stage_config_reload(app: &mut TerminalApp) {
+        app.pending_config = Some(PendingConfigReload {
+            path: String::from("bitty.toml"),
+            kind: String::from("applied"),
+        });
+    }
+
+    #[test]
+    fn a_config_reload_tick_spends_one_recovery_attempt() {
+        // Two config reloads over a plugin that still cannot resolve used to
+        // spend the whole three-attempt budget (one unthrottled pass plus the
+        // throttled tail per tick), so the plugin stayed wall-failed for good
+        // once it became loadable again. One tick is one attempt, and the retry
+        // that follows the second reload must still land.
+        let (mut app, root, data) = wall_app("config", None);
+        let init = root.join(FAULT_ID).join("lua/init.lua");
+        fault(&mut app);
+        std::fs::rename(&init, root.join("init.lua.parked")).expect("park the module root");
+        for tick in 0..2 {
+            stage_config_reload(&mut app);
+            app.deliver_runtime_events();
+            assert!(
+                matches!(state(&app), Some(LifecycleState::Failed(_))),
+                "reload tick {tick}: the unresolvable plugin stays failed"
+            );
+            assert!(
+                app.plugin_runtime
+                    .as_ref()
+                    .expect("plugin runtime")
+                    .wall_recovery_deadline()
+                    .is_some(),
+                "reload tick {tick}: the single attempt must arm the backoff window"
+            );
+        }
+
+        std::fs::rename(root.join("init.lua.parked"), &init).expect("restore the module root");
+        stage_config_reload(&mut app);
+        app.deliver_runtime_events();
+        assert_eq!(
+            state(&app),
+            Some(LifecycleState::Active),
+            "two config reloads must leave the budget to recover on the third"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn plugin_timer_deadline_arms_the_idle_wake_for_a_pending_recovery() {
+        // No timers are armed, so the only reason to wake is the recovery
+        // deadline. Without the fold the app sleeps on a plain `Wait`, no cold
+        // tick runs, and the throttled pass never retries.
+        let (mut app, root, data) = wall_app("fold-none", None);
+        let init = root.join(FAULT_ID).join("lua/init.lua");
+        fault(&mut app);
+        let recovery = arm_window(&mut app, &init);
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("plugin runtime")
+                .timer_deadline(),
+            None,
+            "the fixture arms no plugin timer"
+        );
+        assert_eq!(
+            app.plugin_timer_deadline(),
+            Some(recovery),
+            "the recovery deadline must arm the idle wake on its own"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn plugin_timer_deadline_keeps_the_earlier_of_recovery_and_timer() {
+        // A far timer must not mask the pending recovery deadline.
+        let (mut app, root, data) = wall_app("fold-far", Some(120_000));
+        let init = root.join(FAULT_ID).join("lua/init.lua");
+        fault(&mut app);
+        let recovery = arm_window(&mut app, &init);
+        let timer = app
+            .plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .timer_deadline()
+            .expect("the clock plugin arms a timer");
+        assert!(
+            timer > recovery,
+            "the fixture timer must be the later wake: {timer:?} vs {recovery:?}"
+        );
+        assert_eq!(
+            app.plugin_timer_deadline(),
+            Some(recovery),
+            "the recovery deadline wins the wake-min against a far timer"
+        );
+
+        // And a near timer wins it against the recovery deadline.
+        let (mut app, root2, data2) = wall_app("fold-near", Some(800));
+        let init = root2.join(FAULT_ID).join("lua/init.lua");
+        fault(&mut app);
+        let recovery = arm_window(&mut app, &init);
+        let timer = app
+            .plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .timer_deadline()
+            .expect("the clock plugin arms a timer");
+        assert!(
+            timer < recovery,
+            "the fixture timer must be the earlier wake: {timer:?} vs {recovery:?}"
+        );
+        assert_eq!(
+            app.plugin_timer_deadline(),
+            Some(timer),
+            "an armed timer wins the wake-min against the recovery deadline"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&root2);
+        let _ = std::fs::remove_dir_all(&data2);
     }
 }

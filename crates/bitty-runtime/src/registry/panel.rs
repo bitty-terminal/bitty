@@ -3330,6 +3330,56 @@ impl PanelRegistry {
             .and_then(PanelRecord::controller_generation)
     }
 
+    /// Returns `(PanelHandle, PanelType)` for `panel_id` only when the panel is
+    /// live, non-terminal, and currently bound to `(owner, controller_gen)`.
+    #[must_use]
+    pub fn panel_handle_if_owned_by(
+        &self,
+        panel_id: PanelId,
+        owner: &bitty_plugin_host::PluginId,
+        controller_gen: Generation,
+    ) -> Option<(PanelHandle, PanelType)> {
+        let record = self.panels.get(&panel_id.0)?;
+        if record.state == UiPanelState::Disposed || record.panel_type == PanelType::Terminal {
+            return None;
+        }
+        let binding = record.binding.as_ref()?;
+        if &binding.plugin_id == owner && binding.controller_generation == controller_gen {
+            Some((
+                PanelHandle {
+                    id: record.id,
+                    generation: record.generation,
+                },
+                record.panel_type,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the owning `PluginId` of a live, non-terminal panel, if bound.
+    #[must_use]
+    pub fn panel_controller_owner(&self, panel_id: PanelId) -> Option<bitty_plugin_host::PluginId> {
+        let record = self.panels.get(&panel_id.0)?;
+        if record.state == UiPanelState::Disposed || record.panel_type == PanelType::Terminal {
+            return None;
+        }
+        record
+            .binding
+            .as_ref()
+            .map(|binding| binding.plugin_id.clone())
+    }
+
+    /// Returns the allocation generation of a live panel, if not disposed.
+    #[must_use]
+    pub fn panel_allocation_generation(&self, panel_id: PanelId) -> Option<Generation> {
+        let record = self.panels.get(&panel_id.0)?;
+        if record.state == UiPanelState::Disposed {
+            return None;
+        }
+        Some(record.generation)
+    }
+
     /// The panels whose binding names `owner` at `generation` (OQ-084 A.2/A.3,
     /// bitty#2476 residual 2).
     ///

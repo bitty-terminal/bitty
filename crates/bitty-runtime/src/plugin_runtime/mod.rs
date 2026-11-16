@@ -152,20 +152,23 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
     KeymapSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification,
-    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCreateHandler, PanelCreateOrigin,
-    PanelPinHandler, PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest,
-    QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY,
-    ServiceCallLedger, ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource,
-    SharedTargetAnnotations, SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource,
-    TerminalSubmitQueue, ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks,
-    UnavailableKeymaps, UnavailableSnapshot, UnavailableTargets, UnavailableWorkspaces,
-    WorkspaceRequestQueue, WorkspaceSource, keymap_row, keymap_rows,
+    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCloseHandler, PanelCreateHandler,
+    PanelCreateOrigin, PanelPinHandler, PanelPinQueue, PanelSceneBackend, PluginServices,
+    ProcessEnv, QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest,
+    SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord, ServiceDirectory,
+    ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
+    TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue, ThemePersistHandler,
+    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps, UnavailableSnapshot,
+    UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource, keymap_row,
+    keymap_rows,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
 // application can implement `SettingsSource`/`SnapshotSource` without taking a
 // direct `bitty-lua` dependency.
-pub use bitty_lua::{BridgeError, CommandCatalogEntry, LuaValue, OverlayKeyChord, UiBlockState};
+pub use bitty_lua::{
+    BridgeError, CommandCatalogEntry, LuaValue, OverlayKeyChord, UiBlockState, UiRichNode,
+};
 
 /// Maximum stored manifest body bytes (RFC proposed default).
 pub const PLUGIN_MANIFEST_MAX_BYTES: usize = 256 * 1024;
@@ -862,6 +865,11 @@ pub struct PluginRuntime {
     /// only; mounting and focusing stay host-driven, so the backend carries
     /// no layout authority.
     panel_create_backend: Option<PanelCreateHandler>,
+    /// CTX-1859: synchronous panel-close backend for `bitty.panel.close`.
+    panel_close_backend: Option<PanelCloseHandler>,
+    /// CTX-1859: panel-scoped declarative UI backend for `bitty.panel.mount` /
+    /// `update` / `unmount`.
+    panel_scene_backend: Option<Rc<dyn PanelSceneBackend>>,
     /// CTX-1641 (bitty#2785): the Core-owned terminal-slot scene host.
     ///
     /// Installed by the composition root before activation and shared with
@@ -1147,6 +1155,8 @@ impl PluginRuntime {
             ))),
             panel_pin_backend: None,
             panel_create_backend: None,
+            panel_close_backend: None,
+            panel_scene_backend: None,
             ui_scene_backend: None,
             panel_generation_port: None,
             last_panel_edge: None,
@@ -1792,6 +1802,18 @@ impl PluginRuntime {
     /// like every other panel verb without a host.
     pub fn set_panel_create_backend(&mut self, backend: Option<PanelCreateHandler>) {
         self.panel_create_backend = backend;
+    }
+
+    /// Install the synchronous panel-close backend for `bitty.panel.close`
+    /// (CTX-1859).
+    pub fn set_panel_close_backend(&mut self, backend: Option<PanelCloseHandler>) {
+        self.panel_close_backend = backend;
+    }
+
+    /// Install the panel-scoped declarative UI backend for `bitty.panel.mount`
+    /// / `update` / `unmount` (CTX-1859).
+    pub fn set_panel_scene_backend(&mut self, backend: Option<Rc<dyn PanelSceneBackend>>) {
+        self.panel_scene_backend = backend;
     }
 
     /// Install the Core-owned terminal-slot scene host (CTX-1641, bitty#2785).
@@ -3402,11 +3424,15 @@ impl PluginRuntime {
         if panel_create {
             plugin_services.set_panel_create_backend(self.panel_create_backend.clone());
         }
+        if panel_focus {
+            plugin_services.set_panel_close_backend(self.panel_close_backend.clone());
+        }
         // bitty#2785: the Core-owned terminal-slot scene host, shared only
         // with `ui.rich` generations. The call-time `ui.rich` gate in
         // `ui_mount_scene` stays as the second layer.
         if ui_rich {
             plugin_services.set_ui_scene_backend(self.ui_scene_backend.clone());
+            plugin_services.set_panel_scene_backend(self.panel_scene_backend.clone());
         }
         // CTX-1239 (issue #2101): the `bitty.terminal.submit` intent queue.
         // Shared only with `terminal.input.submit` generations (no queue
@@ -4747,6 +4773,22 @@ impl PluginRuntime {
     /// view (at most three) and passed to handlers by reference, so the
     /// common ungated case builds exactly one envelope per event.
     pub fn deliver_event(&mut self, kind: &str, payload: &LuaValue) -> usize {
+        self.deliver_event_filtered(kind, payload, None)
+    }
+
+    /// Deliver `kind` with `payload` exclusively to `target` (e.g.
+    /// `panel.input` for a focused plugin panel, so other plugins never snoop
+    /// on another plugin's panel input).
+    pub fn deliver_event_to(&mut self, target: &PluginId, kind: &str, payload: &LuaValue) -> usize {
+        self.deliver_event_filtered(kind, payload, Some(target))
+    }
+
+    fn deliver_event_filtered(
+        &mut self,
+        kind: &str,
+        payload: &LuaValue,
+        target: Option<&PluginId>,
+    ) -> usize {
         self.event_sequence = self.event_sequence.saturating_add(1);
         let sequence = self.event_sequence;
         self.record_trace(kind, payload);
@@ -4757,6 +4799,7 @@ impl PluginRuntime {
         let ids: Vec<PluginId> = self
             .entries
             .iter()
+            .filter(|(id, _)| target.is_none_or(|t| *id == t))
             .filter(|(_, entry)| entry.state == LifecycleState::Active)
             .filter(|(_, entry)| {
                 !workspace_kind

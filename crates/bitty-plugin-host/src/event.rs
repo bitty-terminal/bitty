@@ -203,6 +203,10 @@ pub enum EventKind {
     /// synchronous callback on the input path. Any subscriber may observe it;
     /// no phase may intercept or veto it.
     OverlayDismissed,
+    /// Focus-driven input event routed to the owning plugin of a focused
+    /// non-terminal panel (`ViewContent::Panel(PanelId)`). Delivered only to
+    /// the owning plugin generation's `PluginId`.
+    PanelInput,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -235,6 +239,7 @@ impl EventKind {
             "overlay.released" => Ok(Self::OverlayReleased),
             "overlay.input.available" => Ok(Self::OverlayInputAvailable),
             "overlay.dismissed" => Ok(Self::OverlayDismissed),
+            "panel.input" => Ok(Self::PanelInput),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -268,6 +273,7 @@ impl EventKind {
             Self::OverlayReleased => "overlay.released",
             Self::OverlayInputAvailable => "overlay.input.available",
             Self::OverlayDismissed => "overlay.dismissed",
+            Self::PanelInput => "panel.input",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -299,7 +305,8 @@ impl EventKind {
             | Self::WorkspaceChanged
             | Self::OverlayReleased
             | Self::OverlayInputAvailable
-            | Self::OverlayDismissed => EventClass::Observation,
+            | Self::OverlayDismissed
+            | Self::PanelInput => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -374,6 +381,7 @@ impl EventKind {
             | Self::OverlayReleased
             | Self::OverlayInputAvailable
             | Self::OverlayDismissed
+            | Self::PanelInput
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,
@@ -1868,5 +1876,23 @@ mod tests {
         assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
         assert!(EventKind::parse("overlay.dismiss").is_err());
         assert!(EventKind::parse("overlay.dismissed.extra").is_err());
+    }
+
+    #[test]
+    fn panel_input_kind_contract() {
+        // CTX-1859 (#3199): focus-driven input on a plugin-owned non-terminal
+        // panel is its own registered observation kind. It parses and
+        // round-trips, never intercepts, never coalesces (one press is one
+        // observation), and its payload stays ungated so a subscriber never
+        // needs `terminal.input` grants to read its own panel's events.
+        let kind = EventKind::parse("panel.input").expect("known kind");
+        assert_eq!(kind, EventKind::PanelInput);
+        assert_eq!(kind.as_str(), "panel.input");
+        assert_eq!(kind.class(), EventClass::Observation);
+        assert!(!kind.is_interception());
+        assert!(!kind.is_coalescable());
+        assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
+        assert!(EventKind::parse("panel.in").is_err());
+        assert!(EventKind::parse("panel.input.extra").is_err());
     }
 }

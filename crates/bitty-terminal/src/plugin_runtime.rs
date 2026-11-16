@@ -24,10 +24,10 @@ use bitty_ipc::MAX_SNAPSHOT_ZONES;
 use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
-    PaneCwdSource, PanelCreateHandler, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport,
-    PanelGenerationPort, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
-    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
-    WorkspaceInfo, WorkspaceSource, controller_generation,
+    PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind, PanelEdgeRelease,
+    PanelEdgeReport, PanelGenerationPort, PanelPinHandler, PanelPinQueue, PanelSceneBackend,
+    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TargetSource,
+    TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource, controller_generation,
 };
 use bitty_runtime::registry::{
     Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
@@ -552,6 +552,38 @@ pub(crate) struct PluginSession {
     /// and no `panel.create` argument can reach it. `None` fails the create
     /// closed with `E_UI_UNAVAILABLE`.
     pub(crate) focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
+    /// Bounded queue of plugin panel layout operations (create/close Dwindle
+    /// leaves) drained by `TerminalApp::apply_plugin_panel_requests` (CTX-1859).
+    pub(crate) panel_layout_ops: Option<PluginPanelLayoutQueue>,
+}
+
+/// Maximum queued plugin panel layout operations per tick (bounded).
+const PLUGIN_PANEL_LAYOUT_QUEUE_CAP: usize = 64;
+
+/// A pending Dwindle layout operation for a plugin-created panel (CTX-1859).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginPanelLayoutOp {
+    /// Materialize a `View` leaf for `(panel_id, generation)` in the focused
+    /// workspace's Dwindle layout.
+    Create {
+        panel_id: PanelId,
+        generation: bitty_runtime::registry::Generation,
+    },
+    /// Remove the Dwindle `View` leaf for `panel_id` (and dispose if live).
+    Close {
+        panel_id: PanelId,
+        view_id: Option<ViewId>,
+    },
+}
+
+/// Shared queue of pending [`PluginPanelLayoutOp`] items.
+pub(crate) type PluginPanelLayoutQueue = Rc<RefCell<Vec<PluginPanelLayoutOp>>>;
+
+fn push_panel_layout_op(queue: &PluginPanelLayoutQueue, op: PluginPanelLayoutOp) {
+    let mut q = queue.borrow_mut();
+    if q.len() < PLUGIN_PANEL_LAYOUT_QUEUE_CAP {
+        q.push(op);
+    }
 }
 
 /// Live resolved-keymap source for `bitty.keymaps.list()` (issue #2405).
@@ -698,9 +730,18 @@ pub(crate) fn startup_pin_backend(
 /// reported in the same error rather than discarded: the primary diagnosis is
 /// still the bind, and the disposal note is the evidence that a record may be
 /// left behind.
+#[cfg(test)]
 pub(crate) fn startup_panel_create_backend(
     panels: Rc<RefCell<PanelRuntime>>,
     focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
+) -> PanelCreateHandler {
+    startup_panel_create_backend_with_queue(panels, focused_workspace, None)
+}
+
+pub(crate) fn startup_panel_create_backend_with_queue(
+    panels: Rc<RefCell<PanelRuntime>>,
+    focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
+    layout_ops: Option<PluginPanelLayoutQueue>,
 ) -> PanelCreateHandler {
     Rc::new(move |panel_type, origin| {
         let parsed = PanelType::parse(panel_type).ok_or_else(|| {
@@ -767,8 +808,139 @@ pub(crate) fn startup_panel_create_backend(
             };
             return Err(BridgeError::new("runtime", E_UI_UNAVAILABLE, reason));
         }
+        if let Some(queue) = layout_ops.as_ref() {
+            push_panel_layout_op(
+                queue,
+                PluginPanelLayoutOp::Create {
+                    panel_id: handle.id,
+                    generation: handle.generation,
+                },
+            );
+        }
         Ok((handle.id.0, handle.generation.get()))
     })
+}
+
+/// Production `bitty.panel.close` backend enforcing strict generation ownership
+/// and queueing Dwindle leaf removal (CTX-1859).
+pub(crate) fn startup_panel_close_backend(
+    panels: Rc<RefCell<PanelRuntime>>,
+    layout_ops: Option<PluginPanelLayoutQueue>,
+) -> PanelCloseHandler {
+    Rc::new(move |panel_id, owner, generation| {
+        let pid = PanelId(panel_id);
+        let (handle, view_id) = {
+            let host = panels.borrow();
+            let Some((handle, _)) =
+                host.panel_handle_if_owned_by(pid, owner, controller_generation(generation))
+            else {
+                return Err(BridgeError::new(
+                    "capability",
+                    "E_CAPABILITY_DENIED",
+                    format!("panel {panel_id} is not owned by this plugin generation"),
+                ));
+            };
+            let view_id = host.placement_view_of(handle.id);
+            (handle, view_id)
+        };
+        panels
+            .borrow_mut()
+            .dispose_panel(handle.id, handle.generation)
+            .map_err(|err| {
+                BridgeError::new(
+                    "runtime",
+                    E_UI_UNAVAILABLE,
+                    format!("panel.close failed: {err}"),
+                )
+            })?;
+        if let Some(queue) = layout_ops.as_ref() {
+            push_panel_layout_op(
+                queue,
+                PluginPanelLayoutOp::Close {
+                    panel_id: handle.id,
+                    view_id,
+                },
+            );
+        }
+        Ok(true)
+    })
+}
+
+/// Production panel-scoped declarative UI backend (`bitty.panel.mount` /
+/// `update` / `unmount`) enforcing strict generation ownership (CTX-1859).
+struct AppPanelSceneBackend {
+    panels: Rc<RefCell<PanelRuntime>>,
+}
+
+impl AppPanelSceneBackend {
+    fn new(panels: Rc<RefCell<PanelRuntime>>) -> Self {
+        Self { panels }
+    }
+}
+
+impl PanelSceneBackend for AppPanelSceneBackend {
+    fn mount_panel_scene(
+        &self,
+        panel_id: u64,
+        owner: &bitty_plugin_host::manifest::PluginId,
+        generation: u32,
+        node: &bitty_runtime::plugin_runtime::UiRichNode,
+    ) -> Result<bool, BridgeError> {
+        let pid = PanelId(panel_id);
+        let handle = {
+            let host = self.panels.borrow();
+            let Some((handle, _)) =
+                host.panel_handle_if_owned_by(pid, owner, controller_generation(generation))
+            else {
+                return Err(BridgeError::new(
+                    "capability",
+                    "E_CAPABILITY_DENIED",
+                    format!("panel {panel_id} is not owned by this plugin generation"),
+                ));
+            };
+            handle
+        };
+        let scene = bitty_runtime::scene_host::build_panel_scene(
+            bitty_rich::scene::BlockId(panel_id),
+            owner.as_str(),
+            generation,
+            node,
+        )?;
+        self.panels
+            .borrow_mut()
+            .attach_panel_scene(handle, scene)
+            .map_err(|err| {
+                BridgeError::new(
+                    "runtime",
+                    E_UI_UNAVAILABLE,
+                    format!("panel.mount failed: {err}"),
+                )
+            })?;
+        Ok(true)
+    }
+
+    fn unmount_panel_scene(
+        &self,
+        panel_id: u64,
+        owner: &bitty_plugin_host::manifest::PluginId,
+        generation: u32,
+    ) -> Result<bool, BridgeError> {
+        let pid = PanelId(panel_id);
+        let handle = {
+            let host = self.panels.borrow();
+            let Some((handle, _)) =
+                host.panel_handle_if_owned_by(pid, owner, controller_generation(generation))
+            else {
+                return Err(BridgeError::new(
+                    "capability",
+                    "E_CAPABILITY_DENIED",
+                    format!("panel {panel_id} is not owned by this plugin generation"),
+                ));
+            };
+            handle
+        };
+        Ok(self.panels.borrow_mut().detach_panel_scene(handle.id))
+    }
 }
 
 /// Production panel generation port (bitty#2476 residuals 2 and 4).
@@ -808,11 +980,15 @@ pub(crate) fn startup_panel_create_backend(
 /// stays unbound with the placeholder the edge presented.
 struct AppPanelGenerationPort {
     panels: Rc<RefCell<PanelRuntime>>,
+    layout_ops: Option<PluginPanelLayoutQueue>,
 }
 
 impl AppPanelGenerationPort {
-    fn new(panels: Rc<RefCell<PanelRuntime>>) -> Self {
-        Self { panels }
+    fn with_layout_ops(
+        panels: Rc<RefCell<PanelRuntime>>,
+        layout_ops: Option<PluginPanelLayoutQueue>,
+    ) -> Self {
+        Self { panels, layout_ops }
     }
 
     /// Panels the generation holds: still bound to it first, then the ones its
@@ -838,12 +1014,25 @@ impl PanelGenerationPort for AppPanelGenerationPort {
         let mut report = PanelEdgeReport::default();
         for panel in bound {
             report.attempted += 1;
-            match self
-                .panels
-                .borrow_mut()
-                .present_placeholder(panel, ended, edge.reason.as_str())
-            {
-                Ok(_) => report.committed.push(panel),
+            let view_id = self.panels.borrow().placement_view_of(panel);
+            let res =
+                self.panels
+                    .borrow_mut()
+                    .present_placeholder(panel, ended, edge.reason.as_str());
+            match res {
+                Ok(_) => {
+                    self.panels.borrow_mut().detach_panel_scene(panel);
+                    if let Some(queue) = self.layout_ops.as_ref() {
+                        push_panel_layout_op(
+                            queue,
+                            PluginPanelLayoutOp::Close {
+                                panel_id: panel,
+                                view_id,
+                            },
+                        );
+                    }
+                    report.committed.push(panel);
+                }
                 Err(error) => {
                     crate::logging::warn(|| {
                         format!(
@@ -1202,13 +1391,22 @@ pub(crate) fn discover_with_roots(
     // at the startup focus and is refreshed by the app tick loop; the plugin
     // services can only read it through the create backend.
     let focused_workspace = Rc::new(Cell::new(seed.focused_workspace));
-    let panels = match PanelRuntime::new(PanelRegistryConfig::default()) {
+    let (panels, panel_layout_ops) = match PanelRuntime::new(PanelRegistryConfig::default()) {
         Ok(host) => {
             let panels = Rc::new(RefCell::new(host));
-            runtime.set_panel_create_backend(Some(startup_panel_create_backend(
+            let layout_ops: PluginPanelLayoutQueue = Rc::new(RefCell::new(Vec::new()));
+            runtime.set_panel_create_backend(Some(startup_panel_create_backend_with_queue(
                 Rc::clone(&panels),
                 Rc::clone(&focused_workspace),
+                Some(Rc::clone(&layout_ops)),
             )));
+            runtime.set_panel_close_backend(Some(startup_panel_close_backend(
+                Rc::clone(&panels),
+                Some(Rc::clone(&layout_ops)),
+            )));
+            runtime.set_panel_scene_backend(Some(Rc::new(AppPanelSceneBackend::new(Rc::clone(
+                &panels,
+            )))));
             // bitty#2785: the `terminal` slot's scene host shares the same
             // `PanelRuntime`, so `bitty.ui.mount("terminal", …)` attaches to
             // the panel the present loop resolves by placement.
@@ -1223,16 +1421,19 @@ pub(crate) fn discover_with_roots(
             // the containers its predecessor drove (production `rebind_panel`,
             // residual 2). Installing it grants nothing: every call re-checks
             // the binding, the ceiling, and the grant family in the registry.
-            runtime.set_panel_generation_port(Some(Rc::new(AppPanelGenerationPort::new(
-                Rc::clone(&panels),
-            ))));
-            Some(panels)
+            runtime.set_panel_generation_port(Some(Rc::new(
+                AppPanelGenerationPort::with_layout_ops(
+                    Rc::clone(&panels),
+                    Some(Rc::clone(&layout_ops)),
+                ),
+            )));
+            (Some(panels), Some(layout_ops))
         }
         Err(error) => {
             crate::logging::warn(|| {
                 format!("bitty: panel host unavailable, panel surfaces disabled ({error})")
             });
-            None
+            (None, None)
         }
     };
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
@@ -1354,6 +1555,7 @@ pub(crate) fn discover_with_roots(
         panels,
         scene_target,
         focused_workspace,
+        panel_layout_ops,
     })
 }
 
@@ -3882,6 +4084,8 @@ error("activation fails after mounting the terminal slot scene")
             runtime: plugin_runtime,
             panels,
             scene_target,
+            focused_workspace,
+            panel_layout_ops,
             ..
         } = session;
         let panels = panels.expect("production panel host");
@@ -3896,7 +4100,9 @@ error("activation fails after mounting the terminal slot scene")
         )
         .with_plugin_runtime(Some(plugin_runtime))
         .with_panel_scene_host(Some(Rc::clone(&panels)))
-        .with_scene_target(Some(scene_target));
+        .with_scene_target(Some(scene_target))
+        .with_focused_workspace(Some(focused_workspace))
+        .with_panel_layout_ops(panel_layout_ops);
         (app, panels)
     }
 
@@ -4275,5 +4481,483 @@ error("activation fails after mounting the terminal slot scene")
         .expect("symlink");
         let error = load_plugin_budget_overrides(Some(&dir)).expect_err("symlink must fail");
         assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    // ── CTX-1859: plugin dwindle panel, scene mount & input routing ─────
+
+    fn write_dwindle_plugin(
+        root: &Path,
+        id: &str,
+        capabilities: &[&str],
+        events: &[&str],
+        commands: &[&str],
+        lua: &str,
+    ) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(dir.join("lua")).expect("plugin lua dir");
+        let caps = capabilities
+            .iter()
+            .map(|c| format!("{c} = true\n"))
+            .collect::<String>();
+        let evs = events
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cmds = commands
+            .iter()
+            .map(|c| format!("\"{id}:{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let manifest = format!(
+            "[plugin]\n\
+             id = \"{id}\"\n\
+             name = \"{id}\"\n\
+             version = \"0.1.0\"\n\
+             description = \"test\"\n\n\
+             [compat]\n\
+             plugin-api = \"^1.0\"\n\n\
+             [capabilities]\n\
+             {caps}\n\
+             [lazy]\n\
+             commands = [{cmds}]\n\
+             events = [{evs}]\n"
+        );
+        std::fs::write(dir.join("bitty-plugin.toml"), manifest).expect("manifest");
+        std::fs::write(dir.join("lua/init.lua"), lua).expect("lua/init.lua");
+    }
+
+    fn build_dwindle_app(
+        root: PathBuf,
+    ) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
+        let rt = Runtime::with_defaults().expect("defaults must build");
+        let primary = rt.focused_view().expect("primary view");
+        let summaries = rt.workspace_summaries();
+        let leaves = rt.layout().leaf_ids();
+        let pinned = rt.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: Some(primary),
+            focused_workspace: rt.focused_workspace_id(),
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let PluginSession {
+            runtime: plugin_runtime,
+            panels,
+            scene_target,
+            focused_workspace,
+            panel_layout_ops,
+            ..
+        } = session;
+        let panels = panels.expect("production panel host");
+        let keymaps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = crate::terminal_app::TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            keymaps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime))
+        .with_panel_scene_host(Some(Rc::clone(&panels)))
+        .with_scene_target(Some(scene_target))
+        .with_focused_workspace(Some(focused_workspace))
+        .with_panel_layout_ops(panel_layout_ops);
+        (app, panels)
+    }
+
+    fn dispatch_app_cmd(
+        app: &mut crate::terminal_app::TerminalApp,
+        plugin_id: &str,
+        command: &str,
+        args: &[(&str, LuaValue)],
+    ) -> Result<LuaValue, String> {
+        let id = bitty_plugin_host::manifest::PluginId::new(plugin_id).expect("id");
+        let mut table_args = Vec::with_capacity(args.len());
+        for (k, v) in args {
+            table_args.push((LuaValue::String((*k).to_string()), v.clone()));
+        }
+        let arg_slice: Vec<LuaValue> = if table_args.is_empty() {
+            Vec::new()
+        } else {
+            vec![LuaValue::Table(table_args)]
+        };
+        let rt = app.plugin_runtime.as_mut().expect("plugin runtime");
+        rt.dispatch_command(&id, command, &arg_slice)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn plugin_panel_create_mount_update_unmount_close_lifecycle() {
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("dwindle-lifecycle");
+        let lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "rich" })
+                    bitty.panel.mount(p.id, {
+                        kind = "Block",
+                        border = { width = 1 },
+                        child = { kind = "Text", text = "hello panel" },
+                    })
+                    return p.id
+                end,
+            })
+            bitty.commands.register({
+                id = "update",
+                title = "Update",
+                run = function(args)
+                    return bitty.panel.update(args.id, {
+                        kind = "Text",
+                        text = "updated panel",
+                    })
+                end,
+            })
+            bitty.commands.register({
+                id = "unmount",
+                title = "Unmount",
+                run = function(args)
+                    return bitty.panel.unmount(args.id)
+                end,
+            })
+            bitty.commands.register({
+                id = "close",
+                title = "Close",
+                run = function(args)
+                    return bitty.panel.close(args.id)
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.dwindle",
+            &["panel.create", "panel.focus", "ui.rich"],
+            &[],
+            &["open", "update", "unmount", "close"],
+            lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let primary = app.runtime.focused_view().expect("primary view");
+        assert_eq!(app.runtime.layout().leaf_count(), 1);
+
+        let panel_id = match dispatch_app_cmd(&mut app, "xuepoo.dwindle", "open", &[])
+            .expect("open must succeed")
+        {
+            LuaValue::Integer(id) => id,
+            other => panic!("expected integer panel id, got {other:?}"),
+        };
+        app.drive_tick().expect("tick materializes leaf");
+
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        let pid = PanelId(panel_id as u64);
+        let panel_view = panels
+            .borrow()
+            .placement_view_of(pid)
+            .expect("panel must be mounted to a Dwindle View");
+        assert_ne!(panel_view, primary);
+        assert!(
+            !app.runtime.has_pane_session(&panel_view),
+            "plugin panel leaf must be zero-PTY"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(panel_view));
+        assert!(panels.borrow().panel_scene(pid).is_some());
+
+        let updated = dispatch_app_cmd(
+            &mut app,
+            "xuepoo.dwindle",
+            "update",
+            &[("id", LuaValue::Integer(panel_id))],
+        )
+        .expect("update must succeed");
+        assert_eq!(updated, LuaValue::Bool(true));
+        app.drive_tick().expect("tick presents updated scene");
+        assert!(panels.borrow().panel_scene(pid).is_some());
+
+        let unmounted = dispatch_app_cmd(
+            &mut app,
+            "xuepoo.dwindle",
+            "unmount",
+            &[("id", LuaValue::Integer(panel_id))],
+        )
+        .expect("unmount must succeed");
+        assert_eq!(unmounted, LuaValue::Bool(true));
+        assert!(panels.borrow().panel_scene(pid).is_none());
+
+        let closed = dispatch_app_cmd(
+            &mut app,
+            "xuepoo.dwindle",
+            "close",
+            &[("id", LuaValue::Integer(panel_id))],
+        )
+        .expect("close must succeed");
+        assert_eq!(closed, LuaValue::Bool(true));
+        app.drive_tick().expect("tick removes leaf");
+
+        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(panels.borrow().panel_count(), 0);
+        assert_eq!(panels.borrow().placement_view_of(pid), None);
+    }
+
+    #[test]
+    fn plugin_panel_cross_plugin_mount_update_close_denied() {
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("dwindle-ownership");
+        let owner_lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "rich" })
+                    bitty.panel.mount(p.id, { kind = "Text", text = "owner" })
+                    return p.id
+                end,
+            })
+        "#;
+        let intruder_lua = r#"
+            bitty.commands.register({
+                id = "try_mount",
+                title = "TryMount",
+                run = function(args)
+                    return bitty.panel.mount(args.id, { kind = "Text", text = "hijack" })
+                end,
+            })
+            bitty.commands.register({
+                id = "try_update",
+                title = "TryUpdate",
+                run = function(args)
+                    return bitty.panel.update(args.id, { kind = "Text", text = "hijack" })
+                end,
+            })
+            bitty.commands.register({
+                id = "try_unmount",
+                title = "TryUnmount",
+                run = function(args)
+                    return bitty.panel.unmount(args.id)
+                end,
+            })
+            bitty.commands.register({
+                id = "try_close",
+                title = "TryClose",
+                run = function(args)
+                    return bitty.panel.close(args.id)
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.owner",
+            &["panel.create", "panel.focus", "ui.rich"],
+            &[],
+            &["open"],
+            owner_lua,
+        );
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.intruder",
+            &["panel.create", "panel.focus", "ui.rich"],
+            &[],
+            &["try_mount", "try_update", "try_unmount", "try_close"],
+            intruder_lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let panel_id =
+            match dispatch_app_cmd(&mut app, "xuepoo.owner", "open", &[]).expect("owner open") {
+                LuaValue::Integer(id) => id,
+                other => panic!("expected integer, got {other:?}"),
+            };
+        app.drive_tick().expect("tick");
+        let pid = PanelId(panel_id as u64);
+
+        for cmd in ["try_mount", "try_update", "try_unmount", "try_close"] {
+            let err = dispatch_app_cmd(
+                &mut app,
+                "xuepoo.intruder",
+                cmd,
+                &[("id", LuaValue::Integer(panel_id))],
+            )
+            .expect_err("non-owner must be denied");
+            assert!(
+                err.contains("E_CAPABILITY_DENIED"),
+                "{cmd} must deny non-owner, got {err}"
+            );
+        }
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert!(panels.borrow().panel_scene(pid).is_some());
+    }
+
+    #[test]
+    fn plugin_panel_focus_routes_non_global_keys_to_owner_and_preserves_bitty_bindings() {
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("dwindle-input");
+        let owner_lua = r#"
+            local received = ""
+            bitty.events.subscribe("panel.input", function(ev)
+                received = received .. ev.payload.kind .. ":" .. tostring(ev.payload.key) .. ";"
+            end)
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "rich" })
+                    bitty.panel.mount(p.id, { kind = "Text", text = "input" })
+                    return p.id
+                end,
+            })
+            bitty.commands.register({
+                id = "dump",
+                title = "Dump",
+                run = function() return received end,
+            })
+        "#;
+        let bystander_lua = r#"
+            local received = ""
+            bitty.events.subscribe("panel.input", function(ev)
+                received = received .. tostring(ev.payload.key)
+            end)
+            bitty.commands.register({
+                id = "dump",
+                title = "Dump",
+                run = function() return received end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.inputowner",
+            &["panel.create", "panel.focus", "ui.rich"],
+            &["panel.input"],
+            &["open", "dump"],
+            owner_lua,
+        );
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.bystander",
+            &[],
+            &["panel.input"],
+            &["dump"],
+            bystander_lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let primary = app.runtime.focused_view().expect("primary view");
+        let panel_id =
+            match dispatch_app_cmd(&mut app, "xuepoo.inputowner", "open", &[]).expect("open") {
+                LuaValue::Integer(id) => id,
+                other => panic!("expected integer, got {other:?}"),
+            };
+        app.drive_tick().expect("tick");
+        let panel_view = panels
+            .borrow()
+            .placement_view_of(PanelId(panel_id as u64))
+            .expect("panel view");
+        assert_eq!(app.runtime.focused_view(), Some(panel_view));
+
+        // Non-global key 'x' routes to owning plugin, not PTY and not bystander.
+        let key_x = bitty_platform::KeyEvent {
+            logical_key: bitty_platform::LogicalKey::Character("x".to_string()),
+            text: Some("x".to_string()),
+            state: bitty_platform::PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+            location: bitty_platform::KeyLocation::Standard,
+        };
+        let kind_x = bitty_platform::WindowEventKind::KeyboardInput(key_x);
+        assert!(!app.intercept_chrome_key(&kind_x));
+        assert!(app.route_focused_plugin_panel_input(&kind_x));
+
+        let dumped = dispatch_app_cmd(&mut app, "xuepoo.inputowner", "dump", &[]).expect("dump");
+        assert_eq!(dumped, LuaValue::String("key:key:x;".to_string()));
+        let bystander_dumped =
+            dispatch_app_cmd(&mut app, "xuepoo.bystander", "dump", &[]).expect("bystander dump");
+        assert_eq!(bystander_dumped, LuaValue::String(String::new()));
+
+        // Pointer buttons reach the owner as an observation but are NEVER
+        // consumed: the Core keeps click-to-focus/selection on the leaf. The
+        // payload carries no hit-test coordinates (`key` is unset), so the
+        // owner can only observe the press.
+        let click = bitty_platform::WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        ));
+        assert!(
+            !app.route_focused_plugin_panel_input(&click),
+            "pointer buttons must not be swallowed from the Core"
+        );
+        let dumped = dispatch_app_cmd(&mut app, "xuepoo.inputowner", "dump", &[]).expect("dump");
+        assert_eq!(
+            dumped,
+            LuaValue::String("key:key:x;button:nil;".to_string())
+        );
+        let bystander_dumped =
+            dispatch_app_cmd(&mut app, "xuepoo.bystander", "dump", &[]).expect("bystander dump");
+        assert_eq!(bystander_dumped, LuaValue::String(String::new()));
+
+        // Global Bitty keybinding (alt+h -> focus_left) still moves focus back to primary.
+        let alt_press =
+            bitty_platform::WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+                alt: true,
+                ..Default::default()
+            });
+        let _ = app.intercept_chrome_key(&alt_press);
+        let key_h = bitty_platform::KeyEvent {
+            logical_key: bitty_platform::LogicalKey::Character("h".to_string()),
+            text: Some("h".to_string()),
+            state: bitty_platform::PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+            location: bitty_platform::KeyLocation::Standard,
+        };
+        assert!(app.intercept_chrome_key(&bitty_platform::WindowEventKind::KeyboardInput(key_h)));
+        assert_eq!(app.runtime.focused_view(), Some(primary));
+    }
+
+    #[test]
+    fn plugin_panel_generation_dispose_and_reload_remove_dwindle_leaf() {
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("dwindle-reload");
+        let lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "helper" })
+                    return p.id
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.reloader",
+            &["panel.create", "panel.focus"],
+            &[],
+            &["open"],
+            lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let _ = dispatch_app_cmd(&mut app, "xuepoo.reloader", "open", &[]).expect("open");
+        app.drive_tick().expect("tick materializes leaf");
+        assert_eq!(app.runtime.layout().leaf_count(), 2);
+
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.reloader").expect("id");
+        app.plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .reload(&id)
+            .expect("reload");
+        app.drive_tick().expect("tick removes old generation leaf");
+
+        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(panels.borrow().panel_count(), 0);
     }
 }

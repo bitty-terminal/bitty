@@ -1297,6 +1297,9 @@ fn main() {
     let focused_workspace = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.focused_workspace));
+    let panel_layout_ops = plugin_session
+        .as_ref()
+        .and_then(|session| session.panel_layout_ops.as_ref().map(Rc::clone));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
     // Issue #2773: publish the attached runtime's sanitized lifecycle rows for
     // the accepted `bitty.debug/listPlugins` / `getPlugin` inspect methods.
@@ -1523,6 +1526,7 @@ fn main() {
     .with_scene_target(scene_target)
     // OQ-084 B-2: publish the presented workspace id for `panel.create`.
     .with_focused_workspace(focused_workspace)
+    .with_panel_layout_ops(panel_layout_ops)
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
     // cutover selects the retained Core path without consulting a VM.
     .with_safe_mode(args.safe)

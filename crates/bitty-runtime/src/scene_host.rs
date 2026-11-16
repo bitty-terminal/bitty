@@ -546,6 +546,21 @@ impl SceneHost {
     }
 }
 
+/// Builds one admitted scene from a validated rich tree for a panel.
+///
+/// # Errors
+///
+/// Returns `E_UI_COMPONENT_INVALID` when the accepted scene admission refuses
+/// the tree (`SCN-1..5`), or `E_UI_UNAVAILABLE` if admission produces no block.
+pub fn build_panel_scene(
+    block: BlockId,
+    owner: &str,
+    epoch: u32,
+    node: &UiRichNode,
+) -> Result<Scene, BridgeError> {
+    build_scene(block, owner, epoch, node)
+}
+
 /// Builds one admitted terminal-slot scene from a validated rich tree.
 fn build_scene(
     block: BlockId,

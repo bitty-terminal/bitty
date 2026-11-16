@@ -1091,6 +1091,8 @@ pub(crate) struct TerminalApp {
     /// workspace the user is looking at. `None` without a plugin runtime; the
     /// plugin never writes it.
     pub(crate) focused_workspace: Option<std::rc::Rc<std::cell::Cell<Option<WorkspaceId>>>>,
+    /// Pending Dwindle layout operations for plugin-created panels (CTX-1859).
+    pub(crate) panel_layout_ops: Option<crate::plugin_runtime::PluginPanelLayoutQueue>,
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
@@ -1278,6 +1280,7 @@ impl TerminalApp {
             live_history: None,
             scene_target: None,
             focused_workspace: None,
+            panel_layout_ops: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -1350,6 +1353,7 @@ impl TerminalApp {
             live_history: None,
             scene_target: None,
             focused_workspace: None,
+            panel_layout_ops: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -1950,6 +1954,16 @@ impl TerminalApp {
         self
     }
 
+    /// Attaches the pending Dwindle layout queue for plugin-created panels
+    /// (CTX-1859).
+    pub(crate) fn with_panel_layout_ops(
+        mut self,
+        ops: Option<crate::plugin_runtime::PluginPanelLayoutQueue>,
+    ) -> Self {
+        self.panel_layout_ops = ops;
+        self
+    }
+
     /// Sets the safe recovery latch (W-103 S-5, CTX-0929). Production
     /// startup passes the `--safe` flag; the composer cutover reads it to
     /// select the retained Core path without consulting a VM.
@@ -2485,6 +2499,9 @@ impl TerminalApp {
         // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
         // present, so the presented frame reflects the pin state.
         self.apply_plugin_pin_requests();
+        // CTX-1859: materialize or close Dwindle leaves for plugin-created
+        // non-terminal panels before present.
+        self.apply_plugin_panel_requests();
         // CTX-1139: arm queued `bitty.fx.pulse` intents before present, so
         // the presented frame reflects the pulse.
         self.apply_plugin_fx_requests();
@@ -4305,6 +4322,181 @@ impl TerminalApp {
         }
     }
 
+    /// Applies queued Dwindle layout create/close operations for plugin-created
+    /// non-terminal panels (CTX-1859).
+    pub(crate) fn apply_plugin_panel_requests(&mut self) {
+        let Some(queue) = self.panel_layout_ops.as_ref().map(std::rc::Rc::clone) else {
+            return;
+        };
+        let ops: Vec<crate::plugin_runtime::PluginPanelLayoutOp> = {
+            let mut q = queue.borrow_mut();
+            if q.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *q)
+        };
+        for op in ops {
+            match op {
+                crate::plugin_runtime::PluginPanelLayoutOp::Create {
+                    panel_id,
+                    generation,
+                } => {
+                    self.materialize_plugin_panel_leaf(panel_id, generation);
+                }
+                crate::plugin_runtime::PluginPanelLayoutOp::Close { panel_id, view_id } => {
+                    self.close_plugin_panel_leaf(panel_id, view_id);
+                }
+            }
+        }
+    }
+
+    /// Routes non-global input events to the owning plugin when the focused
+    /// leaf is a plugin-owned `ViewContent::Panel` (CTX-1859).
+    ///
+    /// Global Bitty keybindings (`intercept_chrome_key`) already ran before this
+    /// method. Key, IME-commit and wheel events are consumed (returning `true`)
+    /// so they never reach a leaf that owns no PTY. Pointer button events are
+    /// delivered as observations but never consumed: the Core keeps
+    /// click-to-focus and selection, and a plugin can only observe the press
+    /// (the panel input payload carries no hit-test coordinates).
+    pub(crate) fn route_focused_plugin_panel_input(&mut self, kind: &WindowEventKind) -> bool {
+        let Some(focused) = self.runtime.focused_view() else {
+            return false;
+        };
+        // Terminal leaves (pane sessions or primary view) always keep the
+        // normal terminal input path.
+        if self.runtime.has_pane_session(&focused) || self.runtime.primary_view() == Some(focused) {
+            return false;
+        }
+        let Some(scene_host) = self.runtime.scene_host() else {
+            return false;
+        };
+        let Some((panel_id, owner)) = ({
+            let host = scene_host.borrow();
+            host.placement_panel_of(focused).and_then(|panel_id| {
+                host.panel_controller_owner(panel_id)
+                    .map(|owner| (panel_id, owner))
+            })
+        }) else {
+            return false;
+        };
+        let mut consume = true;
+        let payload = match kind {
+            WindowEventKind::KeyboardInput(key) => {
+                if key.state != PressState::Pressed
+                    || key.is_synthetic
+                    || crate::chrome_keys::is_modifier_key(key)
+                {
+                    return false;
+                }
+                let key_name = overlay_key_text(key);
+                let text = key.text.clone().unwrap_or_else(|| key_name.clone());
+                bitty_runtime::plugin_runtime::LuaValue::table([
+                    (
+                        "panel_id",
+                        bitty_runtime::plugin_runtime::LuaValue::Integer(panel_id.0 as i64),
+                    ),
+                    (
+                        "kind",
+                        bitty_runtime::plugin_runtime::LuaValue::String("key".to_string()),
+                    ),
+                    (
+                        "key",
+                        bitty_runtime::plugin_runtime::LuaValue::String(key_name),
+                    ),
+                    (
+                        "text",
+                        bitty_runtime::plugin_runtime::LuaValue::String(text),
+                    ),
+                    (
+                        "ctrl",
+                        bitty_runtime::plugin_runtime::LuaValue::Bool(self.chrome.app_mods.control),
+                    ),
+                    (
+                        "alt",
+                        bitty_runtime::plugin_runtime::LuaValue::Bool(self.chrome.app_mods.alt),
+                    ),
+                    (
+                        "shift",
+                        bitty_runtime::plugin_runtime::LuaValue::Bool(self.chrome.app_mods.shift),
+                    ),
+                    (
+                        "super",
+                        bitty_runtime::plugin_runtime::LuaValue::Bool(
+                            self.chrome.app_mods.super_held,
+                        ),
+                    ),
+                ])
+            }
+            WindowEventKind::Ime(bitty_platform::ImeEvent::Commit(text)) => {
+                bitty_runtime::plugin_runtime::LuaValue::table([
+                    (
+                        "panel_id",
+                        bitty_runtime::plugin_runtime::LuaValue::Integer(panel_id.0 as i64),
+                    ),
+                    (
+                        "kind",
+                        bitty_runtime::plugin_runtime::LuaValue::String("ime".to_string()),
+                    ),
+                    (
+                        "text",
+                        bitty_runtime::plugin_runtime::LuaValue::String(text.clone()),
+                    ),
+                ])
+            }
+            WindowEventKind::MouseWheel(delta) => bitty_runtime::plugin_runtime::LuaValue::table([
+                (
+                    "panel_id",
+                    bitty_runtime::plugin_runtime::LuaValue::Integer(panel_id.0 as i64),
+                ),
+                (
+                    "kind",
+                    bitty_runtime::plugin_runtime::LuaValue::String("wheel".to_string()),
+                ),
+                (
+                    "delta",
+                    bitty_runtime::plugin_runtime::LuaValue::String(format!("{delta:?}")),
+                ),
+            ]),
+            WindowEventKind::MouseInput(mouse) => {
+                // Never consumed: click-to-focus and selection stay Core-owned.
+                consume = false;
+                bitty_runtime::plugin_runtime::LuaValue::table([
+                    (
+                        "panel_id",
+                        bitty_runtime::plugin_runtime::LuaValue::Integer(panel_id.0 as i64),
+                    ),
+                    (
+                        "kind",
+                        bitty_runtime::plugin_runtime::LuaValue::String("button".to_string()),
+                    ),
+                    (
+                        "button",
+                        bitty_runtime::plugin_runtime::LuaValue::String(format!(
+                            "{:?}",
+                            mouse.button
+                        )),
+                    ),
+                    (
+                        "state",
+                        bitty_runtime::plugin_runtime::LuaValue::String(
+                            match mouse.state {
+                                PressState::Pressed => "press",
+                                PressState::Released => "release",
+                            }
+                            .to_string(),
+                        ),
+                    ),
+                ])
+            }
+            _ => return false,
+        };
+        if let Some(plugin_runtime) = self.plugin_runtime.as_mut() {
+            let _ = plugin_runtime.deliver_event_to(&owner, "panel.input", &payload);
+        }
+        consume
+    }
+
     /// Arms queued `bitty.fx.pulse` intents (CTX-1139, DEC-0110).
     ///
     /// Bounded by the plugin runtime's fx queue capacity. Each intent
@@ -6049,6 +6241,9 @@ impl TerminalApp {
         // with no capture active this is a single bool check per event.
         if let PlatformEvent::Window { window_id: _, kind } = &event {
             if self.capture_fallthrough_input(kind) {
+                return;
+            }
+            if self.route_focused_plugin_panel_input(kind) {
                 return;
             }
         }

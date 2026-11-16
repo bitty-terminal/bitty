@@ -2853,6 +2853,36 @@ pub trait HostServices {
         Err(BridgeError::capability_denied("panel.focus"))
     }
 
+    /// Mount a declarative `UiRichNode` scene onto an owned non-terminal panel
+    /// for `bitty.panel.mount` (CTX-1859).
+    ///
+    /// Grant-gated on `ui.rich` and strict panel ownership; returns `true` when
+    /// attached. The default denies.
+    fn panel_mount(&self, panel_id: u64, node: &UiRichNode) -> Result<bool, BridgeError> {
+        let _ = (panel_id, node);
+        Err(BridgeError::capability_denied("ui.rich"))
+    }
+
+    /// Update a declarative `UiRichNode` scene on an owned non-terminal panel
+    /// for `bitty.panel.update` (CTX-1859).
+    ///
+    /// Grant-gated on `ui.rich` and strict panel ownership; returns `true` when
+    /// updated. The default denies.
+    fn panel_update(&self, panel_id: u64, node: &UiRichNode) -> Result<bool, BridgeError> {
+        let _ = (panel_id, node);
+        Err(BridgeError::capability_denied("ui.rich"))
+    }
+
+    /// Unmount the declarative scene from an owned non-terminal panel for
+    /// `bitty.panel.unmount` (CTX-1859).
+    ///
+    /// Grant-gated on `ui.rich` and strict panel ownership; returns whether a
+    /// scene was detached. The default denies.
+    fn panel_unmount(&self, panel_id: u64) -> Result<bool, BridgeError> {
+        let _ = panel_id;
+        Err(BridgeError::capability_denied("ui.rich"))
+    }
+
     /// Destroy a panel for `bitty.panel.destroy` (CTX-0915).
     ///
     /// Grant-gated on `panel.focus`; returns whether the panel was destroyed.
@@ -6053,6 +6083,89 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("panel table accepts 'close'");
+    panel
+        .set(
+            ctx,
+            "mount",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) if id >= 0 => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.mount id must be a non-negative integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let node = read_rich_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    let mounted = state
+                        .bounded_mutation(|_expiry| state.services.panel_mount(panel_id, &node))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(mounted));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'mount'");
+    panel
+        .set(
+            ctx,
+            "update",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) if id >= 0 => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.update id must be a non-negative integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let node = read_rich_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    let updated = state
+                        .bounded_mutation(|_expiry| state.services.panel_update(panel_id, &node))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(updated));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'update'");
+    panel
+        .set(
+            ctx,
+            "unmount",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let panel_id = match stack.get(0) {
+                        Value::Integer(id) if id >= 0 => id as u64,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_DEF_INVALID",
+                                "panel.unmount id must be a non-negative integer",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let unmounted = state
+                        .bounded_mutation(|_expiry| state.services.panel_unmount(panel_id))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(unmounted));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'unmount'");
     panel
         .set(
             ctx,

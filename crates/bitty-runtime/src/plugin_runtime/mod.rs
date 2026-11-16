@@ -676,6 +676,8 @@ struct PluginEntry {
     /// generation. Resets `wall_recovery_attempts` once it reaches
     /// [`HEALTHY_TICKS_RESET_RECOVERY`].
     healthy_timer_ticks: u32,
+    /// Earliest instant the throttled recovery pass may retry after a wall fault.
+    wall_recovery_next_at: Option<Instant>,
     /// Host classification of the current [`LifecycleState::Failed`] reason.
     ///
     /// Set only where the host *knows* the cause: the timer pump records
@@ -2582,6 +2584,7 @@ impl PluginRuntime {
                         entry.healthy_timer_ticks = entry.healthy_timer_ticks.saturating_add(1);
                         if entry.healthy_timer_ticks >= HEALTHY_TICKS_RESET_RECOVERY {
                             entry.wall_recovery_attempts = 0;
+                            entry.wall_recovery_next_at = None;
                             entry.healthy_timer_ticks = 0;
                         }
                     }
@@ -2956,6 +2959,7 @@ impl PluginRuntime {
                 budgets: None,
                 wall_recovery_attempts: 0,
                 healthy_timer_ticks: 0,
+                wall_recovery_next_at: None,
                 failure_class: FailureClass::Unclassified,
             },
         );
@@ -3933,10 +3937,27 @@ impl PluginRuntime {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.wall_recovery_attempts = 0;
             entry.healthy_timer_ticks = 0;
+            entry.wall_recovery_next_at = None;
         }
         let result = self.reload_inner(id);
         self.sync_debug_view();
         result
+    }
+
+    /// Backoff delay before the next throttled `RC-1 wall` recovery attempt.
+    fn wall_recovery_backoff(attempt: u32) -> Duration {
+        match attempt {
+            0 | 1 => Duration::from_secs(2),
+            2 => Duration::from_secs(10),
+            _ => Duration::from_secs(30),
+        }
+    }
+
+    /// Throttled variant of [`Self::recover_wall_failed_plugins`] for the host
+    /// cold-tick loop so transient multi-tick OS stalls do not exhaust
+    /// [`MAX_WALL_RECOVERY_ATTEMPTS`] in milliseconds.
+    pub fn recover_wall_failed_plugins_throttled(&mut self, now: Instant) -> usize {
+        self.recover_wall_failed_plugins_inner(Some(now))
     }
 
     /// Reloads any non-bundled plugin that transitioned to
@@ -3951,6 +3972,10 @@ impl PluginRuntime {
     /// Consecutive recovery attempts are bounded by [`MAX_WALL_RECOVERY_ATTEMPTS`]
     /// so a deterministically failing timer stays stopped.
     pub fn recover_wall_failed_plugins(&mut self) -> usize {
+        self.recover_wall_failed_plugins_inner(None)
+    }
+
+    fn recover_wall_failed_plugins_inner(&mut self, throttled_now: Option<Instant>) -> usize {
         let candidates: Vec<(PluginId, SourceClass, String)> = self
             .entries
             .iter()
@@ -3959,6 +3984,11 @@ impl PluginRuntime {
                     || entry.wall_recovery_attempts >= MAX_WALL_RECOVERY_ATTEMPTS
                 {
                     return None;
+                }
+                if let Some(now) = throttled_now {
+                    if entry.wall_recovery_next_at.is_some_and(|next| now < next) {
+                        return None;
+                    }
                 }
                 match &entry.state {
                     // CTX-1788 (PR #3109 round-2): classify on the typed
@@ -3981,6 +4011,10 @@ impl PluginRuntime {
         for (id, source_class, prev_reason) in candidates {
             if let Some(entry) = self.entries.get_mut(&id) {
                 entry.wall_recovery_attempts = entry.wall_recovery_attempts.saturating_add(1);
+                if let Some(now) = throttled_now {
+                    entry.wall_recovery_next_at =
+                        now.checked_add(Self::wall_recovery_backoff(entry.wall_recovery_attempts));
+                }
             }
             if let Some(store_root) = self.store_root.clone() {
                 match resolution::load_index(&store_root) {

@@ -536,6 +536,13 @@ pub(crate) fn key_ref_from_event(
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) if c.is_ascii_graphic() => KeyName::Char(c.to_ascii_lowercase()),
+                // XKB/Wayland may report Ctrl+letter (especially Ctrl+Alt+h = \x08
+                // and Ctrl+Alt+j = \n) as an ASCII C0 control character rather than
+                // the base letter; map C0 0x01..=0x1a back to 'a'..='z' when Ctrl is held.
+                (Some(c), None) if mods.control && ('\x01'..='\x1a').contains(&c) => {
+                    let letter = (b'a' + (c as u8 - 1)) as char;
+                    KeyName::Char(letter)
+                }
                 _ => return None,
             }
         }
@@ -11665,6 +11672,48 @@ claims = []
         assert!(
             after.x > before.x,
             "move_split:right on focused float must nudge x rightward ({before:?} -> {after:?})"
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_h_j_control_chars_match_move_split_keymaps() {
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mods = AppModifiers {
+            control: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let key_h = KeyEvent {
+            logical_key: LogicalKey::Character("\u{8}".to_string()),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        let key_j = KeyEvent {
+            logical_key: LogicalKey::Character("\n".to_string()),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        let ref_h = key_ref_from_event(&key_h, &mods).expect("ctrl+alt+h keyref");
+        let ref_j = key_ref_from_event(&key_j, &mods).expect("ctrl+alt+j keyref");
+        assert_eq!(
+            match_chrome_keymap(&maps, ref_h),
+            Some(bitty_config::ChromeAction::MoveSplit(
+                bitty_config::SplitDir::Left
+            ))
+        );
+        assert_eq!(
+            match_chrome_keymap(&maps, ref_j),
+            Some(bitty_config::ChromeAction::MoveSplit(
+                bitty_config::SplitDir::Down
+            ))
         );
     }
 

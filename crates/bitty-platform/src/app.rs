@@ -388,6 +388,19 @@ impl WindowHandle {
         self.window.pre_present_notify();
     }
 
+    /// Clears synthetic/native occlusion on routed input delivery (`bitty#3023`).
+    ///
+    /// An unfocused-but-visible Wayland surface can be latched occluded by the
+    /// native `Occluded(true)` edge while the compositor has already resumed
+    /// servicing it. A routed key or pointer delivery proves the surface is
+    /// live, so the probe's occlusion gate is reopened without waiting for a
+    /// frame callback or a focus regain.
+    pub fn note_input_reveal(&self) {
+        if let Ok(mut probe) = self.occlusion_probe.lock() {
+            probe.note_occluded_state(false);
+        }
+    }
+
     /// Samples the redraw-starvation probe for diagnostics (issue #2570).
     ///
     /// Read-only: the snapshot never mutates probe state and never affects

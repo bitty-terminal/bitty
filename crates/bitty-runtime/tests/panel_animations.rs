@@ -1869,3 +1869,60 @@ fn split_zoom_switch_respect_concurrent_surface_budget() {
     // Capacity is available again after completion.
     assert!(rt.trigger_animation(AnimationKind::Workspace, None, end));
 }
+
+#[test]
+fn move_split_interpolates_both_swapped_leaves_smoothly() {
+    let mut rt = runtime_with(AnimationPolicy::default());
+    let start = Instant::now();
+    rt.set_container(UiRect::new(0, 0, 80, 24));
+    rt.set_layout(two_pane_split());
+    let _ = rt.tick_at(start).expect("baseline presents");
+    // Let the initial Open transition finish so only the Move transition runs.
+    let settled = start + Duration::from_millis(200);
+    let _ = rt.tick_at(settled);
+    assert!(!rt.animations_active_at(settled));
+
+    let before_1 = frame_for(&rt.present_frames(), ViewId::new(1));
+    let before_2 = frame_for(&rt.present_frames(), ViewId::new(2));
+
+    assert!(rt.set_focus(ViewId::new(1)));
+    let move_t = Instant::now();
+    assert!(rt.move_focused_panel(bitty_runtime::FocusDirection::Right));
+    let _ = rt.tick_at(move_t).expect("move presents");
+
+    let after_1 = frame_for(&rt.present_frames(), ViewId::new(1));
+    let after_2 = frame_for(&rt.present_frames(), ViewId::new(2));
+    assert_ne!(before_1.frame, after_1.frame, "leaf 1 swapped slots");
+    assert_ne!(before_2.frame, after_2.frame, "leaf 2 swapped slots");
+
+    // Mid-way through the 150 ms Move animation, painted frames must
+    // interpolate between the pre-swap and post-swap bounds rather than
+    // snapping immediately (which set_layout_committed used to cause).
+    let mid = move_t + Duration::from_millis(75);
+    let _ = rt.tick_at(mid).expect("mid frame presents");
+    let painted_mid = rt.paint_frames_at(mid);
+    let mid_1 = frame_for(&painted_mid, ViewId::new(1));
+    let mid_2 = frame_for(&painted_mid, ViewId::new(2));
+    assert_ne!(
+        mid_1.frame, before_1.frame,
+        "leaf 1 must have started moving"
+    );
+    assert_ne!(
+        mid_1.frame, after_1.frame,
+        "leaf 1 must still be mid-flight"
+    );
+    assert_ne!(
+        mid_2.frame, before_2.frame,
+        "leaf 2 must have started moving"
+    );
+    assert_ne!(
+        mid_2.frame, after_2.frame,
+        "leaf 2 must still be mid-flight"
+    );
+
+    let end = move_t + Duration::from_millis(200);
+    let _ = rt.tick_at(end).expect("final frame commits");
+    let painted_end = rt.paint_frames_at(end);
+    assert_eq!(frame_for(&painted_end, ViewId::new(1)).frame, after_1.frame);
+    assert_eq!(frame_for(&painted_end, ViewId::new(2)).frame, after_2.frame);
+}

@@ -1563,6 +1563,28 @@ impl GpuResources {
         let fill_chunks = batch::chunk_fills(&draw_list.fills, surface_w, surface_h, scale);
         let rounded_chunks =
             batch::chunk_rounded_fills(&draw_list.rounded_fills, surface_w, surface_h, scale);
+        let float_layer_chunks: Vec<_> = draw_list
+            .float_layers
+            .iter()
+            .map(|layer| {
+                let backdrop = layer
+                    .backdrop
+                    .as_ref()
+                    .map(|b| {
+                        batch::chunk_rounded_fills(
+                            std::slice::from_ref(b),
+                            surface_w,
+                            surface_h,
+                            scale,
+                        )
+                    })
+                    .unwrap_or_default();
+                let fills = batch::chunk_fills(&layer.fills, surface_w, surface_h, scale);
+                let rounded =
+                    batch::chunk_rounded_fills(&layer.rounded_fills, surface_w, surface_h, scale);
+                (backdrop, fills, rounded)
+            })
+            .collect();
         let overlay_chunks =
             batch::chunk_fills(&draw_list.overlay_fills, surface_w, surface_h, scale);
         let overlay_card_chunks = batch::chunk_rounded_fills(
@@ -1597,6 +1619,12 @@ impl GpuResources {
             .iter()
             .map(|c| c.quad_count)
             .chain(rounded_chunks.iter().map(|c| c.quad_count))
+            .chain(float_layer_chunks.iter().flat_map(|(b, f, r)| {
+                b.iter()
+                    .chain(f.iter())
+                    .chain(r.iter())
+                    .map(|c| c.quad_count)
+            }))
             .chain(overlay_chunks.iter().map(|c| c.quad_count))
             .chain(overlay_card_chunks.iter().map(|c| c.quad_count))
             .chain(overlay_content_chunks.iter().map(|c| c.quad_count))
@@ -1681,6 +1709,19 @@ impl GpuResources {
         // the frame ring paints over corner cell backgrounds.
         for chunk in &rounded_chunks {
             submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+        }
+
+        // CTX-1861: per-float-panel layers (backdrop -> cell fills -> ring).
+        for (backdrop_chunks, float_fill_chunks, float_rounded_chunks) in &float_layer_chunks {
+            for chunk in backdrop_chunks {
+                submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+            }
+            for chunk in float_fill_chunks {
+                submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+            }
+            for chunk in float_rounded_chunks {
+                submit_fill_chunk(&chunk.bytes, chunk.quad_count, &mut first_pass)?;
+            }
         }
 
         // CTX-0347: per-`View` background images paint above cell backgrounds
@@ -1973,6 +2014,7 @@ mod tests {
             },
             fills: Vec::new(),
             rounded_fills: Vec::new(),
+            float_layers: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
             overlay_card_rounded_fills: Vec::new(),

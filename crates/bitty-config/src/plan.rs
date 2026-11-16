@@ -16,9 +16,9 @@ use crate::error::ConfigError;
 use crate::keymap::{ModKey, MouseButtonBinding};
 use crate::panel_rules::PanelSpawnRule;
 use crate::types::{
-    AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FontConfig, HistoryConfig,
-    KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig, SelectionConfig, SessionConfig,
-    TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
+    AppearanceConfig, ChromeConfig, CloseConfirm, DecorationConfig, FloatingConfig, FontConfig,
+    HistoryConfig, KeymapEntry, LayoutConfig, PluginSpec, ScrollbarConfig, SelectionConfig,
+    SessionConfig, TerminalConfig, ViewOverride, WindowConfig, WorkspaceConfig,
 };
 
 /// Current schema version is owned by [`crate::migration`].
@@ -126,6 +126,8 @@ pub struct ConfigPlan {
     /// Core-owned workspace decoration (CTX-0292 `decoration.gaps_in`,
     /// `decoration.gaps_out`, `decoration.border`, `decoration.radius`).
     pub decoration: Option<DecorationConfig>,
+    /// Floating panel defaults (`floating = { ... }`).
+    pub floating: Option<FloatingConfig>,
     /// Per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343
     /// `views.<selector>.*`). A present entry carries its parsed selector and
     /// the closed override field set; absent means "this layer says

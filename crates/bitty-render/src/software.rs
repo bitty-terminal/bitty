@@ -578,6 +578,17 @@ pub fn draw_list_onto_color(
     for fill in &list.rounded_fills {
         surface.fill_rounded_rect(fill);
     }
+    for layer in &list.float_layers {
+        if let Some(backdrop) = &layer.backdrop {
+            surface.fill_rounded_rect(backdrop);
+        }
+        for fill in &layer.fills {
+            surface.fill_rect(fill.rect, fill.color);
+        }
+        for fill in &layer.rounded_fills {
+            surface.fill_rounded_rect(fill);
+        }
+    }
     // CTX-0347: per-`View` background images paint behind content, above cell
     // backgrounds and the decoration ring.
     for blit in &list.backgrounds {
@@ -1098,6 +1109,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![
                 ImageBlit::try_new(
                     crate::geometry::RectPx::new(0, 0, 8, 8),
@@ -1238,6 +1250,7 @@ mod tests {
                 color: [255, 0, 0, 255],
             }],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![
                 ImageBlit::try_new(
                     crate::geometry::RectPx::new(0, 0, 8, 8),
@@ -1287,6 +1300,7 @@ mod tests {
                 },
                 fills: vec![],
                 rounded_fills: vec![],
+                float_layers: Vec::new(),
                 backgrounds: vec![],
                 overlay_fills: vec![],
                 overlay_card_rounded_fills: vec![],

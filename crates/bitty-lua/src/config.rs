@@ -467,6 +467,25 @@ pub struct SessionData {
     pub restore_on_startup: Option<bool>,
 }
 
+/// `floating` table (CTX-1861): default floating panel geometry and appearance.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FloatingData {
+    /// Default width fraction of the container in `(0.0, 1.0]`.
+    pub width: Option<f64>,
+    /// Default height fraction of the container in `(0.0, 1.0]`.
+    pub height: Option<f64>,
+    /// Whether floating panels start centered in the container.
+    pub centered: Option<bool>,
+    /// Horizontal anchor ratio in `0.0..=1.0` when not centered.
+    pub x: Option<f64>,
+    /// Vertical anchor ratio in `0.0..=1.0` when not centered.
+    pub y: Option<f64>,
+    /// Optional backdrop opacity override in `0.0..=1.0`.
+    pub background_opacity: Option<f64>,
+    /// Optional `#RRGGBB` backdrop color override.
+    pub background: Option<String>,
+}
+
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
 /// CTX-0333; see [`FontData`] for `Option` semantics).
 ///
@@ -754,6 +773,8 @@ pub struct ConfigData {
     pub chrome: Option<ChromeData>,
     /// `decoration` table (CTX-0292 Core-owned workspace decoration).
     pub decoration: Option<DecorationData>,
+    /// `floating` table (CTX-1861 floating panel defaults).
+    pub floating: Option<FloatingData>,
     /// `views` table (RFC-0001/OQ-041 per-View appearance overrides,
     /// CTX-0343). `None` means "this layer says nothing".
     pub views: Option<Vec<ViewOverrideData>>,
@@ -2429,6 +2450,59 @@ impl ConfigData {
                         background_image_roots,
                         background_tint,
                         background_tint_strength,
+                    });
+                }
+                "floating" => {
+                    let nested = expect_table(key, val)?;
+                    check_nested_keys(
+                        key,
+                        nested,
+                        &[
+                            "width",
+                            "height",
+                            "centered",
+                            "x",
+                            "y",
+                            "background_opacity",
+                            "background",
+                        ],
+                    )?;
+                    let width = match get_field(nested, "width") {
+                        Some(v) => Some(expect_number("floating.width", v)?),
+                        None => None,
+                    };
+                    let height = match get_field(nested, "height") {
+                        Some(v) => Some(expect_number("floating.height", v)?),
+                        None => None,
+                    };
+                    let centered = match get_field(nested, "centered") {
+                        Some(v) => Some(expect_bool("floating.centered", v)?),
+                        None => None,
+                    };
+                    let x = match get_field(nested, "x") {
+                        Some(v) => Some(expect_number("floating.x", v)?),
+                        None => None,
+                    };
+                    let y = match get_field(nested, "y") {
+                        Some(v) => Some(expect_number("floating.y", v)?),
+                        None => None,
+                    };
+                    let background_opacity = match get_field(nested, "background_opacity") {
+                        Some(v) => Some(expect_number("floating.background_opacity", v)?),
+                        None => None,
+                    };
+                    let background = match get_field(nested, "background") {
+                        Some(v) => Some(expect_string("floating.background", v)?),
+                        None => None,
+                    };
+                    out.floating = Some(FloatingData {
+                        width,
+                        height,
+                        centered,
+                        x,
+                        y,
+                        background_opacity,
+                        background,
                     });
                 }
                 "views" => {

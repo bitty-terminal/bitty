@@ -950,6 +950,94 @@ impl std::fmt::Display for TextStack {
     }
 }
 
+/// Default floating panel size fraction (`0.8` = 80% of container).
+pub const DEFAULT_FLOATING_SIZE_RATIO: f32 = 0.8;
+
+/// Runtime floating panel defaults (CTX-1861).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FloatingPanelConfig {
+    /// Default width as a fraction of the container width in `(0.0, 1.0]`.
+    pub width_ratio: f32,
+    /// Default height as a fraction of the container height in `(0.0, 1.0]`.
+    pub height_ratio: f32,
+    /// Whether new floating panels start centered in the container.
+    pub centered: bool,
+    /// Optional horizontal anchor ratio in `0.0..=1.0` when not centered.
+    pub x_ratio: Option<f32>,
+    /// Optional vertical anchor ratio in `0.0..=1.0` when not centered.
+    pub y_ratio: Option<f32>,
+    /// Optional backdrop opacity override in `0.0..=1.0`.
+    pub background_opacity: Option<f32>,
+    /// Optional `#RRGGBB`/`#RRGGBBAA` backdrop color override.
+    pub background: Option<[u8; 4]>,
+}
+
+impl Default for FloatingPanelConfig {
+    fn default() -> Self {
+        Self {
+            width_ratio: DEFAULT_FLOATING_SIZE_RATIO,
+            height_ratio: DEFAULT_FLOATING_SIZE_RATIO,
+            centered: true,
+            x_ratio: None,
+            y_ratio: None,
+            background_opacity: None,
+            background: None,
+        }
+    }
+}
+
+impl FloatingPanelConfig {
+    /// Builds a [`FloatingPanelConfig`] from [`bitty_config::FloatingConfig`].
+    #[must_use]
+    pub fn from_config(cfg: &bitty_config::FloatingConfig) -> Self {
+        Self {
+            width_ratio: cfg.resolve_width(),
+            height_ratio: cfg.resolve_height(),
+            centered: cfg.resolve_centered(),
+            x_ratio: cfg.x,
+            y_ratio: cfg.y,
+            background_opacity: cfg.background_opacity,
+            background: cfg.resolve_background_rgba(),
+        }
+    }
+
+    /// Validates all floating panel config bounds (fail-closed).
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if !(self.width_ratio.is_finite() && self.width_ratio > 0.0 && self.width_ratio <= 1.0) {
+            return Err(RuntimeError::InvalidConfig(
+                "floating.width must be finite within (0.0, 1.0]",
+            ));
+        }
+        if !(self.height_ratio.is_finite() && self.height_ratio > 0.0 && self.height_ratio <= 1.0) {
+            return Err(RuntimeError::InvalidConfig(
+                "floating.height must be finite within (0.0, 1.0]",
+            ));
+        }
+        if let Some(x) = self.x_ratio {
+            if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "floating.x must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(y) = self.y_ratio {
+            if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "floating.y must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(op) = self.background_opacity {
+            if !(op.is_finite() && (0.0..=1.0).contains(&op)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "floating.background_opacity must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -1279,6 +1367,8 @@ pub struct RuntimeConfig {
     /// placement regardless of this setting; this field only controls
     /// `NewPanel`.
     pub panel_layout_mode: PanelLayoutMode,
+    /// Floating panel geometry and appearance defaults (CTX-1861).
+    pub floating: FloatingPanelConfig,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
@@ -1415,6 +1505,7 @@ impl Default for RuntimeConfig {
             bidi: false,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
+            floating: FloatingPanelConfig::default(),
         }
     }
 }
@@ -1533,6 +1624,7 @@ impl RuntimeConfig {
             bidi: false,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
+            floating: FloatingPanelConfig::default(),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1783,6 +1875,7 @@ impl RuntimeConfig {
                 "paste_confirm_timeout must be within [1, 300] seconds",
             ));
         }
+        self.floating.validate()?;
         Ok(())
     }
 

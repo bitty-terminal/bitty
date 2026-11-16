@@ -137,6 +137,7 @@ fn empty_draw_list() -> DrawList {
         )),
         fills: Vec::new(),
         rounded_fills: Vec::new(),
+        float_layers: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
         overlay_card_rounded_fills: Vec::new(),

@@ -5110,6 +5110,8 @@ impl TerminalApp {
                 || self.runtime.hovered_plaintext_span().is_some());
         let icon = if !inside || overlay_active {
             bitty_platform::CursorIcon::Default
+        } else if let Some(resize_icon) = self.runtime.resize_cursor_icon() {
+            resize_icon
         } else if hovered {
             bitty_platform::CursorIcon::Pointer
         } else if let Some(shape) = self.runtime.focused_pointer_shape() {

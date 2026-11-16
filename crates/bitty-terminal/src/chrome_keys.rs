@@ -214,13 +214,21 @@ pub(crate) struct ZoomState {
     entries: std::collections::BTreeMap<u64, ZoomEntry>,
 }
 
-/// One workspace's zoom pair (CTX-0538).
+/// One workspace's zoom pair (CTX-0538, CTX-1861).
 #[derive(Debug)]
-struct ZoomEntry {
-    /// Real tiled layout while zoomed.
-    backup: LayoutNode,
-    /// Proxy layout installed at engage time (staleness identity).
-    proxy: LayoutNode,
+enum ZoomEntry {
+    /// Zoomed in-tree leaf: real layout + single-leaf tiling proxy.
+    Tree {
+        /// Real tiled layout while zoomed.
+        backup: LayoutNode,
+        /// Proxy layout installed at engage time (staleness identity).
+        proxy: LayoutNode,
+    },
+    /// Zoomed workspace-detached floating panel: saved `(float_offset, anchored_size)`.
+    DetachedFloat {
+        view: ViewId,
+        saved: ((i32, i32), Option<(u16, u16)>),
+    },
 }
 
 /// Stable sequence of the active workspace, if one exists (CTX-0538).
@@ -244,9 +252,10 @@ impl ZoomState {
     /// (diagnostics).
     pub(crate) fn backup_leaf_count(&self, runtime: &Runtime) -> Option<usize> {
         let seq = active_workspace_seq(runtime)?;
-        self.entries
-            .get(&seq)
-            .map(|entry| entry.backup.leaf_ids().len())
+        self.entries.get(&seq).map(|entry| match entry {
+            ZoomEntry::Tree { backup, .. } => backup.leaf_ids().len(),
+            ZoomEntry::DetachedFloat { .. } => runtime.layout().leaf_ids().len() + 1,
+        })
     }
 
     /// Live leaf ids of one workspace's real tree while zoomed, without
@@ -255,17 +264,16 @@ impl ZoomState {
     /// `None` when the workspace holds no zoom backup. The caller owns the
     /// vec; zoom state is untouched, so a later disengage still restores.
     pub(crate) fn backup_leaf_ids_for_seq(&self, seq: u64) -> Option<Vec<ViewId>> {
-        self.entries.get(&seq).map(|entry| entry.backup.leaf_ids())
+        self.entries.get(&seq).map(|entry| match entry {
+            ZoomEntry::Tree { backup, .. } => backup.leaf_ids(),
+            ZoomEntry::DetachedFloat { view, .. } => vec![*view],
+        })
     }
 
     /// Engages zoom on `view`: captures the real tree and installs the
-    /// single-leaf proxy. Refuses when the active workspace is already
-    /// zoomed or the view is not a leaf, leaving the layout untouched.
-    ///
-    /// Issue #2373: the proxy is installed through the normal layout funnel,
-    /// so a zoomed primary owner resizes its grid and PTY winsize to the
-    /// full-bleed frame (SIGWINCH included). Zooming a sibling still leaves
-    /// the hidden owner's grid untouched for the return trip (CTX-0790).
+    /// single-leaf proxy (or zooms a detached float to fill the container).
+    /// Refuses when the active workspace is already zoomed or the view is not
+    /// a leaf/detached float, leaving the layout untouched.
     pub(crate) fn engage(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
         self.prune(runtime);
         let Some(seq) = active_workspace_seq(runtime) else {
@@ -274,14 +282,24 @@ impl ZoomState {
         if self.entries.contains_key(&seq) {
             return false;
         }
-        let Some(leaf) = runtime.layout().find_leaf(view).cloned() else {
-            return false;
-        };
-        let backup = runtime.layout().clone();
-        let proxy = LayoutNode::leaf(leaf);
-        runtime.set_layout(proxy.clone());
-        self.entries.insert(seq, ZoomEntry { backup, proxy });
-        true
+        if let Some(mut leaf) = runtime.layout().find_leaf(view).cloned() {
+            let backup = runtime.layout().clone();
+            if leaf.presentation() == bitty_ui::PresentationMode::Floating {
+                leaf.set_presentation(bitty_ui::PresentationMode::Tiled);
+            }
+            let proxy = LayoutNode::leaf(leaf);
+            runtime.set_layout(proxy.clone());
+            self.entries.insert(seq, ZoomEntry::Tree { backup, proxy });
+            return true;
+        }
+        if runtime.is_detached_float(view) {
+            if let Some(saved) = runtime.zoom_detached_float(view) {
+                self.entries
+                    .insert(seq, ZoomEntry::DetachedFloat { view, saved });
+                return true;
+            }
+        }
+        false
     }
 
     /// Disengages zoom in the active workspace. Restores the real tree only
@@ -295,14 +313,19 @@ impl ZoomState {
         let Some(entry) = self.entries.remove(&seq) else {
             return false;
         };
-        if same_layout_shape(runtime.layout(), &entry.proxy) {
-            runtime.set_layout(entry.backup);
-            return true;
+        match entry {
+            ZoomEntry::Tree { backup, proxy } => {
+                if same_layout_shape(runtime.layout(), &proxy) {
+                    runtime.set_layout(backup);
+                    return true;
+                }
+                eprintln!(
+                    "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
+                );
+                false
+            }
+            ZoomEntry::DetachedFloat { view, saved } => runtime.unzoom_detached_float(view, saved),
         }
-        eprintln!(
-            "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
-        );
-        false
     }
 
     /// Restores zoom before a layout mutation (keymap path and the ctl drain
@@ -331,7 +354,10 @@ impl ZoomState {
         let Some(seq) = self
             .entries
             .iter()
-            .find(|(_, entry)| entry.backup.leaf_ids().contains(&view))
+            .find(|(_, entry)| match entry {
+                ZoomEntry::Tree { backup, .. } => backup.leaf_ids().contains(&view),
+                ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
+            })
             .map(|(seq, _)| *seq)
         else {
             return false;
@@ -342,23 +368,38 @@ impl ZoomState {
         let Some(index) = runtime.workspace_index_by_seq(seq) else {
             return false;
         };
-        if !runtime
-            .workspace_layout(index)
-            .is_some_and(|layout| same_layout_shape(layout, &entry.proxy))
-        {
-            eprintln!(
-                "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
-            );
-            return false;
-        }
-        let Some(entry) = self.entries.remove(&seq) else {
-            return false;
-        };
-        if index == runtime.active_workspace_index() {
-            runtime.set_layout(entry.backup);
-            true
-        } else {
-            runtime.set_stashed_layout_for_seq(seq, entry.backup)
+        match entry {
+            ZoomEntry::Tree { proxy, .. } => {
+                if !runtime
+                    .workspace_layout(index)
+                    .is_some_and(|layout| same_layout_shape(layout, proxy))
+                {
+                    eprintln!(
+                        "warning: zoom backup stale (layout changed while zoomed) — keeping current layout"
+                    );
+                    return false;
+                }
+                let Some(ZoomEntry::Tree { backup, .. }) = self.entries.remove(&seq) else {
+                    return false;
+                };
+                if index == runtime.active_workspace_index() {
+                    runtime.set_layout(backup);
+                    true
+                } else {
+                    runtime.set_stashed_layout_for_seq(seq, backup)
+                }
+            }
+            ZoomEntry::DetachedFloat { .. } => {
+                let Some(ZoomEntry::DetachedFloat { view, saved }) = self.entries.remove(&seq)
+                else {
+                    return false;
+                };
+                if index == runtime.active_workspace_index() {
+                    runtime.unzoom_detached_float(view, saved)
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -11942,5 +11983,118 @@ claims = []
         assert!(!app.apply_chrome_action(ChromeAction::TabOpen));
         assert_eq!(tab_strip(&app), vec![2, 1]);
         assert_eq!(app.runtime.layout().leaf_count(), 2);
+    }
+
+    #[test]
+    fn toggle_zoom_expands_presentation_floating_panel_and_restores() {
+        use bitty_config::ChromeAction;
+        use bitty_runtime::{LayoutNode, PresentationMode, SplitAxis, View, ViewId};
+
+        let mut app = tab_test_app();
+        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        tree.find_leaf_mut(ViewId::new(2))
+            .unwrap()
+            .set_presentation(PresentationMode::Floating);
+        app.runtime.set_layout(tree);
+        app.runtime.set_focus(ViewId::new(2));
+
+        let before = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(2))
+            .expect("floating frame");
+        assert_eq!(before.tier, Some(bitty_runtime::OverlayTier::Float));
+
+        // First ToggleZoom expands the PresentationMode::Floating panel to full workspace.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        let zoomed = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(2))
+            .expect("zoomed frame");
+        assert_eq!(
+            zoomed.tier, None,
+            "zoomed panel must tile to fill workspace"
+        );
+        assert!(zoomed.cols > before.cols && zoomed.rows > before.rows);
+
+        // Second ToggleZoom restores PresentationMode::Floating.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        let restored = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(2))
+            .expect("restored frame");
+        assert_eq!(restored.tier, Some(bitty_runtime::OverlayTier::Float));
+        assert_eq!((restored.cols, restored.rows), (before.cols, before.rows));
+    }
+
+    #[test]
+    fn toggle_zoom_expands_detached_floating_panel_and_restores() {
+        use bitty_config::ChromeAction;
+        use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+
+        let mut app = tab_test_app();
+        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        );
+        app.runtime.set_layout(tree);
+        app.runtime.set_focus(ViewId::new(1));
+        app.runtime
+            .float_detach(ViewId::new(1))
+            .expect("detach must succeed");
+        app.runtime.set_focus(ViewId::new(1));
+
+        let before = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(1))
+            .expect("detached float frame");
+
+        // First ToggleZoom fills the container.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        let zoomed = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(1))
+            .expect("zoomed detached float");
+        assert!(zoomed.cols > before.cols && zoomed.rows > before.rows);
+
+        // Second ToggleZoom restores the detached float geometry.
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        let restored = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|f| f.view == ViewId::new(1))
+            .expect("restored detached float");
+        assert_eq!(
+            (
+                restored.cols,
+                restored.rows,
+                restored.frame.x,
+                restored.frame.y
+            ),
+            (before.cols, before.rows, before.frame.x, before.frame.y)
+        );
     }
 }

@@ -48,7 +48,7 @@
 //!
 //! Any kind may carry an optional `style` table — the bounded primitive set
 //! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`,
-//! `min_width`, `max_width`). A non-flat style lowers to the additive
+//! `min_width`, `max_width`, `gap`). A non-flat style lowers to the additive
 //! `SceneNode::Styled` wrapper, so the existing measure and paint path applies
 //! it; a flat one lowers to nothing. `style` is a modifier, not a tenth kind:
 //! [`UiRichNode::kind`] still reports the wrapped node's kind and
@@ -59,6 +59,14 @@
 //! path to apply the bound. Both are bounded by
 //! [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`], and a floor above the cap is
 //! refused rather than reordered.
+//!
+//! `gap` is the spacing between adjacent siblings in cells
+//! ([`crate::ui_style::UI_STYLE_MAX_GAP_CELLS`], inclusive). It is only
+//! meaningful on a kind that composes children — `Row`, `Column`, `List` — so a
+//! non-zero `gap` on `Text` or on any single-child/leaf kind is a typed
+//! `E_UI_COMPONENT_INVALID` refusal naming the kind, not a dropped field (the
+//! `anchor` precedent). A declared `0` is accepted everywhere and is flat, so it
+//! renders exactly like an absent gap.
 //!
 //! `style.border` and `Block.border` are one stroke in two units (px and
 //! cells), so a `Block` may declare one of them and never both with a
@@ -87,6 +95,7 @@
 //! | language hint | [`UI_RICH_MAX_LANG_BYTES`] (32) | bridge budget |
 //! | style padding / radius / border | `32` / `16` / `16` | [`crate::ui_style`] caps |
 //! | style min/max width | `1000` cells | [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`] |
+//! | style gap | `32` cells | [`crate::ui_style::UI_STYLE_MAX_GAP_CELLS`] |
 //!
 //! Structural elements count against the node budget exactly like the
 //! accepted scene accounting: a table row and a table cell are separate
@@ -441,6 +450,20 @@ impl UiRichNode {
             ))),
         }?;
 
+        // bitty#2191: `gap` separates adjacent siblings, so only a kind that
+        // composes children may declare one. Refused, not ignored: a leaf has
+        // no siblings to separate, and a `Block`/`CodeBlock`/`Table`/`Image`/
+        // `Rule` has no composed sibling axis for the gap to advance — the
+        // `anchor` policy (refuse a position-invalid field) rather than a
+        // silent no-op. A declared `0` stays legal everywhere because it asks
+        // for nothing and renders exactly like an absent gap.
+        if style.is_some_and(|style| style.gap_cells > 0) && !composes_siblings(&node) {
+            return Err(component_invalid(format!(
+                "style.gap is not valid on a {} node: only Row, Column, and List separate adjacent siblings, and a declared 0 is the only gap such a node accepts",
+                node.kind()
+            )));
+        }
+
         // A flat declaration is inert: it claims no geometry, so wrapping it
         // would charge `SCN-1`/`SCN-2` for a node that paints nothing. Only a
         // declaration that actually insets or strokes anything becomes the
@@ -453,6 +476,19 @@ impl UiRichNode {
             Some(_) | None => node,
         })
     }
+}
+
+/// Whether the kind lays its children out as adjacent siblings, which is the
+/// only shape a `gap` can advance.
+///
+/// `List` qualifies because the rich surface composes it vertically, exactly
+/// like `Column` (`scene_bridge` maps it to `SceneNode::Column`). Every other
+/// kind is a leaf or carries a single child, so it has no adjacent pair.
+fn composes_siblings(node: &UiRichNode) -> bool {
+    matches!(
+        node,
+        UiRichNode::Row(_) | UiRichNode::Column(_) | UiRichNode::List(_)
+    )
 }
 
 /// Reads one raw Lua value into the bounded rich scene model.
@@ -1000,7 +1036,10 @@ mod tests {
         for kind in UI_RICH_NODE_KINDS {
             let mut fields = vec![
                 ("kind", LuaValue::String(kind.to_string())),
-                ("style", LuaValue::table([("gap", LuaValue::Integer(1))])),
+                (
+                    "style",
+                    LuaValue::table([("align", LuaValue::String("center".to_string()))]),
+                ),
             ];
             // Give each kind the content field it requires so only the style
             // can be the reason for the refusal.
@@ -1025,8 +1064,98 @@ mod tests {
                 UiRichNode::from_lua_value(&table).expect_err("unknown style key is refused");
             assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
             assert_eq!(
-                error.message, "unsupported scene style field 'gap'",
+                error.message, "unsupported scene style field 'align'",
                 "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_is_refused_on_a_kind_without_a_sibling_axis() {
+        // bitty#2191: `gap` separates adjacent siblings, so only a container
+        // that composes children accepts one. Every other kind is refused with
+        // a diagnostic naming the kind, never silently ignored.
+        for (kind, content) in [
+            ("Text", Some(("text", LuaValue::String("x".to_string())))),
+            ("Block", Some(("child", text("x")))),
+            ("Image", Some(("placement", LuaValue::Integer(1)))),
+            (
+                "CodeBlock",
+                Some(("content", LuaValue::String("x".to_string()))),
+            ),
+            ("Table", Some(("rows", LuaValue::array(Vec::new())))),
+            ("Rule", None),
+        ] {
+            let mut fields = vec![
+                ("kind", LuaValue::String(kind.to_string())),
+                ("style", LuaValue::table([("gap", LuaValue::Integer(2))])),
+            ];
+            if let Some((key, value)) = content {
+                fields.push((key, value));
+            }
+            let table = LuaValue::Table(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                    .collect(),
+            );
+            let error = UiRichNode::from_lua_value(&table)
+                .expect_err("a gap on a kind with no sibling axis is refused");
+            assert_eq!(error.class, "validation");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(
+                error.message,
+                format!(
+                    "style.gap is not valid on a {kind} node: only Row, Column, and List \
+                     separate adjacent siblings, and a declared 0 is the only gap such a \
+                     node accepts"
+                ),
+                "{kind}"
+            );
+        }
+
+        // The three composing kinds accept it, and a declared `0` is legal (and
+        // inert) everywhere.
+        for kind in ["Row", "Column", "List"] {
+            let table = LuaValue::table([
+                ("kind", LuaValue::String(kind.to_string())),
+                ("children", LuaValue::array(vec![text("a"), text("b")])),
+                ("style", LuaValue::table([("gap", LuaValue::Integer(2))])),
+            ]);
+            let node = UiRichNode::from_lua_value(&table)
+                .unwrap_or_else(|error| panic!("{kind} must accept a gap: {error}"));
+            match node {
+                UiRichNode::Styled { style, .. } => assert_eq!(style.gap_cells, 2),
+                other => panic!("expected a styled wrapper, got {other:?}"),
+            }
+        }
+        for kind in UI_RICH_NODE_KINDS {
+            let mut fields = vec![
+                ("kind", LuaValue::String(kind.to_string())),
+                ("style", LuaValue::table([("gap", LuaValue::Integer(0))])),
+            ];
+            match kind {
+                "Text" => fields.push(("text", LuaValue::String("x".to_string()))),
+                "Block" => fields.push(("child", text("x"))),
+                "Image" => fields.push(("placement", LuaValue::Integer(1))),
+                "CodeBlock" => fields.push(("content", LuaValue::String("x".to_string()))),
+                "Table" => fields.push(("rows", LuaValue::array(Vec::new()))),
+                "Row" | "Column" | "List" => {
+                    fields.push(("children", LuaValue::array(vec![text("x")])));
+                }
+                _ => {}
+            }
+            let table = LuaValue::Table(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                    .collect(),
+            );
+            let node = UiRichNode::from_lua_value(&table)
+                .unwrap_or_else(|error| panic!("{kind} must accept gap = 0: {error}"));
+            assert!(
+                !matches!(node, UiRichNode::Styled { .. }),
+                "{kind}: a declared 0 is flat, so it lowers to no wrapper"
             );
         }
     }

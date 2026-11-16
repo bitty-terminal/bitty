@@ -183,6 +183,15 @@ pub const SCENE_STYLE_MAX_BORDER_PX: u16 = 16;
 /// clamped.
 pub const SCENE_STYLE_MAX_WIDTH_CELLS: u16 = 1000;
 
+/// Inclusive maximum sibling gap in cells for `gap_cells`.
+///
+/// Reuses the accepted `decoration.content_inset` upper bound (`0..=32`), the
+/// same range `padding_cells` uses, and mirrors
+/// `bitty_lua::ui_style::UI_STYLE_MAX_GAP_CELLS` so a value the wire parser
+/// accepts cannot be refused one layer later. A declaration past it is refused,
+/// never clamped.
+pub const SCENE_STYLE_MAX_GAP_CELLS: u16 = 32;
+
 /// Closed content-token set a style colour may name.
 ///
 /// Only `content.*`/`state.*` tokens are in the set: an extension styles
@@ -250,8 +259,8 @@ impl std::fmt::Display for ContentToken {
 /// extension resolver (`bitty_ui::scene_style::SceneStyleError`) carries the
 /// same cap variants for the four primitives it resolves, so an authoring
 /// diagnostic and the admission refusal describe a cap the same way. The two
-/// width-bound variants exist only here: the resolver has no measure path and
-/// does not carry the width keys.
+/// width-bound variants and the gap variant exist only here: the resolver has no
+/// measure path and does not carry those keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SceneStyleError {
     /// Padding exceeds [`SCENE_STYLE_MAX_PADDING_CELLS`].
@@ -296,6 +305,13 @@ pub enum SceneStyleError {
         /// Declared cap, in cells.
         max: u16,
     },
+    /// Sibling gap exceeds [`SCENE_STYLE_MAX_GAP_CELLS`].
+    GapOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
 }
 
 impl std::fmt::Display for SceneStyleError {
@@ -322,6 +338,9 @@ impl std::fmt::Display for SceneStyleError {
                     "scene style width range is inverted: min_width {min} > max_width {max}"
                 )
             }
+            Self::GapOverCap { found, cap } => {
+                write!(f, "scene style gap exceeds cap: {found} > {cap}")
+            }
         }
     }
 }
@@ -342,6 +361,7 @@ impl std::error::Error for SceneStyleError {}
 /// | `border_token`  | closed set  | `content.foreground`  | —    |
 /// | `min_width_cells` | cells     | `0` (no floor)        | `1000` |
 /// | `max_width_cells` | cells     | `0` (no cap)          | `1000` |
+/// | `gap_cells`     | cells       | `0` (no spacing)      | `32` |
 ///
 /// `radius_px` and `border_px` are **physical pixels**: the paint path passes
 /// them unchanged into the accepted `RoundedFill` geometry, which is physical
@@ -353,6 +373,13 @@ impl std::error::Error for SceneStyleError {}
 /// the width the child is measured and painted at, inside `padding_cells` — and
 /// are applied by [`Self::constrain_width`], which the measure and paint paths
 /// call. `0` means "no constraint" on that side.
+///
+/// `gap_cells` is the spacing between **adjacent siblings**, applied by the
+/// measure and paint paths of the container the style wraps: it is inserted
+/// between the end of one sibling's span and the start of the next, and it
+/// advances the walk cursor. It is inert on a child of any other shape (a leaf,
+/// or a node with a single child) — the wire parser refuses it there — and `0`
+/// means "no spacing", so an undeclared gap leaves the sibling flow untouched.
 ///
 /// Construction is plain data: an out-of-bounds value is representable so a
 /// test (or a hostile producer that bypasses a typed constructor) can prove
@@ -372,12 +399,14 @@ pub struct SceneNodeStyle {
     pub min_width_cells: u16,
     /// Maximum content width in cells; `0` declares no cap.
     pub max_width_cells: u16,
+    /// Spacing between adjacent siblings, in cells; `0` declares no spacing.
+    pub gap_cells: u16,
 }
 
 impl SceneNodeStyle {
-    /// The flat style: no padding, no radius, no border, no width constraint. A
-    /// flat style paints no operation and measures exactly like an unstyled
-    /// node.
+    /// The flat style: no padding, no radius, no border, no width constraint,
+    /// no sibling gap. A flat style paints no operation and measures exactly
+    /// like an unstyled node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
         radius_px: 0,
@@ -385,6 +414,7 @@ impl SceneNodeStyle {
         border_token: ContentToken::Foreground,
         min_width_cells: 0,
         max_width_cells: 0,
+        gap_cells: 0,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
@@ -405,6 +435,7 @@ impl SceneNodeStyle {
             border_token,
             min_width_cells: 0,
             max_width_cells: 0,
+            gap_cells: 0,
         }
     }
 
@@ -414,6 +445,14 @@ impl SceneNodeStyle {
     pub const fn with_width_range(mut self, min_width_cells: u16, max_width_cells: u16) -> Self {
         self.min_width_cells = min_width_cells;
         self.max_width_cells = max_width_cells;
+        self
+    }
+
+    /// Declares the spacing between adjacent siblings in cells (`0` = none);
+    /// bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn with_gap(mut self, gap_cells: u16) -> Self {
+        self.gap_cells = gap_cells;
         self
     }
 
@@ -482,12 +521,19 @@ impl SceneNodeStyle {
                 max: self.max_width_cells,
             });
         }
+        if self.gap_cells > SCENE_STYLE_MAX_GAP_CELLS {
+            return Err(SceneStyleError::GapOverCap {
+                found: self.gap_cells,
+                cap: SCENE_STYLE_MAX_GAP_CELLS,
+            });
+        }
         Ok(())
     }
 
     /// True when no geometry is claimed; the border token is then inert.
     ///
-    /// A declared width range is geometry: it sizes the node.
+    /// A declared width range is geometry: it sizes the node. A declared gap is
+    /// geometry too: it moves a sibling.
     #[must_use]
     pub const fn is_flat(self) -> bool {
         self.padding_cells == 0
@@ -495,6 +541,7 @@ impl SceneNodeStyle {
             && self.border_px == 0
             && self.min_width_cells == 0
             && self.max_width_cells == 0
+            && self.gap_cells == 0
     }
 }
 
@@ -2345,6 +2392,33 @@ mod tests {
         assert_eq!(fixed.constrain_width(1), 5);
         assert_eq!(fixed.constrain_width(9), 5);
         assert_eq!(fixed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_gap_is_bounded_flat_at_zero_and_never_clamped() {
+        assert!(
+            !SceneNodeStyle::FLAT.with_gap(1).is_flat(),
+            "a gap is geometry"
+        );
+        assert_eq!(SceneNodeStyle::FLAT.with_gap(0), SceneNodeStyle::FLAT);
+        assert_eq!(SceneNodeStyle::FLAT.with_gap(0).validate(), Ok(()));
+        assert_eq!(
+            SceneNodeStyle::FLAT
+                .with_gap(SCENE_STYLE_MAX_GAP_CELLS)
+                .validate(),
+            Ok(()),
+            "the cap is inclusive"
+        );
+        assert_eq!(
+            SceneNodeStyle::FLAT
+                .with_gap(SCENE_STYLE_MAX_GAP_CELLS + 1)
+                .validate(),
+            Err(SceneStyleError::GapOverCap { found: 33, cap: 32 })
+        );
+        assert_eq!(
+            SceneStyleError::GapOverCap { found: 33, cap: 32 }.to_string(),
+            "scene style gap exceeds cap: 33 > 32"
+        );
     }
 
     #[test]

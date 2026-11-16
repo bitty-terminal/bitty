@@ -7,9 +7,10 @@
 //! is the bridge half of the gap: the `style` key the candidate names, parsed
 //! as declarative data and bounded before any host call. The record's
 //! residual-`gap` row ("no `gap`, size-constraint, or cross-axis alignment
-//! field exists on either bridge") is the reason the two width bounds below
-//! are the only additions: sibling spacing and cross-axis alignment stay
-//! unimplemented rather than half-declared.
+//! field exists on either bridge") is closed field by field: the two width
+//! bounds and the sibling `gap` below are the additions, while cross-axis
+//! alignment (`align`) stays unimplemented rather than half-declared — an
+//! unlisted key is refused, so a plugin cannot believe it declared one.
 //!
 //! Both documents are **draft candidates**. Nothing here is accepted,
 //! promoted, or a compatibility promise: the accepted
@@ -30,6 +31,7 @@
 //! | Border colour  | `border_token` | token       | `content.foreground` | closed set    |
 //! | Width floor    | `min_width`    | cells       | `0` (no floor)       | 1000          |
 //! | Width cap      | `max_width`    | cells       | `0` (no cap)         | 1000          |
+//! | Sibling gap    | `gap`          | cells       | `0` (no spacing)     | 32            |
 //!
 //! Padding is measured in cells because scene layout is cell-based; radius and
 //! border width are physical pixels because the scene paint path forwards them
@@ -55,13 +57,48 @@
 //! A width-only declaration is **not** flat: it sizes the node, so it must lower
 //! to the additive wrapper to have any effect.
 //!
+//! # Sibling spacing (`gap`, bitty#2191)
+//!
+//! `gap` is the spacing *between* adjacent siblings, in display cells, capped
+//! inclusively at [`UI_STYLE_MAX_GAP_CELLS`]. It is inserted on the composed
+//! axis between the end of one sibling's span and the start of the next, and it
+//! advances the walk cursor, so a following sibling starts `gap` cells later.
+//!
+//! - **Kinds.** `Row`, `Column`, and `List` (which composes vertically) may
+//!   declare it. A leaf has no siblings to separate, so the rich reader refuses
+//!   a non-zero `gap` on any other kind rather than dropping it — the `anchor`
+//!   precedent, and the same reason `style.border` on a `Block` is not silently
+//!   ignored.
+//! - **`0` is flat.** A declared `0` and an absent `gap` render identically and
+//!   both lower to no wrapper, so an authored `gap = 0` on a leaf is accepted
+//!   and inert instead of being a special case.
+//! - **Inert where there is no pair.** A childless container and a
+//!   single-child container declare a gap that separates nothing; the
+//!   declaration is still valid and still costs the wrapper, because it is a
+//!   plugin decision a later revision can attribute.
+//! - **Never a clamp.** A container whose children plus gaps do not fit the
+//!   slot clips at the slot boundary under the existing walk: no node is
+//!   truncated to make room for a gap, nothing wraps, nothing scrolls, and the
+//!   gap is never shrunk. A fit failure is a clip, not a refusal.
+//! - **Spacing, not inset.** `gap` separates siblings; it never insets a node's
+//!   interior. That stays `padding`'s job (and the scene-layer candidate's), so
+//!   there is exactly one spelling of each.
+//! - **Not text.** `gap` is an integer cell count: it retains no string and
+//!   charges nothing to `SCN-3`/`SCN-4`.
+//!
+//! The composed axis is a property of the paint path, not of the field: in a
+//! band a `Column`/`List` composes horizontally
+//! (`flatten_band_runs`), and in an overlay it stacks vertically
+//! (`overlay_scene_rows`). A plugin must not read `gap` on a `Column` as a
+//! vertical rhythm inside a band.
+//!
 //! Elevation, shadow, opacity, blur, transitions, transforms, z-order,
 //! per-node fonts, and background images are **not** primitives here: each has
 //! a separate owner, and none is smuggled in through this table.
 //!
 //! # Boundaries
 //!
-//! - **Closed vocabulary.** Only the six keys above are accepted. An unknown
+//! - **Closed vocabulary.** Only the seven keys above are accepted. An unknown
 //!   key (CSS-like spellings included) is rejected, never ignored; so is an
 //!   oversized field or token name. A repeated key is rejected as well, but
 //!   only a marshalled table can carry one: the Lua VM collapses duplicate
@@ -116,13 +153,14 @@ use crate::ui::component_invalid;
 // disagree.
 
 /// The closed style key set, in canonical declaration order.
-pub const UI_STYLE_FIELDS: [&str; 6] = [
+pub const UI_STYLE_FIELDS: [&str; 7] = [
     "padding",
     "radius",
     "border",
     "border_token",
     "min_width",
     "max_width",
+    "gap",
 ];
 
 /// Inclusive maximum padding in cells per side.
@@ -154,6 +192,17 @@ pub const UI_STYLE_MAX_NAME_BYTES: usize = 32;
 /// the terminal cannot represent. The bound is a cap on the declaration, not a
 /// clamp: one past it is refused.
 pub const UI_STYLE_MAX_WIDTH_CELLS: u16 = 1000;
+
+/// Inclusive maximum sibling gap in cells for `gap`.
+///
+/// Reuses the accepted `decoration.content_inset` upper bound (`0..=32`), the
+/// same range `padding` uses: a gap is layout spacing between siblings, so it
+/// shares the spacing vocabulary's one number instead of introducing a second.
+/// The total a container can add is bounded by construction —
+/// `(children - 1) * 32` cells — and the painted result is clipped at the slot
+/// width, so paint work per band row stays bounded by the row. One past the cap
+/// is a typed refusal, never a clamp.
+pub const UI_STYLE_MAX_GAP_CELLS: u16 = 32;
 
 // ---------------------------------------------------------------------------
 // Closed border-token set
@@ -276,6 +325,13 @@ pub enum UiStyleError {
         /// Declared cap, in cells.
         max: u16,
     },
+    /// Sibling gap exceeds [`UI_STYLE_MAX_GAP_CELLS`].
+    GapOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
 }
 
 impl std::fmt::Display for UiStyleError {
@@ -302,6 +358,9 @@ impl std::fmt::Display for UiStyleError {
                     "scene style width range is inverted: min_width {min} > max_width {max}"
                 )
             }
+            Self::GapOverCap { found, cap } => {
+                write!(f, "scene style gap exceeds cap: {found} > {cap}")
+            }
         }
     }
 }
@@ -327,10 +386,16 @@ pub struct UiNodeStyle {
     pub min_width_cells: u16,
     /// Maximum content width in cells; `0` declares no cap.
     pub max_width_cells: u16,
+    /// Spacing between adjacent siblings, in cells; `0` declares no spacing.
+    ///
+    /// Inert on a childless container and on a single-child one (there is no
+    /// adjacent pair to separate), and refused on a leaf by the rich reader.
+    pub gap_cells: u16,
 }
 
 impl UiNodeStyle {
-    /// The flat style: no padding, no radius, no border, no width constraint.
+    /// The flat style: no padding, no radius, no border, no width constraint,
+    /// no sibling gap.
     /// Paints nothing and measures exactly like the unwrapped node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
@@ -339,6 +404,7 @@ impl UiNodeStyle {
         border_token: UiBorderToken::Foreground,
         min_width_cells: 0,
         max_width_cells: 0,
+        gap_cells: 0,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
@@ -360,6 +426,7 @@ impl UiNodeStyle {
             border_token,
             min_width_cells: 0,
             max_width_cells: 0,
+            gap_cells: 0,
         }
     }
 
@@ -369,6 +436,14 @@ impl UiNodeStyle {
     pub const fn with_width_range(mut self, min_width_cells: u16, max_width_cells: u16) -> Self {
         self.min_width_cells = min_width_cells;
         self.max_width_cells = max_width_cells;
+        self
+    }
+
+    /// Declares the spacing between adjacent siblings in cells (`0` = none);
+    /// bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn with_gap(mut self, gap_cells: u16) -> Self {
+        self.gap_cells = gap_cells;
         self
     }
 
@@ -422,6 +497,12 @@ impl UiNodeStyle {
                 max: self.max_width_cells,
             });
         }
+        if self.gap_cells > UI_STYLE_MAX_GAP_CELLS {
+            return Err(UiStyleError::GapOverCap {
+                found: self.gap_cells,
+                cap: UI_STYLE_MAX_GAP_CELLS,
+            });
+        }
         Ok(())
     }
 
@@ -429,7 +510,8 @@ impl UiNodeStyle {
     /// the declaration lowers to no wrapper node.
     ///
     /// A declared width range counts as geometry: it sizes the node, so it is
-    /// never flat.
+    /// never flat. A declared gap does too: it moves a sibling, so it needs the
+    /// wrapper to have any effect.
     #[must_use]
     pub const fn is_flat(self) -> bool {
         self.padding_cells == 0
@@ -437,6 +519,7 @@ impl UiNodeStyle {
             && self.border_px == 0
             && self.min_width_cells == 0
             && self.max_width_cells == 0
+            && self.gap_cells == 0
     }
 
     /// Whether this style's pixel stroke collides with a node's own cell
@@ -462,11 +545,16 @@ impl UiNodeStyle {
 
 /// Parses one `style` table into a bounded [`UiNodeStyle`].
 ///
-/// The table is the closed six-key set. Nothing else is accepted: an unknown
+/// The table is the closed seven-key set. Nothing else is accepted: an unknown
 /// key, a repeated key, an oversized name, a non-integer geometry value, an
 /// inverted width range, and a token outside the content set all fail with the
 /// bridge's typed `E_UI_COMPONENT_INVALID` diagnostic. The input is never
 /// echoed past [`UI_STYLE_MAX_NAME_BYTES`].
+///
+/// The parser is kind-blind: `gap` parses on any node here, and the rich reader
+/// refuses it on a kind that has no sibling axis (`bitty_lua::ui_rich`). That
+/// split keeps one field-level refusal code and one place that knows the
+/// closed kind set.
 ///
 /// A repeated key is only reachable from a hand-built marshalled table: the
 /// Lua VM collapses duplicate keys inside a table literal, so a plugin cannot
@@ -487,6 +575,7 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
     let mut border_token = UiBorderToken::Foreground;
     let mut min_width_cells = 0u16;
     let mut max_width_cells = 0u16;
+    let mut gap_cells = 0u16;
     let mut seen = [false; UI_STYLE_FIELDS.len()];
     for (key, field_value) in pairs {
         let LuaValue::String(name) = key else {
@@ -528,11 +617,15 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
             "max_width" => {
                 max_width_cells = style_count(field_value, "max_width", UI_STYLE_MAX_WIDTH_CELLS)?;
             }
+            "gap" => {
+                gap_cells = style_count(field_value, "gap", UI_STYLE_MAX_GAP_CELLS)?;
+            }
             _ => border_token = style_token(field_value)?,
         }
     }
     let style = UiNodeStyle::new(padding_cells, radius_px, border_px, border_token)
-        .with_width_range(min_width_cells, max_width_cells);
+        .with_width_range(min_width_cells, max_width_cells)
+        .with_gap(gap_cells);
     style
         .validate()
         .map_err(|error| component_invalid(error.to_string()))?;
@@ -613,6 +706,7 @@ mod tests {
         assert_eq!(UI_STYLE_MAX_BORDER_PX, 16);
         assert_eq!(UI_STYLE_MAX_NAME_BYTES, 32);
         assert_eq!(UI_STYLE_MAX_WIDTH_CELLS, 1000);
+        assert_eq!(UI_STYLE_MAX_GAP_CELLS, 32);
         assert_eq!(
             UI_STYLE_FIELDS,
             [
@@ -621,7 +715,8 @@ mod tests {
                 "border",
                 "border_token",
                 "min_width",
-                "max_width"
+                "max_width",
+                "gap"
             ]
         );
     }
@@ -715,7 +810,14 @@ mod tests {
         // applies.
         let error = style(vec![("width", LuaValue::Integer(8))]).expect_err("rejected");
         assert_eq!(error.message, "unsupported scene style field 'width'");
-        for name in ["margin", "gap", "stroke", "colour", "background_color"] {
+        for name in [
+            "margin",
+            "align",
+            "spacing",
+            "stroke",
+            "colour",
+            "background_color",
+        ] {
             assert!(
                 style(vec![(name, LuaValue::Integer(1))]).is_err(),
                 "{name} is outside the closed set"
@@ -908,6 +1010,61 @@ mod tests {
     }
 
     #[test]
+    fn the_gap_parses_is_capped_and_zero_is_flat() {
+        let parsed = style(vec![("gap", LuaValue::Integer(3))]).expect("a gap parses");
+        assert_eq!(parsed.gap_cells, 3);
+        assert!(
+            !parsed.is_flat(),
+            "a gap moves a sibling, so it can never be flat"
+        );
+
+        // The cap is inclusive and one past it is a typed refusal.
+        let at_cap = style(vec![("gap", LuaValue::Integer(32))]).expect("32 is the cap");
+        assert_eq!(at_cap.gap_cells, UI_STYLE_MAX_GAP_CELLS);
+        for over in [33, i64::from(u16::MAX) + 1, 1_000_000] {
+            let error = style(vec![("gap", LuaValue::Integer(over))]).expect_err("refused");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(error.class, "validation");
+            assert_eq!(
+                error.message,
+                format!("scene style gap exceeds cap: {over} > 32"),
+                "no clamp: the refused value is reported verbatim"
+            );
+        }
+
+        // A declared `0` is flat: it renders like an absent gap, so it lowers
+        // to no wrapper and costs no node.
+        let zero = style(vec![("gap", LuaValue::Integer(0))]).expect("0 is legal");
+        assert_eq!(zero, UiNodeStyle::FLAT);
+        assert!(zero.is_flat());
+
+        // The gap shares the integer rule: no float, no string, no table, and
+        // no negative value.
+        for value in [
+            LuaValue::Integer(-1),
+            LuaValue::Number(3.0),
+            LuaValue::Number(3.5),
+            LuaValue::Bool(true),
+            LuaValue::String("3".to_string()),
+            LuaValue::table([("cells", LuaValue::Integer(3))]),
+        ] {
+            let error = style(vec![("gap", value)]).expect_err("refused");
+            assert_eq!(
+                error.message, "invalid scene style value for field 'gap'",
+                "the gap is an integer cell count, never a coercible value"
+            );
+        }
+
+        // The gap composes with the other fields instead of replacing one.
+        let composed = style(vec![
+            ("padding", LuaValue::Integer(2)),
+            ("gap", LuaValue::Integer(4)),
+        ])
+        .expect("padding + gap parses");
+        assert_eq!((composed.padding_cells, composed.gap_cells), (2, 4));
+    }
+
+    #[test]
     fn a_width_value_follows_the_same_integer_rule_as_the_other_fields() {
         for value in [
             LuaValue::Integer(-1),
@@ -981,8 +1138,24 @@ mod tests {
             Err(UiStyleError::WidthRangeInverted { min: 7, max: 3 })
         );
         assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_gap(33)
+                .validate(),
+            Err(UiStyleError::GapOverCap { found: 33, cap: 32 })
+        );
+        assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_gap(32)
+                .validate(),
+            Ok(())
+        );
+        assert_eq!(
             UiStyleError::PaddingOverCap { found: 33, cap: 32 }.to_string(),
             "scene style padding exceeds cap: 33 > 32"
+        );
+        assert_eq!(
+            UiStyleError::GapOverCap { found: 33, cap: 32 }.to_string(),
+            "scene style gap exceeds cap: 33 > 32"
         );
     }
 }

@@ -76,7 +76,7 @@
 //! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
 //! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
-//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells` |
+//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells` and `style.gap_cells` of spacing between the wrapped container's adjacent siblings |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
 //! | `List` | one row per item, prefixed `"- "` or `"N. "` when ordered |
@@ -105,6 +105,7 @@
 //! | border token | closed content set | `content.foreground` | — | [`ContentPalette`] colour |
 //! | min width | cells | `0` (no floor) | `1000` | widens the measured content box |
 //! | max width | cells | `0` (no cap) | `1000` | narrows the painted content width |
+//! | gap | cells | `0` (no spacing) | `32` | advances the container walk between siblings; no op |
 //!
 //! The two width bounds apply to the **content box** (the width inside
 //! padding) and are what a declaration uses to size content rather than
@@ -117,9 +118,19 @@
 //! the leaf; the accepted `SCN` node/depth/text budgets are unaffected because
 //! a width changes geometry, not content.
 //!
+//! `gap` is spacing **between adjacent siblings** of the container the style
+//! wraps: it is inserted on that container's composed axis after a sibling whose
+//! span is non-empty and only when a sibling follows it, and it advances the
+//! walk cursor. A `Row` spends it horizontally, a `Column` vertically, and a
+//! child of any other shape ignores it (`gap = 0` and a leaf both take the
+//! unmodified walk). It emits no op of its own, never wraps, never scrolls, and
+//! never truncates a node to make room: when the group plus its gaps does not
+//! fit, the existing `cursor >= extent` break clips the rest of the siblings,
+//! so the spacing can move a node out of the slot but never resize one.
+//!
 //! Core owns every measurement and pixel: the producer declares data and
-//! never lays out or draws. A **flat** style (`padding = radius = border = 0`
-//! and no width bound)
+//! never lays out or draws. A **flat** style (`padding = radius = border = 0`,
+//! no width bound, no gap)
 //! measures and paints exactly like the unwrapped child and emits zero ops,
 //! so an unstyled v1 scene and a scene that declares the default style are
 //! byte-identical. A border is a stroke *inside* the node's own measured
@@ -1123,6 +1134,104 @@ impl Painter {
         self.paint_node(block.content(), 0, y, width, height, 1)
     }
 
+    /// Measures a node with the sibling gap its container declared.
+    ///
+    /// `gap_cells == 0` is exactly [`Self::measure`], which is what keeps an
+    /// undeclared gap byte-identical. A gap only changes a container's own
+    /// extent: the children are measured individually, so the spacing can never
+    /// resize a node — it only moves the ones after it.
+    fn measure_gapped(
+        &self,
+        node: &SceneNode,
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<Size, ScenePaintError> {
+        match (node, gap_cells) {
+            (SceneNode::Row(children), gap) if gap > 0 => self.measure_row(children, depth, gap),
+            (SceneNode::Column(children), gap) if gap > 0 => {
+                self.measure_column(children, depth, gap)
+            }
+            _ => self.measure(node, depth),
+        }
+    }
+
+    /// Measures a `Row`, with `gap_cells` of spacing between adjacent siblings.
+    fn measure_row(
+        &self,
+        children: &[SceneNode],
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<Size, ScenePaintError> {
+        if depth > SCENE_MAX_DEPTH {
+            return Err(ScenePaintError::DepthTooDeep {
+                depth,
+                cap: SCENE_MAX_DEPTH,
+            });
+        }
+        let cols = self.surface.cols();
+        let rows = self.surface.rows();
+        let mut width = 0u16;
+        let mut height = 0u16;
+        let mut previous_cols = 0u16;
+        for (index, child) in children.iter().enumerate() {
+            let size = self.measure(child, depth + 1)?;
+            // The gap sits between two adjacent non-empty spans: an empty
+            // sibling has no end for the spacing to start after and no start
+            // for it to reach, so it adds none. Measuring first is what makes
+            // the *current* span's emptiness part of the rule — checking only
+            // the previous span would charge a gap for a trailing empty sibling
+            // and widen the container past its content. It is added to the
+            // container's extent, not to a child's.
+            if index > 0 && gap_cells > 0 && previous_cols > 0 && size.cols > 0 {
+                width = width.saturating_add(gap_cells).min(cols);
+            }
+            width = width.saturating_add(size.cols).min(cols);
+            height = height.max(size.rows);
+            previous_cols = size.cols;
+        }
+        Ok(Size {
+            cols: width,
+            rows: height.min(rows),
+        })
+    }
+
+    /// Measures a `Column`, with `gap_cells` of spacing between adjacent
+    /// siblings.
+    fn measure_column(
+        &self,
+        children: &[SceneNode],
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<Size, ScenePaintError> {
+        if depth > SCENE_MAX_DEPTH {
+            return Err(ScenePaintError::DepthTooDeep {
+                depth,
+                cap: SCENE_MAX_DEPTH,
+            });
+        }
+        let cols = self.surface.cols();
+        let rows = self.surface.rows();
+        let mut width = 0u16;
+        let mut height = 0u16;
+        let mut previous_rows = 0u16;
+        for (index, child) in children.iter().enumerate() {
+            // The row rule on the vertical axis: measure first, then charge the
+            // gap only between two adjacent non-empty spans, so an empty
+            // sibling — leading, trailing, or in the middle — adds none.
+            let size = self.measure(child, depth + 1)?;
+            if index > 0 && gap_cells > 0 && previous_rows > 0 && size.rows > 0 {
+                height = height.saturating_add(gap_cells).min(rows);
+            }
+            width = width.max(size.cols);
+            height = height.saturating_add(size.rows).min(rows);
+            previous_rows = size.rows;
+        }
+        Ok(Size {
+            cols: width.min(cols),
+            rows: height,
+        })
+    }
+
     fn measure(&self, node: &SceneNode, depth: usize) -> Result<Size, ScenePaintError> {
         if depth > SCENE_MAX_DEPTH {
             return Err(ScenePaintError::DepthTooDeep {
@@ -1147,32 +1256,8 @@ impl Painter {
                     rows: height.min(rows),
                 }
             }
-            SceneNode::Row(children) => {
-                let mut width = 0u16;
-                let mut height = 0u16;
-                for child in children {
-                    let size = self.measure(child, depth + 1)?;
-                    width = width.saturating_add(size.cols).min(cols);
-                    height = height.max(size.rows);
-                }
-                Size {
-                    cols: width,
-                    rows: height.min(rows),
-                }
-            }
-            SceneNode::Column(children) => {
-                let mut width = 0u16;
-                let mut height = 0u16;
-                for child in children {
-                    let size = self.measure(child, depth + 1)?;
-                    width = width.max(size.cols);
-                    height = height.saturating_add(size.rows).min(rows);
-                }
-                Size {
-                    cols: width.min(cols),
-                    rows: height,
-                }
-            }
+            SceneNode::Row(children) => self.measure_row(children, depth, 0)?,
+            SceneNode::Column(children) => self.measure_column(children, depth, 0)?,
             SceneNode::Block { border, child } => {
                 let inset = border_cells(border.as_ref())?;
                 let inner = self.measure(child, depth + 1)?;
@@ -1186,7 +1271,7 @@ impl Painter {
                 // consumes layout cells; Core derives the box, the producer
                 // never does.
                 let style = paint_style(*style)?;
-                let inner = self.measure(child, depth + 1)?;
+                let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
                 let inset = style.padding_cells.saturating_mul(2);
                 // The declared width range bounds the content box, so it is
                 // applied to the measured child width and the padding is added
@@ -1227,6 +1312,142 @@ impl Painter {
         Ok(size)
     }
 
+    /// Paints a node with the sibling gap its container declared.
+    ///
+    /// `gap_cells == 0` is exactly [`Self::paint_node`], so an undeclared gap
+    /// paints the identical op list. The gap only moves the walk cursor, never a
+    /// node's allocation: a sibling that no longer fits is dropped by the walk's
+    /// existing `cursor >= extent` break, which is the clip the candidate record
+    /// specifies instead of a truncation.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_gapped(
+        &mut self,
+        node: &SceneNode,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<(), ScenePaintError> {
+        match (node, gap_cells) {
+            (SceneNode::Row(children), gap) if gap > 0 => {
+                self.paint_row(children, x, y, width, height, depth, gap)
+            }
+            (SceneNode::Column(children), gap) if gap > 0 => {
+                self.paint_column(children, x, y, width, height, depth, gap)
+            }
+            _ => self.paint_node(node, x, y, width, height, depth),
+        }
+    }
+
+    /// Paints a `Row` left to right, advancing the cursor by `gap_cells` between
+    /// adjacent non-empty siblings.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_row(
+        &mut self,
+        children: &[SceneNode],
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<(), ScenePaintError> {
+        if depth > SCENE_MAX_DEPTH {
+            return Err(ScenePaintError::DepthTooDeep {
+                depth,
+                cap: SCENE_MAX_DEPTH,
+            });
+        }
+        let mut cursor = 0u16;
+        let mut previous_cols = 0u16;
+        for (index, child) in children.iter().enumerate() {
+            if cursor >= width {
+                break;
+            }
+            let size = self.measure(child, depth + 1)?;
+            // The gap is spent *before* the current span and only between two
+            // adjacent non-empty siblings, mirroring `measure_row`: a span
+            // whose predecessor is empty takes no gap, so paint and measure
+            // agree on where every sibling starts and no trailing gap can widen
+            // the container. Spending it here can push the cursor past the
+            // clip, so the bound is re-checked before the node is painted.
+            if index > 0 && gap_cells > 0 && previous_cols > 0 && size.cols > 0 {
+                cursor = cursor.saturating_add(gap_cells);
+                if cursor >= width {
+                    break;
+                }
+            }
+            let available = width - cursor;
+            // Give the child the size it measured: a `Block` paints its
+            // border across exactly this extent, so handing it the whole
+            // remaining width would stretch the frame over its siblings
+            // and disagree with `measure`.
+            self.paint_node(
+                child,
+                x.saturating_add(cursor),
+                y,
+                size.cols.min(available),
+                size.rows.min(height),
+                depth + 1,
+            )?;
+            cursor = cursor.saturating_add(size.cols);
+            previous_cols = size.cols;
+        }
+        Ok(())
+    }
+
+    /// Paints a `Column` top to bottom, advancing the cursor by `gap_cells`
+    /// between adjacent non-empty siblings.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_column(
+        &mut self,
+        children: &[SceneNode],
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        depth: usize,
+        gap_cells: u16,
+    ) -> Result<(), ScenePaintError> {
+        if depth > SCENE_MAX_DEPTH {
+            return Err(ScenePaintError::DepthTooDeep {
+                depth,
+                cap: SCENE_MAX_DEPTH,
+            });
+        }
+        let mut cursor = 0u16;
+        let mut previous_rows = 0u16;
+        for (index, child) in children.iter().enumerate() {
+            if cursor >= height {
+                break;
+            }
+            let size = self.measure(child, depth + 1)?;
+            // The row rule on the vertical axis: spend the gap before the
+            // current non-empty span, and only when the previous laid-out span
+            // was non-empty too, so paint agrees with `measure_column`.
+            if index > 0 && gap_cells > 0 && previous_rows > 0 && size.rows > 0 {
+                cursor = cursor.saturating_add(gap_cells);
+                if cursor >= height {
+                    break;
+                }
+            }
+            let available = height - cursor;
+            self.paint_node(
+                child,
+                x,
+                y.saturating_add(cursor),
+                size.cols.min(width),
+                size.rows.min(available),
+                depth + 1,
+            )?;
+            cursor = cursor.saturating_add(size.rows);
+            previous_rows = size.rows;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_node(
         &mut self,
@@ -1249,49 +1470,9 @@ impl Painter {
         match node {
             SceneNode::Text(span) => self.paint_lines(&span.text, x, y, width, height, span.bold),
             SceneNode::Unknown(text) => self.paint_lines(text, x, y, width, height, false),
-            SceneNode::Row(children) => {
-                let mut cursor = 0u16;
-                for child in children {
-                    if cursor >= width {
-                        break;
-                    }
-                    let size = self.measure(child, depth + 1)?;
-                    let available = width - cursor;
-                    // Give the child the size it measured: a `Block` paints its
-                    // border across exactly this extent, so handing it the whole
-                    // remaining width would stretch the frame over its siblings
-                    // and disagree with `measure`.
-                    self.paint_node(
-                        child,
-                        x.saturating_add(cursor),
-                        y,
-                        size.cols.min(available),
-                        size.rows.min(height),
-                        depth + 1,
-                    )?;
-                    cursor = cursor.saturating_add(size.cols);
-                }
-                Ok(())
-            }
+            SceneNode::Row(children) => self.paint_row(children, x, y, width, height, depth, 0),
             SceneNode::Column(children) => {
-                let mut cursor = 0u16;
-                for child in children {
-                    if cursor >= height {
-                        break;
-                    }
-                    let size = self.measure(child, depth + 1)?;
-                    let available = height - cursor;
-                    self.paint_node(
-                        child,
-                        x,
-                        y.saturating_add(cursor),
-                        size.cols.min(width),
-                        size.rows.min(available),
-                        depth + 1,
-                    )?;
-                    cursor = cursor.saturating_add(size.rows);
-                }
-                Ok(())
+                self.paint_column(children, x, y, width, height, depth, 0)
             }
             SceneNode::Block { border, child } => {
                 let inset = border_cells(border.as_ref())?;
@@ -1331,7 +1512,7 @@ impl Painter {
             }
             SceneNode::Styled { style, child } => {
                 let style = paint_style(*style)?;
-                let inner = self.measure(child, depth + 1)?;
+                let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
                 let double = style.padding_cells.saturating_mul(2);
                 // The declared width range feeds the ring's own frame too: a
                 // node that asked for at least (or at most) `N` content cells
@@ -1379,14 +1560,17 @@ impl Painter {
                 if width > double && height > double && content_cols > 0 {
                     // Hand the child the allocation minus padding, exactly
                     // like an unstyled node receives its allocation: a flat
-                    // style must not narrow a root text line.
-                    self.paint_node(
+                    // style must not narrow a root text line. The gap the style
+                    // declared is spent by the container walk over this same
+                    // allocation, so a sibling is moved, never resized.
+                    self.paint_gapped(
                         child,
                         x.saturating_add(style.padding_cells),
                         y.saturating_add(style.padding_cells),
                         content_cols,
                         height - double,
                         depth + 1,
+                        style.gap_cells,
                     )?;
                 }
                 Ok(())

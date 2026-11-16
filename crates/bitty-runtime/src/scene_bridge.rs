@@ -60,6 +60,11 @@
 //! `SceneNodeStyle::constrain_width`. The plugin never computes a width and the
 //! bridge never re-orders the pair; an inverted range was refused at parse.
 //!
+//! `style.gap_cells` (the spacing between adjacent siblings) crosses unchanged
+//! for the same reason: the wire parser has already refused it on a kind with no
+//! sibling axis, and the Core measure and paint walk insert it, so the plugin
+//! declares spacing and Core owns the layout.
+//!
 //! # One stroke per node
 //!
 //! `UiRichNode::Block { border }` is the Core cell frame (cells, cap `8`) and
@@ -150,7 +155,7 @@ pub fn scene_node_of(node: &UiRichNode) -> SceneNode {
 
 /// Maps one bounded wire style onto the scene model's style data.
 ///
-/// Total and lossless: the six wire keys and the six content tokens are the
+/// Total and lossless: the seven wire keys and the six content tokens are the
 /// same vocabulary on both sides, pinned name-for-name by
 /// `tests/scene_style_vocabulary.rs`. Caps were already enforced at parse, and
 /// the scene admission boundary re-checks them, so a value that reaches the
@@ -171,6 +176,7 @@ fn scene_style_of(style: UiNodeStyle) -> SceneNodeStyle {
         },
     )
     .with_width_range(style.min_width_cells, style.max_width_cells)
+    .with_gap(style.gap_cells)
 }
 
 /// Identity and provenance for one rich mount.
@@ -366,6 +372,40 @@ mod tests {
             SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
         ));
         assert_eq!(scene.len(), 1, "last good scene retained");
+    }
+
+    #[test]
+    fn a_styled_gap_crosses_the_bridge_unchanged() {
+        // bitty#2191: the bridge carries the declaration and Core applies it,
+        // so the number a plugin declared is the number the measure path reads.
+        let node = UiRichNode::Styled {
+            style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_gap(3),
+            child: Box::new(UiRichNode::Row(vec![text("a"), text("b")])),
+        };
+        match scene_node_of(&node) {
+            SceneNode::Styled { style, child } => {
+                assert_eq!(style.gap_cells, 3);
+                assert!(
+                    matches!(*child, SceneNode::Row(_)),
+                    "the wrapper keeps the container it spaces"
+                );
+            }
+            other => panic!("expected a styled scene node, got {other:?}"),
+        }
+
+        // The scene model is the second gate: a hand-built over-cap gap is
+        // refused at admission, so the wire parser is not the only check.
+        let over_cap = UiRichNode::Styled {
+            style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_gap(33),
+            child: Box::new(UiRichNode::Row(vec![text("a"), text("b")])),
+        };
+        let mut scene = Scene::new();
+        let error = mount(&mut scene, 1, &over_cap).expect_err("refused at admission");
+        assert!(matches!(
+            error,
+            SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
+        ));
+        assert_eq!(scene.len(), 0, "the refused block was never stored");
     }
 
     #[test]

@@ -1223,22 +1223,6 @@ impl TerminalApp {
         }
     }
 
-    /// Shared new-leaf creation for `new_split:<dir>` and `new_panel`
-    /// (CTX-0838 #1441).
-    ///
-    /// Fail-closed, headless-testable: no focused pane warns and keeps the
-    /// layout; a refused appearance keeps the layout; a missing `target`
-    /// leaf in the tree warns and keeps the layout. On success the fresh
-    /// leaf gets a best-effort shell, focus follows it
-    /// (Hyprland/kitty/ghostty parity), and `label` names the action in the
-    /// loud log line.
-    ///
-    /// `target` is the leaf to split: explicit `new_split:<dir>` passes the
-    /// focused leaf, while adaptive `new_panel` passes the target selected by
-    /// `Runtime::panel_split_plan` (largest feasible for `Balanced` and
-    /// Spiral fallback; largest-area for `BisectLargest`). Spawn sizing and
-    /// cwd inheritance still read the focused pane, so the fresh shell
-    /// matches its neighbors.
     /// Materialize a zero-PTY Dwindle `View` leaf for a plugin-created panel
     /// (`ViewContent::Panel(panel_id)`) in the focused workspace (CTX-1859).
     pub(crate) fn materialize_plugin_panel_leaf(
@@ -1368,6 +1352,22 @@ impl TerminalApp {
         }
     }
 
+    /// Shared new-leaf creation for `new_split:<dir>` and `new_panel`
+    /// (CTX-0838 #1441).
+    ///
+    /// Fail-closed, headless-testable: no focused pane warns and keeps the
+    /// layout; a refused appearance keeps the layout; a missing `target`
+    /// leaf in the tree warns and keeps the layout. On success the fresh
+    /// leaf gets a best-effort shell, focus follows it
+    /// (Hyprland/kitty/ghostty parity), and `label` names the action in the
+    /// loud log line.
+    ///
+    /// `target` is the leaf to split: explicit `new_split:<dir>` passes the
+    /// focused leaf, while adaptive `new_panel` passes the target selected by
+    /// `Runtime::panel_split_plan` (largest feasible for `Balanced` and
+    /// Spiral fallback; largest-area for `BisectLargest`). Spawn sizing and
+    /// cwd inheritance still read the focused pane, so the fresh shell
+    /// matches its neighbors.
     fn apply_new_leaf(
         &mut self,
         target: ViewId,
@@ -2108,6 +2108,9 @@ impl TerminalApp {
                         if layout.remove_leaf(focused).is_some() {
                             self.runtime.set_layout_closing(layout, focused);
                         }
+                        // CTX-1859: the leaf is gone, so a plugin panel bound
+                        // to it must not outlive it as an unreachable record.
+                        self.dispose_plugin_panel_on_view(focused);
                         if let Some(survivor) = self.runtime.floated_views().last().copied() {
                             self.runtime.set_focus(survivor);
                         }
@@ -2151,6 +2154,10 @@ impl TerminalApp {
                                 "warning: keymap close_view could not retire pinned base leaf {focused:?} — ignoring"
                             );
                         }
+                        // CTX-1859: a retired plugin panel leaf must take its
+                        // panel record with it (the retire helper is a no-op
+                        // for a leaf no panel is bound to).
+                        self.dispose_plugin_panel_on_view(focused);
                         eprintln!(
                             "bitty: keymap close_view -> pins={} leafs={} focused={:?}",
                             self.runtime.pinned_count(),

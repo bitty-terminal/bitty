@@ -4882,6 +4882,27 @@ error("activation fails after mounting the terminal slot scene")
             dispatch_app_cmd(&mut app, "xuepoo.bystander", "dump", &[]).expect("bystander dump");
         assert_eq!(bystander_dumped, LuaValue::String(String::new()));
 
+        // Pointer buttons reach the owner as an observation but are NEVER
+        // consumed: the Core keeps click-to-focus/selection on the leaf. The
+        // payload carries no hit-test coordinates (`key` is unset), so the
+        // owner can only observe the press.
+        let click = bitty_platform::WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+            bitty_platform::MouseButton::Left,
+            bitty_platform::PressState::Pressed,
+        ));
+        assert!(
+            !app.route_focused_plugin_panel_input(&click),
+            "pointer buttons must not be swallowed from the Core"
+        );
+        let dumped = dispatch_app_cmd(&mut app, "xuepoo.inputowner", "dump", &[]).expect("dump");
+        assert_eq!(
+            dumped,
+            LuaValue::String("key:key:x;button:nil;".to_string())
+        );
+        let bystander_dumped =
+            dispatch_app_cmd(&mut app, "xuepoo.bystander", "dump", &[]).expect("bystander dump");
+        assert_eq!(bystander_dumped, LuaValue::String(String::new()));
+
         // Global Bitty keybinding (alt+h -> focus_left) still moves focus back to primary.
         let alt_press =
             bitty_platform::WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {

@@ -4354,8 +4354,11 @@ impl TerminalApp {
     /// leaf is a plugin-owned `ViewContent::Panel` (CTX-1859).
     ///
     /// Global Bitty keybindings (`intercept_chrome_key`) already ran before this
-    /// method; returning `true` consumes the event so it never reaches a
-    /// non-existent PTY.
+    /// method. Key, IME-commit and wheel events are consumed (returning `true`)
+    /// so they never reach a leaf that owns no PTY. Pointer button events are
+    /// delivered as observations but never consumed: the Core keeps
+    /// click-to-focus and selection, and a plugin can only observe the press
+    /// (the panel input payload carries no hit-test coordinates).
     pub(crate) fn route_focused_plugin_panel_input(&mut self, kind: &WindowEventKind) -> bool {
         let Some(focused) = self.runtime.focused_view() else {
             return false;
@@ -4377,6 +4380,7 @@ impl TerminalApp {
         }) else {
             return false;
         };
+        let mut consume = true;
         let payload = match kind {
             WindowEventKind::KeyboardInput(key) => {
                 if key.state != PressState::Pressed
@@ -4454,12 +4458,43 @@ impl TerminalApp {
                     bitty_runtime::plugin_runtime::LuaValue::String(format!("{delta:?}")),
                 ),
             ]),
+            WindowEventKind::MouseInput(mouse) => {
+                // Never consumed: click-to-focus and selection stay Core-owned.
+                consume = false;
+                bitty_runtime::plugin_runtime::LuaValue::table([
+                    (
+                        "panel_id",
+                        bitty_runtime::plugin_runtime::LuaValue::Integer(panel_id.0 as i64),
+                    ),
+                    (
+                        "kind",
+                        bitty_runtime::plugin_runtime::LuaValue::String("button".to_string()),
+                    ),
+                    (
+                        "button",
+                        bitty_runtime::plugin_runtime::LuaValue::String(format!(
+                            "{:?}",
+                            mouse.button
+                        )),
+                    ),
+                    (
+                        "state",
+                        bitty_runtime::plugin_runtime::LuaValue::String(
+                            match mouse.state {
+                                PressState::Pressed => "press",
+                                PressState::Released => "release",
+                            }
+                            .to_string(),
+                        ),
+                    ),
+                ])
+            }
             _ => return false,
         };
         if let Some(plugin_runtime) = self.plugin_runtime.as_mut() {
             let _ = plugin_runtime.deliver_event_to(&owner, "panel.input", &payload);
         }
-        true
+        consume
     }
 
     /// Arms queued `bitty.fx.pulse` intents (CTX-1139, DEC-0110).

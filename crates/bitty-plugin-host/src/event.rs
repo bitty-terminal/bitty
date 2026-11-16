@@ -1877,4 +1877,22 @@ mod tests {
         assert!(EventKind::parse("overlay.dismiss").is_err());
         assert!(EventKind::parse("overlay.dismissed.extra").is_err());
     }
+
+    #[test]
+    fn panel_input_kind_contract() {
+        // CTX-1859 (#3199): focus-driven input on a plugin-owned non-terminal
+        // panel is its own registered observation kind. It parses and
+        // round-trips, never intercepts, never coalesces (one press is one
+        // observation), and its payload stays ungated so a subscriber never
+        // needs `terminal.input` grants to read its own panel's events.
+        let kind = EventKind::parse("panel.input").expect("known kind");
+        assert_eq!(kind, EventKind::PanelInput);
+        assert_eq!(kind.as_str(), "panel.input");
+        assert_eq!(kind.class(), EventClass::Observation);
+        assert!(!kind.is_interception());
+        assert!(!kind.is_coalescable());
+        assert_eq!(kind.payload_policy(), PayloadPolicy::Ungated);
+        assert!(EventKind::parse("panel.in").is_err());
+        assert!(EventKind::parse("panel.input.extra").is_err());
+    }
 }

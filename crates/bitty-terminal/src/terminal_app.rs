@@ -4654,6 +4654,12 @@ impl TerminalApp {
     /// CTX-1039 (#1843): "last" counts every workspace, so a shell exiting
     /// in one workspace while others hold panels closes that panel
     /// (`PaneClosed`) and the emptied workspace stays selected.
+    /// CTX-1860 (bitty#3201): "last" also counts live non-terminal panel
+    /// leaves. A zero-PTY leaf is not a leftover tile — since CTX-1859 it is
+    /// a first-class panel (`ViewContent::Panel`) with its own scene, focus
+    /// and input route — so the session ends only when no pane session and
+    /// no live panel leaf remain. See
+    /// [`Runtime::has_live_non_terminal_leaf`].
     ///
     /// Issue #1828: every reaped exit also queues a bounded `process.exited`
     /// edge (`terminal_id` + `exit_code`) for the next cold-tick delivery.
@@ -4673,7 +4679,13 @@ impl TerminalApp {
                 // window is down to its last panel. A shell exiting in one
                 // workspace while others still hold panels closes that
                 // panel, never the app.
-                if self.effective_window_leaf_count() <= 1 {
+                // CTX-1860 (bitty#3201): a surviving live panel leaf holds
+                // the window open even when it is the only leaf left, so the
+                // last-leaf half of the gate is a conjunction with the panel
+                // predicate.
+                if self.effective_window_leaf_count() <= 1
+                    && !self.runtime.has_live_non_terminal_leaf()
+                {
                     crate::logging::info(|| {
                         format!(
                             "bitty: last pane shell {view:?} exited (success={} code={} signal={:?}) — closing session",
@@ -4845,11 +4857,24 @@ impl TerminalApp {
         // 2. Primary shell session.
         // CTX-1039 (#1843): the live-leaf half of this gate counts the
         // whole window, so a primary exit with panels anywhere else closes
-        // the primary pane instead of the session. Zero pane sessions
-        // anywhere keeps the long-standing quit (the primary was the last
-        // running shell; remaining tiles are session-less and inert).
+        // the primary pane instead of the session.
+        // CTX-1860 (bitty#3201): that reasoning only held while a
+        // session-less leaf was inert. Since CTX-1859 a plugin panel leaf is
+        // a first-class zero-PTY view with a scene, focus and input route,
+        // so `pane_session_count() == 0` no longer means "nothing is left":
+        // one primary shell plus one live panel would tear the window (and
+        // the panel) down on `exit`. The session therefore ends only when no
+        // live non-terminal leaf survives anywhere in the window.
+        // `effective_window_leaf_count() <= 1` keeps its old meaning for the
+        // all-terminal case (a lone primary shell closing the window) and for
+        // a window whose remaining tiles are dead terminal leaves; it no
+        // longer ends the session while a live panel leaf is on screen.
         if let Some(status) = self.runtime.primary_exit_status() {
-            if self.runtime.pane_session_count() == 0 || self.effective_window_leaf_count() <= 1 {
+            let live_panel_leaf = self.runtime.has_live_non_terminal_leaf();
+            if !live_panel_leaf
+                && (self.runtime.pane_session_count() == 0
+                    || self.effective_window_leaf_count() <= 1)
+            {
                 crate::logging::info(|| {
                     format!(
                         "bitty: primary shell exited (success={} code={} signal={:?}) — closing session",
@@ -4863,16 +4888,19 @@ impl TerminalApp {
                 return ShellExitOutcome::AppExiting;
             }
 
-            // Primary shell exited while split panes are still active:
-            // Close the primary pane leaf so remaining panes take over.
+            // Primary shell exited while split panes or a live panel leaf
+            // survive: close the primary pane leaf so the rest takes over
+            // (CTX-1860: a plugin panel leaf counts here exactly like a split
+            // pane — it is a live leaf the window must keep painting).
             if let Some(primary_view) = self.runtime.primary_view() {
                 crate::logging::info(|| {
                     format!(
-                        "bitty: primary shell {primary_view:?} exited (success={} code={} signal={:?}) with {} panes running — closing primary pane",
+                        "bitty: primary shell {primary_view:?} exited (success={} code={} signal={:?}) with {} panes and {} live panel leaves — closing primary pane",
                         status.is_success(),
                         status.code(),
                         status.signal(),
-                        self.runtime.pane_session_count()
+                        self.runtime.pane_session_count(),
+                        self.runtime.live_non_terminal_leaf_count()
                     )
                 });
                 if !self

@@ -546,6 +546,13 @@ impl PanelRuntime {
         self.registry.panel_allocation_generation(id)
     }
 
+    /// Whether `id` names a live, non-terminal panel record (CTX-1860,
+    /// bitty#3201).
+    #[must_use]
+    pub fn panel_is_live_non_terminal(&self, id: super::panel::PanelId) -> bool {
+        self.registry.panel_is_live_non_terminal(id)
+    }
+
     /// Releases the facade's own bindings for a panel the registry retired
     /// (RUN-21 lease entry, OQ-051 scene slot and its paint cache, and the
     /// live placement mirror of the registry's attachment).

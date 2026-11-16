@@ -1953,6 +1953,70 @@ impl Runtime {
             + self.inactive_workspaces_leaf_count()
     }
 
+    /// Every view id the window holds as a live leaf (CTX-1860).
+    ///
+    /// The active slot reads the live layout, floats and the scratchpad slot;
+    /// every inactive slot reads its stash, because an inactive slot's copy is
+    /// authoritative while it is parked. This is the same population
+    /// [`Self::window_leaf_count`] counts, in id form, so a per-leaf predicate
+    /// and the window total can never describe different windows. Bounded by
+    /// `MAX_WORKSPACES` slots and their leaves; space is one `Vec` of view ids.
+    #[must_use]
+    pub fn window_view_ids(&self) -> Vec<ViewId> {
+        let mut ids: Vec<ViewId> = self.layout.leaf_ids();
+        ids.extend(self.floats.ids());
+        ids.extend(self.pinned.ids());
+        ids.extend(self.scratchpad.peek().map(|view| view.id()));
+        for (index, slot) in self.workspaces.iter().enumerate() {
+            if index == self.active_workspace {
+                continue;
+            }
+            ids.extend(slot.layout.leaf_ids());
+            ids.extend(slot.floats.ids());
+        }
+        ids
+    }
+
+    /// Leaves in the window whose content is a live non-terminal panel
+    /// (CTX-1860, bitty#3201).
+    ///
+    /// A leaf counts here when the panel host's placement mirror binds it to a
+    /// panel record that is not `Disposed` and is not terminal-typed — the
+    /// `ViewContent::Panel` leaves CTX-1859 materialises for
+    /// `bitty.panel.create`. Those leaves own no PTY, so
+    /// [`Self::pane_session_count`] and the primary owner never see them, yet
+    /// they are not inert: each paints its own declarative scene, holds focus,
+    /// and routes input to its owning plugin. A shell exiting is therefore no
+    /// longer evidence that the window has nothing left to keep alive.
+    ///
+    /// Read-only; `0` when no panel host is installed (every terminal-only and
+    /// headless run), and bounded by [`Self::window_view_ids`].
+    #[must_use]
+    pub fn live_non_terminal_leaf_count(&self) -> usize {
+        let Some(host) = self.scene_host() else {
+            return 0;
+        };
+        let host = host.borrow();
+        self.window_view_ids()
+            .into_iter()
+            .filter(|view| {
+                host.placement_panel_of(*view)
+                    .is_some_and(|panel| host.panel_is_live_non_terminal(panel))
+            })
+            .count()
+    }
+
+    /// Whether any leaf in the window still holds live non-terminal panel
+    /// content (CTX-1860, bitty#3201).
+    ///
+    /// The predicate the shell-exit gate and the last-leaf bookkeeping ask:
+    /// see [`Self::live_non_terminal_leaf_count`] for what a live panel leaf
+    /// is and why a zero-PTY leaf is not inert.
+    #[must_use]
+    pub fn has_live_non_terminal_leaf(&self) -> bool {
+        self.live_non_terminal_leaf_count() > 0
+    }
+
     /// Slot index that owns `view` as a live panel, active slot first.
     ///
     /// Issue #2525: the shell-exit reap path must know which workspace a
@@ -5401,6 +5465,30 @@ mod tests {
         assert_eq!(rt.window_leaf_count(), 2);
         rt.workspace_new().expect("ws2");
         assert_eq!(rt.window_leaf_count(), 3);
+    }
+
+    #[test]
+    fn live_non_terminal_leaf_count_without_panel_host_is_zero_ctx_1860() {
+        // CTX-1860 (bitty#3201): the shell-exit gate asks this predicate on
+        // every reap pass, so a runtime with no panel host installed (every
+        // terminal-only and headless run) must answer zero instead of
+        // holding a window open, and the id population it reads must be the
+        // whole window the leaf total counts.
+        let mut rt = fresh();
+        assert!(rt.scene_host().is_none());
+        assert_eq!(rt.live_non_terminal_leaf_count(), 0);
+        assert!(!rt.has_live_non_terminal_leaf());
+        assert_eq!(rt.window_view_ids(), rt.layout().leaf_ids());
+
+        let first = rt.focused_view().expect("focus");
+        assert_eq!(rt.window_view_ids(), vec![first]);
+        rt.workspace_new().expect("ws2");
+        assert_eq!(
+            rt.window_view_ids().len(),
+            rt.window_leaf_count(),
+            "the id population must cover exactly the leaves the window total counts"
+        );
+        assert_eq!(rt.live_non_terminal_leaf_count(), 0);
     }
 
     #[test]

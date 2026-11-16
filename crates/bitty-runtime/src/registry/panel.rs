@@ -3380,6 +3380,25 @@ impl PanelRegistry {
         Some(record.generation)
     }
 
+    /// Whether `panel_id` names a live, non-terminal panel record (CTX-1860,
+    /// bitty#3201).
+    ///
+    /// "Live" is the registry's own lifecycle fact: a record exists and its
+    /// state is not `Disposed`. Terminal-typed records are excluded because
+    /// their leaf is a PTY leaf whose liveness the runtime already answers
+    /// through its pane sessions and primary ownership — this predicate is
+    /// about the zero-PTY panels that no shell exit can speak for.
+    ///
+    /// Read-only, O(1), and independent of any controller binding: a panel
+    /// whose controller generation was released is still live content while
+    /// the leaf it mounted on keeps painting it.
+    #[must_use]
+    pub fn panel_is_live_non_terminal(&self, panel_id: PanelId) -> bool {
+        self.panels.get(&panel_id.0).is_some_and(|record| {
+            record.state != UiPanelState::Disposed && record.panel_type != PanelType::Terminal
+        })
+    }
+
     /// The panels whose binding names `owner` at `generation` (OQ-084 A.2/A.3,
     /// bitty#2476 residual 2).
     ///

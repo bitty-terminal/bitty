@@ -537,3 +537,39 @@ arm()
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+#[test]
+fn throttled_recovery_respects_backoff_between_attempts() {
+    let mut world = World::activate("backoff", Duration::from_millis(CEILING_CALL_MS));
+    world
+        .runtime
+        .dispatch_command(&world.id, "huge", &[])
+        .expect_err("wall timeout");
+
+    let t0 = std::time::Instant::now();
+    // Remove init.lua so recovery attempt 1 fails and arms the 2s backoff.
+    std::fs::remove_file(world.init_path()).expect("remove init");
+    assert_eq!(world.runtime.recover_wall_failed_plugins_throttled(t0), 0);
+
+    // Restore init.lua: a tick 100ms later must be skipped by backoff, preserving attempts.
+    world.rewrite_init(&init_src());
+    assert_eq!(
+        world
+            .runtime
+            .recover_wall_failed_plugins_throttled(t0 + Duration::from_millis(100)),
+        0,
+        "throttled recovery must wait for backoff before consuming another attempt"
+    );
+
+    // Once the 2s backoff expires, recovery runs and succeeds.
+    assert_eq!(
+        world
+            .runtime
+            .recover_wall_failed_plugins_throttled(t0 + Duration::from_secs(3)),
+        1
+    );
+    assert_eq!(
+        world.runtime.state(&world.id),
+        Some(&LifecycleState::Active)
+    );
+}

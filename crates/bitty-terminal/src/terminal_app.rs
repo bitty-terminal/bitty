@@ -1552,6 +1552,9 @@ impl TerminalApp {
     /// waiting for the confirmation bound (bitty#3032). A settled surface owes
     /// nothing and stays frame-on-demand.
     pub(crate) fn reveal_surface_from_input(&mut self) {
+        if let Some(win) = self.window.handle.as_ref() {
+            win.note_input_reveal();
+        }
         // A settled, visible surface owes nothing: keep frame-on-demand.
         if self.runtime.is_surface_visible() && !self.runtime.surface_reveal_unproven() {
             return;
@@ -2813,7 +2816,7 @@ impl TerminalApp {
             ]);
             let _delivered = plugin_runtime.deliver_event("config.reloaded", &payload);
         }
-        let _ = plugin_runtime.recover_wall_failed_plugins();
+        let _ = plugin_runtime.recover_wall_failed_plugins_throttled(std::time::Instant::now());
     }
 
     /// Queues one `process.exited` edge (issue #1828).
@@ -3048,9 +3051,12 @@ impl TerminalApp {
     /// `None` when no timers are armed, so unarmed idle stays on
     /// `set_wait` (zero-submit preserved).
     pub(crate) fn plugin_timer_deadline(&self) -> Option<std::time::Instant> {
-        self.plugin_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.timer_deadline())
+        self.plugin_runtime.as_ref().and_then(|runtime| {
+            [runtime.timer_deadline(), runtime.wall_recovery_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+        })
     }
 
     /// Bounded cold-tick wake while a command is parked at the RC-1 wall
@@ -3090,7 +3096,7 @@ impl TerminalApp {
             return fired;
         }
         let fired = plugin_runtime.pump_due_timers();
-        let _ = plugin_runtime.recover_wall_failed_plugins();
+        let _ = plugin_runtime.recover_wall_failed_plugins_throttled(std::time::Instant::now());
         fired
     }
 

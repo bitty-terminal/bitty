@@ -11668,6 +11668,53 @@ claims = []
         );
     }
 
+    #[test]
+    fn ctrl_alt_h_j_match_move_split_keymaps_after_platform_normalization() {
+        // bitty#3194 fixed the Wayland Ctrl+Alt+h/j collapse at the platform
+        // boundary: `bitty_platform::event::normalize_control_collapsed_key`
+        // rewrites the C0 control character back to the base letter before the
+        // owned `KeyEvent` is built. This guards the terminal half of that
+        // contract — the normalized letter must still reach `move_split`.
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mods = AppModifiers {
+            control: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let key_h = KeyEvent {
+            logical_key: LogicalKey::Character("h".to_string()),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        let key_j = KeyEvent {
+            logical_key: LogicalKey::Character("j".to_string()),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        let ref_h = key_ref_from_event(&key_h, &mods).expect("ctrl+alt+h keyref");
+        let ref_j = key_ref_from_event(&key_j, &mods).expect("ctrl+alt+j keyref");
+        assert_eq!(
+            match_chrome_keymap(&maps, ref_h),
+            Some(bitty_config::ChromeAction::MoveSplit(
+                bitty_config::SplitDir::Left
+            ))
+        );
+        assert_eq!(
+            match_chrome_keymap(&maps, ref_j),
+            Some(bitty_config::ChromeAction::MoveSplit(
+                bitty_config::SplitDir::Down
+            ))
+        );
+    }
+
     // ── CTX-1836 (bitty#3169): the tab keymap actions ───────────────────
 
     /// Headless app with two tiled panels (`p:1`, `p:2`), focus on `p:1`.

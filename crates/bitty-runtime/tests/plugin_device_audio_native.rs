@@ -493,6 +493,225 @@ fn bar_activation_never_blocks_on_a_slow_audio_monitor() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn sensor_and_device_live_constructors_enable_background_sampling() {
+    assert!(
+        SensorHost::live().is_sampled(),
+        "live sensor host must sample /proc and /sys off the executor thread"
+    );
+    assert!(
+        DeviceHost::live().is_sampled(),
+        "live device host must sample sysfs and procfs off the executor thread"
+    );
+}
+
+#[test]
+fn bar_activation_never_blocks_on_slow_sensor_or_device_readers() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let root = temp_dir("slow-sensor-device");
+    let third = root.join("third");
+    let manifest = r#"[services.required]
+"system.cpu" = "^1.0"
+"system.memory" = "^1.0"
+"system.battery" = "^1.0"
+"network.state" = "^1.0"
+"backlight.state" = "^1.0"
+"#;
+    let grant = r#"platform.cpu-read = true
+platform.memory-read = true
+platform.battery-read = true
+platform.network.read = true
+platform.backlight.read = true"#;
+    let init = r#"
+bitty.commands.register({
+  id = "probe",
+  title = "Probe",
+  run = function() return "probed" end,
+})
+for _, iface in ipairs({"system.cpu", "system.memory", "system.battery", "network.state", "backlight.state"}) do
+  local svc = bitty.services.get(iface)
+  local ok, snap = pcall(svc.get, {})
+  bitty.store.set(iface .. "_nil", (not ok) or (snap == nil))
+end
+local acc = 0
+for i = 1, 20000 do
+  acc = (acc + i) % 1000003
+end
+bitty.store.set("post_loop", acc >= 0)
+return {}
+"#;
+    write_plugin(
+        &third,
+        "xuepoo.slowhost",
+        manifest,
+        grant,
+        &["xuepoo.slowhost:probe"],
+        init,
+    );
+
+    let sysfs_root = root.join("power");
+    let bat = sysfs_root.join("BAT0");
+    std::fs::create_dir_all(&bat).expect("bat dir");
+    std::fs::write(bat.join("type"), "Battery\n").expect("type");
+    std::fs::write(bat.join("capacity"), "72\n").expect("capacity");
+    std::fs::write(bat.join("status"), "Discharging\n").expect("status");
+
+    let class_net = root.join("class_net");
+    let wlan = class_net.join("wlan0");
+    std::fs::create_dir_all(&wlan).expect("wlan dir");
+    std::fs::write(wlan.join("operstate"), "up\n").expect("operstate");
+    std::fs::write(wlan.join("wireless"), "").expect("wireless");
+    let proc_route = root.join("route");
+    std::fs::write(
+        &proc_route,
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\nwlan0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n",
+    )
+    .expect("route");
+    let proc_dev = root.join("dev");
+    std::fs::write(
+        &proc_dev,
+        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n wlan0: 1000000    100    0    0    0     0          0         0  500000      50    0    0    0     0       0          0\n",
+    )
+    .expect("dev");
+    let bl_root = root.join("backlight");
+    let dev = bl_root.join("intel_backlight");
+    std::fs::create_dir_all(&dev).expect("backlight dev");
+    std::fs::write(dev.join("brightness"), "300\n").expect("brightness");
+    std::fs::write(dev.join("max_brightness"), "1200\n").expect("max");
+
+    let activation_thread = std::thread::current().id();
+    let ran_on_activation_thread = Arc::new(AtomicBool::new(false));
+    let worker_calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+
+    fn wait_for_release(
+        activation_thread: std::thread::ThreadId,
+        flag: &Arc<AtomicBool>,
+        calls: &Arc<AtomicUsize>,
+        gate: &Arc<(Mutex<bool>, Condvar)>,
+    ) {
+        if std::thread::current().id() == activation_thread {
+            flag.store(true, Ordering::SeqCst);
+            return;
+        }
+        calls.fetch_add(1, Ordering::SeqCst);
+        let (lock, cvar) = &**gate;
+        let mut released = lock.lock().expect("gate lock");
+        while !*released {
+            let (guard, timeout) = cvar
+                .wait_timeout(released, std::time::Duration::from_secs(5))
+                .expect("wait");
+            released = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+    }
+
+    let mem_source: Arc<dyn Fn() -> Option<String> + Send + Sync> = {
+        let flag = Arc::clone(&ran_on_activation_thread);
+        let calls = Arc::clone(&worker_calls);
+        let gate = Arc::clone(&gate);
+        Arc::new(move || {
+            wait_for_release(activation_thread, &flag, &calls, &gate);
+            Some("MemTotal:        2097152 kB\nMemAvailable:    1048576 kB\nSwapTotal:       0 kB\nSwapFree:        0 kB\n".to_string())
+        })
+    };
+    let cpu_source: Arc<dyn Fn() -> Option<String> + Send + Sync> = Arc::new(|| {
+        Some("cpu  100 0 100 800 0 0 0 0 0 0\ncpu0  50 0 50 400 0 0 0 0 0 0\n".to_string())
+    });
+    let device_hook: Arc<dyn Fn() + Send + Sync> = {
+        let flag = Arc::clone(&ran_on_activation_thread);
+        let calls = Arc::clone(&worker_calls);
+        let gate = Arc::clone(&gate);
+        Arc::new(move || {
+            wait_for_release(activation_thread, &flag, &calls, &gate);
+        })
+    };
+
+    let mut rt = runtime(vec![third]);
+    *rt.sensor_host().borrow_mut() =
+        SensorHost::sampled_for_test(cpu_source, mem_source, sysfs_root, 0);
+    *rt.device_host().borrow_mut() = DeviceHost::sampled_for_test(
+        class_net,
+        proc_route,
+        proc_dev,
+        None,
+        bl_root,
+        Some(device_hook),
+        0,
+    );
+
+    let id = PluginId::new("xuepoo.slowhost").expect("id");
+    rt.discover();
+    // Production RC-1 (50 ms): activation returns immediately instead of
+    // waiting on the blocked /proc / sysfs readers.
+    let report = rt
+        .activate(&id)
+        .expect("activation must not block on slow sensor or device reads");
+    assert_eq!(report.state, LifecycleState::Active);
+    assert!(!ran_on_activation_thread.load(Ordering::SeqCst));
+    assert_eq!(store_bool(&rt, &id, "post_loop"), Some(true));
+    for iface in [
+        "system.cpu",
+        "system.memory",
+        "system.battery",
+        "network.state",
+        "backlight.state",
+    ] {
+        assert_eq!(
+            store_bool(&rt, &id, &format!("{iface}_nil")),
+            Some(true),
+            "initial {iface} poll hides instead of blocking activation"
+        );
+    }
+
+    // Release the background worker readers and verify samples land cleanly.
+    {
+        let (lock, cvar) = &*gate;
+        *lock.lock().expect("release lock") = true;
+        cvar.notify_all();
+    }
+    let mut mem_ready = false;
+    let mut bl_ready = false;
+    for _ in 0..200 {
+        if !mem_ready {
+            if let Ok(val) = rt
+                .sensor_host()
+                .borrow_mut()
+                .call("system.memory", "get", true)
+            {
+                if val.get("pct").is_some() {
+                    mem_ready = true;
+                }
+            }
+        }
+        if !bl_ready {
+            if let Ok(val) = rt.device_host().borrow_mut().call(
+                "backlight.state",
+                "get",
+                &LuaValue::Nil,
+                &["platform.backlight.read".to_string()],
+            ) {
+                if val.get("pct").is_some() {
+                    bl_ready = true;
+                }
+            }
+        }
+        if mem_ready && bl_ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(worker_calls.load(Ordering::SeqCst) >= 2);
+    assert!(mem_ready, "background memory sample should land");
+    assert!(bl_ready, "background backlight sample should land");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 const POLL_LOOP_INIT: &str = r#"
 bitty.commands.register({
   id = "probe",

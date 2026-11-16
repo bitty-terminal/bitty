@@ -1982,18 +1982,91 @@ pub(super) struct ColumnBandRect {
 }
 
 impl Runtime {
-    /// Visible (non-empty-text) bands on `edge`, in stacking order.
+    fn row_band_selection(&self) -> (Vec<&BandContent>, Vec<&BandContent>) {
+        let visible_for = |edge| {
+            self.chrome_bands
+                .edge(edge)
+                .iter()
+                .filter(|band| band_is_visible(&band.root))
+                .collect::<Vec<_>>()
+        };
+        let top = visible_for(BandEdge::Top);
+        let bottom = visible_for(BandEdge::Bottom);
+        let total = top.len().saturating_add(bottom.len());
+        if total == 0 {
+            return (top, bottom);
+        }
+        let window_rows = usize::from(self.window_cells().height);
+        let floor = usize::from(self.chrome_min_rows());
+        let Some(spare) = window_rows.checked_sub(floor) else {
+            return (Vec::new(), Vec::new());
+        };
+        if spare == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        if total <= spare {
+            return (top, bottom);
+        }
+        // Assign per-plugin round-robin ranks so multi-band plugins (such as
+        // a multi-row bottom panel) shed duplicate rows before evicting primary
+        // bands like `bar`, while keeping deterministic stacking order among
+        // retained bands. When even one primary band per distinct plugin
+        // cannot fit inside `spare`, degrade all horizontal bands cleanly.
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut candidates: Vec<(usize, BandEdge, usize)> = Vec::with_capacity(total);
+        for (edge, bands) in [(BandEdge::Top, &top), (BandEdge::Bottom, &bottom)] {
+            for (index, band) in bands.iter().enumerate() {
+                let rank = counts
+                    .entry(band.plugin_id.as_str())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(0);
+                candidates.push((*rank, edge, index));
+            }
+        }
+        if counts.len() > spare {
+            return (Vec::new(), Vec::new());
+        }
+        candidates.sort_by_key(|&(rank, _, _)| rank);
+        let mut keep_top = vec![false; top.len()];
+        let mut keep_bottom = vec![false; bottom.len()];
+        for &(_, edge, index) in candidates.iter().take(spare) {
+            match edge {
+                BandEdge::Top => keep_top[index] = true,
+                BandEdge::Bottom => keep_bottom[index] = true,
+                BandEdge::Left | BandEdge::Right => {}
+            }
+        }
+        let kept_top = top
+            .into_iter()
+            .zip(keep_top)
+            .filter_map(|(band, keep)| keep.then_some(band))
+            .collect();
+        let kept_bottom = bottom
+            .into_iter()
+            .zip(keep_bottom)
+            .filter_map(|(band, keep)| keep.then_some(band))
+            .collect();
+        (kept_top, kept_bottom)
+    }
+
+    /// Visible (non-empty-text) bands on `edge` within the live budget, in
+    /// stacking order.
     ///
     /// Hidden bands take no stacking row (CTX-0925 item 3): every consumer
     /// — row assignment, paint, hit-test, and the exclusive-zone budget —
     /// reads this list, so a hidden band can never own geometry.
     #[must_use]
     pub fn visible_edge_bands(&self, edge: BandEdge) -> Vec<&BandContent> {
-        self.chrome_bands
-            .edge(edge)
-            .iter()
-            .filter(|band| band_is_visible(&band.root))
-            .collect()
+        match edge {
+            BandEdge::Top => self.row_band_selection().0,
+            BandEdge::Bottom => self.row_band_selection().1,
+            BandEdge::Left | BandEdge::Right => self
+                .chrome_bands
+                .edge(edge)
+                .iter()
+                .filter(|band| band_is_visible(&band.root))
+                .collect(),
+        }
     }
 
     /// Visible band rows reserved on horizontal `edge` (CTX-0946 C3).
@@ -2035,37 +2108,17 @@ impl Runtime {
 
     /// Degraded-visible band budget per horizontal edge (CTX-0946 C3).
     ///
-    /// Visible band counts, or `(0, 0)` when the window is too small for
-    /// every visible band plus the content floor. Pure and total; every
-    /// geometry consumer reads this, so paint, hit-test, and the container
-    /// can never disagree.
-    ///
-    /// CTX-0979: Core draws no workspace display, so there is no Core bar
-    /// reservation; the budget degrades against the window rows directly.
+    /// Derived from [`Self::row_band_selection`] so paint, hit-test, and the
+    /// content container never disagree. Multi-band plugins shed excess rows
+    /// first when `want > spare`; `(0, 0)` when there are zero spare rows or
+    /// even one row per distinct plugin cannot fit above [`Self::chrome_min_rows`].
     #[must_use]
     pub fn plugin_band_budget(&self) -> (u16, u16) {
-        let count = |edge| {
-            u16::try_from(
-                self.chrome_bands
-                    .edge(edge)
-                    .iter()
-                    .filter(|band| band_is_visible(&band.root))
-                    .count(),
-            )
-            .unwrap_or(u16::MAX)
-        };
-        let (top, bottom) = (count(BandEdge::Top), count(BandEdge::Bottom));
-        if top == 0 && bottom == 0 {
-            return (0, 0);
-        }
-        let window = self.window_cells();
-        let window_rows = u32::from(window.height);
-        let want = u32::from(top).saturating_add(u32::from(bottom));
-        let floor = u32::from(self.chrome_min_rows());
-        if want.saturating_add(floor) > window_rows {
-            return (0, 0);
-        }
-        (top, bottom)
+        let (top, bottom) = self.row_band_selection();
+        (
+            u16::try_from(top.len()).unwrap_or(u16::MAX),
+            u16::try_from(bottom.len()).unwrap_or(u16::MAX),
+        )
     }
 
     /// Width budget of the visible vertical bands per edge, in window columns
@@ -2765,6 +2818,9 @@ impl Runtime {
     /// `ChromeBands::from_mounts` keep their existing public shapes.
     #[doc(hidden)]
     pub fn set_chrome_bands_with_mounts(&mut self, bands: ChromeBands, mounts: Vec<BandMount>) {
+        if self.chrome_bands != bands {
+            self.pending_full_redraw = true;
+        }
         self.chrome_bands = bands;
         self.rebuild_pending_band_origins(mounts);
         // Issue #2411: same rule as `set_chrome_bands` — a replaced tree ends
@@ -4623,5 +4679,52 @@ mod tests {
             container_rows_only.width - 3,
             "only the column band's width leaves the container"
         );
+    }
+
+    #[test]
+    fn multi_band_panel_sheds_duplicate_rows_before_evicting_single_band_bar() {
+        let mut rt = Runtime::with_defaults().expect("runtime must build");
+        let floor = rt.chrome_min_rows();
+        let spare: u16 = 5;
+        let window_rows = floor.saturating_add(spare);
+        rt.set_window_cells(bitty_ui::Rect::new(0, 0, 80, window_rows));
+
+        let mut mounts = Vec::new();
+        for row in 0..8 {
+            mounts.push((
+                "bitty-featured.devtools".to_string(),
+                UiSlot::Bottom,
+                UiNode::row(vec![UiNode::text(format!("devtools-row-{row}"))]),
+                1,
+            ));
+        }
+        mounts.push((
+            "bitty-terminal.bar".to_string(),
+            UiSlot::Bottom,
+            UiNode::row(vec![UiNode::text("bar-clock")]),
+            1,
+        ));
+        let (bands, unplaced) = ChromeBands::from_mounts(mounts);
+        assert_eq!(unplaced, 0);
+        rt.set_chrome_bands(bands);
+        let _ = rt.tick();
+
+        assert_eq!(
+            rt.plugin_band_budget(),
+            (0, spare),
+            "short window retains `spare` rows instead of dropping all horizontal bands"
+        );
+        let kept = rt.visible_edge_bands(BandEdge::Bottom);
+        assert_eq!(kept.len(), usize::from(spare));
+        assert!(
+            kept.iter()
+                .any(|band| band.plugin_id == "bitty-terminal.bar"),
+            "single-band bar must survive duplicate-row shedding from multi-band panel: {kept:?}"
+        );
+        assert!(
+            rt.band_row_container().height >= floor,
+            "content row floor stays intact"
+        );
+        assert!(!rt.band_geometry_violated());
     }
 }

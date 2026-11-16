@@ -20,14 +20,19 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue};
 
+use super::super::sampled::{SampledCache, SampledValue};
 use super::battery::{BatteryProvider, FsPowerSupply, NoUpower};
 use super::cpu::CpuProvider;
 use super::memory::MemoryProvider;
-use super::{BATTERY_BACKING_HEAD, CPU_BACKING_HEAD, MEMORY_BACKING_HEAD, SENSOR_PROVIDER};
+use super::{
+    BATTERY_BACKING_HEAD, CPU_BACKING_HEAD, FAST_SENSOR_CEILING_MS, MEMORY_BACKING_HEAD,
+    SENSOR_PROVIDER, SLOW_SENSOR_CEILING_MS, STALE_HIDE_WINDOWS,
+};
 
 /// Generation pinned into native sensor records.
 ///
@@ -37,26 +42,77 @@ use super::{BATTERY_BACKING_HEAD, CPU_BACKING_HEAD, MEMORY_BACKING_HEAD, SENSOR_
 /// a plugin id), so the generation never advances.
 pub const SENSOR_GENERATION: u32 = 0;
 
+#[derive(Clone, Copy)]
+enum SensorKind {
+    Cpu = 0,
+    Memory = 1,
+    Battery = 2,
+}
+
+impl From<SensorKind> for usize {
+    fn from(kind: SensorKind) -> Self {
+        kind as usize
+    }
+}
+
+fn dispatch_sensor_reader(
+    cpu: &mut CpuProvider,
+    memory: &mut MemoryProvider,
+    battery: &mut BatteryProvider<NoUpower, FsPowerSupply>,
+    kind: SensorKind,
+    now_ms: u64,
+) -> Option<SampledValue> {
+    match kind {
+        SensorKind::Cpu => cpu.get(now_ms, true).map(|snapshot| SampledValue {
+            value: snapshot.to_lua_value(),
+            base_stale_age_ms: snapshot.stale_age_ms,
+        }),
+        SensorKind::Memory => memory.get(now_ms, true).map(|snapshot| SampledValue {
+            value: snapshot.to_lua_value(),
+            base_stale_age_ms: snapshot.stale_age_ms,
+        }),
+        SensorKind::Battery => battery.get(now_ms, true).map(|snapshot| SampledValue {
+            value: snapshot.to_lua_value(),
+            base_stale_age_ms: snapshot.stale_age_ms,
+        }),
+    }
+}
+
 /// Native sensor host: three live providers plus the monotonic clock.
 ///
 /// Shared per runtime (`Rc<RefCell<...>>`): every generation dispatches
 /// through the same providers, so ceilings are global, not per-consumer.
+///
+/// [`Self::live`] runs `/proc` and `/sys` reads on a persistent background
+/// sampler thread (`bitty-sensor-sample`) so kernel/driver I/O never stalls
+/// the 50 ms RC-1 executor slice; [`Self::for_test`] stays synchronous.
 pub struct SensorHost {
     cpu: CpuProvider,
     memory: MemoryProvider,
     battery: BatteryProvider<NoUpower, FsPowerSupply>,
+    sampled: Option<SampledCache<SensorKind, 3>>,
     start: Instant,
     manual_now_ms: Option<u64>,
 }
 
 impl SensorHost {
-    /// Live host: real `/proc` sources plus the live sysfs fallback.
+    /// Live host: real `/proc` sources plus the live sysfs fallback, sampled off
+    /// the Lua executor thread.
     #[must_use]
     pub fn live() -> Self {
+        let sampled = SampledCache::new("bitty-sensor-sample", || {
+            let mut cpu = CpuProvider::procfs();
+            let mut memory = MemoryProvider::procfs();
+            let mut battery = BatteryProvider::new(NoUpower, FsPowerSupply::system());
+            Box::new(move |kind, now_ms| {
+                dispatch_sensor_reader(&mut cpu, &mut memory, &mut battery, kind, now_ms)
+            })
+        });
         Self {
             cpu: CpuProvider::procfs(),
             memory: MemoryProvider::procfs(),
             battery: BatteryProvider::new(NoUpower, FsPowerSupply::system()),
+            sampled: Some(sampled),
             start: Instant::now(),
             manual_now_ms: None,
         }
@@ -79,9 +135,52 @@ impl SensorHost {
             cpu: CpuProvider::with_source(cpu_source),
             memory: MemoryProvider::with_source(mem_source),
             battery: BatteryProvider::new(NoUpower, FsPowerSupply::with_root(sysfs_root)),
+            sampled: None,
             start: Instant::now(),
             manual_now_ms: Some(initial_now_ms),
         }
+    }
+
+    /// Test host whose reads execute on the background sampler thread (tests).
+    ///
+    /// Mirrors the reader into both the worker and the inline path so any
+    /// regression moving live reads back onto the executor thread pays the
+    /// slow closure inline.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn sampled_for_test(
+        cpu_source: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        mem_source: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        sysfs_root: PathBuf,
+        initial_now_ms: u64,
+    ) -> Self {
+        let worker_cpu = Arc::clone(&cpu_source);
+        let worker_mem = Arc::clone(&mem_source);
+        let worker_sysfs = sysfs_root.clone();
+        let sampled = SampledCache::new("bitty-sensor-sample", move || {
+            let mut cpu = CpuProvider::with_source(Rc::new(move || worker_cpu()));
+            let mut memory = MemoryProvider::with_source(Rc::new(move || worker_mem()));
+            let mut battery =
+                BatteryProvider::new(NoUpower, FsPowerSupply::with_root(worker_sysfs));
+            Box::new(move |kind, now_ms| {
+                dispatch_sensor_reader(&mut cpu, &mut memory, &mut battery, kind, now_ms)
+            })
+        });
+        Self {
+            cpu: CpuProvider::with_source(Rc::new(move || cpu_source())),
+            memory: MemoryProvider::with_source(Rc::new(move || mem_source())),
+            battery: BatteryProvider::new(NoUpower, FsPowerSupply::with_root(sysfs_root)),
+            sampled: Some(sampled),
+            start: Instant::now(),
+            manual_now_ms: Some(initial_now_ms),
+        }
+    }
+
+    /// Whether sensor reads are sampled off the executor thread (tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_sampled(&self) -> bool {
+        self.sampled.is_some()
     }
 
     /// Current host instant in milliseconds.
@@ -152,6 +251,22 @@ impl SensorHost {
         let now = self.now_ms();
         if !granted {
             return Ok(LuaValue::Nil);
+        }
+        if let Some(sampled) = self.sampled.as_ref() {
+            let (kind, ceiling_ms) = match iface {
+                super::SYSTEM_CPU_IFACE => (SensorKind::Cpu, FAST_SENSOR_CEILING_MS),
+                super::SYSTEM_MEMORY_IFACE => (SensorKind::Memory, FAST_SENSOR_CEILING_MS),
+                super::SYSTEM_BATTERY_IFACE => (SensorKind::Battery, SLOW_SENSOR_CEILING_MS),
+                _ => {
+                    return Err(BridgeError::new(
+                        "runtime",
+                        "E_SERVICE_GONE",
+                        format!("service '{iface}' is unavailable"),
+                    ));
+                }
+            };
+            let hide_horizon_ms = ceiling_ms.saturating_mul(STALE_HIDE_WINDOWS);
+            return Ok(sampled.get_or_request(kind, now, ceiling_ms, hide_horizon_ms));
         }
         match iface {
             super::SYSTEM_CPU_IFACE => Ok(self

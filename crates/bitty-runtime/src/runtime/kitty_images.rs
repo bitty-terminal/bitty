@@ -407,8 +407,7 @@ impl Runtime {
         ) {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
-            self.cold_queue
-                .push(crate::ColdEvent::Damage { generation });
+            self.cold_queue.push_damage(generation);
         }
         let id = self
             .kitty_images
@@ -457,8 +456,7 @@ impl Runtime {
         ) {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
-            self.cold_queue
-                .push(crate::ColdEvent::Damage { generation });
+            self.cold_queue.push_damage(generation);
         }
         let id = self
             .kitty_images
@@ -625,8 +623,7 @@ impl Runtime {
             {
                 self.pending_full_redraw = true;
                 let generation = self.state.generation();
-                self.cold_queue
-                    .push(crate::ColdEvent::Damage { generation });
+                self.cold_queue.push_damage(generation);
             }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -872,8 +869,7 @@ impl Runtime {
             {
                 self.pending_full_redraw = true;
                 let generation = self.state.generation();
-                self.cold_queue
-                    .push(crate::ColdEvent::Damage { generation });
+                self.cold_queue.push_damage(generation);
             }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -989,8 +985,7 @@ impl Runtime {
             {
                 self.pending_full_redraw = true;
                 let generation = self.state.generation();
-                self.cold_queue
-                    .push(crate::ColdEvent::Damage { generation });
+                self.cold_queue.push_damage(generation);
             }
             return Ok(if matches!(action, bitty_rich::KittyAction::Transmit) {
                 KittyDisplayOutcome::Stored { image }
@@ -1146,8 +1141,7 @@ impl Runtime {
         if replaced {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
-            self.cold_queue
-                .push(crate::ColdEvent::Damage { generation });
+            self.cold_queue.push_damage(generation);
         }
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
     }
@@ -1227,8 +1221,7 @@ impl Runtime {
         if replaced {
             self.pending_full_redraw = true;
             let generation = self.state.generation();
-            self.cold_queue
-                .push(crate::ColdEvent::Damage { generation });
+            self.cold_queue.push_damage(generation);
         }
         Ok(KittyDisplayOutcome::VirtualPrototype { image })
     }
@@ -1445,10 +1438,7 @@ impl Runtime {
                 // Gap-only edit: no pixels travel, so truth applies alone.
                 let damage = self.state.apply(action);
                 if !damage.regions.is_empty() {
-                    let generation = damage.generation;
-                    self.cold_queue.push(ColdEvent::Damage { generation });
-                    self.plugin_host
-                        .push_observation(HostObservation::Damage { generation });
+                    self.push_damage_events(damage.generation);
                 }
                 return Ok(());
             }
@@ -1557,10 +1547,7 @@ impl Runtime {
         // cached blits wholesale, and publish damage like `a=p`.
         let damage = self.state.apply(action);
         if !damage.regions.is_empty() {
-            let generation = damage.generation;
-            self.cold_queue.push(ColdEvent::Damage { generation });
-            self.plugin_host
-                .push_observation(HostObservation::Damage { generation });
+            self.push_damage_events(damage.generation);
         }
         self.invalidate_kitty_raster_cache();
         Ok(())
@@ -1658,10 +1645,7 @@ impl Runtime {
         // repaint the edited frame on the next tick.
         let damage = self.state.apply(action);
         if !damage.regions.is_empty() {
-            let generation = damage.generation;
-            self.cold_queue.push(ColdEvent::Damage { generation });
-            self.plugin_host
-                .push_observation(HostObservation::Damage { generation });
+            self.push_damage_events(damage.generation);
         }
         self.invalidate_kitty_raster_cache();
         self.damage_kitty_wire(wire);

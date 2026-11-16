@@ -38,6 +38,7 @@ pub mod plugin_settings;
 pub mod presentation_overlay;
 pub mod redaction;
 pub mod resolution;
+pub(crate) mod sampled;
 pub mod services;
 pub mod spawn;
 pub mod store;

@@ -2694,6 +2694,7 @@ impl Runtime {
             self.coalesced_deadline = None;
             self.settle_input_at = None;
             self.settle_burst_at = None;
+            self.clear_hover_pending();
             // A retry belongs to the surface incarnation that failed. Do not
             // let its old deadline win over the reveal's next-frame queue;
             // hidden ticks also must not re-arm it.
@@ -3552,6 +3553,14 @@ impl Runtime {
         if !self.surface_visible {
             self.coalesced_pending = false;
             self.coalesced_deadline = None;
+            // Clear pending hover and expire/tick time-gated state while hidden
+            // so past-due deadlines cannot trigger an `AboutToWait` wakeup spin.
+            self.clear_hover_pending();
+            let _ = self.expire_bell_flash(now);
+            let _ = self.expire_notification_banner(now);
+            let _ = self.advance_notification_banner_at(now);
+            let _ = self.animator.tick(now);
+            let _ = self.fx.tick(now);
             // bitty#2830 hypothesis 2: this tick is the only place that sees
             // output arriving while hidden. Retained work must never sit
             // without a wake - a lost reveal would otherwise strand it until
@@ -17146,6 +17155,48 @@ mod second_window_surface_tests {
         assert!(
             !rt.has_window_surfaces(),
             "instance shutdown releases the sibling swap chain instead of leaving it to process exit"
+        );
+    }
+
+    #[test]
+    fn hidden_surface_expires_bell_notification_and_clears_hover_without_past_deadlines() {
+        let mut rt = runtime();
+        let t0 = Instant::now();
+        rt.handle_pty_bytes(b"ready");
+        assert!(rt.tick_at(t0).is_some());
+
+        // Arm a bell flash + notification banner, then hide the surface.
+        rt.set_osc_notification_allowed(true);
+        rt.set_surface_visibility_at(t0, false);
+        assert!(
+            rt.hover_activation_deadline().is_none(),
+            "hidden transition clears pending hover wakes"
+        );
+
+        // First prove BEL alone while hidden expires cleanly without synthesizing
+        // retained damage.
+        rt.handle_pty_bytes(b"\x07");
+        assert!(rt.bell_notification_deadline().is_some());
+        let after_bell = t0 + crate::runtime::bell::BELL_FLASH_DURATION + Duration::from_millis(10);
+        assert!(rt.tick_at(after_bell).is_none());
+        assert_eq!(
+            rt.bell_notification_deadline(),
+            None,
+            "hidden surface must expire bell flash deadline cleanly"
+        );
+
+        // Next prove OSC 9 notification banner also expires on time while hidden
+        // and never leaves a past-due deadline spinning `AboutToWait`.
+        rt.handle_pty_bytes(b"\x1b]9;bg notice\x07");
+        assert!(rt.bell_notification_deadline().is_some());
+        let expired = after_bell
+            + crate::runtime::bell::NOTIFICATION_BANNER_DURATION
+            + Duration::from_millis(10);
+        assert!(rt.tick_at(expired).is_none());
+        assert_eq!(
+            rt.bell_notification_deadline(),
+            None,
+            "hidden surface must expire notification banner deadline cleanly"
         );
     }
 }

@@ -821,6 +821,9 @@ impl Runtime {
     /// scheduler delay between arming and querying cannot inflate it.
     #[must_use]
     pub fn animation_deadline_at(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        if !self.surface_visible {
+            return None;
+        }
         match (self.animator.next_deadline(now), self.fx.next_deadline(now)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),

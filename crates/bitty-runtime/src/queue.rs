@@ -100,6 +100,23 @@ impl ColdQueue {
         self.inner.push_back(event);
     }
 
+    /// Enqueues [`ColdEvent::Damage`], updating any already-queued damage entry
+    /// in place so sustained PTY bursts never flood out other cold events.
+    pub fn push_damage(&mut self, generation: u64) {
+        if let Some(ColdEvent::Damage {
+            generation: existing,
+        }) = self
+            .inner
+            .iter_mut()
+            .rev()
+            .find(|ev| matches!(ev, ColdEvent::Damage { .. }))
+        {
+            *existing = generation;
+            return;
+        }
+        self.push(ColdEvent::Damage { generation });
+    }
+
     /// Drains all queued events in FIFO order.
     pub fn drain(&mut self) -> Vec<ColdEvent> {
         self.inner.drain(..).collect()

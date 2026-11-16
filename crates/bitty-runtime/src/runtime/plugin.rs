@@ -243,6 +243,13 @@ impl Runtime {
         self.plugin_host.push_observation(obs);
     }
 
+    /// Push a coalesced `Damage` event across both `cold_queue` and the plugin
+    /// host side queue so large bursts carry only the newest generation.
+    pub(crate) fn push_damage_events(&mut self, generation: u64) {
+        self.cold_queue.push_damage(generation);
+        self.plugin_host.push_damage_observation(generation);
+    }
+
     /// Bridge all currently queued [`ColdEvent`]s into the side queue where a direct
     /// [`HostObservation`] mapping exists. This drains the `ColdQueue` and pushes
     /// corresponding observations without blocking; the side queue's bounded drop

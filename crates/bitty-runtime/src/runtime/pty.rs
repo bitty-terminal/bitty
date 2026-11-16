@@ -992,6 +992,7 @@ impl Runtime {
         let mut xtwinops = crate::queries::find_xtwinops(&combined, overlap_len);
         let mut actions: Vec<TerminalAction> = Vec::new();
         self.parser.advance(bytes, |action| actions.push(action));
+        let mut pending_damage_generation: Option<u64> = None;
         for mut action in actions {
             // Map terminal actions to cold-path observations before state
             // mutation where the payload lives on the action itself; state
@@ -1374,10 +1375,7 @@ impl Runtime {
                 };
                 let damage = self.state.apply(&action);
                 if !damage.regions.is_empty() {
-                    let generation = damage.generation;
-                    self.cold_queue.push(ColdEvent::Damage { generation });
-                    self.plugin_host
-                        .push_observation(HostObservation::Damage { generation });
+                    pending_damage_generation = Some(damage.generation);
                 }
                 // Close the deletion-vs-placement identity split: a
                 // protocol-level delete also clears the rendered placements
@@ -1628,10 +1626,7 @@ impl Runtime {
                         );
                         match composed {
                             Ok(()) => {
-                                let generation = self.state.generation();
-                                self.cold_queue.push(ColdEvent::Damage { generation });
-                                self.plugin_host
-                                    .push_observation(HostObservation::Damage { generation });
+                                pending_damage_generation = Some(self.state.generation());
                             }
                             Err(err) => {
                                 // Overlapping self-compose answers
@@ -1698,10 +1693,7 @@ impl Runtime {
             if is_virtual_combined {
                 let damage = self.state.apply(&action);
                 if !damage.regions.is_empty() {
-                    let generation = damage.generation;
-                    self.cold_queue.push(ColdEvent::Damage { generation });
-                    self.plugin_host
-                        .push_observation(HostObservation::Damage { generation });
+                    pending_damage_generation = Some(damage.generation);
                 }
             }
             if let TerminalAction::KittyGraphics {
@@ -1940,11 +1932,7 @@ impl Runtime {
                 }
             }
             if !damage.regions.is_empty() {
-                let generation = damage.generation;
-                self.cold_queue.push(ColdEvent::Damage { generation });
-                // Bridge damage generation as well.
-                self.plugin_host
-                    .push_observation(HostObservation::Damage { generation });
+                pending_damage_generation = Some(damage.generation);
             }
             // Selection invalidation (CTX-0060, extended for issue #1337):
             // FullReset erases grid and scrollback, so any live selection
@@ -2074,6 +2062,9 @@ impl Runtime {
                     });
                 }
             }
+        }
+        if let Some(generation) = pending_damage_generation {
+            self.push_damage_events(generation);
         }
         // Retain a bounded tail so a query split over two PTY reads is still
         // recognized on the next call. Capacity stays near the overlap bound:

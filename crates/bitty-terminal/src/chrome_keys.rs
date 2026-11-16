@@ -536,13 +536,6 @@ pub(crate) fn key_ref_from_event(
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
                 (Some(c), None) if c.is_ascii_graphic() => KeyName::Char(c.to_ascii_lowercase()),
-                // XKB/Wayland may report Ctrl+letter (especially Ctrl+Alt+h = \x08
-                // and Ctrl+Alt+j = \n) as an ASCII C0 control character rather than
-                // the base letter; map C0 0x01..=0x1a back to 'a'..='z' when Ctrl is held.
-                (Some(c), None) if mods.control && ('\x01'..='\x1a').contains(&c) => {
-                    let letter = (b'a' + (c as u8 - 1)) as char;
-                    KeyName::Char(letter)
-                }
                 _ => return None,
             }
         }
@@ -11676,7 +11669,12 @@ claims = []
     }
 
     #[test]
-    fn ctrl_alt_h_j_control_chars_match_move_split_keymaps() {
+    fn ctrl_alt_h_j_match_move_split_keymaps_after_platform_normalization() {
+        // bitty#3194 fixed the Wayland Ctrl+Alt+h/j collapse at the platform
+        // boundary: `bitty_platform::event::normalize_control_collapsed_key`
+        // rewrites the C0 control character back to the base letter before the
+        // owned `KeyEvent` is built. This guards the terminal half of that
+        // contract — the normalized letter must still reach `move_split`.
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let mods = AppModifiers {
@@ -11686,7 +11684,7 @@ claims = []
             super_held: false,
         };
         let key_h = KeyEvent {
-            logical_key: LogicalKey::Character("\u{8}".to_string()),
+            logical_key: LogicalKey::Character("h".to_string()),
             text: None,
             location: bitty_platform::KeyLocation::Standard,
             state: PressState::Pressed,
@@ -11694,7 +11692,7 @@ claims = []
             is_synthetic: false,
         };
         let key_j = KeyEvent {
-            logical_key: LogicalKey::Character("\n".to_string()),
+            logical_key: LogicalKey::Character("j".to_string()),
             text: None,
             location: bitty_platform::KeyLocation::Standard,
             state: PressState::Pressed,

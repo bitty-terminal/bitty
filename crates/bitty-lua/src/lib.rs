@@ -144,7 +144,8 @@ pub use ui_catalog::{
 pub use ui_rich::UiRichNode;
 pub use ui_style::{
     UI_STYLE_FIELDS, UI_STYLE_MAX_BORDER_PX, UI_STYLE_MAX_NAME_BYTES, UI_STYLE_MAX_PADDING_CELLS,
-    UI_STYLE_MAX_RADIUS_PX, UiBorderToken, UiNodeStyle, UiStyleError, parse_node_style,
+    UI_STYLE_MAX_RADIUS_PX, UI_STYLE_MAX_WIDTH_CELLS, UiBorderToken, UiNodeStyle, UiStyleError,
+    parse_node_style,
 };
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────

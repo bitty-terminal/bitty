@@ -47,11 +47,18 @@
 //! # Style (bitty#2191)
 //!
 //! Any kind may carry an optional `style` table — the bounded primitive set
-//! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`).
-//! A non-flat style lowers to the additive `SceneNode::Styled` wrapper, so the
-//! existing measure and paint path applies it; a flat one lowers to nothing.
-//! `style` is a modifier, not a tenth kind: [`UiRichNode::kind`] still reports
-//! the wrapped node's kind and [`UI_RICH_NODE_KINDS`] is unchanged.
+//! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`,
+//! `min_width`, `max_width`). A non-flat style lowers to the additive
+//! `SceneNode::Styled` wrapper, so the existing measure and paint path applies
+//! it; a flat one lowers to nothing. `style` is a modifier, not a tenth kind:
+//! [`UiRichNode::kind`] still reports the wrapped node's kind and
+//! [`UI_RICH_NODE_KINDS`] is unchanged.
+//!
+//! `min_width`/`max_width` bound the content box in cells and are what makes a
+//! width-only declaration non-flat: the node has to be wrapped for the measure
+//! path to apply the bound. Both are bounded by
+//! [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`], and a floor above the cap is
+//! refused rather than reordered.
 //!
 //! `style.border` and `Block.border` are one stroke in two units (px and
 //! cells), so a `Block` may declare one of them and never both with a
@@ -79,6 +86,7 @@
 //! | border width | [`UI_RICH_MAX_BORDER_CELLS`] (8) | paint budget |
 //! | language hint | [`UI_RICH_MAX_LANG_BYTES`] (32) | bridge budget |
 //! | style padding / radius / border | `32` / `16` / `16` | [`crate::ui_style`] caps |
+//! | style min/max width | `1000` cells | [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`] |
 //!
 //! Structural elements count against the node budget exactly like the
 //! accepted scene accounting: a table row and a table cell are separate

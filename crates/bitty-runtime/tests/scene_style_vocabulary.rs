@@ -48,6 +48,15 @@ fn caps_are_identical_on_every_side() {
         wire::UI_STYLE_MAX_NAME_BYTES,
         resolver::SCENE_STYLE_MAX_NAME_BYTES
     );
+    // The width bound is a grid-dimension cap, and it mirrors the accepted
+    // `bitty_term_state::MAX_GRID_DIM` on both sides of the chain. The
+    // extension resolver keeps its four primitives (it has no measure path), so
+    // it carries no width cap and no drift is possible there.
+    assert_eq!(
+        wire::UI_STYLE_MAX_WIDTH_CELLS,
+        scene_model::SCENE_STYLE_MAX_WIDTH_CELLS
+    );
+    assert_eq!(wire::UI_STYLE_MAX_WIDTH_CELLS, 1000);
 }
 
 #[test]
@@ -98,10 +107,18 @@ fn the_closed_token_set_is_name_for_name_identical() {
 
 #[test]
 fn the_wire_key_set_is_the_candidate_set() {
-    // The closed four-key set from the candidate record, no more.
+    // The closed style key set: the four paint primitives from the candidate
+    // record plus the two content-width bounds (bitty#2191). No more.
     assert_eq!(
         wire::UI_STYLE_FIELDS,
-        ["padding", "radius", "border", "border_token"]
+        [
+            "padding",
+            "radius",
+            "border",
+            "border_token",
+            "min_width",
+            "max_width"
+        ]
     );
 }
 
@@ -136,4 +153,14 @@ fn the_wire_flat_style_is_the_scene_flat_style() {
     );
     assert_eq!(wire::UiNodeStyle::FLAT.radius_px, scene_flat.radius_px);
     assert_eq!(wire::UiNodeStyle::FLAT.border_px, scene_flat.border_px);
+    assert_eq!(
+        wire::UiNodeStyle::FLAT.min_width_cells,
+        scene_flat.min_width_cells
+    );
+    assert_eq!(
+        wire::UiNodeStyle::FLAT.max_width_cells,
+        scene_flat.max_width_cells
+    );
+    assert_eq!(scene_flat.min_width_cells, 0, "0 is the unbounded default");
+    assert_eq!(scene_flat.max_width_cells, 0, "0 is the unbounded default");
 }

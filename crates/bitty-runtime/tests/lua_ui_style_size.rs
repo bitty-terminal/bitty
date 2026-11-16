@@ -370,10 +370,12 @@ fn a_wrong_value_type_is_refused() {
 
 #[test]
 fn the_keys_outside_the_set_are_still_refused_loudly() {
-    // `gap` and `align` are the two layout vocabularies this lane deliberately
+    // `align` and `spacing` are the layout vocabularies this lane deliberately
     // did not land: they are outside the closed key set, and the refusal names
-    // them instead of accepting a declaration that would paint nothing.
-    for key in ["gap", "align", "spacing", "width", "min_width_cells"] {
+    // them instead of accepting a declaration that would paint nothing. (`gap`
+    // is the third of that family and is covered by `lua_ui_gap.rs`, which
+    // landed it.)
+    for key in ["align", "spacing", "width", "min_width_cells"] {
         let node = styled_text_value("ab", vec![(key, LuaValue::Integer(1))]);
         let error = UiRichNode::from_lua_value(&node).expect_err("refused");
         assert_eq!(error.class, "validation");

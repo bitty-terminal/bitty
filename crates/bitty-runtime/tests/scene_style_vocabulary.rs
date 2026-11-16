@@ -57,6 +57,14 @@ fn caps_are_identical_on_every_side() {
         scene_model::SCENE_STYLE_MAX_WIDTH_CELLS
     );
     assert_eq!(wire::UI_STYLE_MAX_WIDTH_CELLS, 1000);
+
+    // The sibling gap reuses the padding cap on both sides of the chain, so a
+    // value the wire parser accepts can never be refused a layer later.
+    assert_eq!(
+        wire::UI_STYLE_MAX_GAP_CELLS,
+        scene_model::SCENE_STYLE_MAX_GAP_CELLS
+    );
+    assert_eq!(wire::UI_STYLE_MAX_GAP_CELLS, 32);
 }
 
 #[test]
@@ -108,7 +116,8 @@ fn the_closed_token_set_is_name_for_name_identical() {
 #[test]
 fn the_wire_key_set_is_the_candidate_set() {
     // The closed style key set: the four paint primitives from the candidate
-    // record plus the two content-width bounds (bitty#2191). No more.
+    // record, the two content-width bounds, and the sibling gap (bitty#2191).
+    // No more.
     assert_eq!(
         wire::UI_STYLE_FIELDS,
         [
@@ -117,7 +126,8 @@ fn the_wire_key_set_is_the_candidate_set() {
             "border",
             "border_token",
             "min_width",
-            "max_width"
+            "max_width",
+            "gap"
         ]
     );
 }
@@ -161,6 +171,8 @@ fn the_wire_flat_style_is_the_scene_flat_style() {
         wire::UiNodeStyle::FLAT.max_width_cells,
         scene_flat.max_width_cells
     );
+    assert_eq!(wire::UiNodeStyle::FLAT.gap_cells, scene_flat.gap_cells);
     assert_eq!(scene_flat.min_width_cells, 0, "0 is the unbounded default");
     assert_eq!(scene_flat.max_width_cells, 0, "0 is the unbounded default");
+    assert_eq!(scene_flat.gap_cells, 0, "0 is the no-spacing default");
 }

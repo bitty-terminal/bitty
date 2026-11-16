@@ -294,11 +294,12 @@ fn a_style_declaration_matches_the_hand_built_scene_node() {
 
 #[test]
 fn an_unknown_style_key_is_refused_not_ignored() {
-    let error = UiRichNode::from_lua_value(&styled_text_value(vec![("gap", LuaValue::Integer(1))]))
-        .expect_err("unknown key refused");
+    let error =
+        UiRichNode::from_lua_value(&styled_text_value(vec![("align", LuaValue::Integer(1))]))
+            .expect_err("unknown key refused");
     assert_eq!(error.class, "validation");
     assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
-    assert_eq!(error.message, "unsupported scene style field 'gap'");
+    assert_eq!(error.message, "unsupported scene style field 'align'");
 }
 
 #[test]

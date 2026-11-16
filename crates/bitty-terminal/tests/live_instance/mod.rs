@@ -556,11 +556,16 @@ fn resolve_test_compositor(env: &CompositorEnv, xvfb: Option<&Path>) -> Option<C
 }
 
 /// Refuse a socket that resolves into the owner's ambient session.
+///
+/// The uid is deliberately absent from the message: it is only needed to
+/// recognise the boundary, and echoing a user id into stderr is what
+/// code scanning calls cleartext logging of sensitive information. The
+/// directory is named generically instead.
 fn refuse_ambient_socket(uid: u32, socket: &Path) {
     let ambient_root = PathBuf::from(format!("/run/user/{uid}"));
     if socket.starts_with(&ambient_root) {
         panic!(
-            "AC022 compositor refusal: {} lives under /run/user/{uid}/, the owner's ambient \
+            "AC022 compositor refusal: {} lives under /run/user/<uid>/, the owner's ambient \
              session runtime directory. The workspace bans host-compositor GUI testing \
              (2026-09-24: driving the owner's live Hyprland session segfaulted it and logged the \
              owner out, and spawning probe windows there is part of the ban). Point \

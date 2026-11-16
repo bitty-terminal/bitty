@@ -47,6 +47,15 @@
 //!   overlap, never exceed the row, and never panic. Hit-testing, region
 //!   emission, and paint all read those same runs, so gap cells stay
 //!   unclaimed.
+//! - **Group distribution (bitty#2191).** The same root `Row` may instead
+//!   declare `align` (`start`/`center`/`end`/`space-between`), which
+//!   distributes its direct children inside the same bound: `center` and
+//!   `end` offset the whole group, and `space-between` spreads the leftover
+//!   width across the inter-child gaps. `align` and a child `anchor` are
+//!   mutually exclusive (refused at parse, so this walk never sees both), and
+//!   an over-subscribed group keeps the plain flow and clips at the band edge.
+//!   Nothing here computes a second geometry: hit-test, region emission, and
+//!   paint read the runs this walk emits.
 //! - **Bounded hover.** `on_hover` bindings dispatch on pointer enter/leave
 //!   with the stable region id and a `phase`, through a bounded queue that
 //!   coalesces to one dispatch per region per drain ([`Runtime::update_band_hover`],
@@ -73,6 +82,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::band_slots::{BAND_EDGES, BandAxis, BandEdge};
 use super::{BandContent, ChromeBands, Runtime};
+use bitty_lua::UiAlign;
 use bitty_lua::host::LuaValue;
 use bitty_lua::ui::{
     ClickArg, ClickCommand, UI_BUTTON_ARG, UI_BUTTON_LEFT, UI_BUTTON_MIDDLE, UI_BUTTON_RIGHT,
@@ -351,6 +361,12 @@ pub(crate) fn flatten_band_runs_under(
 /// at the group slot boundary, so runs never overlap, never exceed `width`,
 /// and never panic. A root that is not a `Row` flows left-to-right unchanged.
 ///
+/// bitty#2191: a root `Row` that declares `align` (instead of child anchors)
+/// distributes its direct children inside the same bound — `center` offsets
+/// the group by `slack / 2`, `end` by all of the slack, and `space-between`
+/// spreads it across the inter-child gaps. An over-subscribed group has no
+/// slack and keeps the plain flow, clipped at `width`.
+///
 /// Runs carry absolute display-cell columns, so the paint path and the
 /// hit-test read one geometry. Characters clipped out of their group are not
 /// emitted at all: their runs are absent, which is what keeps a clipped item
@@ -451,8 +467,16 @@ impl BandEmit {
             | UiNode::List { children, .. } => {
                 if let Some(width) = bounded_width {
                     // Issue #2411: only the band root Row has a row width to
-                    // resolve declared anchors against.
-                    for (child, slot) in children.iter().zip(anchored_slots(children, width)) {
+                    // resolve declared anchors against. bitty#2191: a declared
+                    // `align` selects the distribution of the root's own
+                    // children instead; the parser refuses the field beside a
+                    // child `anchor`, so the two mechanisms never reach this
+                    // walk together.
+                    let slots = match node.align() {
+                        Some(align) => align_slots(children, width, align),
+                        None => anchored_slots(children, width),
+                    };
+                    for (child, slot) in children.iter().zip(slots) {
                         self.node(
                             child,
                             slot.origin,
@@ -579,6 +603,81 @@ fn anchored_slots(children: &[UiNode], width: usize) -> Vec<GroupSlot> {
         cursor = cursor.saturating_add(*width);
     }
 
+    slots
+}
+
+/// Resolves the declared distribution of a band root `Row`'s direct children
+/// (bitty#2191).
+///
+/// The group's content is the sum of the children's intrinsic widths; the
+/// slack is the saturating `width - content`, so an over-subscribed group has
+/// no slack at all: it degrades to the plain flow and clips at the band edge
+/// under the existing walk rather than receiving a negative offset.
+///
+/// - `start` — origin `0`, today's left-to-right flow, byte for byte.
+/// - `center` — origin `slack / 2` (integer division, so the left side takes
+///   the smaller half), which centres the whole child group.
+/// - `end` — origin `slack`, so the last child ends exactly at the band edge.
+/// - `space-between` — origin `0`, and `slack` is split across the
+///   `children - 1` inter-child gaps as `slack / gaps` with the remainder
+///   handed to the leftmost gaps, so the first child stays flush left and the
+///   last flush right.
+///
+/// A childless or single-child row has no inter-child gap to spread, so
+/// `space-between` leaves the child flush left: the distribution is inert
+/// there, not an error, and the painted result stays inside the band.
+///
+/// Total: `O(children)` time and one `Vec` of slots, exactly like
+/// [`anchored_slots`]; every returned interval is inside `[0, width]`.
+fn align_slots(children: &[UiNode], width: usize, align: UiAlign) -> Vec<GroupSlot> {
+    let widths: Vec<usize> = children.iter().map(intrinsic_cells).collect();
+    let content = widths
+        .iter()
+        .fold(0usize, |total, cells| total.saturating_add(*cells));
+    let slack = width.saturating_sub(content);
+    let gaps = children.len().saturating_sub(1);
+    let mut gap_cells = vec![0usize; gaps];
+    let origin = match align {
+        UiAlign::Start => 0,
+        UiAlign::Center => slack / 2,
+        UiAlign::End => slack,
+        UiAlign::SpaceBetween => {
+            // No pair means no gap to spread: the group stays flush left. The
+            // `checked_div` is the whole guard, so the remainder is derived
+            // from the quotient rather than dividing twice.
+            if let Some(share) = slack.checked_div(gaps) {
+                let remainder = slack.saturating_sub(share.saturating_mul(gaps));
+                for (index, gap) in gap_cells.iter_mut().enumerate() {
+                    *gap = share.saturating_add(usize::from(index < remainder));
+                }
+            }
+            0
+        }
+    };
+    // The group's own extent: its origin, its content, and the gaps the
+    // distribution inserted, clamped to the row so no slot can escape it.
+    let group_end = origin
+        .saturating_add(content)
+        .saturating_add(
+            gap_cells
+                .iter()
+                .fold(0usize, |total, gap| total.saturating_add(*gap)),
+        )
+        .min(width);
+    let mut slots = Vec::with_capacity(children.len());
+    let mut cursor = origin;
+    for (index, cells) in widths.iter().enumerate() {
+        let end = cursor.saturating_add(*cells).min(group_end);
+        slots.push(GroupSlot {
+            origin: cursor,
+            clip_start: cursor.min(end),
+            clip_end: end,
+        });
+        cursor = cursor.saturating_add(*cells);
+        if let Some(gap) = gap_cells.get(index) {
+            cursor = cursor.saturating_add(*gap);
+        }
+    }
     slots
 }
 
@@ -3569,6 +3668,7 @@ mod tests {
             region: None,
         };
         let root = UiNode::Row {
+            align: None,
             children: vec![text_node("x")],
             fg: Some("accent".to_string()),
             bg: None,
@@ -3588,6 +3688,7 @@ mod tests {
     #[test]
     fn leaf_style_beats_container_style() {
         let root = UiNode::Row {
+            align: None,
             children: vec![UiNode::Text {
                 text: "x".to_string(),
                 fg: Some("foreground".to_string()),
@@ -3621,6 +3722,7 @@ mod tests {
             region: None,
         };
         let root = UiNode::Row {
+            align: None,
             children: vec![text_node("x"), scroll_node("y", "owner:leaf")],
             fg: None,
             bg: None,
@@ -4089,6 +4191,7 @@ mod tests {
             UiNode::row(vec![text_node("left")]),
             UiNode::Row {
                 anchor: Some(UiAnchor::Center),
+                align: None,
                 children: vec![text_node("mid")],
                 fg: None,
                 bg: None,
@@ -4099,6 +4202,7 @@ mod tests {
             },
             UiNode::Row {
                 anchor: Some(UiAnchor::Right),
+                align: None,
                 children: vec![text_node("rt")],
                 fg: None,
                 bg: None,
@@ -4130,6 +4234,7 @@ mod tests {
     fn hover_binding_inherits_to_descendant_runs() {
         let root = UiNode::Row {
             anchor: None,
+            align: None,
             children: vec![text_node("clock")],
             fg: None,
             bg: None,

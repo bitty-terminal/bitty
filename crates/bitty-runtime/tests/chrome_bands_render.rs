@@ -140,6 +140,7 @@ fn row_node_concatenates_children() {
     let mut rt = minimal_runtime();
 
     let row_node = UiNode::Row {
+        align: None,
         children: vec![
             UiNode::Text {
                 text: "Part 1 ".to_string(),

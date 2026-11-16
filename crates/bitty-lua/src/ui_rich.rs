@@ -511,11 +511,19 @@ pub fn read_rich_component(value: Value<'_>) -> Result<UiRichNode, BridgeError> 
 }
 
 /// Rejects band-surface presentation fields the scene schema cannot express.
+///
+/// `align` is on the list because it is a *band* placement field (bitty#2191):
+/// only the band root `Row` is handed a bounded width to distribute inside, so
+/// a rich/terminal tree that declares it here would be asking for a
+/// distribution no paint path on this surface can apply. Refusing it loudly is
+/// the same policy [`crate::ui`] applies to `anchor` — a position-invalid field
+/// is an authoring mistake, not a value to drop.
 fn reject_band_only_fields(value: &LuaValue) -> Result<(), BridgeError> {
     for key in [
         "fg",
         "bg",
         "anchor",
+        "align",
         "on_click",
         "on_scroll",
         "on_hover",

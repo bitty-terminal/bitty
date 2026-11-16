@@ -668,6 +668,7 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+            ..
         }
         | UiNode::Column {
             anchor,
@@ -678,6 +679,7 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+            ..
         }
         | UiNode::List {
             anchor,
@@ -688,6 +690,7 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+            ..
         } if anchor.is_none()
             && fg.is_none()
             && bg.is_none()
@@ -1625,6 +1628,7 @@ mod tests {
         left.pop();
         let mutated = UiNode::Row {
             anchor: None,
+            align: None,
             children: mutated,
             fg: None,
             bg: None,
@@ -1753,6 +1757,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 }
                 | UiNode::Column {
                     anchor,
@@ -1763,6 +1768,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 }
                 | UiNode::List {
                     anchor,
@@ -1773,6 +1779,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 } => {
                     assert!(anchor.is_none());
                     assert!(on_hover.is_none());

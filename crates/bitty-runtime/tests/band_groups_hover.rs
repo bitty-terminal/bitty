@@ -123,6 +123,7 @@ fn hover(command: &str, region: &str) -> ClickCommand {
 fn module(region: &str, label: &str) -> UiNode {
     UiNode::Row {
         anchor: None,
+        align: None,
         children: vec![UiNode::text(label)],
         fg: None,
         bg: None,
@@ -137,6 +138,7 @@ fn module(region: &str, label: &str) -> UiNode {
 fn group(anchor: UiAnchor, children: Vec<UiNode>) -> UiNode {
     UiNode::Row {
         anchor: Some(anchor),
+        align: None,
         children,
         fg: None,
         bg: None,
@@ -154,6 +156,7 @@ fn separator() -> UiNode {
 fn waybar_band() -> UiNode {
     UiNode::Row {
         anchor: None,
+        align: None,
         children: vec![
             group(
                 UiAnchor::Left,
@@ -442,6 +445,7 @@ fn hover_queue_is_capped_and_drops_fail_closed() {
     }
     let root = UiNode::Row {
         anchor: None,
+        align: None,
         children: vec![group(UiAnchor::Left, children)],
         fg: None,
         bg: None,
@@ -560,6 +564,7 @@ fn icon_glyphs_keep_text_path_cell_widths() {
     // path, so the hit region matches what an icon-first module paints.
     let root = UiNode::Row {
         anchor: None,
+        align: None,
         children: vec![group(
             UiAnchor::Left,
             vec![module("clock", "\u{e800} 12:34")],

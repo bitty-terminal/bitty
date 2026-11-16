@@ -11143,6 +11143,7 @@ mod tests {
             on_hover: None,
         };
         UiNode::Row {
+            align: None,
             children: (0..(UI_MAX_NODES - 1)).map(|_| child.clone()).collect(),
             fg: None,
             bg: None,

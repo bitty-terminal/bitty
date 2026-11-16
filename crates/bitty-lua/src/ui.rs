@@ -100,6 +100,7 @@
 use phodopus::Value;
 
 use crate::host::{BridgeError, LuaValue, MarshallingLimits};
+use crate::ui_style::{UiAlign, parse_align};
 
 /// Accepted closed slot set for `bitty.ui.mount` (ADR-0009 `LUA-OQ-7`,
 /// frozen for v1 by OQ-056).
@@ -586,6 +587,18 @@ pub enum UiNode {
     Row {
         /// Group anchor resolved by a parent root `Row` (issue #2411).
         anchor: Option<UiAnchor>,
+        /// Distribution of this row's own children inside the band width
+        /// (bitty#2191, CTX-1853).
+        ///
+        /// Only the **band root** `Row` may declare one: it is the only node
+        /// whose bounded width the band walk knows
+        /// (`flatten_band_runs_in_width`), which is the same bound that
+        /// resolves `anchor`. `None` and `Some(UiAlign::Start)` both mean the
+        /// plain left-to-right flow, so an undeclared field renders exactly as
+        /// it did before. The parser refuses the field on any other kind, on a
+        /// nested `Row`, outside a [`UiSceneScope::Band`] scene, and beside a
+        /// child `anchor` in the same row.
+        align: Option<UiAlign>,
         /// Child nodes in declared order.
         children: Vec<UiNode>,
         /// Foreground theme token name (e.g. "accent", "surface.2").
@@ -662,6 +675,7 @@ impl UiNode {
     pub fn row(children: Vec<UiNode>) -> Self {
         Self::Row {
             anchor: None,
+            align: None,
             children,
             fg: None,
             bg: None,
@@ -714,6 +728,21 @@ impl UiNode {
             | Self::Row { anchor, .. }
             | Self::Column { anchor, .. }
             | Self::List { anchor, .. } => *anchor,
+        }
+    }
+
+    /// The declared child distribution of a band root `Row`, if any
+    /// (bitty#2191, CTX-1853).
+    ///
+    /// Only the scene root `Row` of a band scene may carry one, and only beside
+    /// no child `anchor`; the parser refuses every other placement, so a `Some`
+    /// value here is always resolvable by the band walk. Every other kind has no
+    /// distribution field at all, and therefore reports `None`.
+    #[must_use]
+    pub fn align(&self) -> Option<UiAlign> {
+        match self {
+            Self::Row { align, .. } => *align,
+            Self::Text { .. } | Self::Column { .. } | Self::List { .. } => None,
         }
     }
 
@@ -934,6 +963,10 @@ impl UiNode {
 
         // Parse style attributes (CTX-0890).
         let anchor = extract_anchor(value, placement, scope)?;
+        // bitty#2191 / CTX-1853: `align` distributes the band root Row's own
+        // children, so it is checked against the kind, the host scope, and the
+        // placement before the node is built.
+        let align = extract_align(value, kind, placement, scope)?;
         let fg = extract_theme_token(value, "fg")?;
         let bg = extract_theme_token(value, "bg")?;
         let bold = extract_bool_opt(value, "bold")?;
@@ -985,9 +1018,20 @@ impl UiNode {
                 };
                 let nodes =
                     Self::children_array(children, depth, child_placement, scope, tolerated)?;
+                // bitty#2191 / CTX-1853: one row is placed by one mechanism.
+                // `anchor` places named groups against the row edges and
+                // `align` distributes an unnamed group; declaring both would
+                // make the painted result depend on which one ran first, so the
+                // combination is refused instead of given a precedence rule.
+                if align.is_some() && nodes.iter().any(|child| child.anchor().is_some()) {
+                    return Err(component_invalid(
+                        "align and a child anchor are mutually exclusive in the same root Row",
+                    ));
+                }
                 Ok(match kind {
                     "Row" => Self::Row {
                         anchor,
+                        align,
                         children: nodes,
                         fg,
                         bg,
@@ -1218,6 +1262,57 @@ fn extract_anchor(
         ));
     }
     Ok(Some(anchor))
+}
+
+/// Extract the optional band-root child distribution (bitty#2191, CTX-1853).
+///
+/// Four checks, each of which is a different reason the value cannot be
+/// resolved, and each with its own refusal so a plugin learns which one it hit:
+///
+/// 1. **Value.** A closed, case-sensitive string ([`UiAlign`]); a wrong type or
+///    an unlisted spelling is refused by [`parse_align`] and never clamped to
+///    `start`.
+/// 2. **Kind.** Only a `Row` composes children horizontally. A `Text` has no
+///    children, and a `Column`/`List` composes on the other axis, so neither has
+///    a row to distribute inside.
+/// 3. **Scope.** Only a band scene presents a bounded row width
+///    ([`UiSceneScope::Band`]). An overlay pill stack — and a `left`/`right`
+///    column band, which is validated as `Unanchored` (issue #3165) — sizes each
+///    child to its content, so there is nothing to distribute.
+/// 4. **Placement.** Only the scene root `Row` is handed the band width; a
+///    nested `Row` is measured from its own children, so a declared value there
+///    would be a silent no-op.
+///
+/// A declared value is refused at every one of those steps even when it is
+/// `start`: unlike `style.gap = 0`, this field is a *placement mechanism*
+/// declaration, not a magnitude, so "declared but unresolvable" is an authoring
+/// mistake in every case (the `anchor` policy).
+fn extract_align(
+    value: &LuaValue,
+    kind: &str,
+    placement: NodePlacement,
+    scope: UiSceneScope,
+) -> Result<Option<UiAlign>, BridgeError> {
+    let Some(raw) = value.get("align") else {
+        return Ok(None);
+    };
+    let align = parse_align(raw)?;
+    if kind != "Row" {
+        return Err(component_invalid(format!(
+            "align is not valid on a {kind} node: only a Row composes children horizontally"
+        )));
+    }
+    if scope != UiSceneScope::Band {
+        return Err(component_invalid(
+            "align is only valid in a band scene (top/bottom slot): an overlay pill is content-sized",
+        ));
+    }
+    if placement != NodePlacement::Root {
+        return Err(component_invalid(
+            "align is only valid on the scene root Row: a nested Row is sized by its own children",
+        ));
+    }
+    Ok(Some(align))
 }
 
 /// Extract an optional `{ command, args, region? }` command binding under
@@ -2256,6 +2351,98 @@ mod tests {
             ("anchor", LuaValue::String(anchor.to_string())),
             ("children", LuaValue::array(children)),
         ])
+    }
+
+    fn aligned_row(align: &str, children: Vec<LuaValue>) -> LuaValue {
+        LuaValue::table([
+            ("kind", LuaValue::String("Row".to_string())),
+            ("align", LuaValue::String(align.to_string())),
+            ("children", LuaValue::array(children)),
+        ])
+    }
+
+    #[test]
+    fn the_band_root_row_carries_a_closed_distribution() {
+        // bitty#2191: `align` distributes the band root Row's own children.
+        // Every value in the closed set parses and is carried as an enum.
+        for align in UiAlign::ALL {
+            let node =
+                UiNode::from_lua_value(&aligned_row(align.as_str(), vec![text("a"), text("bb")]))
+                    .unwrap_or_else(|error| panic!("{} must parse: {error}", align.as_str()));
+            assert_eq!(node.align(), Some(align));
+            assert_eq!(node.count_nodes(), 3, "the field adds no wrapper node");
+        }
+        // Absent means `None`, which the band walk renders exactly like
+        // `start`.
+        let plain = UiNode::from_lua_value(&row(vec![text("a")])).expect("plain band");
+        assert_eq!(plain.align(), None);
+    }
+
+    #[test]
+    fn align_is_refused_outside_the_band_root_row() {
+        // Kind: a leaf and a vertical container have no horizontal child group.
+        let leaf = LuaValue::table([
+            ("kind", LuaValue::String("Text".to_string())),
+            ("text", LuaValue::String("a".to_string())),
+            ("align", LuaValue::String("center".to_string())),
+        ]);
+        assert_eq!(
+            UiNode::from_lua_value(&leaf)
+                .expect_err("leaf refused")
+                .message,
+            "align is not valid on a Text node: only a Row composes children horizontally"
+        );
+        for kind in ["Column", "List"] {
+            let value = LuaValue::table([
+                ("kind", LuaValue::String(kind.to_string())),
+                ("align", LuaValue::String("center".to_string())),
+                ("children", LuaValue::array(vec![text("a")])),
+            ]);
+            assert_eq!(
+                UiNode::from_lua_value(&value)
+                    .expect_err("kind refused")
+                    .message,
+                format!(
+                    "align is not valid on a {kind} node: only a Row composes children horizontally"
+                )
+            );
+        }
+        // Placement: only the scene root Row is handed the band width.
+        let nested = row(vec![aligned_row("end", vec![text("a")])]);
+        assert_eq!(
+            UiNode::from_lua_value(&nested)
+                .expect_err("nested row refused")
+                .message,
+            "align is only valid on the scene root Row: a nested Row is sized by its own children"
+        );
+        // Scope: an overlay (or a left/right column band) has no bounded row.
+        assert_eq!(
+            UiNode::from_lua_value_in(
+                &aligned_row("center", vec![text("a")]),
+                UiSceneScope::Unanchored
+            )
+            .expect_err("overlay refused")
+            .message,
+            "align is only valid in a band scene (top/bottom slot): an overlay pill is content-sized"
+        );
+        // One mechanism per row: a child anchor beside `align` is refused, and
+        // no value (including `start`) buys an exemption.
+        for align in UiAlign::ALL {
+            let mixed = LuaValue::table([
+                ("kind", LuaValue::String("Row".to_string())),
+                ("align", LuaValue::String(align.as_str().to_string())),
+                (
+                    "children",
+                    LuaValue::array(vec![anchored("Row", "left", vec![text("a")])]),
+                ),
+            ]);
+            assert_eq!(
+                UiNode::from_lua_value(&mixed)
+                    .expect_err("mixed placement refused")
+                    .message,
+                "align and a child anchor are mutually exclusive in the same root Row"
+            );
+        }
     }
 
     #[test]

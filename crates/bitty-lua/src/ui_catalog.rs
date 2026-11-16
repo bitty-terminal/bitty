@@ -659,8 +659,12 @@ fn plain_text(node: &UiNode, bold: bool) -> Option<&str> {
 
 fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
     match node {
+        // A root `align` is a placement, not decoration: a tree that carries one
+        // is not the plain container a catalog descriptor composes, so it must
+        // fail closed here instead of being recognised as an unaligned one.
         UiNode::Row {
             anchor,
+            align,
             children,
             fg,
             bg,
@@ -668,8 +672,18 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+        } if anchor.is_none()
+            && align.is_none()
+            && fg.is_none()
+            && bg.is_none()
+            && bold.is_none()
+            && on_click.is_none()
+            && on_scroll.is_none()
+            && on_hover.is_none() =>
+        {
+            Some(children.as_slice())
         }
-        | UiNode::Column {
+        UiNode::Column {
             anchor,
             children,
             fg,
@@ -678,6 +692,7 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+            ..
         }
         | UiNode::List {
             anchor,
@@ -688,6 +703,7 @@ fn is_plain_container(node: &UiNode) -> Option<&[UiNode]> {
             on_click,
             on_scroll,
             on_hover,
+            ..
         } if anchor.is_none()
             && fg.is_none()
             && bg.is_none()
@@ -1610,6 +1626,44 @@ mod tests {
     }
 
     #[test]
+    fn band_root_align_is_not_the_plain_descriptor_shape() {
+        // A root `align` (bitty#2191 / CTX-1853) is a placement the catalog
+        // descriptor does not model: composing is unchanged, but a tree that
+        // carries one must fail closed on read-back rather than being
+        // recognised as the canonical unaligned band.
+        let block = CatalogBlock::Band(band(&["a", "b"], &["c"], &["d"]));
+        let node = block.compose().expect("bounded band");
+        assert_eq!(block.verify(&node), Ok(()));
+
+        let UiNode::Row { children, .. } = &node else {
+            panic!("band root is a Row");
+        };
+        let aligned = UiNode::Row {
+            anchor: None,
+            align: Some(crate::ui_style::UiAlign::Center),
+            children: children.clone(),
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        };
+        assert_eq!(
+            CatalogBlock::from_scene(CatalogEntry::Band, &aligned),
+            Err(CatalogError::ShapeMismatch {
+                entry: CatalogEntry::Band,
+            })
+        );
+        assert_eq!(
+            block.verify(&aligned),
+            Err(CatalogError::ShapeMismatch {
+                entry: CatalogEntry::Band,
+            })
+        );
+    }
+
+    #[test]
     fn mutation_and_ignored_blocks_fail_verification() {
         let block = CatalogBlock::Band(band(&["a", "b"], &["c"], &["d"]));
         let node = block.compose().expect("bounded band");
@@ -1625,6 +1679,7 @@ mod tests {
         left.pop();
         let mutated = UiNode::Row {
             anchor: None,
+            align: None,
             children: mutated,
             fg: None,
             bg: None,
@@ -1753,6 +1808,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 }
                 | UiNode::Column {
                     anchor,
@@ -1763,6 +1819,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 }
                 | UiNode::List {
                     anchor,
@@ -1773,6 +1830,7 @@ mod tests {
                     on_click,
                     on_scroll,
                     on_hover,
+                    ..
                 } => {
                     assert!(anchor.is_none());
                     assert!(on_hover.is_none());

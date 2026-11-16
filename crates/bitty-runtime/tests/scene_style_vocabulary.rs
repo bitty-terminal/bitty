@@ -133,6 +133,61 @@ fn the_wire_key_set_is_the_candidate_set() {
 }
 
 #[test]
+fn the_band_distribution_vocabulary_is_closed_and_stays_off_the_style_table() {
+    // bitty#2191 / CTX-1853: `align` is the band root Row's distribution
+    // field. The closed set is the candidate record's four spellings, in
+    // declaration order, and `start` is the absent default that renders like
+    // today's flow.
+    assert_eq!(
+        wire::UiAlign::ALL.map(wire::UiAlign::as_str),
+        ["start", "center", "end", "space-between"]
+    );
+    assert_eq!(wire::UiAlign::default(), wire::UiAlign::Start);
+    for align in wire::UiAlign::ALL {
+        assert_eq!(wire::UiAlign::parse(align.as_str()), Some(align));
+    }
+
+    // Scope drift gate: `align` must stay OFF the rich `style` table. That
+    // table is hosted on `ui.rich`'s terminal slot, where no node is the band
+    // root, so hosting the key there would declare a distribution no paint
+    // path applies. The wire key set is the seven scene keys, and this fails
+    // the moment someone adds `align` to it.
+    assert_eq!(wire::UI_STYLE_FIELDS.len(), 7);
+    assert!(
+        !wire::UI_STYLE_FIELDS.contains(&"align"),
+        "align is a band placement field, not a scene style key"
+    );
+
+    // The two placement vocabularies are distinct: the only overlap is the
+    // spelling `center`, which means "centred on the row" for an anchor and
+    // "centred group" for an align. A field that accepted the other's
+    // spellings would be a second mechanism on one row.
+    for anchor in wire::ui::UiAnchor::ALL {
+        if anchor == wire::ui::UiAnchor::Center {
+            continue;
+        }
+        assert_eq!(
+            wire::UiAlign::parse(anchor.as_str()),
+            None,
+            "anchor '{}' is not an align value",
+            anchor.as_str()
+        );
+    }
+    for align in wire::UiAlign::ALL {
+        assert_eq!(
+            wire::ui::UiAnchor::parse(align.as_str()),
+            if align == wire::UiAlign::Center {
+                Some(wire::ui::UiAnchor::Center)
+            } else {
+                None
+            },
+            "align '{}' is not an anchor value",
+            align.as_str()
+        );
+    }
+}
+
+#[test]
 fn the_default_border_token_is_content_foreground_on_every_side() {
     assert_eq!(
         scene_model::SceneNodeStyle::default().border_token,

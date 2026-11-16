@@ -58,12 +58,15 @@
 //! | PGO-6, reload racing a mount (bitty#2476 residual 9) | here — `a_mount_that_races_a_reload_commits_nothing_and_the_successor_mounts_cleanly` |
 //! | PGO-9, capability gate on a guessed `PanelId` (bitty#2476 residual 9) | here — `a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access`; the deny-by-default half is pinned by `tests/panel_rebind.rs:412`, `a_denied_plugin_presents_unavailable_and_stops_after_one_record` (a capability outside the committed resolution is refused at `require_panel_capability`) |
 //! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, MRU and focus, overlays, tombstone, counts, read with a second container left in the workspace so the MRU entry is observable) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment). The live **grant row** is not covered by either: no accessor reads it once the record is gone — see the first row's rustdoc for what that would take |
+//! | PGO-15, refusal half (bitty#2476 residual 9) | here — `pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing`; the read half is **not** homed, see the blocking note below |
+//! | PGO-1, `PresentationMode` clause (bitty#2476 residual 9) | here — `pgo_1_a_rebind_keeps_the_panels_presentation_mode_on_its_leaf`; the `PanelId`/attachment/title half is `tests/panel_rebind.rs`, the mode half is not observable there because that fixture holds no leaf `View` |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
-//! Still without a row in this crate: PGO-5 and the disable arm of PGO-20
-//! (`disabled` on a live generation, then a re-enable that rebinds). Each row
-//! below is named here with the seam that blocks it rather than implied
-//! covered:
+//! Still without a row in this crate: PGO-5, the disable arm of PGO-20
+//! (`disabled` on a live generation, then a re-enable that rebinds), PGO-11
+//! (provider version records), and PGO-15's read half (a displaced generation
+//! reading its successor's queued events). Each is named here with the seam that
+//! blocks it rather than implied covered:
 //!
 //! - **PGO-5, PGO-20 disable arm** (`disabled` placeholder, then a re-enable
 //!   that rebinds): the reason token has exactly one production producer —
@@ -96,16 +99,18 @@
 //!   direction and no tolerant reader to drive. The persisted panel manifest
 //!   (`bitty-ui/src/panel_persist.rs:367`) has a version gate and unknown-field
 //!   tolerance, but it carries identity, not provider content.
-//! - **PGO-15** (verbs from a displaced generation): only `mount_panel`
-//!   (`registry/panel.rs:1930`, fence call `:1952`) and `present_placeholder`
-//!   (`:2294`, fence call `:2348`) revalidate at use through
-//!   `panel_state_at_controller_fence` (`:1699`); every other verb resolves
-//!   through `get_panel`/`get_panel_mut` (`:1754`/`:1776`), which compares the
-//!   presented generation to the allocation epoch and answers `StaleHandle`, so
-//!   the row's "refused with `ControllerConflict`" does not hold for the whole
-//!   verb set. Its read half has no accessor either: queued events (`:1224`) and
-//!   the panel scene slot (`registry/host.rs:1217`) are keyed by panel, not by
-//!   generation.
+//! - **PGO-15's read half** (a displaced generation reading its successor's
+//!   state): the refusal half is homed above, but the read half has no seam.
+//!   The panel-scoped bus (`PanelEventBus::queued_events_for_panel`,
+//!   `registry/panel.rs:1224`) and the panel scene slot
+//!   (`PanelRuntime::panel_scene`, `registry/host.rs:1217`) are keyed by panel
+//!   alone, so no accessor distinguishes "the queued events generation `N` may
+//!   read" from "the ones `N+1` may read" and no refusal exists to test. The
+//!   row's "refused with `ControllerConflict`" wording is also already known to
+//!   be narrower than the tree: the displaced-but-released generation is
+//!   answered `ControllerReleased`, which the record carries as finding (d)
+//!   rather than as a decided rule. Homing the read half needs a generation key
+//!   on those families, not a test.
 //!
 //! Naming them here keeps the matrix honest about what it covers instead of
 //! implying all twenty-three rows live in one file.
@@ -125,14 +130,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use bitty_config::panel_rules::{PanelPresentation, PanelSpawnRule};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::PluginId;
 use bitty_runtime::plugin_runtime::{
     LifecycleState, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort,
     PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource, controller_generation,
 };
+use bitty_runtime::runtime::panel_rules::presentation_for;
 use bitty_runtime::{
-    Generation, UiRect, ViewId,
+    Generation, LayoutNode, PresentationMode, UiRect, View, ViewId,
     registry::{
         BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelId, PanelRegistry,
         PanelRegistryConfig, PanelRuntime, PanelType, PlaceholderReason, WorkspaceId,
@@ -2047,5 +2054,342 @@ fn a_disposal_releases_the_lease_entry_and_the_placement_mirror() {
             Err(PanelError::NotFound { .. })
         ),
         "and the retired handle cannot name a live tenure"
+    );
+}
+
+/// PGO-15 (bitty#2476 residual 9): a verb a displaced generation still holds a
+/// handle for is refused, and the refusal lands before the container moves.
+///
+/// The refusal symbol is not assumed here, it is read off the tree: the only
+/// at-use revalidation in the registry is
+/// `PanelRegistry::panel_state_at_controller_fence`
+/// (`crates/bitty-runtime/src/registry/panel.rs:1711`). Two verbs reach it
+/// before they commit — `mount_panel` (call at `:1964`) and
+/// `present_placeholder` (call at `:2360`) — and it answers
+/// `ControllerReleased` (`:1743`) when the presented generation is the
+/// record's retained `last_controller_generation`, `ControllerConflict`
+/// (`:1758`) when the record binds or has ended a controller and the presented
+/// generation is neither, and the pre-existing `StaleHandle` while nothing ever
+/// bound. Every other lifecycle verb resolves through `get_panel` (`:1766`) /
+/// `get_panel_mut` (`:1788`), which stays fenced on the allocation epoch and
+/// answers `StaleHandle`; `dispose_panel` raises the same variant explicitly
+/// (`:2165`). All four are typed refusals taken before the commit.
+///
+/// Two limits of the row are stated rather than papered over, and neither is
+/// fixed here because both need production work an owner decision gates:
+///
+/// - The row's literal claim, "every verb is refused with
+///   `ControllerConflict`", does not hold on this tree. A generation whose own
+///   binding ended is refused `ControllerReleased`, which the decision record
+///   already carries as finding (d) ("the widened fence returns a variant D.2
+///   does not define for that case",
+///   `bitty-terminal-docs/specifications/panel-generation-ownership-decision.md`).
+///   `ControllerConflict` is the arm for a generation that is neither bound nor
+///   released, and this row pins both so the distinction cannot collapse.
+/// - The row's read half stays unproven: the panel-scoped bus
+///   (`PanelEventBus::queued_events_for_panel`) and the scene slot
+///   (`PanelRuntime::panel_scene`) are keyed by panel alone, so there is no
+///   generation dimension on which a displaced generation could be refused a
+///   read of its successor's queued events. A test cannot create that key.
+///
+/// Fails for a fence that is dropped from either verb (the mount or the
+/// placeholder commits and the container moves), for one that answers
+/// `StaleHandle` or `ControllerConflict` where the released arm belongs (the
+/// caller cannot tell its own ended binding from a foreign one), for a refusal
+/// that writes the placeholder, the release record, the attachment, the
+/// binding, or the grant row before refusing, and for a grant lookup that
+/// resolves a released generation's row.
+#[test]
+fn pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing() {
+    let (mut runtime, plugin, panels) = edge_fixture("displaced", "acme.displaced");
+    let (panel, epoch) = bound_container(&panels, &plugin, 9, 17);
+    let ended = controller_generation(1);
+    let successor = controller_generation(2);
+
+    // The attachment is released before the edge so the mount below asks the
+    // generation question: a still-mounted container refuses a second mount with
+    // `PanelAlreadyMounted` before the fence is reached, which is a different
+    // answer than the one this row measures.
+    panels
+        .borrow_mut()
+        .unmount_panel(panel, epoch)
+        .expect("unmount before the reload");
+    let state_before = panels
+        .borrow()
+        .panel_state(panel, epoch)
+        .expect("live container");
+    let described_before = panels
+        .borrow()
+        .panel_description(panel, epoch)
+        .expect("the container's title and description");
+
+    runtime.reload(&plugin).expect("reload");
+    assert_eq!(
+        panels.borrow().registry().controller_generation(panel),
+        Some(successor),
+        "the edge rebound the container, so the displaced generation is generation N"
+    );
+    let releases_after_edge = panels.borrow().registry().unbind_release_count(panel);
+    assert_eq!(
+        panels.borrow().registry().placeholder_reason(panel),
+        None,
+        "the bind cleared the reload placeholder and gave the container a controller again"
+    );
+
+    // 1. The controller fence: the two verbs that present a generation.
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .mount_panel(panel, ended, ViewId::new(30))
+            .expect_err("a mount from the generation the reload displaced is refused"),
+        PanelError::ControllerReleased {
+            panel_id: panel,
+            released_generation: ended,
+        },
+        "the fence names the caller's own ended binding instead of a generic stale handle"
+    );
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .present_placeholder(panel, ended, "unloaded")
+            .expect_err("a displaced generation cannot repaint the container as unloaded"),
+        PanelError::ControllerReleased {
+            panel_id: panel,
+            released_generation: ended,
+        },
+        "the placeholder surface is fenced by the same arm"
+    );
+    assert_eq!(
+        panels.borrow().registry().placeholder_reason(panel),
+        None,
+        "the refused placeholder wrote nothing over a container the successor drives"
+    );
+    assert_eq!(
+        panels.borrow().registry().unbind_release_count(panel),
+        releases_after_edge,
+        "and the refusal ran no second release of the ended generation"
+    );
+
+    // 2. The allocation-epoch verbs: every lifecycle command a handle can issue.
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .unmount_panel(panel, ended)
+            .expect_err("a displaced generation cannot unmount the successor's panel"),
+        PanelError::StaleHandle {
+            expected_generation: epoch,
+            found_generation: ended,
+            id_raw: panel.0,
+        },
+        "the lifecycle verbs stay fenced on the allocation epoch, unchanged by a bind"
+    );
+    // Each borrow is its own statement: an array of three `borrow_mut()`
+    // temporaries would keep the first `RefMut` alive until the loop ends.
+    let suspended = panels
+        .borrow_mut()
+        .suspend_panel(panel, ended)
+        .expect_err("a displaced generation cannot suspend the successor's panel");
+    let resumed = panels
+        .borrow_mut()
+        .resume_panel(panel, ended)
+        .expect_err("a displaced generation cannot resume the successor's panel");
+    let disposed = panels
+        .borrow_mut()
+        .dispose_panel(panel, ended)
+        .expect_err("a displaced generation cannot dispose the successor's panel");
+    for (what, error) in [
+        ("suspend", suspended),
+        ("resume", resumed),
+        ("dispose", disposed),
+    ] {
+        assert_eq!(
+            error,
+            PanelError::StaleHandle {
+                expected_generation: epoch,
+                found_generation: ended,
+                id_raw: panel.0,
+            },
+            "the {what} verb is refused on the same handle check"
+        );
+    }
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .focus_panel(panel, ended, WorkspaceId::new(9))
+            .expect_err("a displaced generation cannot focus the successor's panel"),
+        PanelError::StaleHandle {
+            expected_generation: epoch,
+            found_generation: ended,
+            id_raw: panel.0,
+        },
+        "focus does not route a displaced generation's command either"
+    );
+
+    // 3. The control arm: a generation that never bound the container is a
+    //    conflict, not a release. Without this the row would pass for a fence
+    //    that answered one variant for every foreign generation.
+    assert_eq!(
+        panels
+            .borrow_mut()
+            .mount_panel(panel, controller_generation(9), ViewId::new(31))
+            .expect_err("a generation that never bound the container is refused"),
+        PanelError::ControllerConflict {
+            panel_id: panel,
+            bound_generation: Some(successor),
+            presented_generation: controller_generation(9),
+        },
+        "the conflict arm names the binding the caller is not"
+    );
+
+    // 4. No refusal moved anything.
+    let host = panels.borrow();
+    let registry = host.registry();
+    assert_eq!(
+        host.panel_state(panel, epoch).expect("live container"),
+        state_before,
+        "the container's lifecycle state survived every refused verb"
+    );
+    assert_eq!(
+        registry.panel_view(panel, epoch).expect("live container"),
+        None,
+        "no refused mount attached a view: the unmount's result stands"
+    );
+    assert_eq!(
+        host.placement_len(),
+        0,
+        "and the facade's placement mirror bound no view either"
+    );
+    assert_eq!(
+        host.panel_description(panel, epoch)
+            .expect("the container's title and description"),
+        described_before,
+        "title and description are container facts no refusal touches"
+    );
+    assert_eq!(
+        registry.controller_generation(panel),
+        Some(successor),
+        "the binding still names the successor"
+    );
+    assert!(
+        registry.is_panel_capability_granted(panel, successor, CREATE),
+        "the successor keeps the row its bind installed"
+    );
+    assert!(
+        !registry.is_panel_capability_granted(panel, ended, CREATE),
+        "and the released generation reads no grant, refused verb or not"
+    );
+    assert_eq!(
+        registry.error_count("ControllerReleased"),
+        2,
+        "the released arm ran once per fenced verb"
+    );
+    assert_eq!(
+        registry.error_count("ControllerConflict"),
+        1,
+        "and the conflict arm ran once, for the foreign generation"
+    );
+}
+
+/// PGO-1 (bitty#2476 residual 9): a panel's `PresentationMode` survives the
+/// generation swap that rebinds it.
+///
+/// The mode is a workspace fact on the leaf `View`
+/// (`crates/bitty-ui/src/view.rs:227`, stamped through the single gate at
+/// `crates/bitty-ui/src/presentation.rs:157`), while the panel host holds only
+/// the `ViewId` attachment and the controller binding
+/// (`PanelRecord.view`, `crates/bitty-runtime/src/registry/panel.rs:601`). The
+/// row therefore asserts the composite D.3 claims — the same `PanelId` stays
+/// attached to the same leaf, and that leaf still presents the mode the user
+/// stamped rather than the mode its spawn rule asks for — across a reload driven
+/// by the plugin runtime's own edge.
+///
+/// The rule-derived mode is read from the production mapper
+/// (`presentation_for`, `crates/bitty-runtime/src/runtime/panel_rules.rs:50`)
+/// rather than assumed to be `Tiled`, so a rebind that re-presented the
+/// container through the spawn rule would fail this row instead of matching it
+/// by coincidence.
+///
+/// Fails for the generation-owned ephemeral panel the decision rejects: an edge
+/// that retires the container, or one that re-creates and re-mounts it, leaves
+/// the panel attached to another view (or to none), so the leaf the user floated
+/// no longer presents the panel and the mode assertion no longer describes it.
+#[test]
+fn pgo_1_a_rebind_keeps_the_panels_presentation_mode_on_its_leaf() {
+    let (mut runtime, plugin, panels) = edge_fixture("presentation", "acme.presentation");
+    let view = ViewId::new(23);
+    let (panel, epoch) = bound_container(&panels, &plugin, 10, view.0);
+
+    // The spawn rule asks for a tiled leaf: that is the mode the panel starts
+    // in, and the mode a re-presentation would impose.
+    let rule = PanelSpawnRule {
+        cmd: Some("notes".to_string()),
+        cmd_regex: None,
+        title_regex: None,
+        content: None,
+        presentation: Some(PanelPresentation::Tiled),
+        width: None,
+        height: None,
+        workspace: None,
+        centered: None,
+    };
+    let ruled = presentation_for(&rule).expect("the rule names a presentation mode");
+    assert_eq!(
+        ruled,
+        PresentationMode::Tiled,
+        "the rule's mode is the baseline this row measures against"
+    );
+    let mut layout = LayoutNode::leaf(View::with_presentation(view, 80, 24, ruled));
+
+    // The user floats the panel through the same gate the workspace command
+    // routes through.
+    assert!(
+        PresentationMode::request_transition(
+            layout.find_leaf_mut(view).expect("the leaf exists"),
+            PresentationMode::Floating,
+        ),
+        "the gate permits the mode change"
+    );
+    let state_before = panels
+        .borrow()
+        .panel_state(panel, epoch)
+        .expect("live container");
+
+    runtime.reload(&plugin).expect("reload");
+
+    let host = panels.borrow();
+    let registry = host.registry();
+    assert_eq!(
+        registry.controller_generation(panel),
+        Some(controller_generation(2)),
+        "the edge replaced the controller generation"
+    );
+    assert_eq!(
+        layout
+            .find_leaf(view)
+            .expect("the leaf survives the rebind")
+            .presentation(),
+        PresentationMode::Floating,
+        "the leaf keeps the mode the user stamped, not the mode the rule asks for"
+    );
+    assert_eq!(
+        host.placement_view_of(panel),
+        Some(view),
+        "and it is still the leaf the container is presented on, so the mode above is the panel's"
+    );
+    assert_eq!(
+        registry.panel_view(panel, epoch).expect("live container"),
+        Some(view),
+        "the record's attachment is the same view id"
+    );
+    assert_eq!(
+        host.panel_state(panel, epoch).expect("live container"),
+        state_before,
+        "the container's lifecycle state survives the swap"
+    );
+    assert_eq!(
+        host.panel_description(panel, epoch)
+            .expect("the container's title and description"),
+        (Some("Notes".to_string()), Some("acme notes".to_string())),
+        "title and description are container facts the edge leaves alone"
     );
 }

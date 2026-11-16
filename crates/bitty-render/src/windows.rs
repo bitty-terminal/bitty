@@ -711,6 +711,7 @@ mod tests {
                 color,
             }],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],

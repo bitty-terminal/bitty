@@ -616,6 +616,125 @@ impl Runtime {
         }
     }
 
+    /// Edge/corner resize target on a floating panel's border band (CTX-1861).
+    ///
+    /// Matches a pointer over the float's decoration border/padding ring (or a
+    /// narrow outer grab margin around `frame.frame`) while strictly excluding
+    /// `frame.content` so interior clicks and text selection never steal focus
+    /// or TUI mouse events. Topmost float wins.
+    fn floating_border_resize_target(
+        &self,
+        pos: CursorPosition,
+    ) -> Option<(ViewId, ResizeEdge, bool)> {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
+        }
+        let pad = f64::from(self.window_padding_physical());
+        let x = pos.x - pad;
+        let y = pos.y - pad;
+        let handle_px = (4.0 * self.scale_factor.get()).max(4.0);
+        for frame in self.present_frames().into_iter().rev() {
+            let c = frame.content;
+            if c.width > 0 && c.height > 0 {
+                let cx0 = f64::from(c.x);
+                let cy0 = f64::from(c.y);
+                let cx1 = cx0 + f64::from(c.width);
+                let cy1 = cy0 + f64::from(c.height);
+                if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 {
+                    return None;
+                }
+            }
+            if frame.tier != Some(bitty_ui::OverlayTier::Float)
+                || frame.frame.width == 0
+                || frame.frame.height == 0
+            {
+                continue;
+            }
+            let fx0 = f64::from(frame.frame.x);
+            let fy0 = f64::from(frame.frame.y);
+            let fw = f64::from(frame.frame.width);
+            let fh = f64::from(frame.frame.height);
+            let fx1 = fx0 + fw;
+            let fy1 = fy0 + fh;
+            if x < fx0 - handle_px
+                || x >= fx1 + handle_px
+                || y < fy0 - handle_px
+                || y >= fy1 + handle_px
+            {
+                continue;
+            }
+            if self.floating_resize_bounds(frame.view).is_none() {
+                continue;
+            }
+            let corner_x = (12.0 * self.scale_factor.get()).max(8.0).min(fw / 3.0);
+            let corner_y = (12.0 * self.scale_factor.get()).max(8.0).min(fh / 3.0);
+            let left = x < fx0 + corner_x;
+            let right = x >= fx1 - corner_x;
+            let top = y < fy0 + corner_y;
+            let bottom = y >= fy1 - corner_y;
+            let edge = match (left, right, top, bottom) {
+                (true, false, true, false) => ResizeEdge::TopLeft,
+                (false, true, true, false) => ResizeEdge::TopRight,
+                (true, false, false, true) => ResizeEdge::BottomLeft,
+                (false, true, false, true) => ResizeEdge::BottomRight,
+                (true, false, false, false) => ResizeEdge::Left,
+                (false, true, false, false) => ResizeEdge::Right,
+                (false, false, true, false) => ResizeEdge::Top,
+                (false, false, false, true) => ResizeEdge::Bottom,
+                _ => continue,
+            };
+            return Some((frame.view, edge, self.is_anchored_overlay(frame.view)));
+        }
+        None
+    }
+
+    /// Maps a [`ResizeEdge`] to its directional OS cursor icon (CTX-1861).
+    const fn resize_edge_cursor_icon(edge: ResizeEdge) -> bitty_platform::CursorIcon {
+        match edge {
+            ResizeEdge::Top | ResizeEdge::Bottom => bitty_platform::CursorIcon::NsResize,
+            ResizeEdge::Left | ResizeEdge::Right => bitty_platform::CursorIcon::EwResize,
+            ResizeEdge::TopLeft | ResizeEdge::BottomRight => bitty_platform::CursorIcon::NwseResize,
+            ResizeEdge::TopRight | ResizeEdge::BottomLeft => bitty_platform::CursorIcon::NeswResize,
+        }
+    }
+
+    /// Directional resize cursor icon for an active or hovered border/corner
+    /// resize (floating panel or tiled split), or `None` when not over a
+    /// resize handle (CTX-1861).
+    #[must_use]
+    pub fn resize_cursor_icon(&self) -> Option<bitty_platform::CursorIcon> {
+        if let Some(edge) = self.float_resize_edge() {
+            return Some(Self::resize_edge_cursor_icon(edge));
+        }
+        if let Some(drag) = self.border_drag.as_ref() {
+            let has_h = drag.splits.iter().any(|s| s.1 == SplitAxis::Horizontal);
+            let has_v = drag.splits.iter().any(|s| s.1 == SplitAxis::Vertical);
+            return match (has_h, has_v) {
+                (true, true) => Some(bitty_platform::CursorIcon::AllScroll),
+                (true, false) => Some(bitty_platform::CursorIcon::EwResize),
+                (false, true) => Some(bitty_platform::CursorIcon::NsResize),
+                (false, false) => None,
+            };
+        }
+        let cursor = self.last_cursor?;
+        if !self.alt_pressed && !self.super_pressed && !self.shift_pressed {
+            if let Some((_, edge, _)) = self.floating_border_resize_target(cursor) {
+                return Some(Self::resize_edge_cursor_icon(edge));
+            }
+            if let Some(axis) = self.border_drag_hover_at(cursor) {
+                return Some(match axis {
+                    SplitAxis::Horizontal => bitty_platform::CursorIcon::EwResize,
+                    SplitAxis::Vertical => bitty_platform::CursorIcon::NsResize,
+                });
+            }
+        } else if self.alt_pressed && !self.shift_pressed {
+            if let Some(edge) = self.float_resize_hover_at(cursor) {
+                return Some(Self::resize_edge_cursor_icon(edge));
+            }
+        }
+        None
+    }
+
     /// Attempts to grab a float border for an Alt+edge resize (CTX-1150,
     /// issue #2945).
     ///
@@ -1446,6 +1565,44 @@ impl Runtime {
         let Some(cursor) = self.last_cursor else {
             return false;
         };
+        if self.alt_drag.is_some() || self.tiled_drag.is_some() || self.float_resize.is_some() {
+            return false;
+        }
+        // Only a *live* border drag owns the pointer. A canceled tombstone left
+        // by an external layout replacement (`cancel_border_drag`) exists only
+        // to consume the release that ends the abandoned gesture; a fresh press
+        // is a new gesture and supersedes it when the grab below succeeds.
+        // Refusing on `border_drag.is_some()` wedged divider resizing for good
+        // whenever that release never arrived (the tree changed while the
+        // button was held, or the pointer left the window), because nothing
+        // else clears the tombstone.
+        if self.border_drag_active() {
+            return false;
+        }
+        // CTX-1861: plain Left-press on a floating panel's border or corner
+        // grabs a float resize smoothly like a window. Checked before
+        // `pointer_in_content` because the float's border may sit over a
+        // lower tiled pane's content rect; `floating_border_resize_target`
+        // itself rejects any pointer inside a higher/owning frame's content.
+        if let Some((leaf, edge, anchored)) = self.floating_border_resize_target(cursor) {
+            let pad = f64::from(self.window_padding_physical());
+            let clamped = CursorPosition {
+                x: cursor.x.max(pad),
+                y: cursor.y.max(pad),
+            };
+            if let Some(point) = self.floating_resize_point(clamped, anchored) {
+                self.float_resize = Some(FloatResizeState {
+                    leaf,
+                    edge,
+                    anchor_col: i32::from(point.x),
+                    anchor_row: i32::from(point.y),
+                    anchored,
+                });
+                self.set_focus(leaf);
+                self.clear_hover_pending();
+                return true;
+            }
+        }
         if self.pointer_in_content(cursor) {
             return false;
         }

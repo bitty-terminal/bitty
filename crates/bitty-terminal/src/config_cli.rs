@@ -3851,6 +3851,7 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         cfg.window_background_fit = window_background_fit.as_str().to_string();
         cfg.window_background_opacity = window_background_opacity;
         cfg.window_background_position = window_background_position.as_str().to_string();
+        cfg.floating = bitty_runtime::FloatingPanelConfig::from_config(&effective.floating);
         // CTX-0355: carry the same resolved preset's terminal palette
         // (background/foreground/cursor/selection + 16 ANSI) onto the runtime
         // config so the default-path renderer and clear color follow

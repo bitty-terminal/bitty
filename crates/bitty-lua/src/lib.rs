@@ -97,9 +97,9 @@ pub use config_require::{
 };
 
 pub use config::{
-    AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
-    LayoutData, MouseData, PluginData, ScrollbarData, SelectionData, StyleData, TerminalData,
-    ViewOverrideData, WindowData,
+    AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FloatingData, FontData,
+    KeymapData, LayoutData, MouseData, PluginData, ScrollbarData, SelectionData, StyleData,
+    TerminalData, ViewOverrideData, WindowData,
 };
 pub use host::{
     API_VERSION, BoundedExecution, BridgeError, COMMAND_LIST_MAX_ENTRIES,

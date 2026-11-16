@@ -165,14 +165,14 @@ pub use trust::{
 pub use types::{
     AmbiguousWidth, AnimationDurations, AnimationEasing, AnimationEasings, AnimationTransition,
     AnimationsConfig, AppearanceConfig, BackgroundFit, BackgroundPosition, BellMode, BidiMode,
-    CloseConfirm, CursorStyle, DecorationConfig, EffectiveConfig, FontConfig, HistoryCaptureConfig,
-    HistoryConfig, KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES,
-    MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, MAX_VIEW_SELECTOR_BYTES,
-    MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec, ReducedMotion,
-    ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance, ResolvedViewStyle,
-    ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig, TerminalConfig,
-    ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride, ViewSelector,
-    WindowConfig, WorkspaceConfig,
+    CloseConfirm, CursorStyle, DecorationConfig, EffectiveConfig, FloatingConfig, FontConfig,
+    HistoryCaptureConfig, HistoryConfig, KeymapEntry, LayoutConfig,
+    MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
+    MAX_VIEW_SELECTOR_BYTES, MAX_WORKSPACE_LABEL, MouseConfig, OutlineColor, PluginSpec,
+    ReducedMotion, ResolvedOutlineColors, ResolvedOutlineWidths, ResolvedViewAppearance,
+    ResolvedViewStyle, ScrollbarConfig, ScrollbarMode, SelectionConfig, StyleConfig,
+    TerminalConfig, ViewAppearanceOverride, ViewAppearanceTarget, ViewContent, ViewOverride,
+    ViewSelector, WindowConfig, WorkspaceConfig,
 };
 pub use validation::{Validate, collect_diagnostics, validate_stack};
 pub use wheel::{

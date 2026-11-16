@@ -200,6 +200,13 @@ fn runtime_adopts(field: &str) -> bool {
             | "workspace.show_bar"
             | "workspace.bar.edge"
             | "terminal.bidi"
+            | "floating.width"
+            | "floating.height"
+            | "floating.centered"
+            | "floating.x"
+            | "floating.y"
+            | "floating.background_opacity"
+            | "floating.background"
     ) || field.starts_with("appearance.animations")
         || field == "views"
         || field.starts_with(bitty_config::VIEWS_FIELD_PREFIX)
@@ -466,6 +473,9 @@ pub(crate) fn apply_live_presentation(
         .set_chrome_style(chrome_style)
         .map_err(|err| format!("chrome style: {err}"))?;
     runtime.set_animations(resolved.animations);
+    runtime.set_floating_config(bitty_runtime::FloatingPanelConfig::from_config(
+        &effective.floating,
+    ));
     runtime
         .set_window_padding(effective.window.padding)
         .map_err(|err| format!("window.padding: {err}"))?;

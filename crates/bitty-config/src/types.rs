@@ -3348,14 +3348,14 @@ impl ChromeConfig {
 /// pair (RFC-0001 `OQ-039`): `border_color` is the base, and
 /// `border_color_focused` / `border_color_idle` override it explicitly when
 /// the user sets them. Resolution order (later wins) is theme token then
-/// base then explicit pair; see [`Self::resolve_outline`]. Values are
+/// base then explicit pair; see [`DecorationConfig::resolve_outline`]. Values are
 /// canonical `#RRGGBB` / `#RRGGBBAA` ([`OutlineColor`]).
 ///
 /// CTX-0344 adds the accepted focus/idle **outline width** triple
 /// (RFC-0001 `OQ-045`): `border_width` is the base (inheriting
 /// `decoration.border` when unset), and `border_width_focused` /
 /// `border_width_idle` override it explicitly; see
-/// [`Self::resolve_outline_width`]. Bounds are `0..=16` logical px,
+/// [`DecorationConfig::resolve_outline_width`]. Bounds are `0..=16` logical px,
 /// fail-closed, live reload, and the ring is painted inside the frame so the
 /// content grid never moves.
 ///
@@ -3379,6 +3379,115 @@ impl ChromeConfig {
 //
 // CTX-1159 S0: `PartialEq` only (`background_tint_strength` is a float,
 // so `Eq` no longer holds — same posture as `LayoutConfig::resize_step`).
+/// Default floating panel size ratio (`0.8` = 80% of container).
+pub const DEFAULT_FLOATING_SIZE_RATIO: f32 = 0.8;
+
+/// Default floating panel geometry and appearance (`floating = { ... }`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FloatingConfig {
+    /// Default width as a fraction of the container width in `(0.0, 1.0]`.
+    /// `None` uses [`DEFAULT_FLOATING_SIZE_RATIO`].
+    pub width: Option<f32>,
+    /// Default height as a fraction of the container height in `(0.0, 1.0]`.
+    /// `None` uses [`DEFAULT_FLOATING_SIZE_RATIO`].
+    pub height: Option<f32>,
+    /// Whether new floating panels start centered in the container.
+    /// `None` defaults to `true`.
+    pub centered: Option<bool>,
+    /// Horizontal anchor position ratio in `0.0..=1.0` when not centered.
+    pub x: Option<f32>,
+    /// Vertical anchor position ratio in `0.0..=1.0` when not centered.
+    pub y: Option<f32>,
+    /// Optional backdrop opacity override in `0.0..=1.0`.
+    /// `None` inherits the theme/window background opacity.
+    pub background_opacity: Option<f32>,
+    /// Optional `#RRGGBB` backdrop color override.
+    /// `None` inherits the active theme background.
+    pub background: Option<String>,
+}
+
+impl FloatingConfig {
+    /// Validates every floating panel configuration bound (fail-closed).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(w) = self.width {
+            if !(w.is_finite() && w > 0.0 && w <= 1.0) {
+                return Err(ConfigError::validation(
+                    "floating.width",
+                    "must be finite within (0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(h) = self.height {
+            if !(h.is_finite() && h > 0.0 && h <= 1.0) {
+                return Err(ConfigError::validation(
+                    "floating.height",
+                    "must be finite within (0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(x) = self.x {
+            if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+                return Err(ConfigError::validation(
+                    "floating.x",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(y) = self.y {
+            if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+                return Err(ConfigError::validation(
+                    "floating.y",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(opacity) = self.background_opacity {
+            if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+                return Err(ConfigError::validation(
+                    "floating.background_opacity",
+                    "must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(bg) = &self.background {
+            if OutlineColor::parse(bg).is_none() {
+                return Err(ConfigError::validation(
+                    "floating.background",
+                    "must be a #RRGGBB or #RRGGBBAA hex color",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolves the effective width fraction (default `0.8`).
+    #[must_use]
+    pub fn resolve_width(&self) -> f32 {
+        self.width.unwrap_or(DEFAULT_FLOATING_SIZE_RATIO)
+    }
+
+    /// Resolves the effective height fraction (default `0.8`).
+    #[must_use]
+    pub fn resolve_height(&self) -> f32 {
+        self.height.unwrap_or(DEFAULT_FLOATING_SIZE_RATIO)
+    }
+
+    /// Resolves whether floating panels start centered (default `true`).
+    #[must_use]
+    pub fn resolve_centered(&self) -> bool {
+        self.centered.unwrap_or(true)
+    }
+
+    /// Resolves the optional `#RRGGBB`/`#RRGGBBAA` background override into `[r, g, b, a]`.
+    #[must_use]
+    pub fn resolve_background_rgba(&self) -> Option<[u8; 4]> {
+        self.background
+            .as_deref()
+            .and_then(OutlineColor::parse)
+            .map(|c| c.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecorationConfig {
     /// Gap between adjacent views inside one workspace, logical px.
@@ -4229,6 +4338,8 @@ pub struct EffectiveConfig {
     /// Core-owned workspace decoration in logical px (CTX-0292; unified
     /// defaults `6/6/1/6/6` since #1342, spec sync tracked by #1374).
     pub decoration: DecorationConfig,
+    /// Default floating panel geometry and appearance (`floating = { ... }`).
+    pub floating: FloatingConfig,
     /// Merged per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343).
     ///
     /// Deep-merged per selector per field across layers, sorted by tier then
@@ -4293,6 +4404,7 @@ impl Default for EffectiveConfig {
             workspace: WorkspaceConfig::default(),
             chrome: ChromeConfig::default(),
             decoration: DecorationConfig::default(),
+            floating: FloatingConfig::default(),
             views: Vec::new(),
             scrollbar: ScrollbarConfig::default(),
             mouse: MouseConfig::default(),
@@ -4442,6 +4554,7 @@ impl EffectiveConfig {
             crate::keymap::validate_leader_timeout_ms(ms)?;
         }
         self.decoration.validate()?;
+        self.floating.validate()?;
         // CTX-0343: every merged `views` entry must stay structurally valid
         // (grammar/bounds); the per-View AC-1/AC-2 contrast check then runs
         // on every target resolvable without live runtime state.

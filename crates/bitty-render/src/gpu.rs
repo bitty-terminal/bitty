@@ -1091,12 +1091,20 @@ fn clear_headless_rgba(rgba: &mut [u8], background: [u8; 4]) {
 
 /// [`PresentStats`] for one headless present of `draw_list` at `frame`.
 fn headless_present_stats(frame: u64, draw_list: &DrawList) -> PresentStats {
+    let float_fills: usize = draw_list.float_layers.iter().map(|l| l.fills.len()).sum();
+    let float_rounded: usize = draw_list
+        .float_layers
+        .iter()
+        .map(|l| l.rounded_fills.len() + usize::from(l.backdrop.is_some()))
+        .sum();
     PresentStats {
         frame,
         fills: draw_list.fills.len()
+            + float_fills
             + draw_list.overlay_fills.len()
             + draw_list.overlay_content_fills.len(),
         rounded_fills: draw_list.rounded_fills.len()
+            + float_rounded
             + draw_list.overlay_card_rounded_fills.len()
             + draw_list.overlay_rounded_fills.len(),
         glyphs: draw_list.glyphs.len(),
@@ -2007,12 +2015,20 @@ impl Surface {
                 telemetry::present_ok();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
+                let float_fills: usize = draw_list.float_layers.iter().map(|l| l.fills.len()).sum();
+                let float_rounded: usize = draw_list
+                    .float_layers
+                    .iter()
+                    .map(|l| l.rounded_fills.len() + usize::from(l.backdrop.is_some()))
+                    .sum();
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: draw_list.fills.len()
+                        + float_fills
                         + draw_list.overlay_fills.len()
                         + draw_list.overlay_content_fills.len(),
                     rounded_fills: draw_list.rounded_fills.len()
+                        + float_rounded
                         + draw_list.overlay_card_rounded_fills.len()
                         + draw_list.overlay_rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
@@ -2142,6 +2158,19 @@ impl Surface {
         // Rounded decoration fills/rings (CTX-0311).
         for fill in &draw_list.rounded_fills {
             fill_rounded_rect_rgba(rgba, width, height, fill);
+        }
+        // Per-float-panel layers (CTX-1861): backdrop occludes lower tiers,
+        // then float cell fills paint over the backdrop, then float chrome.
+        for layer in &draw_list.float_layers {
+            if let Some(backdrop) = &layer.backdrop {
+                fill_rounded_rect_rgba(rgba, width, height, backdrop);
+            }
+            for fill in &layer.fills {
+                fill_rect_rgba(rgba, width, height, fill.rect, fill.color);
+            }
+            for fill in &layer.rounded_fills {
+                fill_rounded_rect_rgba(rgba, width, height, fill);
+            }
         }
         // CTX-0347: per-`View` background images paint above cell backgrounds
         // and the decoration ring, below overlay fills and glyphs.
@@ -3414,6 +3443,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -3449,6 +3479,7 @@ mod tests {
                 color,
             }],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -3471,6 +3502,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -3681,6 +3713,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -3833,6 +3866,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4028,6 +4062,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4059,6 +4094,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4264,6 +4300,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4309,6 +4346,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4672,6 +4710,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],
@@ -4819,6 +4858,7 @@ mod tests {
             },
             fills: vec![],
             rounded_fills: vec![ring.clone()],
+            float_layers: Vec::new(),
             backgrounds: vec![],
             overlay_fills: vec![],
             overlay_card_rounded_fills: vec![],

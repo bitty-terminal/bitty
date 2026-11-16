@@ -816,3 +816,175 @@ fn restore_drops_the_stored_resize_extent() {
         "a restored pin must present at the default anchored share: {restored:?} vs {home:?}"
     );
 }
+
+#[test]
+fn alt_drag_moves_float_under_tui_mouse_tracking() {
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.set_focus(ViewId::new(1));
+    // Enable SGR 1006 + 1000 mouse tracking on the focused detached float
+    // (mimicking btop / rmpc / opencode).
+    rt.handle_pty_bytes(b"\x1b[?1000;1006h");
+    rt.tick().expect("tick");
+
+    let home = frame_of(&rt, ViewId::new(1));
+    let (cw, ch) = rt.live_cell_size();
+    let cx = f64::from(rt.window_padding_physical())
+        + f64::from(home.content.x)
+        + f64::from(home.content.width) / 2.0;
+    let cy = f64::from(rt.window_padding_physical())
+        + f64::from(home.content.y)
+        + f64::from(home.content.height) / 2.0;
+    let grab = CursorPosition { x: cx, y: cy };
+    rt.handle_cursor_moved(grab);
+    alt(&mut rt, PressState::Pressed);
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Pressed));
+    assert!(
+        rt.alt_drag_active(),
+        "Alt+Left-press must grab float even when TUI mouse tracking is active"
+    );
+    rt.handle_cursor_moved(CursorPosition {
+        x: cx + f64::from(cw * 2),
+        y: cy + f64::from(ch),
+    });
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
+    alt(&mut rt, PressState::Released);
+    assert!(!rt.alt_drag_active());
+
+    let moved = frame_of(&rt, ViewId::new(1));
+    assert!(
+        moved.frame.x > home.frame.x && moved.frame.y > home.frame.y,
+        "Alt+drag must move float under mouse tracking: {moved:?} vs {home:?}"
+    );
+}
+
+#[test]
+fn plain_border_drag_resizes_float_and_sets_cursor_icon() {
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.tick().expect("tick");
+
+    let home = frame_of(&rt, ViewId::new(1));
+    let pad = f64::from(rt.window_padding_physical());
+    // Hover on the right border band of the float (outside content, inside frame).
+    let right_border = CursorPosition {
+        x: pad + f64::from(home.frame.x) + f64::from(home.frame.width) - 1.0,
+        y: pad + f64::from(home.frame.y) + f64::from(home.frame.height) / 2.0,
+    };
+    rt.handle_cursor_moved(right_border);
+    assert_eq!(
+        rt.resize_cursor_icon(),
+        Some(bitty_platform::CursorIcon::EwResize),
+        "hovering right border of float must show EwResize cursor"
+    );
+
+    // Plain Left-press (no Alt!) grabs the border resize.
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Pressed));
+    assert!(
+        rt.float_resize_active(),
+        "plain Left-press on float border must start float resize"
+    );
+    let (cw, _) = rt.live_cell_size();
+    rt.handle_cursor_moved(CursorPosition {
+        x: right_border.x + f64::from(cw * 3),
+        y: right_border.y,
+    });
+    let grown = frame_of(&rt, ViewId::new(1));
+    assert!(
+        grown.cols > home.cols,
+        "plain border drag must grow float width: {grown:?} vs {home:?}"
+    );
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
+    assert!(!rt.float_resize_active());
+
+    // Hovering bottom-right corner shows NwseResize cursor.
+    let corner = CursorPosition {
+        x: pad + f64::from(grown.frame.x) + f64::from(grown.frame.width) - 1.0,
+        y: pad + f64::from(grown.frame.y) + f64::from(grown.frame.height) - 1.0,
+    };
+    rt.handle_cursor_moved(corner);
+    assert_eq!(
+        rt.resize_cursor_icon(),
+        Some(bitty_platform::CursorIcon::NwseResize),
+        "hovering bottom-right corner of float must show NwseResize cursor"
+    );
+}
+
+#[test]
+fn floating_config_applies_size_and_position_to_toggle_floating() {
+    let mut rt = Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig {
+        floating: bitty_runtime::FloatingPanelConfig {
+            width_ratio: 0.5,
+            height_ratio: 0.5,
+            centered: false,
+            x_ratio: Some(0.0),
+            y_ratio: Some(0.0),
+            ..bitty_runtime::FloatingPanelConfig::default()
+        },
+        ..bitty_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime must build");
+    install(&mut rt, two_pane());
+    rt.toggle_floating(Some(ViewId::new(1)))
+        .expect("toggle_floating must detach");
+    let frame = frame_of(&rt, ViewId::new(1));
+    let (cw, ch) = rt.live_cell_size();
+    // 80x24 container at 0.5x0.5 => ~40x12 cells (minus outer gap), anchored at top-left (0, 0).
+    assert!(
+        frame.frame.width <= cw * 40 && frame.frame.width >= cw * 38,
+        "expected ~50% width, got {} (cw={cw})",
+        frame.frame.width
+    );
+    assert!(
+        frame.frame.height <= ch * 12 && frame.frame.height >= ch * 11,
+        "expected ~50% height, got {} (ch={ch})",
+        frame.frame.height
+    );
+    assert!(
+        frame.frame.x <= cw as i32 && frame.frame.y <= ch as i32,
+        "top-left anchor should place float near origin, got {:?}",
+        frame.frame
+    );
+}
+
+#[test]
+fn floating_config_applies_to_in_tree_presentation_mode_floating() {
+    let mut rt = Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig {
+        floating: bitty_runtime::FloatingPanelConfig {
+            width_ratio: 0.5,
+            height_ratio: 0.5,
+            centered: false,
+            x_ratio: Some(0.0),
+            y_ratio: Some(0.0),
+            ..bitty_runtime::FloatingPanelConfig::default()
+        },
+        ..bitty_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime must build");
+    let mut layout = two_pane();
+    layout
+        .find_leaf_mut(ViewId::new(1))
+        .expect("leaf 1")
+        .set_presentation(bitty_runtime::PresentationMode::Floating);
+    install(&mut rt, layout);
+
+    let frame = frame_of(&rt, ViewId::new(1));
+    let (cw, ch) = rt.live_cell_size();
+    assert!(
+        frame.frame.width <= cw * 40 && frame.frame.width >= cw * 38,
+        "expected ~50% width on in-tree float, got {} (cw={cw})",
+        frame.frame.width
+    );
+    assert!(
+        frame.frame.height <= ch * 12 && frame.frame.height >= ch * 11,
+        "expected ~50% height on in-tree float, got {} (ch={ch})",
+        frame.frame.height
+    );
+    assert!(
+        frame.frame.x <= cw as i32 && frame.frame.y <= ch as i32,
+        "top-left anchor should place in-tree float near origin, got {:?}",
+        frame.frame
+    );
+}

@@ -760,6 +760,7 @@ fn normalize_reused_cursor_cell(
 struct CombinedLeaves {
     fills: Vec<bitty_render::grid::FillRect>,
     rounded: Vec<bitty_render::grid::RoundedFill>,
+    float_layers: Vec<bitty_render::grid::FloatDrawLayer>,
     /// CTX-0347 per-`View` background blits, emitted for every visible leaf
     /// (reused or re-rendered) because this retryable pass rebuilds the
     /// combined list from scratch on an atlas reset.
@@ -4289,6 +4290,7 @@ impl Runtime {
         fade: f32,
         higher_floats: &[bitty_render::geometry::RectPx],
         a11y: &mut bitty_ui::a11y_host::UiSnapshotHost,
+        float_layer: Option<&mut bitty_render::grid::FloatDrawLayer>,
         built: &mut CombinedLeaves,
     ) -> bool {
         let surface = bitty_render::scene::SceneSurface::new(
@@ -4330,8 +4332,19 @@ impl Runtime {
         } else {
             built.color_atlas_epoch = Some(color_epoch);
         }
-        built.fills.extend(scene.fills);
-        built.rounded.extend(scene.rounded);
+        if let Some(layer) = float_layer {
+            layer.fills.extend(scene.fills);
+            if !scene.rounded.is_empty() {
+                // Paint scene rounded boxes after backdrop/fills and before
+                // the float's outer shadow/glow/ring.
+                let chrome_rings = core::mem::take(&mut layer.rounded_fills);
+                layer.rounded_fills = scene.rounded;
+                layer.rounded_fills.extend(chrome_rings);
+            }
+        } else {
+            built.fills.extend(scene.fills);
+            built.rounded.extend(scene.rounded);
+        }
         built.glyphs.extend(scene.glyphs);
         built.needs_draw = true;
         built.scene_report.views = built.scene_report.views.saturating_add(1);
@@ -4514,67 +4527,67 @@ impl Runtime {
                     })
                 };
 
-                // CTX-1148 (#1978) + CTX-1271 (#2138): detached floats
-                // must paint opaque. The grid fills cover only the content
-                // rect; the decoration frame (border plus content-inset
-                // band, sub-cell remainder) would otherwise show tiled
-                // content beneath (siblings refill the container after
-                // detach, unlike the keep-slot model). One theme-bg fill
-                // covering the float frame occludes the base beneath the
-                // cell fills. The `DrawList` order paints fills before
-                // rounded fills, so lower leaves' rings/shadows/glows would
-                // still draw over that fill (#2138): a second solid
-                // rounded cover (same frame, `border: 0`) occludes lower
-                // chrome in the rounded pass too, ahead of this float's
-                // own shadow/glow/ring below. Float tier only, so the tiled
-                // baseline is unchanged. Empty frames skip fail-closed.
-                // Bounded: one fill plus one rounded cover per float frame.
-                if frame.tier == Some(OverlayTier::Float)
-                    && frame.frame.width > 0
-                    && frame.frame.height > 0
-                {
-                    let bg = self.renderer.theme_palette().background;
-                    let cover = bitty_render::geometry::RectPx::new(
-                        px_add(pad_px, frame.frame.x),
-                        px_add(pad_px, frame.frame.y),
-                        frame.frame.width,
-                        frame.frame.height,
-                    );
-                    built.fills.push(bitty_render::grid::FillRect {
-                        rect: cover,
-                        color: bg,
-                    });
-                    built.rounded.push(bitty_render::grid::RoundedFill {
-                        frame: cover,
-                        border: 0,
-                        radius: frame.radius,
-                        color: bg,
-                    });
-                    built.needs_draw = true;
+                // CTX-1861: per-float-panel draw layer paints the float's
+                // rounded backdrop underneath its own cell fills and its own
+                // shadow/glow/ring on top of its cell fills, so lower-tier
+                // chrome is occluded without erasing cell backgrounds inside
+                // the float.
+                let mut float_layer = (frame.tier == Some(OverlayTier::Float))
+                    .then(bitty_render::grid::FloatDrawLayer::default);
+                let effective_float_opacity = self
+                    .config
+                    .floating
+                    .background_opacity
+                    .unwrap_or_else(|| {
+                        bitty_render::window::sanitize_window_background_opacity(
+                            self.config.window_background_opacity,
+                        )
+                    })
+                    .clamp(0.0, 1.0);
+                let custom_float_bg = self.config.floating.background.is_some()
+                    || self.config.floating.background_opacity.is_some()
+                    || (effective_float_opacity - 1.0).abs() > f32::EPSILON;
+                let mut default_cell_bg = self.renderer.theme_palette().background;
+                if fade < 1.0 {
+                    default_cell_bg = bitty_render::grid::scale_alpha(default_cell_bg, fade);
+                }
+                if let Some(layer) = float_layer.as_mut() {
+                    if frame.frame.width > 0 && frame.frame.height > 0 {
+                        let mut bg = self
+                            .config
+                            .floating
+                            .background
+                            .unwrap_or_else(|| self.renderer.theme_palette().background);
+                        bg[3] = (f32::from(bg[3]) * effective_float_opacity).round() as u8;
+                        let cover = bitty_render::geometry::RectPx::new(
+                            px_add(pad_px, frame.frame.x),
+                            px_add(pad_px, frame.frame.y),
+                            frame.frame.width,
+                            frame.frame.height,
+                        );
+                        layer.backdrop = Some(bitty_render::grid::RoundedFill {
+                            frame: cover,
+                            border: 0,
+                            radius: frame.radius,
+                            color: bg,
+                        });
+                        built.needs_draw = true;
+                    }
                 }
 
                 // CTX-0311 ring (+ CTX-1162 S3 shadow/glow): shared by the
                 // reuse and re-render paths so a retained leaf still paints
                 // its live focus/open chrome. Back-to-front in
-                // `combined.rounded`: shadow, then glow, then ring.
+                // `rounded`: shadow, then glow, then ring.
+                let ring_target = float_layer
+                    .as_mut()
+                    .map_or(&mut built.rounded, |layer| &mut layer.rounded_fills);
                 let shadow_painted =
-                    self.push_leaf_shadow(frame, open_factor, fade, &ring_ctx, &mut built.rounded);
-                let glow_painted = self.push_leaf_glow(
-                    frame,
-                    view_id,
-                    open_factor,
-                    fade,
-                    &ring_ctx,
-                    &mut built.rounded,
-                );
-                let (frame_clip, ring_painted) = self.push_leaf_ring(
-                    frame,
-                    view_id,
-                    open_factor,
-                    fade,
-                    &ring_ctx,
-                    &mut built.rounded,
-                );
+                    self.push_leaf_shadow(frame, open_factor, fade, &ring_ctx, ring_target);
+                let glow_painted =
+                    self.push_leaf_glow(frame, view_id, open_factor, fade, &ring_ctx, ring_target);
+                let (frame_clip, ring_painted) =
+                    self.push_leaf_ring(frame, view_id, open_factor, fade, &ring_ctx, ring_target);
                 built.needs_draw |= shadow_painted || glow_painted || ring_painted;
 
                 // CTX-0347 (RFC-0001/OQ-042): the resolved per-`View` background
@@ -4714,19 +4727,33 @@ impl Runtime {
                         break;
                     }
                     built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
+                    let skip_default_bg = float_layer.is_some() && custom_float_bg;
+                    let fill_target = float_layer
+                        .as_mut()
+                        .map_or(&mut built.fills, |layer| &mut layer.fills);
                     if dx == 0 && dy == 0 {
-                        built.fills.extend(leaf.fills.iter().cloned());
+                        fill_target.extend(
+                            leaf.fills
+                                .iter()
+                                .filter(|fill| !skip_default_bg || fill.color != default_cell_bg)
+                                .cloned(),
+                        );
                     } else {
                         // Pure translation: shift every retained primitive
                         // (and refresh the glyph clip from the live frame,
                         // which is the same rounded inner arc moved with the
                         // frame) without re-examining the grid.
-                        built.fills.extend(leaf.fills.iter().map(|fill| {
-                            let mut fill = fill.clone();
-                            fill.rect.x = px_add(fill.rect.x, dx);
-                            fill.rect.y = px_add(fill.rect.y, dy);
-                            fill
-                        }));
+                        fill_target.extend(
+                            leaf.fills
+                                .iter()
+                                .filter(|fill| !skip_default_bg || fill.color != default_cell_bg)
+                                .map(|fill| {
+                                    let mut fill = fill.clone();
+                                    fill.rect.x = px_add(fill.rect.x, dx);
+                                    fill.rect.y = px_add(fill.rect.y, dy);
+                                    fill
+                                }),
+                        );
                     }
                     // CTX-1165 (#1993): a retained lower leaf still occludes
                     // under a higher float. The stored list is reused verbatim
@@ -4793,10 +4820,14 @@ impl Runtime {
                         fade,
                         &higher_floats,
                         &mut scene_a11y,
+                        float_layer.as_mut(),
                         &mut built,
                     ) {
                         stale_epoch = true;
                         break;
+                    }
+                    if let Some(layer) = float_layer {
+                        built.float_layers.push(layer);
                     }
                     continue;
                 }
@@ -5201,7 +5232,19 @@ impl Runtime {
                         },
                     );
                 }
-                built.fills.extend(fills);
+                if let Some(layer) = float_layer.as_mut() {
+                    if custom_float_bg {
+                        layer.fills.extend(
+                            fills
+                                .into_iter()
+                                .filter(|fill| fill.color != default_cell_bg),
+                        );
+                    } else {
+                        layer.fills.extend(fills);
+                    }
+                } else {
+                    built.fills.extend(fills);
+                }
                 if higher_floats.is_empty() {
                     built.glyphs.extend(glyphs);
                 } else {
@@ -5221,10 +5264,14 @@ impl Runtime {
                     fade,
                     &higher_floats,
                     &mut scene_a11y,
+                    float_layer.as_mut(),
                     &mut built,
                 ) {
                     stale_epoch = true;
                     break;
+                }
+                if let Some(layer) = float_layer {
+                    built.float_layers.push(layer);
                 }
             }
 
@@ -5401,6 +5448,7 @@ impl Runtime {
         FrameLayers {
             combined_fills: built.fills,
             combined_rounded: built.rounded,
+            combined_float_layers: built.float_layers,
             combined_backgrounds: built.backgrounds,
             combined_glyphs: built.glyphs,
             any_needs_draw: built.needs_draw,
@@ -8563,6 +8611,7 @@ impl Runtime {
                     },
                     fills: Vec::new(),
                     rounded_fills: Vec::new(),
+                    float_layers: Vec::new(),
                     backgrounds: Vec::new(),
                     overlay_fills: Vec::new(),
                     overlay_card_rounded_fills: vec![],
@@ -8578,6 +8627,7 @@ impl Runtime {
             tmp_list.generation = current_gen;
             tmp_list.fills = layers.combined_fills;
             tmp_list.rounded_fills = layers.combined_rounded;
+            tmp_list.float_layers = layers.combined_float_layers;
             tmp_list.backgrounds = layers.combined_backgrounds;
             tmp_list.overlay_fills = layers.combined_overlay;
             tmp_list.overlay_card_rounded_fills = layers.combined_overlay_card_rounded;
@@ -8589,6 +8639,7 @@ impl Runtime {
             tmp_list.plan.extent = plan_extent;
             if tmp_list.fills.is_empty()
                 && tmp_list.rounded_fills.is_empty()
+                && tmp_list.float_layers.is_empty()
                 && tmp_list.glyphs.is_empty()
             {
                 tmp_list.plan.dirty_rects = Vec::new();
@@ -9052,6 +9103,8 @@ struct FrameLayers {
     combined_fills: Vec<bitty_render::grid::FillRect>,
     /// Combined decoration rings.
     combined_rounded: Vec<bitty_render::grid::RoundedFill>,
+    /// Per-floating-panel draw layers (CTX-1861).
+    combined_float_layers: Vec<bitty_render::grid::FloatDrawLayer>,
     /// CTX-0347 per-`View` background blits.
     combined_backgrounds: Vec<bitty_render::grid::ImageBlit>,
     /// Overlay fills (cursor, selection, banners, scrollbar).

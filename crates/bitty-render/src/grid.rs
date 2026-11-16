@@ -1899,6 +1899,20 @@ impl ImageBlit {
     }
 }
 
+/// Per-floating-panel draw layer (CTX-1861).
+///
+/// Paints the float's rounded occlusion/backdrop fill underneath its own
+/// cell fills, and its own shadow/glow/ring on top of its cell fills.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FloatDrawLayer {
+    /// Rounded occlusion/backdrop fill covering the float frame.
+    pub backdrop: Option<RoundedFill>,
+    /// Cell and decoration fills inside the float.
+    pub fills: Vec<FillRect>,
+    /// Shadow, glow, and border ring for this float.
+    pub rounded_fills: Vec<RoundedFill>,
+}
+
 /// Owned record of everything one frame needs to draw.
 ///
 /// Produced by [`GridRenderer::render`]; consumed by a GPU backend seam or,
@@ -1928,6 +1942,12 @@ pub struct DrawList {
     /// Rounded decoration fills/rings (CTX-0311), painted after [`Self::fills`]
     /// and before glyphs so the frame ring covers corner cell backgrounds.
     pub rounded_fills: Vec<RoundedFill>,
+    /// Per-floating-panel draw layers (CTX-1861), painted after tiled
+    /// [`Self::rounded_fills`] and before [`Self::backgrounds`]. Each layer
+    /// paints its rounded backdrop first, then its own cell fills, then its
+    /// own shadow/glow/ring so lower-tier chrome is occluded without erasing
+    /// cell backgrounds inside the float.
+    pub float_layers: Vec<FloatDrawLayer>,
     /// Background-image blits (CTX-0347): the per-`View` content rectangle
     /// painted after cell backgrounds and the decoration ring, and before
     /// overlay fills and glyphs, so the image sits behind content and the
@@ -1964,6 +1984,7 @@ impl DrawList {
     pub fn needs_draw(&self) -> bool {
         !self.fills.is_empty()
             || !self.rounded_fills.is_empty()
+            || !self.float_layers.is_empty()
             || !self.backgrounds.is_empty()
             || !self.overlay_fills.is_empty()
             || !self.overlay_card_rounded_fills.is_empty()
@@ -3555,6 +3576,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // Rounded decoration is composed by the runtime present path
             // (CTX-0311); grid truth carries no rounded geometry.
             rounded_fills: Vec::new(),
+            float_layers: Vec::new(),
             // Background images and overlay fills are composed by the runtime
             // present path (CTX-0347); grid truth carries neither.
             backgrounds: Vec::new(),
@@ -3650,6 +3672,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             atlas_epoch: self.atlas.epoch(),
             fills: Vec::new(),
             rounded_fills: Vec::new(),
+            float_layers: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
             overlay_card_rounded_fills: vec![],
@@ -4547,6 +4570,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             atlas_epoch: self.atlas.epoch(),
             fills: Vec::new(),
             rounded_fills: Vec::new(),
+            float_layers: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
             overlay_card_rounded_fills: vec![],
@@ -4612,6 +4636,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             atlas_epoch: self.atlas.epoch(),
             fills: Vec::new(),
             rounded_fills: Vec::new(),
+            float_layers: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
             overlay_card_rounded_fills: vec![],

@@ -1236,6 +1236,42 @@ impl Runtime {
         {
             return;
         }
+        // CTX-1861 / Issue #1979 / CTX-1150: active drag/resize releases and
+        // Mod+Left-press window-management grabs sit above `if capture` so
+        // Alt+drag, Alt+float-resize, and Mod+tiled-drag work even when a TUI
+        // app (btop, rmpc, opencode) enables mouse reporting. Shift remains the
+        // selection/app escape.
+        if event.button == MouseButton::Left && event.state == PressState::Released {
+            if self.consume_canceled_border_drag_release() || self.end_border_drag() {
+                return;
+            }
+            if self.end_alt_drag() {
+                return;
+            }
+            if self.end_float_resize() {
+                return;
+            }
+            if self.end_tiled_drag_at(now) {
+                return;
+            }
+        }
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && self
+                .last_cursor
+                .is_some_and(|pos| !self.scrollbar_hit_at(pos))
+        {
+            if self.alt_pressed && self.begin_float_resize() {
+                return;
+            }
+            if self.alt_pressed && self.begin_alt_drag() {
+                return;
+            }
+            if (self.alt_pressed || self.super_pressed) && self.begin_tiled_drag_at(now) {
+                return;
+            }
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1252,53 +1288,6 @@ impl Runtime {
         let capture = !shift_override && capture_tracking && self.should_capture_mouse();
 
         if capture {
-            // Issue #2828: a border press is Core chrome consumed before the
-            // capture report, so a capturing app never saw the press. Its
-            // release belongs to the resize gesture whether the drag is still
-            // live (the normal case) or was canceled by an external geometry
-            // change or the pointer leaving the window (the tombstone).
-            // Consume it before capture can report an orphan event to the app.
-            if event.button == MouseButton::Left
-                && event.state == PressState::Released
-                && (self.consume_canceled_border_drag_release() || self.end_border_drag())
-            {
-                return;
-            }
-            // Issue #1710 (CTX-0995): an active Mod tiled-drag owns its
-            // terminating left release even when the focused app enabled
-            // mouse tracking mid-drag. End it here (committing the
-            // Hyprland-like drop when valid) instead of reporting the
-            // release to the app and stranding the gesture: the app never
-            // saw the grabbing press, so the release is not its event.
-            if event.button == MouseButton::Left
-                && event.state == PressState::Released
-                && self.end_tiled_drag_at(now)
-            {
-                return;
-            }
-            // Issue #1979 (CTX-1149): a Mod+Left press that starts a tiled
-            // move owns the gesture even when the focused app tracks the
-            // mouse. Without this the press reported to the app and no drag
-            // ever started, so Mod+drag was dead headed wherever a
-            // mouse-tracking app held focus (and the release arm above could
-            // never fire for a drag that never started). The probe fails
-            // soft on floats, single-leaf trees, and gap bands, so those
-            // presses still reach the app exactly as before; only a press
-            // that actually grabs is consumed. Scrollbar chrome keeps its
-            // non-capture precedence (CTX-0181 sits above the drag grabs
-            // there too), and the Alt+drag float path stays untouched for
-            // CTX-1150: an Alt+press on a float still falls through to the
-            // app here.
-            if event.button == MouseButton::Left
-                && event.state == PressState::Pressed
-                && (self.alt_pressed || self.super_pressed)
-                && self
-                    .last_cursor
-                    .is_some_and(|pos| !self.scrollbar_hit_at(pos))
-                && self.begin_tiled_drag_at(now)
-            {
-                return;
-            }
             if let Some(pos) = self.last_cursor {
                 // CTX-0804 (#1477): pane-local cell of the focused pane that
                 // receives the report, never the primary-global mapping.
@@ -1357,76 +1346,6 @@ impl Runtime {
         // nothing to commit and stale highlights must not auto-copy).
         if event.button == MouseButton::Left && event.state == PressState::Released {
             self.scrollbar_release();
-            if self.end_alt_drag() {
-                return;
-            }
-            // CTX-1150: a release also ends a float edge-resize — like the
-            // Alt+drag move it returns early, skipping the selection
-            // commit/copy (the grabbing press never started a selection).
-            if self.end_float_resize() {
-                return;
-            }
-            // Issue #1348: a release also ends a border-drag resize — but
-            // like the Alt+drag move it returns early, skipping the
-            // selection commit/copy (the grabbing press never started a
-            // selection, so there is nothing to commit and stale highlights
-            // must not auto-copy).
-            if self.end_border_drag() {
-                return;
-            }
-            // Issue #1694 (CTX-0966): a release also ends a Mod tiled-drag
-            // move — committing the Hyprland-like drop when it lands on
-            // another leaf. Like the paths above it returns early so the
-            // grabbing press (which never started a selection) cannot
-            // desync into a selection commit/copy on release
-            // (terminal_app routes releases here; no separate release path
-            // may commit selection while a drag was active).
-            if self.end_tiled_drag_at(now) {
-                return;
-            }
-        }
-        // CTX-1150: Alt+Left-press on a float border grabs it for an edge
-        // resize and consumes the event (no selection starts). Runs before
-        // the interior move so edges win over interiors; interiors and
-        // anchored floats fail soft here and fall through to the move below.
-        // Alt-only: Super is the compositor's window-drag Mod (issue #2140).
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && self.alt_pressed
-            && self.begin_float_resize()
-        {
-            return;
-        }
-        // CTX-0260: Alt+Left-press on a floating overlay grabs it for an
-        // Alt+drag move and consumes the event (no selection starts). The
-        // grab fails soft on tiled leaves (the Mod tiled-drag path below
-        // owns them) and under Shift (which forces the selection path per
-        // the CTX-0181 precedent) — both fall through, so Alt+drag never
-        // breaks selection. Alt-only: Super is the compositor's
-        // window-drag Mod (issue #2140).
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && self.alt_pressed
-            && self.begin_alt_drag()
-        {
-            return;
-        }
-        // Issue #1694 (CTX-0966): Mod+Left-press on a tiled leaf grabs it
-        // for a tiled drag move (Hyprland-like) and consumes the event (no
-        // selection starts, focus follows the dragged pane). Mod is Alt
-        // (the working Mod per OQ-052) or Super (Hyprland muscle memory);
-        // Shift still forces selection. Floating leaves, single-leaf trees,
-        // and gap bands fail soft to selection below. Runs after the
-        // floating grab so Alt+float keeps its owner.
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && (self.alt_pressed || self.super_pressed)
-            && self.begin_tiled_drag_at(now)
-        {
-            return;
         }
 
         // Selection path (including shift override)

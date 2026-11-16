@@ -59,6 +59,7 @@ fn stale_slot_row() -> DrawList {
             color: BG,
         }],
         rounded_fills: Vec::new(),
+        float_layers: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
         overlay_card_rounded_fills: Vec::new(),

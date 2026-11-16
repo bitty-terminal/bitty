@@ -227,6 +227,13 @@ pub const LIVE_FIELDS: &[&str] = &[
     // through the `set_chrome_style` adopter.
     "decoration.background_tint",
     "decoration.background_tint_strength",
+    "floating.width",
+    "floating.height",
+    "floating.centered",
+    "floating.x",
+    "floating.y",
+    "floating.background_opacity",
+    "floating.background",
     "appearance.theme",
     "appearance.colors",
     // CTX-1159 S0: the closed `appearance.style` table is paint-only and
@@ -598,6 +605,41 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
             "decoration.background_tint_strength",
             format!("{:?}", old.decoration.background_tint_strength),
             format!("{:?}", new.decoration.background_tint_strength),
+        ),
+        (
+            "floating.width",
+            format!("{:?}", old.floating.width),
+            format!("{:?}", new.floating.width),
+        ),
+        (
+            "floating.height",
+            format!("{:?}", old.floating.height),
+            format!("{:?}", new.floating.height),
+        ),
+        (
+            "floating.centered",
+            format!("{:?}", old.floating.centered),
+            format!("{:?}", new.floating.centered),
+        ),
+        (
+            "floating.x",
+            format!("{:?}", old.floating.x),
+            format!("{:?}", new.floating.x),
+        ),
+        (
+            "floating.y",
+            format!("{:?}", old.floating.y),
+            format!("{:?}", new.floating.y),
+        ),
+        (
+            "floating.background_opacity",
+            format!("{:?}", old.floating.background_opacity),
+            format!("{:?}", new.floating.background_opacity),
+        ),
+        (
+            "floating.background",
+            format!("{:?}", old.floating.background),
+            format!("{:?}", new.floating.background),
         ),
     ] {
         push_if_changed(field, before, after);

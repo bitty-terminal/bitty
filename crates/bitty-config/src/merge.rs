@@ -545,6 +545,82 @@ fn merge_style_table(
     }
 }
 
+fn merge_floating(
+    effective: &mut EffectiveConfig,
+    acc: &mut MergeAccumulators<'_>,
+    src: &ConfigSource,
+    is_policy: bool,
+    floating: &crate::types::FloatingConfig,
+) {
+    let mut touched = false;
+    touched |= merge_view_leaf(
+        floating.width.as_ref(),
+        &mut effective.floating.width,
+        "floating",
+        "width",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.height.as_ref(),
+        &mut effective.floating.height,
+        "floating",
+        "height",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.centered.as_ref(),
+        &mut effective.floating.centered,
+        "floating",
+        "centered",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.x.as_ref(),
+        &mut effective.floating.x,
+        "floating",
+        "x",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.y.as_ref(),
+        &mut effective.floating.y,
+        "floating",
+        "y",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.background_opacity.as_ref(),
+        &mut effective.floating.background_opacity,
+        "floating",
+        "background_opacity",
+        src,
+        is_policy,
+        acc,
+    );
+    touched |= merge_view_leaf(
+        floating.background.as_ref(),
+        &mut effective.floating.background,
+        "floating",
+        "background",
+        src,
+        is_policy,
+        acc,
+    );
+    if touched {
+        acc.attribution.insert("floating".to_string(), src.clone());
+    }
+}
+
 fn merge_views(
     effective: &mut EffectiveConfig,
     acc: &mut MergeAccumulators<'_>,
@@ -2124,6 +2200,15 @@ fn merge_layers_inner(
                 &mut decoration_acc,
             );
             attribution.insert("decoration".to_string(), src.clone());
+        }
+        if let Some(floating) = &plan.floating {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_floating(&mut effective, &mut acc, src, is_policy, floating);
         }
 
         // CTX-0343: `views` entries deep-merge per selector per field (see
@@ -3705,6 +3790,15 @@ fn merge_layers_allow_policy_violations(
                 &mut decoration_acc,
             );
             attribution.insert("decoration".to_string(), src.clone());
+        }
+        if let Some(floating) = &plan.floating {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_floating(&mut effective, &mut acc, src, is_policy, floating);
         }
         // CTX-0343: `views` entries deep-merge per selector per field (see
         // `merge_views`); absent fields inherit, so a lower layer's explicit

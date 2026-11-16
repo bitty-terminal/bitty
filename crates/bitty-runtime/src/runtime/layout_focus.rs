@@ -23,6 +23,9 @@ pub(super) fn default_container(cols: usize, rows: usize) -> UiRect {
     UiRect::new(0, 0, w, h)
 }
 
+/// Saved `(float_offset, anchored_size)` geometry for a detached float before zoom (CTX-1861).
+pub type DetachedFloatGeometry = ((i32, i32), Option<(u16, u16)>);
+
 /// Bound on the hovered-URL preview text (issue #1759, R-005 anti-spoofing).
 pub const HYPERLINK_PREVIEW_MAX_CHARS: usize = 96;
 
@@ -1347,7 +1350,7 @@ impl Runtime {
             .filter(|fid| !base_ids.contains(fid))
             .position(|fid| fid == id)?;
         let depth = pins_above.saturating_add(position);
-        let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+        let base = self.default_float_base_rect();
         // Issue #2945: same per-leaf resize override as pins.
         let size = self.anchored_overlay_size(id, base);
         let step = u16::try_from(depth).unwrap_or(u16::MAX);
@@ -1373,6 +1376,128 @@ impl Runtime {
                 i32::from(max_y) - origin_y,
             ),
         })
+    }
+
+    /// Default base rect for a newly detached floating panel in container cells
+    /// (CTX-1861), derived from `self.config.floating` and clamped inside
+    /// `self.container`.
+    /// Computes the configured floating panel rect inside `container`
+    /// (shared by detached floats and in-tree `PresentationMode::Floating`).
+    #[must_use]
+    pub(super) fn configured_float_rect(
+        floating: &crate::config::FloatingPanelConfig,
+        container: UiRect,
+    ) -> UiRect {
+        if container.is_empty() {
+            return UiRect::zero();
+        }
+        let cw = container.width;
+        let ch = container.height;
+        let w = ((f32::from(cw) * floating.width_ratio).round() as u16)
+            .max(1)
+            .min(cw);
+        let h = ((f32::from(ch) * floating.height_ratio).round() as u16)
+            .max(1)
+            .min(ch);
+        let avail_x = cw.saturating_sub(w);
+        let avail_y = ch.saturating_sub(h);
+        let dx = if floating.centered {
+            avail_x / 2
+        } else {
+            floating
+                .x_ratio
+                .map(|rx| (f32::from(avail_x) * rx).round() as u16)
+                .unwrap_or(avail_x / 2)
+                .min(avail_x)
+        };
+        let dy = if floating.centered {
+            avail_y / 2
+        } else {
+            floating
+                .y_ratio
+                .map(|ry| (f32::from(avail_y) * ry).round() as u16)
+                .unwrap_or(avail_y / 2)
+                .min(avail_y)
+        };
+        UiRect::new(
+            container.x.saturating_add(dx),
+            container.y.saturating_add(dy),
+            w,
+            h,
+        )
+    }
+
+    /// Computes the default floating panel cell rect from `self.config.floating`
+    /// and `self.container`.
+    #[must_use]
+    pub(super) fn default_float_base_rect(&self) -> UiRect {
+        Self::configured_float_rect(&self.config.floating, self.container)
+    }
+
+    /// True when `id` is a workspace-detached floating panel (CTX-1861).
+    #[must_use]
+    pub fn is_detached_float(&self, id: ViewId) -> bool {
+        self.floats.contains(id)
+    }
+
+    /// Zooms a detached floating panel `id` to fill the container, returning
+    /// its previous `(float_offset, anchored_size)` for restore (CTX-1861).
+    pub fn zoom_detached_float(&mut self, id: ViewId) -> Option<DetachedFloatGeometry> {
+        if !self.floats.contains(id) || self.container.is_empty() {
+            return None;
+        }
+        let anchor = self.float_anchor(id)?;
+        let prev_offset = self.float_offsets.get(&id).copied().unwrap_or((0, 0));
+        let prev_size = self.anchored_sizes.get(&id).copied();
+        self.anchored_sizes
+            .insert(id, (self.container.width, self.container.height));
+        self.float_offsets.insert(
+            id,
+            (
+                i32::from(self.container.x) - anchor.origin.0,
+                i32::from(self.container.y) - anchor.origin.1,
+            ),
+        );
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.pending_full_redraw = true;
+        Some((prev_offset, prev_size))
+    }
+
+    /// Restores a zoomed detached floating panel `id` to its saved
+    /// `(float_offset, anchored_size)` (CTX-1861).
+    pub fn unzoom_detached_float(
+        &mut self,
+        id: ViewId,
+        saved: ((i32, i32), Option<(u16, u16)>),
+    ) -> bool {
+        if !self.floats.contains(id) && !self.workspaces.iter().any(|w| w.floats.contains(id)) {
+            return false;
+        }
+        let (prev_offset, prev_size) = saved;
+        if prev_offset == (0, 0) {
+            self.float_offsets.remove(&id);
+        } else {
+            self.float_offsets.insert(id, prev_offset);
+        }
+        match prev_size {
+            Some(sz) => {
+                self.anchored_sizes.insert(id, sz);
+            }
+            None => {
+                self.anchored_sizes.remove(&id);
+            }
+        }
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Updates the floating panel defaults at runtime (live config reload).
+    pub fn set_floating_config(&mut self, floating: crate::config::FloatingPanelConfig) {
+        self.config.floating = floating;
+        self.pending_full_redraw = true;
     }
 
     /// Effective cell extent of anchored overlay `id` (issue #2945).
@@ -1754,7 +1879,7 @@ impl Runtime {
                         (dv.frame, dv.content, dv.border)
                     }
                 } else if structural.is_none() && mode_tier.is_some() {
-                    let float_rect = bitty_ui::presentation::float_frame(dv.frame, area);
+                    let float_rect = Self::configured_float_rect(&self.config.floating, area);
                     // Elevated float chrome: one extra border px so the
                     // float reads distinct from tiled base; the content
                     // inset grows with it so glyphs never sit under the

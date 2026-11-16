@@ -244,11 +244,12 @@ use crate::plan::{
     MouseConfigPlan, ProfileSelector,
 };
 use crate::types::{
-    AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FontConfig, KeymapEntry,
-    LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_DECORATION_BORDER_WIDTH_PX,
-    MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
-    OutlineColor, PluginSpec, ScrollbarConfig, ScrollbarMode, SelectionConfig, SessionConfig,
-    StyleConfig, TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
+    AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FloatingConfig,
+    FontConfig, KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES,
+    MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN,
+    MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, OutlineColor, PluginSpec, ScrollbarConfig,
+    ScrollbarMode, SelectionConfig, SessionConfig, StyleConfig, TerminalConfig,
+    ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -1660,6 +1661,7 @@ fn drop_element(data: &mut ConfigData, element: &str) -> bool {
         "workspace" => data.workspace.take().is_some(),
         "chrome" => data.chrome.take().is_some(),
         "decoration" => data.decoration.take().is_some(),
+        "floating" => data.floating.take().is_some(),
         "views" => data.views.take().is_some(),
         "scrollbar" => data.scrollbar.take().is_some(),
         "mouse" => data.mouse.take().is_some(),
@@ -2474,6 +2476,50 @@ fn build_plan_from_data(
             })
         }
     };
+    let floating = match data.floating {
+        None => None,
+        Some(f) => {
+            // Validate `f64` bounds before `as f32` so values like
+            // `1.00000001` do not round down to `1.0_f32` and bypass range
+            // checks (fail-closed contract).
+            let check_pos =
+                |val: Option<f64>, field: &'static str| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within (0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
+            let check_unit =
+                |val: Option<f64>, field: &'static str| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within [0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
+            let cfg = FloatingConfig {
+                width: check_pos(f.width, "floating.width")?,
+                height: check_pos(f.height, "floating.height")?,
+                centered: f.centered,
+                x: check_unit(f.x, "floating.x")?,
+                y: check_unit(f.y, "floating.y")?,
+                background_opacity: check_unit(
+                    f.background_opacity,
+                    "floating.background_opacity",
+                )?,
+                background: f.background,
+            };
+            cfg.validate()?;
+            Some(cfg)
+        }
+    };
     // CTX-0343 (RFC-0001/OQ-041): `views` is a closed-selector table of
     // per-field appearance overrides. The Lua extractor already rejected
     // unknown/reserved fields and wrong leaf types with the offending key
@@ -3051,6 +3097,7 @@ fn build_plan_from_data(
         chrome,
         session,
         decoration,
+        floating,
         views,
         scrollbar,
         mouse,
@@ -8132,5 +8179,92 @@ mod style_s0_tests {
         let applied = reconcile_live(&mut current, &merged.effective).expect("reconciles live");
         assert!(applied.is_live());
         assert_eq!(current, merged.effective);
+    }
+
+    #[test]
+    fn floating_config_parses_merges_and_validates() {
+        let lua = r##"
+return {
+    floating = {
+        width = 0.6,
+        height = 0.7,
+        centered = false,
+        x = 0.25,
+        y = 0.5,
+        background_opacity = 0.85,
+        background = "#1A1B26",
+    },
+}
+"##;
+        let source = ConfigSource::new(LayerKind::User, Some("floating.lua"));
+        let plan = parse_lua_config(lua, &source).expect("valid floating");
+        let f = plan.floating.as_ref().expect("floating present");
+        assert_eq!(f.width, Some(0.6));
+        assert_eq!(f.height, Some(0.7));
+        assert_eq!(f.centered, Some(false));
+        assert_eq!(f.x, Some(0.25));
+        assert_eq!(f.y, Some(0.5));
+        assert_eq!(f.background_opacity, Some(0.85));
+        assert_eq!(f.background.as_deref(), Some("#1A1B26"));
+        assert_eq!(f.resolve_background_rgba(), Some([0x1A, 0x1B, 0x26, 0xFF]));
+        assert!(!plan.is_empty(), "plan with floating must not be empty");
+        plan.validate().expect("plan with valid floating validates");
+        assert!(crate::collect_diagnostics(&plan).is_empty());
+
+        // Merge + live reload round-trip.
+        use crate::merge::merge_layers;
+        use crate::plan::LayeredPlan;
+        use crate::reload::reconcile_live;
+        use crate::types::EffectiveConfig;
+
+        let mut override_plan = ConfigPlan::new();
+        override_plan.floating = Some(FloatingConfig {
+            width: Some(0.9),
+            ..Default::default()
+        });
+        let merged = merge_layers(vec![
+            LayeredPlan::new(source.clone(), plan.clone()),
+            LayeredPlan::new(
+                ConfigSource::new(LayerKind::Cli, None::<&str>),
+                override_plan,
+            ),
+        ])
+        .expect("merge_layers succeeds");
+        assert_eq!(merged.effective.floating.width, Some(0.9));
+        assert_eq!(merged.effective.floating.height, Some(0.7));
+        assert_eq!(merged.effective.floating.centered, Some(false));
+        let mut current = EffectiveConfig::default();
+        let applied = reconcile_live(&mut current, &merged.effective).expect("reconciles live");
+        assert!(applied.is_live());
+        assert_eq!(current.floating, merged.effective.floating);
+
+        // Plan validation and diagnostics catch invalid hand-constructed FloatingConfig.
+        let mut bad_plan = ConfigPlan::new();
+        bad_plan.floating = Some(FloatingConfig {
+            width: Some(1.5),
+            ..Default::default()
+        });
+        assert!(bad_plan.validate().is_err());
+        assert!(!crate::collect_diagnostics(&bad_plan).is_empty());
+
+        // Invalid bounds fail closed (including f64 values that would round to 1.0_f32).
+        for bad in [
+            r#"return { floating = { width = 0.0 } }"#,
+            r#"return { floating = { width = 1.5 } }"#,
+            r#"return { floating = { width = 1.00000001 } }"#,
+            r#"return { floating = { height = -0.1 } }"#,
+            r#"return { floating = { x = 1.2 } }"#,
+            r#"return { floating = { x = 1.00000001 } }"#,
+            r#"return { floating = { y = -0.5 } }"#,
+            r#"return { floating = { background_opacity = 1.1 } }"#,
+            r#"return { floating = { background_opacity = 1.00000001 } }"#,
+            r#"return { floating = { background = "not-a-hex" } }"#,
+            r#"return { floating = { unknown_key = 1 } }"#,
+        ] {
+            assert!(
+                parse_lua_config(bad, &source).is_err(),
+                "must reject invalid floating config: {bad}"
+            );
+        }
     }
 }

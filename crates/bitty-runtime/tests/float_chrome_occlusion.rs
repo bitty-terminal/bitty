@@ -101,3 +101,116 @@ fn float_over_tiled_hides_lower_chrome_issue_2138() {
         "lower chrome must not paint over the float interior (issue #2138)"
     );
 }
+
+#[test]
+fn float_cell_background_fills_are_not_occluded_by_backdrop() {
+    let mut rt = make_runtime();
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    // Feed a cell with explicit 24-bit RGB background into the primary
+    // (detached float) grid, mimicking btop/rmpc selection/box backgrounds.
+    rt.handle_pty_bytes(b"\x1b[1;1H\x1b[48;2;200;40;60m   \x1b[0m");
+    rt.tick().expect("float frame must present");
+
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = rt.surface_extent().expect("extent").width();
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|f| f.view == ViewId::new(1))
+        .expect("float frame");
+    let pad = rt.window_padding_physical() as i64;
+    let cx = (pad + i64::from(frame.content.x) + 2).max(0) as u32;
+    let cy = (pad + i64::from(frame.content.y) + 2).max(0) as u32;
+    assert_eq!(
+        pixel(&rgba, width, cx, cy),
+        [200, 40, 60, 255],
+        "floating panel cell FillRect background must paint above the float backdrop"
+    );
+}
+
+#[test]
+fn float_custom_backdrop_color_and_opacity_apply() {
+    let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        floating: bitty_runtime::FloatingPanelConfig {
+            background: Some([10, 20, 30, 255]),
+            background_opacity: Some(1.0),
+            ..bitty_runtime::FloatingPanelConfig::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("headless harness runtime must build");
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.tick().expect("float frame must present");
+
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = rt.surface_extent().expect("extent").width();
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|f| f.view == ViewId::new(1))
+        .expect("float frame");
+    let pad = rt.window_padding_physical() as i64;
+    let cx = (pad + i64::from(frame.content.x) + 2).max(0) as u32;
+    let cy = (pad + i64::from(frame.content.y) + 2).max(0) as u32;
+    assert_eq!(
+        pixel(&rgba, width, cx, cy),
+        [10, 20, 30, 255],
+        "custom floating.background must be visible in empty cells"
+    );
+}
+
+#[test]
+fn float_backdrop_inherits_window_background_opacity_when_unset() {
+    // When floating.background_opacity is None, the float backdrop inherits
+    // window_background_opacity (and still respects floating.background).
+    let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        window_background_opacity: 0.5,
+        floating: bitty_runtime::FloatingPanelConfig {
+            background: Some([200, 220, 240, 255]),
+            background_opacity: None,
+            ..bitty_runtime::FloatingPanelConfig::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("headless harness runtime must build");
+    install(&mut rt, three_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.tick().expect("float frame must present");
+
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let width = rt.surface_extent().expect("extent").width();
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|f| f.view == ViewId::new(1))
+        .expect("float frame");
+    let pad = rt.window_padding_physical() as i64;
+    let cx = (pad + i64::from(frame.content.x) + 2).max(0) as u32;
+    let cy = (pad + i64::from(frame.content.y) + 2).max(0) as u32;
+    let px = pixel(&rgba, width, cx, cy);
+    assert_ne!(
+        px, THEME_BG,
+        "inherited translucent backdrop must still tint over theme background"
+    );
+    assert_ne!(
+        px,
+        [200, 220, 240, 255],
+        "inherited window_background_opacity=0.5 must blend rather than painting opaque"
+    );
+    assert!(
+        px[0] > THEME_BG[0] && px[0] < 200,
+        "expected blended red channel between {} and 200, got {:?}",
+        THEME_BG[0],
+        px
+    );
+}

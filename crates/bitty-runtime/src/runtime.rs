@@ -500,7 +500,7 @@ pub const PASTE_BANNER_FLASH_TEXT: &str = "Paste pending (Enter to confirm, Esc 
 /// window edge inward in plugin id byte order (index `0` outermost; see
 /// [`band_slots`] for the slot-to-edge policy, CTX-0923). Bands are reserved
 /// only when a plugin mounts to that edge; empty = no band.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChromeBands {
     /// Top edge bands (index `0` at the window top, stacking downward).
     pub top: Vec<BandContent>,
@@ -517,7 +517,7 @@ pub struct ChromeBands {
 }
 
 /// Single band content from one plugin mount (CTX-0890).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BandContent {
     /// Owning plugin id.
     pub plugin_id: String,
@@ -3627,6 +3627,9 @@ impl Runtime {
     /// struct, and pushes it into Runtime. bitty-runtime must not depend on
     /// plugin_runtime types directly.
     pub fn set_chrome_bands(&mut self, bands: ChromeBands) {
+        if self.chrome_bands != bands {
+            self.pending_full_redraw = true;
+        }
         self.chrome_bands = bands;
         // CTX-1332 C-D4: without a live mount projection there is no
         // executable origin. Fail closed by clearing pending origins and

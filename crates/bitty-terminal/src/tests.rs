@@ -20035,6 +20035,149 @@ fn teardown_clears_the_focus_target_of_a_run_whose_windows_are_gone() {
     );
 }
 
+#[test]
+fn drive_tick_drains_plugin_side_observations() {
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.set_session_persistence(false);
+
+    for batch in 0..4 {
+        let mut payload = format!("\x1b]0;title-{batch}\x07");
+        for line in 0..200 {
+            payload.push_str(&format!("line-{batch}-{line}\r\n"));
+        }
+        app.runtime.handle_pty_bytes(payload.as_bytes());
+        let _ = app.drive_tick();
+        assert_eq!(
+            app.runtime.plugin_side_len(),
+            0,
+            "drive_tick must drain plugin_host.side_queue()"
+        );
+        assert_eq!(
+            app.runtime.cold_queue_len(),
+            0,
+            "drive_tick must drain cold_queue"
+        );
+    }
+    assert_eq!(app.runtime.plugin_side_dropped(), 0);
+    assert_eq!(app.runtime.cold_queue_dropped(), 0);
+}
+
+#[test]
+fn post_event_ui_update_during_deliver_runtime_events_syncs_bands_and_owes_present() {
+    use bitty_runtime::plugin_runtime::{
+        BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    };
+
+    struct StaticSnapshot;
+    impl SnapshotSource for StaticSnapshot {
+        fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+
+    let tag = format!("ctx1863-postevent-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("bitty-{tag}-root"));
+    let data = std::env::temp_dir().join(format!("bitty-{tag}-data"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+    let id = "bitty-terminal.posteventsync";
+    let plugin_dir = root.join(id);
+    std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
+    std::fs::write(
+        plugin_dir.join("bitty-plugin.toml"),
+        format!(
+            r#"[plugin]
+id = "{id}"
+name = "CTX-1863 post-event band sync"
+version = "0.1.0"
+description = "re-syncs chrome bands updated during deliver_runtime_events"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+ui.rich = true
+workspace.read = true
+
+[lazy]
+events = ["workspace.focused"]
+"#
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        plugin_dir.join("lua/init.lua"),
+        r#"
+        local bar = bitty.ui.mount("bottom", { kind = "Text", text = "ws-init" })
+        bitty.events.subscribe("workspace.focused", function(_ev)
+          bitty.ui.update(bar, { kind = "Text", text = "ws-switched" })
+        end)
+        return {}
+        "#,
+    )
+    .expect("init");
+
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: std::rc::Rc::new(EmptySettings),
+        snapshot: std::rc::Rc::new(StaticSnapshot),
+    });
+    plugin_runtime.discover();
+    let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+    plugin_runtime.activate(&pid).expect("activate");
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    )
+    .with_plugin_runtime(Some(plugin_runtime));
+    app.set_session_persistence(false);
+
+    // First tick presents the initial "ws-init" band and clears present_owed.
+    assert!(app.drive_tick().is_some());
+    assert!(!app.runtime.present_owed());
+
+    // Trigger workspace.focused inside deliver_runtime_events() (after runtime.tick()).
+    let ws = app.runtime.workspace_new().expect("second workspace");
+    assert!(app.runtime.workspace_switch(ws));
+    let _ = app.drive_tick();
+
+    let rendered = format!("{:?}", app.runtime.chrome_bands().bottom);
+    assert!(
+        rendered.contains("ws-switched"),
+        "chrome_bands must sync updates emitted during deliver_runtime_events: {rendered}"
+    );
+    assert!(
+        app.runtime.present_owed(),
+        "post-event band update must mark a follow-up frame owed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 /// The command half that needs a platform context (`ctx.create_window`).
 ///
 /// The recording context refuses every native window, which is exactly the

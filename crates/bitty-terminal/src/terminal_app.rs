@@ -2659,8 +2659,16 @@ impl TerminalApp {
         self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
         // present, IME sync, and the PTY reply flush, so a slow Lua handler
-        // never delays terminal replies or the frame.
+        // never delays terminal replies or the frame. Re-sync chrome bands
+        // immediately afterward so `ui.update` / mount / RC-1 recovery changes
+        // emitted during event delivery schedule a frame instead of sitting
+        // unseen until an unrelated tick.
         self.deliver_runtime_events();
+        if self.update_chrome_bands() && self.runtime.is_surface_visible() {
+            if let Some(win) = self.window.handle.as_ref() {
+                win.request_redraw();
+            }
+        }
         stats
     }
 
@@ -2728,6 +2736,9 @@ impl TerminalApp {
     /// Only `TitleChanged` has an app-side effect; the rest stays plugin
     /// telemetry (already bridged by the runtime).
     pub(crate) fn apply_cold_events(&mut self) {
+        // Drain host observations unconditionally so `plugin_host.side_queue()`
+        // does not stay saturated and count drops on subsequent pushes.
+        let _observations = self.runtime.drain_plugin_observations();
         let events = self.runtime.drain_cold_events();
         if events.is_empty() {
             return;
@@ -2948,13 +2959,17 @@ impl TerminalApp {
     /// Reads mounted UiBlocks from plugin runtime and updates Runtime chrome
     /// bands (CTX-0911, issue #1570).
     ///
-    /// Called once per tick after plugin runtime tick, before present. Converts
-    /// `PluginRuntime::ui_blocks()` into plain `ChromeBands` struct following
-    /// the LiveSnapshot pattern: bitty-runtime must not depend on plugin_runtime
-    /// types directly.
-    fn update_chrome_bands(&mut self) {
+    /// Syncs mounted plugin UI blocks into `Runtime` chrome bands (CTX-0911).
+    ///
+    /// Called before `Runtime::tick()` and re-checked after
+    /// `deliver_runtime_events()` so event-triggered updates schedule a redraw.
+    /// Converts `PluginRuntime::ui_blocks()` into plain `ChromeBands` struct
+    /// following the LiveSnapshot pattern: bitty-runtime must not depend on
+    /// plugin_runtime types directly. Returns `true` when the synced bands
+    /// changed relative to `Runtime`'s current `chrome_bands`.
+    fn update_chrome_bands(&mut self) -> bool {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
-            return;
+            return false;
         };
         // CTX-1332 C-D4: project the live mount registry with generation-owned
         // handles so Runtime can capture an origin per painted band. The
@@ -2996,7 +3011,9 @@ impl TerminalApp {
         // CTX-1332 C-D4/C-D5: set bands and the live origin projection
         // atomically; this also eagerly cancels queued/armed admissions whose
         // origin is no longer live without clearing the release swallow.
+        let changed = self.runtime.chrome_bands() != &bands;
         self.runtime.set_chrome_bands_with_mounts(bands, mounts);
+        changed
     }
 
     /// Focusable-overlay transient input-capture application wiring (CTX-0943,

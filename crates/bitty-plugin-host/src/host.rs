@@ -113,6 +113,25 @@ impl<T> SideQueue<T> {
     }
 }
 
+impl SideQueue<HostObservation> {
+    /// Enqueue [`HostObservation::Damage`], updating any already-queued damage
+    /// entry in place so PTY bursts do not evict control or title events.
+    pub fn push_damage_observation(&mut self, generation: u64) {
+        if let Some(HostObservation::Damage {
+            generation: existing,
+        }) = self
+            .inner
+            .iter_mut()
+            .rev()
+            .find(|obs| matches!(obs, HostObservation::Damage { .. }))
+        {
+            *existing = generation;
+            return;
+        }
+        self.push(HostObservation::Damage { generation });
+    }
+}
+
 /// Snapshot observation delivered through the side queue.
 ///
 /// Read-only, bounded, versioned structures derived from committed terminal state.
@@ -1304,6 +1323,12 @@ impl PluginHost {
     /// Push a host observation into the side queue (producer never blocks).
     pub fn push_observation(&mut self, obs: HostObservation) {
         self.side_queue.push(obs);
+    }
+
+    /// Push a damage observation into the side queue, coalescing any
+    /// already-queued damage entry.
+    pub fn push_damage_observation(&mut self, generation: u64) {
+        self.side_queue.push_damage_observation(generation);
     }
 
     /// Drain side-queue observations (bounded).

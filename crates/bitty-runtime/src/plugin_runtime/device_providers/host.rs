@@ -24,12 +24,19 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bitty_lua::{BridgeError, LuaValue};
-use bitty_platform::backlight_state::PowerClock;
+use bitty_platform::backlight_state::{
+    BACKLIGHT_DEFAULT_INTERVAL_MS, BACKLIGHT_STALE_HIDE_MS, PowerClock,
+};
 use bitty_platform::bluetooth_state::{BluetoothClock, RawBluetoothDevice};
-use bitty_platform::network_state::{EssidSource, NetClock};
+use bitty_platform::network_state::{
+    EssidSource, NETWORK_DEFAULT_INTERVAL_MS, NETWORK_STALE_HIDE_MS, NetClock,
+};
+
+use super::super::sampled::{SampledCache, SampledValue};
 
 use super::bluetooth::{
     BluetoothBridge, MemBluetoothBackend, MemBluetoothSource, bluetooth_set_power,
@@ -82,10 +89,44 @@ impl EssidSource for MemEssidSource {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DeviceKind {
+    Network = 0,
+    Backlight = 1,
+}
+
+impl From<DeviceKind> for usize {
+    fn from(kind: DeviceKind) -> Self {
+        kind as usize
+    }
+}
+
+fn dispatch_device_reader(
+    network: &mut NetworkBridge<SysfsNetLink, ProcNetDevCounters, MemEssidSource>,
+    backlight: &mut BacklightBridge<SysfsBacklightSource>,
+    on_read: Option<&Arc<dyn Fn() + Send + Sync>>,
+    kind: DeviceKind,
+    now_ms: u64,
+) -> Option<SampledValue> {
+    if let Some(hook) = on_read {
+        hook();
+    }
+    let clock = DeviceClock { now: now_ms };
+    match kind {
+        DeviceKind::Network => network.get(now_ms, &clock).map(SampledValue::from_lua),
+        DeviceKind::Backlight => backlight.get(&clock).map(SampledValue::from_lua),
+    }
+}
+
 /// Native device host: live bridges plus the monotonic clock.
 ///
 /// Shared per runtime (`Rc<RefCell<...>>`): every generation dispatches
 /// through the same bridges, so ceilings are global, not per-consumer.
+///
+/// [`Self::live`] runs sysfs/procfs reads (`network.*` and `backlight.state`)
+/// on a persistent background sampler thread (`bitty-device-sample`) so
+/// kernel/driver I/O never stalls the 50 ms RC-1 executor slice;
+/// [`Self::for_test`] stays synchronous.
 pub struct DeviceHost {
     network: NetworkBridge<SysfsNetLink, ProcNetDevCounters, MemEssidSource>,
     bluetooth: BluetoothBridge<MemBluetoothSource>,
@@ -94,6 +135,7 @@ pub struct DeviceHost {
     backlight_root: PathBuf,
     idle: IdleBridge<MemIdleSource>,
     idle_backend: MemIdleBackend,
+    sampled: Option<SampledCache<DeviceKind, 2>>,
     start: Instant,
     manual_now_ms: Option<u64>,
 }
@@ -121,14 +163,32 @@ impl PowerClock for DeviceClock {
 }
 
 impl DeviceHost {
-    /// Live host: real sysfs/procfs sources plus fail-closed stubs.
+    /// Live host: real sysfs/procfs sources plus fail-closed stubs, with
+    /// sysfs/procfs state reads sampled off the Lua executor thread.
     ///
     /// Bluetooth presents absent, ESSID answers none, idle presents absent,
     /// and both bluetooth/idle control backends fail with
-    /// `E_BACKEND_UNAVAILABLE`. Backlight reads live sysfs; backlight
-    /// control attempts the sysfs write only when permitted (DEC-0115).
+    /// `E_BACKEND_UNAVAILABLE`. Backlight reads live sysfs off-thread;
+    /// backlight control attempts the sysfs write only when permitted
+    /// (DEC-0115).
     #[must_use]
     pub fn live() -> Self {
+        let sampled = SampledCache::new("bitty-device-sample", || {
+            let mut network = NetworkBridge::new(
+                SysfsNetLink::system(),
+                ProcNetDevCounters::system(),
+                MemEssidSource::none(),
+            );
+            network.set_broker_grants(&[
+                super::NETWORK_READ_BROKER_HEAD.to_string(),
+                super::ESSID_BROKER_HEAD.to_string(),
+            ]);
+            let mut backlight = BacklightBridge::new(SysfsBacklightSource::system());
+            backlight.set_broker_grants(&[super::BACKLIGHT_READ_BROKER_HEAD.to_string()]);
+            Box::new(move |kind, now_ms| {
+                dispatch_device_reader(&mut network, &mut backlight, None, kind, now_ms)
+            })
+        });
         Self {
             network: NetworkBridge::new(
                 SysfsNetLink::system(),
@@ -157,6 +217,7 @@ impl DeviceHost {
                         .to_string(),
                 ),
             },
+            sampled: Some(sampled),
             start: Instant::now(),
             manual_now_ms: None,
         }
@@ -204,9 +265,64 @@ impl DeviceHost {
                 inhibited: idle_inhibited,
             }),
             idle_backend: MemIdleBackend::default(),
+            sampled: None,
             start: Instant::now(),
             manual_now_ms: Some(initial_now_ms),
         }
+    }
+
+    /// Test host whose `network.*` and `backlight.state` reads run on the
+    /// background sampler thread (tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn sampled_for_test(
+        class_net: PathBuf,
+        proc_route: PathBuf,
+        proc_dev: PathBuf,
+        essid: Option<String>,
+        backlight_root: PathBuf,
+        on_read: Option<Arc<dyn Fn() + Send + Sync>>,
+        initial_now_ms: u64,
+    ) -> Self {
+        let mut host = Self::for_test(
+            class_net.clone(),
+            proc_route.clone(),
+            proc_dev.clone(),
+            essid.clone(),
+            false,
+            None,
+            None,
+            backlight_root.clone(),
+            false,
+            None,
+            initial_now_ms,
+        );
+        let sampled = SampledCache::new("bitty-device-sample", move || {
+            let mut network = NetworkBridge::new(
+                SysfsNetLink::with_roots(class_net, proc_route),
+                ProcNetDevCounters::with_path(proc_dev),
+                MemEssidSource::with_value(essid),
+            );
+            network.set_broker_grants(&[
+                super::NETWORK_READ_BROKER_HEAD.to_string(),
+                super::ESSID_BROKER_HEAD.to_string(),
+            ]);
+            let mut backlight =
+                BacklightBridge::new(SysfsBacklightSource::with_root(backlight_root));
+            backlight.set_broker_grants(&[super::BACKLIGHT_READ_BROKER_HEAD.to_string()]);
+            Box::new(move |kind, now_ms| {
+                dispatch_device_reader(&mut network, &mut backlight, on_read.as_ref(), kind, now_ms)
+            })
+        });
+        host.sampled = Some(sampled);
+        host
+    }
+
+    /// Whether network/backlight reads are sampled off the executor thread (tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_sampled(&self) -> bool {
+        self.sampled.is_some()
     }
 
     /// Current host instant in milliseconds.
@@ -306,6 +422,24 @@ impl DeviceHost {
         let clock = DeviceClock { now };
         match iface {
             NETWORK_STATE_IFACE => {
+                if let Some(sampled) = self.sampled.as_ref() {
+                    if !granted_heads
+                        .iter()
+                        .any(|head| head == super::NETWORK_READ_BROKER_HEAD)
+                    {
+                        return Ok(LuaValue::Nil);
+                    }
+                    let value = sampled.get_or_request(
+                        DeviceKind::Network,
+                        now,
+                        NETWORK_DEFAULT_INTERVAL_MS,
+                        NETWORK_STALE_HIDE_MS,
+                    );
+                    return Ok(match value {
+                        LuaValue::Nil => LuaValue::Nil,
+                        other => strip_essid_unless_doubled(other, granted_heads),
+                    });
+                }
                 self.network.set_broker_grants(granted_heads);
                 Ok(self
                     .network
@@ -314,29 +448,49 @@ impl DeviceHost {
                     .unwrap_or(LuaValue::Nil))
             }
             NETWORK_ESSID_IFACE => {
+                if let Some(sampled) = self.sampled.as_ref() {
+                    if !granted_heads
+                        .iter()
+                        .any(|head| head == super::NETWORK_READ_BROKER_HEAD)
+                        || !granted_heads
+                            .iter()
+                            .any(|head| head == super::ESSID_BROKER_HEAD)
+                    {
+                        return Ok(LuaValue::Nil);
+                    }
+                    let value = sampled.get_or_request(
+                        DeviceKind::Network,
+                        now,
+                        NETWORK_DEFAULT_INTERVAL_MS,
+                        NETWORK_STALE_HIDE_MS,
+                    );
+                    return Ok(project_network_essid(&value, now));
+                }
                 self.network.set_broker_grants(granted_heads);
                 let Some(value) = self.network.get(now, &clock) else {
                     return Ok(LuaValue::Nil);
                 };
-                match value.get("essid") {
-                    Some(LuaValue::String(essid)) => Ok(LuaValue::table([
-                        ("essid", LuaValue::String(essid.clone())),
-                        (
-                            "stale_age_ms",
-                            value
-                                .get("stale_age_ms")
-                                .cloned()
-                                .unwrap_or(LuaValue::Integer(now as i64)),
-                        ),
-                    ])),
-                    _ => Ok(LuaValue::Nil),
-                }
+                Ok(project_network_essid(&value, now))
             }
             BLUETOOTH_STATE_IFACE => {
                 self.bluetooth.set_broker_grants(granted_heads);
                 Ok(self.bluetooth.get(&clock).unwrap_or(LuaValue::Nil))
             }
             BACKLIGHT_STATE_IFACE => {
+                if let Some(sampled) = self.sampled.as_ref() {
+                    if !granted_heads
+                        .iter()
+                        .any(|head| head == super::BACKLIGHT_READ_BROKER_HEAD)
+                    {
+                        return Ok(LuaValue::Nil);
+                    }
+                    return Ok(sampled.get_or_request(
+                        DeviceKind::Backlight,
+                        now,
+                        BACKLIGHT_DEFAULT_INTERVAL_MS,
+                        BACKLIGHT_STALE_HIDE_MS,
+                    ));
+                }
                 self.backlight.set_broker_grants(granted_heads);
                 Ok(self.backlight.get(&clock).unwrap_or(LuaValue::Nil))
             }
@@ -424,6 +578,22 @@ fn strip_essid_unless_doubled(mut value: LuaValue, _granted: &[String]) -> LuaVa
         pairs.retain(|(k, _)| k != &LuaValue::String("essid".to_string()));
     }
     value
+}
+
+fn project_network_essid(value: &LuaValue, now: u64) -> LuaValue {
+    match value.get("essid") {
+        Some(LuaValue::String(essid)) => LuaValue::table([
+            ("essid", LuaValue::String(essid.clone())),
+            (
+                "stale_age_ms",
+                value
+                    .get("stale_age_ms")
+                    .cloned()
+                    .unwrap_or(LuaValue::Integer(now as i64)),
+            ),
+        ]),
+        _ => LuaValue::Nil,
+    }
 }
 
 /// Parse `{on|powered|enabled|inhibited = bool}` control args.

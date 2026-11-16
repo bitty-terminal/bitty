@@ -649,3 +649,70 @@ fn windows_plugin_wiring_compiles_and_is_headless() {
     assert!(rt.is_headless());
     assert!(rt.plugin_side_len() <= rt.plugin_side_capacity());
 }
+
+#[test]
+fn pty_damage_burst_coalesces_without_dropping_titles_or_flooding_queues() {
+    let cfg = RuntimeConfig {
+        cold_queue_capacity: 8,
+        ..RuntimeConfig::default()
+    };
+    let mut rt =
+        Runtime::with_plugin_host_capacity(cfg, bitty_plugin_host::DropPolicy::DropOldest, 64, 8)
+            .expect("must build");
+
+    // Simulate a large TUI frame interspersed with title updates, followed by a
+    // second burst before any drain occurs. Damage events must coalesce to at
+    // most one entry per queue so titles are never evicted and drops stay zero.
+    let mut burst = String::from("\x1b]0;early-title\x07");
+    for row in 0..600 {
+        burst.push_str(&format!("\x1b[32mline-{row}\x1b[0m\r\n"));
+    }
+    rt.handle_pty_bytes(burst.as_bytes());
+    let mut second = String::new();
+    for row in 600..1100 {
+        second.push_str(&format!("\x1b[33mline-{row}\x1b[0m\r\n"));
+    }
+    second.push_str("\x1b]0;late-title\x07");
+    rt.handle_pty_bytes(second.as_bytes());
+
+    assert_eq!(
+        rt.cold_queue_dropped(),
+        0,
+        "cold queue must not drop events"
+    );
+    assert_eq!(
+        rt.plugin_side_dropped(),
+        0,
+        "plugin side queue must not drop observations"
+    );
+
+    let cold = rt.drain_cold_events();
+    let cold_damage = cold
+        .iter()
+        .filter(|ev| matches!(ev, bitty_runtime::ColdEvent::Damage { .. }))
+        .count();
+    assert_eq!(cold_damage, 1, "damage coalesces to one cold entry");
+    let titles: Vec<_> = cold
+        .iter()
+        .filter_map(|ev| match ev {
+            bitty_runtime::ColdEvent::TitleChanged(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles, vec!["early-title", "late-title"]);
+
+    let obs = rt.drain_plugin_observations();
+    let obs_damage = obs
+        .iter()
+        .filter(|o| matches!(o, HostObs::Damage { .. }))
+        .count();
+    assert_eq!(obs_damage, 1, "damage coalesces to one side-queue entry");
+    let obs_titles: Vec<_> = obs
+        .iter()
+        .filter_map(|o| match o {
+            HostObs::TitleChanged(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(obs_titles, vec!["early-title", "late-title"]);
+}

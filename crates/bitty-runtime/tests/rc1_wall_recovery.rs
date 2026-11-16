@@ -30,8 +30,8 @@ use std::time::Duration;
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, MAX_WALL_RECOVERY_ATTEMPTS, PluginRuntime, PluginRuntimeConfig, SettingsSource,
-    SnapshotSource,
+    HEALTHY_TICKS_RESET_RECOVERY, LifecycleState, MAX_WALL_RECOVERY_ATTEMPTS, PluginRuntime,
+    PluginRuntimeConfig, SettingsSource, SnapshotSource,
 };
 
 const PLUGIN_ID: &str = "bitty.ctx1827-wall-recovery";
@@ -453,4 +453,87 @@ fn a_healthy_completion_resets_the_wall_recovery_budget() {
         world.runtime.state(&world.id),
         Some(&LifecycleState::Active)
     );
+}
+
+#[test]
+fn healthy_timer_ticks_reset_wall_recovery_budget() {
+    // A transient wall spike followed by HEALTHY_TICKS_RESET_RECOVERY healthy
+    // timer ticks must reset `wall_recovery_attempts` so a later transient
+    // spike hours later can still recover instead of permanently stopping the
+    // plugin.
+    let root = temp_dir("timer-reset-root");
+    let data = temp_dir("timer-reset-data");
+    let healthy_timer_src = format!(
+        r#"
+local function arm()
+  bitty.timers.create(10, function()
+    arm()
+  end)
+end
+arm()
+{}
+"#,
+        init_src()
+    );
+    write_plugin_dir(&root, &healthy_timer_src);
+
+    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root.clone()],
+        settings: Rc::new(MapSettings::default()),
+        snapshot: Rc::new(SlowSnapshot(Duration::from_millis(CEILING_CALL_MS))),
+    });
+    runtime.set_host_call_deadline_ms(Some(HOST_CALL_DEADLINE_MS));
+    common::install_stub_backend(&mut runtime);
+    runtime.discover();
+    let id = PluginId::new(PLUGIN_ID).expect("id");
+    assert_eq!(
+        runtime.activate(&id).expect("activate").state,
+        LifecycleState::Active
+    );
+
+    // Prime attempt 1 with a real wall timeout and recovery.
+    runtime
+        .dispatch_command(&id, "huge", &[])
+        .expect_err("over-ceiling call is terminal");
+    assert_eq!(runtime.recover_wall_failed_plugins(), 1, "attempt 1");
+
+    let mut now = std::time::Instant::now();
+    for tick in 0..HEALTHY_TICKS_RESET_RECOVERY {
+        now += Duration::from_millis(20);
+        assert_eq!(
+            runtime.pump_due_timers_at(now),
+            1,
+            "healthy timer tick {tick} must fire"
+        );
+    }
+
+    // Second wall timeout + (MAX_WALL_RECOVERY_ATTEMPTS - 1) failed recovery
+    // attempts: because the healthy timer ticks reset the counter, one slot
+    // remains for the clean reload below.
+    runtime
+        .dispatch_command(&id, "huge", &[])
+        .expect_err("second over-ceiling call is terminal");
+    let init_path = root.join(PLUGIN_ID).join("lua/init.lua");
+    std::fs::remove_file(&init_path).expect("remove init.lua");
+    for attempt in 1..=MAX_WALL_RECOVERY_ATTEMPTS - 1 {
+        assert_eq!(
+            runtime.recover_wall_failed_plugins(),
+            0,
+            "failed attempt {attempt} recovers nothing"
+        );
+    }
+    std::fs::write(&init_path, &healthy_timer_src).expect("restore init.lua");
+    assert_eq!(
+        runtime.recover_wall_failed_plugins(),
+        1,
+        "healthy timer ticks must have reset the attempt budget"
+    );
+    assert_eq!(runtime.state(&id), Some(&LifecycleState::Active));
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
 }

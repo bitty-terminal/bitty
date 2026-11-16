@@ -648,6 +648,15 @@ impl From<bitty_plugin_host::PluginError> for PluginRuntimeError {
 /// `RC-1 wall` slice timeout before it is left stopped.
 pub const MAX_WALL_RECOVERY_ATTEMPTS: u32 = 3;
 
+/// Consecutive non-faulting timer ticks required before resetting
+/// `PluginEntry::wall_recovery_attempts` to zero.
+///
+/// Prevents a plugin that fails deterministically on its second tick from
+/// resetting its retry budget on tick 1, while allowing long-running chrome
+/// plugins (`bitty-terminal.bar`) to recover from rare transient wall spikes
+/// hours apart.
+pub const HEALTHY_TICKS_RESET_RECOVERY: u32 = 10;
+
 struct PluginEntry {
     package: PluginPackage,
     generation: u32,
@@ -663,6 +672,10 @@ struct PluginEntry {
     budgets: Option<bitty_plugin_host::budgets::EffectiveBudgets>,
     /// Consecutive automatic recovery attempts after `RC-1 wall` failures.
     wall_recovery_attempts: u32,
+    /// Consecutive non-faulting timer ticks completed by the current `Active`
+    /// generation. Resets `wall_recovery_attempts` once it reaches
+    /// [`HEALTHY_TICKS_RESET_RECOVERY`].
+    healthy_timer_ticks: u32,
     /// Host classification of the current [`LifecycleState::Failed`] reason.
     ///
     /// Set only where the host *knows* the cause: the timer pump records
@@ -2566,7 +2579,11 @@ impl PluginRuntime {
                     if let Some((reason, refused)) = terminal {
                         self.fail_runtime_on_suspend(&plugin, &reason, refused);
                     } else if let Some(entry) = self.entries.get_mut(&plugin) {
-                        entry.wall_recovery_attempts = 0;
+                        entry.healthy_timer_ticks = entry.healthy_timer_ticks.saturating_add(1);
+                        if entry.healthy_timer_ticks >= HEALTHY_TICKS_RESET_RECOVERY {
+                            entry.wall_recovery_attempts = 0;
+                            entry.healthy_timer_ticks = 0;
+                        }
                     }
                 }
             }
@@ -2938,6 +2955,7 @@ impl PluginRuntime {
                 settings_diagnostics: Vec::new(),
                 budgets: None,
                 wall_recovery_attempts: 0,
+                healthy_timer_ticks: 0,
                 failure_class: FailureClass::Unclassified,
             },
         );
@@ -3914,6 +3932,7 @@ impl PluginRuntime {
     pub fn reload(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.wall_recovery_attempts = 0;
+            entry.healthy_timer_ticks = 0;
         }
         let result = self.reload_inner(id);
         self.sync_debug_view();
@@ -5115,6 +5134,7 @@ impl PluginRuntime {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
+            entry.healthy_timer_ticks = 0;
             // CTX-1788 (PR #3109 round-3): a rollback is a fresh classification
             // point. Every activation/reload failure funnels through here, so
             // leaving the previous generation's class in place would let a

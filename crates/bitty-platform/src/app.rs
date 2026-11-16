@@ -835,6 +835,10 @@ struct OcclusionProbe {
     /// iteration must not synthesize a reveal before `Occluded(false)` or
     /// `Focused(true)` arrives (bitty#3096).
     native_occluded: bool,
+    /// Timestamp when `native_occluded` was set to `true`. A `RedrawRequested`
+    /// arriving after [`NATIVE_OCCLUDED_REDRAW_SETTLE`] proves the compositor
+    /// resumed frame callbacks for a visible-but-unfocused window.
+    native_occluded_at: Option<std::time::Instant>,
 }
 
 /// Redraw starvation beyond this span names an occluded surface.
@@ -844,6 +848,14 @@ struct OcclusionProbe {
 /// scheduling jitter with a large margin while staying far below the
 /// seconds-long spans a Hyprland workspace switch-away suspends for.
 const OCCLUSION_STARVE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Minimum settle window after `Occluded(true)` before a `RedrawRequested`
+/// may reveal a natively occluded surface.
+///
+/// Guards against the same-iteration stale `RedrawRequested` queued before the
+/// compositor's `suspended` edge (bitty#3096), while allowing unfocused visible
+/// windows to reveal when compositor frame callbacks resume.
+const NATIVE_OCCLUDED_REDRAW_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl OcclusionProbe {
     /// Read-only diagnostic snapshot (issue #2570).
@@ -879,8 +891,13 @@ impl OcclusionProbe {
     /// immediately re-close the gate the reveal just opened. A reveal does not
     /// imply that a redraw was delivered, so `redraw_seen` is left untouched.
     fn note_occluded_state(&mut self, occluded: bool) {
+        self.note_occluded_state_at(occluded, std::time::Instant::now());
+    }
+
+    fn note_occluded_state_at(&mut self, occluded: bool, now: std::time::Instant) {
         self.occluded = occluded;
         self.native_occluded = occluded;
+        self.native_occluded_at = occluded.then_some(now);
         if !occluded {
             self.last_request = None;
         }
@@ -912,6 +929,14 @@ impl OcclusionProbe {
     /// callback (`RedrawRequested` — the same event also clears the pending
     /// request), keyboard focus regain, or a real size change.
     fn reveal_edge(&mut self, event: &winit::event::WindowEvent) -> Option<bool> {
+        self.reveal_edge_at(event, std::time::Instant::now())
+    }
+
+    fn reveal_edge_at(
+        &mut self,
+        event: &winit::event::WindowEvent,
+        now: std::time::Instant,
+    ) -> Option<bool> {
         if !self.occluded {
             return None;
         }
@@ -919,10 +944,22 @@ impl OcclusionProbe {
             // bitty#3096: when the compositor natively signaled `suspended`
             // (`Occluded(true)`), winit can still emit `RedrawRequested` or
             // `Resized` in the same iteration before the frame callback state
-            // transitions to `Requested`. Only a native `Occluded(false)` or
-            // explicit keyboard focus regain (`Focused(true)`) may clear a
-            // native occlusion.
-            matches!(event, winit::event::WindowEvent::Focused(true))
+            // transitions to `Requested`. Reveal immediately on explicit
+            // keyboard focus regain (`Focused(true)`), or on `RedrawRequested`
+            // once the settle window has elapsed (proving the compositor
+            // resumed frame callbacks for a visible-but-unfocused window).
+            match event {
+                winit::event::WindowEvent::Focused(true) => true,
+                winit::event::WindowEvent::RedrawRequested
+                    if self.native_occluded_at.is_some_and(|at| {
+                        now.saturating_duration_since(at) >= NATIVE_OCCLUDED_REDRAW_SETTLE
+                    }) =>
+                {
+                    self.note_redraw_delivered();
+                    true
+                }
+                _ => false,
+            }
         } else {
             match event {
                 winit::event::WindowEvent::RedrawRequested => {
@@ -938,6 +975,7 @@ impl OcclusionProbe {
         if reveals {
             self.occluded = false;
             self.native_occluded = false;
+            self.native_occluded_at = None;
             Some(false)
         } else {
             None
@@ -1437,6 +1475,56 @@ mod tests {
             None,
             "an un-occluded probe has no reveal edge to deliver"
         );
+    }
+
+    #[test]
+    fn native_occluded_ignores_same_iteration_redraw_requested_and_reveals_after_settle() {
+        // bitty#3096: an immediate RedrawRequested in the same winit iteration
+        // as Occluded(true) must not clear native_occluded.
+        let mut probe = OcclusionProbe::default();
+        let t0 = std::time::Instant::now();
+        probe.note_occluded_state_at(true, t0);
+        assert_eq!(
+            probe.reveal_edge_at(&winit::event::WindowEvent::RedrawRequested, t0),
+            None,
+            "same-iteration RedrawRequested must stay occluded"
+        );
+        assert!(probe.occluded);
+        assert!(probe.native_occluded);
+
+        assert_eq!(
+            probe.reveal_edge_at(
+                &winit::event::WindowEvent::RedrawRequested,
+                t0 + NATIVE_OCCLUDED_REDRAW_SETTLE - std::time::Duration::from_millis(1),
+            ),
+            None,
+            "RedrawRequested before the settle window must stay occluded"
+        );
+        assert!(probe.occluded);
+
+        // Once the settle window elapses, a resumed compositor frame callback
+        // reveals an unfocused visible window even without Occluded(false).
+        assert_eq!(
+            probe.reveal_edge_at(
+                &winit::event::WindowEvent::RedrawRequested,
+                t0 + NATIVE_OCCLUDED_REDRAW_SETTLE,
+            ),
+            Some(false),
+            "RedrawRequested after the settle window must reveal the unfocused visible window"
+        );
+        assert!(!probe.occluded);
+        assert!(!probe.native_occluded);
+        assert_eq!(probe.native_occluded_at, None);
+
+        // Focused(true) continues to reveal immediately without waiting.
+        probe.note_occluded_state_at(true, t0);
+        assert_eq!(
+            probe.reveal_edge_at(&winit::event::WindowEvent::Focused(true), t0),
+            Some(false),
+            "Focused(true) must reveal immediately from native occlusion"
+        );
+        assert!(!probe.occluded);
+        assert!(!probe.native_occluded);
     }
 
     #[test]

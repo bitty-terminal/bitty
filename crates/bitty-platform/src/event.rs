@@ -683,15 +683,42 @@ pub(crate) fn translate_window_event(event: WindowEvent) -> Option<WindowEventKi
             // Device ids are opaque OS handles; the owned vocabulary has no
             // use for them in this slice.
             device_id: _,
-        } => translate_key_parts(
-            key_event.logical_key,
-            key_event.text,
-            key_event.location,
-            key_event.state,
-            key_event.repeat,
-            is_synthetic,
-        )
-        .map(WindowEventKind::KeyboardInput),
+        } => {
+            #[cfg(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            ))]
+            let key_without_modifiers = {
+                use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+                Some(key_event.key_without_modifiers())
+            };
+            #[cfg(not(any(
+                target_os = "windows",
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            )))]
+            let key_without_modifiers: Option<Key> = None;
+
+            translate_key_parts(
+                key_event.logical_key,
+                key_without_modifiers,
+                key_event.text,
+                key_event.location,
+                key_event.state,
+                key_event.repeat,
+                is_synthetic,
+            )
+            .map(WindowEventKind::KeyboardInput)
+        }
         WindowEvent::MouseInput { state, button, .. } => Some(map_mouse_input(state, button)),
         WindowEvent::MouseWheel { delta, .. } => {
             map_mouse_wheel(delta).map(WindowEventKind::MouseWheel)
@@ -727,6 +754,40 @@ pub(crate) const fn map_occluded(occluded: bool) -> WindowEventKind {
     WindowEventKind::Occluded(occluded)
 }
 
+/// Normalizes XKB/IME control-modified keys back to their unmodified ASCII
+/// graphic key when `logical_key` was collapsed to an ASCII control character
+/// or control-equivalent `NamedKey` (`Backspace`, `Enter`, `Tab`, `Escape`).
+///
+/// On Linux/Wayland, `Ctrl+Alt+h` / `Ctrl+Alt+j` can arrive with `logical_key`
+/// set to `Character("\x08")` / `Character("\n")` or `Named(Backspace)` /
+/// `Named(Enter)`. Using `key_without_modifiers` only when `logical_key` is
+/// control-collapsed preserves real `Ctrl+Backspace` / `Ctrl+Enter` (whose
+/// `key_without_modifiers` is still `Named(Backspace)` / `Named(Enter)`) as
+/// well as shifted punctuation like `Shift+1` -> `"!"`.
+fn normalize_control_collapsed_key(logical_key: Key, key_without_modifiers: Option<Key>) -> Key {
+    let is_control_collapsed = match &logical_key {
+        Key::Character(s) => s.chars().any(char::is_control),
+        Key::Named(
+            WinitNamedKey::Backspace
+            | WinitNamedKey::Enter
+            | WinitNamedKey::Tab
+            | WinitNamedKey::Escape,
+        ) => true,
+        _ => false,
+    };
+    if is_control_collapsed {
+        if let Some(Key::Character(ref base)) = key_without_modifiers {
+            let mut chars = base.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if ch.is_ascii_graphic() {
+                    return Key::Character(base.clone());
+                }
+            }
+        }
+    }
+    logical_key
+}
+
 /// Translates keyboard event fields into an owned [`KeyEvent`].
 ///
 /// This is the headless seam for keyboard input: every parameter is plain
@@ -737,6 +798,7 @@ pub(crate) const fn map_occluded(occluded: bool) -> WindowEventKind {
 /// user input, so it never reaches application logic.
 pub(crate) fn translate_key_parts(
     logical_key: Key,
+    key_without_modifiers: Option<Key>,
     text: Option<SmolStr>,
     location: WinitKeyLocation,
     state: ElementState,
@@ -746,6 +808,7 @@ pub(crate) fn translate_key_parts(
     if is_synthetic {
         return None;
     }
+    let logical_key = normalize_control_collapsed_key(logical_key, key_without_modifiers);
     let logical_key = match logical_key {
         Key::Character(value) => LogicalKey::Character(value.to_string()),
         Key::Named(named) => LogicalKey::Named(NamedKey::from(named)),
@@ -980,6 +1043,7 @@ mod tests {
     fn keyboard_character_parts_translate() {
         let translated = translate_key_parts(
             Key::Character(SmolStr::from("a")),
+            None,
             Some(SmolStr::from("a")),
             WinitKeyLocation::Standard,
             ElementState::Pressed,
@@ -1004,6 +1068,7 @@ mod tests {
             translate_key_parts(
                 Key::Character(SmolStr::from("x")),
                 None,
+                None,
                 WinitKeyLocation::Left,
                 ElementState::Released,
                 false,
@@ -1017,6 +1082,7 @@ mod tests {
     fn named_dead_and_unidentified_keys_translate() {
         let named = translate_key_parts(
             Key::Named(WinitNamedKey::ArrowUp),
+            None,
             None,
             WinitKeyLocation::Numpad,
             ElementState::Released,
@@ -1033,6 +1099,7 @@ mod tests {
         let dead = translate_key_parts(
             Key::Dead(Some('^')),
             None,
+            None,
             WinitKeyLocation::Standard,
             ElementState::Pressed,
             false,
@@ -1043,6 +1110,7 @@ mod tests {
 
         let unknown = translate_key_parts(
             Key::Unidentified(NativeKey::Unidentified),
+            None,
             None,
             WinitKeyLocation::Standard,
             ElementState::Pressed,
@@ -1055,6 +1123,7 @@ mod tests {
         let unmodeled = translate_key_parts(
             Key::Named(WinitNamedKey::KanaMode),
             None,
+            None,
             WinitKeyLocation::Standard,
             ElementState::Pressed,
             false,
@@ -1065,6 +1134,84 @@ mod tests {
             unmodeled.logical_key,
             LogicalKey::Named(NamedKey::Other),
             "unmodeled named keys collapse to Other"
+        );
+    }
+
+    #[test]
+    fn control_collapsed_keys_recover_base_char_without_clobbering_real_named_or_shifted_keys() {
+        // Ctrl+Alt+h arriving as "\x08" or Named(Backspace) recovers 'h'.
+        let ctrl_h_byte = translate_key_parts(
+            Key::Character(SmolStr::from("\x08")),
+            Some(Key::Character(SmolStr::from("h"))),
+            None,
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("real input");
+        assert_eq!(
+            ctrl_h_byte.logical_key,
+            LogicalKey::Character(String::from("h"))
+        );
+
+        let ctrl_j_named = translate_key_parts(
+            Key::Named(WinitNamedKey::Enter),
+            Some(Key::Character(SmolStr::from("j"))),
+            None,
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("real input");
+        assert_eq!(
+            ctrl_j_named.logical_key,
+            LogicalKey::Character(String::from("j"))
+        );
+
+        // Real Ctrl+Backspace and Ctrl+Enter keep their NamedKey identity.
+        let real_backspace = translate_key_parts(
+            Key::Named(WinitNamedKey::Backspace),
+            Some(Key::Named(WinitNamedKey::Backspace)),
+            None,
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("real input");
+        assert_eq!(
+            real_backspace.logical_key,
+            LogicalKey::Named(NamedKey::Backspace)
+        );
+
+        let real_enter = translate_key_parts(
+            Key::Named(WinitNamedKey::Enter),
+            Some(Key::Named(WinitNamedKey::Enter)),
+            None,
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("real input");
+        assert_eq!(real_enter.logical_key, LogicalKey::Named(NamedKey::Enter));
+
+        // Shifted punctuation (Shift+1 -> "!") keeps its shifted logical_key.
+        let shifted_bang = translate_key_parts(
+            Key::Character(SmolStr::from("!")),
+            Some(Key::Character(SmolStr::from("1"))),
+            Some(SmolStr::from("!")),
+            WinitKeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+            false,
+        )
+        .expect("real input");
+        assert_eq!(
+            shifted_bang.logical_key,
+            LogicalKey::Character(String::from("!"))
         );
     }
 

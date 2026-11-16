@@ -3523,7 +3523,7 @@ impl Runtime {
         if !next.swap_leaves(focused, neighbor) {
             return false;
         }
-        self.set_layout_committed(next);
+        self.set_layout(next);
         self.set_focus(focused);
         self.trigger_animation(AnimationKind::Move, Some(focused), now);
         true
@@ -3539,7 +3539,7 @@ impl Runtime {
         let focused = self.focused_view()?;
         let mut next = self.layout.clone();
         let axis = next.toggle_parent_split_axis(focused)?;
-        self.set_layout_committed(next);
+        self.set_layout(next);
         self.set_focus(focused);
         self.trigger_animation(
             AnimationKind::Move,

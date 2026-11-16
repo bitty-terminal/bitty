@@ -3348,14 +3348,14 @@ impl ChromeConfig {
 /// pair (RFC-0001 `OQ-039`): `border_color` is the base, and
 /// `border_color_focused` / `border_color_idle` override it explicitly when
 /// the user sets them. Resolution order (later wins) is theme token then
-/// base then explicit pair; see [`Self::resolve_outline`]. Values are
+/// base then explicit pair; see [`DecorationConfig::resolve_outline`]. Values are
 /// canonical `#RRGGBB` / `#RRGGBBAA` ([`OutlineColor`]).
 ///
 /// CTX-0344 adds the accepted focus/idle **outline width** triple
 /// (RFC-0001 `OQ-045`): `border_width` is the base (inheriting
 /// `decoration.border` when unset), and `border_width_focused` /
 /// `border_width_idle` override it explicitly; see
-/// [`Self::resolve_outline_width`]. Bounds are `0..=16` logical px,
+/// [`DecorationConfig::resolve_outline_width`]. Bounds are `0..=16` logical px,
 /// fail-closed, live reload, and the ring is painted inside the frame so the
 /// content grid never moves.
 ///

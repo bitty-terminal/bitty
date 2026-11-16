@@ -1565,11 +1565,18 @@ impl Runtime {
         let Some(cursor) = self.last_cursor else {
             return false;
         };
-        if self.alt_drag.is_some()
-            || self.tiled_drag.is_some()
-            || self.border_drag.is_some()
-            || self.float_resize.is_some()
-        {
+        if self.alt_drag.is_some() || self.tiled_drag.is_some() || self.float_resize.is_some() {
+            return false;
+        }
+        // Only a *live* border drag owns the pointer. A canceled tombstone left
+        // by an external layout replacement (`cancel_border_drag`) exists only
+        // to consume the release that ends the abandoned gesture; a fresh press
+        // is a new gesture and supersedes it when the grab below succeeds.
+        // Refusing on `border_drag.is_some()` wedged divider resizing for good
+        // whenever that release never arrived (the tree changed while the
+        // button was held, or the pointer left the window), because nothing
+        // else clears the tombstone.
+        if self.border_drag_active() {
             return false;
         }
         // CTX-1861: plain Left-press on a floating panel's border or corner

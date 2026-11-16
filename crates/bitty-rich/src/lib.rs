@@ -112,6 +112,7 @@
 
 pub mod background;
 pub mod blocks;
+pub mod catalog;
 pub mod clipboard;
 pub mod geometry;
 pub mod hints;
@@ -139,6 +140,12 @@ pub use background::{
 pub use blocks::{
     COMMAND_BLOCK_MAX, CommandBlock, CommandId, CommandState, FOLD_MAX, FoldState, SemanticRange,
     block_by_id, block_count, blocks, hidden_blocks, is_output_kind, list_blocks, visible_blocks,
+};
+pub use catalog::{
+    BandSpec, CATALOG_MAX_BAND_SLOTS, CATALOG_MAX_DETAIL_LINES, CATALOG_MAX_LABEL_BYTES,
+    CATALOG_MAX_PILL_LABEL_BYTES, CATALOG_MAX_PILLS, CATALOG_MAX_SHEET_LINES,
+    CATALOG_MAX_STATUS_SEGMENTS, CatalogComponent, CatalogError, CompositionKind, DetailSpec,
+    PillRowSpec, SheetSpec, StatusSegment, StatusStripSpec,
 };
 pub use clipboard::{
     ClipboardGrantScope, ClipboardPolicy, ClipboardReadToken, ClipboardRequest, ClipboardState,

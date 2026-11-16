@@ -43,6 +43,11 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 - `src/scene.rs` — versioned blocks and declarative scene composition,
   including the additive v2 `SceneNode::Styled` style node with bounded
   geometry caps and the closed content-token set.
+- `src/catalog.rs` — headless extension component catalog: typed descriptors
+  for the band, pill row, status strip, tooltip/detail fallback, and sheet
+  body, each lowered deterministically onto the Plugin API v1 node set
+  (`Text | Row | Column | List`) under a documented per-composition cap that
+  refuses rather than truncates.
 - `src/kitty_place.rs` — Kitty placement policy (declared-size pre-check plus
   admission/eviction/rect geometry) and the kitty ledger bounds
   (`KITTY_PLACE_MAX_IMAGES`, `KITTY_LEDGER_MAX_BYTES`). Bounded decode and

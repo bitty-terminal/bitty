@@ -386,7 +386,7 @@ impl std::fmt::Display for UiAlign {
 /// Reads the declared `align` value: one closed, bounded, case-sensitive
 /// string (bitty#2191, CTX-1853).
 ///
-/// The shape follows [`style_token`]: a wrong type is the field's
+/// The shape follows `style_token`: a wrong type is the field's
 /// invalid-value refusal, an oversized string is refused by length without
 /// being echoed, and an unlisted spelling names the closed set. Nothing is
 /// clamped to `start` — a plugin that misspells the key's value must not

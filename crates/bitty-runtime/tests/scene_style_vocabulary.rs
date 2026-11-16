@@ -116,8 +116,8 @@ fn the_closed_token_set_is_name_for_name_identical() {
 #[test]
 fn the_wire_key_set_is_the_candidate_set() {
     // The closed style key set: the four paint primitives from the candidate
-    // record, the two content-width bounds, and the sibling gap (bitty#2191).
-    // No more.
+    // record, the two content-width bounds, the sibling gap, and the cross-axis
+    // child placement (bitty#2191). No more.
     assert_eq!(
         wire::UI_STYLE_FIELDS,
         [
@@ -127,17 +127,16 @@ fn the_wire_key_set_is_the_candidate_set() {
             "border_token",
             "min_width",
             "max_width",
-            "gap"
+            "gap",
+            "align"
         ]
     );
 }
 
 #[test]
-fn the_band_distribution_vocabulary_is_closed_and_stays_off_the_style_table() {
-    // bitty#2191 / CTX-1853: `align` is the band root Row's distribution
-    // field. The closed set is the candidate record's four spellings, in
-    // declaration order, and `start` is the absent default that renders like
-    // today's flow.
+fn the_two_align_vocabularies_are_closed_and_do_not_mix() {
+    // bitty#2191 / CTX-1853: the band root Row's `align` is a four-value
+    // **distribution** of the whole group across the band width.
     assert_eq!(
         wire::UiAlign::ALL.map(wire::UiAlign::as_str),
         ["start", "center", "end", "space-between"]
@@ -147,21 +146,47 @@ fn the_band_distribution_vocabulary_is_closed_and_stays_off_the_style_table() {
         assert_eq!(wire::UiAlign::parse(align.as_str()), Some(align));
     }
 
-    // Scope drift gate: `align` must stay OFF the rich `style` table. That
-    // table is hosted on `ui.rich`'s terminal slot, where no node is the band
-    // root, so hosting the key there would declare a distribution no paint
-    // path applies. The wire key set is the seven scene keys, and this fails
-    // the moment someone adds `align` to it.
-    assert_eq!(wire::UI_STYLE_FIELDS.len(), 7);
+    // The `style.align` key is a three-value **placement** of each child on the
+    // axis its siblings do not advance, and it mirrors the scene model
+    // name-for-name. `space-between` spreads slack between siblings, which is a
+    // distribution and not a placement, so the style set refuses it.
+    assert_eq!(
+        wire::UiStyleAlign::ALL.map(wire::UiStyleAlign::as_str),
+        ["start", "center", "end"]
+    );
+    assert_eq!(
+        wire::UiStyleAlign::ALL.map(wire::UiStyleAlign::as_str),
+        scene_model::SceneStyleAlign::ALL.map(scene_model::SceneStyleAlign::as_str)
+    );
+    for (style_align, model) in wire::UiStyleAlign::ALL
+        .into_iter()
+        .zip(scene_model::SceneStyleAlign::ALL)
+    {
+        assert_eq!(
+            wire::UiStyleAlign::parse(style_align.as_str()),
+            Some(style_align)
+        );
+        assert_eq!(
+            scene_model::SceneStyleAlign::parse(style_align.as_str()),
+            Some(model),
+            "the scene model accepts every wire spelling"
+        );
+    }
+    assert_eq!(wire::UiStyleAlign::parse("space-between"), None);
+    assert_eq!(scene_model::SceneStyleAlign::parse("space-between"), None);
+
+    // The two surfaces can never meet on one node: the `style` table is hosted
+    // on `ui.rich`'s terminal slot, where no node is the band root, so neither
+    // vocabulary needs a precedence rule against the other.
+    assert_eq!(wire::UI_STYLE_FIELDS.len(), 8);
     assert!(
-        !wire::UI_STYLE_FIELDS.contains(&"align"),
-        "align is a band placement field, not a scene style key"
+        wire::UI_STYLE_FIELDS.contains(&"align"),
+        "the placement key is the style table's"
     );
 
-    // The two placement vocabularies are distinct: the only overlap is the
-    // spelling `center`, which means "centred on the row" for an anchor and
-    // "centred group" for an align. A field that accepted the other's
-    // spellings would be a second mechanism on one row.
+    // The anchor vocabulary stays distinct: the only overlap is the spelling
+    // `center`, which means "centred on the row" for an anchor, "centred group"
+    // for a distribution, and "centred child" for a placement.
     for anchor in wire::ui::UiAnchor::ALL {
         if anchor == wire::ui::UiAnchor::Center {
             continue;
@@ -170,6 +195,12 @@ fn the_band_distribution_vocabulary_is_closed_and_stays_off_the_style_table() {
             wire::UiAlign::parse(anchor.as_str()),
             None,
             "anchor '{}' is not an align value",
+            anchor.as_str()
+        );
+        assert_eq!(
+            wire::UiStyleAlign::parse(anchor.as_str()),
+            None,
+            "anchor '{}' is not a style align value",
             anchor.as_str()
         );
     }
@@ -227,7 +258,16 @@ fn the_wire_flat_style_is_the_scene_flat_style() {
         scene_flat.max_width_cells
     );
     assert_eq!(wire::UiNodeStyle::FLAT.gap_cells, scene_flat.gap_cells);
+    assert_eq!(
+        wire::UiNodeStyle::FLAT.align.as_str(),
+        scene_flat.align.as_str()
+    );
     assert_eq!(scene_flat.min_width_cells, 0, "0 is the unbounded default");
     assert_eq!(scene_flat.max_width_cells, 0, "0 is the unbounded default");
     assert_eq!(scene_flat.gap_cells, 0, "0 is the no-spacing default");
+    assert_eq!(
+        scene_flat.align,
+        scene_model::SceneStyleAlign::Start,
+        "start is the offset-zero default"
+    );
 }

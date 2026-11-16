@@ -199,6 +199,6 @@ pub use scene::{
     SCENE_MAX_RICH_BYTES_PER_TERMINAL, SCENE_MAX_TEXT_BYTES_PER_BLOCK, SCENE_STYLE_MAX_BORDER_PX,
     SCENE_STYLE_MAX_GAP_CELLS, SCENE_STYLE_MAX_PADDING_CELLS, SCENE_STYLE_MAX_RADIUS_PX,
     SCENE_STYLE_MAX_WIDTH_CELLS, SCENE_STYLE_SCHEMA_VERSION, Scene, SceneError, SceneNode,
-    SceneNodeStyle, SceneStyleError, ScrollBehavior, StyledSpan, TableModel,
+    SceneNodeStyle, SceneStyleAlign, SceneStyleError, ScrollBehavior, StyledSpan, TableModel,
 };
 pub use shell::{CommandRegion, ShellIntegration};

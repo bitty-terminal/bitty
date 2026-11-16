@@ -683,3 +683,81 @@ fn append_into_splits_rounded_rings_from_plain_fills() {
     assert_eq!(rounded.len(), 1);
     assert!(!glyphs.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Cross-axis child alignment (bitty#2191)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_styled_align_offsets_children_inside_the_declared_box() {
+    use bitty_rich::scene::SceneStyleAlign;
+
+    // A 9-cell floor on a Column makes horizontal slack exist: the 1-cell run
+    // sits 4 cells in (centre) or 8 cells in (end). A paint path that parsed the
+    // placement but never offset the child keeps both at column 0.
+    for (align, expected_col) in [
+        (SceneStyleAlign::Start, 0),
+        (SceneStyleAlign::Center, 4),
+        (SceneStyleAlign::End, 8),
+    ] {
+        let node = styled(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground)
+                .with_width_range(9, 0)
+                .with_align(align),
+            SceneNode::Column(vec![text("a")]),
+        );
+        let paint = paint(node);
+        assert_eq!(
+            text_ops(&paint),
+            vec![(0, expected_col, "a".to_string())],
+            "align = {align}"
+        );
+    }
+}
+
+#[test]
+fn a_styled_align_places_row_siblings_on_the_vertical_axis() {
+    use bitty_rich::scene::SceneStyleAlign;
+
+    // The Row's height is the tallest sibling (3 rows), so the one-row sibling
+    // is centred (row 1) or bottom-aligned (row 2). A walk that read the
+    // placement as a horizontal offset would leave the column at 1.
+    for (align, expected_row) in [
+        (SceneStyleAlign::Start, 0),
+        (SceneStyleAlign::Center, 1),
+        (SceneStyleAlign::End, 2),
+    ] {
+        let node = styled(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_align(align),
+            SceneNode::Row(vec![text("a\nb\nc"), text("x")]),
+        );
+        let paint = paint(node);
+        assert!(
+            text_ops(&paint).contains(&(expected_row, 1, "x".to_string())),
+            "align = {align} must place the short run on row {expected_row}: {:?}",
+            text_ops(&paint)
+        );
+    }
+}
+
+#[test]
+fn a_start_align_is_byte_identical_to_an_undeclared_one() {
+    use bitty_rich::scene::SceneStyleAlign;
+
+    let children = || SceneNode::Column(vec![text("a"), text("abc")]);
+    let declared = paint(styled(
+        SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground)
+            .with_width_range(9, 0)
+            .with_align(SceneStyleAlign::Start),
+        children(),
+    ));
+    let floored = paint(styled(
+        SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_width_range(9, 0),
+        children(),
+    ));
+    assert_eq!(
+        encode(&declared),
+        encode(&floored),
+        "a declared start adds no op and moves no child"
+    );
+}

@@ -525,9 +525,10 @@ fn a_gap_on_a_text_leaf_is_refused() {
 
 #[test]
 fn the_keys_outside_the_set_are_still_refused_loudly() {
-    // `align`, `spacing`, and `width` remain outside the closed key set: the
-    // gap lane added no second spelling and no cross-axis distribution.
-    for key in ["align", "spacing", "width", "min_width_cells", "margin"] {
+    // `spacing`, `height`, and `width` remain outside the closed key set: the
+    // gap lane added no second spelling and no size key, and `margin` stays
+    // refused because `padding` is the one inset.
+    for key in ["spacing", "width", "height", "min_width_cells", "margin"] {
         let node = styled_row_value(vec![text_value("a")], vec![(key, LuaValue::Integer(1))]);
         let error = UiRichNode::from_lua_value(&node).expect_err("refused");
         assert_eq!(error.class, "validation");

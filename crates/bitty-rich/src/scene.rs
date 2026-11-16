@@ -253,6 +253,70 @@ impl std::fmt::Display for ContentToken {
     }
 }
 
+/// Cross-axis placement of a container's direct children (bitty#2191).
+///
+/// A `Row` walks its children left to right, so the placement axis is vertical;
+/// a `Column` walks them top to bottom, so it is horizontal. Slack is the
+/// container's content box minus the child's own measured extent, and
+/// [`Self::offset`] never returns more than that slack, so a placement can move
+/// a child inside the box but never past it.
+///
+/// The set is closed and holds three spellings. `Start` is the default and
+/// equals today's offset-zero walk, so an undeclared placement measures and
+/// paints exactly as before.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SceneStyleAlign {
+    /// `start` — offset zero on every child (today's walk).
+    #[default]
+    Start,
+    /// `center` — `slack / 2` cells in from the start edge.
+    Center,
+    /// `end` — `slack` cells in: the child ends flush with the far edge.
+    End,
+}
+
+impl SceneStyleAlign {
+    /// Every permitted placement, in canonical declaration order.
+    pub const ALL: [Self; 3] = [Self::Start, Self::Center, Self::End];
+
+    /// Wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Center => "center",
+            Self::End => "end",
+        }
+    }
+
+    /// Parses an exact, case-sensitive spelling; `None` outside the set.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|align| align.as_str() == name)
+    }
+
+    /// Offset in cells for one child inside `box_cells`.
+    ///
+    /// Saturating: a child at least as large as its box has no slack and stays
+    /// at offset zero, which keeps the pre-existing clip as the failure mode
+    /// instead of introducing an overflow.
+    #[must_use]
+    pub const fn offset(self, box_cells: u16, child_cells: u16) -> u16 {
+        let slack = box_cells.saturating_sub(child_cells);
+        match self {
+            Self::Start => 0,
+            Self::Center => slack / 2,
+            Self::End => slack,
+        }
+    }
+}
+
+impl std::fmt::Display for SceneStyleAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Typed refusal of an out-of-bounds style value.
 ///
 /// Caps are inclusive; one past the cap is rejected and never clamped. The
@@ -362,6 +426,7 @@ impl std::error::Error for SceneStyleError {}
 /// | `min_width_cells` | cells     | `0` (no floor)        | `1000` |
 /// | `max_width_cells` | cells     | `0` (no cap)          | `1000` |
 /// | `gap_cells`     | cells       | `0` (no spacing)      | `32` |
+/// | `align`         | closed set  | `start`               | —    |
 ///
 /// `radius_px` and `border_px` are **physical pixels**: the paint path passes
 /// them unchanged into the accepted `RoundedFill` geometry, which is physical
@@ -380,6 +445,11 @@ impl std::error::Error for SceneStyleError {}
 /// advances the walk cursor. It is inert on a child of any other shape (a leaf,
 /// or a node with a single child) — the wire parser refuses it there — and `0`
 /// means "no spacing", so an undeclared gap leaves the sibling flow untouched.
+///
+/// `align` places the container's **direct children** on the axis their
+/// siblings do not advance (a `Row` vertically, a `Column` horizontally). It
+/// changes no measured size, so it is paint-only on the cross axis; `Start` is
+/// the default and equals today's offset-zero walk.
 ///
 /// Construction is plain data: an out-of-bounds value is representable so a
 /// test (or a hostile producer that bypasses a typed constructor) can prove
@@ -401,12 +471,14 @@ pub struct SceneNodeStyle {
     pub max_width_cells: u16,
     /// Spacing between adjacent siblings, in cells; `0` declares no spacing.
     pub gap_cells: u16,
+    /// Cross-axis placement of the direct children; `Start` is today's walk.
+    pub align: SceneStyleAlign,
 }
 
 impl SceneNodeStyle {
     /// The flat style: no padding, no radius, no border, no width constraint,
-    /// no sibling gap. A flat style paints no operation and measures exactly
-    /// like an unstyled node.
+    /// no sibling gap, and children at the start edge. A flat style paints no
+    /// operation and measures exactly like an unstyled node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
         radius_px: 0,
@@ -415,6 +487,7 @@ impl SceneNodeStyle {
         min_width_cells: 0,
         max_width_cells: 0,
         gap_cells: 0,
+        align: SceneStyleAlign::Start,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
@@ -436,6 +509,7 @@ impl SceneNodeStyle {
             min_width_cells: 0,
             max_width_cells: 0,
             gap_cells: 0,
+            align: SceneStyleAlign::Start,
         }
     }
 
@@ -453,6 +527,16 @@ impl SceneNodeStyle {
     #[must_use]
     pub const fn with_gap(mut self, gap_cells: u16) -> Self {
         self.gap_cells = gap_cells;
+        self
+    }
+
+    /// Declares the cross-axis placement of the direct children.
+    ///
+    /// A closed three-name set, so there is no bound to validate: an unlisted
+    /// spelling never reaches this type.
+    #[must_use]
+    pub const fn with_align(mut self, align: SceneStyleAlign) -> Self {
+        self.align = align;
         self
     }
 
@@ -533,7 +617,9 @@ impl SceneNodeStyle {
     /// True when no geometry is claimed; the border token is then inert.
     ///
     /// A declared width range is geometry: it sizes the node. A declared gap is
-    /// geometry too: it moves a sibling.
+    /// geometry too: it moves a sibling. A non-`start` align is geometry as
+    /// well: it moves every child, where `start` is exactly today's offset-zero
+    /// walk.
     #[must_use]
     pub const fn is_flat(self) -> bool {
         self.padding_cells == 0
@@ -542,6 +628,7 @@ impl SceneNodeStyle {
             && self.min_width_cells == 0
             && self.max_width_cells == 0
             && self.gap_cells == 0
+            && matches!(self.align, SceneStyleAlign::Start)
     }
 }
 
@@ -2419,6 +2506,49 @@ mod tests {
             SceneStyleError::GapOverCap { found: 33, cap: 32 }.to_string(),
             "scene style gap exceeds cap: 33 > 32"
         );
+    }
+
+    #[test]
+    fn the_align_is_a_closed_placement_that_is_flat_at_start() {
+        // bitty#2191: `start` is the offset-zero walk, so it is the flat
+        // default; every other placement moves a child and needs the wrapper.
+        assert_eq!(SceneStyleAlign::default(), SceneStyleAlign::Start);
+        assert_eq!(
+            SceneStyleAlign::ALL.map(SceneStyleAlign::as_str),
+            ["start", "center", "end"]
+        );
+        for align in SceneStyleAlign::ALL {
+            assert_eq!(SceneStyleAlign::parse(align.as_str()), Some(align));
+            assert_eq!(
+                SceneNodeStyle::FLAT.with_align(align).is_flat(),
+                align == SceneStyleAlign::Start,
+                "{align} flatness"
+            );
+        }
+        assert_eq!(SceneStyleAlign::parse("space-between"), None);
+        assert_eq!(SceneStyleAlign::parse("Center"), None, "case-sensitive");
+        assert_eq!(
+            SceneNodeStyle::FLAT
+                .with_align(SceneStyleAlign::Center)
+                .validate(),
+            Ok(()),
+            "a closed set has no out-of-range value to refuse"
+        );
+    }
+
+    #[test]
+    fn the_align_offset_uses_saturating_slack() {
+        // `end` and `center` move a child inside the slack; a child at least as
+        // large as its box has none and stays at offset zero, so the placement
+        // can never push a child past the frame.
+        assert_eq!(SceneStyleAlign::Start.offset(9, 1), 0);
+        assert_eq!(SceneStyleAlign::Center.offset(9, 1), 4);
+        assert_eq!(SceneStyleAlign::End.offset(9, 1), 8);
+        assert_eq!(SceneStyleAlign::Center.offset(9, 4), 2, "integer division");
+        assert_eq!(SceneStyleAlign::Center.offset(4, 9), 0, "no negative slack");
+        assert_eq!(SceneStyleAlign::End.offset(4, 9), 0);
+        assert_eq!(SceneStyleAlign::End.offset(4, 4), 0, "a full box has none");
+        assert_eq!(SceneStyleAlign::End.offset(0, 0), 0);
     }
 
     #[test]

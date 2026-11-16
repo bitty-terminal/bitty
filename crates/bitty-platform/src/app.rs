@@ -989,6 +989,7 @@ impl OcclusionProbe {
             self.occluded = false;
             self.native_occluded = false;
             self.native_occluded_at = None;
+            self.last_request = None;
             Some(false)
         } else {
             None

@@ -2449,6 +2449,22 @@ impl PluginRuntime {
             .min()
     }
 
+    /// Earliest throttled wall-recovery retry deadline for a plugin that
+    /// is still eligible for automatic reload.
+    #[must_use]
+    pub fn wall_recovery_deadline(&self) -> Option<Instant> {
+        self.entries
+            .values()
+            .filter(|entry| {
+                !entry.package.source_class.is_bundled()
+                    && entry.wall_recovery_attempts < MAX_WALL_RECOVERY_ATTEMPTS
+                    && matches!(entry.state, LifecycleState::Failed(_))
+                    && entry.failure_class == FailureClass::WallSliceTimeout
+            })
+            .filter_map(|entry| entry.wall_recovery_next_at)
+            .min()
+    }
+
     /// Fire due one-shot timers at the current instant (CTX-1244).
     ///
     /// Cold-tick pump only (the app calls it from `drive_tick` before
@@ -4305,6 +4321,7 @@ impl PluginRuntime {
         }
         if let Some(entry) = self.entries.get_mut(id) {
             entry.wall_recovery_attempts = 0;
+            entry.wall_recovery_next_at = None;
         }
         Ok(result)
     }
@@ -4562,6 +4579,7 @@ impl PluginRuntime {
                     if outcome.is_ok() {
                         if let Some(entry) = self.entries.get_mut(&id) {
                             entry.wall_recovery_attempts = 0;
+                            entry.wall_recovery_next_at = None;
                         }
                     }
                     completed.push(ParkedCommandCompletion {
@@ -4782,6 +4800,7 @@ impl PluginRuntime {
             drop(vm_ref);
             if any_ok && terminal.is_none() {
                 entry.wall_recovery_attempts = 0;
+                entry.wall_recovery_next_at = None;
             }
             self.fail_runtime_on_wall_terminal(
                 &id,

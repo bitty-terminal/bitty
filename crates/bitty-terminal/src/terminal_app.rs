@@ -3051,9 +3051,12 @@ impl TerminalApp {
     /// `None` when no timers are armed, so unarmed idle stays on
     /// `set_wait` (zero-submit preserved).
     pub(crate) fn plugin_timer_deadline(&self) -> Option<std::time::Instant> {
-        self.plugin_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.timer_deadline())
+        self.plugin_runtime.as_ref().and_then(|runtime| {
+            [runtime.timer_deadline(), runtime.wall_recovery_deadline()]
+                .into_iter()
+                .flatten()
+                .min()
+        })
     }
 
     /// Bounded cold-tick wake while a command is parked at the RC-1 wall

@@ -65,6 +65,12 @@
 //! sibling axis, and the Core measure and paint walk insert it, so the plugin
 //! declares spacing and Core owns the layout.
 //!
+//! `style.align` (the cross-axis placement of a container's direct children)
+//! crosses unchanged too: it is a closed three-name enum on both sides, the
+//! wire parser refused it on a kind with no adjacent child, and the Core paint
+//! walk applies the offset. It changes no measured size, so the bridge cannot
+//! alter an extent by carrying it.
+//!
 //! # One stroke per node
 //!
 //! `UiRichNode::Block { border }` is the Core cell frame (cells, cap `8`) and
@@ -81,11 +87,11 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_lua::{UiBorderToken, UiNodeStyle, UiRichNode};
+use bitty_lua::{UiBorderToken, UiNodeStyle, UiRichNode, UiStyleAlign};
 use bitty_rich::image::PlacementId;
 use bitty_rich::scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ContentToken, RichBlock, Scene, SceneError,
-    SceneNode, SceneNodeStyle, ScrollBehavior, StyledSpan, TableModel,
+    SceneNode, SceneNodeStyle, SceneStyleAlign, ScrollBehavior, StyledSpan, TableModel,
 };
 
 /// Typed failure from the rich-scene bridge.
@@ -155,7 +161,7 @@ pub fn scene_node_of(node: &UiRichNode) -> SceneNode {
 
 /// Maps one bounded wire style onto the scene model's style data.
 ///
-/// Total and lossless: the seven wire keys and the six content tokens are the
+/// Total and lossless: the eight wire keys and the six content tokens are the
 /// same vocabulary on both sides, pinned name-for-name by
 /// `tests/scene_style_vocabulary.rs`. Caps were already enforced at parse, and
 /// the scene admission boundary re-checks them, so a value that reaches the
@@ -177,6 +183,11 @@ fn scene_style_of(style: UiNodeStyle) -> SceneNodeStyle {
     )
     .with_width_range(style.min_width_cells, style.max_width_cells)
     .with_gap(style.gap_cells)
+    .with_align(match style.align {
+        UiStyleAlign::Start => SceneStyleAlign::Start,
+        UiStyleAlign::Center => SceneStyleAlign::Center,
+        UiStyleAlign::End => SceneStyleAlign::End,
+    })
 }
 
 /// Identity and provenance for one rich mount.
@@ -406,6 +417,32 @@ mod tests {
             SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
         ));
         assert_eq!(scene.len(), 0, "the refused block was never stored");
+    }
+
+    #[test]
+    fn a_styled_align_crosses_the_bridge_unchanged() {
+        // bitty#2191: the placement is a closed enum on both sides, so the value
+        // a plugin declared is the value the paint walk reads.
+        for (wire, model) in [
+            (UiStyleAlign::Start, SceneStyleAlign::Start),
+            (UiStyleAlign::Center, SceneStyleAlign::Center),
+            (UiStyleAlign::End, SceneStyleAlign::End),
+        ] {
+            let node = UiRichNode::Styled {
+                style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_align(wire),
+                child: Box::new(UiRichNode::Column(vec![text("a"), text("b")])),
+            };
+            match scene_node_of(&node) {
+                SceneNode::Styled { style, child } => {
+                    assert_eq!(style.align, model, "{wire}");
+                    assert!(
+                        matches!(*child, SceneNode::Column(_)),
+                        "the wrapper keeps the container it places"
+                    );
+                }
+                other => panic!("expected a styled scene node, got {other:?}"),
+            }
+        }
     }
 
     #[test]

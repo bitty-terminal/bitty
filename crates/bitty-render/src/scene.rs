@@ -76,7 +76,7 @@
 //! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
 //! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
-//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells` and `style.gap_cells` of spacing between the wrapped container's adjacent siblings |
+//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells`, `style.gap_cells` of spacing between the wrapped container's adjacent siblings, and `style.align` placing those siblings on the cross axis inside that content box |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
 //! | `List` | one row per item, prefixed `"- "` or `"N. "` when ordered |
@@ -106,6 +106,7 @@
 //! | min width | cells | `0` (no floor) | `1000` | widens the measured content box |
 //! | max width | cells | `0` (no cap) | `1000` | narrows the painted content width |
 //! | gap | cells | `0` (no spacing) | `32` | advances the container walk between siblings; no op |
+//! | align | closed set | `start` | — | offsets each child on the cross axis; no op |
 //!
 //! The two width bounds apply to the **content box** (the width inside
 //! padding) and are what a declaration uses to size content rather than
@@ -128,9 +129,21 @@
 //! fit, the existing `cursor >= extent` break clips the rest of the siblings,
 //! so the spacing can move a node out of the slot but never resize one.
 //!
+//! `align` places the direct children of the styled container on the axis its
+//! siblings do not advance: a `Row` walk is horizontal, so the placement is
+//! vertical; a `Column` walk is vertical, so the placement is horizontal. The
+//! basis is the node's own **content box** — the declared width range after
+//! `padding`, never more than the allocation the node was handed — so an
+//! alignment can never place a child outside the frame its ring draws. `start`
+//! is offset zero for every child and is byte-identical to an undeclared
+//! `align`; `center` uses `slack / 2` and `end` uses `slack`, where the slack
+//! is saturating, so a child as wide as its box stays at zero. Alignment is
+//! paint-only: it changes no measured size, so the frame and the sibling flow
+//! after the container are untouched.
+//!
 //! Core owns every measurement and pixel: the producer declares data and
 //! never lays out or draws. A **flat** style (`padding = radius = border = 0`,
-//! no width bound, no gap)
+//! no width bound, no gap, `align = start`)
 //! measures and paints exactly like the unwrapped child and emits zero ops,
 //! so an unstyled v1 scene and a scene that declares the default style are
 //! byte-identical. A border is a stroke *inside* the node's own measured
@@ -193,7 +206,7 @@ use bitty_rich::image::PlacementId;
 use bitty_rich::scene::{
     Border, CodeBlockModel, ContentToken, ListModel, RichBlock, SCENE_MAX_BLOCKS_PER_TERMINAL,
     SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK, SCENE_MAX_RICH_BYTES_PER_TERMINAL, Scene,
-    SceneNode, SceneNodeStyle, TableModel,
+    SceneNode, SceneNodeStyle, SceneStyleAlign, TableModel,
 };
 use bitty_term_state::char_cell_width;
 
@@ -1089,6 +1102,41 @@ struct Size {
     rows: u16,
 }
 
+/// How a container walk places its direct children (bitty#2191).
+///
+/// Carries the two style fields a walk applies — the sibling `gap` and the
+/// cross-axis `align` — plus the content box the placement is measured in.
+/// [`Self::NONE`] is the pre-style walk: no spacing, every child at offset
+/// zero, and an empty box, which is what every unstyled `Row`/`Column` uses and
+/// why an unstyled tree paints the identical op list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ChildFlow {
+    /// Cells of spacing between adjacent non-empty siblings.
+    gap_cells: u16,
+    /// Cross-axis placement of each child.
+    align: SceneStyleAlign,
+    /// Content-box width; the horizontal placement basis.
+    cols: u16,
+    /// Content-box height; the vertical placement basis.
+    rows: u16,
+}
+
+impl ChildFlow {
+    /// The unstyled walk: no spacing, no offset.
+    const NONE: Self = Self {
+        gap_cells: 0,
+        align: SceneStyleAlign::Start,
+        cols: 0,
+        rows: 0,
+    };
+
+    /// True when the walk would do nothing a plain [`Painter::paint_node`] does
+    /// not already do.
+    const fn is_inert(self) -> bool {
+        self.gap_cells == 0 && matches!(self.align, SceneStyleAlign::Start)
+    }
+}
+
 struct Painter {
     surface: SceneSurface,
     budget: ScenePaintBudget,
@@ -1312,15 +1360,17 @@ impl Painter {
         Ok(size)
     }
 
-    /// Paints a node with the sibling gap its container declared.
+    /// Paints a node with the child flow its container's style declared.
     ///
-    /// `gap_cells == 0` is exactly [`Self::paint_node`], so an undeclared gap
-    /// paints the identical op list. The gap only moves the walk cursor, never a
-    /// node's allocation: a sibling that no longer fits is dropped by the walk's
-    /// existing `cursor >= extent` break, which is the clip the candidate record
+    /// An inert flow ([`ChildFlow::NONE`], or a declared `gap = 0` with
+    /// `align = start`) is exactly [`Self::paint_node`], so an undeclared style
+    /// paints the identical op list. The gap only moves the walk cursor and the
+    /// alignment only offsets a child inside the box it was measured in: a
+    /// sibling that no longer fits is dropped by the walk's existing
+    /// `cursor >= extent` break, which is the clip the candidate record
     /// specifies instead of a truncation.
     #[allow(clippy::too_many_arguments)]
-    fn paint_gapped(
+    fn paint_flow(
         &mut self,
         node: &SceneNode,
         x: u16,
@@ -1328,21 +1378,22 @@ impl Painter {
         width: u16,
         height: u16,
         depth: usize,
-        gap_cells: u16,
+        flow: ChildFlow,
     ) -> Result<(), ScenePaintError> {
-        match (node, gap_cells) {
-            (SceneNode::Row(children), gap) if gap > 0 => {
-                self.paint_row(children, x, y, width, height, depth, gap)
+        match node {
+            SceneNode::Row(children) if !flow.is_inert() => {
+                self.paint_row(children, x, y, width, height, depth, flow)
             }
-            (SceneNode::Column(children), gap) if gap > 0 => {
-                self.paint_column(children, x, y, width, height, depth, gap)
+            SceneNode::Column(children) if !flow.is_inert() => {
+                self.paint_column(children, x, y, width, height, depth, flow)
             }
             _ => self.paint_node(node, x, y, width, height, depth),
         }
     }
 
-    /// Paints a `Row` left to right, advancing the cursor by `gap_cells` between
-    /// adjacent non-empty siblings.
+    /// Paints a `Row` left to right, advancing the cursor by `flow.gap_cells`
+    /// between adjacent non-empty siblings and placing each child vertically by
+    /// `flow.align` inside the row's content box.
     #[allow(clippy::too_many_arguments)]
     fn paint_row(
         &mut self,
@@ -1352,7 +1403,7 @@ impl Painter {
         width: u16,
         height: u16,
         depth: usize,
-        gap_cells: u16,
+        flow: ChildFlow,
     ) -> Result<(), ScenePaintError> {
         if depth > SCENE_MAX_DEPTH {
             return Err(ScenePaintError::DepthTooDeep {
@@ -1360,6 +1411,7 @@ impl Painter {
                 cap: SCENE_MAX_DEPTH,
             });
         }
+        let gap_cells = flow.gap_cells;
         let mut cursor = 0u16;
         let mut previous_cols = 0u16;
         for (index, child) in children.iter().enumerate() {
@@ -1380,6 +1432,12 @@ impl Painter {
                 }
             }
             let available = width - cursor;
+            // The cross-axis placement: the slack between the row's content
+            // box and this child's measured height, never negative, so a child
+            // as tall as its box stays at offset zero and the walk's clip is
+            // still the only failure mode.
+            let offset = flow.align.offset(flow.rows, size.rows);
+            let child_height = size.rows.min(height.saturating_sub(offset));
             // Give the child the size it measured: a `Block` paints its
             // border across exactly this extent, so handing it the whole
             // remaining width would stretch the frame over its siblings
@@ -1387,9 +1445,9 @@ impl Painter {
             self.paint_node(
                 child,
                 x.saturating_add(cursor),
-                y,
+                y.saturating_add(offset),
                 size.cols.min(available),
-                size.rows.min(height),
+                child_height,
                 depth + 1,
             )?;
             cursor = cursor.saturating_add(size.cols);
@@ -1398,8 +1456,9 @@ impl Painter {
         Ok(())
     }
 
-    /// Paints a `Column` top to bottom, advancing the cursor by `gap_cells`
-    /// between adjacent non-empty siblings.
+    /// Paints a `Column` top to bottom, advancing the cursor by
+    /// `flow.gap_cells` between adjacent non-empty siblings and placing each
+    /// child horizontally by `flow.align` inside the column's content box.
     #[allow(clippy::too_many_arguments)]
     fn paint_column(
         &mut self,
@@ -1409,7 +1468,7 @@ impl Painter {
         width: u16,
         height: u16,
         depth: usize,
-        gap_cells: u16,
+        flow: ChildFlow,
     ) -> Result<(), ScenePaintError> {
         if depth > SCENE_MAX_DEPTH {
             return Err(ScenePaintError::DepthTooDeep {
@@ -1417,6 +1476,7 @@ impl Painter {
                 cap: SCENE_MAX_DEPTH,
             });
         }
+        let gap_cells = flow.gap_cells;
         let mut cursor = 0u16;
         let mut previous_rows = 0u16;
         for (index, child) in children.iter().enumerate() {
@@ -1434,11 +1494,17 @@ impl Painter {
                 }
             }
             let available = height - cursor;
+            // The cross-axis placement on the horizontal axis. The box is the
+            // column's own content width, so a child is centred or pushed to
+            // the far edge inside the frame the container declared rather than
+            // inside whatever the parent handed over.
+            let offset = flow.align.offset(flow.cols, size.cols);
+            let child_width = size.cols.min(width.saturating_sub(offset));
             self.paint_node(
                 child,
-                x,
+                x.saturating_add(offset),
                 y.saturating_add(cursor),
-                size.cols.min(width),
+                child_width,
                 size.rows.min(available),
                 depth + 1,
             )?;
@@ -1470,9 +1536,11 @@ impl Painter {
         match node {
             SceneNode::Text(span) => self.paint_lines(&span.text, x, y, width, height, span.bold),
             SceneNode::Unknown(text) => self.paint_lines(text, x, y, width, height, false),
-            SceneNode::Row(children) => self.paint_row(children, x, y, width, height, depth, 0),
+            SceneNode::Row(children) => {
+                self.paint_row(children, x, y, width, height, depth, ChildFlow::NONE)
+            }
             SceneNode::Column(children) => {
-                self.paint_column(children, x, y, width, height, depth, 0)
+                self.paint_column(children, x, y, width, height, depth, ChildFlow::NONE)
             }
             SceneNode::Block { border, child } => {
                 let inset = border_cells(border.as_ref())?;
@@ -1557,20 +1625,33 @@ impl Painter {
                 } else {
                     width.saturating_sub(double)
                 };
+                // The cross-axis placement basis is the node's own content box:
+                // the declared width range after padding, clipped to the
+                // allocation the parent handed over. A `min_width` therefore
+                // widens the box a `Column` centres inside, and a parent that
+                // clips the node narrows it — either way an aligned child can
+                // never land outside the frame the ring around it draws.
+                let flow = ChildFlow {
+                    gap_cells: style.gap_cells,
+                    align: style.align,
+                    cols: content_cols.min(style.constrain_width(inner.cols)),
+                    rows: height.saturating_sub(double).min(inner.rows),
+                };
                 if width > double && height > double && content_cols > 0 {
                     // Hand the child the allocation minus padding, exactly
                     // like an unstyled node receives its allocation: a flat
                     // style must not narrow a root text line. The gap the style
                     // declared is spent by the container walk over this same
-                    // allocation, so a sibling is moved, never resized.
-                    self.paint_gapped(
+                    // allocation, so a sibling is moved, never resized, and the
+                    // alignment offsets it inside the declared box.
+                    self.paint_flow(
                         child,
                         x.saturating_add(style.padding_cells),
                         y.saturating_add(style.padding_cells),
                         content_cols,
                         height - double,
                         depth + 1,
-                        style.gap_cells,
+                        flow,
                     )?;
                 }
                 Ok(())

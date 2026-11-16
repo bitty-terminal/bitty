@@ -34,6 +34,7 @@
 //! | Width floor    | `min_width`    | cells       | `0` (no floor)       | 1000          |
 //! | Width cap      | `max_width`    | cells       | `0` (no cap)         | 1000          |
 //! | Sibling gap    | `gap`          | cells       | `0` (no spacing)     | 32            |
+//! | Child align    | `align`        | closed set  | `start`              | closed set    |
 //!
 //! Padding is measured in cells because scene layout is cell-based; radius and
 //! border width are physical pixels because the scene paint path forwards them
@@ -94,7 +95,51 @@
 //! (`overlay_scene_rows`). A plugin must not read `gap` on a `Column` as a
 //! vertical rhythm inside a band.
 //!
-//! # Band distribution (`align`, bitty#2191)
+//! # Child alignment (`align`, bitty#2191)
+//!
+//! `align` places the **direct children** of a `Row`, `Column`, or `List`
+//! inside that container's content box, on the axis its siblings do not
+//! advance: a `Row` walks its siblings left to right, so `align` moves them
+//! vertically; a `Column`/`List` walks them top to bottom, so `align` moves
+//! them horizontally. It is the placement half of the layout vocabulary that
+//! `gap` (spacing) does not cover.
+//!
+//! - **Closed set.** `start`, `center`, `end` — case-sensitive, three
+//!   spellings and no more. `space-between` is deliberately *not* one: spreading
+//!   slack between siblings is the band root `Row`'s [`UiAlign`] distribution,
+//!   not a cross-axis placement, so a plugin that spells it here is told it is
+//!   unsupported instead of being handed a distribution this surface cannot
+//!   apply.
+//! - **`start` is today.** An absent `align` and a declared `start` both place
+//!   every child at offset zero, which is exactly the pre-existing walk, and
+//!   both are flat: no wrapper node, no operation.
+//! - **Kinds.** `Row`, `Column`, and `List` compose adjacent children, so they
+//!   are the only kinds that can place one. A leaf or single-child kind that
+//!   declares a non-`start` value is refused by the rich reader (the `gap`
+//!   policy), and a declared `start` is accepted everywhere and inert.
+//! - **Saturating slack, never an overflow.** `center` places a child at
+//!   `slack / 2` and `end` at `slack`, where `slack` is the content box minus
+//!   the child's own measured extent. A child wider than the box has no slack
+//!   and stays at offset zero, so an alignment can move a child inside the box
+//!   but never push it past: the existing clip stays the failure mode.
+//! - **It never measures.** Alignment moves children inside a box the
+//!   container already owns; it changes no node's measured size, so the measure
+//!   path is untouched and the frame (and any ring around it) stays the same.
+//! - **No string retained.** The value resolves to an enum, so `align` charges
+//!   nothing to `SCN-3`/`SCN-4` and retains no bytes.
+//!
+//! The box is the node's own content box: `min_width` widens it, which is what
+//! makes a horizontal placement visible on a `Column`, and a parent that clips
+//! the node narrows the placement to the box it actually handed over.
+//!
+//! This key and the band root's [`UiAlign`] field share a spelling and nothing
+//! else. The `style` table is hosted on `ui.rich`'s `terminal` slot (bitty#3176)
+//! and the band field is valid only in a band scene, so the two can never meet
+//! on one node; each refuses the other's exclusive spelling (`space-between`
+//! here, no `style` table there), so one row never has two distribution
+//! mechanisms.
+//!
+//! # Band distribution (band-root `align`, bitty#2191)
 //!
 //! `align` is a closed string — `start`, `center`, `end`, `space-between` —
 //! that selects one of four distributions of the nodes the tree already
@@ -102,10 +147,13 @@
 //! cannot place a node the tree does not contain.
 //!
 //! - **Surface.** It is a field on the v1 band `Row`
-//!   ([`crate::ui::UiNode::Row`]), not a `style` key: [`UI_STYLE_FIELDS`] keeps
-//!   refusing the name, because the `style` table is hosted on `ui.rich`'s
-//!   `terminal` slot (bitty#3176) and no rich row is the band root. A `style`
-//!   spelling would declare a distribution no band paint path can apply.
+//!   ([`crate::ui::UiNode::Row`]), not the `style` key: that key is the
+//!   cross-axis placement above (three spellings, no `space-between`), this
+//!   field is the main-axis distribution of the whole group across the band's
+//!   presented width (four spellings). The two surfaces cannot meet on one
+//!   node — the `style` table is hosted on `ui.rich`'s `terminal` slot
+//!   (bitty#3176), where no node is the band root — so neither is a fallback
+//!   for the other.
 //! - **Kinds and scope.** `Row` only, only as the **band root**, and only in a
 //!   [`crate::ui::UiSceneScope::Band`] scene. `Text`/`Column`/`List`, a nested
 //!   `Row`, and every `Unanchored` mount (the overlay pill stack, a `left`/
@@ -140,12 +188,12 @@
 //!
 //! # Boundaries
 //!
-//! - **Closed vocabulary.** Only the seven keys above are accepted. An unknown
+//! - **Closed vocabulary.** Only the eight keys above are accepted. An unknown
 //!   key (CSS-like spellings included) is rejected, never ignored; so is an
-//!   oversized field or token name. `align` is among the refused names on
-//!   purpose — it is the band placement field described below, not a `style`
-//!   key — so a rich tree that spells it here is told it is unsupported
-//!   instead of being handed a distribution it will never receive. A repeated
+//!   oversized field or token name. `spacing`, `width`, `height`, `margin`, and
+//!   `align_items` are among the refused names: the set has exactly one
+//!   spelling per concept, and a second name for spacing or a size would let
+//!   one node declare two answers. A repeated
 //!   key is rejected as well, but
 //!   only a marshalled table can carry one: the Lua VM collapses duplicate
 //!   keys in a table literal before the bridge sees the value, so that arm is
@@ -199,7 +247,7 @@ use crate::ui::component_invalid;
 // disagree.
 
 /// The closed style key set, in canonical declaration order.
-pub const UI_STYLE_FIELDS: [&str; 7] = [
+pub const UI_STYLE_FIELDS: [&str; 8] = [
     "padding",
     "radius",
     "border",
@@ -207,6 +255,7 @@ pub const UI_STYLE_FIELDS: [&str; 7] = [
     "min_width",
     "max_width",
     "gap",
+    "align",
 ];
 
 /// Inclusive maximum padding in cells per side.
@@ -316,6 +365,93 @@ impl std::fmt::Display for UiBorderToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-axis placement vocabulary (`style.align`, bitty#2191)
+// ---------------------------------------------------------------------------
+
+/// How a `Row`, `Column`, or `List` places its direct children on the axis its
+/// siblings do not advance (bitty#2191).
+///
+/// This is the `style.align` spelling. It is a placement, not a distribution:
+/// a `Row` walks left to right, so the placement axis is vertical; a
+/// `Column`/`List` walks top to bottom, so it is horizontal. Slack is the
+/// container's content box minus the child's own measured extent, and an
+/// offset is never allowed to exceed it.
+///
+/// The set is closed, case-sensitive, and holds three spellings. The band root
+/// `Row`'s [`UiAlign`] field is the four-value **distribution** on the other
+/// surface; `space-between` belongs to it and is not a placement, so this set
+/// refuses it. `start` is the default and equals today's walk exactly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum UiStyleAlign {
+    /// `start` — every child keeps offset zero (today's walk).
+    #[default]
+    Start,
+    /// `center` — a child sits `slack / 2` cells in from the start edge.
+    Center,
+    /// `end` — a child sits `slack` cells in: it ends flush with the far edge.
+    End,
+}
+
+impl UiStyleAlign {
+    /// Every permitted placement, in canonical declaration order.
+    pub const ALL: [Self; 3] = [Self::Start, Self::Center, Self::End];
+
+    /// Wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Center => "center",
+            Self::End => "end",
+        }
+    }
+
+    /// Parses an exact, case-sensitive spelling; `None` outside the set.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|align| align.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for UiStyleAlign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Reads the declared `style.align` value: one closed, bounded, case-sensitive
+/// string.
+///
+/// The shape follows the other style fields: a wrong type is the field's
+/// invalid-value refusal, an oversized string is refused by length without
+/// being echoed, and an unlisted spelling names the closed set. Nothing is
+/// clamped to `start` — a plugin that misspells the value must not believe it
+/// declared a placement Core silently replaced.
+///
+/// # Errors
+///
+/// [`BridgeError`] with class `validation` and code
+/// `E_UI_COMPONENT_INVALID`.
+pub fn parse_style_align(value: &LuaValue) -> Result<UiStyleAlign, BridgeError> {
+    let LuaValue::String(name) = value else {
+        return Err(component_invalid(
+            "invalid scene style value for field 'align'",
+        ));
+    };
+    if name.len() > UI_STYLE_MAX_NAME_BYTES {
+        return Err(component_invalid(format!(
+            "scene style align exceeds cap: {} > {UI_STYLE_MAX_NAME_BYTES} bytes",
+            name.len()
+        )));
+    }
+    UiStyleAlign::parse(name).ok_or_else(|| {
+        component_invalid(format!(
+            "unknown scene style align '{name}': expected 'start', 'center', or 'end'"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -532,11 +668,16 @@ pub struct UiNodeStyle {
     /// Inert on a childless container and on a single-child one (there is no
     /// adjacent pair to separate), and refused on a leaf by the rich reader.
     pub gap_cells: u16,
+    /// Cross-axis placement of the direct children; `Start` is today's walk.
+    ///
+    /// Applies to `Row` (vertical), `Column`/`List` (horizontal); refused on a
+    /// kind with no adjacent children by the rich reader.
+    pub align: UiStyleAlign,
 }
 
 impl UiNodeStyle {
     /// The flat style: no padding, no radius, no border, no width constraint,
-    /// no sibling gap.
+    /// no sibling gap, and children at the start edge.
     /// Paints nothing and measures exactly like the unwrapped node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
@@ -546,6 +687,7 @@ impl UiNodeStyle {
         min_width_cells: 0,
         max_width_cells: 0,
         gap_cells: 0,
+        align: UiStyleAlign::Start,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
@@ -568,6 +710,7 @@ impl UiNodeStyle {
             min_width_cells: 0,
             max_width_cells: 0,
             gap_cells: 0,
+            align: UiStyleAlign::Start,
         }
     }
 
@@ -585,6 +728,16 @@ impl UiNodeStyle {
     #[must_use]
     pub const fn with_gap(mut self, gap_cells: u16) -> Self {
         self.gap_cells = gap_cells;
+        self
+    }
+
+    /// Declares the cross-axis placement of the direct children.
+    ///
+    /// The value is a three-name closed set, so it carries no bound to check:
+    /// an unlisted spelling never reaches this type.
+    #[must_use]
+    pub const fn with_align(mut self, align: UiStyleAlign) -> Self {
+        self.align = align;
         self
     }
 
@@ -652,7 +805,8 @@ impl UiNodeStyle {
     ///
     /// A declared width range counts as geometry: it sizes the node, so it is
     /// never flat. A declared gap does too: it moves a sibling, so it needs the
-    /// wrapper to have any effect.
+    /// wrapper to have any effect. A non-`start` align does too: it moves every
+    /// child, and `start` is exactly today's offset-zero walk.
     #[must_use]
     pub const fn is_flat(self) -> bool {
         self.padding_cells == 0
@@ -661,6 +815,7 @@ impl UiNodeStyle {
             && self.min_width_cells == 0
             && self.max_width_cells == 0
             && self.gap_cells == 0
+            && matches!(self.align, UiStyleAlign::Start)
     }
 
     /// Whether this style's pixel stroke collides with a node's own cell
@@ -686,14 +841,16 @@ impl UiNodeStyle {
 
 /// Parses one `style` table into a bounded [`UiNodeStyle`].
 ///
-/// The table is the closed seven-key set. Nothing else is accepted: an unknown
+/// The table is the closed eight-key set. Nothing else is accepted: an unknown
 /// key, a repeated key, an oversized name, a non-integer geometry value, an
-/// inverted width range, and a token outside the content set all fail with the
+/// inverted width range, an align spelling outside its three names, and a token
+/// outside the content set all fail with the
 /// bridge's typed `E_UI_COMPONENT_INVALID` diagnostic. The input is never
 /// echoed past [`UI_STYLE_MAX_NAME_BYTES`].
 ///
-/// The parser is kind-blind: `gap` parses on any node here, and the rich reader
-/// refuses it on a kind that has no sibling axis (`bitty_lua::ui_rich`). That
+/// The parser is kind-blind: `gap` and `align` parse on any node here, and the
+/// rich reader refuses them on a kind that has no sibling axis
+/// (`bitty_lua::ui_rich`). That
 /// split keeps one field-level refusal code and one place that knows the
 /// closed kind set.
 ///
@@ -717,6 +874,7 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
     let mut min_width_cells = 0u16;
     let mut max_width_cells = 0u16;
     let mut gap_cells = 0u16;
+    let mut align = UiStyleAlign::Start;
     let mut seen = [false; UI_STYLE_FIELDS.len()];
     for (key, field_value) in pairs {
         let LuaValue::String(name) = key else {
@@ -761,12 +919,16 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
             "gap" => {
                 gap_cells = style_count(field_value, "gap", UI_STYLE_MAX_GAP_CELLS)?;
             }
+            "align" => {
+                align = parse_style_align(field_value)?;
+            }
             _ => border_token = style_token(field_value)?,
         }
     }
     let style = UiNodeStyle::new(padding_cells, radius_px, border_px, border_token)
         .with_width_range(min_width_cells, max_width_cells)
-        .with_gap(gap_cells);
+        .with_gap(gap_cells)
+        .with_align(align);
     style
         .validate()
         .map_err(|error| component_invalid(error.to_string()))?;
@@ -857,7 +1019,8 @@ mod tests {
                 "border_token",
                 "min_width",
                 "max_width",
-                "gap"
+                "gap",
+                "align"
             ]
         );
     }
@@ -953,8 +1116,8 @@ mod tests {
         assert_eq!(error.message, "unsupported scene style field 'width'");
         for name in [
             "margin",
-            "align",
             "spacing",
+            "height",
             "stroke",
             "colour",
             "background_color",
@@ -1296,16 +1459,110 @@ mod tests {
     }
 
     #[test]
-    fn align_is_not_a_style_key() {
-        // The `style` table is hosted on `ui.rich`'s terminal slot only, where
-        // no node is the band root: `align` is a band placement field, so the
-        // closed style key set keeps refusing the name instead of accepting a
-        // distribution no band paint path would apply.
-        assert!(!UI_STYLE_FIELDS.contains(&"align"));
-        let error = style(vec![("align", LuaValue::String("center".to_string()))])
-            .expect_err("align is not a scene style key");
+    fn align_is_the_cross_axis_placement_not_the_band_distribution() {
+        // bitty#2191: `style.align` places a container's direct children inside
+        // its content box. It is a three-name placement, so the band root Row's
+        // four-value distribution spelling `space-between` is refused here
+        // instead of being handed a distribution this surface cannot apply.
+        for align in UiStyleAlign::ALL {
+            let parsed = style(vec![(
+                "align",
+                LuaValue::String(align.as_str().to_string()),
+            )])
+            .unwrap_or_else(|error| panic!("{} must parse: {error}", align.as_str()));
+            assert_eq!(parsed.align, align);
+            assert_eq!(
+                parsed.is_flat(),
+                align == UiStyleAlign::Start,
+                "start is today's walk, every other placement moves a child"
+            );
+        }
+        assert_eq!(UiStyleAlign::default(), UiStyleAlign::Start);
+        assert_eq!(
+            UiStyleAlign::ALL.map(UiStyleAlign::as_str),
+            ["start", "center", "end"]
+        );
+
+        let error = style(vec![(
+            "align",
+            LuaValue::String("space-between".to_string()),
+        )])
+        .expect_err("the band distribution is not a placement");
         assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
-        assert_eq!(error.message, "unsupported scene style field 'align'");
+        assert_eq!(
+            error.message,
+            "unknown scene style align 'space-between': expected 'start', 'center', or 'end'"
+        );
+    }
+
+    #[test]
+    fn a_malformed_align_is_a_typed_refusal_that_never_clamps() {
+        // A wrong type is the field's invalid-value refusal: the wire form is a
+        // string, so nothing is coerced from an integer or a boolean.
+        for value in [
+            LuaValue::Integer(1),
+            LuaValue::Bool(true),
+            LuaValue::Number(1.0),
+            LuaValue::table([("kind", LuaValue::String("center".to_string()))]),
+            LuaValue::Nil,
+        ] {
+            let error = style(vec![("align", value)]).expect_err("wrong type refused");
+            assert_eq!(error.class, "validation");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(error.message, "invalid scene style value for field 'align'");
+        }
+
+        // An unlisted spelling is refused, not clamped to `start`.
+        let error = style(vec![("align", LuaValue::String("middle".to_string()))])
+            .expect_err("unknown spelling refused");
+        assert_eq!(
+            error.message,
+            "unknown scene style align 'middle': expected 'start', 'center', or 'end'"
+        );
+        // Case matters: the closed set is lower-case.
+        assert!(
+            style(vec![("align", LuaValue::String("Center".to_string()))]).is_err(),
+            "the set is case-sensitive"
+        );
+
+        // An oversized value is refused by length without being echoed.
+        let long = "s".repeat(UI_STYLE_MAX_NAME_BYTES + 1);
+        let error = style(vec![("align", LuaValue::String(long.clone()))])
+            .expect_err("oversized value refused");
+        assert_eq!(
+            error.message,
+            "scene style align exceeds cap: 33 > 32 bytes"
+        );
+        assert!(!error.message.contains(&long));
+    }
+
+    #[test]
+    fn a_repeated_align_is_refused() {
+        let error = style(vec![
+            ("align", LuaValue::String("center".to_string())),
+            ("align", LuaValue::String("end".to_string())),
+        ])
+        .expect_err("a repeated key is refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert_eq!(
+            error.message,
+            "duplicate scene style field 'align' (only a marshalled table can repeat a key)"
+        );
+    }
+
+    #[test]
+    fn the_names_outside_the_set_stay_refused() {
+        // A second spelling for spacing or for a size would let one node declare
+        // two answers, so the closed set keeps refusing every alternative name.
+        for key in ["spacing", "width", "height", "margin", "align_items"] {
+            let error = style(vec![(key, LuaValue::Integer(1))]).expect_err("refused");
+            assert_eq!(error.class, "validation");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(
+                error.message,
+                format!("unsupported scene style field '{key}'")
+            );
+        }
     }
 
     #[test]

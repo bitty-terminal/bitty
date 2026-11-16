@@ -48,7 +48,7 @@
 //!
 //! Any kind may carry an optional `style` table — the bounded primitive set
 //! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`,
-//! `min_width`, `max_width`, `gap`). A non-flat style lowers to the additive
+//! `min_width`, `max_width`, `gap`, `align`). A non-flat style lowers to the additive
 //! `SceneNode::Styled` wrapper, so the existing measure and paint path applies
 //! it; a flat one lowers to nothing. `style` is a modifier, not a tenth kind:
 //! [`UiRichNode::kind`] still reports the wrapped node's kind and
@@ -67,6 +67,12 @@
 //! `E_UI_COMPONENT_INVALID` refusal naming the kind, not a dropped field (the
 //! `anchor` precedent). A declared `0` is accepted everywhere and is flat, so it
 //! renders exactly like an absent gap.
+//!
+//! `align` places a container's direct children on the axis its siblings do not
+//! advance (`start`, `center`, `end`; a `Row` places vertically, a
+//! `Column`/`List` horizontally). It takes the same kind guard as `gap` and for
+//! the same reason: a leaf has no adjacent child to place. A declared `start`
+//! is today's offset-zero walk, so it is accepted everywhere and is flat.
 //!
 //! `style.border` and `Block.border` are one stroke in two units (px and
 //! cells), so a `Block` may declare one of them and never both with a
@@ -115,7 +121,7 @@ use crate::host::{BridgeError, LuaValue};
 use crate::ui::{
     UI_MARSHAL_LIMITS, UI_MAX_DEPTH, UI_MAX_NODES, UI_MAX_TEXT_BYTES, component_invalid,
 };
-use crate::ui_style::{UiNodeStyle, parse_node_style};
+use crate::ui_style::{UiNodeStyle, UiStyleAlign, parse_node_style};
 
 /// Maximum table rows accepted by one `Table` node.
 pub const UI_RICH_MAX_TABLE_ROWS: usize = 256;
@@ -464,6 +470,22 @@ impl UiRichNode {
             )));
         }
 
+        // bitty#2191: `align` places the direct children of a container on the
+        // axis its siblings do not advance, so it has the same shape
+        // requirement as `gap` and takes the same guard. A `Block` has one
+        // child and no sibling axis, and a leaf has none at all, so a
+        // placement there would be a declaration nothing can apply — refused,
+        // not ignored. A declared `start` asks for today's offset-zero walk and
+        // stays legal everywhere.
+        if style.is_some_and(|style| !matches!(style.align, UiStyleAlign::Start))
+            && !composes_siblings(&node)
+        {
+            return Err(component_invalid(format!(
+                "style.align is not valid on a {} node: only Row, Column, and List place adjacent children, and a declared start is the only align such a node accepts",
+                node.kind()
+            )));
+        }
+
         // A flat declaration is inert: it claims no geometry, so wrapping it
         // would charge `SCN-1`/`SCN-2` for a node that paints nothing. Only a
         // declaration that actually insets or strokes anything becomes the
@@ -512,12 +534,14 @@ pub fn read_rich_component(value: Value<'_>) -> Result<UiRichNode, BridgeError> 
 
 /// Rejects band-surface presentation fields the scene schema cannot express.
 ///
-/// `align` is on the list because it is a *band* placement field (bitty#2191):
-/// only the band root `Row` is handed a bounded width to distribute inside, so
-/// a rich/terminal tree that declares it here would be asking for a
-/// distribution no paint path on this surface can apply. Refusing it loudly is
-/// the same policy [`crate::ui`] applies to `anchor` — a position-invalid field
-/// is an authoring mistake, not a value to drop.
+/// The top-level `align` key is on the list because it is the *band
+/// distribution* field (bitty#2191): only the band root `Row` is handed a
+/// bounded width to distribute inside, so a rich/terminal tree that declares it
+/// there would be asking for a distribution no paint path on this surface can
+/// apply. The cross-axis placement is the `style.align` key instead, which this
+/// surface does apply. Refusing the top-level spelling loudly is the same
+/// policy [`crate::ui`] applies to `anchor` — a position-invalid field is an
+/// authoring mistake, not a value to drop.
 fn reject_band_only_fields(value: &LuaValue) -> Result<(), BridgeError> {
     for key in [
         "fg",
@@ -1044,10 +1068,7 @@ mod tests {
         for kind in UI_RICH_NODE_KINDS {
             let mut fields = vec![
                 ("kind", LuaValue::String(kind.to_string())),
-                (
-                    "style",
-                    LuaValue::table([("align", LuaValue::String("center".to_string()))]),
-                ),
+                ("style", LuaValue::table([("width", LuaValue::Integer(1))])),
             ];
             // Give each kind the content field it requires so only the style
             // can be the reason for the refusal.
@@ -1072,9 +1093,101 @@ mod tests {
                 UiRichNode::from_lua_value(&table).expect_err("unknown style key is refused");
             assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
             assert_eq!(
-                error.message, "unsupported scene style field 'align'",
+                error.message, "unsupported scene style field 'width'",
                 "{kind}"
             );
+        }
+    }
+
+    #[test]
+    fn an_align_is_refused_on_a_kind_that_places_no_adjacent_children() {
+        // bitty#2191: `align` places adjacent children, so only Row, Column,
+        // and List may declare a non-`start` value. Every other kind is refused
+        // with a diagnostic naming it, never silently ignored.
+        for (kind, content) in [
+            ("Text", Some(("text", LuaValue::String("x".to_string())))),
+            ("Block", Some(("child", text("x")))),
+            ("Image", Some(("placement", LuaValue::Integer(1)))),
+            (
+                "CodeBlock",
+                Some(("content", LuaValue::String("x".to_string()))),
+            ),
+            ("Table", Some(("rows", LuaValue::array(Vec::new())))),
+            ("Rule", None),
+        ] {
+            for spelling in ["center", "end"] {
+                let mut fields = vec![
+                    ("kind", LuaValue::String(kind.to_string())),
+                    (
+                        "style",
+                        LuaValue::table([("align", LuaValue::String(spelling.to_string()))]),
+                    ),
+                ];
+                if let Some((key, value)) = content.clone() {
+                    fields.push((key, value));
+                }
+                let table = LuaValue::Table(
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                        .collect(),
+                );
+                let error = UiRichNode::from_lua_value(&table).expect_err("refused");
+                assert_eq!(error.class, "validation");
+                assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+                assert_eq!(
+                    error.message,
+                    format!(
+                        "style.align is not valid on a {kind} node: only Row, Column, \
+                         and List place adjacent children, and a declared start is the \
+                         only align such a node accepts"
+                    ),
+                    "{kind} / {spelling}"
+                );
+            }
+
+            // A declared `start` asks for nothing, so it is accepted and inert.
+            let mut fields = vec![
+                ("kind", LuaValue::String(kind.to_string())),
+                (
+                    "style",
+                    LuaValue::table([("align", LuaValue::String("start".to_string()))]),
+                ),
+            ];
+            if let Some((key, value)) = content.clone() {
+                fields.push((key, value));
+            }
+            let table = LuaValue::Table(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (LuaValue::String(key.to_string()), value))
+                    .collect(),
+            );
+            UiRichNode::from_lua_value(&table)
+                .unwrap_or_else(|error| panic!("{kind} must accept align = start: {error}"));
+        }
+    }
+
+    #[test]
+    fn an_align_is_accepted_on_every_container_that_places_children() {
+        for kind in ["Row", "Column", "List"] {
+            let table = LuaValue::table([
+                ("kind", LuaValue::String(kind.to_string())),
+                ("children", LuaValue::array(vec![text("a"), text("b")])),
+                (
+                    "style",
+                    LuaValue::table([("align", LuaValue::String("end".to_string()))]),
+                ),
+            ]);
+            let node = UiRichNode::from_lua_value(&table)
+                .unwrap_or_else(|error| panic!("{kind} must accept align: {error}"));
+            match node {
+                UiRichNode::Styled { style, .. } => {
+                    assert_eq!(style.align, UiStyleAlign::End, "{kind}");
+                    assert!(!style.is_flat(), "a placement moves a child");
+                }
+                other => panic!("expected a styled wrapper, got {}", other.kind()),
+            }
         }
     }
 

@@ -76,7 +76,7 @@
 //! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
 //! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
-//! | `Styled` | `style.padding_cells` cells of inset on every side around the child |
+//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells` |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
 //! | `List` | one row per item, prefixed `"- "` or `"N. "` when ordered |
@@ -103,9 +103,23 @@
 //! | radius | physical px | `0` | `16` | corner radius of the border ring |
 //! | border | physical px | `0` | `16` | one rounded ring op |
 //! | border token | closed content set | `content.foreground` | — | [`ContentPalette`] colour |
+//! | min width | cells | `0` (no floor) | `1000` | widens the measured content box |
+//! | max width | cells | `0` (no cap) | `1000` | narrows the painted content width |
+//!
+//! The two width bounds apply to the **content box** (the width inside
+//! padding) and are what a declaration uses to size content rather than
+//! decorate it: a `max_width` narrower than the child's measured width clips
+//! the painted run and shrinks the node's advance in a `Row`, while a
+//! `min_width` widens the measured box so a sibling after it starts further
+//! right. Both use `0` for "unbounded", so an undeclared range leaves the
+//! pre-existing layout untouched — the same compatibility rule the flat style
+//! follows. Neither bound can make a node narrower than one cell or wider than
+//! the leaf; the accepted `SCN` node/depth/text budgets are unaffected because
+//! a width changes geometry, not content.
 //!
 //! Core owns every measurement and pixel: the producer declares data and
-//! never lays out or draws. A **flat** style (`padding = radius = border = 0`)
+//! never lays out or draws. A **flat** style (`padding = radius = border = 0`
+//! and no width bound)
 //! measures and paints exactly like the unwrapped child and emits zero ops,
 //! so an unstyled v1 scene and a scene that declares the default style are
 //! byte-identical. A border is a stroke *inside* the node's own measured
@@ -1174,8 +1188,15 @@ impl Painter {
                 let style = paint_style(*style)?;
                 let inner = self.measure(child, depth + 1)?;
                 let inset = style.padding_cells.saturating_mul(2);
+                // The declared width range bounds the content box, so it is
+                // applied to the measured child width and the padding is added
+                // outside it. `constrain_width` is the identity for an
+                // undeclared range, so an unstyled tree measures unchanged.
                 Size {
-                    cols: inner.cols.saturating_add(inset).min(cols),
+                    cols: style
+                        .constrain_width(inner.cols)
+                        .saturating_add(inset)
+                        .min(cols),
                     rows: inner.rows.saturating_add(inset).min(rows),
                 }
             }
@@ -1312,8 +1333,12 @@ impl Painter {
                 let style = paint_style(*style)?;
                 let inner = self.measure(child, depth + 1)?;
                 let double = style.padding_cells.saturating_mul(2);
+                // The declared width range feeds the ring's own frame too: a
+                // node that asked for at least (or at most) `N` content cells
+                // is framed at that width plus its padding, so the stroke and
+                // the content agree about the box.
                 let frame = Size {
-                    cols: inner.cols.saturating_add(double),
+                    cols: style.constrain_width(inner.cols).saturating_add(double),
                     rows: inner.rows.saturating_add(double),
                 };
                 if style.border_px > 0 {
@@ -1340,7 +1365,18 @@ impl Painter {
                         }
                     }
                 }
-                if width > double && height > double {
+                // The content allocation never exceeds the declared cap: a
+                // `max_width` shrinks the width handed to the child (a text
+                // line is clipped to it, a row advances by it), and an
+                // undeclared cap leaves today's allocation byte for byte. A
+                // declared floor only widens the measured extent, so it needs
+                // no change here: painting clamps to the allocation anyway.
+                let content_cols = if style.max_width_cells > 0 {
+                    width.saturating_sub(double).min(style.max_width_cells)
+                } else {
+                    width.saturating_sub(double)
+                };
+                if width > double && height > double && content_cols > 0 {
                     // Hand the child the allocation minus padding, exactly
                     // like an unstyled node receives its allocation: a flat
                     // style must not narrow a root text line.
@@ -1348,7 +1384,7 @@ impl Painter {
                         child,
                         x.saturating_add(style.padding_cells),
                         y.saturating_add(style.padding_cells),
-                        width - double,
+                        content_cols,
                         height - double,
                         depth + 1,
                     )?;

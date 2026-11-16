@@ -173,6 +173,16 @@ pub const SCENE_STYLE_MAX_RADIUS_PX: u16 = 16;
 /// matches `bitty_ui::scene_style::SCENE_STYLE_MAX_BORDER_PX`.
 pub const SCENE_STYLE_MAX_BORDER_PX: u16 = 16;
 
+/// Inclusive maximum content width in cells for `min_width_cells` /
+/// `max_width_cells`.
+///
+/// Reuses the accepted grid-dimension bound
+/// (`bitty_term_state::MAX_GRID_DIM`, mirrored by
+/// `bitty_ui::view::MAX_FIXED_SIZE_DIM`): a width constraint can never name a
+/// grid the terminal cannot represent. A declaration past it is refused, never
+/// clamped.
+pub const SCENE_STYLE_MAX_WIDTH_CELLS: u16 = 1000;
+
 /// Closed content-token set a style colour may name.
 ///
 /// Only `content.*`/`state.*` tokens are in the set: an extension styles
@@ -238,8 +248,10 @@ impl std::fmt::Display for ContentToken {
 ///
 /// Caps are inclusive; one past the cap is rejected and never clamped. The
 /// extension resolver (`bitty_ui::scene_style::SceneStyleError`) carries the
-/// same three cap variants plus its wire-parsing variants, so an authoring
-/// diagnostic and the admission refusal describe a cap the same way.
+/// same cap variants for the four primitives it resolves, so an authoring
+/// diagnostic and the admission refusal describe a cap the same way. The two
+/// width-bound variants exist only here: the resolver has no measure path and
+/// does not carry the width keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SceneStyleError {
     /// Padding exceeds [`SCENE_STYLE_MAX_PADDING_CELLS`].
@@ -263,6 +275,27 @@ pub enum SceneStyleError {
         /// The cap that was exceeded.
         cap: u16,
     },
+    /// A minimum content width exceeds [`SCENE_STYLE_MAX_WIDTH_CELLS`].
+    MinWidthOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// A maximum content width exceeds [`SCENE_STYLE_MAX_WIDTH_CELLS`].
+    MaxWidthOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// The declared width floor exceeds the declared width cap.
+    WidthRangeInverted {
+        /// Declared floor, in cells.
+        min: u16,
+        /// Declared cap, in cells.
+        max: u16,
+    },
 }
 
 impl std::fmt::Display for SceneStyleError {
@@ -276,6 +309,18 @@ impl std::fmt::Display for SceneStyleError {
             }
             Self::BorderOverCap { found, cap } => {
                 write!(f, "scene style border exceeds cap: {found} > {cap}")
+            }
+            Self::MinWidthOverCap { found, cap } => {
+                write!(f, "scene style min_width exceeds cap: {found} > {cap}")
+            }
+            Self::MaxWidthOverCap { found, cap } => {
+                write!(f, "scene style max_width exceeds cap: {found} > {cap}")
+            }
+            Self::WidthRangeInverted { min, max } => {
+                write!(
+                    f,
+                    "scene style width range is inverted: min_width {min} > max_width {max}"
+                )
             }
         }
     }
@@ -295,12 +340,19 @@ impl std::error::Error for SceneStyleError {}
 /// | `radius_px`     | physical px | `0`                   | `16` |
 /// | `border_px`     | physical px | `0`                   | `16` |
 /// | `border_token`  | closed set  | `content.foreground`  | —    |
+/// | `min_width_cells` | cells     | `0` (no floor)        | `1000` |
+/// | `max_width_cells` | cells     | `0` (no cap)          | `1000` |
 ///
 /// `radius_px` and `border_px` are **physical pixels**: the paint path passes
 /// them unchanged into the accepted `RoundedFill` geometry, which is physical
 /// pixel space, so the scene layer applies no DPI scale. A logical-pixel unit
 /// with a DPI story is a separate future change; declaring one here would make
 /// the documented unit disagree with the painted frame.
+///
+/// `min_width_cells` and `max_width_cells` bound the **content box** in cells —
+/// the width the child is measured and painted at, inside `padding_cells` — and
+/// are applied by [`Self::constrain_width`], which the measure and paint paths
+/// call. `0` means "no constraint" on that side.
 ///
 /// Construction is plain data: an out-of-bounds value is representable so a
 /// test (or a hostile producer that bypasses a typed constructor) can prove
@@ -316,19 +368,29 @@ pub struct SceneNodeStyle {
     pub border_px: u16,
     /// Border colour token from the closed content set.
     pub border_token: ContentToken,
+    /// Minimum content width in cells; `0` declares no floor.
+    pub min_width_cells: u16,
+    /// Maximum content width in cells; `0` declares no cap.
+    pub max_width_cells: u16,
 }
 
 impl SceneNodeStyle {
-    /// The flat style: no padding, no radius, no border. A flat style paints
-    /// no operation and measures exactly like an unstyled node.
+    /// The flat style: no padding, no radius, no border, no width constraint. A
+    /// flat style paints no operation and measures exactly like an unstyled
+    /// node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
         radius_px: 0,
         border_px: 0,
         border_token: ContentToken::Foreground,
+        min_width_cells: 0,
+        max_width_cells: 0,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
+    ///
+    /// The width range starts unconstrained (`0`/`0`); declare one with
+    /// [`Self::with_width_range`].
     #[must_use]
     pub const fn new(
         padding_cells: u16,
@@ -341,7 +403,37 @@ impl SceneNodeStyle {
             radius_px,
             border_px,
             border_token,
+            min_width_cells: 0,
+            max_width_cells: 0,
         }
+    }
+
+    /// Declares a content-box width range in cells (`0` = unbounded on that
+    /// side); bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn with_width_range(mut self, min_width_cells: u16, max_width_cells: u16) -> Self {
+        self.min_width_cells = min_width_cells;
+        self.max_width_cells = max_width_cells;
+        self
+    }
+
+    /// Applies the declared width range to a measured content width.
+    ///
+    /// The floor wins first and the cap second, but a validated declaration
+    /// never has `min_width_cells > max_width_cells`, so the order cannot
+    /// matter: this is a two-sided clamp inside a range, not a precedence rule.
+    /// `0` on either side means "unbounded", so an undeclared range returns
+    /// `cols` unchanged and an unstyled tree measures exactly as before.
+    #[must_use]
+    pub const fn constrain_width(self, cols: u16) -> u16 {
+        let mut width = cols;
+        if self.min_width_cells > 0 && width < self.min_width_cells {
+            width = self.min_width_cells;
+        }
+        if self.max_width_cells > 0 && width > self.max_width_cells {
+            width = self.max_width_cells;
+        }
+        width
     }
 
     /// Checks every field against its inclusive cap.
@@ -369,13 +461,40 @@ impl SceneNodeStyle {
                 cap: SCENE_STYLE_MAX_BORDER_PX,
             });
         }
+        if self.min_width_cells > SCENE_STYLE_MAX_WIDTH_CELLS {
+            return Err(SceneStyleError::MinWidthOverCap {
+                found: self.min_width_cells,
+                cap: SCENE_STYLE_MAX_WIDTH_CELLS,
+            });
+        }
+        if self.max_width_cells > SCENE_STYLE_MAX_WIDTH_CELLS {
+            return Err(SceneStyleError::MaxWidthOverCap {
+                found: self.max_width_cells,
+                cap: SCENE_STYLE_MAX_WIDTH_CELLS,
+            });
+        }
+        if self.min_width_cells > 0
+            && self.max_width_cells > 0
+            && self.min_width_cells > self.max_width_cells
+        {
+            return Err(SceneStyleError::WidthRangeInverted {
+                min: self.min_width_cells,
+                max: self.max_width_cells,
+            });
+        }
         Ok(())
     }
 
     /// True when no geometry is claimed; the border token is then inert.
+    ///
+    /// A declared width range is geometry: it sizes the node.
     #[must_use]
     pub const fn is_flat(self) -> bool {
-        self.padding_cells == 0 && self.radius_px == 0 && self.border_px == 0
+        self.padding_cells == 0
+            && self.radius_px == 0
+            && self.border_px == 0
+            && self.min_width_cells == 0
+            && self.max_width_cells == 0
     }
 }
 
@@ -2188,6 +2307,105 @@ mod tests {
         assert!(!SceneNodeStyle::new(1, 0, 0, ContentToken::Foreground).is_flat());
         assert!(!SceneNodeStyle::new(0, 1, 0, ContentToken::Foreground).is_flat());
         assert!(!SceneNodeStyle::new(0, 0, 1, ContentToken::Foreground).is_flat());
+        // A width range is geometry: it sizes the node, so it is never flat.
+        assert!(
+            !SceneNodeStyle::FLAT.with_width_range(4, 0).is_flat(),
+            "a declared floor is not flat"
+        );
+        assert!(
+            !SceneNodeStyle::FLAT.with_width_range(0, 4).is_flat(),
+            "a declared cap is not flat"
+        );
+    }
+
+    #[test]
+    fn the_width_range_is_a_two_sided_clamp_inside_its_cap() {
+        // The identity for an undeclared range is what keeps every existing
+        // scene measuring exactly as before.
+        assert_eq!(SceneNodeStyle::FLAT.constrain_width(7), 7);
+        assert_eq!(SceneNodeStyle::FLAT.constrain_width(0), 0);
+
+        let range = SceneNodeStyle::FLAT.with_width_range(4, 8);
+        assert_eq!(range.constrain_width(0), 4, "the floor lifts a short box");
+        assert_eq!(range.constrain_width(4), 4);
+        assert_eq!(range.constrain_width(6), 6, "inside the range: unchanged");
+        assert_eq!(range.constrain_width(8), 8);
+        assert_eq!(range.constrain_width(9), 8, "the cap trims a wide box");
+
+        // One-sided declarations leave the other side alone.
+        let floor_only = SceneNodeStyle::FLAT.with_width_range(4, 0);
+        assert_eq!(floor_only.constrain_width(2), 4);
+        assert_eq!(floor_only.constrain_width(400), 400);
+        let cap_only = SceneNodeStyle::FLAT.with_width_range(0, 4);
+        assert_eq!(cap_only.constrain_width(0), 0);
+        assert_eq!(cap_only.constrain_width(400), 4);
+
+        // A fixed width (floor == cap) is a legal range, not an empty one.
+        let fixed = SceneNodeStyle::FLAT.with_width_range(5, 5);
+        assert_eq!(fixed.constrain_width(1), 5);
+        assert_eq!(fixed.constrain_width(9), 5);
+        assert_eq!(fixed.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_out_of_range_width_is_refused_without_clamping() {
+        assert_eq!(
+            SceneNodeStyle::FLAT
+                .with_width_range(SCENE_STYLE_MAX_WIDTH_CELLS + 1, 0)
+                .validate(),
+            Err(SceneStyleError::MinWidthOverCap {
+                found: 1001,
+                cap: 1000
+            })
+        );
+        assert_eq!(
+            SceneNodeStyle::FLAT
+                .with_width_range(0, SCENE_STYLE_MAX_WIDTH_CELLS + 1)
+                .validate(),
+            Err(SceneStyleError::MaxWidthOverCap {
+                found: 1001,
+                cap: 1000
+            })
+        );
+        assert_eq!(
+            SceneNodeStyle::FLAT.with_width_range(9, 4).validate(),
+            Err(SceneStyleError::WidthRangeInverted { min: 9, max: 4 })
+        );
+        assert_eq!(
+            SceneStyleError::WidthRangeInverted { min: 9, max: 4 }.to_string(),
+            "scene style width range is inverted: min_width 9 > max_width 4"
+        );
+        // An admission attempt with an over-cap width paints nothing and is not
+        // stored, exactly like the four painted primitives.
+        let mut scene = Scene::new();
+        scene
+            .insert(
+                RichBlock::new(
+                    BlockId(1),
+                    BlockAnchor::Zone(1),
+                    tiny_text("kept"),
+                    ScrollBehavior::Inline,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("a v1 block is admitted"),
+            )
+            .expect("admitted");
+        let over_cap = RichBlock::new(
+            BlockId(3),
+            BlockAnchor::Zone(3),
+            styled(SceneNodeStyle::FLAT.with_width_range(0, SCENE_STYLE_MAX_WIDTH_CELLS + 1)),
+            ScrollBehavior::Inline,
+            1,
+            1,
+            3,
+        );
+        assert!(
+            matches!(over_cap, Err(SceneError::StyleInvalid { .. })),
+            "the admission boundary refuses the width too"
+        );
+        assert_eq!(scene.len(), 1, "the refused block was never stored");
     }
 
     #[test]

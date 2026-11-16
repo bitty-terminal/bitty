@@ -54,6 +54,12 @@
 //! mapping is a total function of the six-name content token set, so no new
 //! vocabulary enters Core here.
 //!
+//! `style.min_width_cells`/`max_width_cells` (the content-box width range,
+//! bitty#2191) cross unchanged: the bridge carries the declaration and the
+//! Core measure path (`bitty_render::scene`) applies it through
+//! `SceneNodeStyle::constrain_width`. The plugin never computes a width and the
+//! bridge never re-orders the pair; an inverted range was refused at parse.
+//!
 //! # One stroke per node
 //!
 //! `UiRichNode::Block { border }` is the Core cell frame (cells, cap `8`) and
@@ -144,7 +150,7 @@ pub fn scene_node_of(node: &UiRichNode) -> SceneNode {
 
 /// Maps one bounded wire style onto the scene model's style data.
 ///
-/// Total and lossless: the four primitives and the six content tokens are the
+/// Total and lossless: the six wire keys and the six content tokens are the
 /// same vocabulary on both sides, pinned name-for-name by
 /// `tests/scene_style_vocabulary.rs`. Caps were already enforced at parse, and
 /// the scene admission boundary re-checks them, so a value that reaches the
@@ -164,6 +170,7 @@ fn scene_style_of(style: UiNodeStyle) -> SceneNodeStyle {
             UiBorderToken::Success => ContentToken::Success,
         },
     )
+    .with_width_range(style.min_width_cells, style.max_width_cells)
 }
 
 /// Identity and provenance for one rich mount.

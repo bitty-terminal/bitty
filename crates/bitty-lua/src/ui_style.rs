@@ -33,6 +33,8 @@
 //! | Border colour  | `border_token` | token       | `content.foreground` | closed set    |
 //! | Width floor    | `min_width`    | cells       | `0` (no floor)       | 1000          |
 //! | Width cap      | `max_width`    | cells       | `0` (no cap)         | 1000          |
+//! | Height floor   | `min_height`   | cells       | `0` (no floor)       | 1000          |
+//! | Height cap     | `max_height`   | cells       | `0` (no cap)         | 1000          |
 //! | Sibling gap    | `gap`          | cells       | `0` (no spacing)     | 32            |
 //! | Child align    | `align`        | closed set  | `start`              | closed set    |
 //!
@@ -59,6 +61,33 @@
 //!
 //! A width-only declaration is **not** flat: it sizes the node, so it must lower
 //! to the additive wrapper to have any effect.
+//!
+//! # Height constraints (bitty#2191)
+//!
+//! `min_height` and `max_height` are the vertical half of the same size
+//! vocabulary, with the same shape: **content box**, cells, `0` = no
+//! constraint on that side, inclusive cap [`UI_STYLE_MAX_HEIGHT_CELLS`], and an
+//! inverted range (`min_height > max_height`) refused instead of reordered. A
+//! box the plugin declares, Core derives.
+//!
+//! - **Why the pair, not a bare `height`.** One spelling per concept: a bare
+//!   `height` is a third name for a size and stays refused, exactly like a bare
+//!   `width` next to the width pair.
+//! - **Floor widens, cap clips.** A floor raises the frame the node paints (a
+//!   one-line capsule can claim a three-row pill without Core inventing
+//!   content), and a cap narrows the rows handed to the child, so content past
+//!   it is clipped by the existing walk. Neither is a clamp of the declaration:
+//!   an authored value is applied or refused, never adjusted.
+//! - **Clip, not refusal.** A container whose allocation is shorter than the
+//!   declared floor clips at the allocation under the existing walk; the same
+//!   fit failure a `min_width` sees in a narrow slot. Nothing wraps or scrolls.
+//! - **Kinds.** Any kind may declare the pair: a height is the node's own
+//!   extent, not a relation between siblings, so unlike `gap`/`align` it needs
+//!   no composed axis and is never refused per kind.
+//! - **No string, no measure.** Both values are integers resolved to data the
+//!   Core measure path applies (`SceneNodeStyle::constrain_height` in
+//!   `bitty-rich`, called by `bitty-render`'s measure and paint), so they charge
+//!   nothing to `SCN-3`/`SCN-4`.
 //!
 //! # Sibling spacing (`gap`, bitty#2191)
 //!
@@ -188,7 +217,7 @@
 //!
 //! # Boundaries
 //!
-//! - **Closed vocabulary.** Only the eight keys above are accepted. An unknown
+//! - **Closed vocabulary.** Only the ten keys above are accepted. An unknown
 //!   key (CSS-like spellings included) is rejected, never ignored; so is an
 //!   oversized field or token name. `spacing`, `width`, `height`, `margin`, and
 //!   `align_items` are among the refused names: the set has exactly one
@@ -247,13 +276,15 @@ use crate::ui::component_invalid;
 // disagree.
 
 /// The closed style key set, in canonical declaration order.
-pub const UI_STYLE_FIELDS: [&str; 8] = [
+pub const UI_STYLE_FIELDS: [&str; 10] = [
     "padding",
     "radius",
     "border",
     "border_token",
     "min_width",
     "max_width",
+    "min_height",
+    "max_height",
     "gap",
     "align",
 ];
@@ -287,6 +318,15 @@ pub const UI_STYLE_MAX_NAME_BYTES: usize = 32;
 /// the terminal cannot represent. The bound is a cap on the declaration, not a
 /// clamp: one past it is refused.
 pub const UI_STYLE_MAX_WIDTH_CELLS: u16 = 1000;
+
+/// Inclusive maximum content height in cells for `min_height`/`max_height`.
+///
+/// Reuses the same accepted grid-dimension bound as
+/// [`UI_STYLE_MAX_WIDTH_CELLS`]: `bitty_term_state::MAX_GRID_DIM` bounds both
+/// axes of a grid, so a height constraint can never name a terminal that
+/// cannot exist. The bound is a cap on the declaration, not a clamp: one past
+/// it is refused, and a declared floor the allocation cannot fit is a clip.
+pub const UI_STYLE_MAX_HEIGHT_CELLS: u16 = 1000;
 
 /// Inclusive maximum sibling gap in cells for `gap`.
 ///
@@ -602,6 +642,27 @@ pub enum UiStyleError {
         /// Declared cap, in cells.
         max: u16,
     },
+    /// Minimum content height exceeds [`UI_STYLE_MAX_HEIGHT_CELLS`].
+    MinHeightOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// Maximum content height exceeds [`UI_STYLE_MAX_HEIGHT_CELLS`].
+    MaxHeightOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// A height floor above the height cap would describe an empty range.
+    HeightRangeInverted {
+        /// Declared floor, in cells.
+        min: u16,
+        /// Declared cap, in cells.
+        max: u16,
+    },
     /// Sibling gap exceeds [`UI_STYLE_MAX_GAP_CELLS`].
     GapOverCap {
         /// Rejected value.
@@ -635,6 +696,18 @@ impl std::fmt::Display for UiStyleError {
                     "scene style width range is inverted: min_width {min} > max_width {max}"
                 )
             }
+            Self::MinHeightOverCap { found, cap } => {
+                write!(f, "scene style min_height exceeds cap: {found} > {cap}")
+            }
+            Self::MaxHeightOverCap { found, cap } => {
+                write!(f, "scene style max_height exceeds cap: {found} > {cap}")
+            }
+            Self::HeightRangeInverted { min, max } => {
+                write!(
+                    f,
+                    "scene style height range is inverted: min_height {min} > max_height {max}"
+                )
+            }
             Self::GapOverCap { found, cap } => {
                 write!(f, "scene style gap exceeds cap: {found} > {cap}")
             }
@@ -663,6 +736,10 @@ pub struct UiNodeStyle {
     pub min_width_cells: u16,
     /// Maximum content width in cells; `0` declares no cap.
     pub max_width_cells: u16,
+    /// Minimum content height in cells; `0` declares no floor.
+    pub min_height_cells: u16,
+    /// Maximum content height in cells; `0` declares no cap.
+    pub max_height_cells: u16,
     /// Spacing between adjacent siblings, in cells; `0` declares no spacing.
     ///
     /// Inert on a childless container and on a single-child one (there is no
@@ -676,8 +753,8 @@ pub struct UiNodeStyle {
 }
 
 impl UiNodeStyle {
-    /// The flat style: no padding, no radius, no border, no width constraint,
-    /// no sibling gap, and children at the start edge.
+    /// The flat style: no padding, no radius, no border, no width or height
+    /// constraint, no sibling gap, and children at the start edge.
     /// Paints nothing and measures exactly like the unwrapped node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
@@ -686,6 +763,8 @@ impl UiNodeStyle {
         border_token: UiBorderToken::Foreground,
         min_width_cells: 0,
         max_width_cells: 0,
+        min_height_cells: 0,
+        max_height_cells: 0,
         gap_cells: 0,
         align: UiStyleAlign::Start,
     };
@@ -709,6 +788,8 @@ impl UiNodeStyle {
             border_token,
             min_width_cells: 0,
             max_width_cells: 0,
+            min_height_cells: 0,
+            max_height_cells: 0,
             gap_cells: 0,
             align: UiStyleAlign::Start,
         }
@@ -720,6 +801,15 @@ impl UiNodeStyle {
     pub const fn with_width_range(mut self, min_width_cells: u16, max_width_cells: u16) -> Self {
         self.min_width_cells = min_width_cells;
         self.max_width_cells = max_width_cells;
+        self
+    }
+
+    /// Declares a content-box height range in cells (`0` = unbounded on that
+    /// side); bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn with_height_range(mut self, min_height_cells: u16, max_height_cells: u16) -> Self {
+        self.min_height_cells = min_height_cells;
+        self.max_height_cells = max_height_cells;
         self
     }
 
@@ -791,6 +881,29 @@ impl UiNodeStyle {
                 max: self.max_width_cells,
             });
         }
+        if self.min_height_cells > UI_STYLE_MAX_HEIGHT_CELLS {
+            return Err(UiStyleError::MinHeightOverCap {
+                found: self.min_height_cells,
+                cap: UI_STYLE_MAX_HEIGHT_CELLS,
+            });
+        }
+        if self.max_height_cells > UI_STYLE_MAX_HEIGHT_CELLS {
+            return Err(UiStyleError::MaxHeightOverCap {
+                found: self.max_height_cells,
+                cap: UI_STYLE_MAX_HEIGHT_CELLS,
+            });
+        }
+        // The same two-sided rule as the width range: only two declared bounds
+        // can invert, and a floor above the cap is refused rather than swapped.
+        if self.min_height_cells > 0
+            && self.max_height_cells > 0
+            && self.min_height_cells > self.max_height_cells
+        {
+            return Err(UiStyleError::HeightRangeInverted {
+                min: self.min_height_cells,
+                max: self.max_height_cells,
+            });
+        }
         if self.gap_cells > UI_STYLE_MAX_GAP_CELLS {
             return Err(UiStyleError::GapOverCap {
                 found: self.gap_cells,
@@ -799,12 +912,12 @@ impl UiNodeStyle {
         }
         Ok(())
     }
-
     /// True when no geometry is claimed; the border token is then inert and
     /// the declaration lowers to no wrapper node.
     ///
     /// A declared width range counts as geometry: it sizes the node, so it is
-    /// never flat. A declared gap does too: it moves a sibling, so it needs the
+    /// never flat. A declared height range does too, for the same reason. A
+    /// declared gap does: it moves a sibling, so it needs the
     /// wrapper to have any effect. A non-`start` align does too: it moves every
     /// child, and `start` is exactly today's offset-zero walk.
     #[must_use]
@@ -814,6 +927,8 @@ impl UiNodeStyle {
             && self.border_px == 0
             && self.min_width_cells == 0
             && self.max_width_cells == 0
+            && self.min_height_cells == 0
+            && self.max_height_cells == 0
             && self.gap_cells == 0
             && matches!(self.align, UiStyleAlign::Start)
     }
@@ -841,9 +956,10 @@ impl UiNodeStyle {
 
 /// Parses one `style` table into a bounded [`UiNodeStyle`].
 ///
-/// The table is the closed eight-key set. Nothing else is accepted: an unknown
+/// The table is the closed ten-key set. Nothing else is accepted: an unknown
 /// key, a repeated key, an oversized name, a non-integer geometry value, an
-/// inverted width range, an align spelling outside its three names, and a token
+/// inverted width or height range, an align spelling outside its three names,
+/// and a token
 /// outside the content set all fail with the
 /// bridge's typed `E_UI_COMPONENT_INVALID` diagnostic. The input is never
 /// echoed past [`UI_STYLE_MAX_NAME_BYTES`].
@@ -873,6 +989,8 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
     let mut border_token = UiBorderToken::Foreground;
     let mut min_width_cells = 0u16;
     let mut max_width_cells = 0u16;
+    let mut min_height_cells = 0u16;
+    let mut max_height_cells = 0u16;
     let mut gap_cells = 0u16;
     let mut align = UiStyleAlign::Start;
     let mut seen = [false; UI_STYLE_FIELDS.len()];
@@ -916,6 +1034,14 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
             "max_width" => {
                 max_width_cells = style_count(field_value, "max_width", UI_STYLE_MAX_WIDTH_CELLS)?;
             }
+            "min_height" => {
+                min_height_cells =
+                    style_count(field_value, "min_height", UI_STYLE_MAX_HEIGHT_CELLS)?;
+            }
+            "max_height" => {
+                max_height_cells =
+                    style_count(field_value, "max_height", UI_STYLE_MAX_HEIGHT_CELLS)?;
+            }
             "gap" => {
                 gap_cells = style_count(field_value, "gap", UI_STYLE_MAX_GAP_CELLS)?;
             }
@@ -927,6 +1053,7 @@ pub fn parse_node_style(value: &LuaValue) -> Result<UiNodeStyle, BridgeError> {
     }
     let style = UiNodeStyle::new(padding_cells, radius_px, border_px, border_token)
         .with_width_range(min_width_cells, max_width_cells)
+        .with_height_range(min_height_cells, max_height_cells)
         .with_gap(gap_cells)
         .with_align(align);
     style
@@ -1009,6 +1136,7 @@ mod tests {
         assert_eq!(UI_STYLE_MAX_BORDER_PX, 16);
         assert_eq!(UI_STYLE_MAX_NAME_BYTES, 32);
         assert_eq!(UI_STYLE_MAX_WIDTH_CELLS, 1000);
+        assert_eq!(UI_STYLE_MAX_HEIGHT_CELLS, 1000);
         assert_eq!(UI_STYLE_MAX_GAP_CELLS, 32);
         assert_eq!(
             UI_STYLE_FIELDS,
@@ -1019,6 +1147,8 @@ mod tests {
                 "border_token",
                 "min_width",
                 "max_width",
+                "min_height",
+                "max_height",
                 "gap",
                 "align"
             ]
@@ -1387,6 +1517,154 @@ mod tests {
     }
 
     #[test]
+    fn the_height_bounds_parse_and_their_cap_is_inclusive() {
+        // bitty#2191: the vertical half of the size vocabulary. `0` on a side
+        // means unbounded, so a pair, a floor alone, and a cap alone all parse.
+        let parsed = style(vec![
+            ("min_height", LuaValue::Integer(2)),
+            ("max_height", LuaValue::Integer(6)),
+        ])
+        .expect("a height range parses");
+        assert_eq!(parsed.min_height_cells, 2);
+        assert_eq!(parsed.max_height_cells, 6);
+        assert!(
+            !parsed.is_flat(),
+            "a height range sizes the node, so it can never be flat"
+        );
+
+        let floor_only =
+            style(vec![("min_height", LuaValue::Integer(3))]).expect("a floor alone parses");
+        assert_eq!(floor_only.max_height_cells, 0);
+        assert!(!floor_only.is_flat());
+        let cap_only =
+            style(vec![("max_height", LuaValue::Integer(1))]).expect("a cap alone parses");
+        assert_eq!(cap_only.min_height_cells, 0);
+        assert!(!cap_only.is_flat());
+
+        // The grid-dimension cap is inclusive on both sides and equal bounds are
+        // a legal fixed height.
+        let at_cap = style(vec![
+            (
+                "min_height",
+                LuaValue::Integer(i64::from(UI_STYLE_MAX_HEIGHT_CELLS)),
+            ),
+            (
+                "max_height",
+                LuaValue::Integer(i64::from(UI_STYLE_MAX_HEIGHT_CELLS)),
+            ),
+        ])
+        .expect("the cap itself is accepted");
+        assert_eq!(at_cap.min_height_cells, UI_STYLE_MAX_HEIGHT_CELLS);
+        assert_eq!(at_cap.max_height_cells, UI_STYLE_MAX_HEIGHT_CELLS);
+        let fixed = style(vec![
+            ("min_height", LuaValue::Integer(4)),
+            ("max_height", LuaValue::Integer(4)),
+        ])
+        .expect("min == max is a fixed height");
+        assert_eq!((fixed.min_height_cells, fixed.max_height_cells), (4, 4));
+
+        // A declared `0`/`0` is flat: it renders like an absent range.
+        let zero = style(vec![
+            ("min_height", LuaValue::Integer(0)),
+            ("max_height", LuaValue::Integer(0)),
+        ])
+        .expect("0 is legal on both sides");
+        assert_eq!(zero, UiNodeStyle::FLAT);
+        assert!(zero.is_flat());
+
+        // The pair composes with the other fields instead of replacing one.
+        let composed = style(vec![
+            ("padding", LuaValue::Integer(1)),
+            ("min_height", LuaValue::Integer(3)),
+            ("min_width", LuaValue::Integer(6)),
+        ])
+        .expect("padding + height + width parses");
+        assert_eq!(
+            (
+                composed.padding_cells,
+                composed.min_height_cells,
+                composed.min_width_cells
+            ),
+            (1, 3, 6)
+        );
+    }
+
+    #[test]
+    fn a_height_past_the_cap_is_a_typed_rejection_and_a_bare_height_is_not_a_key() {
+        let over = i64::from(UI_STYLE_MAX_HEIGHT_CELLS) + 1;
+        for field in ["min_height", "max_height"] {
+            let error = style(vec![(field, LuaValue::Integer(over))]).expect_err("rejected");
+            assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+            assert_eq!(error.class, "validation");
+            assert_eq!(
+                error.message,
+                format!("scene style {field} exceeds cap: {over} > {UI_STYLE_MAX_HEIGHT_CELLS}"),
+                "{field}"
+            );
+            // No clamp: a value past `u16` reports the found value verbatim.
+            let error = style(vec![(field, LuaValue::Integer(1_000_000))]).expect_err("rejected");
+            assert_eq!(
+                error.message,
+                format!("scene style {field} exceeds cap: 1000000 > {UI_STYLE_MAX_HEIGHT_CELLS}")
+            );
+        }
+
+        // The pair is the vocabulary, not a bare `height`: the CSS-like single
+        // name stays refused so one concept never has two spellings.
+        let error = style(vec![("height", LuaValue::Integer(3))]).expect_err("refused");
+        assert_eq!(error.message, "unsupported scene style field 'height'");
+
+        // A wrong value type follows the same integer rule as every other
+        // geometry field, including no float coercion.
+        for value in [
+            LuaValue::Integer(-1),
+            LuaValue::Number(3.0),
+            LuaValue::Number(3.5),
+            LuaValue::Bool(true),
+            LuaValue::String("3".to_string()),
+            LuaValue::table([("cells", LuaValue::Integer(3))]),
+        ] {
+            let error = style(vec![("min_height", value)]).expect_err("rejected");
+            assert_eq!(
+                error.message,
+                "invalid scene style value for field 'min_height'"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inverted_height_range_is_refused_instead_of_reordered() {
+        let error = style(vec![
+            ("min_height", LuaValue::Integer(7)),
+            ("max_height", LuaValue::Integer(3)),
+        ])
+        .expect_err("an empty range is refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert_eq!(error.class, "validation");
+        assert_eq!(
+            error.message,
+            "scene style height range is inverted: min_height 7 > max_height 3"
+        );
+
+        // The width range and the height range are independent: a width that
+        // inverts is refused even when the height range is well ordered, and a
+        // zero (unbounded) height side never inverts.
+        assert!(style(vec![("min_height", LuaValue::Integer(7))]).is_ok());
+        assert!(style(vec![("max_height", LuaValue::Integer(1))]).is_ok());
+        let error = style(vec![
+            ("min_height", LuaValue::Integer(2)),
+            ("max_height", LuaValue::Integer(4)),
+            ("min_width", LuaValue::Integer(9)),
+            ("max_width", LuaValue::Integer(4)),
+        ])
+        .expect_err("the width range is still checked");
+        assert_eq!(
+            error.message,
+            "scene style width range is inverted: min_width 9 > max_width 4"
+        );
+    }
+
+    #[test]
     fn a_pixel_stroke_collides_with_a_cell_frame_only_when_both_paint() {
         // bitty#3176 item 1: the rule is a pure function of the two widths, so
         // the parser applies one behaviour instead of inventing a precedence.
@@ -1613,6 +1891,40 @@ mod tests {
         assert_eq!(
             UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
                 .with_gap(32)
+                .validate(),
+            Ok(())
+        );
+        assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_height_range(0, UI_STYLE_MAX_HEIGHT_CELLS + 1)
+                .validate(),
+            Err(UiStyleError::MaxHeightOverCap {
+                found: 1001,
+                cap: 1000
+            })
+        );
+        assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_height_range(UI_STYLE_MAX_HEIGHT_CELLS + 1, 0)
+                .validate(),
+            Err(UiStyleError::MinHeightOverCap {
+                found: 1001,
+                cap: 1000
+            })
+        );
+        assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_height_range(6, 2)
+                .validate(),
+            Err(UiStyleError::HeightRangeInverted { min: 6, max: 2 })
+        );
+        assert_eq!(
+            UiStyleError::HeightRangeInverted { min: 6, max: 2 }.to_string(),
+            "scene style height range is inverted: min_height 6 > max_height 2"
+        );
+        assert_eq!(
+            UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground)
+                .with_height_range(2, 0)
                 .validate(),
             Ok(())
         );

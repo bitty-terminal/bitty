@@ -197,8 +197,9 @@ pub use scene::{
     BlockAnchor, BlockId, Border, CodeBlockModel, ContentToken, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,
     SCENE_MAX_RICH_BYTES_PER_TERMINAL, SCENE_MAX_TEXT_BYTES_PER_BLOCK, SCENE_STYLE_MAX_BORDER_PX,
-    SCENE_STYLE_MAX_GAP_CELLS, SCENE_STYLE_MAX_PADDING_CELLS, SCENE_STYLE_MAX_RADIUS_PX,
-    SCENE_STYLE_MAX_WIDTH_CELLS, SCENE_STYLE_SCHEMA_VERSION, Scene, SceneError, SceneNode,
-    SceneNodeStyle, SceneStyleAlign, SceneStyleError, ScrollBehavior, StyledSpan, TableModel,
+    SCENE_STYLE_MAX_GAP_CELLS, SCENE_STYLE_MAX_HEIGHT_CELLS, SCENE_STYLE_MAX_PADDING_CELLS,
+    SCENE_STYLE_MAX_RADIUS_PX, SCENE_STYLE_MAX_WIDTH_CELLS, SCENE_STYLE_SCHEMA_VERSION, Scene,
+    SceneError, SceneNode, SceneNodeStyle, SceneStyleAlign, SceneStyleError, ScrollBehavior,
+    StyledSpan, TableModel,
 };
 pub use shell::{CommandRegion, ShellIntegration};

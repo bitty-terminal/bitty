@@ -742,6 +742,11 @@ impl DeliverySummary {
 struct MonitorState {
     last_progress: u64,
     stall_started: Option<Instant>,
+    /// The phase the current episode stalled in (bitty#3211).
+    ///
+    /// Recorded when the episode starts owing a line, so the recovery line can
+    /// name the phase that hung instead of whatever the closing poll sampled.
+    stalled_phase: Option<Phase>,
     reported: bool,
     /// Highest completed-tick sequence consumed from the runtime ring.
     last_tick_seq: u64,
@@ -813,7 +818,11 @@ enum MonitorAction {
     /// `phase` is the sampled phase that stalled.
     Report { idle: Duration, phase: Phase },
     /// The loop made progress again after a reported stall.
-    Recovered { stalled_for: Duration },
+    ///
+    /// `phase` is the phase that stalled, as the report named it. A park that
+    /// closes the episode samples `idle`, and naming that would hide what
+    /// actually hung.
+    Recovered { stalled_for: Duration, phase: Phase },
 }
 
 impl MonitorState {
@@ -822,6 +831,7 @@ impl MonitorState {
         Self {
             last_progress: progress,
             stall_started: None,
+            stalled_phase: None,
             reported: false,
             last_tick_seq: tick_seq,
             pending_ticks: VecDeque::with_capacity(TICK_RING_CAPACITY),
@@ -1003,22 +1013,29 @@ impl MonitorState {
         let active = active || parked;
         if progress != self.last_progress {
             self.last_progress = progress;
-            let recovered = self
-                .stall_started
-                .take()
-                .map(|started| now.saturating_duration_since(started));
-            let had_report = std::mem::replace(&mut self.reported, false);
-            return match recovered {
-                Some(stalled_for) if had_report => MonitorAction::Recovered { stalled_for },
-                _ => MonitorAction::None,
+            return match self.close_episode(now) {
+                Some(recovery) => MonitorAction::Recovered {
+                    stalled_for: recovery.stalled_for,
+                    phase: recovery.phase,
+                },
+                None => MonitorAction::None,
             };
         }
         if !active {
-            // Idle is expected: no stall, and a threshold crossing that ended
-            // without a report leaves no recovery line.
-            self.stall_started = None;
-            self.reported = false;
-            return MonitorAction::None;
+            // Idle is expected: no stall. The park edge is also a way out of a
+            // reported stall, though, and bitty#3211 showed the line could be
+            // dropped here: `Shared::mark` publishes `active` before it bumps
+            // `progress`, so a poll that lands between the two stores sees the
+            // park edge with the old counter. Both edges therefore close the
+            // episode, and whichever one a poll observes first delivers the
+            // one line the report owes.
+            return match self.close_episode(now) {
+                Some(recovery) => MonitorAction::Recovered {
+                    stalled_for: recovery.stalled_for,
+                    phase: recovery.phase,
+                },
+                None => MonitorAction::None,
+            };
         }
         if idle < threshold {
             return MonitorAction::None;
@@ -1036,9 +1053,11 @@ impl MonitorState {
             // A parked loop keeps marking progress, which resets the one-shot
             // flag; bound the repeats for the same backlog instead.
             self.reported = true;
+            self.stalled_phase = Some(phase);
             return MonitorAction::None;
         }
         self.reported = true;
+        self.stalled_phase = Some(phase);
         if parked {
             self.parked_at = Some(now);
         }
@@ -1048,6 +1067,46 @@ impl MonitorState {
         self.reported_at = Some(now);
         MonitorAction::Report { idle, phase }
     }
+
+    /// Ends the current stall episode and names the recovery line it owes.
+    ///
+    /// `None` means the episode never wrote a report, so there is nothing to
+    /// close: a threshold crossing that ended silently leaves no line. Every
+    /// way out of an episode goes through here, so a reported stall can never
+    /// end without its recovery line being emitted exactly once (bitty#3211).
+    fn close_episode(&mut self, now: Instant) -> Option<RecoverySpan> {
+        let stalled_for = self
+            .stall_started
+            .take()
+            .map(|started| now.saturating_duration_since(started));
+        let phase = self.stalled_phase.take().unwrap_or(Phase::Unknown);
+        let had_report = std::mem::replace(&mut self.reported, false);
+        match stalled_for {
+            Some(stalled_for) if had_report => Some(RecoverySpan { stalled_for, phase }),
+            _ => None,
+        }
+    }
+
+    /// Takes the advance edge from one progress snapshot.
+    ///
+    /// The monitor calls this on the wake, before it samples any evidence, so
+    /// a phase advance that closes a reported stall delivers its line the
+    /// moment the loop moves instead of waiting behind the report path
+    /// (bitty#3211).
+    fn take_advance(&mut self, now: Instant, progress: u64) -> Option<RecoverySpan> {
+        if progress == self.last_progress {
+            return None;
+        }
+        self.last_progress = progress;
+        self.close_episode(now)
+    }
+}
+
+/// One recovery line's span and the phase that stalled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoverySpan {
+    stalled_for: Duration,
+    phase: Phase,
 }
 
 /// Shared state written by the main thread and sampled by the monitor.
@@ -1074,6 +1133,10 @@ struct Shared {
     /// Set when the monitor computes `idle_park == true` and parks at 0 Hz.
     #[cfg(test)]
     idle_parked: AtomicBool,
+    /// Test-only delay inserted between the `active` publish and the progress
+    /// bump in [`Shared::mark`] (bitty#3211 seam).
+    #[cfg(test)]
+    publish_gap_ms: AtomicU64,
 }
 
 impl Shared {
@@ -1092,6 +1155,8 @@ impl Shared {
             polls: AtomicU64::new(0),
             #[cfg(test)]
             idle_parked: AtomicBool::new(false),
+            #[cfg(test)]
+            publish_gap_ms: AtomicU64::new(0),
         }
     }
 
@@ -1110,6 +1175,18 @@ impl Shared {
         self.active.store(active, Ordering::Relaxed);
         self.last_beat_ns
             .store(self.elapsed_ns(), Ordering::Relaxed);
+        // bitty#3211 seam: the publish is not atomic, so a poll can observe
+        // `active` already stored while `progress` is still the old count.
+        // Production widens that gap only by preemption; the test hook makes
+        // the interleaving deterministic instead of leaving it to a loaded
+        // runner. Only a test sets a non-zero gap.
+        #[cfg(test)]
+        {
+            let gap_ms = self.publish_gap_ms.load(Ordering::Relaxed);
+            if gap_ms > 0 {
+                std::thread::sleep(Duration::from_millis(gap_ms));
+            }
+        }
         self.progress.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1118,6 +1195,19 @@ impl Shared {
             self.elapsed_ns()
                 .saturating_sub(self.last_beat_ns.load(Ordering::Relaxed)),
         )
+    }
+
+    /// Widens the `mark` publish gap for a deterministic recovery test.
+    ///
+    /// Production only ever sees this gap when a thread is preempted between
+    /// the two relaxed stores; a test sets it to make that interleaving
+    /// certain on every platform (bitty#3211).
+    #[cfg(test)]
+    fn set_publish_gap(&self, gap: Duration) {
+        self.publish_gap_ms.store(
+            u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1220,6 +1310,12 @@ impl StopSignal {
     }
 
     /// Periodic poll sleep: waits `timeout`, waking early only on `request()`.
+    ///
+    /// A `notify()` deliberately does not shorten this sleep: the periodic
+    /// sample is the monitor's own budget, and a notification is already
+    /// preserved by the wake pipe for the 0 Hz park. The advance a `notify()`
+    /// announces is taken at the top of the next poll (bitty#3211), so the
+    /// only cost of the remaining interval is latency, never a lost line.
     fn wait_poll(&self, timeout: Duration) -> bool {
         let guard = self
             .stop_waiter
@@ -1726,6 +1822,18 @@ fn monitor_loop(
         #[cfg(test)]
         shared.polls.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
+        // bitty#3211: the advance edge is taken on the wake, out of one
+        // snapshot and before any evidence sampling. A reported stall that
+        // ends here delivers its recovery line immediately; the report paths
+        // below can spend the whole delivery budget, and nothing may sit
+        // between the loop moving again and the line that says so.
+        let progress = shared.progress.load(Ordering::Relaxed);
+        if let Some(recovery) = state.take_advance(now, progress) {
+            if stop.is_stopped() {
+                return;
+            }
+            delivery.record(sink(&render_recovery(recovery)));
+        }
         #[cfg(unix)]
         if signal_flag.swap(false, Ordering::SeqCst) {
             let due = last_signal_at
@@ -1758,7 +1866,6 @@ fn monitor_loop(
                 // operator is inspecting, even with the debug abort armed.
             }
         }
-        let progress = shared.progress.load(Ordering::Relaxed);
         let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
         let active = shared.active.load(Ordering::Relaxed);
         let idle = shared.idle_for();
@@ -1824,15 +1931,17 @@ fn monitor_loop(
                 state.note_in_flight_report(report_phase);
                 maybe_abort_after_report();
             }
-            MonitorAction::Recovered { stalled_for } => {
+            MonitorAction::Recovered {
+                stalled_for,
+                phase: recovered_phase,
+            } => {
                 if stop.is_stopped() {
                     return;
                 }
-                delivery.record(sink(&format!(
-                    "bitty: main-loop hang recovered after {} ms (phase={})",
-                    stalled_for.as_millis(),
-                    phase.as_str()
-                )));
+                delivery.record(sink(&render_recovery(RecoverySpan {
+                    stalled_for,
+                    phase: recovered_phase,
+                })));
             }
         }
         // Completed over-bound ticks are independent evidence: a progress
@@ -2179,6 +2288,18 @@ fn sanitize_identifier(raw: &str, max_chars: usize) -> String {
         out.push(if ch.is_control() { '?' } else { ch });
     }
     out
+}
+
+/// Render one recovery line.
+///
+/// One line, bounded by construction, and delivered on whichever poll observes
+/// the stall episode ending (bitty#3211).
+fn render_recovery(recovery: RecoverySpan) -> String {
+    format!(
+        "bitty: main-loop hang recovered after {} ms (phase={})",
+        recovery.stalled_for.as_millis(),
+        recovery.phase.as_str()
+    )
 }
 
 /// Render one bounded report.
@@ -4381,7 +4502,8 @@ mod tests {
                 false,
             ),
             MonitorAction::Recovered {
-                stalled_for: Duration::from_secs(31)
+                stalled_for: Duration::from_secs(31),
+                phase: Phase::RuntimeTick,
             }
         );
         assert_eq!(
@@ -4807,6 +4929,7 @@ mod tests {
             ),
             MonitorAction::Recovered {
                 stalled_for: long - bound,
+                phase: Phase::RuntimeTick,
             }
         );
     }
@@ -6345,6 +6468,114 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("recovery line");
         assert!(recovered.contains("hang recovered"), "{recovered}");
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// bitty#3211: the park edge must not swallow the recovery a report owes.
+    ///
+    /// `Shared::mark` publishes `active` before it bumps `progress`, so a poll
+    /// can legitimately sample the park edge with the old counter. That sample
+    /// used to clear the episode without a line, and the advance that followed
+    /// found nothing left to report: the recovery line was lost outright, and
+    /// no later poll could recover it.
+    #[test]
+    fn park_edge_delivers_the_recovery_the_report_owes() {
+        let start = Instant::now();
+        let threshold = DEFAULT_STALL_THRESHOLD;
+        let mut state = MonitorState::new(start, 7, 0, 0);
+        assert_eq!(
+            state.evaluate(
+                start + threshold,
+                7,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: threshold,
+                    threshold,
+                },
+                false,
+            ),
+            MonitorAction::Report {
+                idle: threshold,
+                phase: Phase::RuntimeTick,
+            }
+        );
+        // The park edge with the still-stale counter: the app called `idle()`
+        // and this poll sampled between the two publishes.
+        assert_eq!(
+            state.evaluate(
+                start + threshold + Duration::from_millis(20),
+                7,
+                false,
+                StallSample {
+                    phase: Phase::Idle,
+                    idle: Duration::ZERO,
+                    threshold,
+                },
+                false,
+            ),
+            MonitorAction::Recovered {
+                stalled_for: Duration::from_millis(20),
+                phase: Phase::RuntimeTick,
+            }
+        );
+        // The advance that lands after it owes nothing: one line per episode.
+        assert_eq!(
+            state.evaluate(
+                start + threshold + Duration::from_millis(40),
+                8,
+                false,
+                StallSample {
+                    phase: Phase::Idle,
+                    idle: Duration::ZERO,
+                    threshold,
+                },
+                false,
+            ),
+            MonitorAction::None
+        );
+    }
+
+    /// bitty#3211 acceptance: the recovery line still arrives inside the test's
+    /// own 5 s budget when a poll observes the phase publish's intermediate
+    /// state.
+    ///
+    /// The publish gap is nanoseconds in production and only preemption widens
+    /// it; this seam makes that interleaving deterministic so the regression is
+    /// visible on a fast Linux host as well as on a loaded macOS runner. The
+    /// budget is deliberately not widened: the line must arrive because the
+    /// mechanism delivers it, not because the test waits longer.
+    #[test]
+    fn recovery_line_survives_a_preempted_phase_publish() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(100),
+            Arc::new(HangGauges::new()),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.enter(Phase::RuntimeTick);
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked tick must produce a dump");
+        assert!(first.starts_with(STALL_REPORT_PREFIX), "{first}");
+        // `idle()` stores `active` here and bumps `progress` only after the
+        // gap, so the monitor is guaranteed to sample "parked, no advance".
+        watchdog.shared.set_publish_gap(Duration::from_millis(300));
+        watchdog.idle();
+        let recovered = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery line");
+        assert!(recovered.contains("hang recovered"), "{recovered}");
+        assert!(
+            recovered.contains("phase=runtime-tick"),
+            "the recovery line must name the phase that stalled: {recovered}"
+        );
+        watchdog.shared.set_publish_gap(Duration::ZERO);
         watchdog
             .stop_and_join()
             .expect("monitor thread must exit cleanly");

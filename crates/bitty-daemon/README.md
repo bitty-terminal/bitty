@@ -1838,6 +1838,13 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   journal settlement.
 - `tests/frame_credentials.rs` — per-frame credential acceptance across a real
   process boundary and the fd-passing handoff (grandchild's frame refused).
+- `tests/no_tcp_listener_absence.rs` — the daemon's own no-TCP observation
+  (bitty#2921): an `ss -tanpH` scan attributed to the daemon's PID set across
+  startup, attach, detach, `SIGTERM` and `SIGKILL`, plus the TCP table of the
+  daemon's own network namespace, because the daemon serves non-dumpable and
+  `ss -p` can never name it. A loopback listener held by the test process
+  keeps the `ss` filter non-vacuous, and a control child in its own private
+  namespace keeps the namespace reader non-vacuous.
 
 ## Gates
 

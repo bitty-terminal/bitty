@@ -210,6 +210,10 @@ version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-a11y?rev=99486eef216d77b8f81d2b67f2cef856af266a3f#99486eef216d77b8f81d2b67f2cef856af266a3f"
 
 [[package]]
+name = "bitty-com"
+version = "0.0.45"
+
+[[package]]
 name = "bitty-config"
 version = "0.0.45"
 dependencies = [
@@ -490,6 +494,7 @@ dependencies = [
 name = "bitty-terminal"
 version = "0.0.45"
 dependencies = [
+ "bitty-com",
  "bitty-config",
  "bitty-ipc",
  "bitty-lua",

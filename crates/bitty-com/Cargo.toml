@@ -1,0 +1,34 @@
+[package]
+name = "bitty-com"
+description = "Windows console companion proxy (bitty.com) that launches the sibling Bitty executable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+keywords = ["windows", "console", "launcher", "bitty"]
+categories = ["command-line-utilities"]
+# Never published to crates.io: the artifact is shipped as `bitty.com` inside
+# the Windows archives, next to `bitty.exe` (see packaging/README.md).
+publish = false
+
+[lints]
+workspace = true
+
+# The binary is `bitty-com` on every platform; packaging renames the Windows
+# artifact to `bitty.com` when it stages the archive. Keeping the build name
+# distinct from the shipped name means no build script and no `[[bin]] name`
+# override that would confuse `cargo build -p bitty-com`.
+[[bin]]
+name = "bitty-com"
+path = "src/main.rs"
+
+[lib]
+name = "bitty_com"
+path = "src/lib.rs"
+
+# Pure `std`: no dependencies of any kind, on any target. The Windows launch
+# path uses `std::os::windows::process` (creation flags) rather than a Win32
+# crate, so this manifest stays dependency-free and Linux/macOS legs compile
+# the same source.
+[dependencies]

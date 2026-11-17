@@ -32,15 +32,33 @@
 //! | Arm | Namespace | Channel | Covers | Blind to |
 //! | --- | --- | --- | --- | --- |
 //! | host | the host's | `ss -tanpH` filtered to the daemon's PID set | every *attributable* member: the daemon's children, and the attached client (this test process) | the daemon's own rows (`PR_SET_DUMPABLE=0`); the arm prints the measured refusal |
-//! | private | a fresh unprivileged user + network namespace | `/proc/<pid>/net/tcp{,6}` of the daemon's own namespace | every TCP socket object created by any process in that namespace — the daemon and the client that attaches to it | a connect attempt that a route lookup rejects before a socket row exists (see below) |
+//! | private | a fresh network namespace of the daemon's own: an unprivileged user + network namespace, or `sudo -n`'s network namespace | `/proc/<pid>/net/tcp{,6}` of the daemon's own namespace | every TCP socket object created by any process in that namespace — the daemon and the client that attaches to it | a connect attempt that a route lookup rejects before a socket row exists (see below) |
 //!
 //! The private arm is the one that can speak for the daemon process itself: it
 //! reads the kernel's TCP table for the namespace the daemon lives in, so no
-//! PID attribution is needed and `PR_SET_DUMPABLE=0` is irrelevant. It needs
-//! unprivileged user namespaces; on a host that refuses them the arm prints
-//! `NOTCP private-arm: skipped` with the reason rather than reporting a pass it
-//! did not observe (the repo's typed-skip convention, `tests/harness/real.rs`).
-//! On this cell's Linux CI the arm runs.
+//! PID attribution is needed and `PR_SET_DUMPABLE=0` is irrelevant.
+//!
+//! # The private arm is mandatory: it can fail, never skip
+//!
+//! This cell exists because the host arm is vacuous for the daemon: `ss -p`
+//! cannot name a non-dumpable process, so the host arm reports zero rows
+//! whether or not the daemon listens on TCP. A pass therefore has to mean the
+//! daemon's own table was read, and the arm is the only thing that reads it.
+//! It obtains a private network namespace from the first channel that works on
+//! this host:
+//!
+//! 1. unprivileged `unshare --user --map-root-user --net …`, no privilege
+//!    required;
+//! 2. the runner's passwordless escalation, `sudo -n unshare --net …`.
+//!
+//! Both channels are probed with `true`, never with the product, so a `bittyd`
+//! that fails inside a namespace cannot read as a host limitation. When neither
+//! channel works the cell **fails** with both probe results and the remedy: at
+//! that point nothing has observed the daemon's table, and a green run would be
+//! the vacuous pass this cell exists to prevent. A host that forbids both may
+//! set `BITTY_NOTCP_ALLOW_PRIVATE_SKIP=1` to record the gap instead; the cell
+//! then prints `NOTCP private-arm: SKIPPED … UNPROVEN` and claims nothing about
+//! the daemon. CI never sets that variable.
 //!
 //! # Phases
 //!
@@ -58,7 +76,7 @@
 //!
 //! # Non-vacuity
 //!
-//! Three independent checks, so an empty filter cannot pass:
+//! Five independent checks, so an empty filter cannot pass:
 //!
 //! 1. [`tcp_absence::self_check`] binds a loopback listener in this test process
 //!    and requires the same `ss` filter to attribute it (>= 1 `LISTEN` row);
@@ -66,7 +84,13 @@
 //!    binds one loopback listener, and requires `/proc/<pid>/net/tcp` to report
 //!    it before the daemon's zero is trusted;
 //! 3. every live phase asserts the daemon's PID set is non-empty and contains
-//!    the PID this cell recorded at spawn — never a name or pattern match.
+//!    the PID this cell recorded at spawn — never a name or pattern match;
+//! 4. a loopback listener this cell holds in *its own* namespace is required to
+//!    appear in this cell's table and to be absent from the daemon's, so a read
+//!    of the host's table cannot pass as the daemon's;
+//! 5. the driver records `/proc/<pid>/ns/net` for itself and for the daemon, and
+//!    the arm asserts those are equal and are not this cell's namespace: the
+//!    daemon is a member of the namespace whose table was read.
 //!
 //! # What this cell does not prove
 //!
@@ -83,6 +107,16 @@
 //!   nothing about the code path under test (the daemon binds a Unix socket and
 //!   never consults network configuration), but the isolation is the cell's, not
 //!   production's.
+//! - Under the privileged channel the helper, and through it the daemon, runs as
+//!   `root`; the unprivileged channel runs both as mapped root inside a user
+//!   namespace. The claim is a socket table, which the uid does not change, and
+//!   the host arm drives the same lifecycle as the invoking user.
+//! - The parent can read the table of a root-owned daemon but not its
+//!   `/proc/<pid>/fd`, its `/proc/<pid>/ns/net`, or signal it, so the namespace
+//!   identity comes from the driver (the process that spawned the daemon) and
+//!   the teardown is the driver's `SIGKILL`. A failed assertion in that channel
+//!   is cleaned up by the driver's own kill-on-drop and, failing that, by the
+//!   runner's teardown.
 //!
 //! Run with `cargo test -p bitty-daemon --test no_tcp_listener_absence --offline
 //! -- --nocapture`.
@@ -134,6 +168,8 @@ const POLL: Duration = Duration::from_millis(10);
 
 /// Environment override for the `unshare` binary under test.
 const UNSHARE_ENV: &str = "BITTY_TEST_UNSHARE";
+/// Environment override for the `sudo` binary of the privileged channel.
+const SUDO_ENV: &str = "BITTY_TEST_SUDO";
 
 /// Absolute candidates for `unshare` (util-linux), then `PATH`.
 const UNSHARE_CANDIDATES: [&str; 4] = [
@@ -142,6 +178,23 @@ const UNSHARE_CANDIDATES: [&str; 4] = [
     "/usr/sbin/unshare",
     "/sbin/unshare",
 ];
+
+/// Absolute candidates for `sudo`, then `PATH`.
+const SUDO_CANDIDATES: [&str; 4] = ["/usr/bin/sudo", "/bin/sudo", "/usr/sbin/sudo", "/sbin/sudo"];
+
+/// Absolute candidates for `env`, which carries the helper's marker root past
+/// `sudo`'s `env_reset`.
+const ENV_CANDIDATES: [&str; 2] = ["/usr/bin/env", "/bin/env"];
+
+/// Absolute candidates for `true`: the only payload of the namespace probes, so
+/// no probe depends on the product.
+const TRUE_CANDIDATES: [&str; 2] = ["/bin/true", "/usr/bin/true"];
+
+/// The environment that downgrades "this host cannot create a network
+/// namespace" from a failure into a recorded, explicitly-requested gap. CI
+/// never sets it, so a green run there always means the daemon's own table was
+/// read.
+const ALLOW_SKIP_ENV: &str = "BITTY_NOTCP_ALLOW_PRIVATE_SKIP";
 
 /// Marker-file environment for the private-namespace driver helper.
 const DRIVER_ROOT_ENV: &str = "BITTY_NOTCP_DRIVER_ROOT";
@@ -414,18 +467,25 @@ fn reply_ok(reply: &Value) -> bool {
     reply.get("ok").and_then(Value::as_bool).unwrap_or(false)
 }
 
-/// Resolve the `unshare` binary, or `None` when the host has none.
-fn unshare_binary() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os(UNSHARE_ENV) {
-        let path = PathBuf::from(explicit);
-        assert!(
-            path.is_file(),
-            "{UNSHARE_ENV}={} is not a file: the private-namespace arm cannot run",
-            path.display()
-        );
-        return Some(path);
+/// Resolve a program by an optional environment override, then absolute
+/// candidates, then `PATH`.
+///
+/// An override that is not a file is a hard failure: it names the binary this
+/// cell must use, so silently falling through to another one would hide a
+/// misconfiguration behind a different channel.
+fn resolve_binary(env_key: Option<&str>, candidates: &[&str], program: &str) -> Option<PathBuf> {
+    if let Some(env_key) = env_key {
+        if let Some(explicit) = std::env::var_os(env_key) {
+            let path = PathBuf::from(explicit);
+            assert!(
+                path.is_file(),
+                "{env_key}={} is not a file: the private-namespace arm cannot run",
+                path.display()
+            );
+            return Some(path);
+        }
     }
-    for candidate in UNSHARE_CANDIDATES {
+    for candidate in candidates {
         let path = PathBuf::from(candidate);
         if path.is_file() {
             return Some(path);
@@ -433,13 +493,205 @@ fn unshare_binary() -> Option<PathBuf> {
     }
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join("unshare");
+            let candidate = dir.join(program);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// Resolve the `unshare` binary, or `None` when the host has none.
+fn unshare_binary() -> Option<PathBuf> {
+    resolve_binary(Some(UNSHARE_ENV), &UNSHARE_CANDIDATES, "unshare")
+}
+
+/// The channel that gives this cell a private network namespace.
+///
+/// Both channels run the same driver and therefore the same daemon; they differ
+/// only in who is allowed to create the namespace. The arm is mandatory:
+/// [`resolve_netns`] fails the cell when neither channel works.
+enum Netns {
+    /// `unshare --user --map-root-user --net …`: a user + network namespace of
+    /// this process's own, with no privilege required.
+    UserNamespace { unshare: PathBuf },
+    /// `sudo -n unshare --net …`: the runner's passwordless escalation for a
+    /// network namespace only. The user namespace is unchanged, so the driver,
+    /// the daemon and this cell stay in one.
+    Privileged {
+        sudo: PathBuf,
+        unshare: PathBuf,
+        env: PathBuf,
+    },
+}
+
+impl Netns {
+    /// The channel, spelled as the command it runs (without quoting).
+    fn label(&self) -> String {
+        match self {
+            Self::UserNamespace { unshare } => {
+                format!("{} --user --map-root-user --net", unshare.display())
+            }
+            Self::Privileged { sudo, unshare, .. } => {
+                format!("{} -n {} --net", sudo.display(), unshare.display())
+            }
+        }
+    }
+
+    /// `<channel> <program> <args>`, with every `env` pair exported to
+    /// `program`.
+    ///
+    /// `sudo` resets the environment, so the privileged channel passes each pair
+    /// as an `env(1)` argv prefix instead of depending on `sudoers`' `env_keep`.
+    fn command(&self, program: &Path, args: &[&str], env: &[(&str, &Path)]) -> Command {
+        let mut command = match self {
+            Self::UserNamespace { unshare } => {
+                let mut command = Command::new(unshare);
+                command
+                    .args(["--user", "--map-root-user", "--net", "--"])
+                    .arg(program);
+                command
+            }
+            Self::Privileged {
+                sudo,
+                unshare,
+                env: env_binary,
+            } => {
+                let mut command = Command::new(sudo);
+                command.arg("-n").arg(env_binary);
+                for (key, value) in env {
+                    command.arg(format!("{key}={}", value.display()));
+                }
+                command.arg(unshare).args(["--net", "--"]).arg(program);
+                command
+            }
+        };
+        command.args(args);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        command
+    }
+
+    /// Whether this channel can create a namespace here, and why not when it
+    /// cannot.
+    ///
+    /// The payload is `true`: a probe that ran the product would report a broken
+    /// `bittyd` as a host limitation and silently disable the only channel that
+    /// can speak for the daemon.
+    fn ready(&self) -> Result<(), String> {
+        let true_binary = resolve_binary(None, &TRUE_CANDIDATES, "true")
+            .ok_or_else(|| format!("no `true` binary in {TRUE_CANDIDATES:?} or on PATH"))?;
+        let line = format!("`{}` {}", self.label(), true_binary.display());
+        let output = self
+            .command(&true_binary, &[], &[])
+            .output()
+            .map_err(|error| format!("cannot run {line}: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        Err(format!("{line} exited {code}: {detail}"))
+    }
+}
+
+/// Whether the host was explicitly allowed to record the private arm as an
+/// unproven gap instead of failing.
+fn private_arm_opt_out() -> bool {
+    matches!(
+        std::env::var(ALLOW_SKIP_ENV),
+        Ok(value) if !value.is_empty() && value != "0"
+    )
+}
+
+/// The channel this host can give the private arm, or `None` only when both
+/// channels failed *and* [`ALLOW_SKIP_ENV`] asked for the gap.
+///
+/// A host that cannot create a namespace cannot observe the daemon's own socket
+/// table, and this cell never reports a pass it did not observe: the default is
+/// a typed failure that names both probes, their output, and the remedy.
+fn resolve_netns() -> Option<Netns> {
+    let unshare = unshare_binary();
+    let mut failures: Vec<String> = Vec::new();
+
+    if let Some(unshare) = unshare.clone() {
+        let candidate = Netns::UserNamespace { unshare };
+        match candidate.ready() {
+            Ok(()) => {
+                println!(
+                    "NOTCP private-arm channel: `{}` created a namespace here without privilege",
+                    candidate.label()
+                );
+                return Some(candidate);
+            }
+            Err(reason) => failures.push(format!("unprivileged: {reason}")),
+        }
+    } else {
+        failures.push(format!(
+            "unprivileged: no `unshare` binary in {UNSHARE_CANDIDATES:?} or on PATH"
+        ));
+    }
+
+    if let Some(unshare) = unshare {
+        let sudo = resolve_binary(Some(SUDO_ENV), &SUDO_CANDIDATES, "sudo");
+        let env = resolve_binary(None, &ENV_CANDIDATES, "env");
+        match (sudo, env) {
+            (Some(sudo), Some(env)) => {
+                let candidate = Netns::Privileged { sudo, unshare, env };
+                match candidate.ready() {
+                    Ok(()) => {
+                        println!(
+                            "NOTCP private-arm channel: `{}` created a namespace here, so the \
+                             unprivileged channel is the one this host refuses",
+                            candidate.label()
+                        );
+                        return Some(candidate);
+                    }
+                    Err(reason) => failures.push(format!("privileged: {reason}")),
+                }
+            }
+            (None, _) => failures.push(format!(
+                "privileged: no `sudo` binary in {SUDO_CANDIDATES:?} or on PATH"
+            )),
+            (Some(_), None) => failures.push(format!(
+                "privileged: no `env` binary in {ENV_CANDIDATES:?} or on PATH to carry the \
+                 helper's marker root across `sudo`"
+            )),
+        }
+    }
+
+    let detail = failures
+        .iter()
+        .map(|failure| format!("\n    {failure}"))
+        .collect::<String>();
+    if private_arm_opt_out() {
+        println!(
+            "NOTCP private-arm: SKIPPED — {ALLOW_SKIP_ENV} is set and neither namespace channel \
+             works here, so the daemon's own TCP table is UNPROVEN: the host arm's `ss` filter \
+             cannot attribute a non-dumpable daemon, and this run claims nothing about it. \
+             Probes:{detail}"
+        );
+        return None;
+    }
+    panic!(
+        "NOTCP private-arm cannot run: neither namespace channel works, and this cell refuses to \
+         pass without the only channel that can read the daemon's own TCP table — the host arm's \
+         `ss` filter cannot attribute a non-dumpable daemon, so a pass here would be vacuous. \
+         Probes:{detail}\n  \
+         Remedy: install util-linux's `unshare` and allow unprivileged user namespaces (`sysctl -w \
+         kernel.unprivileged_userns_clone=1`; Ubuntu 24.04 also restricts them through AppArmor, \
+         `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`), or grant this user a \
+         passwordless `sudo -n unshare --net` entry. A host that forbids both may set \
+         {ALLOW_SKIP_ENV}=1 to record the gap instead: the cell then prints the evidence as \
+         UNPROVEN instead of failing."
+    )
 }
 
 fn kill_pid(pid: u32, signal: nix::sys::signal::Signal) {
@@ -590,13 +842,19 @@ fn host_namespace_arm() {
     tcp_absence::scan_pids(&after_stop).assert_no_tcp("host-after-stop");
     println!(
         "NOTCP host-after-stop: the recorded PID {pid} exited 0 and no PID the fixture can still \
-         see remains, so none of them holds a TCP socket"
+         see remains, so the post-mortem scan has nothing left to attribute"
     );
 
     // ── abort ────────────────────────────────────────────────────────────
     let mut aborted = Daemon::start("host-abort");
     let aborted_pid = aborted.pid();
-    tcp_absence::scan_pids(&aborted.tree_pids()).assert_no_tcp("host-abort-startup");
+    let abort_startup = tcp_absence::scan_pids(&aborted.tree_pids());
+    assert!(
+        abort_startup.pids.contains(&aborted_pid),
+        "the aborted daemon's PID set must include the PID this cell recorded ({aborted_pid}): {:?}",
+        abort_startup.pids
+    );
+    abort_startup.assert_no_tcp("host-abort-startup");
     kill_pid(aborted_pid, nix::sys::signal::Signal::SIGKILL);
     let status = aborted.wait_exit(STOP_BUDGET);
     assert!(
@@ -618,55 +876,44 @@ fn host_namespace_arm() {
 /// The private-namespace arm: the daemon's own socket table, observed from
 /// outside the process.
 ///
-/// `unshare --user --map-root-user --net` gives an unprivileged user + network
-/// namespace; `/proc/<pid>/net/tcp{,6}` then reports only the sockets created
-/// inside it, which is exactly the daemon's tree — no PID attribution needed,
-/// so `PR_SET_DUMPABLE=0` cannot hide anything. The client has to live in the
-/// same namespace as the daemon (`src/peer.rs` refuses a peer from another user
-/// namespace: "a mapped uid is not same-user success"), so the driver is a
-/// re-executed copy of this test binary running inside that namespace and
-/// signalling each phase through marker files.
+/// The channel (`unshare --user --map-root-user --net`, or the runner's
+/// passwordless `sudo -n unshare --net` when unprivileged user namespaces are
+/// refused) gives the driver a network namespace of its own, which the daemon
+/// inherits. `/proc/<pid>/net/tcp{,6}` then reports only the sockets created
+/// inside it — no PID attribution needed, so `PR_SET_DUMPABLE=0` cannot hide
+/// anything. The client has to live in the same namespace as the daemon
+/// (`src/peer.rs` refuses a peer from another user namespace: "a mapped uid is
+/// not same-user success"), so the driver is a re-executed copy of this test
+/// binary running inside that namespace and signalling each phase through marker
+/// files.
+///
+/// The channel comes from [`resolve_netns`], which fails the cell when no
+/// namespace can be created: this arm is the only evidence that speaks for the
+/// daemon, so it is never skipped by default.
 fn private_namespace_arm() {
-    let Some(unshare) = unshare_binary() else {
-        println!(
-            "NOTCP private-arm: skipped — no `unshare` binary in {UNSHARE_CANDIDATES:?} or on PATH, \
-             so the daemon's own socket table cannot be read from outside this process"
-        );
+    let Some(netns) = resolve_netns() else {
         return;
     };
 
-    // Unprivileged user namespaces are not available everywhere (some
-    // distributions restrict them); a host that refuses them records the typed
-    // skip instead of reporting a pass it did not observe.
-    let probe = Command::new(&unshare)
-        .args(["--user", "--map-root-user", "--net", "--"])
-        .arg(BITTYD)
-        .arg("--version")
-        .output();
-    match probe {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            println!(
-                "NOTCP private-arm: skipped — `{} --user --map-root-user --net` exited {}: {}",
-                unshare.display(),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            return;
-        }
-        Err(error) => {
-            println!(
-                "NOTCP private-arm: skipped — cannot run `{}`: {error}",
-                unshare.display()
-            );
-            return;
-        }
-    }
+    // ── the reader, and not the host's table ─────────────────────────────
+    // A loopback listener this cell holds in *its own* namespace. The same
+    // reader must report it in this cell's table and must not report it in the
+    // daemon's, which is what keeps "zero rows" from being a read of the host's
+    // table by accident.
+    let carrier = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind the carrier listener in this cell's namespace");
+    let carrier_port = carrier
+        .local_addr()
+        .expect("read the carrier listener's address")
+        .port();
+    let carrier_row = format!(":{carrier_port:04X}");
+    let own_namespace = tcp_absence::namespace_identity(std::process::id())
+        .expect("this test process has a network namespace");
 
     // ── control: the reader must see a socket in a private namespace ─────
     let control_root = Root::new("control");
     let mut control = spawn_helper(
-        &unshare,
+        &netns,
         &["--ignored", "--exact", CONTROL_HELPER, "--nocapture"],
         CONTROL_ROOT_ENV,
         control_root.path(),
@@ -692,14 +939,19 @@ fn private_namespace_arm() {
          vacuous",
         control.id()
     );
+    // Release the control through its marker: under the privileged channel its
+    // uid is root, so this process may not be able to signal it.
+    std::fs::write(control_root.marker("control.stop"), "1").expect("release the control listener");
     let _ = control.kill();
     let _ = control.wait();
 
     // ── the daemon itself ────────────────────────────────────────────────
     let root = Root::new("private");
-    root.prepare();
+    // The daemon attests that its runtime root is owned by its own uid, so the
+    // driver — never this process, whose uid differs under the privileged
+    // channel — creates the roots it will attest.
     let mut driver = spawn_helper(
-        &unshare,
+        &netns,
         &["--ignored", "--exact", DRIVER_HELPER, "--nocapture"],
         DRIVER_ROOT_ENV,
         root.path(),
@@ -714,15 +966,22 @@ fn private_namespace_arm() {
         )
     });
     let mut daemon_guard = PidGuard::new(daemon_pid);
-    // Isolation is asserted, not assumed: the daemon and this cell must be in
-    // different network namespaces, or the table read would be the host's.
-    let daemon_namespace = tcp_absence::namespace_identity(daemon_pid)
-        .unwrap_or_else(|| panic!("no `/proc/{daemon_pid}/ns/net` entry for the daemon"));
-    let host_namespace = tcp_absence::namespace_identity(std::process::id())
-        .expect("this test process has a network namespace");
+    // Membership is asserted, not assumed: the daemon must be a member of the
+    // namespace the driver ran in, and that namespace must not be this cell's —
+    // otherwise the table read would be the host's. The identities come from the
+    // driver because a parent of another uid cannot resolve the namespace link
+    // of a daemon the privileged channel started as root.
+    let daemon_namespace = read_marker(&root, "daemon.netns");
+    let driver_namespace = read_marker(&root, "driver.netns");
+    assert_eq!(
+        daemon_namespace, driver_namespace,
+        "the daemon must run in the namespace its driver was started in (daemon \
+         {daemon_namespace}, driver {driver_namespace})"
+    );
     assert_ne!(
-        daemon_namespace, host_namespace,
-        "the daemon must run in its own network namespace ({daemon_namespace} == {host_namespace})"
+        daemon_namespace, own_namespace,
+        "the daemon must run in its own network namespace (daemon {daemon_namespace} == this \
+         cell's {own_namespace}), or the table read would be the host's"
     );
     let pid_set = tcp_absence::session_pids(daemon_pid);
     assert!(
@@ -730,14 +989,50 @@ fn private_namespace_arm() {
         "the daemon's PID set must include the PID the driver recorded ({daemon_pid}): {pid_set:?}"
     );
     println!(
-        "NOTCP private-arm daemon pid={daemon_pid} netns={daemon_namespace} (host netns \
-         {host_namespace})"
+        "NOTCP private-arm daemon pid={daemon_pid} netns={daemon_namespace} (driver netns \
+         {driver_namespace}, this cell's netns {own_namespace}) via `{}`",
+        netns.label()
     );
-    tcp_absence::scan_namespace(daemon_pid).assert_no_tcp("private-startup");
+    let startup = tcp_absence::scan_namespace(daemon_pid);
+    startup.assert_no_tcp("private-startup");
+
+    // ── the table that was read is the daemon's, not the host's ──────────
+    let own = tcp_absence::scan_namespace(std::process::id());
+    assert!(
+        own.rows.iter().any(|row| row.contains(&carrier_row)),
+        "the namespace reader must report this cell's own loopback listener (port {carrier_port}) \
+         in this cell's table, or it cannot be trusted to report the daemon's"
+    );
+    assert!(
+        !startup.rows.iter().any(|row| row.contains(&carrier_row)),
+        "the daemon's table must not be this cell's: it reported the host listener on port \
+         {carrier_port}: {:?}",
+        startup.rows
+    );
+    println!(
+        "NOTCP namespace-isolation: this cell's table reports its own loopback listener (port \
+         {carrier_port}) and the daemon's table does not, so the daemon's table belongs to \
+         another namespace"
+    );
 
     wait_for_marker(&root, "attached", &mut driver, "the attached client");
+    // The driver writes the daemon's reply into the marker: a phase called
+    // "attached" is evidence of an attach only if the daemon actually served it,
+    // so the reply is parsed here instead of trusting the marker's arrival.
+    let attached_reply: Value = serde_json::from_str(&read_marker(&root, "attached"))
+        .unwrap_or_else(|error| panic!("the driver's attach marker is not a reply: {error}"));
+    assert!(
+        reply_ok(&attached_reply),
+        "the daemon must serve the client inside its namespace while attached: {attached_reply}"
+    );
     let attached = tcp_absence::scan_namespace(daemon_pid);
     attached.assert_no_tcp("private-attached");
+    assert!(
+        !attached.rows.iter().any(|row| row.contains(&carrier_row)),
+        "the attached scan must still read the daemon's namespace and not this cell's: it \
+         reported the host listener on port {carrier_port}: {:?}",
+        attached.rows
+    );
 
     wait_for_marker(&root, "detached", &mut driver, "the client's detach");
     tcp_absence::scan_namespace(daemon_pid).assert_no_tcp("private-after-detach");
@@ -765,7 +1060,7 @@ fn private_namespace_arm() {
 /// Spawn one of this binary's `#[ignore]`d helpers inside a fresh private
 /// namespace, with its stdout and stderr captured next to the marker files.
 fn spawn_helper(
-    unshare: &Path,
+    netns: &Netns,
     args: &[&str],
     env_key: &str,
     env_value: &Path,
@@ -776,22 +1071,78 @@ fn spawn_helper(
         .expect("create the helper stdout log");
     let stderr = File::create(format!("{}.err", log_prefix.display()))
         .expect("create the helper stderr log");
-    let mut command = Command::new(unshare);
+    let mut command = netns.command(&executable, args, &[(env_key, env_value)]);
     command
-        .args(["--user", "--map-root-user", "--net", "--"])
-        .arg(&executable)
-        .args(args)
-        .env(env_key, env_value)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     command.spawn().unwrap_or_else(|error| {
         panic!(
-            "cannot spawn the helper `{} {:?}`: {error}",
-            executable.display(),
-            args
+            "cannot spawn the helper through `{}`: `{}` {args:?}: {error}",
+            netns.label(),
+            executable.display()
         )
     })
+}
+
+/// The text a helper recorded in `root`/`name`, trimmed.
+fn read_marker(root: &Root, name: &str) -> String {
+    let path = root.marker(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read the helper's `{}`: {error}", path.display()))
+        .trim()
+        .to_owned()
+}
+
+/// Create the runtime and state roots the daemon attests, as this process's uid.
+///
+/// The endpoint refuses a runtime root owned by a different user
+/// (`src/endpoint.rs`, `attest_runtime_root`), and under the privileged channel
+/// the daemon runs as root: the driver, which shares the daemon's uid, is the
+/// only process that can create them for it.
+fn prepare_daemon_roots(root: &Path) {
+    let runtime = root.join("runtime");
+    std::fs::create_dir_all(&runtime).expect("create the driver's runtime root");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod the driver's runtime root");
+    std::fs::create_dir_all(root.join("state")).expect("create the driver's state root");
+}
+
+/// Relax the ownership of a driver's tree so the invoking user can remove it.
+///
+/// A driver the privileged channel started as root owns every directory it
+/// created, and the daemon's `0700` runtime directory would stop this cell's
+/// `Root` drop from unlinking them. Called once the daemon is dead, so no tamper
+/// interval can observe the relaxed mode, and only for a root fixture.
+fn hand_back_tree(path: &Path) {
+    if !nix::unistd::geteuid().is_root() {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777));
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            hand_back_tree(&entry.path());
+        }
+    }
+}
+
+/// Kills the daemon if the driver unwinds before its own teardown.
+///
+/// The parent cannot signal a daemon the privileged channel started as root, so
+/// the driver is the process that has to reap it.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Block until `name` exists in `root`, failing with the helper's own output.
@@ -835,22 +1186,33 @@ fn read_pid(root: &Root) -> Option<u32> {
 /// started in, and mark each phase for the observing parent.
 ///
 /// It is `#[ignore]`d so a normal run of this target never executes it: the
-/// parent starts it with `--ignored --exact` inside
-/// `unshare --user --map-root-user --net`. Nothing here asserts; every
-/// assertion belongs to the parent, which is the external observer.
+/// parent starts it inside a private network namespace (`--user
+/// --map-root-user --net`, or `sudo -n --net`). Nothing here asserts; every
+/// assertion belongs to the parent, which is the external observer. What it does
+/// provide is the two namespace identities the parent cannot resolve itself when
+/// the channel made this process root.
 #[test]
 #[ignore = "helper: re-executed inside a private network namespace by the no-TCP cell"]
 fn private_namespace_driver() {
     let Some(root) = std::env::var_os(DRIVER_ROOT_ENV).map(PathBuf::from) else {
         return;
     };
+    prepare_daemon_roots(&root);
+    let driver_namespace = tcp_absence::namespace_identity(std::process::id())
+        .expect("the driver has a network namespace");
+    std::fs::write(root.join("driver.netns"), &driver_namespace)
+        .expect("record the driver's namespace");
     let socket = root.join("runtime").join("bitty").join("bittyd.sock");
     let capability = root.join("runtime").join("bitty").join("bittyd.operator");
     let stderr = root.join("daemon.stderr");
-    let mut daemon = spawn_daemon(&root, &stderr);
-    let pid = daemon.id();
+    let mut daemon = KillOnDrop(spawn_daemon(&root, &stderr));
+    let pid = daemon.0.id();
     std::fs::write(root.join("daemon.pid"), pid.to_string()).expect("record the daemon PID");
-    wait_ready(&socket, &capability, &mut daemon, &stderr);
+    let daemon_namespace = tcp_absence::namespace_identity(pid)
+        .unwrap_or_else(|| panic!("no `/proc/{pid}/ns/net` entry for the daemon"));
+    std::fs::write(root.join("daemon.netns"), &daemon_namespace)
+        .expect("record the daemon's namespace");
+    wait_ready(&socket, &capability, &mut daemon.0, &stderr);
     std::fs::write(root.join("startup"), "1").expect("mark startup");
     std::thread::sleep(Duration::from_millis(300));
 
@@ -869,15 +1231,20 @@ fn private_namespace_driver() {
     std::thread::sleep(Duration::from_millis(300));
 
     kill_pid(pid, nix::sys::signal::Signal::SIGKILL);
-    let status = daemon.wait().expect("reap the killed daemon");
+    let status = daemon.0.wait().expect("reap the killed daemon");
+    // The daemon is dead: hand the tree back so the parent can remove it even
+    // when this helper (and therefore the daemon) ran as root.
+    hand_back_tree(&root);
     std::fs::write(root.join("stopped"), format!("{status}")).expect("mark the abort");
 }
 
 /// Helper: bind one loopback listener inside the namespace this process was
-/// started in, and hold it until the observing parent kills it.
+/// started in, and hold it until the parent asks for it to stop.
 ///
 /// The parent's control row: the same `/proc/<pid>/net/tcp` reader must report
-/// this listener, or the daemon's zero rows prove nothing.
+/// this listener, or the daemon's zero rows prove nothing. The parent releases
+/// it through a marker rather than a signal, because under the privileged channel
+/// this process runs as root.
 #[test]
 #[ignore = "helper: re-executed inside a private network namespace by the no-TCP cell"]
 fn private_namespace_listener_control() {
@@ -891,6 +1258,13 @@ fn private_namespace_listener_control() {
         .expect("read the control listener's address")
         .port();
     std::fs::write(root.join("control.port"), port.to_string()).expect("record the control port");
-    std::thread::sleep(Duration::from_secs(20));
+    let stop = root.join("control.stop");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if stop.exists() {
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
     drop(listener);
 }

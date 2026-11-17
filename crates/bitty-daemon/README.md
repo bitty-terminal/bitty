@@ -1839,12 +1839,21 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/frame_credentials.rs` — per-frame credential acceptance across a real
   process boundary and the fd-passing handoff (grandchild's frame refused).
 - `tests/no_tcp_listener_absence.rs` — the daemon's own no-TCP observation
-  (bitty#2921): an `ss -tanpH` scan attributed to the daemon's PID set across
-  startup, attach, detach, `SIGTERM` and `SIGKILL`, plus the TCP table of the
-  daemon's own network namespace, because the daemon serves non-dumpable and
-  `ss -p` can never name it. A loopback listener held by the test process
-  keeps the `ss` filter non-vacuous, and a control child in its own private
-  namespace keeps the namespace reader non-vacuous.
+  (bitty#2921), in two channels. An `ss -tanpH` scan attributed to the daemon's
+  PID set at startup, while a negotiated client is attached, and after the
+  detach (the post-mortem scans after `SIGTERM` and `SIGKILL` only assert that
+  no PID of the tree remains to hold a socket), plus `/proc/<pid>/net/tcp{,6}`
+  for the TCP table of the daemon's own network namespace, because the daemon
+  serves non-dumpable and `ss -p` can never name it. The namespace channel is
+  the only one that speaks for the daemon, so it is mandatory: the cell takes
+  the unprivileged `unshare --user --map-root-user --net` when the host allows
+  it and the runner's passwordless `sudo -n unshare --net` otherwise, and fails
+  — instead of reporting a pass — when neither works.
+  `BITTY_NOTCP_ALLOW_PRIVATE_SKIP=1` records the gap as unproven instead, and CI
+  never sets it. A loopback listener held by the test process keeps the `ss`
+  filter non-vacuous, a control child in its own private namespace keeps the
+  namespace reader non-vacuous, and a host-namespace listener the cell holds must
+  be absent from the daemon's table so a read of the host's table cannot pass.
 
 ## Gates
 

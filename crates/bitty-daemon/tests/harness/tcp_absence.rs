@@ -326,9 +326,11 @@ pub(crate) fn namespace_identity(pid: u32) -> Option<String> {
 ///
 /// This is a second, independent channel from [`TcpScan`]: it does not need
 /// `-p` attribution, so it also covers a process the observer may not inspect
-/// (`PR_SET_DUMPABLE=0`). Its scope is the namespace, so it is only decisive
-/// when the observed process is the namespace's sole member — which is what
-/// the cell's private-namespace arm arranges and asserts.
+/// (`PR_SET_DUMPABLE=0`). Its scope is the whole namespace, so it is decisive
+/// when every member of that namespace belongs to the cell — the driver and the
+/// daemon do — and the arm asserts the daemon is in the driver's namespace and
+/// that the namespace is not the cell's own. Reading also never depends on the
+/// observed process's uid: `/proc/<pid>/net/tcp{,6}` is not pid-attributed.
 #[derive(Debug, Clone)]
 pub(crate) struct NamespaceScan {
     /// The PID whose namespace was read.

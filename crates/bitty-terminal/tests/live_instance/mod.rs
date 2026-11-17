@@ -48,6 +48,11 @@ use std::time::{Duration, Instant};
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 
 /// External scan of the instance's TCP sockets (bitty#2921, CTX-1865).
+///
+/// Linux only: the scan shells out to `ss` and attributes rows through
+/// `/proc`, so it is compiled only where both exist. macOS and Windows admit
+/// the rest of this fixture but not this module.
+#[cfg(target_os = "linux")]
 pub(crate) mod tcp_absence;
 
 /// Binary under test (fails to compile if the `[[bin]]` rename regresses).
@@ -254,6 +259,10 @@ impl TestInstance {
     /// PTY children commonly call `setsid()`, which puts them in a *new*
     /// group, so this alone is not the whole session tree — see
     /// [`TestInstance::session_pids`].
+    ///
+    /// Linux only: `/proc/<pid>/stat` is the only source, so this is compiled
+    /// only for the no-TCP cell's platform.
+    #[cfg(target_os = "linux")]
     pub(crate) fn process_group_pids(&self) -> Vec<u32> {
         let pgid = self.pid();
         let mut pids = Vec::new();
@@ -271,6 +280,8 @@ impl TestInstance {
     /// This is the PID set the no-TCP scan attributes sockets to: the app, its
     /// reading shells, and anything a shell started during the cell. `/proc` is
     /// the only source, so the set is exactly the tree this fixture spawned.
+    /// Linux only, same reason as [`TestInstance::process_group_pids`].
+    #[cfg(target_os = "linux")]
     pub(crate) fn session_pids(&self) -> Vec<u32> {
         let root = self.pid();
         let table = proc_table();
@@ -369,6 +380,10 @@ impl Drop for TestInstance {
 }
 
 /// The two `/proc/<pid>/stat` fields this fixture reads.
+///
+/// Linux only: `/proc` is the only source, so neither this struct nor
+/// [`proc_table`] exists on other targets.
+#[cfg(target_os = "linux")]
 struct ProcEntry {
     /// Parent PID (field 4).
     ppid: u32,
@@ -385,6 +400,7 @@ struct ProcEntry {
 ///
 /// A process that exits mid-walk is simply absent: `/proc` is a snapshot, and
 /// every caller here tolerates a shrinking tree.
+#[cfg(target_os = "linux")]
 fn proc_table() -> Vec<(u32, ProcEntry)> {
     let mut table = Vec::new();
     let entries = match std::fs::read_dir("/proc") {

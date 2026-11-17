@@ -12,7 +12,7 @@
 //!    `capability_denied` host class
 //!    (`crates/bitty-runtime/tests/component_host.rs:232` and `:705`), and the
 //!    manifest pairing rule is
-//!    `crates/bitty-plugin-host/src/manifest.rs:4483`; neither is re-tested
+//!    `crates/bitty-plugin-host/src/manifest.rs:4489`; neither is re-tested
 //!    here.
 //! 2. **filesystem escape**: a request that leaves its granted roots — parent
 //!    traversal, or an absolute `/etc/...` target — is refused with a typed
@@ -21,7 +21,7 @@
 //!    corpus (`src/fs_authz.rs:1638` `hostile_grant_shapes_deny_before_scope`,
 //!    `:1699` `absolute_paths_never_covered_even_by_broad_scope`), and the
 //!    runtime listing gate covers `~/docs/../outside` and `/etc`
-//!    (`crates/bitty-runtime/src/plugin_runtime/fs_list.rs:817` and `:823`).
+//!    (`crates/bitty-runtime/src/plugin_runtime/fs_list.rs:833` and `:838`).
 //!    This cell adds the `/etc/shadow`-shaped absolute target the criterion
 //!    names and asserts the "refused, not clamped" property at both the
 //!    authorizer and the matcher.
@@ -36,8 +36,9 @@
 //! `cargo test -p bitty-plugin-host --test denial_evidence --offline -- --nocapture`.
 
 use bitty_plugin_host::{
-    AgentRequest, CapabilityId, CapabilityScope, DenialKind, EffectiveStack, FilesystemScope,
-    FsDecision, FsDenialKind, RequestKind, SensitivePathPolicy, authorize, authorize_fs,
+    AgentRequest, CapabilityId, CapabilityScope, DenialKind, EffectiveLayer, EffectiveStack,
+    FilesystemScope, FsDecision, FsDenialKind, RequestKind, SensitivePathPolicy, authorize,
+    authorize_fs,
 };
 
 /// One layer's voice holding exactly `caps`.
@@ -84,9 +85,50 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
         chain.contains(network_cap()),
         "the refusal must name the capability it withheld: {chain}"
     );
-    assert!(
-        chain.contains("host-ceiling") || chain.contains("user-policy"),
-        "the refusal must name the layer that withheld it: {chain}"
+    // Not "some layer": the chain is the concrete narrowing set in authority
+    // order, each voice reporting the capability count it actually allowed,
+    // with the request's own excess last. Every layer here holds exactly the
+    // one read capability, so a chain that attributed the narrowing anywhere
+    // else would print a different count.
+    let expected = vec![
+        (
+            EffectiveLayer::HostCeiling,
+            "allows 1 capabilities".to_string(),
+        ),
+        (
+            EffectiveLayer::UserPolicy,
+            "allows 1 capabilities".to_string(),
+        ),
+        (
+            EffectiveLayer::ProjectPolicy,
+            "allows 1 capabilities".to_string(),
+        ),
+        (
+            EffectiveLayer::ParentDelegation,
+            "allows 1 capabilities".to_string(),
+        ),
+        (
+            EffectiveLayer::TaskGrant,
+            "allows 1 capabilities".to_string(),
+        ),
+        (
+            EffectiveLayer::AgentRequest,
+            format!("request exceeds intersection ({})", network_cap()),
+        ),
+    ];
+    let named: Vec<(EffectiveLayer, String)> = denial
+        .chain
+        .iter()
+        .map(|step| {
+            (
+                step.layer.expect("every narrowing step names its layer"),
+                step.detail.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named, expected,
+        "the refusal must name each layer that withheld it, in authority order: {chain}"
     );
     println!("DENY network gain refused: {}", denial.kind);
     println!("DENY reason chain:\n{chain}");
@@ -99,6 +141,71 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
     println!(
         "DENY network.connect kind refused: {} ({})",
         denial.kind, denial.request_kind
+    );
+
+    // Attribution, not presence: a stack where every voice but the task grant
+    // carries the destination must name `task-grant` as the one that narrowed,
+    // and print the wider count on the four voices above it. A chain that
+    // merely named some layer could not satisfy the counts.
+    let wider = [read_only[0], network_cap()];
+    let one_voice_short = EffectiveStack {
+        host: layer("host-ceiling", &wider),
+        user: layer("user-policy", &wider),
+        project: Some(layer("project-policy", &wider)),
+        parent: layer("parent-delegation", &wider),
+        task: layer("task-grant", &read_only),
+    };
+    let denial = authorize(
+        &one_voice_short,
+        &request,
+        RequestKind::NetworkConnect,
+        true,
+    )
+    .expect_err("the task grant withholds the destination, so the request is excess");
+    assert_eq!(denial.kind, DenialKind::ExceedsPolicy);
+    let attributed: Vec<(EffectiveLayer, String)> = denial
+        .chain
+        .iter()
+        .map(|step| {
+            (
+                step.layer.expect("every narrowing step names its layer"),
+                step.detail.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        attributed,
+        vec![
+            (
+                EffectiveLayer::HostCeiling,
+                "allows 2 capabilities".to_string()
+            ),
+            (
+                EffectiveLayer::UserPolicy,
+                "allows 2 capabilities".to_string()
+            ),
+            (
+                EffectiveLayer::ProjectPolicy,
+                "allows 2 capabilities".to_string()
+            ),
+            (
+                EffectiveLayer::ParentDelegation,
+                "allows 2 capabilities".to_string()
+            ),
+            (
+                EffectiveLayer::TaskGrant,
+                "allows 1 capabilities".to_string()
+            ),
+            (
+                EffectiveLayer::AgentRequest,
+                format!("request exceeds intersection ({})", network_cap()),
+            ),
+        ],
+        "the chain must attribute the narrowing to the one layer that withheld it: {}",
+        denial.reason_chain().join("\n")
+    );
+    println!(
+        "DENY attribution: only `task-grant` narrowed; the four voices above it allowed the destination"
     );
 
     // Control: with the destination granted by every layer, the same request

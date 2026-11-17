@@ -2513,7 +2513,7 @@ pub(crate) fn init_plugin_state_path(
     )
 }
 
-/// Platform-aware [`init_plugin_state_path`] accepting Windows `%APPDATA%` and
+/// Platform-aware managed-manifest resolver accepting Windows `%APPDATA%` and
 /// `%LOCALAPPDATA%` roots alongside XDG/HOME.
 pub(crate) fn init_plugin_state_path_with_platform_env(
     config_path: Option<&str>,

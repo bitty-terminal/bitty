@@ -335,7 +335,8 @@ jobs:
                   slow_units: ([$records[].targets[].slow_units] | add // 0),
                   oom: ([$records[].targets[].oom] | add // 0),
                   timeouts: ([$records[].targets[].timeouts] | add // 0),
-                  other_artifacts: ([$records[].targets[].other_artifacts] | add // 0)
+                  other_artifacts: ([$records[].targets[].other_artifacts] | add // 0),
+                  pre_existing_artifacts: ([$records[].targets[].pre_existing_artifacts] | add // 0)
                 },
                 result: (
                   if ($results | any(. == "finding")) then "finding"

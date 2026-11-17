@@ -40,7 +40,7 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Maximum candidates emitted per helper call (deterministic bound).
 pub(crate) const MAX_CANDIDATES: usize = 256;
@@ -179,13 +179,33 @@ fn plugin_candidates() -> Vec<String> {
         localappdata.as_deref(),
     )
     .ok();
-    let store_root = crate::plugin_runtime::store_root_with_platform_env(
+    let store_root = plugin_candidates_store_root(
         xdg_data_home.as_deref(),
         home.as_deref(),
         localappdata.as_deref(),
         appdata.as_deref(),
     );
     plugin_candidates_from(state_path.as_deref(), store_root.as_deref())
+}
+
+/// Store root the completion helper reads plugin ids from.
+///
+/// Read-only on purpose: `<TAB>` completion runs on every keystroke of a
+/// shell, so it must never adopt (move or copy) a legacy store as a side
+/// effect of listing a word. It still resolves the root the packages actually
+/// live under, so the candidates match what the app will load.
+fn plugin_candidates_store_root(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    crate::plugin_runtime::read_only_store_root_with_platform_env(
+        xdg_data_home,
+        home,
+        localappdata,
+        appdata,
+    )
 }
 
 /// Superset extraction for the plugin candidates (state + store).
@@ -449,6 +469,56 @@ mod tests {
                 "zeta.bundled".to_string()
             ]
         );
+    }
+
+    /// Completion reads a legacy store where it still lives, and adopts nothing.
+    ///
+    /// `<TAB>` runs on every keystroke of a shell: resolving the effective root
+    /// there moved an upgraded install's plugin tree as a side effect of
+    /// listing a word (CTX-1876 review). The candidates still have to be the
+    /// ids the app will load, so the read-only resolver names the legacy root.
+    #[test]
+    fn completion_candidates_read_a_legacy_store_without_adopting_it() {
+        let dir = scratch_dir("legacy-store");
+        let home = dir.join("home");
+        let legacy = home.join(".local/share/bitty/plugins");
+        let new_root = dir.join("local").join("bitty").join("plugins");
+        std::fs::create_dir_all(&legacy).expect("legacy store");
+        bitty_runtime::plugin_runtime::resolution::write_index(
+            &legacy,
+            &[store_record("aaa.legacy")],
+        )
+        .expect("legacy store index");
+        let home_value = home.to_string_lossy().into_owned();
+        let local_value = dir.join("local").to_string_lossy().into_owned();
+
+        let root = plugin_candidates_store_root(None, Some(&home_value), Some(&local_value), None)
+            .expect("store root");
+        assert_eq!(root, legacy, "the candidates come from the live store");
+        assert!(
+            legacy.join("current.json").is_file(),
+            "completion must not move the legacy tree"
+        );
+        assert!(!new_root.exists(), "completion creates no new root");
+        assert_eq!(
+            plugin_candidates_from(None, Some(&root)),
+            vec!["aaa.legacy".to_string()],
+            "the ids the app will load are offered"
+        );
+        // The adopting resolver, used by the commands that act on the store,
+        // does move it — so the assertion above is about the read-only call,
+        // not about the migration being broken.
+        assert_eq!(
+            crate::plugin_runtime::effective_store_root_with_platform_env(
+                None,
+                Some(&home_value),
+                Some(&local_value),
+                None,
+            ),
+            Some(new_root)
+        );
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -58,11 +58,13 @@ pub fn roots_from_env() -> (Option<PathBuf>, Option<PathBuf>) {
 pub fn state_root_from_env() -> Option<PathBuf> {
     let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
     let home = std::env::var("HOME").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
     let state_dir = std::env::var(COMPONENT_STATE_DIR_ENV).ok();
     component_state_root_for(
         state_dir.as_deref(),
         xdg_state_home.as_deref(),
         home.as_deref(),
+        localappdata.as_deref(),
     )
 }
 

@@ -3238,7 +3238,7 @@ pub(crate) fn init_plugin_inventory(
 /// data root both leave the bundled catalog usable.
 pub(crate) fn init_plugin_inventory_for_env(env: &InitEnv<'_>) -> InitPluginInventory {
     let bundled = bitty_plugin_host::bundled::bundled_ids_sorted();
-    let store = match crate::plugin_runtime::store_root_with_platform_env(
+    let store = match crate::plugin_runtime::effective_store_root_with_platform_env(
         env.xdg_data_home,
         env.home,
         env.localappdata,

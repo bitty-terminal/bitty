@@ -11,8 +11,9 @@
 //! <state-root>/<name>/activation     # "v1 active\n", "v1 denied:capability_denied\n"
 //! ```
 //!
-//! The state root is `$XDG_STATE_HOME/bitty/extensions`
-//! (`$HOME/.local/state/bitty/extensions` when `XDG_STATE_HOME` is unset).
+//! The state root is `$XDG_STATE_HOME/bitty/extensions`,
+//! `%LOCALAPPDATA%\bitty\extensions` on Windows, or
+//! `$HOME/.local/state/bitty/extensions` when neither is set.
 //! It is independent of the install tiers, so the record covers user and
 //! system installs alike and survives reinstalls. A user-tier record written
 //! beside `current` by older builds is still read as a fallback; new writes
@@ -198,20 +199,32 @@ pub fn activation_path(component_dir: &Path) -> PathBuf {
     component_dir.join(COMPONENT_ACTIVATION_FILE)
 }
 
-/// `$XDG_STATE_HOME` or `$HOME/.local/state` from explicit environment
-/// values (empty or whitespace-only values count as unset).
+/// `$XDG_STATE_HOME`, `%LOCALAPPDATA%`, or `$HOME/.local/state` from explicit
+/// environment values (empty or whitespace-only values count as unset).
 ///
-/// Component activation diagnostics live under this user-owned tree rather
-/// than under either install tier.
+/// The order mirrors the data resolver ([`super::data_home_with_platform_env`]):
+/// `%LOCALAPPDATA%` is the native per-user, non-roaming root on Windows, while
+/// `$HOME` there is a compatibility variable a POSIX shell exported, so the
+/// native root has to win or the fallback is unreachable exactly where it is
+/// needed. Component activation diagnostics live under this user-owned tree
+/// rather than under either install tier, and they are a last-recorded
+/// projection, so adopting the Windows root needs no record migration: the
+/// next transition rewrites the record, and a legacy record beside `current`
+/// is still read as a fallback
+/// ([`read_component_activation`]).
 #[must_use]
-pub fn state_home_for(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_state_home {
-        if !xdg.trim().is_empty() {
-            return Some(PathBuf::from(xdg));
-        }
+pub fn state_home_for(
+    xdg_state_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = super::non_empty_trimmed(xdg_state_home) {
+        return Some(PathBuf::from(xdg));
     }
-    home.filter(|home| !home.trim().is_empty())
-        .map(|home| PathBuf::from(home).join(".local").join("state"))
+    if let Some(local) = super::non_empty_trimmed(localappdata) {
+        return Some(PathBuf::from(local));
+    }
+    super::non_empty_trimmed(home).map(|home| PathBuf::from(home).join(".local").join("state"))
 }
 
 /// Component activation state root (`<state-home>/bitty/extensions`).
@@ -224,13 +237,12 @@ pub fn component_state_root_for(
     override_dir: Option<&str>,
     xdg_state_home: Option<&str>,
     home: Option<&str>,
+    localappdata: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(dir) = override_dir {
-        if !dir.trim().is_empty() {
-            return Some(PathBuf::from(dir));
-        }
+    if let Some(dir) = super::non_empty_trimmed(override_dir) {
+        return Some(PathBuf::from(dir));
     }
-    state_home_for(xdg_state_home, home)
+    state_home_for(xdg_state_home, home, localappdata)
         .map(|base| base.join("bitty").join(COMPONENT_ACTIVATION_DIR_NAME))
 }
 
@@ -895,18 +907,60 @@ mod tests {
     #[test]
     fn state_root_resolves_from_xdg_then_home() {
         assert_eq!(
-            component_state_root_for(Some("override"), Some("xdg-state"), Some("home")),
+            component_state_root_for(
+                Some("override"),
+                Some("xdg-state"),
+                Some("home"),
+                Some("local")
+            ),
             Some(PathBuf::from("override"))
         );
         assert_eq!(
-            component_state_root_for(None, Some("xdg-state"), Some("home")),
+            component_state_root_for(None, Some("xdg-state"), Some("home"), Some("local")),
             Some(PathBuf::from("xdg-state/bitty/extensions"))
         );
         assert_eq!(
-            component_state_root_for(Some("  "), Some(" "), Some("home")),
+            component_state_root_for(Some("  "), Some(" "), Some("home"), Some(" ")),
             Some(PathBuf::from("home/.local/state/bitty/extensions"))
         );
-        assert_eq!(component_state_root_for(None, Some(" "), Some(" ")), None);
+        assert_eq!(
+            component_state_root_for(None, Some(" "), Some(" "), Some(" ")),
+            None
+        );
+    }
+
+    /// CTX-1878: the Windows state root wins over a `$HOME` a POSIX shell
+    /// exported, exactly as the data root does; removing the
+    /// `%LOCALAPPDATA%` arm sends this record tree back to `$HOME`.
+    #[test]
+    fn windows_local_app_data_outranks_home_for_the_state_root() {
+        assert_eq!(
+            state_home_for(None, Some("/home/u"), Some("C:/Local")),
+            Some(PathBuf::from("C:/Local"))
+        );
+        assert_eq!(
+            component_state_root_for(None, None, Some("/home/u"), Some("C:/Local")),
+            Some(PathBuf::from("C:/Local/bitty/extensions"))
+        );
+        // Trimming and the explicit override still apply on that path.
+        assert_eq!(
+            component_state_root_for(None, None, Some("/home/u"), Some("  C:/Local  ")),
+            Some(PathBuf::from("C:/Local/bitty/extensions"))
+        );
+        assert_eq!(
+            component_state_root_for(Some("override"), None, Some("/home/u"), Some("C:/Local")),
+            Some(PathBuf::from("override"))
+        );
+        // `$XDG_STATE_HOME` keeps winning over both.
+        assert_eq!(
+            state_home_for(Some("/xdg-state"), Some("/home/u"), Some("C:/Local")),
+            Some(PathBuf::from("/xdg-state"))
+        );
+        // No Windows root: the POSIX fallback is unchanged.
+        assert_eq!(
+            state_home_for(None, Some("/home/u"), Some(" ")),
+            Some(PathBuf::from("/home/u/.local/state"))
+        );
     }
 
     #[test]

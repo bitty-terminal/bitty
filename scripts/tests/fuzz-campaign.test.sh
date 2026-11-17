@@ -4,10 +4,10 @@
 # The driver's only heavyweight dependency is a nightly cargo-fuzz run, so the
 # tests stub `cargo` and exercise everything the evidence depends on: the plan
 # and budget clamp, libFuzzer stat parsing, artifact classification (crash /
-# leak / slow unit / OOM / timeout / stale / unclassified), the execution floor,
-# the signal trap, the evidence schema, the cap `-max_len` derivation, and the
-# wiring that keeps the campaign itself out of the PR-required checks while the
-# driver test runs there.
+# leak / slow unit / OOM / timeout / pre-seeded / unclassified), the execution
+# floor, the signal trap, the evidence schema, the cap `-max_len` derivation,
+# and the wiring that keeps the campaign itself out of the PR-required checks
+# while the driver test runs there.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -223,12 +223,47 @@ if grep -Eq '/(home|Users|mnt|tmp)/' "$TMP/out-clean/summary.json"; then
   fail 'summary.json must not embed host paths'
 fi
 
-# --- stale artifacts from an earlier run are not counted as new findings
+# --- a pre-seeded artifact is never `clean`, even when the run adds no new name.
+# libFuzzer derives an artifact name from the input that produced it
+# (`leak-<sha1>`, `timeout-<sha1>`, ...), so a run that re-discovers an input an
+# earlier campaign, a local `just fuzz`, or a shared cache left in
+# `fuzz/artifacts/<target>/` rewrites the same file and the name diff stays
+# empty. P0-AC-002 counts findings, not new file names (bitty#3232), so the
+# driver must refuse `clean` here and record what it saw.
+for preseed in leak-deadbeef crash-stale timeout-stale; do
+  : >"$TMP/artifacts/vt_parser/$preseed"
+  rm -rf "$TMP/out-preseed"
+  run_fails 1 clean "$TMP/out-preseed"
+  expect_eq "pre-seeded $preseed campaign result" 'finding' "$(jq -r '.result' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed target result" 'finding' "$(jq -r '.targets[0].result' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed is not a new finding" '0' \
+    "$(jq -r '.targets[0] | .crashes + .leaks + .slow_units + .oom + .timeouts + .other_artifacts' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed adds no name" '0' "$(jq -r '.targets[0].artifacts | length' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed is recorded" '1' "$(jq -r '.targets[0].pre_existing_artifacts' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed is named" "$preseed" "$(jq -r '.targets[0].pre_existing_artifact_names[0]' "$TMP/out-preseed/summary.json")"
+  expect_eq "pre-seeded $preseed reaches the totals" '1' "$(jq -r '.totals.pre_existing_artifacts' "$TMP/out-preseed/summary.json")"
+  grep -Fq "| Pre-existing |" "$TMP/out-preseed/summary.md" || fail 'summary.md must carry the pre-existing column'
+  grep -Fq "$preseed (pre-existing artifact" "$TMP/out-preseed/summary.md" ||
+    fail "pre-seeded $preseed must be named in summary.md findings"
+  rm -f "$TMP/artifacts/vt_parser/$preseed"
+done
+
+# --- pre-existing and newly added artifacts are reported separately
 : >"$TMP/artifacts/vt_parser/crash-stale"
-rm -rf "$TMP/out-stale"
-run_fails 0 clean "$TMP/out-stale"
-expect_eq 'stale artifact ignored' '0' "$(jq -r '.targets[0].crashes' "$TMP/out-stale/summary.json")"
-rm -f "$TMP/artifacts/vt_parser/crash-stale"
+rm -rf "$TMP/out-mixed"
+run_fails 1 leak "$TMP/out-mixed"
+expect_eq 'mixed campaign result' 'finding' "$(jq -r '.result' "$TMP/out-mixed/summary.json")"
+expect_eq 'mixed campaign counts the new leak' '1' "$(jq -r '.targets[0].leaks' "$TMP/out-mixed/summary.json")"
+expect_eq 'mixed campaign counts the pre-existing artifact' '1' "$(jq -r '.targets[0].pre_existing_artifacts' "$TMP/out-mixed/summary.json")"
+expect_eq 'mixed campaign keeps the new name only in artifacts' 'leak-deadbeef' "$(jq -r '.targets[0].artifacts[0]' "$TMP/out-mixed/summary.json")"
+expect_eq 'mixed campaign names the pre-existing artifact' 'crash-stale' "$(jq -r '.targets[0].pre_existing_artifact_names[0]' "$TMP/out-mixed/summary.json")"
+rm -f "$TMP/artifacts/vt_parser/crash-stale" "$TMP/artifacts/vt_parser/leak-deadbeef"
+
+# --- with the directory empty again the same run is clean
+rm -rf "$TMP/out-reclean"
+run_fails 0 clean "$TMP/out-reclean"
+expect_eq 'emptied artifact dir restores a clean record' 'clean' "$(jq -r '.result' "$TMP/out-reclean/summary.json")"
+expect_eq 'emptied artifact dir records no pre-existing artifact' '0' "$(jq -r '.totals.pre_existing_artifacts' "$TMP/out-reclean/summary.json")"
 
 # --- every artifact class fails the campaign, including the exit-0 classes
 for mode in crash leak slowunit unclassified oom timeout; do

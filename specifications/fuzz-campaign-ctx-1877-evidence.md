@@ -76,6 +76,27 @@ artifact survived, because that is how it reports an abort; any other non-zero
 exit is a runner/build `error`, and a run that exits 0 without executing
 anything is `inconclusive` — never `clean`.
 
+**Artifact state assumed at campaign start: the target's artifact directory is
+empty.** That is `fuzz/artifacts/<target>/` by default, or
+`<--artifacts-dir>/<target>/`. The driver does not clear that directory — doing
+so would delete artifacts an earlier run left as evidence — and it does not
+trust a name diff alone. libFuzzer derives an artifact name from the input that
+produced it (`leak-<sha1>`, `timeout-<sha1>`, `crash-<sha1>`), so a run that
+re-discovers an input a previous campaign, a local `just fuzz`, or a shared
+cache left behind rewrites the same file and adds no *new* name. Any artifact
+present for the target after the run is therefore a finding, regardless of
+whether this run wrote it, and `clean` is not recorded while one is there. The
+record names what it saw in `pre_existing_artifacts` and
+`pre_existing_artifact_names`, and the per-class counters stay at zero because
+they count only what the run itself added — a target in that state reports
+`finding` with nothing new, which is the guard firing, not a second defect. CI
+meets the assumption by construction (a fresh checkout per matrix job); a local
+run meets it by pointing `--artifacts-dir` at the evidence directory of that
+particular run, or by triaging a finding and clearing the directory before the
+next campaign. Clearing is a deliberate act: triage first
+(`cargo +nightly fuzz tmin <target> <artifact>`), then remove the file, so an
+artifact is never dropped unseen.
+
 Seeds come from `fuzz/corpora/<target>` when that directory exists;
 `parser_to_state` replays the canonical R-001 corpus `fuzz/corpora/vt`
 (`vt_parser` holds a byte-identical copy); `control_string_cap` has no committed
@@ -84,7 +105,8 @@ generates them through the ignored `generate_cap_seeds` test when asked and
 passes `-max_len=4198432` for that target only.
 
 Exit codes: `0` every target clean, `1` at least one finding (crash, leak, slow
-unit, OOM, timeout, or unclassified artifact), `2` usage error, `3`
+unit, OOM, timeout, unclassified artifact, or an artifact already in the
+target's artifact directory when the run started), `2` usage error, `3`
 environment or runner error (toolchain or cargo-fuzz missing, build failure,
 wrapper timeout) with no finding recorded, `4` inconclusive record (a target
 executed zero iterations).
@@ -101,7 +123,10 @@ locally, a per-target upload in CI):
 - `logs/<target>.log` — the complete libFuzzer output (the caller sees the tail
   only).
 - `artifacts/<target>/` — any `crash-*`, `oom-*`, `timeout-*`, `slow-unit-*`, or
-  `leak-*` file a run added, copied out of the gitignored `fuzz/artifacts/`.
+  `leak-*` file a run added, copied out of the gitignored `fuzz/artifacts/`. An
+  artifact that was already there when the run started is named in
+  `summary.json` and `summary.md` instead of being copied: it is not this run's
+  evidence, only the reason the target cannot be called `clean`.
 
 `summary.json` fields that matter to a review:
 
@@ -115,7 +140,8 @@ locally, a per-target upload in CI):
 | `targets[].runs`, `exec_per_sec`, `new_units`             | Executions and coverage the budget bought                                                    |
 | `targets[].corpus_seeds`, `corpus_delta`                  | Seed units at start; units the run added before the retention trim                           |
 | `targets[].peak_rss_mb`                                   | Peak resident set reported by libFuzzer                                                      |
-| `targets[].crashes`, `oom`, `timeouts`, `other_artifacts` | Finding classes counted from artifacts the run itself added (pre-existing files are ignored) |
+| `targets[].crashes`, `oom`, `timeouts`, `other_artifacts` | Finding classes counted from artifacts the run itself added (pre-existing files counted separately, below) |
+| `targets[].pre_existing_artifacts`, `pre_existing_artifact_names` | Artifacts the directory already held when the run started: count and names; any entry here blocks `clean`, because a re-discovered input reuses its name |
 | `targets[].exit_code`, `result`                           | Process status and `clean` / `finding` / `error`                                             |
 | `totals`, `result`                                        | Whole-campaign roll-up; one `result` decides a run page                                      |
 
@@ -218,6 +244,16 @@ What still has to happen for closure, and who owns it:
 0`; a `timeout-*` artifact on a loaded runner is still treated as a finding,
   which is the correct fail-closed direction. Do not relax the timeout to hide
   one: investigate the input instead.
+- **Artifact state is an input to the record, not something to paper over.**
+  Because presence counts, a target whose artifact directory is not empty
+  reports `finding` even when the run itself discovered nothing. That is
+  deliberate (bitty#3232): P0-AC-002 counts findings, not new file names, and
+  libFuzzer reuses the name of a re-discovered input, so a name diff alone
+  would let a stale artifact launder a clean record. It costs a nightly run
+  nothing — every matrix job starts from a fresh checkout — and it costs a
+  local campaign one triage-then-clear step after a real finding. The driver
+  does not clean the directory for you: the artifact a run left behind is the
+  thing an auditor is meant to inspect.
 - **Portability.** The driver needs bash and POSIX `find`. `timeout`/`setsid`
   and GNU `find -printf` are used when present (Linux, CI); without them the
   hard kill and the retention trim degrade with a warning instead of aborting,

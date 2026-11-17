@@ -19,27 +19,39 @@
 #   3. classifies every artifact a run adds under the artifact prefix
 #      (`crash-*`, `leak-*`, `slow-unit-*`, `oom-*`, `timeout-*`, anything else)
 #      and copies it into the evidence directory;
-#   4. appends a row to `targets.tsv` and rewrites `summary.json`/`summary.md`
+#   4. refuses to record `clean` for a target whose artifact directory already
+#      held an artifact when the run started, because libFuzzer names an
+#      artifact from its input (`leak-<sha1>`, `timeout-<sha1>`, ...): the same
+#      input re-discovered by a later run reuses the same name and would
+#      otherwise leave the name diff empty;
+#   5. appends a row to `targets.tsv` and rewrites `summary.json`/`summary.md`
 #      after every target, so a campaign killed mid-flight still leaves a
 #      valid record of what ran.
 #
 # Every artifact class is a finding: a leak is exactly the "memory-safety
 # finding" P0-AC-002 forbids, a slow unit is the hang class, and an
-# unclassified artifact is a finding until someone classifies it. libFuzzer's
-# own error exit (77 by default) is a finding even when it left no artifact,
-# because that is how it reports an abort; any other non-zero exit is a
-# runner/build `error`, and a run that exits 0 without executing anything is
-# `inconclusive` — never `clean`.
+# unclassified artifact is a finding until someone classifies it. An artifact
+# still present for the target after the run — whether newly written or left
+# behind by an earlier campaign, a local `just fuzz`, or a shared cache — is a
+# finding too, so an artifact-seeded run can never be called `clean`. That is
+# why the campaign assumes the target's artifact directory is empty at start:
+# an existing artifact is reported (and counted under `pre_existing_artifacts`)
+# until it is triaged and the directory cleared, instead of being silently
+# folded into a clean result. libFuzzer's own error exit (77 by default) is a
+# finding even when it left no artifact, because that is how it reports an
+# abort; any other non-zero exit is a runner/build `error`, and a run that
+# exits 0 without executing anything is `inconclusive` — never `clean`.
 #
 # Evidence schema (`summary.json`): campaign, acceptance, revision,
 # revision_dirty, toolchain, cargo_fuzz, libfuzzer flags, started/finished UTC,
 # requested_secs, targets[] {target, secs_requested, secs_actual, secs_fuzzed,
 # runs, exec_per_sec, new_units, corpus_seeds, corpus_delta, peak_rss_mb,
 # crashes, leaks, slow_units, oom, timeouts, other_artifacts, exit_code,
-# result, artifacts[]}, totals{...}, result. `secs_actual` is the wall clock of
-# the whole per-target step (build plus run); `secs_fuzzed` is libFuzzer's own
-# `Done <runs> runs in <secs> second(s)` budget. No host path is recorded, so a
-# summary is safe to attach to a security-corpus record as-is.
+# result, artifacts[], pre_existing_artifacts, pre_existing_artifact_names[]},
+# totals{...}, result. `secs_actual` is the wall clock of the whole per-target
+# step (build plus run); `secs_fuzzed` is libFuzzer's own `Done <runs> runs in
+# <secs> second(s)` budget. No host path is recorded, so a summary is safe to
+# attach to a security-corpus record as-is.
 #
 # Bounds: --secs 10..86400 (default 600); -timeout 1..600 (default 25);
 # -rss_limit_mb 256..16384 (default 2048); each target's process runs in its
@@ -67,7 +79,8 @@
 #   scripts/fuzz-campaign.sh --dry-run           # plan only, no toolchain
 #
 # Exit codes: 0 = every target clean, 1 = at least one finding (crash, leak,
-# slow unit, OOM, timeout, or unclassified artifact), 2 = usage error,
+# slow unit, OOM, timeout, unclassified artifact, or an artifact already in the
+# target's artifact directory when the run started), 2 = usage error,
 # 3 = environment or runner error (toolchain or cargo-fuzz missing, build
 # failure, wrapper timeout) with no finding recorded, 4 = inconclusive record
 # (a target executed zero iterations, so a clean result cannot be claimed).
@@ -333,7 +346,7 @@ JSON
       }
       {
         if (count++) printf ",\n"
-        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, json_list($19)
+        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s, \"pre_existing_artifacts\": %d, \"pre_existing_artifact_names\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, json_list($19), $20, json_list($21)
         fuzzed += $4
         runs += $5
         new_units += $7
@@ -344,6 +357,7 @@ JSON
         oom += $14
         timeouts += $15
         other += $16
+        pre_existing += $20
         if ($18 == "finding") has_finding = 1
         if ($18 == "error") has_error = 1
         if ($18 == "inconclusive") has_inconclusive = 1
@@ -351,7 +365,7 @@ JSON
       END {
         overall = has_finding ? "finding" : (has_error ? "error" : (has_inconclusive ? "inconclusive" : "clean"))
         printf "\n  ],\n"
-        printf "  \"totals\": {\"targets\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"new_units\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d},\n", count + 0, fuzzed + 0, runs + 0, new_units + 0, peak + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, other + 0
+        printf "  \"totals\": {\"targets\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"new_units\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"pre_existing_artifacts\": %d},\n", count + 0, fuzzed + 0, runs + 0, new_units + 0, peak + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, other + 0, pre_existing + 0
         printf "  \"result\": \"%s\"\n}\n", overall
       }
     ' "$WORK_TARGETS"
@@ -369,12 +383,12 @@ render_summary_md() {
 - Started: $started
 - Budget: $SECS s per target, \`-timeout=$TIMEOUT_SECS\`, \`-rss_limit_mb=$RSS_LIMIT_MB\`, \`-workers=1\`
 
-| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Crashes | Leaks | Slow units | OOM | Timeouts | Result |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Crashes | Leaks | Slow units | OOM | Timeouts | Pre-existing | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 MD
     awk -F '\t' '
       {
-        printf "| `%s` | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $11, $12, $13, $14, $15, $18
+        printf "| `%s` | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $11, $12, $13, $14, $15, $20, $18
         fuzzed += $4
         runs += $5
         crashes += $11
@@ -382,13 +396,14 @@ MD
         slow += $13
         oom += $14
         timeouts += $15
+        pre_existing += $20
         if ($18 == "finding") has_finding = 1
         if ($18 == "error") has_error = 1
         if ($18 == "inconclusive") has_inconclusive = 1
       }
       END {
         overall = has_finding ? "finding" : (has_error ? "error" : (has_inconclusive ? "inconclusive" : "clean"))
-        printf "| **total** | %d | %d | – | – | – | – | %d | %d | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, overall
+        printf "| **total** | %d | %d | – | – | – | – | %d | %d | %d | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, pre_existing + 0, overall
       }
     ' "$WORK_TARGETS"
     if [ -s "$WORK_FINDINGS" ]; then
@@ -446,8 +461,8 @@ generate_cap_seeds() {
 }
 
 record_target() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" \
     >>"$WORK_TARGETS"
 }
 
@@ -528,6 +543,18 @@ run_target() {
   local new_artifacts
   new_artifacts="$(comm -13 "$WORK_DIR/artifacts-pre-$target.txt" "$WORK_DIR/artifacts-post-$target.txt")"
 
+  # Artifacts the directory already held when the run started and still holds.
+  # libFuzzer derives an artifact name from the input that produced it
+  # (`leak-<sha1>`, `timeout-<sha1>`, `crash-<sha1>`), so a run that
+  # re-discovers an input an earlier campaign left behind rewrites the very
+  # same file: the name diff above is empty, yet the target has an artifact.
+  # Presence after the run is therefore the test, which also covers the
+  # `(name, mtime)` variant and needs no `find -printf`, so the guard holds on
+  # a host where the retention trim already degrades.
+  local pre_existing_artifacts pre_existing_count
+  pre_existing_artifacts="$(comm -12 "$WORK_DIR/artifacts-pre-$target.txt" "$WORK_DIR/artifacts-post-$target.txt")"
+  pre_existing_count="$(printf '%s\n' "$pre_existing_artifacts" | awk 'NF { n++ } END { print n + 0 }')"
+
   local crashes leaks slow_units oom timeouts other total_artifacts
   crashes="$(count_prefix "$new_artifacts" 'crash-')"
   leaks="$(count_prefix "$new_artifacts" 'leak-')"
@@ -547,6 +574,19 @@ run_target() {
     done <<<"$new_artifacts"
   fi
 
+  # An artifact that survived the run from before it is named in the record
+  # (and in the findings list) but not copied out: it is not this run's
+  # evidence, only proof that the target could not start from a clean slate.
+  if [ "$pre_existing_count" -gt 0 ]; then
+    echo "fuzz-campaign: $target held $pre_existing_count artifact(s) before the run ($artifacts_dir); triage them and clear the directory to earn a clean record" >&2
+    while IFS= read -r artifact; do
+      if [ -n "$artifact" ]; then
+        printf '%s: %s/%s (pre-existing artifact, not added by this run)\n' \
+          "$target" "$target" "$artifact" >>"$WORK_FINDINGS"
+      fi
+    done <<<"$pre_existing_artifacts"
+  fi
+
   local runs exec_per_sec new_units peak_rss result secs_fuzzed
   secs_fuzzed="$(done_secs "$log")"
   runs="$(stat_value "$log" 'stat::number_of_executed_units')"
@@ -558,9 +598,11 @@ run_target() {
   peak_rss="$(stat_value "$log" 'stat::peak_rss_mb')"
 
   # Precedence: an artifact is a finding regardless of the exit status (a leak
-  # can exit 0); a non-zero exit without an artifact is a build/runner error;
-  # a zero-execution run is inconclusive, never clean.
-  if [ "$total_artifacts" -gt 0 ]; then
+  # can exit 0), and so is an artifact that was already there before the run —
+  # P0-AC-002 counts findings, not new file names. A non-zero exit without an
+  # artifact is a build/runner error; a zero-execution run is inconclusive,
+  # never clean.
+  if [ "$total_artifacts" -gt 0 ] || [ "$pre_existing_count" -gt 0 ]; then
     result="finding"
   elif [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 77 ]; then
     result="error"
@@ -575,19 +617,23 @@ run_target() {
   fi
 
   local corpus_delta=$(($(count_files "$corpus_dir") - corpus_before))
-  local artifact_list="-"
+  local artifact_list="-" pre_existing_list="-"
   if [ -n "$new_artifacts" ]; then
     artifact_list="$(printf '%s\n' "$new_artifacts" | paste -sd ' ' -)"
+  fi
+  if [ -n "$pre_existing_artifacts" ]; then
+    pre_existing_list="$(printf '%s\n' "$pre_existing_artifacts" | paste -sd ' ' -)"
   fi
 
   record_target "$target" "$SECS" "$secs_actual" "$secs_fuzzed" "$runs" "$exec_per_sec" \
     "$new_units" "$corpus_seeds" "$corpus_delta" "$peak_rss" "$crashes" "$leaks" \
-    "$slow_units" "$oom" "$timeouts" "$other" "$exit_code" "$result" "$artifact_list"
+    "$slow_units" "$oom" "$timeouts" "$other" "$exit_code" "$result" "$artifact_list" \
+    "$pre_existing_count" "$pre_existing_list"
 
   write_summaries "$STARTED_UTC"
   trim_corpus "$corpus_dir" || echo "fuzz-campaign: warning: corpus trim failed for $target" >&2
 
-  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs crashes=$crashes leaks=$leaks slow_units=$slow_units oom=$oom timeouts=$timeouts exit=$exit_code)"
+  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs crashes=$crashes leaks=$leaks slow_units=$slow_units oom=$oom timeouts=$timeouts pre_existing=$pre_existing_count exit=$exit_code)"
 }
 
 main() {

@@ -40,11 +40,15 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
+
+/// External scan of the instance's TCP sockets (`P0-AC-023`/CTX-1865).
+pub(crate) mod tcp_absence;
 
 /// Binary under test (fails to compile if the `[[bin]]` rename regresses).
 pub(crate) const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
@@ -145,6 +149,10 @@ impl TestInstance {
         } else {
             cmd.env_remove("BITTY_CTL_ELEVATE");
         }
+        // The instance owns its own process group so the no-TCP scan
+        // (`tcp_absence`) can attribute every socket to a PID this test
+        // recorded, without ever matching a process by name.
+        cmd.process_group(0);
         let child = cmd
             .spawn()
             .unwrap_or_else(|err| panic!("spawn {BITTY_BIN}: {err}"));
@@ -196,6 +204,9 @@ impl TestInstance {
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr));
         compositor.apply(&mut cmd);
+        // Same process-group ownership as the headless spawn, so a scan can
+        // attribute the app and its compositor to recorded PIDs only.
+        cmd.process_group(0);
         let child = cmd
             .spawn()
             .unwrap_or_else(|err| panic!("spawn {BITTY_BIN}: {err}"));
@@ -223,6 +234,64 @@ impl TestInstance {
 
     pub(crate) fn socket(&self) -> &str {
         &self.socket
+    }
+
+    /// The PID this fixture spawned and Drop will kill.
+    ///
+    /// Recorded at spawn, so a test never has to match a process by name: it
+    /// is the only handle any teardown in this fixture is allowed to use.
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Every live PID in the instance's own process group, this one included.
+    ///
+    /// The instance is spawned with `process_group(0)`, so it leads its own
+    /// group. Reading `/proc/<pid>/stat` is what makes an external scan
+    /// attributable to *this* instance: no name or pattern match is involved,
+    /// and a PID the fixture did not create can never be returned.
+    ///
+    /// PTY children commonly call `setsid()`, which puts them in a *new*
+    /// group, so this alone is not the whole session tree — see
+    /// [`TestInstance::session_pids`].
+    pub(crate) fn process_group_pids(&self) -> Vec<u32> {
+        let pgid = self.pid();
+        let mut pids = Vec::new();
+        for (pid, process) in proc_table() {
+            if process.pgid == pgid {
+                pids.push(pid);
+            }
+        }
+        pids.sort_unstable();
+        pids
+    }
+
+    /// The instance's process group plus every descendant, recursively.
+    ///
+    /// This is the PID set the no-TCP scan attributes sockets to: the app, its
+    /// reading shells, and anything a shell started during the cell. `/proc` is
+    /// the only source, so the set is exactly the tree this fixture spawned.
+    pub(crate) fn session_pids(&self) -> Vec<u32> {
+        let root = self.pid();
+        let table = proc_table();
+        let mut pids: Vec<u32> = self.process_group_pids();
+        // A reaped instance is absent from `/proc`: it must not be reported as
+        // a live member of its own session.
+        if table.iter().any(|(pid, _)| *pid == root) {
+            pids.push(root);
+        }
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for (pid, process) in &table {
+                if process.ppid == parent && !pids.contains(pid) {
+                    pids.push(*pid);
+                    frontier.push(*pid);
+                }
+            }
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
     }
 
     pub(crate) fn stderr_tail(&self) -> String {
@@ -297,6 +366,59 @@ impl Drop for TestInstance {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The two `/proc/<pid>/stat` fields this fixture reads.
+struct ProcEntry {
+    /// Parent PID (field 4).
+    ppid: u32,
+    /// Process-group id (field 5).
+    pgid: u32,
+}
+
+/// Every live process as `(pid, { ppid, pgid })`, read from `/proc`.
+///
+/// `comm` (field 2) is parenthesised and may itself contain spaces or
+/// parentheses, so parsing starts after the *last* `)`; the remaining fields
+/// are `state ppid pgrp ...`, which puts `ppid` at index 1 and `pgrp` at
+/// index 2.
+///
+/// A process that exits mid-walk is simply absent: `/proc` is a snapshot, and
+/// every caller here tolerates a shrinking tree.
+fn proc_table() -> Vec<(u32, ProcEntry)> {
+    let mut table = Vec::new();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("live_instance: cannot read /proc: {err}");
+            return table;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|raw| raw.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let Some(rest) = stat.get(close + 1..) else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let (Some(ppid), Some(pgid)) = (
+            fields.next().and_then(|raw| raw.parse::<u32>().ok()),
+            fields.next().and_then(|raw| raw.parse::<u32>().ok()),
+        ) else {
+            continue;
+        };
+        table.push((pid, ProcEntry { ppid, pgid }));
+    }
+    table
 }
 
 /// The only display connection a windowed test instance may use: one the test

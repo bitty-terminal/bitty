@@ -65,6 +65,16 @@ Bounds owned by the driver: `--secs` 10..86400, `-timeout` 1..600 (default 25),
 `-rss_limit_mb` 256..16384 (default 2048), `-workers=1`. The scratch corpus
 `fuzz/corpus/<target>` is trimmed to 2000 units per target after a run so a
 persisted corpus cache stays bounded; the committed corpora are never modified.
+The driver runs each target in its own session under `timeout`, and traps
+INT/TERM/HUP to terminate that session and remove its work directory, so an
+interrupted owner campaign leaves no orphaned fuzzer.
+
+Every artifact class is a finding: `crash-*`, `leak-*` (LSan memory safety),
+`slow-unit-*` (the hang class), `oom-*`, `timeout-*`, and any unclassified
+artifact. libFuzzer's own error exit (`77` by default) is a finding even when no
+artifact survived, because that is how it reports an abort; any other non-zero
+exit is a runner/build `error`, and a run that exits 0 without executing
+anything is `inconclusive` — never `clean`.
 
 Seeds come from `fuzz/corpora/<target>` when that directory exists;
 `parser_to_state` replays the canonical R-001 corpus `fuzz/corpora/vt`
@@ -73,9 +83,11 @@ seeds because its inputs are at and past the ~4 MiB parser cap, so the driver
 generates them through the ignored `generate_cap_seeds` test when asked and
 passes `-max_len=4198432` for that target only.
 
-Exit codes: `0` every target clean, `1` at least one crash, OOM, or timeout,
-`2` usage error, `3` environment or runner error (toolchain or cargo-fuzz
-missing, build failure, wrapper timeout) with no finding recorded.
+Exit codes: `0` every target clean, `1` at least one finding (crash, leak, slow
+unit, OOM, timeout, or unclassified artifact), `2` usage error, `3`
+environment or runner error (toolchain or cargo-fuzz missing, build failure,
+wrapper timeout) with no finding recorded, `4` inconclusive record (a target
+executed zero iterations).
 
 ## Evidence record
 
@@ -109,7 +121,15 @@ locally, a per-target upload in CI):
 
 No host path is recorded, so a summary is safe to attach to a security-corpus
 entry as-is. The `report` job merges the per-target records into one
-`fuzz-campaign-summary-<run id>` artifact for the whole run.
+`fuzz-campaign-summary-<run id>` artifact for the whole run. That merged record
+carries the campaign-level `revision`, `revision_dirty`, `toolchain`,
+`cargo_fuzz`, `libfuzzer`, and `started_utc`/`finished_utc` values (or `mixed`
+when the legs disagree), each target's own provenance copy, the enumerated
+`expected_targets` beside `received_targets`/`missing_targets`, and a `result`
+that also covers the target-set comparison: a leg that dies before writing its
+summary makes the run `incomplete`, never `clean`. Per-target diagnostics keep
+30 days; the merged record keeps 90 so the citable artifact outlives them and
+still states what produced the result.
 
 ## Measured run (this change)
 
@@ -130,8 +150,10 @@ CARGO_TARGET_DIR=<task cache> just fuzz-campaign 60 --generate-cap-seeds
 | `parser_to_state`    | 61          | 2,544   | 41     | 536       | 30    | 392           | 0       | 0   | 0        |
 | **total**            | 307         | 141,480 | –      | 4,595     | –     | 653           | 0       | 0   | 0        |
 
-Result `clean`, exit 0: no `crash-*`, `oom-*`, `timeout-*`, `slow-unit-*`, or
-`leak-*` artifact, `slowest_unit_time_sec: 0` on every target. The
+Result `clean`, exit 0: no artifact of any class (`crash-*`, `leak-*`,
+`slow-unit-*`, `oom-*`, `timeout-*`, unclassified), `slowest_unit_time_sec: 0`
+on every target, and every target executed its budget (the execution floor that
+a later `inconclusive` class now enforces). The
 `vt_parser` seed count is high because the run resumed a scratch corpus left by
 an aborted attempt, which also exercised the retention trim (766 oldest units
 removed, 2000 kept). `control_string_cap` executes slowly by design: its inputs
@@ -178,11 +200,17 @@ What still has to happen for closure, and who owns it:
   cargo-fuzz binary, and 600 s of fuzzing by default. The 1800 s dispatch
   ceiling keeps a manual run inside the 60-minute job timeout; it is a ceiling,
   not a default.
-- **Corpus cache growth.** The corpus cache key includes `github.run_id`, so it
-  adds an entry per target per night and the newest matching entry wins on
-  restore. Unit trimming bounds each entry; the discovered corpus is also
-  uploaded as an artifact so a failed run still leaves its coverage behind. The
-  committed `fuzz/corpora/` remains the canonical seed set.
+- **Corpus cache growth.** The corpus cache key rolls with the ISO week
+  (`fuzz-corpus-<target>-<YYYY-Www>`), so a target adds one entry per week
+  instead of one per night against the repository-wide Actions cache quota that
+  the required checks also draw on; the newest matching entry wins on restore.
+  The save is not success-gated (a finding is when the corpus matters most), and
+  a duplicate weekly key is tolerated as a cache miss rather than a campaign
+  failure. Unit trimming bounds each entry; the discovered corpus is uploaded as
+  an artifact too, so a failed run still leaves its coverage behind — including
+  the cap target, whose routine uploads stay excluded because its ~50 MiB seed
+  set is derivable. The committed `fuzz/corpora/` remains the canonical seed
+  set.
 - **Nightly churn.** The toolchain is not date-pinned, so the fuzz build is
   usually cold. That is a deliberate trade: the fuzz crate should track current
   nightly, and the evidence records which nightly ran.
@@ -190,6 +218,13 @@ What still has to happen for closure, and who owns it:
 0`; a `timeout-*` artifact on a loaded runner is still treated as a finding,
   which is the correct fail-closed direction. Do not relax the timeout to hide
   one: investigate the input instead.
+- **Portability.** The driver needs bash and POSIX `find`. `timeout`/`setsid`
+  and GNU `find -printf` are used when present (Linux, CI); without them the
+  hard kill and the retention trim degrade with a warning instead of aborting,
+  so the `just` path is Linux-first and a macOS host needs coreutils'
+  `gtimeout`. `--artifacts-dir` is forwarded to libFuzzer as
+  `-artifact_prefix`, so a caller that relocates artifacts still gets their
+  classification.
 - **`act` and the dynamic matrix.** `act -n --list` resolves the workflow, and
   `act -n ... -j targets` dry-runs the enumeration job, but `act` cannot
   evaluate a matrix built from `needs.<job>.outputs`, so the campaign job is
@@ -208,10 +243,20 @@ What still has to happen for closure, and who owns it:
 -P ubuntu-24.04=catthehacker/ubuntu:act-24.04` — job succeeds in dry run.
 - `shellcheck -S warning scripts/fuzz-campaign.sh
 scripts/tests/fuzz-campaign.test.sh` and `shfmt -d` — clean.
-- `just fuzz-campaign-test` — PASS, and wired into `just check`.
+- `just fuzz-campaign-test` — PASS; wired into `just check` and executed by the
+  `Quality gates` job in `ci.yml`, because PR CI never runs `just check`. The
+  campaign itself stays nightly-only; the test guards that split by asserting
+  the workflow's triggers are `schedule`/`workflow_dispatch` only and that
+  `ci.yml` never invokes the driver.
 - The measured run above — `result: clean`, exit 0.
 
 ## Open points
+
+- The cap target's `-max_len` is duplicated in the driver as a literal because
+  the generator's value is a Rust constant. The driver test re-derives
+  `FUZZ_MAX_LEN` from the iTerm2 constants and fails if the two drift apart;
+  having the generator emit the value for the driver to consume is the cleaner
+  long-term shape.
 
 - Whether the nightly budget should grow (for example a weekly 1800 s run on
   top of the 600 s nightly) depends on CI cost the owner has not yet budgeted.

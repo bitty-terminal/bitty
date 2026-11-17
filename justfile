@@ -741,17 +741,19 @@ soak-campaign secs="120":
 # P0-AC-002). Runs every target in `fuzz/Cargo.toml` for `secs` seconds each
 # (default 600) through `scripts/fuzz-campaign.sh`, which seeds from the
 # committed `fuzz/corpora/`, owns the libFuzzer timeout/RSS bounds, and writes
-# `summary.json`, `summary.md`, per-target logs, and any crash/OOM/timeout
-# artifact under `recording/fuzz-campaign/` (gitignored). The recipe exits
-# non-zero on the first finding class it records, so an owner campaign is a
-# single command: `just fuzz-campaign 3600`. Extra arguments pass through to the
-# driver (`--targets a,b`, `--out-dir <dir>`, `--generate-cap-seeds`).
+# `summary.json`, `summary.md`, per-target logs, and any finding artifact
+# under `recording/fuzz-campaign/` (gitignored). Any crash, leak, slow unit,
+# OOM, timeout, or unclassified artifact exits non-zero, and a run that
+# executed nothing is inconclusive rather than clean. Extra arguments pass
+# through to the driver (`--targets a,b`, `--out-dir <dir>`).
 #
 # Requires nightly plus `cargo-fuzz` (`rustup toolchain install nightly`,
-# `cargo install --locked --version 0.13.2 cargo-fuzz`); the nightly
+# `cargo install --locked --version 0.13.2 cargo-fuzz`). Linux-first: the hard
+# kill needs `timeout` (or `gtimeout`), and without GNU `find -printf` the
+# corpus retention trim is skipped with a warning. The nightly
 # `fuzz-campaign.yml` workflow runs the same driver per target outside the
-# PR-required checks. A clean campaign is evidence, not closure: P0-AC-002 also
-# needs a named revision and independent auditor review.
+# PR-required checks. Run a bounded campaign over every fuzz target and keep
+# its evidence record.
 fuzz-campaign secs="600" *args:
     ./scripts/fuzz-campaign.sh --secs {{secs}} {{args}}
 

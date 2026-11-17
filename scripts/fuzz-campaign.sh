@@ -14,32 +14,49 @@
 #   1. seeds the scratch corpus from the committed `fuzz/corpora/<target>`
 #      (when present) without discarding units a previous run discovered;
 #   2. runs libFuzzer for the budget with pinned `-timeout`, `-rss_limit_mb`,
-#      `-workers`, and `-max_len` (`control_string_cap` overrides the last one);
-#   3. classifies every artifact a run adds under `fuzz/artifacts/<target>/`
-#      (`crash-*`, `oom-*`, `timeout-*`, `slow-unit-*`, `leak-*`) and copies
-#      it into the evidence directory;
+#      `-workers`, and `-artifact_prefix` (`control_string_cap` also overrides
+#      `-max_len`);
+#   3. classifies every artifact a run adds under the artifact prefix
+#      (`crash-*`, `leak-*`, `slow-unit-*`, `oom-*`, `timeout-*`, anything else)
+#      and copies it into the evidence directory;
 #   4. appends a row to `targets.tsv` and rewrites `summary.json`/`summary.md`
 #      after every target, so a campaign killed mid-flight still leaves a
 #      valid record of what ran.
+#
+# Every artifact class is a finding: a leak is exactly the "memory-safety
+# finding" P0-AC-002 forbids, a slow unit is the hang class, and an
+# unclassified artifact is a finding until someone classifies it. libFuzzer's
+# own error exit (77 by default) is a finding even when it left no artifact,
+# because that is how it reports an abort; any other non-zero exit is a
+# runner/build `error`, and a run that exits 0 without executing anything is
+# `inconclusive` — never `clean`.
 #
 # Evidence schema (`summary.json`): campaign, acceptance, revision,
 # revision_dirty, toolchain, cargo_fuzz, libfuzzer flags, started/finished UTC,
 # requested_secs, targets[] {target, secs_requested, secs_actual, secs_fuzzed,
 # runs, exec_per_sec, new_units, corpus_seeds, corpus_delta, peak_rss_mb,
-# crashes, oom, timeouts, other_artifacts, exit_code, result, artifacts[]},
-# totals{secs_fuzzed, runs, crashes, oom, timeouts}, result. `secs_actual` is
-# the wall clock of the whole per-target step (build plus run); `secs_fuzzed`
-# is libFuzzer's own `Done <runs> runs in <secs> second(s)` budget. No host path is recorded, so a
+# crashes, leaks, slow_units, oom, timeouts, other_artifacts, exit_code,
+# result, artifacts[]}, totals{...}, result. `secs_actual` is the wall clock of
+# the whole per-target step (build plus run); `secs_fuzzed` is libFuzzer's own
+# `Done <runs> runs in <secs> second(s)` budget. No host path is recorded, so a
 # summary is safe to attach to a security-corpus record as-is.
 #
 # Bounds: --secs 10..86400 (default 600); -timeout 1..600 (default 25);
-# -rss_limit_mb 256..16384 (default 2048); each target's process is wrapped in
-# a hard kill at the budget plus HARD_LIMIT_SLACK_SECS so a wedged build cannot
-# hang the caller. The scratch corpus is trimmed to MAX_CORPUS_FILES units per
-# target after the run, which keeps a persisted CI cache bounded; the committed
-# corpora are never modified. `corpus_delta` counts the units a run added before
-# that trim, and each target's full libFuzzer log stays in `logs/` (only the tail
-# reaches the caller's output).
+# -rss_limit_mb 256..16384 (default 2048); each target's process runs in its
+# own session and is hard-killed at the budget plus HARD_LIMIT_SLACK_SECS, so a
+# wedged build cannot hang the caller. The caller and its child are trapped on
+# INT/TERM/HUP: the child session is terminated and the work directory removed.
+# The scratch corpus is trimmed to MAX_CORPUS_FILES units per target after the
+# run, which keeps a persisted CI cache bounded; the committed corpora are
+# never modified. `corpus_delta` counts the units a run added before that trim,
+# and each target's full libFuzzer log stays in `logs/` (only the tail reaches
+# the caller's output).
+#
+# Portability: the driver needs bash and POSIX find. `timeout(1)`/`setsid(1)`
+# and GNU `find -printf` are used when present (Linux, including CI); without
+# them the hard kill and the corpus retention trim degrade with a warning
+# instead of aborting. The `just fuzz-campaign` recipe is therefore
+# Linux-first, and a macOS host needs coreutils' `gtimeout`.
 #
 # Usage:
 #   scripts/fuzz-campaign.sh                     # 600 s per target, all targets
@@ -49,9 +66,11 @@
 #   scripts/fuzz-campaign.sh --generate-cap-seeds  # materialize cap seeds once
 #   scripts/fuzz-campaign.sh --dry-run           # plan only, no toolchain
 #
-# Exit codes: 0 = every target clean, 1 = at least one crash, OOM, or timeout,
-# 2 = usage error, 3 = environment or runner error (toolchain or cargo-fuzz
-# missing, build failure, wrapper timeout) with no finding recorded.
+# Exit codes: 0 = every target clean, 1 = at least one finding (crash, leak,
+# slow unit, OOM, timeout, or unclassified artifact), 2 = usage error,
+# 3 = environment or runner error (toolchain or cargo-fuzz missing, build
+# failure, wrapper timeout) with no finding recorded, 4 = inconclusive record
+# (a target executed zero iterations, so a clean result cannot be claimed).
 
 set -euo pipefail
 
@@ -78,8 +97,11 @@ MIN_RSS_LIMIT_MB=256
 MAX_RSS_LIMIT_MB=16384
 
 # The cap target feeds whole control strings, so it is the one target whose
-# inputs exceed libFuzzer's 1 MiB default mutation cap. The value matches the
-# `generate_cap_seeds` generator's `FUZZ_MAX_LEN`.
+# inputs exceed libFuzzer's 1 MiB default mutation cap. This mirrors
+# `FUZZ_MAX_LEN` in `crates/bitty-vt/tests/control_string_cap.rs` (`CAP + 19`,
+# where `CAP = ITERM2_OSC_MAX_ATTRIBUTE_BYTES + 1 +
+# ITERM2_OSC_MAX_WIRE_BYTES + ITERM2_OSC_PREFIX.len() + 2`); the driver test
+# re-derives the value from that source and fails when the two drift apart.
 CAP_TARGET="control_string_cap"
 CAP_MAX_LEN=4198432
 
@@ -89,6 +111,14 @@ MAX_CORPUS_FILES=2000
 # Extra wall clock allowed for the per-target build before the hard kill.
 HARD_LIMIT_SLACK_SECS=300
 CAT_SEED_TIMEOUT_SECS=300
+
+# Optional GNU/userland helpers. Missing ones degrade, they never abort a run.
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+SETSID_BIN="$(command -v setsid || true)"
+FIND_PRINTF=0
+if find "$FUZZ_DIR" -maxdepth 1 -printf '' >/dev/null 2>&1; then
+  FIND_PRINTF=1
+fi
 
 SECS="$DEFAULT_SECS"
 TARGETS=""
@@ -103,6 +133,10 @@ GENERATE_CAP_SEEDS=0
 DRY_RUN=0
 LIST_TARGETS=0
 PRINT_CARGO_FUZZ_VERSION=0
+
+# Launch state for the trap: the child session we started and the work dir.
+CHILD_PID=""
+WORK_DIR=""
 
 usage() {
   awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
@@ -136,6 +170,29 @@ clamp() {
   fi
 }
 
+# Kill only the process session this driver created at launch (`setsid` makes
+# the wrapper a session leader, so the negative PID reaches timeout, cargo, and
+# the fuzzer). Never a name or pattern match.
+stop_child() {
+  [ -n "$CHILD_PID" ] || return 0
+  if [ -n "$SETSID_BIN" ]; then
+    kill -TERM -- "-$CHILD_PID" 2>/dev/null || true
+  else
+    kill -TERM "$CHILD_PID" 2>/dev/null || true
+  fi
+  CHILD_PID=""
+}
+
+cleanup() {
+  local status="${1:-$?}"
+  trap - EXIT INT TERM HUP
+  stop_child
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+    rm -rf -- "$WORK_DIR"
+  fi
+  exit "$status"
+}
+
 # Every `[[bin]]` name in the fuzz manifest, in declaration order. Reading the
 # manifest keeps a new target from silently escaping the campaign (the same
 # "enumerate, do not assume" rule the soak campaign applies to its tests).
@@ -154,36 +211,18 @@ list_targets() {
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-    --secs)
-      SECS="${2:-}"
-      shift 2
-      ;;
-    --targets)
-      TARGETS="${2:-}"
-      shift 2
-      ;;
-    --out-dir)
-      OUT_DIR="${2:-}"
-      shift 2
-      ;;
-    --corpus-dir)
-      CORPUS_DIR="${2:-}"
-      shift 2
-      ;;
-    --artifacts-dir)
-      ARTIFACTS_ROOT="${2:-}"
-      shift 2
-      ;;
-    --toolchain)
-      TOOLCHAIN="${2:-}"
-      shift 2
-      ;;
-    --timeout)
-      TIMEOUT_SECS="${2:-}"
-      shift 2
-      ;;
-    --rss-limit-mb)
-      RSS_LIMIT_MB="${2:-}"
+    --secs | --targets | --out-dir | --corpus-dir | --artifacts-dir | --toolchain | --timeout | --rss-limit-mb)
+      [ $# -ge 2 ] || die "$1 requires a value"
+      case "$1" in
+      --secs) SECS="$2" ;;
+      --targets) TARGETS="$2" ;;
+      --out-dir) OUT_DIR="$2" ;;
+      --corpus-dir) CORPUS_DIR="$2" ;;
+      --artifacts-dir) ARTIFACTS_ROOT="$2" ;;
+      --toolchain) TOOLCHAIN="$2" ;;
+      --timeout) TIMEOUT_SECS="$2" ;;
+      --rss-limit-mb) RSS_LIMIT_MB="$2" ;;
+      esac
       shift 2
       ;;
     --generate-cap-seeds)
@@ -231,6 +270,16 @@ seed_source() {
 
 count_seeds() {
   find "$1" -maxdepth 1 -type f -name '*.bin' | wc -l | tr -d ' '
+}
+
+# Basenames of the files directly inside a directory, one per line, without
+# depending on GNU `find -printf`.
+list_file_names() {
+  if [ "$FIND_PRINTF" -eq 1 ]; then
+    find "$1" -maxdepth 1 -type f -printf '%f\n'
+  else
+    find "$1" -maxdepth 1 -type f -exec basename {} \;
+  fi
 }
 
 # Count the artifacts whose name starts with `$2` in a newline-separated list.
@@ -284,19 +333,25 @@ JSON
       }
       {
         if (count++) printf ",\n"
-        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, json_list($17)
+        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, json_list($19)
         fuzzed += $4
         runs += $5
+        new_units += $7
+        if ($10 > peak) peak = $10
         crashes += $11
-        oom += $12
-        timeouts += $13
-        if ($16 == "finding") has_finding = 1
-        if ($16 == "error") has_error = 1
+        leaks += $12
+        slow += $13
+        oom += $14
+        timeouts += $15
+        other += $16
+        if ($18 == "finding") has_finding = 1
+        if ($18 == "error") has_error = 1
+        if ($18 == "inconclusive") has_inconclusive = 1
       }
       END {
-        overall = has_finding ? "finding" : (has_error ? "error" : "clean")
+        overall = has_finding ? "finding" : (has_error ? "error" : (has_inconclusive ? "inconclusive" : "clean"))
         printf "\n  ],\n"
-        printf "  \"totals\": {\"targets\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"crashes\": %d, \"oom\": %d, \"timeouts\": %d},\n", count + 0, fuzzed + 0, runs + 0, crashes + 0, oom + 0, timeouts + 0
+        printf "  \"totals\": {\"targets\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"new_units\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d},\n", count + 0, fuzzed + 0, runs + 0, new_units + 0, peak + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, other + 0
         printf "  \"result\": \"%s\"\n}\n", overall
       }
     ' "$WORK_TARGETS"
@@ -310,26 +365,30 @@ render_summary_md() {
 # fuzz campaign summary
 
 - Campaign: \`bitty-fuzz-campaign\` (R-001 / P0-AC-002 evidence; bitty#3227, CTX-1877)
+- Revision: \`$REVISION\` (dirty: $REVISION_DIRTY), $TOOLCHAIN_VERSION, $CARGO_FUZZ_DETECTED
 - Started: $started
 - Budget: $SECS s per target, \`-timeout=$TIMEOUT_SECS\`, \`-rss_limit_mb=$RSS_LIMIT_MB\`, \`-workers=1\`
 
-| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Crashes | OOM | Timeouts | Result |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Crashes | Leaks | Slow units | OOM | Timeouts | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 MD
     awk -F '\t' '
       {
-        printf "| `%s` | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $11, $12, $13, $16
+        printf "| `%s` | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $11, $12, $13, $14, $15, $18
         fuzzed += $4
         runs += $5
         crashes += $11
-        oom += $12
-        timeouts += $13
-        if ($16 == "finding") has_finding = 1
-        if ($16 == "error") has_error = 1
+        leaks += $12
+        slow += $13
+        oom += $14
+        timeouts += $15
+        if ($18 == "finding") has_finding = 1
+        if ($18 == "error") has_error = 1
+        if ($18 == "inconclusive") has_inconclusive = 1
       }
       END {
-        overall = has_finding ? "finding" : (has_error ? "error" : "clean")
-        printf "| **total** | %d | %d | – | – | – | – | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, oom + 0, timeouts + 0, overall
+        overall = has_finding ? "finding" : (has_error ? "error" : (has_inconclusive ? "inconclusive" : "clean"))
+        printf "| **total** | %d | %d | – | – | – | – | %d | %d | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, overall
       }
     ' "$WORK_TARGETS"
     if [ -s "$WORK_FINDINGS" ]; then
@@ -350,11 +409,16 @@ write_summaries() {
 # oldest units by mtime go first; a unit libFuzzer still finds interesting gets
 # re-added on the next run. Deliberately no `head` in the pipeline: a reader
 # that exits early sends SIGPIPE to `sort`, which `pipefail` would turn into a
-# campaign abort even though trimming is only hygiene.
+# campaign abort even though trimming is only hygiene. Retention needs GNU
+# `find -printf`; without it the trim degrades to a warning.
 trim_corpus() {
   local dir="$1" total excess
   total="$(count_files "$dir")"
   if [ "$total" -le "$MAX_CORPUS_FILES" ]; then
+    return 0
+  fi
+  if [ "$FIND_PRINTF" -ne 1 ]; then
+    echo "fuzz-campaign: skipping corpus trim (find -printf unavailable)" >&2
     return 0
   fi
   excess=$((total - MAX_CORPUS_FILES))
@@ -366,9 +430,14 @@ trim_corpus() {
 
 generate_cap_seeds() {
   local log="$OUT_DIR/logs/$CAP_TARGET-seeds.log"
+  local -a guard=()
   echo "fuzz-campaign: generating $CAP_TARGET seeds (parser cap boundaries)"
-  if ! timeout --signal=TERM "${CAT_SEED_TIMEOUT_SECS}s" \
-    "$CARGO" test --locked -p bitty-vt --test control_string_cap -- \
+  if [ -n "$TIMEOUT_BIN" ]; then
+    guard=("$TIMEOUT_BIN" --signal=TERM "${CAT_SEED_TIMEOUT_SECS}s")
+  else
+    guard=(env)
+  fi
+  if ! "${guard[@]}" "$CARGO" test --locked -p bitty-vt --test control_string_cap -- \
     --ignored --nocapture generate_cap_seeds >"$log" 2>&1; then
     cat -- "$log" >&2
     env_die "cap seed generation failed (see $log)"
@@ -377,8 +446,8 @@ generate_cap_seeds() {
 }
 
 record_target() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" \
     >>"$WORK_TARGETS"
 }
 
@@ -410,26 +479,43 @@ run_target() {
   corpus_seeds="$(count_files "$corpus_dir")"
   corpus_before="$corpus_seeds"
 
+  # `-artifact_prefix` is what makes `--artifacts-dir` real: libFuzzer (through
+  # cargo-fuzz) writes its findings where this driver looks for them, instead
+  # of always into `fuzz/artifacts/<target>`.
   local -a fuzz_args=(
     "-max_total_time=$SECS"
     "-timeout=$TIMEOUT_SECS"
     "-rss_limit_mb=$RSS_LIMIT_MB"
     "-workers=1"
     "-print_final_stats=1"
+    "-artifact_prefix=$artifacts_dir/"
   )
   if [ "$target" = "$CAP_TARGET" ]; then
     fuzz_args+=("-max_len=$CAP_MAX_LEN")
   fi
 
-  find "$artifacts_dir" -maxdepth 1 -type f -printf '%f\n' | sort >"$WORK_DIR/artifacts-pre-$target.txt"
+  list_file_names "$artifacts_dir" | sort >"$WORK_DIR/artifacts-pre-$target.txt"
 
   local started_at ended_at exit_code=0
   started_at="$(date -u +%s)"
+  local -a runner=()
+  if [ -n "$TIMEOUT_BIN" ]; then
+    runner=("$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$((SECS + HARD_LIMIT_SLACK_SECS))s")
+  else
+    echo "fuzz-campaign: warning: no timeout(1); $target runs without a hard kill" >&2
+    runner=(env)
+  fi
+  if [ -n "$SETSID_BIN" ]; then
+    runner=("$SETSID_BIN" "${runner[@]}")
+  fi
+
   set +e
-  timeout --signal=TERM --kill-after=60 "$((SECS + HARD_LIMIT_SLACK_SECS))s" \
-    "$CARGO" "+$TOOLCHAIN" fuzz run "$target" "$corpus_dir" -- "${fuzz_args[@]}" \
-    >"$log" 2>&1
+  "${runner[@]}" "$CARGO" "+$TOOLCHAIN" fuzz run "$target" "$corpus_dir" -- "${fuzz_args[@]}" \
+    >"$log" 2>&1 &
+  CHILD_PID=$!
+  wait "$CHILD_PID"
   exit_code=$?
+  CHILD_PID=""
   set -e
   ended_at="$(date -u +%s)"
   # The step log is already in the evidence directory; print only the tail so a
@@ -438,15 +524,18 @@ run_target() {
 
   local secs_actual=$((ended_at - started_at))
 
-  find "$artifacts_dir" -maxdepth 1 -type f -printf '%f\n' | sort >"$WORK_DIR/artifacts-post-$target.txt"
+  list_file_names "$artifacts_dir" | sort >"$WORK_DIR/artifacts-post-$target.txt"
   local new_artifacts
   new_artifacts="$(comm -13 "$WORK_DIR/artifacts-pre-$target.txt" "$WORK_DIR/artifacts-post-$target.txt")"
 
-  local crashes oom timeouts other
+  local crashes leaks slow_units oom timeouts other total_artifacts
   crashes="$(count_prefix "$new_artifacts" 'crash-')"
+  leaks="$(count_prefix "$new_artifacts" 'leak-')"
+  slow_units="$(count_prefix "$new_artifacts" 'slow-unit-')"
   oom="$(count_prefix "$new_artifacts" 'oom-')"
   timeouts="$(count_prefix "$new_artifacts" 'timeout-')"
-  other=$(($(printf '%s\n' "$new_artifacts" | awk 'NF { n++ } END { print n + 0 }') - crashes - oom - timeouts))
+  total_artifacts="$(printf '%s\n' "$new_artifacts" | awk 'NF { n++ } END { print n + 0 }')"
+  other=$((total_artifacts - crashes - leaks - slow_units - oom - timeouts))
 
   if [ -n "$new_artifacts" ]; then
     mkdir -p "$OUT_DIR/artifacts/$target"
@@ -468,10 +557,19 @@ run_target() {
   new_units="$(stat_value "$log" 'stat::new_units_added')"
   peak_rss="$(stat_value "$log" 'stat::peak_rss_mb')"
 
-  if [ "$crashes" -gt 0 ] || [ "$oom" -gt 0 ] || [ "$timeouts" -gt 0 ]; then
+  # Precedence: an artifact is a finding regardless of the exit status (a leak
+  # can exit 0); a non-zero exit without an artifact is a build/runner error;
+  # a zero-execution run is inconclusive, never clean.
+  if [ "$total_artifacts" -gt 0 ]; then
     result="finding"
-  elif [ "$exit_code" -ne 0 ]; then
+  elif [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 77 ]; then
     result="error"
+  elif [ "$exit_code" -eq 77 ]; then
+    # libFuzzer's default `-error_exitcode`: it aborted even though no artifact
+    # survived. Never downgrade that to `error` ("no finding recorded").
+    result="finding"
+  elif [ "$runs" -eq 0 ] || [ "$secs_fuzzed" -eq 0 ]; then
+    result="inconclusive"
   else
     result="clean"
   fi
@@ -483,16 +581,21 @@ run_target() {
   fi
 
   record_target "$target" "$SECS" "$secs_actual" "$secs_fuzzed" "$runs" "$exec_per_sec" \
-    "$new_units" "$corpus_seeds" "$corpus_delta" "$peak_rss" "$crashes" "$oom" \
-    "$timeouts" "$other" "$exit_code" "$result" "$artifact_list"
+    "$new_units" "$corpus_seeds" "$corpus_delta" "$peak_rss" "$crashes" "$leaks" \
+    "$slow_units" "$oom" "$timeouts" "$other" "$exit_code" "$result" "$artifact_list"
 
   write_summaries "$STARTED_UTC"
   trim_corpus "$corpus_dir" || echo "fuzz-campaign: warning: corpus trim failed for $target" >&2
 
-  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs crashes=$crashes oom=$oom timeouts=$timeouts exit=$exit_code)"
+  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs crashes=$crashes leaks=$leaks slow_units=$slow_units oom=$oom timeouts=$timeouts exit=$exit_code)"
 }
 
 main() {
+  trap 'cleanup $?' EXIT
+  trap 'cleanup 130' INT
+  trap 'cleanup 143' TERM
+  trap 'cleanup 129' HUP
+
   parse_args "$@"
 
   if [ "$PRINT_CARGO_FUZZ_VERSION" -eq 1 ]; then
@@ -547,7 +650,6 @@ main() {
     echo "  corpus-dir: $CORPUS_DIR"
     echo "  artifacts-dir: $ARTIFACTS_ROOT"
     echo "  out-dir: $OUT_DIR"
-    local target
     local seeds_dir
     while IFS= read -r target; do
       seeds_dir="$(seed_source "$target")"
@@ -594,14 +696,17 @@ main() {
 
   local result
   result="$(awk -F '\t' '
-    $16 == "finding" { finding = 1 }
-    $16 == "error" { error = 1 }
-    END { print finding ? "finding" : (error ? "error" : "clean") }
+    $18 == "finding" { finding = 1 }
+    $18 == "error" { error = 1 }
+    $18 == "inconclusive" { inconclusive = 1 }
+    END { print finding ? "finding" : (error ? "error" : (inconclusive ? "inconclusive" : "clean")) }
   ' "$WORK_TARGETS")"
+
   echo "fuzz-campaign: $result — evidence at $OUT_DIR/summary.json"
   case "$result" in
   clean) exit 0 ;;
   finding) exit 1 ;;
+  inconclusive) exit 4 ;;
   *) exit 3 ;;
   esac
 }

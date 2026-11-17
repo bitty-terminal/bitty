@@ -4394,7 +4394,54 @@ impl TerminalApp {
                 crate::plugin_runtime::PluginPanelLayoutOp::Close { panel_id, view_id } => {
                     self.close_plugin_panel_leaf(panel_id, view_id);
                 }
+                crate::plugin_runtime::PluginPanelLayoutOp::ObservePresentation {
+                    panel_id,
+                    view_id,
+                } => {
+                    self.record_plugin_panel_presentation(panel_id, view_id);
+                }
             }
+        }
+    }
+
+    /// Records the presentation mode a retained panel leaf still presents,
+    /// reported by the generation bind edge (bitty#2476 AC-1, OQ-084 D.3).
+    ///
+    /// The bind edge moved the controller binding and left the container
+    /// attached, so the leaf's mode is the fact the clause names — and this is
+    /// the only layer that can read it, because the layout is this app's. The
+    /// value goes to the panel host's observation table through
+    /// `PanelRuntime::note_presentation_observation`, read-only evidence: this
+    /// path re-stamps nothing, re-presents nothing, and moves no layout. A leaf
+    /// the workspace no longer holds (a queued observation whose panel was
+    /// closed first) records nothing rather than inventing a mode.
+    fn record_plugin_panel_presentation(
+        &mut self,
+        panel_id: bitty_runtime::registry::PanelId,
+        view_id: ViewId,
+    ) {
+        let Some(mode) = self.runtime.view_presentation(view_id) else {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: panel {} presentation not observed (leaf {view_id} is gone)",
+                    panel_id.0
+                )
+            });
+            return;
+        };
+        let Some(scene_host) = self.runtime.scene_host() else {
+            return;
+        };
+        if let Err(error) = scene_host
+            .borrow_mut()
+            .note_presentation_observation(panel_id, view_id, mode)
+        {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: panel {} presentation not recorded: {error}",
+                    panel_id.0
+                )
+            });
         }
     }
 

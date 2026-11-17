@@ -1589,8 +1589,12 @@ jobs:
       # RUSTSEC-2026-0543 (chrono unmaintained, all versions) has no patched
       # release; deny.toml carries the full justification (Lua `os.date`
       # calendar conversion only, informational advisory, replacements blocked
-      # by MSRV 1.85) and the 2027-03-31 re-audit bound. Keep the two lists in
-      # step — a deny.toml ignore that audit does not share turns this leg red.
+      # by MSRV 1.85) and the 2027-03-31 re-audit bound. `cargo audit` 0.22.2
+      # reports the unmaintained class as a warning and exits 0, so this step is
+      # not the enforcing half — `cargo deny check` is. Keep the ignore here
+      # anyway so both tools read the same exception list (a future `-D
+      # warnings` on this step, or an audit release that escalates the class,
+      # must not resurrect the advisory), and keep the two lists in step.
       # cargo-deny and cargo-audit share ~/.cargo/advisory-db; deny populates it
       # so clear before audit to avoid "Refusing to initialize non-empty directory" failure.
       - name: Audit advisories

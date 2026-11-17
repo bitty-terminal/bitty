@@ -57,7 +57,7 @@ CI, scheduled or manual:
 - Nightly at 04:47 UTC, 600 s per target.
 - `workflow_dispatch` takes `duration_secs` (10..1800). The 1800 s ceiling plus
   the driver's 300 s hard-kill slack, a cold fuzz build, and one-time cap-seed
-  generation fit the job's 45-minute timeout; the accounting is in the workflow.
+  generation fit the job's 60-minute timeout; the accounting is in the workflow.
 - Each target runs in its own matrix job, so one target's failure does not erase
   the others' evidence (`fail-fast: false`).
 
@@ -176,7 +176,7 @@ What still has to happen for closure, and who owns it:
 
 - **CI cost.** Five matrix jobs per night: one fuzz build each, a cached
   cargo-fuzz binary, and 600 s of fuzzing by default. The 1800 s dispatch
-  ceiling keeps a manual run inside the 45-minute job timeout; it is a ceiling,
+  ceiling keeps a manual run inside the 60-minute job timeout; it is a ceiling,
   not a default.
 - **Corpus cache growth.** The corpus cache key includes `github.run_id`, so it
   adds an entry per target per night and the newest matching entry wins on

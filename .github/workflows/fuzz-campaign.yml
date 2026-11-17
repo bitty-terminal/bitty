@@ -84,16 +84,18 @@ jobs:
     name: Fuzz ${{ matrix.target }}
     needs: targets
     runs-on: ubuntu-24.04
-    # Budget accounting inside the 45-minute job timeout:
+    # Budget accounting inside the 60-minute job timeout:
     #
-    #   1800 s MAX_FUZZ_SECS (dispatch ceiling)   = 30 min of fuzzing
-    #   + 300 s per-target hard-kill slack        =  5 min
-    #   + ~300 s cold fuzz build + installs       =  5 min
-    #   + 300 s cap-seed generation (one target)  =  5 min
+    #   1800 s MAX_FUZZ_SECS (dispatch ceiling, build included in its        = 30 min
+    #     hard-kill slack below)
+    #   + 300 s per-target hard-kill slack                                  =  5 min
+    #   + 300 s cap-seed generation (the cap target only)                   =  5 min
+    #   + ~180 s checkout, toolchain, cargo-fuzz install, uploads           =  3 min
     #
     # The nightly default is 600 s per target, so the scheduled run sits far
-    # inside this bound; only a deliberate 1800 s dispatch approaches it.
-    timeout-minutes: 45
+    # inside this bound; only a deliberate 1800 s dispatch approaches 43 min of
+    # it, which leaves real headroom on a slow runner instead of a timeout.
+    timeout-minutes: 60
     strategy:
       # One finding must not erase the other targets' evidence.
       fail-fast: false

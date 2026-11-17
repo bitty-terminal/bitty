@@ -53,7 +53,7 @@ mod ffi;
 #[cfg(windows)]
 mod conpty;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod console;
 
 #[cfg(windows)]

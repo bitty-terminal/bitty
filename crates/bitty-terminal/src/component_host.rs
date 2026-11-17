@@ -31,10 +31,16 @@ use bitty_runtime::component::{
 pub fn roots_from_env() -> (Option<PathBuf>, Option<PathBuf>) {
     let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    let appdata = std::env::var("APPDATA").ok();
     let components_dir = std::env::var(COMPONENTS_DIR_ENV).ok();
     let system_components_dir = std::env::var(SYSTEM_COMPONENTS_DIR_ENV).ok();
-    let data_home =
-        bitty_runtime::component::data_home_for(xdg_data_home.as_deref(), home.as_deref());
+    let data_home = bitty_runtime::component::data_home_with_platform_env(
+        xdg_data_home.as_deref(),
+        home.as_deref(),
+        localappdata.as_deref(),
+        appdata.as_deref(),
+    );
     component_search_roots_for(
         components_dir.as_deref(),
         data_home.as_deref(),

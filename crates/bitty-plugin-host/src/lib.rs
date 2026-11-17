@@ -208,7 +208,7 @@ pub use effective::{
     PolicyProvenance, RequestKind, USER_POLICY_FILE_NAME, authorize, authorize_with_role,
     authorize_with_role_and_ceilings, authorize_with_trust, authorize_with_trust_and_role,
     delegate, enforcement_class_for, explain_capability, parse_policy, project_policy_path,
-    user_policy_path_with_env,
+    user_policy_path_with_env, user_policy_path_with_platform_env,
 };
 pub use error::{ErrorClass, PluginError};
 pub use event::{

@@ -212,7 +212,7 @@ use bitty_plugin_host::effective::{
     AgentRequest, CapabilityExplanation, CapabilityScope, DenialKind, ENFORCEMENT_MAP,
     EffectiveLayer, EffectiveStack, EnforcementEntry, LayerState, MAX_POLICY_FILE_BYTES,
     PolicyProvenance, RequestKind, explain_capability, parse_policy, project_policy_path,
-    user_policy_path_with_env,
+    user_policy_path_with_platform_env,
 };
 use bitty_plugin_host::grant::{GrantRecord as HostGrantRecord, GrantStore};
 use bitty_plugin_host::manifest::{PluginId, PluginManifest, SettingDecl, SettingDefault};
@@ -1687,15 +1687,38 @@ impl PluginFailure {
     }
 }
 
-/// Resolve the managed-manifest path.
-///
-/// - An explicit `--config`/`BITTY_CONFIG` path selects its parent directory.
-/// - Otherwise `$XDG_CONFIG_HOME/bitty`, falling back to `~/.config/bitty`.
+const NO_DATA_ROOT_MESSAGE: &str =
+    "bitty plugin: no data root ($XDG_DATA_HOME, %LOCALAPPDATA%, $HOME, or %APPDATA% unset)";
+
+/// Resolve the managed-manifest path (non-platform XDG/HOME helper for tests).
+#[cfg(test)]
 fn resolve_state_path(
     config_path: Option<&str>,
     bitty_config_env: Option<&str>,
     xdg_config_home: Option<&str>,
     home: Option<&str>,
+) -> Result<PathBuf, PluginFailure> {
+    resolve_state_path_with_platform_env(
+        config_path,
+        bitty_config_env,
+        xdg_config_home,
+        home,
+        None,
+        None,
+    )
+}
+
+/// Resolve the managed-manifest path across Unix and Windows environment roots.
+///
+/// - An explicit `--config`/`BITTY_CONFIG` path selects its parent directory.
+/// - Otherwise `$XDG_CONFIG_HOME` > `%APPDATA%` > `$HOME/.config` > `%LOCALAPPDATA%`.
+fn resolve_state_path_with_platform_env(
+    config_path: Option<&str>,
+    bitty_config_env: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
 ) -> Result<PathBuf, PluginFailure> {
     if let Some(explicit) =
         bitty_config::file::resolve_config_explicit(config_path, bitty_config_env)
@@ -1717,11 +1740,12 @@ fn resolve_state_path(
         };
         return Ok(dir.join(STATE_FILE_NAME));
     }
-    bitty_config::file::config_dir_with_env(xdg_config_home, home)
+    bitty_config::file::config_dir_with_platform_env(xdg_config_home, home, appdata, localappdata)
         .map(|dir| dir.join(STATE_FILE_NAME))
         .ok_or_else(|| {
             PluginFailure::usage(
-                "bitty plugin: no config root ($XDG_CONFIG_HOME or $HOME unset)".to_string(),
+                "bitty plugin: no config root ($XDG_CONFIG_HOME, %APPDATA%, $HOME, or %LOCALAPPDATA% unset)"
+                    .to_string(),
             )
         })
 }
@@ -2463,19 +2487,51 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
 
 /// Resolve the managed-manifest path for `bitty init` follow-ups.
 ///
-/// Mirrors [`resolve_state_path`] (explicit `--config`/`BITTY_CONFIG` parent,
-/// else XDG config root): the init wizard records into the same
-/// `bitty-plugins.lua` ledger `plugin install <id>` uses, so a recorded queue
-/// is consumable later by `plugin install`. Returns a plain string error for
-/// the init dispatch (English-only, no secrets).
+/// Mirrors [`resolve_state_path_with_platform_env`] (explicit
+/// `--config`/`BITTY_CONFIG` parent, else platform config root): the init
+/// wizard records into the same `bitty-plugins.lua` ledger `plugin install <id>`
+/// uses, so a recorded queue is consumable later by `plugin install`. Returns
+/// a plain string error for the init dispatch (English-only, no secrets).
+///
+/// Test-only: production callers use
+/// [`init_plugin_state_path_with_platform_env`] so `%APPDATA%` /
+/// `%LOCALAPPDATA%` reach the resolver.
+#[cfg(test)]
 pub(crate) fn init_plugin_state_path(
     config_path: Option<&str>,
     bitty_config_env: Option<&str>,
     xdg_config_home: Option<&str>,
     home: Option<&str>,
 ) -> Result<PathBuf, String> {
-    resolve_state_path(config_path, bitty_config_env, xdg_config_home, home)
-        .map_err(|failure| failure.message)
+    init_plugin_state_path_with_platform_env(
+        config_path,
+        bitty_config_env,
+        xdg_config_home,
+        home,
+        None,
+        None,
+    )
+}
+
+/// Platform-aware managed-manifest resolver accepting Windows `%APPDATA%` and
+/// `%LOCALAPPDATA%` roots alongside XDG/HOME.
+pub(crate) fn init_plugin_state_path_with_platform_env(
+    config_path: Option<&str>,
+    bitty_config_env: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Result<PathBuf, String> {
+    resolve_state_path_with_platform_env(
+        config_path,
+        bitty_config_env,
+        xdg_config_home,
+        home,
+        appdata,
+        localappdata,
+    )
+    .map_err(|failure| failure.message)
 }
 
 /// Record first-batch bundled ids offline without fetching or consent.
@@ -3965,7 +4021,12 @@ fn build_explain_report(
         ));
     }
 
-    let user_path = user_policy_path_with_env(context.xdg_config_home, context.home);
+    let user_path = user_policy_path_with_platform_env(
+        context.xdg_config_home,
+        context.home,
+        context.appdata,
+        context.localappdata,
+    );
     let user_scope = match user_path.as_deref() {
         Some(path) => load_policy_scope(Path::new(path), PolicyProvenance::User)?,
         None => None,
@@ -4073,7 +4134,8 @@ fn build_explain_report(
             EffectiveLayer::UserPolicy if user_scope.is_none() => {
                 layer.detail = match user_path.as_deref() {
                     Some(path) => format!("file not present: {path}"),
-                    None => "no config root (set XDG_CONFIG_HOME or HOME)".to_string(),
+                    None => "no config root (set XDG_CONFIG_HOME, APPDATA, HOME, or LOCALAPPDATA)"
+                        .to_string(),
                 };
             }
             EffectiveLayer::ProjectPolicy if project_scope.is_none() => {
@@ -5523,6 +5585,10 @@ pub struct PluginContext<'a> {
     pub xdg_data_home: Option<&'a str>,
     /// `HOME` environment value.
     pub home: Option<&'a str>,
+    /// Windows `APPDATA` environment value (roaming config / fallback data root).
+    pub appdata: Option<&'a str>,
+    /// Windows `LOCALAPPDATA` environment value (local data / fallback config root).
+    pub localappdata: Option<&'a str>,
     /// Current working directory for the project policy layer
     /// (`<cwd>/.bitty/capabilities.conf`); `None` when undeterminable.
     pub cwd: Option<&'a str>,
@@ -5562,11 +5628,13 @@ pub fn run_plugin_subcommand(
 
     // Post-word `--no-color` wins; a pre-word global flag is honored too.
     let no_color = request.no_color || context.pre_no_color;
-    let path = match resolve_state_path(
+    let path = match resolve_state_path_with_platform_env(
         context.config_path,
         context.bitty_config_env,
         context.xdg_config_home,
         context.home,
+        context.appdata,
+        context.localappdata,
     ) {
         Ok(path) => path,
         Err(failure) => {
@@ -5575,7 +5643,12 @@ pub fn run_plugin_subcommand(
         }
     };
     // Resolved once from injected environment values (never process env here).
-    let store_root = crate::plugin_runtime::store_root_for(context.xdg_data_home, context.home);
+    let store_root = crate::plugin_runtime::store_root_with_platform_env(
+        context.xdg_data_home,
+        context.home,
+        context.localappdata,
+        context.appdata,
+    );
     // Doctor must diagnose a malformed ledger instead of failing before it can
     // report it, so it runs before the strict state load.
     if request.verb == PluginVerb::Doctor {
@@ -7053,7 +7126,7 @@ fn install_source(
     output: &mut dyn std::io::Write,
 ) -> i32 {
     let Some(store_root) = store_root else {
-        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        eprintln!("{NO_DATA_ROOT_MESSAGE}");
         return EXIT_USAGE;
     };
     // Git spellings (allowlist) clone first, then share the local pipeline.
@@ -7165,7 +7238,7 @@ fn install_official(
     output: &mut dyn std::io::Write,
 ) -> i32 {
     let Some(store_root) = store_root else {
-        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        eprintln!("{NO_DATA_ROOT_MESSAGE}");
         return EXIT_USAGE;
     };
     // Catalog compatibility is known before any network access: an entry
@@ -7763,7 +7836,7 @@ fn set_store_enabled(
     output: &mut dyn std::io::Write,
 ) -> i32 {
     let Some(store_root) = store_root else {
-        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        eprintln!("{NO_DATA_ROOT_MESSAGE}");
         return EXIT_USAGE;
     };
     match package::set_enabled(store_root, id, enabled) {
@@ -8050,7 +8123,7 @@ fn run_plugin_doctor(
             failures += 1;
             let _ = writeln!(
                 output,
-                "  [fail] store: no data root ($XDG_DATA_HOME or $HOME unset)"
+                "  [fail] store: no data root ($XDG_DATA_HOME, %LOCALAPPDATA%, $HOME, or %APPDATA% unset)"
             );
         }
     }
@@ -8301,7 +8374,7 @@ fn uninstall_store(
         return EXIT_USAGE;
     }
     let Some(store_root) = store_root else {
-        eprintln!("bitty plugin: no data root ($XDG_DATA_HOME or $HOME unset)");
+        eprintln!("{NO_DATA_ROOT_MESSAGE}");
         return EXIT_USAGE;
     };
     match package::uninstall(store_root, id) {
@@ -10192,6 +10265,52 @@ mod tests {
 
         assert!(resolve_state_path(None, None, None, None).is_err());
         assert!(resolve_state_path(Some("init.lua"), None, None, None).is_err());
+    }
+
+    #[test]
+    fn state_path_resolution_supports_windows_appdata_and_localappdata() {
+        let appdata = resolve_state_path_with_platform_env(
+            None,
+            None,
+            None,
+            None,
+            Some("C:/Roaming"),
+            Some("C:/Local"),
+        )
+        .expect("appdata");
+        assert_eq!(appdata, Path::new("C:/Roaming/bitty").join(STATE_FILE_NAME));
+
+        let local = resolve_state_path_with_platform_env(
+            None,
+            None,
+            Some("   "),
+            None,
+            Some(""),
+            Some("C:/Local"),
+        )
+        .expect("localappdata");
+        assert_eq!(local, Path::new("C:/Local/bitty").join(STATE_FILE_NAME));
+
+        let xdg_wins = resolve_state_path_with_platform_env(
+            None,
+            None,
+            Some("/xdg"),
+            Some("/home/u"),
+            Some("C:/Roaming"),
+            Some("C:/Local"),
+        )
+        .expect("xdg wins");
+        assert_eq!(xdg_wins, Path::new("/xdg/bitty").join(STATE_FILE_NAME));
+
+        let err = resolve_state_path_with_platform_env(None, None, None, None, Some(" "), None)
+            .expect_err("all config roots unset");
+        assert!(
+            err.message.contains("no config root")
+                && err.message.contains("%APPDATA%")
+                && err.message.contains("%LOCALAPPDATA%"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -12738,6 +12857,79 @@ mod tests {
             "",
         );
         assert_eq!(code, EXIT_PLUGIN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plugin_dispatch_works_with_windows_appdata_and_localappdata_only() {
+        let dir = scratch_dir("win-appdata");
+        let appdata = dir.join("roaming");
+        let localappdata = dir.join("local");
+        std::fs::create_dir_all(&appdata).expect("appdata");
+        std::fs::create_dir_all(&localappdata).expect("localappdata");
+        let appdata_s = appdata.display().to_string();
+        let localappdata_s = localappdata.display().to_string();
+
+        let id = "xuepoo.winenv";
+        let source = write_store_plugin(&dir, id, "1.0.0", "return \"ok\"\n");
+        let context = PluginContext {
+            appdata: Some(&appdata_s),
+            localappdata: Some(&localappdata_s),
+            ..PluginContext::default()
+        };
+
+        let run_ctx = |raw: &[&str]| -> (i32, String) {
+            let owned: Vec<String> = raw.iter().map(|token| (*token).to_string()).collect();
+            let mut input = Cursor::new(Vec::<u8>::new());
+            let mut output = Vec::new();
+            let code = run_plugin_subcommand(&owned, &context, &mut input, &mut output);
+            (code, String::from_utf8(output).expect("utf-8"))
+        };
+
+        // Install a local package and a bundled plugin without XDG_CONFIG_HOME,
+        // XDG_DATA_HOME, or HOME: store package writes to
+        // %LOCALAPPDATA%\bitty\plugins and bundled ledger writes to
+        // %APPDATA%\bitty\bitty-plugins.lua.
+        let src_s = source.display().to_string();
+        let (code, out) = run_ctx(&["install", &src_s, "--yes"]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            localappdata
+                .join("bitty")
+                .join("plugins")
+                .join("packages")
+                .join(id)
+                .exists(),
+            "store package written under %LOCALAPPDATA%"
+        );
+
+        let (code, out) = run_ctx(&["install", "bitty-terminal.shell-integration", "--yes"]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            appdata.join("bitty").join(STATE_FILE_NAME).exists(),
+            "managed ledger written under %APPDATA%"
+        );
+
+        let (code, out) = run_ctx(&["list", "--format", "json"]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains(id), "{out}");
+
+        // `explain` reads %APPDATA%\bitty\capabilities.conf when present.
+        let cap_policy = appdata.join("bitty").join("capabilities.conf");
+        std::fs::write(&cap_policy, "allow terminal.semantic-read\n").expect("policy");
+        let (code, out) = run_ctx(&[
+            "explain",
+            "bitty-terminal.shell-integration",
+            "terminal.semantic-read",
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.contains("capabilities.conf") && out.contains("\"decision\":\"allow\""),
+            "explain should allow via %APPDATA% user policy: {out}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

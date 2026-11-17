@@ -128,10 +128,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bitty_runtime::component::{
     ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_DESCRIPTOR_MAX_BYTES,
     COMPONENT_EXECUTABLE_MAX_BYTES, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
-    ComponentSummary, component_search_roots_for, component_state_root_for, data_home_for,
-    discover_components, executable_file_name, incompatible_component_hint,
-    read_component_activation_with_state, remove_activation_artifacts, seam_for,
-    validate_component_name,
+    ComponentSummary, component_search_roots_for, component_state_root_for,
+    data_home_with_platform_env, discover_components, executable_file_name,
+    incompatible_component_hint, read_component_activation_with_state, remove_activation_artifacts,
+    seam_for, validate_component_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1038,10 @@ pub struct ComponentContext<'a> {
     pub xdg_data_home: Option<&'a str>,
     /// `HOME` environment value (fallback data-home parent).
     pub home: Option<&'a str>,
+    /// Windows `LOCALAPPDATA` environment value (user data-home parent).
+    pub localappdata: Option<&'a str>,
+    /// Windows `APPDATA` environment value (last-resort data-home parent).
+    pub appdata: Option<&'a str>,
     /// `BITTY_COMPONENTS_DIR` override (tests; wins over XDG).
     pub components_dir: Option<&'a str>,
     /// `BITTY_SYSTEM_COMPONENTS_DIR` override (tests; default is the
@@ -1055,6 +1059,8 @@ pub struct ComponentContext<'a> {
     /// Pre-word `--no-color`.
     pub pre_no_color: bool,
 }
+
+const NO_USER_EXTENSION_ROOT_MESSAGE: &str = "bitty extension: no user extension root (data directory unavailable; set $XDG_DATA_HOME, %LOCALAPPDATA%, $HOME, or %APPDATA%)";
 
 /// One dispatch failure with its stable exit code.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1179,7 +1185,12 @@ pub fn run_component_subcommand(
         }
     };
 
-    let data_home = data_home_for(context.xdg_data_home, context.home);
+    let data_home = data_home_with_platform_env(
+        context.xdg_data_home,
+        context.home,
+        context.localappdata,
+        context.appdata,
+    );
     let (user_root, system_root) = component_search_roots_for(
         context.components_dir,
         data_home.as_deref(),
@@ -1620,7 +1631,7 @@ fn op_add(
     }
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty extension: no user extension root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            NO_USER_EXTENSION_ROOT_MESSAGE.to_string(),
         ));
     };
     let staged = load_staged_source(source, version_flag)?;
@@ -1859,7 +1870,7 @@ fn op_install(
 ) -> Result<String, ComponentFailure> {
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty extension: no user extension root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            NO_USER_EXTENSION_ROOT_MESSAGE.to_string(),
         ));
     };
     // Validate name/version before probing the host: hostile input is a
@@ -2693,7 +2704,7 @@ fn op_remove(
     }
     let Some(user) = user_root else {
         return Err(ComponentFailure::component(
-            "bitty extension: no user extension root (data directory unavailable; set $XDG_DATA_HOME or $HOME)".to_string(),
+            NO_USER_EXTENSION_ROOT_MESSAGE.to_string(),
         ));
     };
     let component_dir = user.join(name);
@@ -3219,6 +3230,7 @@ mod tests {
                 wsl_distro_env: None,
                 pre_format: None,
                 pre_no_color: false,
+                ..ComponentContext::default()
             },
             user.to_owned(),
             system.to_owned(),
@@ -3725,6 +3737,7 @@ mod tests {
             wsl_distro_env: Some("Ubuntu"),
             pre_format: None,
             pre_no_color: false,
+            ..ComponentContext::default()
         };
         let (code, _) = run_with(&env_context, &["install", "net", "--version", "0.0.23"]);
         assert_eq!(code, EXIT_USAGE);
@@ -6139,6 +6152,34 @@ mod tests {
             "external target must stay intact after refused version remove"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn component_dispatch_resolves_localappdata_when_xdg_and_home_unset() {
+        let base = scratch("win-localappdata");
+        let local = base.join("local");
+        let system = base.join("system");
+        let staging = write_source_dir(&base.join("staging"), "net", "0.0.1", "[1, 1]");
+        std::fs::create_dir_all(&local).expect("local");
+        let local_s = local.to_string_lossy().into_owned();
+        let system_s = system.to_string_lossy().into_owned();
+        let context = ComponentContext {
+            localappdata: Some(&local_s),
+            system_components_dir: Some(&system_s),
+            ..ComponentContext::default()
+        };
+        let (code, out) = run_with(&context, &["add", &staging.to_string_lossy()]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            local
+                .join("bitty")
+                .join("extensions")
+                .join("net")
+                .join("0.0.1")
+                .is_dir(),
+            "extension staged under %LOCALAPPDATA%\\bitty\\extensions"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

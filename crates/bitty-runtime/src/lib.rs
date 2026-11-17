@@ -247,7 +247,7 @@ pub use ai_request::{
     MAX_METADATA_SNAPSHOT_BYTES, MAX_METADATA_VERSION_BYTES, MetadataError, MetadataExtension,
     MetadataSyncError, SNAPSHOT_VERSION_INITIAL, ServiceMetadata, SnapshotSyncState,
 };
-pub use component::data_home_for;
+pub use component::{data_home_for, data_home_with_platform_env};
 pub use config::{
     BACKGROUND_FITS, ChromeStyle, CloseConfirmMode, DEFAULT_BACKGROUND_FIT,
     DEFAULT_FLOATING_SIZE_RATIO, DEFAULT_STYLE_FADE_UNFOCUSED, DEFAULT_STYLE_GLOW_WIDTH,

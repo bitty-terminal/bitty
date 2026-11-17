@@ -106,15 +106,10 @@ fn install_via_add(root: &Path, name: &str, executable: &Path, mode: &str) {
     let components_dir = root.to_string_lossy().into_owned();
     let system_dir = root.join("system").to_string_lossy().into_owned();
     let context = ComponentContext {
-        xdg_data_home: None,
-        home: None,
         components_dir: Some(&components_dir),
         system_components_dir: Some(&system_dir),
-        xdg_state_home: None,
-        component_state_dir: None,
-        wsl_distro_env: None,
-        pre_format: None,
         pre_no_color: true,
+        ..ComponentContext::default()
     };
     let mut input = std::io::Cursor::new(Vec::<u8>::new());
     let mut output = Vec::new();

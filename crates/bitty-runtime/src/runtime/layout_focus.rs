@@ -1807,7 +1807,9 @@ impl Runtime {
             // never hides behind sticky chrome. Bounds come from the slot's
             // resolved geometry (global `floating` defaults + per-scratchpad
             // overrides) with the same depth cascade and container clamp the
-            // pin/float stores use, so stacked scratchpads stay clickable.
+            // pin/float stores use. `present_cell_in` resolves this same order
+            // topmost-first, so a scratchpad is clickable wherever it overlaps
+            // a pin or detached float.
             for (depth, entry) in self
                 .scratchpads
                 .visible_entries()
@@ -2321,13 +2323,15 @@ impl Runtime {
         // visible overlay, not the base leaf painted beneath it.
         //
         // CTX-1164 (#1992): among stacked `Float`-tier frames the winner is
-        // topmost-painted-first per the present composite order — window-global
-        // pins in reverse pin order (pinned-above-float precedent), then
-        // workspace-detached floats in reverse paint order — not merely the
-        // last frame in the slice. The slice order already matches today, so
-        // this pins the invariant explicitly instead of relying on it; unknown
-        // ids fall back to slice order and empty frames never win (fail-closed,
-        // no new authority: only frames already containing the point compete).
+        // topmost-painted-first per the present composite order — shown
+        // scratchpads in reverse paint order (issue #3205: they composite
+        // after every other `Float` layer), then window-global pins in reverse
+        // pin order (pinned-above-float precedent), then workspace-detached
+        // floats in reverse paint order — not merely the last frame in the
+        // slice. The slice order already matches today, so this pins the
+        // invariant explicitly instead of relying on it; unknown ids fall back
+        // to slice order and empty frames never win (fail-closed, no new
+        // authority: only frames already containing the point compete).
         let containing: Vec<&PresentFrame> = frames
             .iter()
             .rev()
@@ -2348,26 +2352,46 @@ impl Runtime {
                 .copied()
                 .filter(|frame| frame.tier == Some(OverlayTier::Float))
                 .collect();
-            let pinned_order = self.pinned.ids();
-            let mut hit = None;
-            for id in pinned_order.iter().rev() {
-                if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
-                    hit = Some(*found);
+            // Issue #3205: a shown scratchpad is painted after the pin and
+            // detached-float layers, so it is the topmost `Float` the pointer
+            // can land on. Resolving it first keeps the pick order equal to
+            // the paint order; without this a scratchpad would be unclickable
+            // wherever a pin or float overlaps it, which is the default
+            // geometry for all three tiers.
+            let mut scratchpad_hit = None;
+            for entry in self.scratchpads.visible_entries().iter().rev() {
+                if let Some(found) = top_floats
+                    .iter()
+                    .find(|frame| frame.view == entry.view_id())
+                {
+                    scratchpad_hit = Some(*found);
                     break;
                 }
             }
-            if let Some(pinned) = hit {
-                pinned
+            if let Some(shown) = scratchpad_hit {
+                shown
             } else {
-                let float_order = self.floats.paint_ids();
-                let mut detached = None;
-                for id in float_order.iter().rev() {
+                let pinned_order = self.pinned.ids();
+                let mut hit = None;
+                for id in pinned_order.iter().rev() {
                     if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
-                        detached = Some(*found);
+                        hit = Some(*found);
                         break;
                     }
                 }
-                detached.unwrap_or(first)
+                if let Some(pinned) = hit {
+                    pinned
+                } else {
+                    let float_order = self.floats.paint_ids();
+                    let mut detached = None;
+                    for id in float_order.iter().rev() {
+                        if let Some(found) = top_floats.iter().find(|frame| frame.view == *id) {
+                            detached = Some(*found);
+                            break;
+                        }
+                    }
+                    detached.unwrap_or(first)
+                }
             }
         } else {
             first

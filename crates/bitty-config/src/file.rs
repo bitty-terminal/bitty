@@ -8333,17 +8333,33 @@ return {
 
     #[test]
     fn scratchpads_parse_merge_and_validate_issue_3205() {
+        // `cwd` must be an absolute path for the parser *and* the validator,
+        // and the literal has to be platform-independent: a root-only POSIX
+        // path such as "/tmp" has no prefix on Windows, so `is_absolute()` is
+        // false there and the parse fails. Build the fixture from the platform
+        // temp dir with forward slashes, which is the separator a Lua string
+        // literal can carry (a backslash would start an escape).
+        let absolute_cwd = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+        assert!(
+            std::path::Path::new(&absolute_cwd).is_absolute(),
+            "the fixture cwd must be absolute on this platform: {absolute_cwd}"
+        );
+        assert!(
+            !absolute_cwd.contains(['"', '\\']),
+            "the fixture cwd must be expressible as a Lua string: {absolute_cwd}"
+        );
         let lua = r##"
 return {
     scratchpads = {
-        default = { cmd = "btop", args = { "--utf-force" }, cwd = "/tmp", width = 0.6, background_opacity = 0.9 },
+        default = { cmd = "btop", args = { "--utf-force" }, cwd = "@CWD@", width = 0.6, background_opacity = 0.9 },
         files = { command = "bitty-terminal.file-manager:open", height = 0.4, centered = false, x = 0.1 },
         manual = { width = 0.5 },
     },
 }
-"##;
+"##
+        .replace("@CWD@", &absolute_cwd);
         let source = ConfigSource::new(LayerKind::User, Some("scratchpads.lua"));
-        let plan = parse_lua_config(lua, &source).expect("valid scratchpads");
+        let plan = parse_lua_config(&lua, &source).expect("valid scratchpads");
         let entries = plan.scratchpads.as_ref().expect("scratchpads present");
         assert_eq!(entries.len(), 3);
         let default = entries
@@ -8352,7 +8368,7 @@ return {
             .expect("default slot");
         assert_eq!(default.cmd.as_deref(), Some("btop"));
         assert_eq!(default.args, vec!["--utf-force".to_string()]);
-        assert_eq!(default.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(default.cwd.as_deref(), Some(absolute_cwd.as_str()));
         assert_eq!(default.width, Some(0.6));
         assert_eq!(default.background_opacity, Some(0.9));
         assert!(default.command.is_none());

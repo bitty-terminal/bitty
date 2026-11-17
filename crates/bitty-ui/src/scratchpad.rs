@@ -58,26 +58,11 @@ pub const MAX_SCRATCHPAD_NAME_LEN: usize = 32;
 /// `<owner>.<name>:<command>` grammar (see
 /// [`QualifiedCommand`](crate::panel::QualifiedCommand)). Retained for the
 /// existing `command:bitty.workspace:scratchpad-toggle` binding; it is the
-/// [`DEFAULT_SCRATCHPAD`] slot without a name suffix.
+/// [`DEFAULT_SCRATCHPAD`] slot without a name suffix. Named slots are reached
+/// through the keymap action grammar (`toggle_scratchpad:<name>`,
+/// `move_to_scratchpad:<name>`, `scratchpad_to_tiled:<name>`), which is the
+/// only surface `bitty-terminal` routes.
 pub const SCRATCHPAD_CMD_TOGGLE: &str = "bitty.workspace:scratchpad-toggle";
-
-/// Workspace command prefix toggling a named scratchpad slot
-/// (`bitty.workspace:scratchpad-toggle:<name>`).
-pub const SCRATCHPAD_CMD_TOGGLE_NAMED: &str = "bitty.workspace:scratchpad-toggle:";
-
-/// Workspace command moving the focused panel into a scratchpad slot and
-/// showing it (`bitty.workspace:scratchpad-move[:<name>]`).
-pub const SCRATCHPAD_CMD_MOVE: &str = "bitty.workspace:scratchpad-move";
-
-/// Workspace command prefix moving the focused panel into a named slot.
-pub const SCRATCHPAD_CMD_MOVE_NAMED: &str = "bitty.workspace:scratchpad-move:";
-
-/// Workspace command returning a scratchpad entry to the tiling
-/// (`bitty.workspace:scratchpad-to-tiled[:<name>]`).
-pub const SCRATCHPAD_CMD_TO_TILED: &str = "bitty.workspace:scratchpad-to-tiled";
-
-/// Workspace command prefix returning a named entry to the tiling.
-pub const SCRATCHPAD_CMD_TO_TILED_NAMED: &str = "bitty.workspace:scratchpad-to-tiled:";
 
 /// Per-scratchpad size/position overrides, resolved against the global
 /// `floating` config by the caller (`bitty-runtime`).
@@ -112,41 +97,6 @@ impl Default for ScratchpadGeometry {
             x: None,
             y: None,
             background_opacity: None,
-        }
-    }
-}
-
-/// One parsed scratchpad workspace command.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ScratchpadCommand {
-    /// Toggle visibility of `name` (park the target when the slot is empty).
-    Toggle(String),
-    /// Move the focused panel into `name`, or restore its visible entry to
-    /// the tiling.
-    Move(String),
-    /// Return `name`'s entry to the tiling.
-    ToTiled(String),
-}
-
-impl ScratchpadCommand {
-    /// Parses `bitty.workspace:scratchpad-*` commands. Returns `None` for
-    /// every other command (unknown commands never touch a slot).
-    #[must_use]
-    pub fn parse(command: &str) -> Option<Self> {
-        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_TOGGLE_NAMED) {
-            return is_valid_scratchpad_name(rest).then(|| Self::Toggle(rest.to_string()));
-        }
-        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_MOVE_NAMED) {
-            return is_valid_scratchpad_name(rest).then(|| Self::Move(rest.to_string()));
-        }
-        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_TO_TILED_NAMED) {
-            return is_valid_scratchpad_name(rest).then(|| Self::ToTiled(rest.to_string()));
-        }
-        match command {
-            SCRATCHPAD_CMD_TOGGLE => Some(Self::Toggle(DEFAULT_SCRATCHPAD.to_string())),
-            SCRATCHPAD_CMD_MOVE => Some(Self::Move(DEFAULT_SCRATCHPAD.to_string())),
-            SCRATCHPAD_CMD_TO_TILED => Some(Self::ToTiled(DEFAULT_SCRATCHPAD.to_string())),
-            _ => None,
         }
     }
 }
@@ -660,48 +610,6 @@ impl Scratchpads {
     }
 }
 
-/// Applies a parsed scratchpad [`ScratchpadCommand`] to `store`/`tree`.
-///
-/// `target` is the focused leaf the `Move`/`Toggle` verb parks when the slot
-/// is empty. Returns the affected entry id and, for hide/show transitions,
-/// whether it is now visible (`None` when the command moved it to the tiling
-/// or parked it).
-pub fn apply_scratchpad_command(
-    store: &mut Scratchpads,
-    tree: &mut LayoutNode,
-    command: &ScratchpadCommand,
-    target: Option<ViewId>,
-    geometry: ScratchpadGeometry,
-) -> Result<Option<(ViewId, bool)>, ScratchpadError> {
-    match command {
-        ScratchpadCommand::Toggle(name) => {
-            if store.contains_name(name) {
-                store.toggle_visibility(name).map(Some)
-            } else {
-                let id = target.ok_or(ScratchpadError::Vacant(name.clone()))?;
-                store
-                    .park(name, tree, id, geometry)
-                    .map(|id| Some((id, true)))
-            }
-        }
-        ScratchpadCommand::Move(name) => {
-            if let Some(entry) = store.entry(name) {
-                if entry.visible {
-                    store.to_tiled(name, tree).map(|_| None)
-                } else {
-                    store.show(name).map(|id| Some((id, true)))
-                }
-            } else {
-                let id = target.ok_or(ScratchpadError::Vacant(name.clone()))?;
-                store
-                    .park(name, tree, id, geometry)
-                    .map(|id| Some((id, true)))
-            }
-        }
-        ScratchpadCommand::ToTiled(name) => store.to_tiled(name, tree).map(|_| None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,115 +932,41 @@ mod tests {
     }
 
     #[test]
-    fn command_grammar_and_apply_toggle_hide_show() {
-        assert_eq!(
-            ScratchpadCommand::parse(SCRATCHPAD_CMD_TOGGLE),
-            Some(ScratchpadCommand::Toggle(DEFAULT_SCRATCHPAD.to_string()))
-        );
-        assert_eq!(
-            ScratchpadCommand::parse("bitty.workspace:scratchpad-toggle:logs"),
-            Some(ScratchpadCommand::Toggle("logs".to_string()))
-        );
-        assert_eq!(
-            ScratchpadCommand::parse("bitty.workspace:scratchpad-move"),
-            Some(ScratchpadCommand::Move(DEFAULT_SCRATCHPAD.to_string()))
-        );
-        assert_eq!(
-            ScratchpadCommand::parse("bitty.workspace:scratchpad-to-tiled:logs"),
-            Some(ScratchpadCommand::ToTiled("logs".to_string()))
-        );
-        assert_eq!(ScratchpadCommand::parse("bitty.workspace:nope"), None);
-        assert_eq!(
-            ScratchpadCommand::parse("bitty.workspace:scratchpad-toggle:Bad Name"),
-            None,
-            "invalid slot names never parse"
-        );
-
+    fn toggle_visibility_hides_then_shows_the_same_entry() {
         let mut tree = pair();
         let mut store = Scratchpads::new();
-        let toggle = ScratchpadCommand::parse(SCRATCHPAD_CMD_TOGGLE).expect("parse");
-        assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
+        let id = store
+            .park(
+                DEFAULT_SCRATCHPAD,
                 &mut tree,
-                &toggle,
-                Some(ViewId::new(1)),
-                ScratchpadGeometry::default()
-            ),
-            Ok(Some((ViewId::new(1), true)))
-        );
+                ViewId::new(1),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park leaf 1");
         assert!(store.is_visible(DEFAULT_SCRATCHPAD));
         assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
-                &mut tree,
-                &toggle,
-                Some(ViewId::new(2)),
-                ScratchpadGeometry::default()
-            ),
-            Ok(Some((ViewId::new(1), false))),
-            "toggle hides the shown entry and ignores the target"
+            store.toggle_visibility(DEFAULT_SCRATCHPAD),
+            Ok((id, false)),
+            "a visible entry is hidden, not dropped"
         );
         assert!(!store.is_visible(DEFAULT_SCRATCHPAD));
-        assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
-                &mut tree,
-                &toggle,
-                None,
-                ScratchpadGeometry::default()
-            ),
-            Ok(Some((ViewId::new(1), true)))
+        assert!(
+            store.contains_name(DEFAULT_SCRATCHPAD),
+            "the slot keeps the entry"
         );
-
-        let to_tiled = ScratchpadCommand::parse(SCRATCHPAD_CMD_TO_TILED).expect("parse");
         assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
-                &mut tree,
-                &to_tiled,
-                None,
-                ScratchpadGeometry::default()
-            ),
-            Ok(None)
+            store.toggle_visibility(DEFAULT_SCRATCHPAD),
+            Ok((id, true)),
+            "the same entry comes back"
         );
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
-    }
-
-    #[test]
-    fn move_command_parks_then_restores_visible_entry_to_tiled() {
-        let mut tree = pair();
-        let mut store = Scratchpads::new();
-        let mv = ScratchpadCommand::parse("bitty.workspace:scratchpad-move:notes").expect("parse");
-        assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
-                &mut tree,
-                &mv,
-                Some(ViewId::new(2)),
-                ScratchpadGeometry::default()
-            ),
-            Ok(Some((ViewId::new(2), true)))
-        );
-        assert!(store.is_visible("notes"));
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1)]);
-
-        // The second Move restores the visible panel to the tiling.
-        assert_eq!(
-            apply_scratchpad_command(
-                &mut store,
-                &mut tree,
-                &mv,
-                Some(ViewId::new(1)),
-                ScratchpadGeometry::default()
-            ),
-            Ok(None)
-        );
-        assert!(store.is_empty());
+        assert!(store.is_visible(DEFAULT_SCRATCHPAD));
+        assert_eq!(store.to_tiled(DEFAULT_SCRATCHPAD, &mut tree), Ok(id));
         assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
         assert_eq!(
-            tree.find_leaf(ViewId::new(2)).expect("leaf").presentation(),
-            PresentationMode::Tiled
+            tree.find_leaf(ViewId::new(1)).expect("leaf").presentation(),
+            PresentationMode::Tiled,
+            "to_tiled stamps the restored leaf"
         );
+        assert!(store.is_empty(), "to_tiled empties the slot");
     }
 }

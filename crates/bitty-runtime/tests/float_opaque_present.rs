@@ -11,7 +11,7 @@
 //! - the three-pane owner layout (float third) shows no bleed-through.
 
 use bitty_runtime::{
-    LayoutNode, OverlayTier, PresentFrame, Runtime, SplitAxis, UiRect, View, ViewId,
+    LayoutNode, OverlayTier, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
 };
 
 const THEME_BG: [u8; 4] = [0x1E, 0x1E, 0x2E, 0xFF];
@@ -209,4 +209,99 @@ fn three_pane_float_third_has_no_bleed_through() {
     }
     assert_eq!(bleed, 0, "no tiled red may show through the detached third");
     assert!(opaque > 0, "float frame carries opaque theme background");
+}
+
+/// Backdrop colour used only by the per-slot opacity test, so "the theme
+/// background" and "the float's own backdrop" are distinguishable pixels.
+const FLOAT_BG: [u8; 4] = [0xF3, 0x8B, 0xA8, 0xFF];
+
+fn single_pane() -> LayoutNode {
+    LayoutNode::leaf(View::new(ViewId::new(1), 80, 24))
+}
+
+fn scratchpad_spec(name: &str, opacity: f32) -> bitty_runtime::ScratchpadSpec {
+    bitty_runtime::ScratchpadSpec {
+        name: name.to_string(),
+        spawn: None,
+        geometry: bitty_ui::ScratchpadGeometry {
+            width: 0.6,
+            height: 0.6,
+            centered: true,
+            x: None,
+            y: None,
+            background_opacity: Some(opacity),
+        },
+    }
+}
+
+/// Inset-band pixel of `view`'s frame: inside the float backdrop, outside every
+/// cell fill, so the pixel is the backdrop composited over the tiled base.
+fn band_point(rt: &Runtime, view: ViewId) -> (u32, u32) {
+    let frame = frame_of(rt, view);
+    assert!(frame.frame.width > 20 && frame.frame.height > 10);
+    let pad = rt.window_padding_physical();
+    let x = pad
+        .saturating_add(frame.frame.x.max(0) as u32)
+        .saturating_add(frame.frame.width / 2);
+    let y = pad
+        .saturating_add(frame.frame.y.max(0) as u32)
+        .saturating_add(2);
+    (x, y)
+}
+
+#[test]
+fn scratchpad_per_slot_background_opacity_reaches_the_composite() {
+    // Issue #3205 review: the per-slot `background_opacity` is the only
+    // production hunk of the scratchpad patch that nothing rendered. It
+    // resolves into the float backdrop's alpha in the present path, so assert
+    // the produced frame, not the resolved spec float: a fully transparent
+    // slot must show the tiled base through its band, an opaque slot must
+    // paint the configured float backdrop there.
+    let mut cfg = RuntimeConfig::default();
+    cfg.floating.background = Some(FLOAT_BG);
+    cfg.animations.enabled = false;
+    let mut rt = Runtime::with_deterministic_rasterizer(cfg).expect("runtime must build");
+    install(&mut rt, single_pane());
+    rt.tick().expect("tiled baseline must present");
+
+    assert!(
+        rt.set_scratchpad_specs(vec![scratchpad_spec("clear", 0.0)]),
+        "the transparent spec validates"
+    );
+    rt.scratchpad_adopt("clear", View::new(ViewId::new(9), 80, 24))
+        .expect("the empty slot adopts the panel");
+    assert!(rt.scratchpad_visible("clear"));
+    assert_eq!(
+        frame_of(&rt, ViewId::new(9)).tier,
+        Some(OverlayTier::Float),
+        "a shown scratchpad presents as a float overlay"
+    );
+    rt.tick().expect("the transparent scratchpad must present");
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let extent = rt.surface_extent().expect("extent");
+    let width = extent.width();
+    let (x, y) = band_point(&rt, ViewId::new(9));
+    assert!(
+        x + 1 < width && y + 1 < extent.height(),
+        "the band probe stays inside the window"
+    );
+    assert_eq!(
+        pixel(&rgba, width, x, y),
+        THEME_BG,
+        "per-slot opacity 0.0 must not paint the float backdrop"
+    );
+
+    // Same geometry, opaque slot: the backdrop is the configured float colour.
+    assert!(rt.scratchpad_discard("clear"), "the slot is discarded");
+    assert!(rt.set_scratchpad_specs(vec![scratchpad_spec("solid", 1.0)]));
+    rt.scratchpad_adopt("solid", View::new(ViewId::new(9), 80, 24))
+        .expect("the empty slot adopts the panel on the second pass");
+    rt.tick().expect("the opaque scratchpad must present");
+    let rgba = rt.headless_rgba().expect("rgba after tick");
+    let (x, y) = band_point(&rt, ViewId::new(9));
+    assert_eq!(
+        pixel(&rgba, width, x, y),
+        FLOAT_BG,
+        "per-slot opacity 1.0 paints the float backdrop at full alpha"
+    );
 }

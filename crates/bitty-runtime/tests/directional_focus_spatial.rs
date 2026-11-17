@@ -621,14 +621,26 @@ fn empty_layout_directional_focus_is_a_noop() {
 fn hidden_scratchpad_is_not_a_directional_target() {
     let mut rt = make_runtime();
     install(&mut rt, l_shape());
+    // Issue #3205 redefined parking: `scratchpad_hide` detaches the leaf into
+    // the default slot and *shows* it as a cross-workspace float, so a hidden
+    // slot needs the toggle that flips visibility.
     rt.scratchpad_hide(ViewId::new(3))
         .expect("hiding the bottom-right pane leaves two live panes");
     assert_eq!(rt.layout().leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+    assert_eq!(
+        rt.scratchpad_toggle(None).expect("hide the shown slot"),
+        None,
+        "the toggle hides the parked slot"
+    );
+    assert!(
+        !rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD),
+        "the slot is hidden, not dropped"
+    );
     assert!(
         !rt.present_frames()
             .iter()
             .any(|frame| frame.view == ViewId::new(3)),
-        "a parked scratchpad pane paints nothing"
+        "a hidden scratchpad pane paints nothing"
     );
     assert_eq!(
         move_from(&mut rt, 2, FocusDirection::Down),
@@ -639,10 +651,10 @@ fn hidden_scratchpad_is_not_a_directional_target() {
         rt.scratchpad_show().expect("show the parked pane"),
         ViewId::new(3)
     );
-    assert_eq!(
-        move_from(&mut rt, 3, FocusDirection::Left),
-        Some(ViewId::new(2)),
-        "the restored pane participates in geometry again"
+    assert!(
+        move_from(&mut rt, 3, FocusDirection::Left).is_some(),
+        "the shown pane participates in geometry again (as the centered float, \
+         not its old tile slot)"
     );
 }
 

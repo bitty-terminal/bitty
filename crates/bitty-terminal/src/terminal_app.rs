@@ -905,6 +905,18 @@ impl EventTracker {
     }
 }
 
+/// One armed plugin-backed scratchpad launch (issue #3205): the slot that will
+/// adopt the next materialized plugin panel, plus the qualified command whose
+/// dispatch armed it. The command is what lets a refusal clear exactly this
+/// latch instead of leaving it armed for an unrelated panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPluginScratchpad {
+    /// Scratchpad slot that adopts the panel this launch creates.
+    pub(crate) slot: String,
+    /// Qualified `<owner:command>` the launch dispatched.
+    pub(crate) command: String,
+}
+
 /// `AppModifiers` lives in [`crate::chrome_keys`] (CTX-0233 pure move).
 /// The Correct Terminal handler: owns `Runtime`, an optional window, and the
 /// real PTY pump via `Runtime::poll_pty` (plus an opt-in synthetic demo pump
@@ -938,11 +950,14 @@ pub(crate) struct TerminalApp {
     pub(crate) pending_new_windows: usize,
     /// Scratchpad slot waiting for a GUI plugin panel (issue #3205).
     ///
-    /// Set when a plugin-backed scratchpad is triggered; the next
-    /// `bitty.panel.create` materialization adopts its leaf into this slot
-    /// instead of splitting the focused pane. Cleared on adoption or on a
-    /// dispatch refusal so it can never leak into an unrelated panel.
-    pub(crate) pending_plugin_scratchpad: Option<String>,
+    /// Armed when a plugin-backed scratchpad launch is accepted on the bounded
+    /// input queue; the next `bitty.panel.create` materialization adopts its
+    /// leaf into [`PendingPluginScratchpad::slot`] instead of splitting the
+    /// focused pane. The armed command travels with it so the dispatch that
+    /// the queue promised can clear it on a refusal: a launch that was refused
+    /// (no plugin VM, undeclared command, callee error, bad args payload) never
+    /// carries over to the next unrelated plugin panel.
+    pub(crate) pending_plugin_scratchpad: Option<PendingPluginScratchpad>,
     /// Secondary windows whose first surface attach was deferred because the
     /// OS window reported no size yet (bitty#1765, slice 2).
     ///
@@ -3792,9 +3807,12 @@ impl TerminalApp {
     /// payload bound on `command:<owner:command>` targets and
     /// [`INPUT_COMMAND_QUEUE_CAPACITY`] on the queue; overflow and oversize
     /// targets drop the newest request with one attributed diagnostic and a
-    /// counter, never a silent drop. The queued action is re-run by
+    /// counter, never a silent drop. Returns `true` only when this exact
+    /// action was queued, so a caller that latches state for the queued work
+    /// (issue #3205 scratchpad adoption) arms it on acceptance instead of
+    /// comparing the queue tail. The queued action is re-run by
     /// [`Self::pump_cold_commands`], so no authority is captured here.
-    pub(crate) fn enqueue_input_command(&mut self, action: bitty_config::ChromeAction) {
+    pub(crate) fn enqueue_input_command(&mut self, action: bitty_config::ChromeAction) -> bool {
         if let bitty_config::ChromeAction::InvokeCommand(invocation) = &action {
             if invocation.target().len() > bitty_config::keymap::MAX_INVOKE_COMMAND_LEN {
                 self.pending_input_commands_dropped =
@@ -3806,7 +3824,7 @@ impl TerminalApp {
                         bitty_config::keymap::MAX_INVOKE_COMMAND_LEN
                     )
                 });
-                return;
+                return false;
             }
         }
         if self.pending_input_commands.len() >= INPUT_COMMAND_QUEUE_CAPACITY {
@@ -3820,9 +3838,10 @@ impl TerminalApp {
                     self.pending_input_commands_dropped
                 )
             });
-            return;
+            return false;
         }
         self.pending_input_commands.push_back(action);
+        true
     }
 
     /// Resumes commands parked at the RC-1 wall budget on the cold phase

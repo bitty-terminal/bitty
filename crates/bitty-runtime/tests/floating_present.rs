@@ -940,3 +940,80 @@ fn stacked_floats_pin_stays_above_detached() {
     );
     rt.handle_mouse_input(release(MouseButton::Left));
 }
+
+#[test]
+fn stacked_floats_shown_scratchpad_is_clickable_over_a_pin() {
+    // Issue #3205: a shown scratchpad composites after every other `Float`
+    // layer, so the pointer must resolve it first. Before the pick-order fix
+    // the hit test ranked pins ahead of everything else and a click on the
+    // scratchpad's centre focused the pin underneath it — the default
+    // geometry for both tiers is a centered 80% float, so the whole surface
+    // was unclickable.
+    let mut rt = Runtime::new(RuntimeConfig {
+        focus_follows_mouse: false,
+        ..RuntimeConfig::default()
+    })
+    .expect("opt-out runtime must build");
+    install(&mut rt, four_pane());
+    rt.float_detach(ViewId::new(1)).expect("detach must apply");
+    rt.pin_floating(ViewId::new(2)).expect("pin must apply");
+    assert!(
+        rt.set_scratchpad_specs(vec![bitty_runtime::ScratchpadSpec {
+            name: String::from("logs"),
+            spawn: None,
+            // Smaller than the pin so a pin-only strip survives the overlap.
+            geometry: bitty_ui::ScratchpadGeometry {
+                width: 0.5,
+                height: 0.5,
+                centered: true,
+                x: None,
+                y: None,
+                background_opacity: None,
+            },
+        }]),
+        "the scratchpad spec validates"
+    );
+    let slot = ViewId::new(9);
+    rt.scratchpad_adopt("logs", View::new(slot, 80, 24))
+        .expect("empty slot adopts the panel");
+    assert!(rt.scratchpad_visible("logs"));
+
+    let order: Vec<ViewId> = rt.present_frames().iter().map(|frame| frame.view).collect();
+    assert_eq!(
+        order,
+        vec![
+            ViewId::new(3),
+            ViewId::new(4),
+            ViewId::new(1),
+            ViewId::new(2),
+            slot
+        ],
+        "paint order: tiled base, detached float, pin, then the scratchpad"
+    );
+
+    // Focus something else first so the click has to move focus.
+    assert!(rt.set_focus(ViewId::new(4)));
+    let centre = frame_point(&rt, slot, 0.5, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(centre).map(|(view, _)| view),
+        Some(slot),
+        "the overlapping scratchpad wins the hit test over the pin beneath it"
+    );
+    rt.handle_cursor_moved(centre);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_eq!(
+        rt.focused_view(),
+        Some(slot),
+        "clicking the scratchpad centre focuses the scratchpad, not the pin"
+    );
+    rt.handle_mouse_input(release(MouseButton::Left));
+
+    // The pin still owns a strip the smaller scratchpad does not cover, so the
+    // new pick order did not swallow the sticky tier wholesale.
+    let pin_only = frame_point(&rt, ViewId::new(2), 0.05, 0.5);
+    assert_eq!(
+        rt.cursor_to_present_cell(pin_only).map(|(view, _)| view),
+        Some(ViewId::new(2)),
+        "a pin-only strip still resolves to the pin"
+    );
+}

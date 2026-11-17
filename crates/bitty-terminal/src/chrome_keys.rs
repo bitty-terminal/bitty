@@ -1273,13 +1273,15 @@ impl TerminalApp {
                 let action = bitty_config::ChromeAction::InvokeCommand(
                     bitty_config::CommandInvocation::new(command.clone()),
                 );
-                self.enqueue_input_command(action.clone());
-                if self
-                    .pending_input_commands
-                    .back()
-                    .is_some_and(|queued| *queued == action)
-                {
-                    self.pending_plugin_scratchpad = Some(name.clone());
+                if self.enqueue_input_command(action) {
+                    // The latch carries the launched command, so the dispatch
+                    // that the queue promised can clear it on a refusal
+                    // instead of adopting the next unrelated panel.
+                    self.pending_plugin_scratchpad =
+                        Some(crate::terminal_app::PendingPluginScratchpad {
+                            slot: name.clone(),
+                            command: command.clone(),
+                        });
                     eprintln!("bitty: keymap {label} -> slot '{name}' launching {command}");
                 } else {
                     eprintln!(
@@ -1287,6 +1289,29 @@ impl TerminalApp {
                     );
                 }
             }
+        }
+    }
+
+    /// Clears the armed scratchpad adoption latch when `qualified` is the
+    /// command it was waiting for (issue #3205 review).
+    ///
+    /// `pending_plugin_scratchpad` is consumed by the next panel
+    /// materialization, but a refused dispatch produces no panel: leaving it
+    /// armed would adopt the next *unrelated* plugin panel into the slot. The
+    /// latch travels with the qualified command for exactly this comparison.
+    fn clear_pending_scratchpad_launch(&mut self, qualified: &str) {
+        let armed = self
+            .pending_plugin_scratchpad
+            .as_ref()
+            .is_some_and(|pending| pending.command == qualified);
+        if !armed {
+            return;
+        }
+        if let Some(pending) = self.pending_plugin_scratchpad.take() {
+            let slot = pending.slot;
+            eprintln!(
+                "bitty: plugin launch for scratchpad '{slot}' was refused — the slot stays empty"
+            );
         }
     }
 
@@ -1433,19 +1458,21 @@ impl TerminalApp {
         }
         // Issue #3205: a scratchpad-triggered plugin command adopts its panel
         // into that slot instead of splitting the focused pane. The pending
-        // name is consumed either way, so it can never leak into an unrelated
+        // latch is consumed either way, so it can never leak into an unrelated
         // later panel; an occupied/refused slot falls back to the normal
-        // placement path below.
+        // placement path below. A refused launch never reaches here armed: the
+        // dispatch clears the latch (see `clear_pending_scratchpad_launch`).
         let adopt_slot = self
             .pending_plugin_scratchpad
             .take()
-            .filter(|name| !self.runtime.scratchpad_has_name(name));
+            .filter(|pending| !self.runtime.scratchpad_has_name(&pending.slot));
         let mount_gen = scene_host
             .borrow()
             .registry()
             .controller_generation(panel_id)
             .unwrap_or(generation);
-        if let Some(name) = adopt_slot.as_deref() {
+        if let Some(pending) = adopt_slot.as_ref() {
+            let name = pending.slot.as_str();
             if let Err(err) = scene_host
                 .borrow_mut()
                 .mount_panel(panel_id, mount_gen, new_id)
@@ -2031,6 +2058,9 @@ impl TerminalApp {
                 let args = match Self::command_args(invocation.args_json()) {
                     Ok(args) => args,
                     Err(diagnostic) => {
+                        // Issue #3205: a refused launch must not stay armed for
+                        // the next unrelated plugin panel.
+                        self.clear_pending_scratchpad_launch(qualified);
                         eprintln!(
                             "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
                         );
@@ -2044,9 +2074,15 @@ impl TerminalApp {
                         }
                         eprintln!("bitty: keymap command:{qualified} -> invoked");
                     }
-                    Err(diagnostic) => eprintln!(
-                        "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
-                    ),
+                    Err(diagnostic) => {
+                        // Issue #3205: the scratchpad launch that queued this
+                        // command produced no panel, so drop its adoption
+                        // latch instead of adopting an unrelated panel later.
+                        self.clear_pending_scratchpad_launch(qualified);
+                        eprintln!(
+                            "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
+                        );
+                    }
                 }
             }
             A::NewSplit(dir) => {
@@ -6631,6 +6667,69 @@ mod tests {
             "refusal keeps the layout byte-identical"
         );
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    /// Runtime config with one plugin-backed scratchpad slot (`logs`).
+    fn plugin_scratchpad_runtime() -> Runtime {
+        let mut runtime = Runtime::with_defaults().expect("runtime must build");
+        runtime.set_layout(two_pane_layout());
+        assert!(
+            runtime.set_scratchpad_specs(vec![bitty_runtime::ScratchpadSpec {
+                name: String::from("logs"),
+                spawn: Some(bitty_runtime::ScratchpadSpawn::Plugin {
+                    command: String::from("bitty-featured.devtools:plugins"),
+                }),
+                geometry: bitty_ui::ScratchpadGeometry::default(),
+            }]),
+            "the plugin scratchpad spec validates"
+        );
+        runtime
+    }
+
+    #[test]
+    fn refused_scratchpad_launch_does_not_arm_adoption() {
+        // Issue #3205 review: the adoption latch is only consumed by the next
+        // panel materialization, so a refused launch used to leave it armed
+        // and the next *unrelated* plugin panel landed in the scratchpad slot.
+        // The latch now travels with the command the launch queued and is
+        // dropped when that dispatch is refused.
+        use bitty_config::ChromeAction;
+        let mut app = TerminalApp::with_theme(
+            plugin_scratchpad_runtime(),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("defaults"),
+            SpawnSpec::default(),
+        );
+        assert!(
+            !app.apply_input_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from(
+                "logs"
+            )))),
+            "arming the launch is not a close request"
+        );
+        assert_eq!(
+            app.pending_input_commands.len(),
+            1,
+            "the launch was queued on the cold path"
+        );
+        let armed = app
+            .pending_plugin_scratchpad
+            .as_ref()
+            .expect("an accepted launch arms the adoption latch");
+        assert_eq!(armed.slot, "logs");
+        assert_eq!(armed.command, "bitty-featured.devtools:plugins");
+        assert!(app.runtime.scratchpad_names().is_empty(), "no slot yet");
+
+        // No plugin runtime is alive, so the dispatch is refused. Adoption
+        // must not survive it: nothing will ever fill this slot.
+        app.pump_cold_commands();
+        assert_eq!(app.pending_input_commands.len(), 0, "the queue drained");
+        assert!(
+            app.pending_plugin_scratchpad.is_none(),
+            "a refused launch must not adopt the next unrelated plugin panel"
+        );
+        assert!(app.runtime.scratchpad_names().is_empty());
     }
 
     #[test]

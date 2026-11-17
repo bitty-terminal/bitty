@@ -66,6 +66,7 @@
 use bitty_rich::scene::Scene;
 use bitty_ui::ViewId;
 use bitty_ui::placement::{Placement, PlacementError};
+use bitty_ui::presentation::PresentationMode;
 use bitty_ui::uitree::UiNodeId;
 
 use std::collections::{BTreeSet, HashMap};
@@ -113,6 +114,16 @@ use super::{Generation, WorkspaceId};
 pub struct PanelRuntime {
     registry: PanelRegistry,
     placement: Placement,
+    /// Recorded reads of panel leaves' presentation modes (bitty#2476 AC-1).
+    ///
+    /// The mode is a workspace fact on the leaf `View`
+    /// ([`bitty_ui::View::presentation`]) inside the layout the app owns, so
+    /// this host cannot hold it as truth and never derives placement, paint,
+    /// or a capability from it. One row per live panel, written only by the
+    /// app's generation-edge drain through
+    /// [`PanelRuntime::note_presentation_observation`], replaced at the next
+    /// observation, and cleared at [`PanelRuntime::dispose_panel`].
+    presentation_observations: HashMap<super::panel::PanelId, PanelPresentationObservation>,
     providers: PanelProviderRegistry,
     routable: RoutableLedger,
     /// Panel lease table (RUN-21, #1052): one pure [`PanelLease`] kernel
@@ -210,6 +221,27 @@ impl PanelLeaseEntry {
     }
 }
 
+/// A recorded read of one panel leaf's presentation mode (bitty#2476 AC-1,
+/// OQ-084 D.3).
+///
+/// [`PresentationMode`] is stamped on the leaf `View` and read through the
+/// single transition gate ([`PresentationMode::request_transition`]); the panel
+/// host owns no layout, so this value is *evidence*, never truth. It answers
+/// one question — "what did the app see on this panel's leaf at the last
+/// generation edge?" — and nothing in the host consults it: a leaf's paint, a
+/// panel's placement, a lease, or a grant never depend on it.
+///
+/// The `view` is carried beside the mode so a row cannot be read as the state
+/// of whichever leaf the panel is attached to later: an observation names the
+/// leaf it was taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelPresentationObservation {
+    /// The leaf the mode was read from.
+    pub view: ViewId,
+    /// The mode that leaf presented when it was read.
+    pub mode: PresentationMode,
+}
+
 /// Maps a refused kernel transition to the typed host denial, keeping the
 /// stable kernel audit name (`already_occupied` / `not_occupied` /
 /// `not_holder`) at the front of the reason.
@@ -231,6 +263,7 @@ impl PanelRuntime {
         Ok(Self {
             registry: PanelRegistry::new(config)?,
             placement: Placement::new(),
+            presentation_observations: HashMap::new(),
             providers: PanelProviderRegistry::new(),
             routable: RoutableLedger::new(),
             leases: HashMap::new(),
@@ -437,6 +470,15 @@ impl PanelRuntime {
     /// render scene slot all survive a rebind (D.3). Only the controller
     /// binding, the panel-scoped grants, and the lease tenure move.
     ///
+    /// The presentation mode is a workspace fact on the leaf `View`, which this
+    /// seam cannot read, so it is reported rather than written: the app's bind
+    /// edge reads the retained leaf and records what it saw through
+    /// [`PanelRuntime::note_presentation_observation`], readable afterwards with
+    /// [`PanelRuntime::presentation_observation_of`] (bitty#2476 AC-1). A
+    /// rebind that presents nothing therefore still leaves the mode observable,
+    /// and the observation is evidence — no placement, paint, or grant consults
+    /// it.
+    ///
     /// A rebind never deletes content the caller must see: the predecessor's
     /// generation-owned families are released by the registry's phase 1, and
     /// nothing of them is replayed into the successor.
@@ -594,6 +636,7 @@ impl PanelRuntime {
     /// live placement mirror of the registry's attachment).
     fn release_panel_mirrors(&mut self, id: super::panel::PanelId) {
         let _ = self.placement.unbind(id);
+        self.presentation_observations.remove(&id);
         self.leases.remove(&id);
         if self.scenes.remove(&id).is_some() {
             self.scene_revision = self.scene_revision.saturating_add(1);
@@ -1053,6 +1096,58 @@ impl PanelRuntime {
     #[must_use]
     pub fn placement_len(&self) -> usize {
         self.placement.len()
+    }
+
+    /// Records the presentation mode the app read from `panel`'s leaf at a
+    /// generation edge (bitty#2476 AC-1, OQ-084 D.3).
+    ///
+    /// The caller is the one layer that owns the layout the leaf lives in: the
+    /// app's drain of the generation-edge layout operations, which reads
+    /// [`bitty_ui::View::presentation`] from the leaf the bind retained. The
+    /// host stores the pair verbatim — it neither derives the mode nor
+    /// presents, gates, or places anything from it — so the leaf stays the only
+    /// truth and this table stays evidence.
+    ///
+    /// Rows are keyed by panel and replaced at the next observation, so the
+    /// table is bounded by the live panel count, and
+    /// [`PanelRuntime::dispose_panel`] drops the row with the record it
+    /// describes: an observation can never outlive its container or name a leaf
+    /// a later panel occupies.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::NotFound`] when `panel` is not a live record. A refused
+    /// observation writes nothing.
+    pub fn note_presentation_observation(
+        &mut self,
+        panel: super::panel::PanelId,
+        view: ViewId,
+        mode: PresentationMode,
+    ) -> Result<(), PanelError> {
+        if self.registry.panel_allocation_generation(panel).is_none() {
+            return Err(PanelError::NotFound {
+                kind: "panel",
+                id_raw: panel.0,
+            });
+        }
+        self.presentation_observations
+            .insert(panel, PanelPresentationObservation { view, mode });
+        Ok(())
+    }
+
+    /// Returns the last presentation mode the app observed on `panel`'s leaf,
+    /// if it has observed one (bitty#2476 AC-1).
+    ///
+    /// Read-only: this is the only way to read the table, and nothing in the
+    /// host or the present loop consumes it. `None` means either the panel has
+    /// no recorded observation (no generation edge has run for it since it was
+    /// created) or its record is gone.
+    #[must_use]
+    pub fn presentation_observation_of(
+        &self,
+        panel: super::panel::PanelId,
+    ) -> Option<PanelPresentationObservation> {
+        self.presentation_observations.get(&panel).copied()
     }
 
     /// Registers a validated provider manifest behind the `panel.provider`
@@ -1922,5 +2017,69 @@ mod tests {
         // Terminal/Empty leaves keep the grid path: no payload.
         assert!(PanelRuntime::nonterminal_for_leaf(ViewContent::Terminal(7), node, 5).is_none());
         assert!(PanelRuntime::nonterminal_for_leaf(ViewContent::Empty, node, 5).is_none());
+    }
+
+    /// bitty#2476 AC-1: the presentation observation is evidence about one
+    /// named leaf — recorded verbatim, replaced at the next observation,
+    /// refused for a panel that is not live, and dropped with the record.
+    ///
+    /// It fails for a table that keeps the first observation (a stale mode
+    /// reads as current after a later transition), for one that accepts an
+    /// observation for a disposed panel (a row outliving its container, which
+    /// a reused `PanelId` would inherit), and for one that survives disposal.
+    #[test]
+    fn presentation_observation_is_recorded_replaced_and_cleared() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        assert_eq!(
+            host.presentation_observation_of(handle.id),
+            None,
+            "a container that no edge has observed reads nothing"
+        );
+
+        host.note_presentation_observation(handle.id, view(21), PresentationMode::Floating)
+            .expect("a live panel accepts an observation");
+        assert_eq!(
+            host.presentation_observation_of(handle.id),
+            Some(PanelPresentationObservation {
+                view: view(21),
+                mode: PresentationMode::Floating,
+            }),
+            "the observation names the leaf it was read from"
+        );
+
+        host.note_presentation_observation(handle.id, view(22), PresentationMode::Scratchpad)
+            .expect("a second observation replaces the first");
+        assert_eq!(
+            host.presentation_observation_of(handle.id),
+            Some(PanelPresentationObservation {
+                view: view(22),
+                mode: PresentationMode::Scratchpad,
+            }),
+            "the most recent read is the row, including its leaf"
+        );
+
+        let disposed = super::super::panel::PanelId::new(999);
+        assert!(
+            matches!(
+                host.note_presentation_observation(disposed, view(23), PresentationMode::Tiled),
+                Err(PanelError::NotFound { .. })
+            ),
+            "an observation is never written for a panel that is not live"
+        );
+        assert_eq!(
+            host.presentation_observation_of(disposed),
+            None,
+            "the refused write left no row"
+        );
+
+        host.dispose_panel(handle.id, handle.generation).unwrap();
+        assert_eq!(
+            host.presentation_observation_of(handle.id),
+            None,
+            "disposal drops the observation with the record it describes"
+        );
     }
 }

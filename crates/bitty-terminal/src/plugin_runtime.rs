@@ -30,7 +30,8 @@ use bitty_runtime::plugin_runtime::{
     TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource, controller_generation,
 };
 use bitty_runtime::registry::{
-    Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
+    Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType,
+    PlaceholderReason, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
@@ -574,6 +575,18 @@ pub(crate) enum PluginPanelLayoutOp {
         panel_id: PanelId,
         view_id: Option<ViewId>,
     },
+    /// Record the presentation mode the retained `View` leaf still presents
+    /// for `panel_id` (bitty#2476 AC-1, OQ-084 D.3).
+    ///
+    /// Queued by the bind edge: the port moved the controller binding onto the
+    /// successor and the container kept its leaf, so the leaf's
+    /// [`PresentationMode`](bitty_ui::presentation::PresentationMode) is a fact
+    /// only the app's layout can read. The drain reads it and records it
+    /// read-only in the panel host
+    /// (`PanelRuntime::note_presentation_observation`), where
+    /// `presentation_observation_of` answers what the leaf presented at the
+    /// edge. No layout decision, paint, or grant ever consults the row.
+    ObservePresentation { panel_id: PanelId, view_id: ViewId },
 }
 
 /// Shared queue of pending [`PluginPanelLayoutOp`] items.
@@ -1041,14 +1054,34 @@ impl PanelGenerationPort for AppPanelGenerationPort {
             match res {
                 Ok(_) => {
                     self.panels.borrow_mut().detach_panel_scene(panel);
-                    if let Some(queue) = self.layout_ops.as_ref() {
-                        push_panel_layout_op(
-                            queue,
-                            PluginPanelLayoutOp::Close {
-                                panel_id: panel,
-                                view_id,
-                            },
-                        );
+                    // A reload's release is not terminal for the container: the
+                    // successor bind on the same edge rebinds it (OQ-084 D.3), so
+                    // the leaf has to outlive the release. This `Close` is
+                    // *queued*, not applied: it drains in the app's next tick,
+                    // after `bind_successor` below has already committed. The old
+                    // code therefore did not fail the bind — it rebound the
+                    // container and then, one tick later, removed the leaf and
+                    // disposed the just-rebound record through
+                    // `close_plugin_panel_leaf`, i.e. a successful reload whose
+                    // container and record were destroyed right afterwards.
+                    //
+                    // What survives is the container and its leaf, not the
+                    // placeholder: `PanelRegistry::rebind_panel` clears
+                    // `record.placeholder` in D.2 phase 2 step 2 and
+                    // `detach_panel_scene` above has already taken the render
+                    // scene, so the rebound container is bound, placeholder-free
+                    // and scene-less. Every other reason ends the generation
+                    // with no successor, so its leaf goes with it.
+                    if !matches!(edge.reason, PlaceholderReason::Reloaded) {
+                        if let Some(queue) = self.layout_ops.as_ref() {
+                            push_panel_layout_op(
+                                queue,
+                                PluginPanelLayoutOp::Close {
+                                    panel_id: panel,
+                                    view_id,
+                                },
+                            );
+                        }
                     }
                     report.committed.push(panel);
                 }
@@ -1074,14 +1107,37 @@ impl PanelGenerationPort for AppPanelGenerationPort {
         let mut report = PanelEdgeReport::default();
         for panel in held {
             report.attempted += 1;
-            match self.panels.borrow_mut().rebind_panel(
+            // One borrow per step: the bind's mutable borrow has to end before
+            // the placement mirror is read back for the observation below.
+            let rebound = self.panels.borrow_mut().rebind_panel(
                 panel,
                 successor,
                 edge.owner,
                 edge.requested,
                 edge.consented,
-            ) {
-                Ok(committed) => report.committed.push(committed.panel_id()),
+            );
+            match rebound {
+                Ok(committed) => {
+                    let panel_id = committed.panel_id();
+                    // bitty#2476 AC-1 (OQ-084 D.3): the container kept its leaf
+                    // and only the controller moved, so the mode that leaf
+                    // presents *now* is the fact the clause names. This edge
+                    // cannot read a layout — the app owns it — so it names the
+                    // leaf the rebind retained (the placement mirror the bind
+                    // left untouched) and the app's drain reports the mode it
+                    // reads. A panel with no attachment has no leaf to observe
+                    // and queues nothing.
+                    if let (Some(queue), Some(view_id)) = (
+                        self.layout_ops.as_ref(),
+                        self.panels.borrow().placement_view_of(panel_id),
+                    ) {
+                        push_panel_layout_op(
+                            queue,
+                            PluginPanelLayoutOp::ObservePresentation { panel_id, view_id },
+                        );
+                    }
+                    report.committed.push(panel_id);
+                }
                 Err(error) => {
                     // D.2: a refused bind writes no phase 2 step, so the panel
                     // stays unbound with the placeholder the edge presented and
@@ -4942,7 +4998,15 @@ error("activation fails after mounting the terminal slot scene")
     }
 
     #[test]
-    fn plugin_panel_generation_dispose_and_reload_remove_dwindle_leaf() {
+    fn plugin_panel_generation_dispose_removes_the_dwindle_leaf() {
+        // bitty#2476 AC-1 split this row in two. What is unchanged is the
+        // assertion quartet (`leaf_count` 2 -> 1, `panel_count` 0) and the
+        // four facts it names — not the path: the old row only ever called
+        // `reload`, so `dispose` is a path this assertion set did not
+        // previously touch. A **dispose** ends the generation with no
+        // successor, so the container and its leaf go with it; a **reload** now
+        // retains both for the successor bind and is asserted by
+        // `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`.
         let _guard = crate::ctl::test_control_queue_lock();
         let root = pin_test_dir("dwindle-reload");
         let lua = r#"
@@ -4972,12 +5036,147 @@ error("activation fails after mounting the terminal slot scene")
         app.plugin_runtime
             .as_mut()
             .expect("plugin runtime")
-            .reload(&id)
-            .expect("reload");
-        app.drive_tick().expect("tick removes old generation leaf");
+            .dispose(&id)
+            .expect("dispose");
+        app.drive_tick()
+            .expect("tick removes the ended generation's leaf");
 
         assert_eq!(app.runtime.layout().leaf_count(), 1);
         assert_eq!(panels.borrow().panel_count(), 0);
+    }
+
+    /// bitty#2476 AC-1 on the production edge: a reload retains the container
+    /// and its leaf, and the presentation mode that leaf presents is reported
+    /// through the app's own generation-edge drain — not asserted over a tree
+    /// the test built.
+    ///
+    /// The chain is the production one end to end: `AppPanelGenerationPort`
+    /// (installed by the composition root `build_dwindle_app` drives) rebinds
+    /// the container through `PanelRuntime::rebind_panel` and queues
+    /// `PluginPanelLayoutOp::ObservePresentation`; the app's
+    /// `apply_plugin_panel_requests` reads the retained leaf's mode with
+    /// `Runtime::view_presentation` and records it with
+    /// `PanelRuntime::note_presentation_observation`; the row reads it back with
+    /// `presentation_observation_of`.
+    ///
+    /// It fails for a bind edge that queues no observation (nothing recorded), a
+    /// drain that records nothing (nothing recorded), and a release that closes
+    /// the leaf on a reload — the last one leaves no leaf to read, so the
+    /// observation stays `None` while the container survives.
+    #[test]
+    fn a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained() {
+        use bitty_ui::PresentationMode;
+
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("dwindle-reload-presentation");
+        let lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "helper" })
+                    return p.id
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.presentation",
+            &["panel.create", "panel.focus"],
+            &[],
+            &["open"],
+            lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let raw = match dispatch_app_cmd(&mut app, "xuepoo.presentation", "open", &[]) {
+            Ok(LuaValue::Integer(id)) => id,
+            other => panic!("expected integer panel id, got {other:?}"),
+        };
+        app.drive_tick().expect("tick materializes the leaf");
+        let panel = PanelId(raw as u64);
+        let view = panels
+            .borrow()
+            .placement_view_of(panel)
+            .expect("the created panel is attached to a leaf");
+        assert_eq!(
+            app.runtime.view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "a fresh plugin panel leaf is tiled"
+        );
+        assert_eq!(
+            panels.borrow().presentation_observation_of(panel),
+            None,
+            "no generation edge has run for the container yet"
+        );
+
+        // Stamp the mode the way a workspace command does, through the single
+        // transition gate — the fact the clause is about.
+        {
+            let mut layout = app.runtime.layout_mut();
+            let leaf = layout.find_leaf_mut(view).expect("the panel leaf is tiled");
+            assert!(PresentationMode::request_transition(
+                leaf,
+                PresentationMode::Floating
+            ));
+        }
+        assert_eq!(
+            app.runtime.view_presentation(view),
+            Some(PresentationMode::Floating)
+        );
+
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.presentation").expect("id");
+        let predecessor = panels
+            .borrow()
+            .registry()
+            .controller_generation(panel)
+            .expect("the container is bound before the reload");
+        app.plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .reload(&id)
+            .expect("reload");
+        app.drive_tick()
+            .expect("tick drains the bind edge's observation");
+
+        // The container survived: same record, same leaf, successor controller.
+        assert_eq!(
+            panels.borrow().panel_count(),
+            1,
+            "a reload retains the container for its successor (D.3)"
+        );
+        assert!(
+            app.runtime.layout().find_leaf(view).is_some(),
+            "the retained container keeps its leaf"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(panel),
+            Some(view),
+            "the placement mirror still names the same leaf"
+        );
+        let successor = panels
+            .borrow()
+            .registry()
+            .controller_generation(panel)
+            .expect("the successor drives the container");
+        assert_ne!(
+            successor, predecessor,
+            "the reload moved the controller generation"
+        );
+
+        // The mode the retained leaf presents, read through the production seam.
+        assert_eq!(
+            panels.borrow().presentation_observation_of(panel),
+            Some(bitty_runtime::registry::PanelPresentationObservation {
+                view,
+                mode: PresentationMode::Floating,
+            }),
+            "the reload edge reports the mode the retained leaf still presents"
+        );
+        assert_eq!(
+            app.runtime.view_presentation(view),
+            Some(PresentationMode::Floating),
+            "and the leaf itself still presents it"
+        );
     }
 
     // ── CTX-1860 (bitty#3201): a live zero-PTY panel leaf outlives a shell exit ──

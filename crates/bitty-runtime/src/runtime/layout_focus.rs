@@ -2538,6 +2538,19 @@ impl Runtime {
             .or_else(|| self.scratchpads.find_view(id))
     }
 
+    /// The presentation mode the leaf `id` presents, wherever the workspace
+    /// keeps it: the tiled layout, a detached float, a pinned slot, or a
+    /// scratchpad slot (bitty#2476 AC-1).
+    ///
+    /// Read-only, and the only cross-container way to ask: a plugin panel's
+    /// leaf can be tiled or detached, and the generation edge that reports the
+    /// mode it retained must not guess which store holds it. `None` when no
+    /// store holds `id`.
+    #[must_use]
+    pub fn view_presentation(&self, id: ViewId) -> Option<bitty_ui::PresentationMode> {
+        self.find_view(id).map(View::presentation)
+    }
+
     /// Mutable shared view lookup across layout, detached floats, and pins
     /// (issue #2139).
     pub(super) fn find_view_mut(&mut self, id: ViewId) -> Option<&mut View> {

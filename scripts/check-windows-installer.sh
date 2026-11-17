@@ -62,6 +62,10 @@ done
 
 # Owner-bar specifics.
 grep -qF 'Source: "{#MySourceDir}' "$ISS" || fail "Files must stage from {#MySourceDir} (absolute stage dir)"
+# bitty#3224: the setup must install the console companion proxy next to the GUI
+# binary. Without it a shell launch resolves bitty.exe directly and never blocks.
+grep -qF 'Source: "{#MySourceDir}\bitty.exe"' "$ISS" || fail "installer must install bitty.exe"
+grep -qF 'Source: "{#MySourceDir}\bitty.com"' "$ISS" || fail "installer must install bitty.com (console companion proxy)"
 grep -qi 'unsigned' "$ISS" || fail "must state the unsigned 0.1.0 status"
 grep -qF '#1810' "$ISS" || fail "must reference #1810 for the signing deferral"
 grep -qi 'SmartScreen' "$ISS" || fail "must mention the SmartScreen click-through"

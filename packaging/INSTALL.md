@@ -51,9 +51,11 @@ What each script installs:
 - macOS x86_64/arm64: the bare per-arch binary (the DMG is interactive and
   unsuitable for headless install; the same binary is the Homebrew fetch
   artifact).
-- Windows x64: the portable ZIP (`bitty.exe` + `bitty.ico` +
-  LICENSE/README/CHANGELOG). Windows arm64: the bare exe (the ZIP matrix
-  builds x64 only), so its shortcut falls back to the executable icon.
+- Windows x64/arm64: the portable ZIP (`bitty.exe` + its `bitty.com` console
+  companion + `bitty.ico` + LICENSE/README/CHANGELOG). `bitty.com` is what makes
+  a `cmd`/PowerShell `bitty` invocation block on CLI subcommands, so both files
+  install into the same directory; an archive without `bitty.com` fails the
+  install closed.
 - FreeBSD (Tier 2): not a bootstrap target — manual download from the
   release page instead.
 
@@ -166,11 +168,18 @@ All three Windows channels create a Start Menu entry, so Windows app search
 resolves "Bitty"; the PowerShell one-liner and Scoop also put `bitty` on a
 shell path. They differ in packaging and removal.
 
+All three Windows channels install the same pair: `bitty.exe` (the GUI binary,
+which the Start Menu entry launches) and `bitty.com` (the console companion
+proxy, which `%PATHEXT%` resolves first for a shell invocation so CLI
+subcommands block and print — bitty#3224). Scoop's shim is `bitty.com`; the
+PowerShell one-liner and the setup leave `bitty` on the shell through the
+directory on `Path`.
+
 | Channel                              | Start Menu                                           | PATH                                         | Uninstall                |
 | ------------------------------------ | ---------------------------------------------------- | -------------------------------------------- | ------------------------ |
 | `setup.exe` (Inno Setup)             | `Bitty` shortcut, plus an opt-in Desktop shortcut    | not modified                                 | Apps & Features -> Bitty |
 | PowerShell one-liner (`install.ps1`) | `Bitty.lnk`                                          | user `Path` gains `%LOCALAPPDATA%\bitty\bin` | Apps & Features -> Bitty |
-| Scoop                                | `Bitty` shortcut from the manifest `shortcuts` entry | `bitty` shim on the Scoop shim path          | `scoop uninstall bitty`  |
+| Scoop                                | `Bitty` shortcut from the manifest `shortcuts` entry | `bitty` shim is the archived `bitty.com`     | `scoop uninstall bitty`  |
 
 The PowerShell one-liner creates `Bitty.lnk` in
 `%APPDATA%\Microsoft\Windows\Start Menu\Programs`, appends the install
@@ -180,8 +189,8 @@ app-list entry under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Bitty` so
 Settings -> Apps -> Installed apps shows Bitty with its version and an
 Uninstall button. The shortcut and the app-list entry point at the shipped
-`bitty.ico`; when the payload has no icon (arm64 bare exe, until #2929 embeds
-it in `bitty.exe`) they fall back to the executable icon. Each action is
+`bitty.ico`; a payload without one falls back to the executable icon (#2929
+embeds the mascot in `bitty.exe`). Each action is
 best-effort: on failure the installer warns and prints the manual step
 instead of failing the install. Scripted installs can skip them with
 `-NoShortcut`, `-NoPathUpdate`, and `-NoRegistry`:
@@ -241,6 +250,15 @@ cargo +1.98.1 install --git https://github.com/bitty-terminal/bitty.git bitty-te
 Note: the binary crate is `bitty-terminal` (`publish = false`) and the
 `bitty` name on crates.io belongs to an unrelated project, so registry
 installs do not work. Registry publication is tracked separately (#1512).
+
+On Windows, a source build produces `bitty.exe` (GUI subsystem) only. To keep
+shell invocations blocking, also build and place the console companion next to
+it under its shipped name (bitty#3224):
+
+```powershell
+cargo build --release --locked -p bitty-com
+Copy-Item .\target\release\bitty-com.exe .\bitty.com
+```
 
 ## Proxies and CDNs
 

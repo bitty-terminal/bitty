@@ -19,9 +19,13 @@
 # archives and name the package/FreeBSD exceptions.
 #
 # CTX-1681 (#2863) adds the Windows discoverability contract: the Scoop
-# manifest renames the raw artifact to the `bitty` shim and declares a `Bitty`
-# Start Menu shortcut per architecture, while the download URL keeps the raw
-# artifact name.
+# manifest exposes a `bitty` shim and declares a `Bitty` Start Menu shortcut.
+#
+# bitty#3224 changes what those entries point at: the payload is now the portable
+# ZIP, the `bitty` shim is `bitty.com` (the console companion proxy, which is the
+# name `%PATHEXT%` resolves first from a shell), and the shortcut stays the GUI
+# `bitty.exe`. Scoop only resolves `bin`/`shortcuts` against extracted archive
+# members, so the renderer rejects bare-`.exe` asset names.
 #
 # The live tag-time fetch/verify path stays in release.yml; this gate pins the
 # generation contract on every PR.
@@ -44,8 +48,8 @@ VERSION=0.0.24
 BASE_URL="https://cdn.bitty.run/releases/v${VERSION}"
 INTEL_ASSET=bitty-x86_64-apple-darwin
 ARM_ASSET=bitty-aarch64-apple-darwin
-X64_ASSET=bitty-x86_64-pc-windows-msvc.exe
-ARM64_ASSET=bitty-aarch64-pc-windows-msvc.exe
+X64_ASSET=bitty-${VERSION}-windows-x86_64.zip
+ARM64_ASSET=bitty-${VERSION}-windows-aarch64.zip
 SHA_INTEL=772bd9e7fcf2d3e64fed7c6f1241a3abd9da237e6540a7ede82fd375343ec3aa
 SHA_ARM=88ff8a49211f3d9d4cccfd0a5894670a7c668900dc8922e7d982bbf855e3f0e8
 SHA_X64=e0bdb50de8429e85e39979a76fb0ea24bcb862c18bf4ff5a2e7c8ecfe6a89642
@@ -152,34 +156,36 @@ def check(condition, message):
 
 
 arch = manifest.get("architecture", {})
-check(arch.get("64bit", {}).get("url") == f"{base}/bitty-x86_64-pc-windows-msvc.exe",
+x64_zip = f"bitty-{version}-windows-x86_64.zip"
+arm64_zip = f"bitty-{version}-windows-aarch64.zip"
+check(arch.get("64bit", {}).get("url") == f"{base}/{x64_zip}",
       "Scoop x64 URL uses the R2/CDN host")
-check(arch.get("arm64", {}).get("url") == f"{base}/bitty-aarch64-pc-windows-msvc.exe",
+check(arch.get("arm64", {}).get("url") == f"{base}/{arm64_zip}",
       "Scoop arm64 URL uses the R2/CDN host")
 check(arch.get("64bit", {}).get("hash") == sha_x64,
       "Scoop x64 hash is the expected digest")
 check(arch.get("arm64", {}).get("hash") == sha_arm64,
       "Scoop arm64 hash is the expected digest")
-check(arch.get("64bit", {}).get("bin") == [["bitty-x86_64-pc-windows-msvc.exe", "bitty"]],
-      "Scoop x64 executable is exposed as the bitty shim")
-check(arch.get("arm64", {}).get("bin") == [["bitty-aarch64-pc-windows-msvc.exe", "bitty"]],
-      "Scoop arm64 executable is exposed as the bitty shim")
-check(arch.get("64bit", {}).get("shortcuts") == [["bitty-x86_64-pc-windows-msvc.exe", "Bitty"]],
-      "Scoop x64 declares a Bitty Start Menu shortcut")
-check(arch.get("arm64", {}).get("shortcuts") == [["bitty-aarch64-pc-windows-msvc.exe", "Bitty"]],
-      "Scoop arm64 declares a Bitty Start Menu shortcut")
-check(arch.get("64bit", {}).get("url", "").endswith("/bitty-x86_64-pc-windows-msvc.exe"),
-      "Scoop x64 download URL keeps the raw artifact name")
-check(arch.get("arm64", {}).get("url", "").endswith("/bitty-aarch64-pc-windows-msvc.exe"),
-      "Scoop arm64 download URL keeps the raw artifact name")
+check(arch.get("64bit", {}).get("bin") == [["bitty.com", "bitty"]],
+      "Scoop x64 shims bitty.com as the console `bitty` entry point")
+check(arch.get("arm64", {}).get("bin") == [["bitty.com", "bitty"]],
+      "Scoop arm64 shims bitty.com as the console `bitty` entry point")
+check(arch.get("64bit", {}).get("shortcuts") == [["bitty.exe", "Bitty"]],
+      "Scoop x64 declares a Bitty shortcut to the GUI binary")
+check(arch.get("arm64", {}).get("shortcuts") == [["bitty.exe", "Bitty"]],
+      "Scoop arm64 declares a Bitty shortcut to the GUI binary")
+check(arch.get("64bit", {}).get("url", "").endswith("/" + x64_zip),
+      "Scoop x64 downloads the portable ZIP")
+check(arch.get("arm64", {}).get("url", "").endswith("/" + arm64_zip),
+      "Scoop arm64 downloads the portable ZIP")
 notes = manifest.get("notes", "")
 check(f"https://github.com/bitty-terminal/bitty/releases/tag/v{version}" in notes,
       "Scoop documents the GitHub Releases fallback")
 check(manifest.get("autoupdate", {}).get("architecture", {}).get("64bit", {}).get("url")
-      == "https://cdn.bitty.run/releases/v$version/bitty-x86_64-pc-windows-msvc.exe",
+      == f"https://cdn.bitty.run/releases/v$version/{x64_zip}",
       "Scoop x64 autoupdate uses the R2/CDN host")
 check(manifest.get("autoupdate", {}).get("architecture", {}).get("arm64", {}).get("url")
-      == "https://cdn.bitty.run/releases/v$version/bitty-aarch64-pc-windows-msvc.exe",
+      == f"https://cdn.bitty.run/releases/v$version/{arm64_zip}",
       "Scoop arm64 autoupdate uses the R2/CDN host")
 check(all("github.com" not in str(value) for value in arch.values() if isinstance(value, dict)),
       "Scoop download entries have no GitHub URL")
@@ -251,6 +257,13 @@ expect_render_fail "an uppercase digest" homebrew \
 expect_render_fail "a path-traversing asset name" scoop \
   --version "$VERSION" --base-url "$BASE_URL" \
   --x64-asset "../${X64_ASSET}" --arm64-asset "$ARM64_ASSET" \
+  --sha-x64 "$SHA_X64" --sha-arm64 "$SHA_ARM64"
+# bitty#3224: the Scoop manifest's bin/shortcuts point at archive members, so a
+# bare `.exe` payload cannot satisfy it. The renderer must reject it instead of
+# emitting a manifest that installs nothing.
+expect_render_fail "a bare-exe Scoop payload" scoop \
+  --version "$VERSION" --base-url "$BASE_URL" \
+  --x64-asset 'bitty-x86_64-pc-windows-msvc.exe' --arm64-asset "$ARM64_ASSET" \
   --sha-x64 "$SHA_X64" --sha-arm64 "$SHA_ARM64"
 
 job_block() { # <job>

@@ -516,7 +516,8 @@ registry/uninstall scripting for the same bar.
   Linux targets, `unix-bundle` job)
 - windows x64 (`x86_64-pc-windows-msvc`, windows-latest)
 - windows aarch64 (`aarch64-pc-windows-msvc`, windows-latest)
-- windows x64 portable ZIP (`bitty-<version>-windows-x86_64.zip`, `windows-zip` job)
+- windows portable ZIPs (`bitty-<version>-windows-x86_64.zip` and
+  `bitty-<version>-windows-aarch64.zip`, `windows-zip` job)
 - windows x64 setup installer (`bitty-<version>-windows-x86_64-setup.exe`, `windows-installer` job; verified by `verify-windows-installer`)
 - macos x64 (`x86_64-apple-darwin`, macos-14)
 - macos aarch64 (`aarch64-apple-darwin`, macos-14)
@@ -527,11 +528,15 @@ inside `scripts/make-macos-dmg.sh`; the job mounts the DMG and launches both
 slices before upload. The app is intentionally unsigned — codesign/notarize is
 deferred (034 item 11) — and the bare triple binaries keep shipping.
 
-The portable ZIP packs `bitty.exe` with `LICENSE`, `README.md` and
-`CHANGELOG.md` at the archive root (assembled by `scripts/make-windows-zip.sh`,
-no installer); the bare `.exe` assets keep shipping for Scoop and direct
-downloads. The `verify-windows-zip` job unzips on a clean Windows runner and
-runs `bitty.exe --version`.
+The portable ZIPs pack `bitty.exe` and its `bitty.com` console companion (see
+`Windows console companion` below) with `bitty.ico`, `LICENSE`, `README.md` and
+`CHANGELOG.md` at the archive root, one archive per architecture (assembled by
+`scripts/make-windows-zip.sh`, no installer); the bare `.exe` assets keep
+shipping for direct downloads. The `verify-windows-zip` job expands both
+archives on a clean Windows runner, asserts the payload, runs
+`bitty.exe --version`, and then repeats the version call plus an invalid-flag
+usage error through `bitty.com`, which must block and return the wrapped exit
+code (`0` and `2`).
 
 The versioned Linux bundles pack `bin/bitty` and `bin/bittyd` with `share/`
 (desktop entry, icons, metainfo, systemd user unit) plus `LICENSE`,
@@ -645,7 +650,7 @@ and `VERSION` resolve at install time via `latest.txt`:
 | macOS arm64                | `https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-apple-darwin`                        |
 | macOS x86_64               | `https://cdn.bitty.run/releases/<TAG>/bitty-x86_64-apple-darwin`                         |
 | Windows x64                | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip`                |
-| Windows arm64              | `https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe`                 |
+| Windows arm64              | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-aarch64.zip`               |
 
 Each row has a `<artifact>.sha256` sidecar at the same URL with `.sha256`
 appended, which the script verifies before installing. Worked example at
@@ -658,7 +663,7 @@ https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-unknown-linux-musl.ta
 https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-apple-darwin
 https://cdn.bitty.run/releases/v0.0.23/bitty-x86_64-apple-darwin
 https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip
-https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe
+https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-aarch64.zip
 ```
 
 Rationale per OS:
@@ -692,13 +697,15 @@ Rationale per OS:
   unsuitable for headless `curl | bash`; a bare binary is a single directly
   executable file and is already the Homebrew fetch artifact. The DMG stays
   the manual-download path.
-- Windows x64 fetches the portable ZIP (`scripts/make-windows-zip.sh`,
-  verified by `verify-windows-zip`): `bitty.exe`, the display icon
+- Windows fetches the portable ZIP on both architectures
+  (`scripts/make-windows-zip.sh`, verified by `verify-windows-zip`):
+  `bitty.exe`, its `bitty.com` console companion, the display icon
   `bitty.ico`, and docs at the archive root, expanded with `Expand-Archive`.
-  Windows arm64 fetches the bare `bitty-aarch64-pc-windows-msvc.exe` because
-  the ZIP matrix builds x64 only; both arches install first-class, only the
-  container differs until the ZIP matrix extends (recorded follow-up, not a
-  parity gap).
+  Both files must land in the same directory — that pairing is what makes a
+  `cmd`/PowerShell `bitty` invocation block on CLI subcommands (see
+  `Windows console companion`), so the installer fails closed when the archive
+  does not carry `bitty.com`. The bare per-arch `.exe` assets keep shipping for
+  direct downloads.
 - FreeBSD Tier 2 is not a bootstrap target: no `install.sh` path serves the
   `bitty-<VERSION>-x86_64-unknown-freebsd.tar.xz`; it stays manual download
   and scripts fail closed there with guidance.
@@ -731,10 +738,57 @@ from the 64 px frame. Regenerate it after changing the hicolor icons:
 python3 scripts/make-windows-ico.py
 ```
 
-arm64 installs a bare exe with no `.ico` in the payload, so their shortcut
-falls back to the executable icon; bitty#2929 embeds the mascot in `bitty.exe`
-and switches both Windows channels to `bitty.exe,0`, after which the `.ico`
-copy is only a portable-payload convenience.
+Both architectures now install the portable ZIP, so both ship `bitty.ico` and
+the shortcut/`DisplayIcon` point at it; bitty#2929 embeds the mascot in
+`bitty.exe` and switches both Windows channels to `bitty.exe,0`, after which
+the `.ico` copy is only a portable-payload convenience.
+
+### Windows console companion (`bitty.com`, bitty#3224)
+
+`bitty.exe` links with `windows_subsystem = "windows"` so a Start Menu/Search
+launch never flashes a console window (bitty#2929). The cost is that
+`CreateProcess` starts it as a GUI application: a `cmd.exe`, PowerShell, Windows
+Terminal, or Scoop-shim invocation does not block on it and never keeps an exit
+code, which makes `bitty init` and every other CLI subcommand look inert.
+
+The fix is the classic Windows console-companion trampoline: ship a second,
+console-subsystem executable named `bitty.com` in the same directory.
+`CreateProcess` resolves a bare `bitty` through `%PATHEXT%`, where `.COM`
+precedes `.EXE`, so the proxy wins for console invocations and then decides:
+
+- **console command** — subcommand words (`init`, `config`, `doctor`, `list`,
+  `ctl`, `run`, `plugin`, ...), `+actions`, `--help`/`--version`,
+  `--headless`/`--test-mode`, and any argv the real parser rejects as a usage
+  error: spawn `bitty.exe` with inherited stdin/stdout/stderr, wait, and return
+  the child's exit code;
+- **desktop launch** — a bare `bitty`, layout/theme flags, or an explicit
+  program (`bitty -- htop`): spawn `bitty.exe` with
+  `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and exit 0 immediately.
+
+The proxy is `crates/bitty-com` (pure `std`, no dependencies,
+`#![forbid(unsafe_code)]`). It resolves the sibling from its own executable
+path — same directory, never `$PATH`, never a hardcoded install root — and
+refuses to run (exit 1, message on stderr) when `bitty.exe` is missing. The argv
+classification duplicates a slice of `crates/bitty-terminal`'s parser on
+purpose, and `bitty-terminal`'s `com_parity_tests` run one corpus through both
+so the two cannot drift silently. Non-Windows builds compile the same source
+without the detach flags, so Linux/macOS legs stay green.
+
+Distribution wiring:
+
+- both portable ZIPs carry `bitty.com` at the archive root
+  (`scripts/make-windows-zip.sh` requires `--com` and validates the arch in the
+  archive name; `scripts/tests/make-windows-zip.test.sh` pins the payload);
+- `install.ps1` installs `bitty.exe` + `bitty.com` from the ZIP, fails closed if
+  the archive lacks the proxy, and runs its version smoke *through* `bitty.com`;
+- `packaging/windows/bitty.iss` installs both files per-user;
+- the Scoop manifest ships the ZIP with `bin = [["bitty.com", "bitty"]]` and
+  `shortcuts = [["bitty.exe", "Bitty"]]`, so the shim is the console proxy and
+  the Start Menu entry is the GUI binary;
+- CI (`ci.yml` Windows leg) builds the pair, asserts `.COM` precedes `.EXE` in
+  `%PATHEXT%`, resolves a bare `bitty` to the proxy, and checks the blocking
+  contracts (`--version` exit 0, `--headless` exit 0, unknown flag exit 2) plus
+  the detach path.
 
 ### Channel download sources (CTX-1413, #1847)
 
@@ -748,9 +802,9 @@ before any channel publisher runs:
 | --------------- | ------------------------------------------------------------------------- | -------------------------- | ------------------------------------- |
 | AUR `bitty-bin` | `https://cdn.bitty.run/releases/<TAG>/bitty-x86_64-unknown-linux-gnu`     | GitHub Releases binary URL | `sha256sums_x86_64` at `makepkg` time |
 | Homebrew        | `https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-apple-darwin`          | GitHub Releases comment    | formula `sha256`                      |
-| Scoop           | `https://cdn.bitty.run/releases/<TAG>/bitty-<arch>-pc-windows-msvc.exe`   | GitHub Releases `notes`    | manifest `hash`                       |
+| Scoop           | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-<arch>.zip` | GitHub Releases `notes`    | manifest `hash`                       |
 | `install.sh`    | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-<target>.tar.zst`   | GitHub Releases asset      | `.sha256` sidecar, fail closed        |
-| `install.ps1`   | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip` | GitHub Releases asset      | `.sha256` sidecar, fail closed        |
+| `install.ps1`   | `https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-<arch>.zip` | GitHub Releases asset      | `.sha256` sidecar, fail closed        |
 
 `scripts/render-package-manifests.sh` renders the Homebrew formula and Scoop
 manifest for those URLs; `scripts/tests/check-package-manifests.test.sh` pins

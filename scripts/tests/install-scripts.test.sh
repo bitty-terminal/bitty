@@ -183,7 +183,8 @@ if [[ ! -f "$PS1_SCRIPT" ]]; then
   FAIL=1
 else
   for needle in 'install/latest.txt' 'releases/$tag' \
-    'bitty-$VersionBare-windows-x86_64.zip' 'bitty-aarch64-pc-windows-msvc.exe' \
+    'bitty-$VersionBare-windows-x86_64.zip' 'bitty-$VersionBare-windows-aarch64.zip' \
+    'bitty.com' 'portable ZIP missing bitty.com' \
     'irm https://cdn.bitty.run/install/install.ps1 | iex' \
     'Expand-Archive' 'Get-FileHash' \
     'Microsoft\Windows\Start Menu\Programs' 'Bitty.lnk' 'WScript.Shell' \

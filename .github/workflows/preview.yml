@@ -262,7 +262,7 @@ jobs:
           # P-10/P-15: the channel is the only preview marker in the binary;
           # the base version and archive names stay bare.
           BITTY_CHANNEL: preview
-        run: cargo build --release --locked -p bitty-terminal --target "$TARGET"
+        run: cargo build --release --locked -p bitty-terminal -p bitty-com --target "$TARGET"
 
       - name: Check release binary has no builder paths
         shell: bash
@@ -333,13 +333,18 @@ jobs:
             ext=".exe"
           fi
           cp "target/${TARGET}/release/bitty${ext}" "dist/bitty-${TARGET}${ext}"
-          ls -lh "dist/bitty-${TARGET}${ext}"
+          # bitty#3224: the Windows preview archive also carries the console
+          # companion proxy; the packer renames it to `bitty.com`.
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "target/${TARGET}/release/bitty-com.exe" "dist/bitty-com-${TARGET}.exe"
+          fi
+          ls -lh dist/
 
       - name: Upload the build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bitty-preview-build-${{ matrix.target }}
-          path: dist/bitty-${{ matrix.target }}*
+          path: dist/bitty-*
           if-no-files-found: error
           retention-days: 7
 
@@ -411,7 +416,9 @@ jobs:
           windows)
             bash scripts/make-windows-zip.sh \
               --version "$BASE_VERSION" \
+              --arch x86_64 \
               --exe "dist/bitty-${TARGET}.exe" \
+              --com "dist/bitty-com-${TARGET}.exe" \
               --output "dist/${ARCHIVE}"
             ;;
           *)
@@ -513,7 +520,7 @@ jobs:
           name: bitty-preview-archive-x86_64-pc-windows-msvc
           path: pkg
 
-      - name: Expand and run bitty.exe
+      - name: Expand and run bitty.exe and bitty.com
         shell: pwsh
         env:
           BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
@@ -533,12 +540,13 @@ jobs:
           if ($dirs.Count -ne 0) {
             throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
           }
-          $expected = @('bitty.exe', 'bitty.ico', 'LICENSE', 'README.md', 'CHANGELOG.md')
-          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+          $expected = @('CHANGELOG.md', 'LICENSE', 'README.md', 'bitty.com', 'bitty.exe', 'bitty.ico')
+          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name } | Sort-Object)
           if (Compare-Object $expected $actual) {
             throw "archive contents mismatch: $($actual -join ', ')"
           }
           $exe = Join-Path $dest 'bitty.exe'
+          $com = Join-Path $dest 'bitty.com'
           $output = (& $exe --version 2>&1 | Out-String)
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "bitty --version exited $code" }
@@ -547,6 +555,12 @@ jobs:
           if ($output -cnotmatch $pattern) {
             throw "version/channel mismatch: '$output'"
           }
+          # bitty#3224: the console companion proxy must block and return the
+          # wrapped output/exit code, which is what a shell launch relies on.
+          $viaProxy = ([string](& $com --version 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --version exited $LASTEXITCODE" }
+          if ($viaProxy -cnotmatch $pattern) { throw "bitty.com --version mismatch: '$viaProxy'" }
+          Write-Host "bitty.com --version => $viaProxy"
 
   # P-03, P-06, P-10, P-15: verify every archive, attest it, then publish one
   # public pre-release with the bare base version in the asset names. A

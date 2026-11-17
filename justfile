@@ -462,6 +462,13 @@ install-scripts-test:
 unix-bundle-test:
     ./scripts/tests/make-unix-bundle.test.sh
 
+# Windows portable-ZIP payload contract (bitty#3224): the packer must ship
+# `bitty.com` next to `bitty.exe` for both architectures, stage the proxy under
+# its shipped name, and reject a payload without it. Host-agnostic (zip/unzip
+# only), so the release-time contract is gated on every PR.
+windows-zip-test:
+    ./scripts/tests/make-windows-zip.test.sh
+
 appimage-test:
     ./scripts/tests/make-appimage.test.sh
 
@@ -623,7 +630,7 @@ commit-check message:
 # Local CI-equivalent gate. Registry-free by contract: `catalog-test` runs
 # hermetic fixtures; the strict registry drift gate is `check-registry` and
 # needs a bitty-plugins checkout (see CONTRIBUTING.md).
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test freebsd-pkg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test fuzz-campaign-test actionlint markdownlint catalog-test nix-patch-test
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test windows-zip-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test freebsd-pkg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test fuzz-campaign-test actionlint markdownlint catalog-test nix-patch-test
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

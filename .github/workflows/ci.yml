@@ -273,6 +273,9 @@ jobs:
           bash scripts/check-spec.sh
           bash scripts/tests/check-distro-recipes.test.sh
           bash scripts/tests/check-package-manifests.test.sh
+          # bitty#3224: the Windows ZIP must carry bitty.com next to bitty.exe
+          # for both architectures.
+          bash scripts/tests/make-windows-zip.test.sh
           bash scripts/tests/check-release-smoke-fail-closed.test.sh
           bash scripts/tests/check-aur-bin-render.test.sh
           bash scripts/tests/check-aur-source-build.test.sh
@@ -1745,6 +1748,68 @@ jobs:
           }
           Write-Host "bitty --version => $text"
 
+      # bitty#3224: `bitty.exe` is a GUI-subsystem executable, so a shell launch
+      # never blocks on it. `bitty.com` is the console companion Windows resolves
+      # first (`%PATHEXT%` order puts `.COM` before `.EXE`); it must block on CLI
+      # invocations, inherit this console's streams, return the wrapped exit
+      # code, and detach for a bare launch. This drives the real pair in one
+      # directory, exactly as an installed user would.
+      - name: Assert the bitty.com console companion contract (bitty#3224)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo build -p bitty-terminal --bin bitty --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build -p bitty-terminal failed' }
+          & cargo build -p bitty-com --bin bitty-com --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo build -p bitty-com failed' }
+          $root = Join-Path (Get-Location) 'target\debug'
+          $dir = Join-Path $env:RUNNER_TEMP 'bitty-com-contract'
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $exe = Join-Path $dir 'bitty.exe'
+          $com = Join-Path $dir 'bitty.com'
+          # The shipped name is `bitty.com`; the build artifact is bitty-com.exe.
+          Copy-Item (Join-Path $root 'bitty.exe') $exe -Force
+          Copy-Item (Join-Path $root 'bitty-com.exe') $com -Force
+          if (-not (Test-Path $com)) { throw "console companion missing: $com" }
+          # The mechanism itself: `.COM` must precede `.EXE` in `%PATHEXT%`, and a
+          # bare `bitty` must resolve to the proxy when both files are on PATH.
+          $pathext = @($env:PATHEXT -split ';' | Where-Object { $_ })
+          if ($pathext[0] -ne '.COM') {
+            throw "PATHEXT must list .COM before .EXE, got: $($pathext -join ';')"
+          }
+          $originalPath = $env:Path
+          try {
+            $env:Path = "$dir;$originalPath"
+            $picked = (Get-Command 'bitty' -CommandType Application | Select-Object -First 1).Source
+            if ($picked -ne $com) { throw "shell resolution picked '$picked' instead of '$com'" }
+            Write-Host "bare 'bitty' resolves to the console companion: $picked"
+          } finally {
+            $env:Path = $originalPath
+          }
+          # Console commands must block and hand back their streams.
+          $version = ([string](& $com --version 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --version exited $LASTEXITCODE" }
+          if ($version -notmatch '^bitty \S+') { throw "bitty.com --version printed '$version'" }
+          Write-Host "bitty.com --version => $version (exit 0, synchronous)"
+          $headless = ([string](& $com --headless --log-level error 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --headless exited $LASTEXITCODE: $headless" }
+          Write-Host 'bitty.com --headless OK (exit 0, synchronous)'
+          # An invalid flag is an argv-only failure: the usage error must reach
+          # this console with exit 2 instead of vanishing into a detached window.
+          $usage = ([string](& $com --definitely-not-a-flag 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 2) { throw "bitty.com <invalid flag> exited $LASTEXITCODE (want 2)" }
+          if ($usage -notmatch 'unknown flag') { throw "usage error missing from the console streams: '$usage'" }
+          Write-Host 'bitty.com invalid-flag usage error OK (exit 2, synchronous)'
+          # A bare launch is the desktop path: return 0 immediately and leave the
+          # GUI child running detached (never waited on).
+          $watch = [System.Diagnostics.Stopwatch]::StartNew()
+          & $com
+          $detachCode = $LASTEXITCODE
+          $watch.Stop()
+          if ($detachCode -ne 0) { throw "bare bitty.com exited $detachCode (want 0)" }
+          Write-Host ("bare launch detached in {0} ms (exit 0)" -f $watch.ElapsedMilliseconds)
+
       - name: Run doctests
         shell: bash
         run: cargo test --workspace --doc --locked
@@ -1835,8 +1900,8 @@ jobs:
           if ($urls[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
           if ($urls[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
           $urlsArm = @( & $script -Version 0.0.23 -Target arm64 -PrintUrl )
-          if ($urlsArm[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe') { throw "arm64 PrintUrl mismatch: $($urlsArm[0])" }
-          if ($urlsArm[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-aarch64-pc-windows-msvc.exe.sha256') { throw "arm64 sidecar mismatch: $($urlsArm[1])" }
+          if ($urlsArm[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-aarch64.zip') { throw "arm64 PrintUrl mismatch: $($urlsArm[0])" }
+          if ($urlsArm[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-aarch64.zip.sha256') { throw "arm64 sidecar mismatch: $($urlsArm[1])" }
           Write-Host 'PrintUrl templates OK'
           try {
             & $script -Version 0.0.23-rc1 -Target x64 -DryRun | Out-Null
@@ -1932,6 +1997,15 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'cargo build for the install smoke failed' }
           }
           if (-not (Test-Path $exe)) { throw "debug bitty.exe missing: $exe" }
+          # bitty#3224: the published ZIP carries bitty.com next to bitty.exe, so
+          # the fixture needs a real one. install.ps1 also runs its version smoke
+          # through it, which makes this leg execute the proxy end to end.
+          $com = Join-Path $env:GITHUB_WORKSPACE 'target\debug\bitty-com.exe'
+          if (-not (Test-Path $com)) {
+            & cargo build -p bitty-com --bin bitty-com --locked
+            if ($LASTEXITCODE -ne 0) { throw 'cargo build for the console companion failed' }
+          }
+          if (-not (Test-Path $com)) { throw "debug bitty-com.exe missing: $com" }
           $python = Get-Command python -ErrorAction SilentlyContinue
           if ($null -eq $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
           if ($null -eq $python) {
@@ -1950,16 +2024,26 @@ jobs:
           foreach ($v in @($version, $nextVersion)) {
             $rel = Join-Path $cdn "releases\v$v"
             New-Item -ItemType Directory -Force -Path $rel | Out-Null
-            $zip = Join-Path $rel "bitty-$v-windows-x86_64.zip"
-            Compress-Archive -Path $exe, $ico -DestinationPath $zip -Force
-            $zipHash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            Set-Content -Path "$zip.sha256" -Value "$zipHash  bitty-$v-windows-x86_64.zip"
+            # The published ZIP carries bitty.exe, its bitty.com console
+            # companion (bitty#3224), and the display icon at the archive root;
+            # both architectures ship the same container.
+            $zipStage = Join-Path $root "zip-stage-$v"
+            New-Item -ItemType Directory -Force -Path $zipStage | Out-Null
+            Copy-Item -Path $exe -Destination (Join-Path $zipStage 'bitty.exe') -Force
+            Copy-Item -Path $com -Destination (Join-Path $zipStage 'bitty.com') -Force
+            Copy-Item -Path $ico -Destination (Join-Path $zipStage 'bitty.ico') -Force
+            $zipItems = @(
+              (Join-Path $zipStage 'bitty.exe'),
+              (Join-Path $zipStage 'bitty.com'),
+              (Join-Path $zipStage 'bitty.ico')
+            )
+            foreach ($archName in @('x86_64', 'aarch64')) {
+              $zip = Join-Path $rel "bitty-$v-windows-$archName.zip"
+              Compress-Archive -Path $zipItems -DestinationPath $zip -Force
+              $zipHash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+              Set-Content -Path "$zip.sha256" -Value "$zipHash  bitty-$v-windows-$archName.zip"
+            }
           }
-          $armRel = Join-Path $cdn "releases\v$version"
-          $armPayload = Join-Path $armRel 'bitty-aarch64-pc-windows-msvc.exe'
-          Copy-Item -Path $exe -Destination $armPayload
-          $armHash = (Get-FileHash -Path $armPayload -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path "$armPayload.sha256" -Value "$armHash  bitty-aarch64-pc-windows-msvc.exe"
           Set-Content -Path (Join-Path $cdn 'health.txt') -Value 'ok'
           $listener = New-Object -TypeName System.Net.Sockets.TcpListener -ArgumentList @([System.Net.IPAddress]::Loopback, 0)
           $listener.Start()
@@ -1983,9 +2067,14 @@ jobs:
             if (-not $ready) { throw "local CDN server did not start on $base" }
             $log = (& $script -Version $version -Target x64 -CdnBase $base -InstallDir $installDir *>&1) -join "`n"
             $installedExe = Join-Path $installDir 'bitty.exe'
+            $installedCom = Join-Path $installDir 'bitty.com'
             $installedIco = Join-Path $installDir 'bitty.ico'
             $uninstaller = Join-Path $installDir 'uninstall.ps1'
             if (-not (Test-Path $installedExe)) { throw 'install.ps1 did not install bitty.exe' }
+            # bitty#3224: the console companion is part of the install contract;
+            # its smoke (inside install.ps1) is what proves a shell launch blocks.
+            if (-not (Test-Path $installedCom)) { throw 'install.ps1 did not install bitty.com next to the exe' }
+            if ($log -notmatch 'smoke OK \(via bitty.com\)') { throw "install smoke did not run through bitty.com: $log" }
             if (-not (Test-Path $installedIco)) { throw 'install.ps1 did not install bitty.ico next to the exe' }
             if (-not (Test-Path $uninstaller)) { throw 'install.ps1 did not write uninstall.ps1' }
             if (-not (Test-Path (Join-Path $installDir 'bitty-install-state.json'))) { throw 'install.ps1 did not write the install state' }
@@ -2062,9 +2151,12 @@ jobs:
             Write-Host '-NoRegistry OK (no entry, uninstaller still generated and usable)'
             $armDir = Join-Path $root 'arm64'
             & $script -Version $version -Target arm64 -CdnBase $base -InstallDir $armDir -NoShortcut -NoPathUpdate -NoRegistry *>&1 | Out-Null
-            if (-not (Test-Path (Join-Path $armDir 'bitty.exe'))) { throw 'arm64 bare-exe install did not install bitty.exe' }
-            if (Test-Path (Join-Path $armDir 'bitty.ico')) { throw 'arm64 bare-exe install must not fabricate bitty.ico' }
-            Write-Host 'arm64 bare-exe install OK (falls back to the exe icon)'
+            # bitty#3224: arm64 ships the same portable ZIP, so the console
+            # companion installs next to the GUI binary here too.
+            if (-not (Test-Path (Join-Path $armDir 'bitty.exe'))) { throw 'arm64 install did not install bitty.exe' }
+            if (-not (Test-Path (Join-Path $armDir 'bitty.com'))) { throw 'arm64 install did not install bitty.com' }
+            if (-not (Test-Path (Join-Path $armDir 'bitty.ico'))) { throw 'arm64 install did not install bitty.ico' }
+            Write-Host 'arm64 ZIP install OK (bitty.exe + bitty.com + bitty.ico)'
             Write-Host 'install.ps1 app-list behaviour OK'
           } finally {
             if ($null -eq $originalPath) {

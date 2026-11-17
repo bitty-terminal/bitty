@@ -65,6 +65,22 @@ fn column_value(children: Vec<LuaValue>) -> LuaValue {
     ])
 }
 
+fn row_value(children: Vec<LuaValue>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("Row".to_string())),
+        ("children", LuaValue::array(children)),
+    ])
+}
+
+fn bordered_block_value(child: LuaValue, style: Vec<(&str, LuaValue)>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("Block".to_string())),
+        ("border", LuaValue::table([("width", LuaValue::Integer(1))])),
+        ("child", child),
+        ("style", style_table(style)),
+    ])
+}
+
 fn style_table(style: Vec<(&str, LuaValue)>) -> LuaValue {
     LuaValue::Table(
         style
@@ -328,6 +344,17 @@ fn an_unstyled_tree_and_a_zero_height_declaration_paint_the_same_list() {
 fn a_height_declaration_never_moves_a_sibling_on_the_other_axis() {
     // The vertical pair bounds the node's own extent only: it must not touch the
     // horizontal flow, which is the width pair's and `gap`'s business.
+    let row = row_value(vec![
+        styled_text_value("ab", height_range(3, 5)),
+        text_value("cd"),
+    ]);
+    let paint = paint_of(&read_and_mount(&row).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "ab".to_string()), (0, 2, "cd".to_string())],
+        "a vertical floor taller than the child keeps the horizontal sibling at column 2"
+    );
+
     let flat = column_value(vec![
         styled_text_value("ab", height_range(1, 3)),
         text_value("cd"),
@@ -338,6 +365,50 @@ fn a_height_declaration_never_moves_a_sibling_on_the_other_axis() {
         vec![(0, 0, "ab".to_string()), (1, 0, "cd".to_string())],
         "a height range at the measured value changes no coordinate"
     );
+}
+
+#[test]
+fn a_capped_bordered_block_never_paints_into_the_next_column_sibling() {
+    let tree = column_value(vec![
+        bordered_block_value(
+            text_value("boxed"),
+            vec![("max_height", LuaValue::Integer(1))],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&tree).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(1, 0, "Z".to_string())],
+        "sibling starts on row 1 after the 1-row capped Block"
+    );
+    let cell = surface().cell;
+    let capped_alloc = RectPx::new(0, 0, 7 * cell.width, cell.height);
+    let sibling_alloc = RectPx::new(
+        0,
+        i32::try_from(cell.height).unwrap(),
+        cell.width,
+        cell.height,
+    );
+    let fills: Vec<RectPx> = paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Fill { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert!(!fills.is_empty(), "top/side border segments still paint");
+    for fill in &fills {
+        assert!(
+            capped_alloc.contains_rect(fill),
+            "border fill {fill:?} escaped the 1-row capped Block allocation {capped_alloc:?}"
+        );
+        assert!(
+            fill.intersection(&sibling_alloc).is_none(),
+            "border fill {fill:?} overlapped the sibling allocation {sibling_alloc:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

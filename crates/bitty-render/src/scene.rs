@@ -1830,7 +1830,11 @@ impl Painter {
     ) -> Result<(), ScenePaintError> {
         let full = self.cell_rect(x, y, frame.cols, frame.rows);
         let aligned = self.surface.aligned_rect();
-        if full.intersection(&aligned).is_none() {
+        let allocated = self.cell_rect(x, y, available.cols, available.rows);
+        let Some(clip) = aligned.intersection(&allocated) else {
+            return Ok(());
+        };
+        if full.intersection(&clip).is_none() {
             return Ok(());
         }
         let horizontal = u32::from(inset)
@@ -1840,11 +1844,12 @@ impl Painter {
             .saturating_mul(self.surface.cell.width)
             .min(full.width);
         // Segments are anchored on the block's true frame, then intersected
-        // with the leaf. Top/left always paint (clipped to the visible part);
-        // the bottom and right edges only paint when the frame actually ends
-        // inside the extent this node was allocated, so a clipped block never
-        // draws its edge on the clip boundary and never bleeds past the
-        // allocation into a sibling.
+        // with both the leaf (`aligned`) and the child's allocation rect.
+        // Top/left always paint (clipped to the visible part); the bottom and
+        // right edges only paint when the frame actually ends inside the
+        // extent this node was allocated, so a clipped block never draws its
+        // edge on the clip boundary and never bleeds past the allocation into
+        // a sibling.
         let top = RectPx::new(full.x, full.y, full.width, horizontal);
         let bottom = RectPx::new(
             full.x,
@@ -1869,7 +1874,7 @@ impl Painter {
             (frame.cols <= available.cols).then_some(right),
         ];
         for segment in segments.into_iter().flatten() {
-            let Some(clipped) = segment.intersection(&aligned) else {
+            let Some(clipped) = segment.intersection(&clip) else {
                 continue;
             };
             if !clipped.is_empty() {

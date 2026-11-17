@@ -831,3 +831,111 @@ fn a_zero_height_range_is_byte_identical_to_an_undeclared_one() {
     // `constrain_height` is the identity for an undeclared range.
     assert_eq!(encode(&declared), encode(&plain));
 }
+
+#[test]
+fn a_capped_bordered_block_never_paints_its_border_into_a_column_sibling() {
+    // A cell-bordered `Block` around one line measures 3 rows high; capping
+    // it to `max_height = 1` allocates it 1 row in the `Column` and places the
+    // following sibling on row 1. Its border segments must clip to that 1-row
+    // allocation instead of bleeding down into the sibling's rows.
+    let node = SceneNode::Column(vec![
+        styled(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_height_range(0, 1),
+            SceneNode::Block {
+                border: Some(Border {
+                    width: 1,
+                    color: String::new(),
+                }),
+                child: Box::new(text("boxed")),
+            },
+        ),
+        text("sibling"),
+    ]);
+    let paint = paint(node);
+    let x0 = surface().rect.x;
+    let y0 = surface().rect.y;
+    let cw = cell().width;
+    let ch = cell().height;
+    let capped_alloc = RectPx::new(x0, y0, 7 * cw, ch);
+    let sibling_alloc = RectPx::new(x0, y0 + i32::try_from(ch).unwrap(), 7 * cw, ch);
+
+    let fills: Vec<RectPx> = paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Fill { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !fills.is_empty(),
+        "visible top/side border segments still paint"
+    );
+    for fill in &fills {
+        assert!(
+            capped_alloc.contains_rect(fill),
+            "border segment {fill:?} bled past the capped 1-row allocation {capped_alloc:?}"
+        );
+        assert!(
+            fill.intersection(&sibling_alloc).is_none(),
+            "border segment {fill:?} overlapped the column sibling {sibling_alloc:?}"
+        );
+    }
+    assert_eq!(
+        text_ops(&paint),
+        vec![(1, 0, "sibling".to_string())],
+        "the sibling starts on row 1 after the capped block"
+    );
+}
+
+#[test]
+fn a_width_capped_bordered_block_never_paints_its_border_into_a_row_sibling() {
+    // Mirror on the horizontal axis: capping a cell-bordered `Block` to
+    // `max_width = 1` in a `Row` must clip top/bottom segments to 1 column so
+    // they do not bleed into the following sibling at column 1.
+    let node = SceneNode::Row(vec![
+        styled(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_width_range(0, 1),
+            SceneNode::Block {
+                border: Some(Border {
+                    width: 1,
+                    color: String::new(),
+                }),
+                child: Box::new(text("boxed")),
+            },
+        ),
+        text("Z"),
+    ]);
+    let paint = paint(node);
+    let x0 = surface().rect.x;
+    let y0 = surface().rect.y;
+    let cw = cell().width;
+    let ch = cell().height;
+    let capped_alloc = RectPx::new(x0, y0, cw, 3 * ch);
+    let sibling_alloc = RectPx::new(x0 + i32::try_from(cw).unwrap(), y0, cw, ch);
+
+    let fills: Vec<RectPx> = paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Fill { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    assert!(!fills.is_empty(), "visible border segments still paint");
+    for fill in &fills {
+        assert!(
+            capped_alloc.contains_rect(fill),
+            "border segment {fill:?} bled past the capped 1-col allocation {capped_alloc:?}"
+        );
+        assert!(
+            fill.intersection(&sibling_alloc).is_none(),
+            "border segment {fill:?} overlapped the row sibling {sibling_alloc:?}"
+        );
+    }
+    assert_eq!(
+        text_ops(&paint),
+        vec![(0, 1, "Z".to_string())],
+        "the sibling starts on column 1 after the width-capped block"
+    );
+}

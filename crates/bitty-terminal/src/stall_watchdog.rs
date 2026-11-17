@@ -1171,10 +1171,16 @@ impl Shared {
     }
 
     fn mark(&self, phase: Phase, active: bool) {
-        self.phase.store(phase as u8, Ordering::Relaxed);
-        self.active.store(active, Ordering::Relaxed);
+        // Store `last_beat_ns` first, then release `phase`, `active`, and
+        // `progress`. Any monitor poll that acquires the new `phase` or
+        // `active` (even before `progress` bumps) is guaranteed by the
+        // Release/Acquire happens-before edge to observe the refreshed
+        // `last_beat_ns`, preventing `old progress + new phase/active + stale
+        // last_beat_ns` from triggering a spurious stall report.
         self.last_beat_ns
             .store(self.elapsed_ns(), Ordering::Relaxed);
+        self.phase.store(phase as u8, Ordering::Release);
+        self.active.store(active, Ordering::Release);
         // bitty#3211 seam: the publish is not atomic, so a poll can observe
         // `active` already stored while `progress` is still the old count.
         // Production widens that gap only by preemption; the test hook makes
@@ -1187,7 +1193,10 @@ impl Shared {
                 std::thread::sleep(Duration::from_millis(gap_ms));
             }
         }
-        self.progress.fetch_add(1, Ordering::Relaxed);
+        // Release pairs with the monitor's Acquire loads of `progress` so
+        // weak-memory CPUs (ARM64) cannot expose the bumped count before the
+        // updated `last_beat_ns`, `phase`, and `active` stores above.
+        self.progress.fetch_add(1, Ordering::Release);
     }
 
     fn idle_for(&self) -> Duration {
@@ -1200,8 +1209,8 @@ impl Shared {
     /// Widens the `mark` publish gap for a deterministic recovery test.
     ///
     /// Production only ever sees this gap when a thread is preempted between
-    /// the two relaxed stores; a test sets it to make that interleaving
-    /// certain on every platform (bitty#3211).
+    /// the `active` release and the `progress` bump; a test sets it to make
+    /// that interleaving certain on every platform (bitty#3211).
     #[cfg(test)]
     fn set_publish_gap(&self, gap: Duration) {
         self.publish_gap_ms.store(
@@ -1673,7 +1682,7 @@ impl StallWatchdog {
 
     /// Mark the loop active in `phase` and advance the heartbeat.
     pub(crate) fn enter(&self, phase: Phase) {
-        let was_active = self.shared.active.load(Ordering::Relaxed);
+        let was_active = self.shared.active.load(Ordering::Acquire);
         self.shared.mark(phase, true);
         if !was_active {
             self.stop.notify();
@@ -1694,7 +1703,7 @@ impl StallWatchdog {
 
     /// Mark the loop idle (armed `ControlFlow::Wait`): not a stall.
     pub(crate) fn idle(&self) {
-        let was_active = self.shared.active.load(Ordering::Relaxed);
+        let was_active = self.shared.active.load(Ordering::Acquire);
         self.shared.mark(Phase::Idle, false);
         if was_active {
             self.stop.notify();
@@ -1789,9 +1798,12 @@ fn monitor_loop(
     sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
 ) {
     let initial_gauges = shared.gauges.snapshot();
+    // Release/Acquire on `progress` prevents ARM64/weak-memory reordering
+    // between observing `progress` (`take_advance`) and reading updated
+    // `active`/`phase`/`last_beat_ns`.
     let mut state = MonitorState::new(
         Instant::now(),
-        shared.progress.load(Ordering::Relaxed),
+        shared.progress.load(Ordering::Acquire),
         shared.presented_frames.load(Ordering::Relaxed),
         initial_gauges.tick_count,
     );
@@ -1827,7 +1839,9 @@ fn monitor_loop(
         // ends here delivers its recovery line immediately; the report paths
         // below can spend the whole delivery budget, and nothing may sit
         // between the loop moving again and the line that says so.
-        let progress = shared.progress.load(Ordering::Relaxed);
+        // Release/Acquire on `progress` prevents ARM64/weak-memory reordering
+        // between `take_advance` and observing updated `active`/`phase`/`last_beat_ns`.
+        let progress = shared.progress.load(Ordering::Acquire);
         if let Some(recovery) = state.take_advance(now, progress) {
             if stop.is_stopped() {
                 return;
@@ -1842,7 +1856,10 @@ fn monitor_loop(
                 last_signal_at = Some(now);
                 let stale =
                     state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
-                let sampled_phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
+                // Acquire pairs with `Shared::mark`'s Release store so
+                // `sampled_phase` cannot pair with a stale `last_beat_ns`
+                // loaded in `idle_for()` below.
+                let sampled_phase = Phase::from_u8(shared.phase.load(Ordering::Acquire));
                 let report = build_report(
                     shared,
                     config,
@@ -1866,8 +1883,12 @@ fn monitor_loop(
                 // operator is inspecting, even with the debug abort armed.
             }
         }
-        let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
-        let active = shared.active.load(Ordering::Relaxed);
+        // Acquire `phase` and `active` before `idle_for()` so `Shared::mark`'s
+        // Release stores establish happens-before from the refreshed
+        // `last_beat_ns` store and a poll cannot evaluate a new `phase`/`active`
+        // against a stale `last_beat_ns` before `progress` bumps.
+        let phase = Phase::from_u8(shared.phase.load(Ordering::Acquire));
+        let active = shared.active.load(Ordering::Acquire);
         let idle = shared.idle_for();
         let bound = config.bound_for(phase);
         // One gauge sample per poll drives the parked-work bitset and the
@@ -2137,7 +2158,7 @@ fn build_report(
         idle: sample.idle,
         phase: sample.phase,
         app_uptime: now.saturating_duration_since(shared.start),
-        progress: shared.progress.load(Ordering::Relaxed),
+        progress: shared.progress.load(Ordering::Acquire),
         context: shared.context.try_lock().ok().map(|slot| slot.clone()),
         pending: PendingWork::from_gauges(&gauges),
         present_stale_ms: present_stale
@@ -6576,6 +6597,63 @@ mod tests {
             "the recovery line must name the phase that stalled: {recovered}"
         );
         watchdog.shared.set_publish_gap(Duration::ZERO);
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// CTX-1869: waking from a long idle into an active phase must refresh
+    /// `last_beat_ns` before releasing `phase` and `active`.
+    ///
+    /// With `publish_gap` inserted between `active.store(true, Release)` and
+    /// `progress.fetch_add(1, Release)`, a monitor poll in the gap sees the old
+    /// `progress` alongside the new `phase` and `active`. Because `last_beat_ns`
+    /// was already written before those releases, the poll observes a fresh
+    /// beat (`idle < threshold`) and emits no spurious stall report.
+    #[test]
+    fn enter_after_long_idle_emits_no_spurious_report_in_publish_gap() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(600),
+            Arc::new(HangGauges::new()),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.idle();
+        while !watchdog.shared.idle_parked.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // Let the idle `last_beat_ns` age past the 600 ms stall threshold.
+        std::thread::sleep(Duration::from_millis(650));
+        // Keep the gap longer than `poll_interval` (100 ms) so the monitor
+        // polls inside the gap, yet well under the 600 ms stall threshold so
+        // the enter itself never becomes a genuine stall.
+        watchdog.shared.set_publish_gap(Duration::from_millis(250));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                watchdog.enter(Phase::RuntimeTick);
+            });
+            // Wait until `mark` releases `active = true` (still inside the gap
+            // before `progress` bumps), then wake the monitor so it samples
+            // `old progress + new phase/active`.
+            while !watchdog.shared.active.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            let polls_before = watchdog.shared.polls.load(Ordering::Relaxed);
+            watchdog.stop.notify();
+            while watchdog.shared.polls.load(Ordering::Relaxed) == polls_before {
+                std::thread::yield_now();
+            }
+        });
+        watchdog.shared.set_publish_gap(Duration::ZERO);
+        watchdog.idle();
+        assert_eq!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "entering an active phase after a long idle must not emit a spurious report"
+        );
         watchdog
             .stop_and_join()
             .expect("monitor thread must exit cleanly");

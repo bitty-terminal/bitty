@@ -183,6 +183,16 @@ pub const SCENE_STYLE_MAX_BORDER_PX: u16 = 16;
 /// clamped.
 pub const SCENE_STYLE_MAX_WIDTH_CELLS: u16 = 1000;
 
+/// Inclusive maximum content height in cells for `min_height_cells` /
+/// `max_height_cells`.
+///
+/// Reuses the same accepted grid-dimension bound as
+/// [`SCENE_STYLE_MAX_WIDTH_CELLS`] (`bitty_term_state::MAX_GRID_DIM` bounds both
+/// axes) and mirrors `bitty_lua::ui_style::UI_STYLE_MAX_HEIGHT_CELLS`, so a
+/// value the wire parser accepts cannot be refused one layer later. A
+/// declaration past it is refused, never clamped.
+pub const SCENE_STYLE_MAX_HEIGHT_CELLS: u16 = 1000;
+
 /// Inclusive maximum sibling gap in cells for `gap_cells`.
 ///
 /// Reuses the accepted `decoration.content_inset` upper bound (`0..=32`), the
@@ -362,8 +372,29 @@ pub enum SceneStyleError {
         /// The cap that was exceeded.
         cap: u16,
     },
+    /// A minimum content height exceeds [`SCENE_STYLE_MAX_HEIGHT_CELLS`].
+    MinHeightOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// A maximum content height exceeds [`SCENE_STYLE_MAX_HEIGHT_CELLS`].
+    MaxHeightOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
     /// The declared width floor exceeds the declared width cap.
     WidthRangeInverted {
+        /// Declared floor, in cells.
+        min: u16,
+        /// Declared cap, in cells.
+        max: u16,
+    },
+    /// A declared height floor exceeds the declared height cap.
+    HeightRangeInverted {
         /// Declared floor, in cells.
         min: u16,
         /// Declared cap, in cells.
@@ -402,6 +433,18 @@ impl std::fmt::Display for SceneStyleError {
                     "scene style width range is inverted: min_width {min} > max_width {max}"
                 )
             }
+            Self::MinHeightOverCap { found, cap } => {
+                write!(f, "scene style min_height exceeds cap: {found} > {cap}")
+            }
+            Self::MaxHeightOverCap { found, cap } => {
+                write!(f, "scene style max_height exceeds cap: {found} > {cap}")
+            }
+            Self::HeightRangeInverted { min, max } => {
+                write!(
+                    f,
+                    "scene style height range is inverted: min_height {min} > max_height {max}"
+                )
+            }
             Self::GapOverCap { found, cap } => {
                 write!(f, "scene style gap exceeds cap: {found} > {cap}")
             }
@@ -425,6 +468,8 @@ impl std::error::Error for SceneStyleError {}
 /// | `border_token`  | closed set  | `content.foreground`  | —    |
 /// | `min_width_cells` | cells     | `0` (no floor)        | `1000` |
 /// | `max_width_cells` | cells     | `0` (no cap)          | `1000` |
+/// | `min_height_cells` | cells    | `0` (no floor)        | `1000` |
+/// | `max_height_cells` | cells    | `0` (no cap)          | `1000` |
 /// | `gap_cells`     | cells       | `0` (no spacing)      | `32` |
 /// | `align`         | closed set  | `start`               | —    |
 ///
@@ -438,6 +483,12 @@ impl std::error::Error for SceneStyleError {}
 /// the width the child is measured and painted at, inside `padding_cells` — and
 /// are applied by [`Self::constrain_width`], which the measure and paint paths
 /// call. `0` means "no constraint" on that side.
+///
+/// `min_height_cells` and `max_height_cells` are the same declaration on the
+/// other axis and are applied by [`Self::constrain_height`]: a floor raises the
+/// frame the node paints, and a cap narrows the rows handed to the child. `0`
+/// means "no constraint" on that side, and an inverted range is refused by
+/// [`Self::validate`] rather than swapped.
 ///
 /// `gap_cells` is the spacing between **adjacent siblings**, applied by the
 /// measure and paint paths of the container the style wraps: it is inserted
@@ -469,6 +520,10 @@ pub struct SceneNodeStyle {
     pub min_width_cells: u16,
     /// Maximum content width in cells; `0` declares no cap.
     pub max_width_cells: u16,
+    /// Minimum content height in cells; `0` declares no floor.
+    pub min_height_cells: u16,
+    /// Maximum content height in cells; `0` declares no cap.
+    pub max_height_cells: u16,
     /// Spacing between adjacent siblings, in cells; `0` declares no spacing.
     pub gap_cells: u16,
     /// Cross-axis placement of the direct children; `Start` is today's walk.
@@ -476,9 +531,9 @@ pub struct SceneNodeStyle {
 }
 
 impl SceneNodeStyle {
-    /// The flat style: no padding, no radius, no border, no width constraint,
-    /// no sibling gap, and children at the start edge. A flat style paints no
-    /// operation and measures exactly like an unstyled node.
+    /// The flat style: no padding, no radius, no border, no width or height
+    /// constraint, no sibling gap, and children at the start edge. A flat style
+    /// paints no operation and measures exactly like an unstyled node.
     pub const FLAT: Self = Self {
         padding_cells: 0,
         radius_px: 0,
@@ -486,14 +541,16 @@ impl SceneNodeStyle {
         border_token: ContentToken::Foreground,
         min_width_cells: 0,
         max_width_cells: 0,
+        min_height_cells: 0,
+        max_height_cells: 0,
         gap_cells: 0,
         align: SceneStyleAlign::Start,
     };
 
     /// Builds a style declaration; bounds are checked by [`Self::validate`].
     ///
-    /// The width range starts unconstrained (`0`/`0`); declare one with
-    /// [`Self::with_width_range`].
+    /// The width and height ranges start unconstrained (`0`/`0`); declare one
+    /// with [`Self::with_width_range`] or [`Self::with_height_range`].
     #[must_use]
     pub const fn new(
         padding_cells: u16,
@@ -508,6 +565,8 @@ impl SceneNodeStyle {
             border_token,
             min_width_cells: 0,
             max_width_cells: 0,
+            min_height_cells: 0,
+            max_height_cells: 0,
             gap_cells: 0,
             align: SceneStyleAlign::Start,
         }
@@ -519,6 +578,15 @@ impl SceneNodeStyle {
     pub const fn with_width_range(mut self, min_width_cells: u16, max_width_cells: u16) -> Self {
         self.min_width_cells = min_width_cells;
         self.max_width_cells = max_width_cells;
+        self
+    }
+
+    /// Declares a content-box height range in cells (`0` = unbounded on that
+    /// side); bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn with_height_range(mut self, min_height_cells: u16, max_height_cells: u16) -> Self {
+        self.min_height_cells = min_height_cells;
+        self.max_height_cells = max_height_cells;
         self
     }
 
@@ -557,6 +625,27 @@ impl SceneNodeStyle {
             width = self.max_width_cells;
         }
         width
+    }
+
+    /// Applies the declared height range to a measured content height.
+    ///
+    /// The vertical twin of [`Self::constrain_width`], with the same two-sided
+    /// rule: a floor raises the extent (a one-line child can claim a taller
+    /// frame) and a cap lowers it (the child paints into fewer rows). `0` on a
+    /// side is unbounded, and a validated declaration never inverts, so the
+    /// order of the two steps cannot matter. Callers still clip against the
+    /// allocation they were handed, so a floor the slot cannot fit is a clip and
+    /// never an overflow.
+    #[must_use]
+    pub const fn constrain_height(self, rows: u16) -> u16 {
+        let mut height = rows;
+        if self.min_height_cells > 0 && height < self.min_height_cells {
+            height = self.min_height_cells;
+        }
+        if self.max_height_cells > 0 && height > self.max_height_cells {
+            height = self.max_height_cells;
+        }
+        height
     }
 
     /// Checks every field against its inclusive cap.
@@ -605,6 +694,27 @@ impl SceneNodeStyle {
                 max: self.max_width_cells,
             });
         }
+        if self.min_height_cells > SCENE_STYLE_MAX_HEIGHT_CELLS {
+            return Err(SceneStyleError::MinHeightOverCap {
+                found: self.min_height_cells,
+                cap: SCENE_STYLE_MAX_HEIGHT_CELLS,
+            });
+        }
+        if self.max_height_cells > SCENE_STYLE_MAX_HEIGHT_CELLS {
+            return Err(SceneStyleError::MaxHeightOverCap {
+                found: self.max_height_cells,
+                cap: SCENE_STYLE_MAX_HEIGHT_CELLS,
+            });
+        }
+        if self.min_height_cells > 0
+            && self.max_height_cells > 0
+            && self.min_height_cells > self.max_height_cells
+        {
+            return Err(SceneStyleError::HeightRangeInverted {
+                min: self.min_height_cells,
+                max: self.max_height_cells,
+            });
+        }
         if self.gap_cells > SCENE_STYLE_MAX_GAP_CELLS {
             return Err(SceneStyleError::GapOverCap {
                 found: self.gap_cells,
@@ -616,7 +726,8 @@ impl SceneNodeStyle {
 
     /// True when no geometry is claimed; the border token is then inert.
     ///
-    /// A declared width range is geometry: it sizes the node. A declared gap is
+    /// A declared width range is geometry: it sizes the node. A declared height
+    /// range is geometry for the same reason. A declared gap is
     /// geometry too: it moves a sibling. A non-`start` align is geometry as
     /// well: it moves every child, where `start` is exactly today's offset-zero
     /// walk.
@@ -627,6 +738,8 @@ impl SceneNodeStyle {
             && self.border_px == 0
             && self.min_width_cells == 0
             && self.max_width_cells == 0
+            && self.min_height_cells == 0
+            && self.max_height_cells == 0
             && self.gap_cells == 0
             && matches!(self.align, SceneStyleAlign::Start)
     }

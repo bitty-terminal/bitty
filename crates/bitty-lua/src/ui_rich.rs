@@ -48,7 +48,8 @@
 //!
 //! Any kind may carry an optional `style` table — the bounded primitive set
 //! from [`crate::ui_style`] (`padding`, `radius`, `border`, `border_token`,
-//! `min_width`, `max_width`, `gap`, `align`). A non-flat style lowers to the additive
+//! `min_width`, `max_width`, `min_height`, `max_height`, `gap`, `align`). A
+//! non-flat style lowers to the additive
 //! `SceneNode::Styled` wrapper, so the existing measure and paint path applies
 //! it; a flat one lowers to nothing. `style` is a modifier, not a tenth kind:
 //! [`UiRichNode::kind`] still reports the wrapped node's kind and
@@ -59,6 +60,13 @@
 //! path to apply the bound. Both are bounded by
 //! [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`], and a floor above the cap is
 //! refused rather than reordered.
+//!
+//! `min_height`/`max_height` are the vertical half of the same size vocabulary
+//! (content box, cells, `0` = unbounded on that side, cap
+//! [`crate::ui_style::UI_STYLE_MAX_HEIGHT_CELLS`]). Any kind may declare them:
+//! a height is the node's own extent, not a relation between siblings, so the
+//! `gap`/`align` kind guard does not apply. An inverted height range is refused
+//! exactly like an inverted width range.
 //!
 //! `gap` is the spacing between adjacent siblings in cells
 //! ([`crate::ui_style::UI_STYLE_MAX_GAP_CELLS`], inclusive). It is only
@@ -101,6 +109,7 @@
 //! | language hint | [`UI_RICH_MAX_LANG_BYTES`] (32) | bridge budget |
 //! | style padding / radius / border | `32` / `16` / `16` | [`crate::ui_style`] caps |
 //! | style min/max width | `1000` cells | [`crate::ui_style::UI_STYLE_MAX_WIDTH_CELLS`] |
+//! | style min/max height | `1000` cells | [`crate::ui_style::UI_STYLE_MAX_HEIGHT_CELLS`] |
 //! | style gap | `32` cells | [`crate::ui_style::UI_STYLE_MAX_GAP_CELLS`] |
 //!
 //! Structural elements count against the node budget exactly like the

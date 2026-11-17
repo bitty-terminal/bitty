@@ -60,6 +60,11 @@
 //! `SceneNodeStyle::constrain_width`. The plugin never computes a width and the
 //! bridge never re-orders the pair; an inverted range was refused at parse.
 //!
+//! `style.min_height_cells`/`max_height_cells` (the content-box height range)
+//! cross unchanged for the same reason, and the Core measure and paint paths
+//! apply them through `SceneNodeStyle::constrain_height`. A floor the slot
+//! cannot fit is a clip at the allocation, never an overflow.
+//!
 //! `style.gap_cells` (the spacing between adjacent siblings) crosses unchanged
 //! for the same reason: the wire parser has already refused it on a kind with no
 //! sibling axis, and the Core measure and paint walk insert it, so the plugin
@@ -161,7 +166,7 @@ pub fn scene_node_of(node: &UiRichNode) -> SceneNode {
 
 /// Maps one bounded wire style onto the scene model's style data.
 ///
-/// Total and lossless: the eight wire keys and the six content tokens are the
+/// Total and lossless: the ten wire keys and the six content tokens are the
 /// same vocabulary on both sides, pinned name-for-name by
 /// `tests/scene_style_vocabulary.rs`. Caps were already enforced at parse, and
 /// the scene admission boundary re-checks them, so a value that reaches the
@@ -182,6 +187,7 @@ fn scene_style_of(style: UiNodeStyle) -> SceneNodeStyle {
         },
     )
     .with_width_range(style.min_width_cells, style.max_width_cells)
+    .with_height_range(style.min_height_cells, style.max_height_cells)
     .with_gap(style.gap_cells)
     .with_align(match style.align {
         UiStyleAlign::Start => SceneStyleAlign::Start,
@@ -417,6 +423,50 @@ mod tests {
             SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
         ));
         assert_eq!(scene.len(), 0, "the refused block was never stored");
+    }
+
+    #[test]
+    fn a_styled_height_range_crosses_the_bridge_unchanged() {
+        // bitty#2191: the vertical size pair is the same declaration the width
+        // pair is, so the bridge carries both numbers losslessly and the scene
+        // model re-checks them at admission.
+        let node = UiRichNode::Styled {
+            style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_height_range(2, 5),
+            child: Box::new(text("a")),
+        };
+        match scene_node_of(&node) {
+            SceneNode::Styled { style, child } => {
+                assert_eq!(style.min_height_cells, 2);
+                assert_eq!(style.max_height_cells, 5);
+                assert!(matches!(*child, SceneNode::Text(_)));
+            }
+            other => panic!("expected a styled scene node, got {other:?}"),
+        }
+
+        // A hand-built out-of-range declaration is refused at admission too: the
+        // wire parser is not the only gate.
+        let over_cap = UiRichNode::Styled {
+            style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_height_range(0, 1001),
+            child: Box::new(text("a")),
+        };
+        let mut scene = Scene::new();
+        let error = mount(&mut scene, 1, &over_cap).expect_err("refused at admission");
+        assert!(matches!(
+            error,
+            SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
+        ));
+        assert_eq!(scene.len(), 0, "the refused block was never stored");
+
+        let inverted = UiRichNode::Styled {
+            style: UiNodeStyle::new(0, 0, 0, UiBorderToken::Foreground).with_height_range(6, 2),
+            child: Box::new(text("a")),
+        };
+        let error = mount(&mut scene, 1, &inverted).expect_err("refused at admission");
+        assert!(matches!(
+            error,
+            SceneBridgeError::Admission(SceneError::StyleInvalid { .. })
+        ));
+        assert_eq!(scene.len(), 0);
     }
 
     #[test]

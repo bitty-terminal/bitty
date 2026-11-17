@@ -76,7 +76,7 @@
 //! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
 //! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
-//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells`, `style.gap_cells` of spacing between the wrapped container's adjacent siblings, and `style.align` placing those siblings on the cross axis inside that content box |
+//! | `Styled` | `style.padding_cells` cells of inset on every side around the child, with the child's content width bounded by `style.min_width_cells`/`max_width_cells`, its content height bounded by `style.min_height_cells`/`max_height_cells`, `style.gap_cells` of spacing between the wrapped container's adjacent siblings, and `style.align` placing those siblings on the cross axis inside that content box |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
 //! | `List` | one row per item, prefixed `"- "` or `"N. "` when ordered |
@@ -1321,16 +1321,20 @@ impl Painter {
                 let style = paint_style(*style)?;
                 let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
                 let inset = style.padding_cells.saturating_mul(2);
-                // The declared width range bounds the content box, so it is
-                // applied to the measured child width and the padding is added
-                // outside it. `constrain_width` is the identity for an
-                // undeclared range, so an unstyled tree measures unchanged.
+                // The declared width and height ranges bound the content box, so
+                // they are applied to the measured child extent and the padding
+                // is added outside them. Both `constrain_*` calls are the
+                // identity for an undeclared range, so an unstyled tree measures
+                // unchanged.
                 Size {
                     cols: style
                         .constrain_width(inner.cols)
                         .saturating_add(inset)
                         .min(cols),
-                    rows: inner.rows.saturating_add(inset).min(rows),
+                    rows: style
+                        .constrain_height(inner.rows)
+                        .saturating_add(inset)
+                        .min(rows),
                 }
             }
             SceneNode::CodeBlock(model) => {
@@ -1582,13 +1586,13 @@ impl Painter {
                 let style = paint_style(*style)?;
                 let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
                 let double = style.padding_cells.saturating_mul(2);
-                // The declared width range feeds the ring's own frame too: a
-                // node that asked for at least (or at most) `N` content cells
-                // is framed at that width plus its padding, so the stroke and
-                // the content agree about the box.
+                // The declared width and height ranges feed the ring's own frame
+                // too: a node that asked for at least (or at most) `N` content
+                // cells is framed at that extent plus its padding, so the stroke
+                // and the content agree about the box.
                 let frame = Size {
                     cols: style.constrain_width(inner.cols).saturating_add(double),
-                    rows: inner.rows.saturating_add(double),
+                    rows: style.constrain_height(inner.rows).saturating_add(double),
                 };
                 if style.border_px > 0 {
                     // One ring op, painted inside the node's own frame. The
@@ -1614,16 +1618,23 @@ impl Painter {
                         }
                     }
                 }
-                // The content allocation never exceeds the declared cap: a
+                // The content allocation never exceeds either declared cap: a
                 // `max_width` shrinks the width handed to the child (a text
-                // line is clipped to it, a row advances by it), and an
-                // undeclared cap leaves today's allocation byte for byte. A
-                // declared floor only widens the measured extent, so it needs
-                // no change here: painting clamps to the allocation anyway.
+                // line is clipped to it, a row advances by it), a `max_height`
+                // shrinks the rows handed to the child (the walk stops at the
+                // row bound), and an undeclared cap leaves today's allocation
+                // byte for byte. A declared floor only widens the measured
+                // extent, so it needs no change here: painting clamps to the
+                // allocation anyway.
                 let content_cols = if style.max_width_cells > 0 {
                     width.saturating_sub(double).min(style.max_width_cells)
                 } else {
                     width.saturating_sub(double)
+                };
+                let content_rows = if style.max_height_cells > 0 {
+                    height.saturating_sub(double).min(style.max_height_cells)
+                } else {
+                    height.saturating_sub(double)
                 };
                 // The cross-axis placement basis is the node's own content box:
                 // the declared width range after padding, clipped to the
@@ -1635,9 +1646,9 @@ impl Painter {
                     gap_cells: style.gap_cells,
                     align: style.align,
                     cols: content_cols.min(style.constrain_width(inner.cols)),
-                    rows: height.saturating_sub(double).min(inner.rows),
+                    rows: content_rows.min(style.constrain_height(inner.rows)),
                 };
-                if width > double && height > double && content_cols > 0 {
+                if width > double && content_cols > 0 && content_rows > 0 {
                     // Hand the child the allocation minus padding, exactly
                     // like an unstyled node receives its allocation: a flat
                     // style must not narrow a root text line. The gap the style
@@ -1649,7 +1660,7 @@ impl Painter {
                         x.saturating_add(style.padding_cells),
                         y.saturating_add(style.padding_cells),
                         content_cols,
-                        height - double,
+                        content_rows,
                         depth + 1,
                         flow,
                     )?;

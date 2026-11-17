@@ -65,6 +65,19 @@ fn caps_are_identical_on_every_side() {
         scene_model::SCENE_STYLE_MAX_GAP_CELLS
     );
     assert_eq!(wire::UI_STYLE_MAX_GAP_CELLS, 32);
+
+    // The height bound is the same grid-dimension cap on the other axis, and it
+    // mirrors on both sides of the chain for the same reason as the width.
+    assert_eq!(
+        wire::UI_STYLE_MAX_HEIGHT_CELLS,
+        scene_model::SCENE_STYLE_MAX_HEIGHT_CELLS
+    );
+    assert_eq!(wire::UI_STYLE_MAX_HEIGHT_CELLS, 1000);
+    assert_eq!(
+        wire::UI_STYLE_MAX_HEIGHT_CELLS,
+        wire::UI_STYLE_MAX_WIDTH_CELLS,
+        "both axes share one grid-dimension bound"
+    );
 }
 
 #[test]
@@ -116,8 +129,8 @@ fn the_closed_token_set_is_name_for_name_identical() {
 #[test]
 fn the_wire_key_set_is_the_candidate_set() {
     // The closed style key set: the four paint primitives from the candidate
-    // record, the two content-width bounds, the sibling gap, and the cross-axis
-    // child placement (bitty#2191). No more.
+    // record, the two content-width bounds, the two content-height bounds, the
+    // sibling gap, and the cross-axis child placement (bitty#2191). No more.
     assert_eq!(
         wire::UI_STYLE_FIELDS,
         [
@@ -127,6 +140,8 @@ fn the_wire_key_set_is_the_candidate_set() {
             "border_token",
             "min_width",
             "max_width",
+            "min_height",
+            "max_height",
             "gap",
             "align"
         ]
@@ -178,7 +193,7 @@ fn the_two_align_vocabularies_are_closed_and_do_not_mix() {
     // The two surfaces can never meet on one node: the `style` table is hosted
     // on `ui.rich`'s terminal slot, where no node is the band root, so neither
     // vocabulary needs a precedence rule against the other.
-    assert_eq!(wire::UI_STYLE_FIELDS.len(), 8);
+    assert_eq!(wire::UI_STYLE_FIELDS.len(), 10);
     assert!(
         wire::UI_STYLE_FIELDS.contains(&"align"),
         "the placement key is the style table's"
@@ -256,6 +271,14 @@ fn the_wire_flat_style_is_the_scene_flat_style() {
     assert_eq!(
         wire::UiNodeStyle::FLAT.max_width_cells,
         scene_flat.max_width_cells
+    );
+    assert_eq!(
+        wire::UiNodeStyle::FLAT.min_height_cells,
+        scene_flat.min_height_cells
+    );
+    assert_eq!(
+        wire::UiNodeStyle::FLAT.max_height_cells,
+        scene_flat.max_height_cells
     );
     assert_eq!(wire::UiNodeStyle::FLAT.gap_cells, scene_flat.gap_cells);
     assert_eq!(

@@ -762,3 +762,72 @@ fn a_start_align_is_byte_identical_to_an_undeclared_one() {
         "a declared start adds no op and moves no child"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Content-box height constraints (bitty#2191)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_height_floor_raises_the_ring_frame_without_inventing_content() {
+    // A one-row child under a 4-row floor: the ring must frame four rows (64 px
+    // at a 16 px cell) while the text stays on row 0. A paint path that parses
+    // the floor but never applies it frames one row (16 px).
+    let node = styled(
+        SceneNodeStyle::new(0, 3, 1, ContentToken::Accent).with_height_range(4, 0),
+        text("a"),
+    );
+    let paint = paint(node);
+    let rings = rings(&paint);
+    assert_eq!(rings.len(), 1, "one ring for the styled node");
+    assert_eq!(
+        rings[0].0.height,
+        4 * 16,
+        "the ring frames the floored content box, not the one-line child"
+    );
+    assert_eq!(text_ops(&paint), vec![(0, 0, "a".to_string())]);
+}
+
+#[test]
+fn a_height_cap_clips_the_rows_a_child_paints_into() {
+    // Three lines under a 1-row cap: the walk stops at the declared box, so only
+    // the first line reaches the paint list. A paint path that ignores the cap
+    // paints all three.
+    let node = styled(
+        SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_height_range(0, 1),
+        text("a\nb\nc"),
+    );
+    let paint = paint(node);
+    assert_eq!(text_ops(&paint), vec![(0, 0, "a".to_string())]);
+}
+
+#[test]
+fn a_height_range_sizes_the_node_a_following_sibling_starts_after() {
+    // The floor is a measure fact, so a Column places the next sibling after the
+    // floored extent: row 3, not row 1.
+    let node = SceneNode::Column(vec![
+        styled(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_height_range(3, 0),
+            text("a"),
+        ),
+        text("Z"),
+    ]);
+    let paint = paint(node);
+    assert_eq!(
+        text_ops(&paint),
+        vec![(0, 0, "a".to_string()), (3, 0, "Z".to_string())]
+    );
+}
+
+#[test]
+fn a_zero_height_range_is_byte_identical_to_an_undeclared_one() {
+    let children = || SceneNode::Column(vec![text("a"), text("abc")]);
+    let declared = paint(styled(
+        SceneNodeStyle::new(0, 0, 0, ContentToken::Foreground).with_height_range(0, 0),
+        children(),
+    ));
+    let plain = paint(children());
+    // The wrapper itself is flat in this case, so even the op lists match: the
+    // reader drops a flat style before the scene is built, and the model's
+    // `constrain_height` is the identity for an undeclared range.
+    assert_eq!(encode(&declared), encode(&plain));
+}

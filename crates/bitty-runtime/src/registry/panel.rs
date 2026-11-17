@@ -593,6 +593,93 @@ pub struct PlaceholderPresentation {
     pub saturated: bool,
 }
 
+/// The placeholder and recovery record set a container presents while unbound
+/// (`bitty#2476` AC-4, OQ-084 E).
+///
+/// "Accepts no verb, keeps one record" is the AC: once a container's controller
+/// generation ends, nothing the frame loop does adds a second record, and no
+/// verb lands. The registry holds both halves — the single [`PanelPlaceholder`]
+/// and the capped recovery record ring — but only as separate reads, so a caller
+/// observing the AC over time had no one value to compare. This is that value: a
+/// read-only snapshot, returned by
+/// [`PanelRegistry::unbound_container_records`], that compares equal across
+/// ticks and changes only if a transition actually runs.
+///
+/// The snapshot is derived on every call and never stored: it carries no
+/// authority, and a plugin cannot hold or mutate it. `bound` reports whether the
+/// container currently has a controller generation, so a bound container reads as
+/// an empty set instead of as "no container".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnboundContainerRecords {
+    panel: PanelId,
+    /// The controller generation the record currently binds, if any.
+    bound: Option<Generation>,
+    /// The single reason the container presents, if it presents one (PGO-14).
+    placeholder: Option<PlaceholderReason>,
+    /// The retained recovery records' typed reasons, oldest first.
+    reasons: Vec<RecoveryReason>,
+    /// The binding a `saturated` note already went out for, if any.
+    saturated_for: Option<Generation>,
+}
+
+impl UnboundContainerRecords {
+    /// The container this snapshot describes.
+    #[must_use]
+    pub const fn panel_id(&self) -> PanelId {
+        self.panel
+    }
+
+    /// The controller generation the container currently binds.
+    ///
+    /// `None` is the unbound state the snapshot describes; `Some` means a
+    /// successor already rebound the container, so the placeholder and record
+    /// set are the retained history rather than a live presentation.
+    #[must_use]
+    pub const fn bound_generation(&self) -> Option<Generation> {
+        self.bound
+    }
+
+    /// Whether the container has no controller generation.
+    #[must_use]
+    pub const fn is_unbound(&self) -> bool {
+        self.bound.is_none()
+    }
+
+    /// The single reason the container presents, if it presents one.
+    #[must_use]
+    pub const fn placeholder(&self) -> Option<PlaceholderReason> {
+        self.placeholder
+    }
+
+    /// How many records the container retains (`0` for a bound or never-ended
+    /// container, at most [`RECOVERY_ATTEMPT_CAP`](crate::registry::RECOVERY_ATTEMPT_CAP)).
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.reasons.len()
+    }
+
+    /// The retained records' typed reasons, oldest first.
+    ///
+    /// The reasons, not the prose: a caller compares a closed vocabulary across
+    /// ticks instead of parsing a diagnostic string.
+    #[must_use]
+    pub fn reasons(&self) -> &[RecoveryReason] {
+        &self.reasons
+    }
+
+    /// The binding a `saturated` note already went out for, if any.
+    #[must_use]
+    pub const fn saturated_for(&self) -> Option<Generation> {
+        self.saturated_for
+    }
+
+    /// Whether the container presents nothing and retains no record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.placeholder.is_none() && self.reasons.is_empty()
+    }
+}
+
 /// Internal panel record.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1302,9 +1389,11 @@ pub struct RetainedGrantCeiling {
 
 /// Per-family release record written by the panel's unbind edge (OQ-084 A.2).
 ///
-/// The edge releases four families for one `(PanelId, generation)`: the
+/// The edge releases five families for one `(PanelId, generation)`: the
 /// panel-scoped grant row, the panel's queued bus events, the commands the
-/// generation registered, and the overlays attributed to it. This record
+/// generation registered, the overlays attributed to it, and — reported to this
+/// registry by the edge that revoked it, because the session is the plugin
+/// runtime's (D.4) — the generation's overlay input-capture session. This record
 /// names the ended generation and counts what each family released, so
 /// "released nothing" (`Some(0)` everywhere) stays distinguishable from
 /// "the release never ran" (no record).
@@ -1320,13 +1409,25 @@ pub struct GenerationReleaseRecord {
     pub commands: usize,
     /// Overlays attributed to the generation and dismissed.
     pub overlays: usize,
+    /// Overlay input-capture sessions the generation's edge revoked
+    /// (`bitty#2476` AC-3, OQ-084 D.4).
+    ///
+    /// The session is generation-scoped, not container-scoped: a generation
+    /// holds at most one (the capture table is single-owner), the plugin
+    /// runtime revokes it in `OverlayCapture::revoke_plugin` before the edge
+    /// runs, and the edge reports what it revoked through
+    /// [`PanelRegistry::note_capture_release`]. Because the record is per
+    /// container, an edge that released several containers reports the same
+    /// generation-wide count on each of them: the number says *what the edge
+    /// revoked*, never "how much this container owned".
+    pub capture_sessions: usize,
 }
 
 impl GenerationReleaseRecord {
     /// Total items released across every family.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.grants + self.events + self.commands + self.overlays
+        self.grants + self.events + self.commands + self.overlays + self.capture_sessions
     }
 
     /// Whether at least one family released something.
@@ -1334,6 +1435,29 @@ impl GenerationReleaseRecord {
     pub fn released_any(&self) -> bool {
         self.total() > 0
     }
+}
+
+/// A capture-family release the generation edge reported before it ran the
+/// container's unbind release (`bitty#2476` AC-3, OQ-084 D.4).
+///
+/// The session itself belongs to the plugin runtime
+/// (`OverlayCapture::revoke_plugin`), which cannot reach this registry, so the
+/// edge reports what it revoked and this is where the report waits for the
+/// release that folds it into the panel's [`GenerationReleaseRecord`]. At most
+/// one per live panel: the next report for the same panel replaces it, and the
+/// panel's disposal drops it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureEdgeReport {
+    /// The generation whose capture session the edge revoked.
+    generation: Generation,
+}
+
+impl CaptureEdgeReport {
+    /// Sessions a report accounts for.
+    ///
+    /// Always `1`: a report exists only because the edge revoked a session, and
+    /// the capture table is single-owner, so a generation holds at most one.
+    const SESSIONS: usize = 1;
 }
 
 /// Why a panel container was retired (OQ-084 C.9).
@@ -1554,6 +1678,12 @@ pub struct PanelRegistry {
     /// panel's next edge, and dropped with the container. Created even when a
     /// family released nothing.
     release_records: BTreeMap<PanelId, GenerationReleaseRecord>,
+    /// Capture-family reports the generation edge handed over before the
+    /// container's unbind release (`bitty#2476` AC-3, OQ-084 D.4): at most one
+    /// per live panel, written by [`PanelRegistry::note_capture_release`] and
+    /// folded into `release_records` by [`PanelRegistry::release_generation_scope`].
+    /// Dropped with the container.
+    capture_edge_reports: BTreeMap<PanelId, CaptureEdgeReport>,
     /// Overlay attribution (OQ-084 A.2/D.4): which `(PanelId, generation)`
     /// asked for each live overlay, so the unbind edge can dismiss exactly
     /// that generation's surfaces. Bounded by the `4+1` overlay envelope.
@@ -1618,6 +1748,7 @@ impl PanelRegistry {
             capabilities: HashMap::new(),
             retained_ceilings: BTreeMap::new(),
             release_records: BTreeMap::new(),
+            capture_edge_reports: BTreeMap::new(),
             overlay_attribution: BTreeMap::new(),
             recovery: RecoveryBudget::new(),
             errors: HashMap::new(),
@@ -2234,6 +2365,10 @@ impl PanelRegistry {
             self.retained_ceilings.remove(&key);
         }
         self.release_records.remove(&panel_id);
+        // The capture-family report is a container fact like the record it feeds:
+        // a disposed panel is a first bind, so no report may outlive it and be
+        // folded into a later edge for a different container.
+        self.capture_edge_reports.remove(&panel_id);
         // The recovery counter is scoped to a container, so it retires with it:
         // a new panel is a first bind, not a continuation of this one's budget.
         self.recovery.retire(panel_id);
@@ -2468,6 +2603,39 @@ impl PanelRegistry {
     #[must_use]
     pub fn recovery_records(&self, panel_id: PanelId) -> Vec<RecoveryRecord> {
         self.recovery.records(panel_id)
+    }
+
+    /// The placeholder and recovery record set a container presents while
+    /// unbound (`bitty#2476` AC-4).
+    ///
+    /// One read-only value for the AC "accepts no verb, keeps one record": a
+    /// caller compares it across ticks and sees it unchanged while no transition
+    /// runs. `None` when the panel does not exist or the registry is disposed;
+    /// a bound container reads as a snapshot with
+    /// [`UnboundContainerRecords::bound_generation`] set and no placeholder.
+    ///
+    /// The snapshot is derived, never stored: it grants nothing and a plugin
+    /// cannot hold it. The record count is the retained ring's length (at most
+    /// `RECOVERY_ATTEMPT_CAP`), and the reasons are the ring's typed
+    /// [`RecoveryReason`]s rather than prose.
+    #[must_use]
+    pub fn unbound_container_records(&self, panel_id: PanelId) -> Option<UnboundContainerRecords> {
+        if self.disposed {
+            return None;
+        }
+        let record = self.panels.get(&panel_id.0)?;
+        Some(UnboundContainerRecords {
+            panel: panel_id,
+            bound: record.controller_generation(),
+            placeholder: record.placeholder.map(PanelPlaceholder::reason),
+            reasons: self
+                .recovery
+                .records(panel_id)
+                .into_iter()
+                .map(|record| record.reason)
+                .collect(),
+            saturated_for: self.recovery.saturated_note(panel_id).map(Generation),
+        })
     }
 
     /// The Core-owned placeholder block a panel currently presents, rebuilt
@@ -2958,6 +3126,74 @@ impl PanelRegistry {
         Ok(())
     }
 
+    /// Reports the capture family the generation edge revoked for a container
+    /// (`bitty#2476` AC-3, OQ-084 D.4).
+    ///
+    /// OQ-084 A.2 fuses three of the five generation-owned families at the
+    /// registry seam: the grant row, the queued bus events, the panel commands,
+    /// and the attributed overlays are all this registry's, so
+    /// [`Self::release_generation_scope`] releases them itself. The fifth —
+    /// the generation's overlay input-capture session — is **not** this
+    /// registry's: `OverlayCapture::revoke_plugin` runs in the plugin runtime at
+    /// the generation edge (see `plugin_runtime/mod.rs`, `dispose_inner`), which
+    /// cannot name a `PanelRegistry`. Without a report the capture family was
+    /// the one family the release record could not name, so "the capture session
+    /// is gone" was only inferable from the plugin runtime's own state.
+    ///
+    /// This is that report. The edge calls it **before** it releases the
+    /// container (production order: `clear_ui_blocks` and the capture revoke
+    /// precede the panel edge), and the next
+    /// [`Self::release_generation_scope`] for the same generation folds the one
+    /// session into [`GenerationReleaseRecord::capture_sessions`]. The report is
+    /// per container but the session is per generation, so an edge that released
+    /// several containers of one generation reports it on each: it names what the
+    /// edge revoked, not what a container owned.
+    ///
+    /// The call carries no count: a report *is* the fact "the edge revoked this
+    /// generation's capture session", and the capture table is single-owner, so a
+    /// generation can hold at most one. Calling it again for the same generation
+    /// replaces the report rather than counting twice.
+    ///
+    /// `generation` must be the panel's **current binding generation**: a report
+    /// for a generation the record does not bind is refused as `StaleHandle`
+    /// before anything is stored, so a late report cannot be attributed to a
+    /// successor's edge and a report that arrives after the release is a
+    /// diagnosable ordering defect rather than a silently lost fact. At most one
+    /// report is retained per panel (the next replaces it) and disposal drops it
+    /// with the container.
+    ///
+    /// # Errors
+    /// `RegistryDisposed`, `NotFound` when the panel is gone, and `StaleHandle`
+    /// when `generation` is not the binding generation the release would act
+    /// on.
+    pub fn note_capture_release(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+    ) -> Result<(), PanelError> {
+        self.ensure_not_disposed()?;
+        let bound = match self.panels.get(&panel_id.0) {
+            Some(record) => record.grant_key_generation(),
+            None => {
+                return Err(PanelError::NotFound {
+                    kind: "panel",
+                    id_raw: panel_id.0,
+                });
+            }
+        };
+        if bound != generation {
+            self.bump_error("StaleHandle");
+            return Err(PanelError::StaleHandle {
+                expected_generation: bound,
+                found_generation: generation,
+                id_raw: panel_id.0,
+            });
+        }
+        self.capture_edge_reports
+            .insert(panel_id, CaptureEdgeReport { generation });
+        Ok(())
+    }
+
     /// Runs the unbind release for one controller generation (OQ-084 A.2/B-4).
     ///
     /// The release covers every generation-owned family, in one call:
@@ -2966,7 +3202,10 @@ impl PanelRegistry {
     ///   tombstone first);
     /// - the panel's queued bus events, drained;
     /// - the commands this generation registered, unregistered;
-    /// - the overlays attributed to `(panel_id, generation)`, dismissed.
+    /// - the overlays attributed to `(panel_id, generation)`, dismissed;
+    /// - the capture session the generation's edge revoked, as reported through
+    ///   [`Self::note_capture_release`] (the session itself is the plugin
+    ///   runtime's; this edge only folds the report into the record).
     ///
     /// It writes one [`GenerationReleaseRecord`] naming the ended generation
     /// and counting each family. The record is created even when every family
@@ -3206,6 +3445,19 @@ impl PanelRegistry {
         let commands = self.command_registry.commands_for(panel_id).len();
         self.command_registry.unregister_panel(panel_id);
         let overlays = self.release_attributed_overlays(panel_id, generation);
+        // OQ-084 D.4 / bitty#2476 AC-3: the capture family. The session is the
+        // plugin runtime's — `clear_ui_blocks` and `OverlayCapture::revoke_plugin`
+        // run at the generation edge, which cannot reach this registry — so the
+        // edge reports what it revoked *before* it releases the container and
+        // this edge folds the report into the same per-family record. A report
+        // naming another generation is dropped rather than counted: it belongs to
+        // an edge that already ran, and counting it here would attribute one
+        // generation's session to another's release.
+        let capture_sessions = self
+            .capture_edge_reports
+            .remove(&panel_id)
+            .filter(|report| report.generation == generation)
+            .map_or(0, |_| CaptureEdgeReport::SESSIONS);
         self.release_records.insert(
             panel_id,
             GenerationReleaseRecord {
@@ -3214,6 +3466,7 @@ impl PanelRegistry {
                 events,
                 commands,
                 overlays,
+                capture_sessions,
             },
         );
         Ok(had_row)

@@ -1014,6 +1014,25 @@ impl PanelGenerationPort for AppPanelGenerationPort {
         let mut report = PanelEdgeReport::default();
         for panel in bound {
             report.attempted += 1;
+            // bitty#2476 AC-3 (OQ-084 D.4): the capture family is revoked in the
+            // plugin runtime, so it is the one family this side has to be told
+            // about. Report it **before** the release below, because the release
+            // is what writes the container's per-family record — the same record
+            // that names the grants, events, commands, and overlays the registry
+            // released itself. A refusal is a diagnosable ordering defect (the
+            // generation is not this panel's binding), so it is logged and the
+            // release still runs: the container must never be left orphaned for
+            // want of a diagnostic field.
+            if edge.capture_revoked {
+                if let Err(error) = self.panels.borrow_mut().note_capture_release(panel, ended) {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: panel {} capture release not recorded: {error}",
+                            panel.0
+                        )
+                    });
+                }
+            }
             let view_id = self.panels.borrow().placement_view_of(panel);
             let res =
                 self.panels
@@ -5445,5 +5464,96 @@ error("activation fails after mounting the terminal slot scene")
             "a window with no pane session and no leaf must close, not sit stranded (bitty#3201)"
         );
         let _ = std::fs::remove_file(&script);
+    }
+
+    /// bitty#2476 AC-3: the composition root's port reports the capture family
+    /// to the registry **before** it releases the container, so the container's
+    /// release record names the family the plugin runtime revoked.
+    ///
+    /// The runtime half (that `dispose_inner` revokes the session and answers the
+    /// edge) is `crates/bitty-runtime/tests/panel_generation_ownership.rs`; this
+    /// row is the adapter between the two halves, which is the only place they
+    /// meet. It fails if the port stops reporting (the record keeps
+    /// `capture_sessions: 0`) and if it reports after the release instead of
+    /// before (the release already wrote the record, and the report lands
+    /// nowhere).
+    #[test]
+    fn the_panel_edge_port_reports_the_capture_family_before_the_release() {
+        use bitty_runtime::registry::PlaceholderReason;
+
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+        ));
+        let port = AppPanelGenerationPort::with_layout_ops(Rc::clone(&panels), None);
+        let owner = bitty_plugin_host::manifest::PluginId::new("acme.notes").expect("valid id");
+        let handle = panels
+            .borrow_mut()
+            .create_panel(PanelType::Helper, None)
+            .expect("create panel");
+        let ended = controller_generation(1);
+        panels
+            .borrow_mut()
+            .rebind_panel(handle.id, ended, &owner, &BTreeSet::new(), &BTreeSet::new())
+            .expect("first bind");
+
+        let report = port.release_generation(PanelEdgeRelease {
+            owner: &owner,
+            ended: 1,
+            reason: PlaceholderReason::Unloaded,
+            capture_revoked: true,
+        });
+
+        assert_eq!(report.committed, vec![handle.id], "{report:?}");
+        let host = panels.borrow();
+        let release = host
+            .registry()
+            .unbind_release_record(handle.id)
+            .expect("the port released the container");
+        assert_eq!(release.generation, ended);
+        assert_eq!(
+            release.capture_sessions, 1,
+            "the port must report the capture family before the release writes the record"
+        );
+    }
+
+    /// The same port for an edge that revoked no capture: the record keeps `0`,
+    /// so the field is the edge's answer and not a constant the port stamps on
+    /// every release.
+    #[test]
+    fn the_panel_edge_port_reports_no_capture_when_the_edge_revoked_none() {
+        use bitty_runtime::registry::PlaceholderReason;
+
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+        ));
+        let port = AppPanelGenerationPort::with_layout_ops(Rc::clone(&panels), None);
+        let owner = bitty_plugin_host::manifest::PluginId::new("acme.notes").expect("valid id");
+        let handle = panels
+            .borrow_mut()
+            .create_panel(PanelType::Helper, None)
+            .expect("create panel");
+        let ended = controller_generation(1);
+        panels
+            .borrow_mut()
+            .rebind_panel(handle.id, ended, &owner, &BTreeSet::new(), &BTreeSet::new())
+            .expect("first bind");
+
+        let report = port.release_generation(PanelEdgeRelease {
+            owner: &owner,
+            ended: 1,
+            reason: PlaceholderReason::Unloaded,
+            capture_revoked: false,
+        });
+
+        assert_eq!(report.committed, vec![handle.id], "{report:?}");
+        let host = panels.borrow();
+        let release = host
+            .registry()
+            .unbind_release_record(handle.id)
+            .expect("the port released the container");
+        assert_eq!(
+            release.capture_sessions, 0,
+            "an edge that revoked nothing must record nothing"
+        );
     }
 }

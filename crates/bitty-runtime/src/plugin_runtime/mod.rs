@@ -1875,17 +1875,24 @@ impl PluginRuntime {
 
     /// Runs the generation's unbind edge through the installed port, if any.
     ///
-    /// Called from `dispose_inner` after the generation's own content release
-    /// (`clear_ui_blocks`, which also revokes the scene and the capture session)
-    /// and before the entry is reused, so the containers the generation bound
-    /// are released and left presenting their placeholder before any successor
-    /// exists (OQ-084 A.2: the release completes before the placeholder, and it
-    /// needs no successor).
+    /// Called from `dispose_inner` and `rollback` after the generation's own
+    /// content release (`clear_ui_blocks`, which also revokes the scene) and
+    /// **after** the edge revoked the generation's overlay capture session
+    /// (`OverlayCapture::revoke_plugin`), and before the entry is reused, so the
+    /// containers the generation bound are released and left presenting their
+    /// placeholder before any successor exists (OQ-084 A.2: the release completes
+    /// before the placeholder, and it needs no successor).
+    ///
+    /// `capture_revoked` is what that revoke answered: the capture family is the
+    /// one generation-owned family the panel side cannot observe, so it is
+    /// carried on the edge (bitty#2476 AC-3, OQ-084 D.4) and the implementation
+    /// reports it to the registry before it releases a container.
     fn release_panel_generation(
         &mut self,
         owner: &PluginId,
         ended: panel_generation::PluginGeneration,
         reason: PlaceholderReason,
+        capture_revoked: bool,
     ) {
         let Some(port) = self.panel_generation_port.clone() else {
             return;
@@ -1894,6 +1901,7 @@ impl PluginRuntime {
             owner,
             ended,
             reason,
+            capture_revoked,
         });
         self.last_panel_edge = Some(report);
     }
@@ -3907,7 +3915,12 @@ impl PluginRuntime {
         }
         // CTX-0941: unload/crash/dispose is a release. Core drops the capture
         // so a faulty or dead generation can never pin input.
-        self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
+        //
+        // bitty#2476 AC-3: the answer is the capture family the panel edge is
+        // about to report. It is read here because this revoke is the only place
+        // that knows whether the generation held a session, and it runs before
+        // the container edge below -- the order the report needs.
+        let capture_revoked = self.overlay_capture.borrow_mut().revoke_plugin(id.as_str());
         // CTX-1431: the disposed generation's presentation-only surface
         // leaves with the generation; no stale panel survives unload,
         // disable, crash, or reload.
@@ -3925,7 +3938,7 @@ impl PluginRuntime {
         // not a reload (OQ-084 A.2). A port the app did not install leaves this
         // a no-op.
         let ended = entry.generation;
-        self.release_panel_generation(id, ended, reason);
+        self.release_panel_generation(id, ended, reason, capture_revoked);
         // CTX-0897: traces never outlive the generation (also on reload,
         // where dispose and the next activation share one public call).
         self.drop_traces(id);
@@ -5304,6 +5317,21 @@ impl PluginRuntime {
             entry.services = None;
             entry.budgets = None;
         }
+        // CTX-0941: a failed activation is a release. A generation that
+        // acquired the transient capture during `init.lua` must never keep it
+        // after the activation rolls back, or a dead/failed plugin would pin
+        // input forever. The reason is `crashed`: the generation never
+        // reached a runnable state.
+        //
+        // bitty#2476 AC-3: the revoke runs *before* the container edge below,
+        // the order `dispose_inner` already uses, so the edge can report the
+        // capture family it lost and the container's release record names it
+        // like the other four families. Nothing between the two lines depended
+        // on the original order.
+        let capture_revoked = self
+            .overlay_capture
+            .borrow_mut()
+            .revoke_plugin_with_reason(id.as_str(), CRASHED_RELEASE_REASON);
         // bitty#2476 residuals 4 and 5: the rollback is the fifth event that
         // ends a generation (dispose, unload/disable through `dispose_inner`,
         // the reload teardown, and this one). The entry borrow ends above, so
@@ -5314,16 +5342,8 @@ impl PluginRuntime {
         // reload (OQ-084 A.2, E.1: a crash keeps the container and names the
         // reason instead of respawning).
         if let Some(ended) = ended {
-            self.release_panel_generation(id, ended, PlaceholderReason::Crashed);
+            self.release_panel_generation(id, ended, PlaceholderReason::Crashed, capture_revoked);
         }
-        // CTX-0941: a failed activation is a release. A generation that
-        // acquired the transient capture during `init.lua` must never keep it
-        // after the activation rolls back, or a dead/failed plugin would pin
-        // input forever. The reason is `crashed`: the generation never
-        // reached a runnable state.
-        self.overlay_capture
-            .borrow_mut()
-            .revoke_plugin_with_reason(id.as_str(), CRASHED_RELEASE_REASON);
         // CTX-1431: a failed activation also drops any presentation-only
         // surface the rolled-back generation had shown during `init.lua`.
         self.presentation_overlay

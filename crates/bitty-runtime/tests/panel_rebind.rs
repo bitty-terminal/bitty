@@ -32,7 +32,7 @@ use bitty_runtime::{
     registry::{
         BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelId, PanelRegistry,
         PanelRegistryConfig, PanelRuntime, PanelState, PanelType, PlaceholderReason,
-        RecoveryOutcome, WorkspaceId,
+        RECOVERY_ATTEMPT_CAP, RecoveryOutcome, RecoveryReason, WorkspaceId,
     },
 };
 
@@ -901,4 +901,135 @@ fn the_lease_returns_to_idle_on_commit_and_survives_a_refusal() {
     runtime
         .acquire_panel_lease(handle.id, epoch, LeaseHolder(78), 30, 1_010)
         .expect("successor acquires");
+}
+
+/// AC-4, "accepts no verb, one record" (bitty#2476): an unbound container keeps
+/// exactly the record its ending transition wrote, however many ticks pass with
+/// no verb call, and a verb on it still fails closed.
+///
+/// A tick is the per-frame work a released container actually sees: the host's
+/// lease sweep, the placeholder block the presenter rebuilds from the reason, and
+/// the state and attachment reads a painter makes. None of them is a verb, so
+/// none may write a recovery record — the counted attempts stay at one while the
+/// retained record set, read as one value through
+/// [`PanelRuntime::unbound_container_records`], compares equal to the snapshot
+/// taken at the edge. The row drives `RECOVERY_ATTEMPT_CAP * 3` ticks: the
+/// "eight" bound is a count of *transitions*, and `panel_placeholder_bounds`
+/// already pins the ninth attempt; what is unpinned without this row is that a
+/// tick is not an attempt.
+///
+/// Fails for a tick path that re-presents the placeholder (a second record per
+/// tick, and the count would climb), for one that raises the attempt counter, for
+/// an accessor that reports something other than the retained set, and for a
+/// grant gate that lets a verb reach an unbound container.
+#[test]
+fn an_unbound_container_keeps_one_record_across_many_ticks() {
+    let mut runtime = host();
+    let handle = runtime
+        .create_panel(PanelType::Helper, None)
+        .expect("create panel");
+    runtime
+        .mount_panel(handle.id, handle.generation, ViewId::new(31))
+        .expect("mount panel");
+    let epoch = handle.generation;
+    let n = epoch.next().expect("controller generation");
+    runtime
+        .rebind_panel(
+            handle.id,
+            n,
+            &owner("acme.notes"),
+            &set(&[CREATE, FOCUS]),
+            &empty(),
+        )
+        .expect("first bind");
+
+    // The generation ends with no successor: the container is left presenting
+    // the closed `unloaded` reason and keeps exactly one record.
+    let presented = runtime
+        .present_placeholder(handle.id, n, "unloaded")
+        .expect("the unload edge");
+    assert_eq!(
+        presented.outcome,
+        RecoveryOutcome::Placeholder(PlaceholderReason::Unloaded)
+    );
+    let baseline = runtime
+        .unbound_container_records(handle.id)
+        .expect("the container is live");
+    assert!(baseline.is_unbound(), "the edge left the container unbound");
+    assert_eq!(
+        baseline.placeholder(),
+        Some(PlaceholderReason::Unloaded),
+        "exactly one findable reason per panel (PGO-14)"
+    );
+    assert_eq!(
+        baseline.record_count(),
+        1,
+        "one ending transition, one record"
+    );
+    assert_eq!(
+        baseline.reasons(),
+        &[RecoveryReason::Unloaded][..],
+        "the record names the reason the edge carried, typed"
+    );
+    assert!(baseline.saturated_for().is_none(), "one attempt is no cap");
+
+    for tick in 0..(u64::from(RECOVERY_ATTEMPT_CAP) * 3) {
+        // The per-frame work a released container sees. None of it is a verb.
+        let _ = runtime.sweep_expired_leases(tick);
+        assert!(
+            runtime
+                .registry()
+                .placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "tick {tick}: the placeholder stays presentable"
+        );
+        assert_eq!(
+            runtime
+                .panel_state(handle.id, epoch)
+                .expect("live container"),
+            PanelState::Mounted,
+            "tick {tick}: the container is retained, never disposed"
+        );
+        assert_eq!(
+            runtime
+                .registry()
+                .panel_view(handle.id, epoch)
+                .expect("live container"),
+            Some(ViewId::new(31)),
+            "tick {tick}: the attachment survives"
+        );
+        let ticked = runtime
+            .unbound_container_records(handle.id)
+            .expect("the container is live");
+        assert_eq!(
+            ticked, baseline,
+            "tick {tick}: a tick must not add, drop, or rewrite a record"
+        );
+    }
+
+    // The counter counts transitions, not frames.
+    assert_eq!(
+        runtime
+            .registry()
+            .recovery_attempts(handle.id, n, PlaceholderReason::Unloaded),
+        1,
+        "twelve ticks are not twelve recovery attempts"
+    );
+
+    // A verb on the unbound container still fails closed, and the refusal emits
+    // no record: "accepts no verb" and "one record" are the same fact.
+    assert!(matches!(
+        runtime
+            .registry()
+            .require_panel_capability(handle.id, n, CREATE),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+    assert_eq!(
+        runtime
+            .unbound_container_records(handle.id)
+            .expect("the container is live"),
+        baseline,
+        "a refused verb emits no record"
+    );
 }

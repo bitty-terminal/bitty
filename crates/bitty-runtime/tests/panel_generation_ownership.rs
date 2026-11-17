@@ -60,7 +60,7 @@
 //! | PGO-9, capability gate on a guessed `PanelId` (bitty#2476 residual 9) | here — `a_guessed_panel_id_is_denied_at_the_grant_gate_before_any_state_access`; the deny-by-default half is pinned by `tests/panel_rebind.rs:412`, `a_denied_plugin_presents_unavailable_and_stops_after_one_record` (a capability outside the committed resolution is refused at `require_panel_capability`) |
 //! | PGO-13, disposal reclaim (bitty#2476 residual 9) | here — `a_disposal_reclaims_every_registry_owned_family_to_the_pre_creation_baseline` (queue, commands, MRU and focus, overlays, tombstone, counts, read with a second container left in the workspace so the MRU entry is observable) and `a_disposal_releases_the_lease_entry_and_the_placement_mirror` (lease, attachment). The live **grant row** is not covered by either: no accessor reads it once the record is gone — see the first row's rustdoc for what that would take |
 //! | PGO-15, refusal half (bitty#2476 residual 9) | here — `pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing`; the read half is **not** homed, see the blocking note below |
-//! | PGO-1, container-fact half through the reload edge (bitty#2476 residual 9) | here — `pgo_1_container_facts_survive_the_rebind_edge` (attachment, lifecycle state, title across the plugin-runtime edge); the controller half is `tests/panel_rebind.rs`. The `PresentationMode` clause is homed where the layout lives (`crates/bitty-terminal/src/plugin_runtime.rs`, `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`), see the note below |
+//! | PGO-1, container-fact half through the reload edge (bitty#2476 residual 9) | here — `pgo_1_container_facts_survive_the_rebind_edge` (attachment, lifecycle state, title across the plugin-runtime edge); the controller half is `tests/panel_rebind.rs`. The `PresentationMode` clause is **homed as a report** where the layout lives (`crates/bitty-terminal/src/plugin_runtime.rs`, `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`): no production caller reads the report, and the two end states the retention change creates are listed as **not measured** in the note below |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
 //!
 //! Still without a row in this crate: PGO-5, the disable arm of PGO-20
@@ -113,10 +113,10 @@
 //!   rather than as a decided rule. Homing the read half needs a generation key
 //!   on those families, not a test.
 //! - **PGO-1's `PresentationMode` clause** (a panel's presentation mode
-//!   surviving the generation swap): homed, but not in this crate. The mode
-//!   lives on the leaf `View` (`crates/bitty-ui/src/view.rs:227`) inside the
-//!   layout the app owns, so the row reads it where the generation edge and the
-//!   layout meet —
+//!   surviving the generation swap): homed **as a report**, and not in this
+//!   crate. The mode lives on the leaf `View` (`crates/bitty-ui/src/view.rs:227`)
+//!   inside the layout the app owns, so the row reads it where the generation
+//!   edge and the layout meet —
 //!   `crates/bitty-terminal/src/plugin_runtime.rs`,
 //!   `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`.
 //!   `AppPanelGenerationPort::bind_successor` queues
@@ -132,7 +132,14 @@
 //!   not a synchronous part of the bind transaction. The same reload retains the
 //!   container rather than closing its leaf (`PlaceholderReason::Reloaded` is
 //!   the one release that queues no `Close`), which is what gives the
-//!   observation a leaf to read.
+//!   observation a leaf to read. That retention is **not** measured, in this
+//!   crate or in `bitty-terminal`: it leaves a successful reload's retained leaf
+//!   presenting nothing until a successor mounts a scene, and it leaves the
+//!   containers of a reload that fails *after* `dispose_inner` (or whose
+//!   successor bind is refused) stuck in the `Reloaded` placeholder with no
+//!   `Close` ever queued. Both are named as unmeasured in
+//!   `pgo_1_container_facts_survive_the_rebind_edge`'s rustdoc rather than
+//!   implied covered.
 //!
 //! Naming them here keeps the matrix honest about what it covers instead of
 //! implying all twenty-three rows live in one file.
@@ -2334,8 +2341,8 @@ fn pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing() {
 /// this test built would stay green with the reload edge deleted — the shape of
 /// a tautology a reviewer already measured here.
 ///
-/// The clause is homed on the production seam instead, where the layout and the
-/// generation edge meet: `crates/bitty-terminal/src/plugin_runtime.rs`,
+/// The clause is homed **as a report** on the production seam instead, where the
+/// layout and the generation edge meet: `crates/bitty-terminal/src/plugin_runtime.rs`,
 /// `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`.
 /// `AppPanelGenerationPort::bind_successor` moves the controller and queues
 /// `PluginPanelLayoutOp::ObservePresentation` for the leaf the rebind retained;
@@ -2346,7 +2353,32 @@ fn pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing() {
 /// this one does not is the *report*, not the invariant: the mode is never
 /// re-stamped or copied into placement, so "intact" means the leaf the rebind
 /// kept still presents the mode it presented before, as read back through the
-/// app's own drain.
+/// app's own drain. `presentation_observation_of` has no production caller —
+/// only the two test files read it — which is the declared evidence design, not
+/// an accident of this row.
+///
+/// # What the retention change does *not* measure
+///
+/// The same reload queues no `Close` (the one release that does not), which is
+/// what gives the observation a leaf to read. That change has two end states,
+/// and **neither is covered by a row here or in `bitty-terminal`** — they are
+/// named so the matrix is not read as claiming them:
+///
+/// - After a *successful* reload the retained leaf presents **nothing**: the
+///   release detached its render scene and `rebind_panel` clears the
+///   placeholder record in D.2 phase 2 step 2, so the container is bound,
+///   placeholder-free and scene-less until a successor mounts a scene — and
+///   `bitty.panel.create` mounts a *new* container instead of reusing this one,
+///   so a reload can leave a content-less pane beside what the successor
+///   creates. Nothing asserts what the retained leaf paints in that window.
+/// - A reload that fails *after* `dispose_inner` (`reload_inner`'s store
+///   re-resolution or `activate_inner` returning `Err`), or whose successor
+///   bind is refused, leaves its containers in the `Reloaded` placeholder with
+///   **no `Close` ever queued**; the old code removed them at the next tick. A
+///   later reload does not repair them either: `held()` enumerates
+///   `panels_ended_at(owner, predecessor)` and the next reload names the
+///   generation that just ended, so those orphan records keep presenting "Its
+///   plugin is reloading." until the plugin is disposed or the pane is closed.
 ///
 /// Fails for an edge that does not rebind (the controller generation stays N),
 /// one that retires the container (no attachment), one that unmounts it (the

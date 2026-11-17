@@ -1055,12 +1055,23 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                 Ok(_) => {
                     self.panels.borrow_mut().detach_panel_scene(panel);
                     // A reload's release is not terminal for the container: the
-                    // successor bind on the same edge rebinds it (OQ-084 D.3) and
-                    // the placeholder this release just presented is written
-                    // *into* that container (D.2 step 3 / A.2), so closing the
-                    // leaf here would destroy the very presentation the edge
-                    // exists to retain. Every other reason ends the generation
-                    // with no successor, so the leaf goes with it.
+                    // successor bind on the same edge rebinds it (OQ-084 D.3), so
+                    // the leaf has to outlive the release. This `Close` is
+                    // *queued*, not applied: it drains in the app's next tick,
+                    // after `bind_successor` below has already committed. The old
+                    // code therefore did not fail the bind — it rebound the
+                    // container and then, one tick later, removed the leaf and
+                    // disposed the just-rebound record through
+                    // `close_plugin_panel_leaf`, i.e. a successful reload whose
+                    // container and record were destroyed right afterwards.
+                    //
+                    // What survives is the container and its leaf, not the
+                    // placeholder: `PanelRegistry::rebind_panel` clears
+                    // `record.placeholder` in D.2 phase 2 step 2 and
+                    // `detach_panel_scene` above has already taken the render
+                    // scene, so the rebound container is bound, placeholder-free
+                    // and scene-less. Every other reason ends the generation
+                    // with no successor, so its leaf goes with it.
                     if !matches!(edge.reason, PlaceholderReason::Reloaded) {
                         if let Some(queue) = self.layout_ops.as_ref() {
                             push_panel_layout_op(
@@ -4988,10 +4999,13 @@ error("activation fails after mounting the terminal slot scene")
 
     #[test]
     fn plugin_panel_generation_dispose_removes_the_dwindle_leaf() {
-        // bitty#2476 AC-1 split this row in two: a **dispose** ends the
-        // generation with no successor, so the container and its leaf go with
-        // it (unchanged behaviour), while a **reload** retains both for the
-        // successor bind and is now asserted by
+        // bitty#2476 AC-1 split this row in two. What is unchanged is the
+        // assertion quartet (`leaf_count` 2 -> 1, `panel_count` 0) and the
+        // four facts it names — not the path: the old row only ever called
+        // `reload`, so `dispose` is a path this assertion set did not
+        // previously touch. A **dispose** ends the generation with no
+        // successor, so the container and its leaf go with it; a **reload** now
+        // retains both for the successor bind and is asserted by
         // `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`.
         let _guard = crate::ctl::test_control_queue_lock();
         let root = pin_test_dir("dwindle-reload");

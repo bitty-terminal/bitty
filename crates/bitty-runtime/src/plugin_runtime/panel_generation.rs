@@ -133,6 +133,20 @@ pub struct PanelEdgeRelease<'a> {
     /// [`PlaceholderReason`] rather than a free string, so a caller cannot hand
     /// the registry a token outside the vocabulary.
     pub reason: PlaceholderReason,
+    /// Whether the edge revoked this generation's overlay input-capture session
+    /// (`bitty#2476` AC-3).
+    ///
+    /// The capture table is single-owner, so the edge reports at most one
+    /// session: `true` when `OverlayCapture::revoke_plugin` dropped the ended
+    /// generation's session, `false` when it held none (or held one belonging to
+    /// another generation, which the revoke leaves alone). D.4 puts the revoke
+    /// in the plugin runtime, so this field is the only way the panel side can
+    /// learn that the fifth generation-owned family went with the edge; an
+    /// implementation that releases a container reports it through
+    /// `PanelRuntime::note_capture_release` **before** the release, so the
+    /// container's release record names the capture family the same way it names
+    /// grants, events, commands, and overlays.
+    pub capture_revoked: bool,
 }
 
 /// The successor bind of one plugin generation (bitty#2476 residual 2).

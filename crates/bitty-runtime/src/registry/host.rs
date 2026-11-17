@@ -518,6 +518,42 @@ impl PanelRuntime {
         self.registry.present_placeholder(id, presented, reason)
     }
 
+    /// The placeholder and recovery record set a container presents while
+    /// unbound (`bitty#2476` AC-4).
+    ///
+    /// The facade adds nothing: the record set is the registry's, the lease entry
+    /// is untouched by a placeholder transition, and the presentation facts
+    /// (attachment, title, geometry) are container facts either way. This
+    /// accessor exists on the facade because the frame loop holds the facade, not
+    /// the registry, and the AC is an observation over ticks.
+    #[must_use]
+    pub fn unbound_container_records(
+        &self,
+        id: super::panel::PanelId,
+    ) -> Option<super::panel::UnboundContainerRecords> {
+        self.registry.unbound_container_records(id)
+    }
+
+    /// Reports the capture family the generation edge revoked for a container
+    /// (`bitty#2476` AC-3, OQ-084 D.4).
+    ///
+    /// The session belongs to the plugin runtime, so the edge reports it here
+    /// before it releases the container; the next release folds the report into
+    /// the panel's [`GenerationReleaseRecord`](super::panel::GenerationReleaseRecord).
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PanelRegistry::note_capture_release`] refuses with:
+    /// `RegistryDisposed`, `NotFound`, or `StaleHandle` when `generation` is not
+    /// the panel's binding generation.
+    pub fn note_capture_release(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+    ) -> Result<(), PanelError> {
+        self.registry.note_capture_release(id, generation)
+    }
+
     /// Returns `(PanelHandle, PanelType)` for `id` only when the panel is
     /// live, non-terminal, and currently bound to `(owner, controller_gen)`.
     #[must_use]

@@ -49,6 +49,7 @@
 //! | PGO-22(d), owner mismatch | here — `a_bind_by_another_owner_is_refused_as_a_lost_ceiling`; the tombstone-side twin (a tombstone stamped under a foreign owner while the record names another) can only be built by violating the table invariant, so it stays in `registry::panel::grant_ceiling_tests` |
 //! | PGO-23 | `tests/panel_grant_ceiling.rs:182` (disposal drops the tombstone), `tests/panel_unbind_release.rs` (the four released families), `crates/bitty-ui/src/panel_recovery.rs` (the placeholder reasons) |
 //! | PGO-23, edge-driven (bitty#2476 residual 4) | here — `a_generation_edge_with_no_successor_presents_the_placeholder_after_the_release` |
+//! | bitty#2476 AC-3, capture family at the edge | here — `the_generation_edge_records_the_capture_session_it_revoked` (the plugin runtime's own `dispose_inner` revokes the session) and `a_generation_edge_without_a_capture_records_none` (the negative half); the registry-side row is `tests/panel_unbind_release.rs` |
 //! | PGO-4, crash-driven (bitty#2476 residual 4) | here — `pgo_4_a_crash_inside_a_callback_presents_crashed_and_contains_the_damage`; the crash is a callback stopped by the generation's own RC-1 instruction budget, so the producer of `crashed` is `PluginRuntime::rollback` (`src/plugin_runtime/mod.rs:5109`, port call at `:5155`), not the test |
 //! | PGO-20, crash arm (bitty#2476 residual 4) | here — `pgo_20_a_crashed_generation_is_bounded_and_loses_its_authority_at_the_next_bind`; the disable arm is **not** homed, see the blocking note below |
 //! | PGO-1/PGO-2, edge-driven (bitty#2476 residual 2) | here — `the_generation_edge_rebinds_the_container_and_moves_the_controller` |
@@ -151,6 +152,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::PluginId;
@@ -779,6 +781,15 @@ impl PanelGenerationPort for EdgePort {
         let mut report = PanelEdgeReport::default();
         for panel in bound {
             report.attempted += 1;
+            // The same report the composition root makes before it releases the
+            // container (bitty#2476 AC-3): the capture family is the plugin
+            // runtime's, so the port hands it to the registry here.
+            if edge.capture_revoked {
+                self.panels
+                    .borrow_mut()
+                    .note_capture_release(panel, ended)
+                    .expect("the generation still binds the container it is releasing");
+            }
             match self
                 .panels
                 .borrow_mut()
@@ -2372,4 +2383,88 @@ fn pgo_1_container_facts_survive_the_rebind_edge() {
         (Some("Notes".to_string()), Some("acme notes".to_string())),
         "title and description are container facts the edge leaves alone"
     );
+}
+
+/// AC-3 on the production edge (bitty#2476, OQ-084 D.4): the generation's
+/// overlay input-capture session is revoked by the plugin runtime, and the
+/// container's release record names it with the four families the registry
+/// released itself.
+///
+/// The capture table lives in the plugin runtime, so this is the only row where
+/// the *producer* of the fact is the real `dispose_inner`: the test acquires the
+/// session the way a focusable overlay does, disposes the generation, and reads
+/// the record through the panel host. A revoke whose answer never reaches the
+/// edge, or an edge that reports it but a registry that does not fold it in,
+/// leaves `capture_sessions` at `0` and fails here.
+#[test]
+fn the_generation_edge_records_the_capture_session_it_revoked() {
+    let (mut runtime, plugin, panels) = edge_fixture("capture", "acme.edgecapture");
+    let (panel, _epoch) = bound_container(&panels, &plugin, 7, 13);
+    let ended = controller_generation(1);
+
+    // The generation holds a live input capture, exactly as a plugin that opened
+    // a focusable overlay and acquired it would.
+    runtime
+        .overlay_capture()
+        .borrow_mut()
+        .acquire(
+            plugin.as_str(),
+            4_242,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("the generation takes the capture");
+    assert!(runtime.overlay_capture().borrow().is_active());
+
+    runtime.dispose(&plugin).expect("dispose");
+
+    let host_ref = panels.borrow();
+    let release = host_ref
+        .registry()
+        .unbind_release_record(panel)
+        .expect("the edge wrote the container's release record");
+    assert_eq!(
+        release.generation, ended,
+        "the record names the ended generation"
+    );
+    assert_eq!(
+        release.capture_sessions, 1,
+        "the capture family the edge revoked is named with the other families"
+    );
+    assert_eq!(
+        release.grants, 2,
+        "the registry-released families are still counted"
+    );
+    assert_eq!(release.total(), 3);
+}
+
+/// The same edge for a generation that held no capture session: the record
+/// counts `0`, so the field is the edge's answer rather than a constant.
+///
+/// This is the negative half of the row above. A record that always carried `1`
+/// (or an implementation that reported a revoke it never made) passes the
+/// capture row and fails this one.
+#[test]
+fn a_generation_edge_without_a_capture_records_none() {
+    let (mut runtime, plugin, panels) = edge_fixture("nocapture", "acme.edgenocapture");
+    let (panel, _epoch) = bound_container(&panels, &plugin, 8, 14);
+    let ended = controller_generation(1);
+    assert!(
+        !runtime.overlay_capture().borrow().is_active(),
+        "the fixture never acquired a capture"
+    );
+
+    runtime.dispose(&plugin).expect("dispose");
+
+    let host_ref = panels.borrow();
+    let release = host_ref
+        .registry()
+        .unbind_release_record(panel)
+        .expect("the edge wrote the container's release record");
+    assert_eq!(release.generation, ended);
+    assert_eq!(
+        release.capture_sessions, 0,
+        "a generation that held no capture reports none"
+    );
+    assert_eq!(release.grants, 2);
+    assert_eq!(release.total(), 2);
 }

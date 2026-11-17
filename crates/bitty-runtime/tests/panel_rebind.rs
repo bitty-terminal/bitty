@@ -29,10 +29,11 @@ use std::collections::BTreeSet;
 use bitty_plugin_host::PluginId;
 use bitty_runtime::{
     Generation, UiRect, ViewId,
+    cw_present::CW_PRESENT_MAX_SCENE_BLOCKS,
     registry::{
         BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelId, PanelRegistry,
         PanelRegistryConfig, PanelRuntime, PanelState, PanelType, PlaceholderReason,
-        RecoveryOutcome, WorkspaceId,
+        RECOVERY_ATTEMPT_CAP, RecoveryOutcome, RecoveryReason, ViewContent, WorkspaceId,
     },
 };
 
@@ -901,4 +902,189 @@ fn the_lease_returns_to_idle_on_commit_and_survives_a_refusal() {
     runtime
         .acquire_panel_lease(handle.id, epoch, LeaseHolder(78), 30, 1_010)
         .expect("successor acquires");
+}
+
+/// AC-4, "accepts no verb, one record" (bitty#2476): an unbound container keeps
+/// exactly the record its ending transition wrote, however many ticks pass with
+/// no verb call, and a verb on it still fails closed.
+///
+/// A tick is the per-frame work a released container actually sees from this
+/// seam: the host's lease sweep, the present loop's per-leaf entry
+/// ([`PanelRuntime::scene_paint_for`] with the container's own content, the
+/// call a shipped frame makes for that leaf), the placeholder block a presenter
+/// builds from the reason, and the state and attachment reads a painter makes.
+/// None of them is a verb, so none may write a recovery record — the counted
+/// attempts stay at one while the retained record set, read as one value
+/// through [`PanelRuntime::unbound_container_records`], compares equal to the
+/// snapshot taken at the edge. The row drives `RECOVERY_ATTEMPT_CAP * 3` ticks:
+/// the "eight" bound is a count of *transitions*, and `panel_placeholder_bounds`
+/// already pins the ninth attempt; what is unpinned without this row is that a
+/// tick is not an attempt.
+///
+/// The presenter is **not** a tick path and this row does not claim it is:
+/// `present_placeholder` runs once per generation edge, from the composition
+/// root's `PanelGenerationPort` (`AppPanelGenerationPort::release_generation` in
+/// `bitty-terminal/src/plugin_runtime.rs`), and the shipped present loop
+/// (`bitty-runtime/src/runtime/scene_present.rs`) only composes an *attached*
+/// scene, so an unbound container has no per-frame presenter reachable from
+/// this seam. What the row asserts instead is the fence that keeps the presenter
+/// edge-only: driving it again for the ended generation is refused with
+/// `ControllerReleased` and writes no record.
+///
+/// Fails for a lease sweep or a present-loop leaf call that raises the attempt
+/// counter or writes a record, for a presenter that accepts a second
+/// presentation of the ended generation or writes a record before refusing it,
+/// for an accessor that reports something other than the retained set, and for
+/// a grant gate that lets a verb reach an unbound container.
+#[test]
+fn an_unbound_container_keeps_one_record_across_many_ticks() {
+    let mut runtime = host();
+    let handle = runtime
+        .create_panel(PanelType::Helper, None)
+        .expect("create panel");
+    runtime
+        .mount_panel(handle.id, handle.generation, ViewId::new(31))
+        .expect("mount panel");
+    let epoch = handle.generation;
+    let n = epoch.next().expect("controller generation");
+    runtime
+        .rebind_panel(
+            handle.id,
+            n,
+            &owner("acme.notes"),
+            &set(&[CREATE, FOCUS]),
+            &empty(),
+        )
+        .expect("first bind");
+
+    // The generation ends with no successor: the container is left presenting
+    // the closed `unloaded` reason and keeps exactly one record.
+    let presented = runtime
+        .present_placeholder(handle.id, n, "unloaded")
+        .expect("the unload edge");
+    assert_eq!(
+        presented.outcome,
+        RecoveryOutcome::Placeholder(PlaceholderReason::Unloaded)
+    );
+    let baseline = runtime
+        .unbound_container_records(handle.id)
+        .expect("the container is live");
+    assert!(baseline.is_unbound(), "the edge left the container unbound");
+    assert_eq!(
+        baseline.placeholder(),
+        Some(PlaceholderReason::Unloaded),
+        "exactly one findable reason per panel (PGO-14)"
+    );
+    assert_eq!(
+        baseline.record_count(),
+        1,
+        "one ending transition, one record"
+    );
+    assert_eq!(
+        baseline.reasons(),
+        &[RecoveryReason::Unloaded][..],
+        "the record names the reason the edge carried, typed"
+    );
+    assert!(baseline.saturated_for().is_none(), "one attempt is no cap");
+
+    for tick in 0..(u64::from(RECOVERY_ATTEMPT_CAP) * 3) {
+        // The per-frame work a released container sees. None of it is a verb.
+        let _ = runtime.sweep_expired_leases(tick);
+        // The present loop's per-leaf entry for this container's own content
+        // (`runtime/scene_present.rs`). It takes `&mut self`, so a present path
+        // that wrote on the way past would show up here. The container has no
+        // attached scene (its content was released at the edge), so the leaf
+        // paints nothing and presents no refusal.
+        let present = runtime.scene_paint_for(
+            ViewContent::Panel(handle.id),
+            None,
+            CW_PRESENT_MAX_SCENE_BLOCKS,
+        );
+        assert!(
+            present.paint.is_empty() && present.block_ids.is_empty(),
+            "tick {tick}: an unbound container has no scene to present"
+        );
+        assert!(
+            present.refusal.is_none(),
+            "tick {tick}: presenting an unbound leaf is not a refusal"
+        );
+        assert!(
+            runtime
+                .registry()
+                .placeholder_block(handle.id)
+                .expect("the fixed table is admitted")
+                .is_some(),
+            "tick {tick}: the placeholder stays presentable"
+        );
+        assert_eq!(
+            runtime
+                .panel_state(handle.id, epoch)
+                .expect("live container"),
+            PanelState::Mounted,
+            "tick {tick}: the container is retained, never disposed"
+        );
+        assert_eq!(
+            runtime
+                .registry()
+                .panel_view(handle.id, epoch)
+                .expect("live container"),
+            Some(ViewId::new(31)),
+            "tick {tick}: the attachment survives"
+        );
+        let ticked = runtime
+            .unbound_container_records(handle.id)
+            .expect("the container is live");
+        assert_eq!(
+            ticked, baseline,
+            "tick {tick}: a tick must not add, drop, or rewrite a record"
+        );
+    }
+
+    // The presenter is edge-owned, so no tick can reach it. The one thing a
+    // caller *can* drive is the presenter itself, and the retirement fence is
+    // what keeps it edge-only: a second presentation of the ended generation is
+    // refused, and the refusal writes no record and leaves the placeholder the
+    // edge wrote alone.
+    assert_eq!(
+        runtime
+            .present_placeholder(handle.id, n, "unloaded")
+            .expect_err("a tick cannot re-present an ended generation"),
+        PanelError::ControllerReleased {
+            panel_id: handle.id,
+            released_generation: n,
+        },
+        "the retirement fence keeps the presenter edge-only"
+    );
+    assert_eq!(
+        runtime
+            .unbound_container_records(handle.id)
+            .expect("the container is live"),
+        baseline,
+        "a refused presentation writes no record"
+    );
+
+    // The counter counts transitions, not frames.
+    assert_eq!(
+        runtime
+            .registry()
+            .recovery_attempts(handle.id, n, PlaceholderReason::Unloaded),
+        1,
+        "twelve ticks are not twelve recovery attempts"
+    );
+
+    // A verb on the unbound container still fails closed, and the refusal emits
+    // no record: "accepts no verb" and "one record" are the same fact.
+    assert!(matches!(
+        runtime
+            .registry()
+            .require_panel_capability(handle.id, n, CREATE),
+        Err(PanelError::CapabilityDenied { .. })
+    ));
+    assert_eq!(
+        runtime
+            .unbound_container_records(handle.id)
+            .expect("the container is live"),
+        baseline,
+        "a refused verb emits no record"
+    );
 }

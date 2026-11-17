@@ -522,6 +522,13 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare panel_rules".into(),
         });
     }
+    if plan.scratchpads.is_some() {
+        // Issue #3205: scratchpad entries spawn PTYs / launch plugin commands,
+        // so they carry process authority a project layer must never hold.
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not declare scratchpads".into(),
+        });
+    }
     if plan.chrome.is_some() {
         return Err(ConfigError::TrustViolation {
             message: "project config must not declare chrome".into(),

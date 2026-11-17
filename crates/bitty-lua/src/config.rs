@@ -486,6 +486,35 @@ pub struct FloatingData {
     pub background: Option<String>,
 }
 
+/// One `scratchpads` entry (issue #3205): a named PTY or plugin scratchpad
+/// with optional geometry overrides. Raw data; every bound/grammar check runs
+/// fail-closed downstream in `bitty-config`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ScratchpadData {
+    /// Slot name (the `scratchpads` table key).
+    pub name: String,
+    /// PTY program to spawn on first trigger.
+    pub cmd: Option<String>,
+    /// Extra PTY arguments.
+    pub args: Option<Vec<String>>,
+    /// Working directory for the PTY program.
+    pub cwd: Option<String>,
+    /// Plugin command (`<owner>:<command>`) launched on first trigger.
+    pub command: Option<String>,
+    /// Width fraction override in `(0.0, 1.0]`.
+    pub width: Option<f64>,
+    /// Height fraction override in `(0.0, 1.0]`.
+    pub height: Option<f64>,
+    /// Centering override.
+    pub centered: Option<bool>,
+    /// Horizontal anchor ratio override in `[0.0, 1.0]`.
+    pub x: Option<f64>,
+    /// Vertical anchor ratio override in `[0.0, 1.0]`.
+    pub y: Option<f64>,
+    /// Backdrop opacity override in `[0.0, 1.0]`.
+    pub background_opacity: Option<f64>,
+}
+
 /// Core-owned workspace decoration overrides, plain data (CTX-0292; unified
 /// CTX-0333; see [`FontData`] for `Option` semantics).
 ///
@@ -775,6 +804,9 @@ pub struct ConfigData {
     pub decoration: Option<DecorationData>,
     /// `floating` table (CTX-1861 floating panel defaults).
     pub floating: Option<FloatingData>,
+    /// `scratchpads` table (issue #3205 named scratchpad slots). `None`
+    /// means "this layer says nothing".
+    pub scratchpads: Option<Vec<ScratchpadData>>,
     /// `views` table (RFC-0001/OQ-041 per-View appearance overrides,
     /// CTX-0343). `None` means "this layer says nothing".
     pub views: Option<Vec<ViewOverrideData>>,
@@ -858,6 +890,8 @@ impl ConfigData {
             && self.workspace.is_none()
             && self.chrome.is_none()
             && self.decoration.is_none()
+            && self.floating.is_none()
+            && self.scratchpads.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()
@@ -2504,6 +2538,101 @@ impl ConfigData {
                         background_opacity,
                         background,
                     });
+                }
+                // Issue #3205: `scratchpads = { default = { cmd = "btop" },
+                // files = { command = "bitty-terminal.file-manager:open" } }`
+                // declares named cross-workspace scratchpad slots. The field
+                // set is closed here; names/bounds/typed parsing are checked
+                // fail-closed downstream in `bitty-config`.
+                "scratchpads" => {
+                    let (pairs, truncated, has_non_string_keys) = match val.as_ref() {
+                        ValueSnapshot::Table {
+                            pairs,
+                            truncated,
+                            has_non_string_keys,
+                            ..
+                        } => (pairs, *truncated, *has_non_string_keys),
+                        ValueSnapshot::Nil => {
+                            return Err(String::from("scratchpads: expected table (found nil)"));
+                        }
+                        other => {
+                            return Err(format!(
+                                "scratchpads: expected table (found {})",
+                                other.kind()
+                            ));
+                        }
+                    };
+                    if has_non_string_keys {
+                        return Err(String::from("scratchpads: slot names must be strings"));
+                    }
+                    if truncated {
+                        return Err(format!(
+                            "scratchpads: exceeds {MAX_CONFIG_NESTED_KEYS} slots"
+                        ));
+                    }
+                    let mut entries = Vec::with_capacity(pairs.len());
+                    for (slot_name, slot_value) in pairs {
+                        let slot_path = format!("scratchpads.{slot_name}");
+                        let nested = expect_table(&slot_path, slot_value.as_ref())?;
+                        check_nested_keys(
+                            &slot_path,
+                            nested,
+                            &[
+                                "cmd",
+                                "args",
+                                "cwd",
+                                "command",
+                                "width",
+                                "height",
+                                "centered",
+                                "x",
+                                "y",
+                                "background_opacity",
+                            ],
+                        )?;
+                        let mut data = ScratchpadData {
+                            name: slot_name.clone(),
+                            ..Default::default()
+                        };
+                        let field = |name: &str| format!("{slot_path}.{name}");
+                        if let Some(v) = get_field(nested, "cmd") {
+                            data.cmd = Some(expect_string(&field("cmd"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "args") {
+                            data.args = Some(expect_string_list(
+                                &field("args"),
+                                v,
+                                MAX_CONFIG_NESTED_KEYS,
+                            )?);
+                        }
+                        if let Some(v) = get_field(nested, "cwd") {
+                            data.cwd = Some(expect_string(&field("cwd"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "command") {
+                            data.command = Some(expect_string(&field("command"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "width") {
+                            data.width = Some(expect_number(&field("width"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "height") {
+                            data.height = Some(expect_number(&field("height"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "centered") {
+                            data.centered = Some(expect_bool(&field("centered"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "x") {
+                            data.x = Some(expect_number(&field("x"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "y") {
+                            data.y = Some(expect_number(&field("y"), v)?);
+                        }
+                        if let Some(v) = get_field(nested, "background_opacity") {
+                            data.background_opacity =
+                                Some(expect_number(&field("background_opacity"), v)?);
+                        }
+                        entries.push(data);
+                    }
+                    out.scratchpads = Some(entries);
                 }
                 "views" => {
                     // CTX-0343 (RFC-0001/OQ-041): `views = { ["ws:2"] = {

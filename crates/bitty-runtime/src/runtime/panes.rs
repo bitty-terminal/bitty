@@ -549,9 +549,10 @@ impl Runtime {
         if !self.layout.leaf_ids().contains(&view)
             && !self.pinned.contains(view)
             && !self.floats.contains(view)
+            && !self.scratchpads.contains_view(view)
         {
             return Err(RuntimeError::InvalidConfig(
-                "view is not a leaf of the current layout, the pinned store, or the detached-float store",
+                "view is not a leaf of the current layout, the pinned store, the detached-float store, or a scratchpad slot",
             ));
         }
         // CTX-0343: a pane bind turns (or keeps) the leaf at `terminal`

@@ -197,6 +197,11 @@ const FLOAT_FRAME_NUM: u32 = 4;
 /// Denominator of the float-frame share (4/5 ~= 80% per axis).
 const FLOAT_FRAME_DEN: u32 = 5;
 
+/// Accepted float size share per axis as a ratio (`4/5`), shared by the
+/// scratchpad geometry defaults (issue #3205) and `bitty-runtime`'s
+/// `floating.width`/`floating.height` fallback so the two cannot drift.
+pub const DEFAULT_FLOAT_SIZE_RATIO: f32 = 0.8;
+
 /// Extra border ring px making mode-floating leaves visually distinct
 /// (CTX-1058 elevated float chrome).
 pub const FLOAT_BORDER_EXTRA: u16 = 1;

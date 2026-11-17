@@ -3488,6 +3488,207 @@ impl FloatingConfig {
     }
 }
 
+/// Maximum named scratchpad slots (`scratchpads = { ... }`, issue #3205).
+pub const MAX_SCRATCHPADS: usize = 32;
+/// Maximum scratchpad slot name length in bytes.
+pub const MAX_SCRATCHPAD_NAME_LEN: usize = 32;
+/// Maximum argument entries for one PTY scratchpad.
+pub const MAX_SCRATCHPAD_ARGS: usize = 32;
+/// Maximum byte length of one scratchpad command/cwd/argument value.
+pub const MAX_SCRATCHPAD_VALUE_LEN: usize = 1024;
+
+/// True when `name` is an accepted scratchpad slot name: 1..=32 ASCII bytes,
+/// lowercase letters, digits, `-`, `_`.
+///
+/// Mirrors `bitty_ui::is_valid_scratchpad_name` (the UI crate cannot depend on
+/// this one); `bitty-runtime` pins the two validators against one matrix.
+#[must_use]
+pub fn is_valid_scratchpad_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SCRATCHPAD_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// One named scratchpad (`scratchpads = { <name> = { ... } }`, issue #3205).
+///
+/// A scratchpad is either a PTY scratchpad (`cmd` + optional `args`/`cwd`) or
+/// a GUI plugin scratchpad (`command = "<owner>:<command>"`); declaring both
+/// in one entry fails closed. Every geometry leaf is an optional override that
+/// inherits the global `floating` config when absent.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ScratchpadConfig {
+    /// Slot name (the `scratchpads` table key).
+    pub name: String,
+    /// PTY program to spawn on first trigger (direct `argv[0]`, no shell).
+    pub cmd: Option<String>,
+    /// Extra PTY arguments.
+    pub args: Vec<String>,
+    /// Working directory for the PTY program (absolute path).
+    pub cwd: Option<String>,
+    /// Plugin command (`<owner>:<command>`) launched on first trigger.
+    pub command: Option<String>,
+    /// Width fraction override in `(0.0, 1.0]`.
+    pub width: Option<f32>,
+    /// Height fraction override in `(0.0, 1.0]`.
+    pub height: Option<f32>,
+    /// Centering override.
+    pub centered: Option<bool>,
+    /// Horizontal anchor ratio override in `[0.0, 1.0]`.
+    pub x: Option<f32>,
+    /// Vertical anchor ratio override in `[0.0, 1.0]`.
+    pub y: Option<f32>,
+    /// Backdrop opacity override in `[0.0, 1.0]`.
+    pub background_opacity: Option<f32>,
+}
+
+impl ScratchpadConfig {
+    /// Validates one scratchpad entry (fail-closed, names the offending path).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !is_valid_scratchpad_name(&self.name) {
+            return Err(ConfigError::validation(
+                "scratchpads",
+                format!(
+                    "invalid scratchpad name {:?}: expected 1..={MAX_SCRATCHPAD_NAME_LEN} \
+                     lowercase ASCII letters, digits, '-' or '_'",
+                    self.name
+                ),
+            ));
+        }
+        if self.cmd.is_some() && self.command.is_some() {
+            return Err(ConfigError::validation(
+                format!("scratchpads.{}", self.name),
+                "declare either cmd (PTY) or command (plugin), not both",
+            ));
+        }
+        if let Some(cmd) = &self.cmd {
+            if cmd.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.cmd", self.name),
+                    "must not be blank",
+                ));
+            }
+            if cmd.len() > MAX_SCRATCHPAD_VALUE_LEN {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.cmd", self.name),
+                    format!("must be <= {MAX_SCRATCHPAD_VALUE_LEN} bytes"),
+                ));
+            }
+        }
+        if self.args.len() > MAX_SCRATCHPAD_ARGS {
+            return Err(ConfigError::validation(
+                format!("scratchpads.{}.args", self.name),
+                format!("must contain <= {MAX_SCRATCHPAD_ARGS} entries"),
+            ));
+        }
+        for (index, arg) in self.args.iter().enumerate() {
+            if arg.len() > MAX_SCRATCHPAD_VALUE_LEN {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.args[{index}]", self.name),
+                    format!("must be <= {MAX_SCRATCHPAD_VALUE_LEN} bytes"),
+                ));
+            }
+        }
+        if let Some(cwd) = &self.cwd {
+            if cwd.trim().is_empty() {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.cwd", self.name),
+                    "must not be blank",
+                ));
+            }
+            if cwd.len() > MAX_SCRATCHPAD_VALUE_LEN {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.cwd", self.name),
+                    format!("must be <= {MAX_SCRATCHPAD_VALUE_LEN} bytes"),
+                ));
+            }
+            if !std::path::Path::new(cwd).is_absolute() {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.cwd", self.name),
+                    "must be an absolute path (host- and CWD-independent)",
+                ));
+            }
+        }
+        if let Some(command) = &self.command {
+            let trimmed = command.trim();
+            if trimmed != command {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.command", self.name),
+                    "must not be padded with whitespace",
+                ));
+            }
+            let valid = match trimmed.split_once(':') {
+                Some((owner, action)) => !owner.is_empty() && !action.is_empty(),
+                None => false,
+            };
+            if !valid {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.command", self.name),
+                    "expected '<owner>:<command>'",
+                ));
+            }
+            if command.len() > MAX_SCRATCHPAD_VALUE_LEN {
+                return Err(ConfigError::validation(
+                    format!("scratchpads.{}.command", self.name),
+                    format!("must be <= {MAX_SCRATCHPAD_VALUE_LEN} bytes"),
+                ));
+            }
+        }
+        for (value, field, allow_zero) in [
+            (self.width, "width", false),
+            (self.height, "height", false),
+            (self.x, "x", true),
+            (self.y, "y", true),
+            (self.background_opacity, "background_opacity", true),
+        ] {
+            if let Some(value) = value {
+                let in_range = value.is_finite()
+                    && if allow_zero {
+                        (0.0..=1.0).contains(&value)
+                    } else {
+                        value > 0.0 && value <= 1.0
+                    };
+                if !in_range {
+                    let range = if allow_zero {
+                        "[0.0, 1.0]"
+                    } else {
+                        "(0.0, 1.0]"
+                    };
+                    return Err(ConfigError::validation(
+                        format!("scratchpads.{}.{field}", self.name),
+                        format!("must be finite within {range}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validates a `scratchpads` table: entry count bound, per-entry contract, and
+/// duplicate names fail closed.
+pub fn validate_scratchpads(entries: &[ScratchpadConfig]) -> Result<(), ConfigError> {
+    if entries.len() > MAX_SCRATCHPADS {
+        return Err(ConfigError::validation(
+            "scratchpads",
+            format!("must contain <= {MAX_SCRATCHPADS} named slots"),
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        entry.validate()?;
+        if seen.contains(&entry.name.as_str()) {
+            return Err(ConfigError::validation(
+                "scratchpads",
+                format!("duplicate scratchpad name {:?}", entry.name),
+            ));
+        }
+        seen.push(&entry.name);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecorationConfig {
     /// Gap between adjacent views inside one workspace, logical px.
@@ -4340,6 +4541,9 @@ pub struct EffectiveConfig {
     pub decoration: DecorationConfig,
     /// Default floating panel geometry and appearance (`floating = { ... }`).
     pub floating: FloatingConfig,
+    /// Named scratchpad slots (`scratchpads = { <name> = { ... } }`, issue
+    /// #3205), sorted by declaration order.
+    pub scratchpads: Vec<ScratchpadConfig>,
     /// Merged per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343).
     ///
     /// Deep-merged per selector per field across layers, sorted by tier then
@@ -4405,6 +4609,7 @@ impl Default for EffectiveConfig {
             chrome: ChromeConfig::default(),
             decoration: DecorationConfig::default(),
             floating: FloatingConfig::default(),
+            scratchpads: Vec::new(),
             views: Vec::new(),
             scrollbar: ScrollbarConfig::default(),
             mouse: MouseConfig::default(),
@@ -4555,6 +4760,7 @@ impl EffectiveConfig {
         }
         self.decoration.validate()?;
         self.floating.validate()?;
+        validate_scratchpads(&self.scratchpads)?;
         // CTX-0343: every merged `views` entry must stay structurally valid
         // (grammar/bounds); the per-View AC-1/AC-2 contrast check then runs
         // on every target resolvable without live runtime state.

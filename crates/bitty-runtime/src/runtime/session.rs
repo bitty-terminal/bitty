@@ -1327,15 +1327,14 @@ impl Runtime {
         for pin in &snap.pinned {
             self.pinned.restore(pin.view.clone(), pin.anchor, pin.after);
         }
-        // Issue #3074: a restore installs a whole new world, so any pre-restore
-        // parked scratchpad leaf, its live pane session, and its
-        // primary-ownership handoff must be cleared (the high-water raise above
-        // already accounted for its id).
-        if let Some(parked_id) = self.scratchpad.peek().map(View::id) {
-            self.close_pane_session(&parked_id);
+        // Issue #3074 / #3205: a restore installs a whole new world, so every
+        // pre-restore scratchpad entry, its live pane session, and its view
+        // bindings must be cleared (the high-water raise above already
+        // accounted for the ids).
+        for view in self.scratchpads.drain_views() {
+            self.close_pane_session(&view.id());
+            self.drop_view_bindings_for(view.id());
         }
-        self.scratchpad = ScratchpadSlot::new();
-        self.scratchpad_primary_owner = None;
         // CTX-0536 (#923): a restored snapshot installs ids directly; raise
         // the monotonic high-water so a later allocation never reuses one.
         self.raise_view_id_high_water();

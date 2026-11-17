@@ -120,6 +120,39 @@ pub struct WorkspaceSummary {
     pub scratchpad_occupied: bool,
 }
 
+/// Outcome of one named scratchpad verb (issue #3205).
+///
+/// The runtime owns every layout/store mutation; the app only performs the
+/// side effects a headless runtime cannot (PTY spawn, plugin dispatch).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScratchpadActivation {
+    /// The slot is now shown as a cross-workspace float overlay.
+    Shown(ViewId),
+    /// The slot was hidden; the same `ViewId` stays parked.
+    Hidden(ViewId),
+    /// The slot's panel re-entered the tiling as a `Tiled` leaf.
+    RestoredToTiled(ViewId),
+    /// The runtime created the slot leaf and the app must spawn its PTY. On
+    /// failure the app rolls the slot back with
+    /// [`Runtime::scratchpad_discard`].
+    Spawn {
+        /// Slot name.
+        name: String,
+        /// Fresh leaf the PTY must attach to.
+        view: ViewId,
+        /// Resolved spawn recipe.
+        spawn: crate::config::ScratchpadSpawn,
+    },
+    /// The slot's source is a GUI plugin command; the app must dispatch it
+    /// and adopt the resulting panel with [`Runtime::scratchpad_adopt`].
+    LaunchPlugin {
+        /// Slot name.
+        name: String,
+        /// Qualified plugin command.
+        command: String,
+    },
+}
+
 /// A close awaiting explicit confirmation (kill-confirm gate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWsClose {
@@ -390,13 +423,14 @@ impl Runtime {
     /// on switch-away), so the summary is never stale. Time O(w + l) over
     /// `w` workspaces and `l` total leaves; space O(w + l).
     ///
-    /// CTX-0954: every row carries the window-global scratchpad occupancy
-    /// (`0`/`1` + presence), so a scratchpad put/take changes every row and
-    /// the existing `workspace.changed` diff fires without a new event.
+    /// CTX-0954 / #3205: every row carries the window-global scratchpad
+    /// occupancy (named-slot count + presence), so a scratchpad put/take
+    /// changes every row and the existing `workspace.changed` diff fires
+    /// without a new event.
     #[must_use]
     pub fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
-        let scratchpad_count = usize::from(!self.scratchpad.is_empty());
-        let scratchpad_occupied = !self.scratchpad.is_empty();
+        let scratchpad_count = self.scratchpads.len();
+        let scratchpad_occupied = !self.scratchpads.is_empty();
         self.workspaces
             .iter()
             .take(MAX_WORKSPACES)
@@ -449,9 +483,7 @@ impl Runtime {
         }
         live.extend(self.pinned.ids().iter().map(|view| view.0));
         live.extend(self.floats.paint_ids().iter().map(|view| view.0));
-        if let Some(parked) = self.scratchpad.peek() {
-            live.insert(parked.id().0);
-        }
+        live.extend(self.scratchpads.ids().iter().map(|view| view.0));
         self.panel_target_ids
             .borrow_mut()
             .retain(|view, _| live.contains(&view.0));
@@ -539,95 +571,340 @@ impl Runtime {
         out
     }
 
-    /// Parked panels in the window scratchpad slot: `0` (empty) or `1`
-    /// (occupied) (CTX-0954).
+    /// Occupied named scratchpad slots (visible and hidden, issue #3205).
     ///
-    /// Structurally bounded by the single-slot invariant; identity only,
-    /// never terminal content.
+    /// Structurally bounded by [`bitty_ui::MAX_SCRATCHPADS`]; identity and
+    /// names only, never terminal content.
     #[must_use]
     pub fn scratchpad_count(&self) -> usize {
-        usize::from(!self.scratchpad.is_empty())
+        self.scratchpads.len()
     }
 
-    /// Whether the window scratchpad slot holds a parked panel (CTX-0954).
+    /// Whether any scratchpad slot holds a panel (issue #3205).
     #[must_use]
     pub fn scratchpad_occupied(&self) -> bool {
-        !self.scratchpad.is_empty()
+        !self.scratchpads.is_empty()
     }
 
-    /// Park live leaf `id` into the window scratchpad slot (CTX-0954).
+    /// Occupied scratchpad slot names in park order.
+    #[must_use]
+    pub fn scratchpad_names(&self) -> Vec<&str> {
+        self.scratchpads.names()
+    }
+
+    /// Whether slot `name` is currently shown as a float overlay.
+    #[must_use]
+    pub fn scratchpad_visible(&self, name: &str) -> bool {
+        self.scratchpads.is_visible(name)
+    }
+
+    /// Whether slot `name` already holds a panel (visible or hidden).
+    #[must_use]
+    pub fn scratchpad_has_name(&self, name: &str) -> bool {
+        self.scratchpads.contains_name(name)
+    }
+
+    /// The resolved definition of slot `name`, if the config declares one.
+    #[must_use]
+    pub fn scratchpad_spec(&self, name: &str) -> Option<&crate::config::ScratchpadSpec> {
+        self.config
+            .scratchpads
+            .iter()
+            .find(|spec| spec.name == name)
+    }
+
+    /// Resolved geometry for `name`: the configured spec, else the float
+    /// default.
+    fn scratchpad_geometry(&self, name: &str) -> ScratchpadGeometry {
+        self.scratchpad_spec(name)
+            .map(|spec| spec.geometry)
+            .unwrap_or_default()
+    }
+
+    /// Focus (and primary ownership) after a scratchpad stops painting: the
+    /// first surviving tiled leaf, then a detached float, a pinned leaf, or
+    /// another shown scratchpad.
+    fn scratchpad_focus_survivor(&self) -> Option<ViewId> {
+        self.layout
+            .leaf_ids()
+            .into_iter()
+            .next()
+            .or_else(|| self.floats.paint_ids().last().copied())
+            .or_else(|| self.pinned.ids().last().copied())
+            .or_else(|| {
+                self.scratchpads
+                    .visible_ids()
+                    .into_iter()
+                    .find(|id| Some(*id) != self.focus.focused())
+            })
+    }
+
+    /// Shared post-edit fixups after a scratchpad became visible/focused.
+    fn after_scratchpad_shown(&mut self, id: ViewId) {
+        self.clear_hover_pending();
+        self.focus = Focus::with_focus(id);
+        // A shown scratchpad is the focused, painted surface: the primary grid
+        // follows it so its shell is sized and typable (same discipline as a
+        // detached float).
+        self.primary_view = Some(id);
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.pending_full_redraw = true;
+    }
+
+    /// Shared post-edit fixups after a scratchpad stopped painting.
+    fn after_scratchpad_hidden(&mut self, id: ViewId) {
+        self.clear_hover_pending();
+        if self.focus.focused() == Some(id) {
+            match self.scratchpad_focus_survivor() {
+                Some(next) => self.focus = Focus::with_focus(next),
+                None => self.focus.clear(),
+            }
+        }
+        if self.primary_view == Some(id) {
+            self.primary_view = self.focus.focused();
+        }
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.pending_full_redraw = true;
+    }
+
+    /// Empty-slot activation: spawn a PTY leaf or ask the app to launch a
+    /// plugin command (issue #3205).
+    fn scratchpad_activate_empty(&mut self, name: &str) -> Result<ScratchpadActivation, String> {
+        let Some(spec) = self.scratchpad_spec(name).cloned() else {
+            return Err(format!(
+                "scratchpad '{name}' is empty and no scratchpads.{name} entry is configured"
+            ));
+        };
+        match spec.spawn.clone() {
+            Some(crate::config::ScratchpadSpawn::Plugin { command }) => {
+                Ok(ScratchpadActivation::LaunchPlugin {
+                    name: name.to_string(),
+                    command,
+                })
+            }
+            Some(spawn @ crate::config::ScratchpadSpawn::Pty { .. }) => {
+                // The leaf exists before the PTY does, so the runtime owns the
+                // id and the slot from here; a failed spawn rolls the slot back
+                // through `scratchpad_discard`.
+                let view = self.next_view_id_global();
+                let label = self.active_workspace_label();
+                self.validate_view_target_at("terminal", label, view)
+                    .map_err(|error| error.to_string())?;
+                self.scratchpads
+                    .create(
+                        name,
+                        View::new(view, self.cols.max(1), self.rows.max(1)),
+                        spec.geometry,
+                    )
+                    .map_err(|error| error.to_string())?;
+                self.after_scratchpad_shown(view);
+                Ok(ScratchpadActivation::Spawn {
+                    name: name.to_string(),
+                    view,
+                    spawn,
+                })
+            }
+            None => Err(format!(
+                "scratchpad '{name}' is empty and its scratchpads.{name} entry declares no cmd or command"
+            )),
+        }
+    }
+
+    /// Toggle scratchpad `name` (issue #3205).
     ///
-    /// The leaf detaches from the live (active-workspace) layout and waits in
-    /// the single hidden slot; its pane session (if any) stays keyed by
-    /// [`ViewId`] and resumes on show. Occupancy surfaces through
-    /// [`Self::workspace_summaries`] and the existing `workspace.changed`
-    /// diff — no panel capability is involved.
+    /// A visible slot hides (parking the same `ViewId`, so its session stays
+    /// alive); a hidden slot shows; an empty slot auto-spawns/launches its
+    /// configured source. `target` is the compatibility park target used by
+    /// the legacy `bitty.workspace:scratchpad-toggle` command (it parks the
+    /// focused leaf into an empty slot); the keymap toggle passes `None`, so
+    /// pressing it never steals the focused panel.
     ///
-    /// When the parked leaf owns the primary shell, ownership moves to the
-    /// surviving focus (a parked leaf paints nothing) and the `(parked,
-    /// handoff)` pair is recorded in `scratchpad_primary_owner` so
-    /// [`Self::scratchpad_show`] can hand it back only while the handoff
-    /// still holds it (CodeRabbit #1671 follow-up).
+    /// Fail-closed with layout, focus, and sessions untouched for an invalid
+    /// name, a refused mode stamp, a stranded single-leaf layout, an unknown
+    /// target, or an empty unconfigured slot.
+    pub fn scratchpad_toggle_named(
+        &mut self,
+        name: &str,
+        target: Option<ViewId>,
+    ) -> Result<ScratchpadActivation, String> {
+        if let Some(entry) = self.scratchpads.entry(name) {
+            let visible = entry.visible();
+            if visible {
+                let id = self
+                    .scratchpads
+                    .hide(name)
+                    .map_err(|error| error.to_string())?;
+                self.after_scratchpad_hidden(id);
+                Ok(ScratchpadActivation::Hidden(id))
+            } else {
+                let id = self
+                    .scratchpads
+                    .show(name)
+                    .map_err(|error| error.to_string())?;
+                self.after_scratchpad_shown(id);
+                Ok(ScratchpadActivation::Shown(id))
+            }
+        } else if let Some(id) = target {
+            let geometry = self.scratchpad_geometry(name);
+            self.scratchpads
+                .park(name, &mut self.layout, id, geometry)
+                .map_err(|error| error.to_string())?;
+            self.after_scratchpad_shown(id);
+            Ok(ScratchpadActivation::Shown(id))
+        } else {
+            self.scratchpad_activate_empty(name)
+        }
+    }
+
+    /// `move_to_scratchpad[:<name>]` (issue #3205).
     ///
-    /// Fail-closed with state untouched: occupied slot, unknown id, a
-    /// rejected mode stamp, or hiding the live layout's last leaf (an empty
-    /// live layout would strand focus and present).
+    /// A visible slot returns its panel to the tiling; a hidden slot is shown;
+    /// an empty slot parks the focused `target` (or auto-spawns when the slot
+    /// is configured and nothing is focused).
+    pub fn scratchpad_move_named(
+        &mut self,
+        name: &str,
+        target: Option<ViewId>,
+    ) -> Result<ScratchpadActivation, String> {
+        if let Some(entry) = self.scratchpads.entry(name) {
+            if entry.visible() {
+                let id = self
+                    .scratchpads
+                    .to_tiled(name, &mut self.layout)
+                    .map_err(|error| error.to_string())?;
+                self.after_scratchpad_shown_in_layout(id);
+                Ok(ScratchpadActivation::RestoredToTiled(id))
+            } else {
+                let id = self
+                    .scratchpads
+                    .show(name)
+                    .map_err(|error| error.to_string())?;
+                self.after_scratchpad_shown(id);
+                Ok(ScratchpadActivation::Shown(id))
+            }
+        } else if let Some(id) = target {
+            self.scratchpad_toggle_named(name, Some(id))
+        } else {
+            self.scratchpad_activate_empty(name)
+        }
+    }
+
+    /// `scratchpad_to_tiled[:<name>]` (issue #3205): return the slot's panel
+    /// to the tiling as a `Tiled` leaf beside its recorded anchor.
+    pub fn scratchpad_to_tiled_named(&mut self, name: &str) -> Result<ViewId, String> {
+        let id = self
+            .scratchpads
+            .to_tiled(name, &mut self.layout)
+            .map_err(|error| error.to_string())?;
+        self.after_scratchpad_shown_in_layout(id);
+        Ok(id)
+    }
+
+    /// Shared fixups after a scratchpad re-entered the layout as `Tiled`.
+    fn after_scratchpad_shown_in_layout(&mut self, id: ViewId) {
+        self.clear_hover_pending();
+        self.focus = Focus::with_focus(id);
+        self.primary_view = Some(id);
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.pending_full_redraw = true;
+    }
+
+    /// Adopts a freshly materialized panel (a plugin-created leaf) into the
+    /// empty, visible slot `name` (issue #3205 GUI scratchpads).
+    ///
+    /// The runtime owns the leaf from here: the view never enters the layout,
+    /// it is stamped `Floating`, focused, and composited over the active
+    /// workspace. Fails closed (view untouched) when the name is occupied or
+    /// the bounded slot table is full.
+    pub fn scratchpad_adopt(&mut self, name: &str, view: View) -> Result<ViewId, String> {
+        let geometry = self.scratchpad_geometry(name);
+        let id = self
+            .scratchpads
+            .create(name, view, geometry)
+            .map_err(|error| error.to_string())?;
+        self.after_scratchpad_shown(id);
+        Ok(id)
+    }
+
+    /// Discards the panel in slot `name` without restoring it (auto-spawn
+    /// rollback and dead-panel teardown).
+    ///
+    /// Focus and primary ownership are re-homed off the discarded view first,
+    /// so a failed spawn can never leave focus naming a leaf that no longer
+    /// exists anywhere.
+    pub fn scratchpad_discard(&mut self, name: &str) -> bool {
+        let Some(view) = self.scratchpads.entry(name).map(|entry| entry.view_id()) else {
+            return false;
+        };
+        let was_focused = self.focus.focused() == Some(view);
+        let was_primary = self.primary_view == Some(view);
+        if self.scratchpads.discard_name(name).is_none() {
+            return false;
+        }
+        if was_focused {
+            match self.scratchpad_focus_survivor() {
+                Some(next) => self.focus = Focus::with_focus(next),
+                None => self.focus.clear(),
+            }
+        }
+        if was_primary {
+            self.primary_view = self.focus.focused();
+        }
+        self.after_stashed_removal(view);
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.sync_mode_caches_to_focus();
+        self.pending_full_redraw = true;
+        true
+    }
+
+    /// Park live leaf `id` into the default scratchpad and show it (CTX-0954,
+    /// redefined by issue #3205: parking shows the cross-workspace float).
+    ///
+    /// Fails closed with state untouched for a stranded single-leaf layout,
+    /// an unknown id, an unsupported mode, or an occupied slot.
     pub fn scratchpad_hide(&mut self, id: ViewId) -> Result<(), String> {
         if self.layout.leaf_count() <= 1 {
             return Err(String::from("scratchpad hide would strand an empty layout"));
         }
-        self.scratchpad
-            .hide(&mut self.layout, id)
+        let geometry = self.scratchpad_geometry(bitty_ui::DEFAULT_SCRATCHPAD);
+        self.scratchpads
+            .park(bitty_ui::DEFAULT_SCRATCHPAD, &mut self.layout, id, geometry)
             .map_err(|error| error.to_string())?;
-        let restore_primary = self.primary_view == Some(id);
-        self.after_scratchpad_move(Some(id));
-        self.scratchpad_primary_owner = restore_primary.then_some((id, self.primary_view));
+        self.after_scratchpad_shown(id);
         Ok(())
     }
 
-    /// Restore the parked leaf beside its anchor and focus it (CTX-0954).
-    ///
-    /// When the parked leaf owned the primary shell at hide time, ownership
-    /// returns to it before the geometry sync — but only while `primary_view`
-    /// still matches the recorded handoff recipient (a workspace close may
-    /// have re-homed it elsewhere since; stealing it back would leave the new
-    /// owner erased and its input buffered). Otherwise the restored leaf
-    /// stays session-less (CodeRabbit #1671 follow-up).
-    ///
-    /// Returns the restored leaf id. Fail-closed with state untouched when
-    /// nothing is parked or the mode gate rejects the restore.
+    /// Show the default scratchpad slot, focusing it (CTX-0954 / #3205).
     pub fn scratchpad_show(&mut self) -> Result<ViewId, String> {
         let id = self
-            .scratchpad
-            .show(&mut self.layout)
+            .scratchpads
+            .show(bitty_ui::DEFAULT_SCRATCHPAD)
             .map_err(|error| error.to_string())?;
-        self.focus = Focus::with_focus(id);
-        if self
-            .scratchpad_primary_owner
-            .as_ref()
-            .is_some_and(|(owner, handoff)| {
-                *owner == id && self.primary_view.as_ref() == handoff.as_ref()
-            })
-        {
-            self.primary_view = Some(id);
-        }
-        self.scratchpad_primary_owner = None;
-        self.after_scratchpad_move(None);
+        self.after_scratchpad_shown(id);
         Ok(id)
     }
 
-    /// Toggle the window scratchpad slot (CTX-0954).
+    /// Toggle the default scratchpad slot (CTX-0954 / #3205).
     ///
-    /// Shows the parked leaf when occupied (the target is ignored), otherwise
-    /// hides `target`. Returns the restored id on show, `None` on hide.
-    /// Same fail-closed rules as [`Self::scratchpad_hide`] and
-    /// [`Self::scratchpad_show`].
+    /// Shows a hidden slot, hides a visible one (the target is ignored), or
+    /// parks `target` into an empty slot. Returns the restored id on show,
+    /// `None` on hide/park.
     pub fn scratchpad_toggle(&mut self, target: Option<ViewId>) -> Result<Option<ViewId>, String> {
-        if self.scratchpad.is_empty() {
-            let id = target.ok_or_else(|| String::from("scratchpad hide needs a target leaf"))?;
-            self.scratchpad_hide(id).map(|()| None)
-        } else {
-            self.scratchpad_show().map(Some)
+        match self.scratchpad_toggle_named(bitty_ui::DEFAULT_SCRATCHPAD, target)? {
+            ScratchpadActivation::Shown(id)
+            | ScratchpadActivation::RestoredToTiled(id)
+            | ScratchpadActivation::Spawn { view: id, .. } => Ok(Some(id)),
+            ScratchpadActivation::Hidden(_) => Ok(None),
+            ScratchpadActivation::LaunchPlugin { name, .. } => Err(format!(
+                "scratchpad '{name}' is a plugin scratchpad and needs the app dispatch path"
+            )),
         }
     }
 
@@ -1101,13 +1378,7 @@ impl Runtime {
                 return true;
             }
         }
-        if self.scratchpad.discard(id).is_some() {
-            if self
-                .scratchpad_primary_owner
-                .is_some_and(|(owner, _)| owner == id)
-            {
-                self.scratchpad_primary_owner = None;
-            }
+        if self.scratchpads.discard(id).is_some() {
             self.after_stashed_removal(id);
             return true;
         }
@@ -1131,8 +1402,10 @@ impl Runtime {
     }
 
     /// Shared post-edit fixups after the live layout lost or gained a leaf
-    /// through the scratchpad slot (CTX-0954), the pinned store (CTX-1077),
-    /// or the detached-float store (CTX-1147).
+    /// through the pinned store (CTX-1077) or the detached-float store
+    /// (CTX-1147). Named scratchpads (issue #3205) do not use this seam: a
+    /// shown slot lives entirely outside the layout and re-homes focus via
+    /// [`Self::after_scratchpad_shown`]/[`Self::after_scratchpad_hidden`].
     ///
     /// `hidden` is the just-parked leaf, if any: focus moves off it onto the
     /// first surviving leaf, and primary-grid ownership follows (a parked leaf
@@ -1355,11 +1628,10 @@ impl Runtime {
         for slot in &self.workspaces {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
         }
-        // CTX-0954: the parked leaf is window-owned while hidden; covering it
-        // keeps the allocator from re-handing its id before it is restored.
-        if let Some(parked) = self.scratchpad.peek() {
-            raws.push(parked.id().0);
-        }
+        // CTX-0954: every scratchpad entry is window-owned while it holds a
+        // view; covering them keeps the allocator from re-handing an id
+        // before it is restored or closed.
+        raws.extend(self.scratchpads.ids().iter().map(|id| id.0));
         // CTX-1077: pinned leaves are window-owned while pinned (detached
         // from every slot layout); covering them keeps the allocator from
         // re-handing an id before it is unpinned.
@@ -1390,9 +1662,7 @@ impl Runtime {
             raws.extend(slot.layout.leaf_ids().iter().map(|id| id.0));
             raws.extend(slot.floats.ids().iter().map(|id| id.0));
         }
-        if let Some(parked) = self.scratchpad.peek() {
-            raws.push(parked.id().0);
-        }
+        raws.extend(self.scratchpads.ids().iter().map(|id| id.0));
         raws.extend(self.pinned.ids().iter().map(|id| id.0));
         raws.extend(self.floats.ids().iter().map(|id| id.0));
         raws
@@ -1432,6 +1702,7 @@ impl Runtime {
             !self.layout.leaf_ids().contains(id)
                 && !self.pinned.contains(*id)
                 && !self.floats.contains(*id)
+                && !self.scratchpads.is_view_visible(*id)
         }) {
             let replacement = self
                 .layout
@@ -1439,7 +1710,8 @@ impl Runtime {
                 .into_iter()
                 .next()
                 .or_else(|| self.floats.paint_ids().last().copied())
-                .or_else(|| self.pinned.ids().last().copied());
+                .or_else(|| self.pinned.ids().last().copied())
+                .or_else(|| self.scratchpads.visible_ids().last().copied());
             match replacement {
                 Some(next) => {
                     self.focus = Focus::with_focus(next);
@@ -1985,7 +2257,7 @@ impl Runtime {
         let mut ids: Vec<ViewId> = active_tiled;
         ids.extend(self.floats.ids());
         ids.extend(self.pinned.ids());
-        ids.extend(self.scratchpad.peek().map(|view| view.id()));
+        ids.extend(self.scratchpads.ids());
         for (index, slot) in self.workspaces.iter().enumerate() {
             if index == self.active_workspace {
                 continue;
@@ -2157,6 +2429,13 @@ impl Runtime {
         // an inactive workspace must not reload the active slot from a stale
         // stash (live leaf edits, geometry, focus, and owners would revert).
         self.stash_active_slot();
+        // Issue #3205: a shown scratchpad is window-global, so closing the
+        // active workspace must not steal its focus — it still paints over the
+        // newly loaded slot. Capture it while `self.focus` is still live.
+        let overlay_focus = self
+            .focus
+            .focused()
+            .filter(|id| self.scratchpads.is_view_visible(*id));
         // CTX-0567 (#992): fold every id currently held (live layout plus all
         // stashed slots, including the slot about to be removed) into the
         // monotonic high-water *before* the slot is dropped. Retirement is a
@@ -2244,6 +2523,15 @@ impl Runtime {
         };
         self.active_workspace = active;
         self.load_slot(active);
+        // Issue #3205: re-assert the shown scratchpad's focus after the slot
+        // load replaced it with the new workspace's stashed focus.
+        if let Some(id) = overlay_focus {
+            if self.scratchpads.is_view_visible(id) {
+                self.focus = Focus::with_focus(id);
+                self.sync_mode_caches_to_focus();
+                self.pending_full_redraw = true;
+            }
+        }
         // CTX-1336 (#2221): closing a workspace installs a different slot.
         // Like `workspace_switch`, that is a layout/focus change with no PTY
         // damage of its own, so force the next frame; otherwise the closed
@@ -5010,8 +5298,10 @@ mod tests {
 
     #[test]
     fn scratchpad_hide_show_tracks_occupancy_in_summaries() {
-        // CTX-0954: empty vs occupied rows; a put/take flips count + presence
-        // on every (window-global) row; the parked id is never re-handed.
+        // CTX-0954 / #3205: empty vs occupied rows; a put/take flips count +
+        // presence on every (window-global) row; a shown slot paints as a
+        // float overlay (never back into the layout) and its id is never
+        // re-handed while the slot owns it.
         let mut rt = fresh();
         let only = rt.focused_view().expect("focus");
         assert_eq!(rt.scratchpad_count(), 0);
@@ -5025,7 +5315,7 @@ mod tests {
         assert!(rt.scratchpad_hide(only).is_err());
         assert!(rt.scratchpad_show().is_err());
         assert_eq!(rt.layout().leaf_ids(), vec![only]);
-        // A second leaf lets the focused one park.
+        // A second leaf lets the focused one park (and show) as an overlay.
         let second = ViewId::new(2);
         let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
         rt.set_layout(LayoutNode::split(
@@ -5035,14 +5325,19 @@ mod tests {
             LayoutNode::leaf(View::new(second, 40, 24)),
         ));
         assert!(rt.set_focus(only));
-        rt.scratchpad_hide(only).expect("hide focused leaf");
+        rt.scratchpad_hide(only).expect("park focused leaf");
         assert_eq!(rt.scratchpad_count(), 1);
         assert!(rt.scratchpad_occupied());
-        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
+        assert_eq!(rt.layout().leaf_ids(), vec![second], "slot collapses");
         assert_eq!(
             rt.focused_view(),
-            Some(second),
-            "focus leaves the parked leaf"
+            Some(only),
+            "the shown overlay takes focus"
+        );
+        assert!(
+            !rt.layout().leaf_ids().contains(&only),
+            "a shown scratchpad never re-enters the layout"
         );
         let summaries = rt.workspace_summaries();
         assert!(!summaries.is_empty());
@@ -5053,15 +5348,21 @@ mod tests {
         assert_ne!(
             rt.next_view_id_global(),
             only,
-            "parked id stays covered while hidden"
+            "parked id stays covered while the slot owns it"
         );
         // Occupied hide is refused with the tree untouched.
         let before = rt.layout().clone();
         assert!(rt.scratchpad_hide(second).is_err());
         assert_eq!(rt.layout(), &before);
-        // Show restores the same id beside its anchor and focuses it.
+        // Showing an already-shown slot is idempotent (same id, no layout).
         let restored = rt.scratchpad_show().expect("show");
         assert_eq!(restored, only);
+        assert_eq!(rt.layout().leaf_ids(), vec![second]);
+        // `to_tiled` is the explicit "give it back" verb.
+        let tiled = rt
+            .scratchpad_to_tiled_named(bitty_ui::DEFAULT_SCRATCHPAD)
+            .expect("to tiled");
+        assert_eq!(tiled, only);
         assert_eq!(rt.scratchpad_count(), 0);
         assert!(!rt.scratchpad_occupied());
         assert_eq!(rt.focused_view(), Some(only));
@@ -5073,11 +5374,15 @@ mod tests {
     }
 
     #[test]
-    fn scratchpad_toggle_hides_then_shows_target_ignored_on_show() {
-        // CTX-0954: vacant toggle hides the target; occupied toggle restores
-        // the parked leaf and ignores the target.
+    fn scratchpad_toggle_parks_then_hides_without_leaving_the_slot() {
+        // #3205: an empty, unconfigured slot refuses `toggle` (there is
+        // nothing to show and no source to spawn); a target parks and shows
+        // it; the next toggle hides it while keeping the same `ViewId`.
         let mut rt = fresh();
-        assert!(rt.scratchpad_toggle(None).is_err(), "hide needs a target");
+        assert!(
+            rt.scratchpad_toggle(None).is_err(),
+            "empty unconfigured slot refuses"
+        );
         let only = rt.focused_view().expect("focus");
         let second = ViewId::new(2);
         let leaf1 = rt.layout().find_leaf(only).cloned().expect("leaf1");
@@ -5088,14 +5393,332 @@ mod tests {
             LayoutNode::leaf(View::new(second, 40, 24)),
         ));
         assert!(rt.set_focus(only));
-        assert_eq!(rt.scratchpad_toggle(Some(only)).expect("hide"), None);
-        assert!(rt.scratchpad_occupied());
         assert_eq!(
-            rt.scratchpad_toggle(Some(second)).expect("show"),
-            Some(only)
+            rt.scratchpad_toggle(Some(only)).expect("park"),
+            Some(only),
+            "parking shows the overlay"
         );
-        assert!(!rt.scratchpad_occupied());
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
+        // Occupied: the target is ignored; the slot hides (same id parked).
+        assert_eq!(rt.scratchpad_toggle(Some(second)).expect("hide"), None);
+        assert!(!rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
+        assert_eq!(rt.scratchpad_count(), 1, "hiding never empties the slot");
+        assert_eq!(rt.focused_view(), Some(second), "focus returns to tiled");
+        // Showing again returns the same id.
+        assert_eq!(rt.scratchpad_toggle(Some(only)).expect("show"), Some(only));
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
         assert_eq!(rt.focused_view(), Some(only));
+        assert!(!rt.layout().leaf_ids().contains(&only));
+    }
+
+    #[test]
+    fn scratchpad_first_trigger_requests_spawn_then_toggles_the_same_slot() {
+        // Issue #3205: an empty configured slot auto-spawns on the first
+        // trigger, paints at its own geometry, and never asks for a second
+        // spawn while the slot holds the panel.
+        let mut rt = fresh();
+        assert!(rt.set_scratchpad_specs(vec![crate::config::ScratchpadSpec {
+            name: String::from("btop"),
+            spawn: Some(crate::config::ScratchpadSpawn::Pty {
+                cmd: String::from("btop"),
+                args: vec![String::from("--utf-force")],
+                cwd: None,
+            }),
+            geometry: bitty_ui::ScratchpadGeometry {
+                width: 0.5,
+                height: 0.9,
+                centered: true,
+                x: None,
+                y: None,
+                background_opacity: Some(0.7),
+            },
+        }]));
+        let activation = rt
+            .scratchpad_toggle_named("btop", None)
+            .expect("first trigger spawns");
+        let view = match activation {
+            ScratchpadActivation::Spawn { name, view, spawn } => {
+                assert_eq!(name, "btop");
+                assert_eq!(
+                    spawn,
+                    crate::config::ScratchpadSpawn::Pty {
+                        cmd: String::from("btop"),
+                        args: vec![String::from("--utf-force")],
+                        cwd: None,
+                    }
+                );
+                view
+            }
+            other => panic!("expected Spawn, got {other:?}"),
+        };
+        assert!(rt.scratchpad_has_name("btop"));
+        assert!(rt.scratchpad_visible("btop"));
+        assert_eq!(rt.focused_view(), Some(view), "the fresh slot takes focus");
+        assert_eq!(rt.primary_view(), Some(view));
+        assert!(
+            !rt.layout().leaf_ids().contains(&view),
+            "a scratchpad leaf never enters the layout"
+        );
+        // The composite honours the per-slot size override while the slot is
+        // shown (80% width/height is the default; this slot asks for 50%/90%).
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("shown scratchpad has a present frame");
+        assert_eq!(frame.tier, Some(OverlayTier::Float));
+        let container = rt.container;
+        assert!(
+            frame.cols <= (container.width / 2).saturating_add(2),
+            "width override applies: cols={} container={}",
+            frame.cols,
+            container.width
+        );
+        assert!(
+            frame.rows >= (container.height * 8) / 10,
+            "height override applies: rows={} container={}",
+            frame.rows,
+            container.height
+        );
+
+        // No second spawn: the occupied slot just hides/shows the same view.
+        assert!(matches!(
+            rt.scratchpad_toggle_named("btop", None).expect("hide"),
+            ScratchpadActivation::Hidden(id) if id == view
+        ));
+        assert!(!rt.scratchpad_visible("btop"));
+        assert!(matches!(
+            rt.scratchpad_toggle_named("btop", None).expect("show"),
+            ScratchpadActivation::Shown(id) if id == view
+        ));
+        assert!(rt.scratchpad_visible("btop"));
+    }
+
+    #[test]
+    fn scratchpad_plugin_spec_requests_launch_without_creating_a_leaf() {
+        // Issue #3205: a GUI plugin scratchpad has no PTY leaf until the
+        // plugin creates its panel, so the first trigger only asks the app to
+        // dispatch the command.
+        let mut rt = fresh();
+        assert!(rt.set_scratchpad_specs(vec![crate::config::ScratchpadSpec {
+            name: String::from("files"),
+            spawn: Some(crate::config::ScratchpadSpawn::Plugin {
+                command: String::from("bitty-terminal.file-manager:open"),
+            }),
+            geometry: bitty_ui::ScratchpadGeometry::default(),
+        }]));
+        let before = rt.layout().clone();
+        assert_eq!(
+            rt.scratchpad_toggle_named("files", None).expect("launch"),
+            ScratchpadActivation::LaunchPlugin {
+                name: String::from("files"),
+                command: String::from("bitty-terminal.file-manager:open"),
+            }
+        );
+        assert!(!rt.scratchpad_has_name("files"));
+        assert_eq!(rt.layout(), &before, "launch touches no layout");
+
+        // Adoption materializes the plugin panel straight into the slot.
+        let view = ViewId::new(9);
+        assert_eq!(
+            rt.scratchpad_adopt("files", View::new(view, 40, 24))
+                .expect("adopt plugin panel"),
+            view
+        );
+        assert!(rt.scratchpad_visible("files"));
+        assert_eq!(rt.focused_view(), Some(view));
+        assert!(!rt.layout().leaf_ids().contains(&view));
+        // A second adoption for the same slot is refused with the panel
+        // untouched (the app places it normally instead).
+        assert!(
+            rt.scratchpad_adopt("files", View::new(ViewId::new(10), 40, 24))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn refused_scratchpad_move_leaves_layout_focus_and_slot_untouched() {
+        // Issue #3205: a refused move is atomic — the layout, focus, and the
+        // slot table are byte-identical afterwards.
+        let mut rt = fresh();
+        let only = rt.focused_view().expect("focus");
+        let before = rt.layout().clone();
+        let err = rt
+            .scratchpad_move_named(bitty_ui::DEFAULT_SCRATCHPAD, Some(only))
+            .expect_err("single-leaf move must refuse");
+        assert!(err.contains("strand"), "unexpected refusal: {err}");
+        assert_eq!(rt.layout(), &before);
+        assert_eq!(rt.focused_view(), Some(only));
+        assert_eq!(rt.primary_view(), Some(only));
+        assert!(!rt.scratchpad_occupied());
+
+        // A Fullscreen leaf is not a movable scratchpad source; the rejected
+        // park restores the tree exactly.
+        let second = ViewId::new(2);
+        let layout = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::with_presentation(
+                only,
+                40,
+                24,
+                bitty_ui::PresentationMode::Fullscreen,
+            )),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        );
+        rt.set_layout(layout.clone());
+        assert!(rt.set_focus(only));
+        let err = rt
+            .scratchpad_move_named("logs", Some(only))
+            .expect_err("fullscreen move must refuse");
+        assert!(err.contains("floating"), "unexpected refusal: {err}");
+        assert_eq!(rt.layout().leaf_ids(), layout.leaf_ids());
+        assert_eq!(rt.focused_view(), Some(only));
+        assert!(!rt.scratchpad_has_name("logs"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn named_scratchpad_hide_show_keeps_the_pane_session() {
+        // Issue #3205: hiding parks the scratchpad — it never kills its PTY.
+        require_pty!();
+        let mut rt = fresh();
+        let first = rt.focused_view().expect("focus");
+        let second = ViewId::new(2);
+        let leaf = rt.layout().find_leaf(first).cloned().expect("leaf");
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(leaf),
+            LayoutNode::leaf(View::new(second, 40, 24)),
+        ));
+        rt.spawn_shell_for_view(second, "/bin/sh", &[], 20, 10)
+            .expect("spawn second pane shell");
+        assert!(rt.has_pane_session(&second));
+        assert!(rt.set_focus(second));
+
+        assert!(matches!(
+            rt.scratchpad_move_named("logs", Some(second))
+                .expect("park into named slot"),
+            ScratchpadActivation::Shown(id) if id == second
+        ));
+        assert!(rt.has_pane_session(&second), "park keeps the pane session");
+        assert!(!rt.layout().leaf_ids().contains(&second));
+
+        assert!(matches!(
+            rt.scratchpad_toggle_named("logs", None).expect("hide"),
+            ScratchpadActivation::Hidden(id) if id == second
+        ));
+        assert!(
+            rt.has_pane_session(&second),
+            "hiding parks without killing the PTY"
+        );
+        assert!(matches!(
+            rt.scratchpad_toggle_named("logs", None).expect("show"),
+            ScratchpadActivation::Shown(id) if id == second
+        ));
+        assert!(
+            rt.has_pane_session(&second),
+            "the same session resumes on show"
+        );
+        assert_eq!(rt.scratchpad_names(), vec!["logs"]);
+    }
+
+    #[test]
+    fn scratchpad_spec_resolves_global_floating_defaults_and_overrides() {
+        // Issue #3205: per-scratchpad size/position/opacity inherit the global
+        // `floating` table per field.
+        let global = bitty_config::FloatingConfig {
+            width: Some(0.5),
+            height: Some(0.6),
+            centered: Some(false),
+            x: Some(0.25),
+            y: Some(0.75),
+            background_opacity: Some(0.9),
+            background: None,
+        };
+        let entry = bitty_config::types::ScratchpadConfig {
+            name: String::from("logs"),
+            cmd: Some(String::from("lazygit")),
+            width: Some(0.9),
+            ..Default::default()
+        };
+        let spec = crate::config::ScratchpadSpec::from_config(&entry, &global);
+        assert_eq!(spec.geometry.width, 0.9, "explicit override wins");
+        assert_eq!(spec.geometry.height, 0.6, "height inherited");
+        assert_eq!(spec.geometry.x, Some(0.25), "x inherited");
+        assert_eq!(spec.geometry.y, Some(0.75), "y inherited");
+        assert!(!spec.geometry.centered, "centered inherited");
+        assert_eq!(spec.geometry.background_opacity, Some(0.9));
+        assert_eq!(
+            spec.spawn,
+            Some(crate::config::ScratchpadSpawn::Pty {
+                cmd: String::from("lazygit"),
+                args: Vec::new(),
+                cwd: None,
+            })
+        );
+        spec.validate().expect("resolved spec validates");
+
+        // Defaults with no global overrides resolve to the accepted float
+        // share (80%, centered) and no opacity override.
+        let spec = crate::config::ScratchpadSpec::from_config(
+            &bitty_config::types::ScratchpadConfig {
+                name: String::from("plain"),
+                ..Default::default()
+            },
+            &bitty_config::FloatingConfig::default(),
+        );
+        assert_eq!(
+            spec.geometry.width,
+            bitty_ui::presentation::DEFAULT_FLOAT_SIZE_RATIO
+        );
+        assert_eq!(
+            spec.geometry.height,
+            bitty_ui::presentation::DEFAULT_FLOAT_SIZE_RATIO
+        );
+        assert!(spec.geometry.centered);
+        assert_eq!(spec.geometry.background_opacity, None);
+        assert_eq!(spec.spawn, None, "geometry-only slot declares no source");
+
+        // Validation stays fail-closed at the runtime boundary too.
+        let mut bad = spec.clone();
+        bad.name = String::from("Bad Name");
+        assert!(bad.validate().is_err());
+        let mut bad = spec.clone();
+        bad.geometry.width = 1.5;
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn scratchpad_spec_validator_matches_config_validator() {
+        // `bitty-ui` cannot depend on `bitty-config`, so the name grammar is
+        // duplicated by design; pin the two against one matrix.
+        for name in [
+            "default",
+            "logs",
+            "build-logs_2",
+            "a",
+            "x-y_z9",
+            "",
+            "Bad",
+            "has space",
+            "trailing-",
+        ] {
+            assert_eq!(
+                bitty_ui::is_valid_scratchpad_name(name),
+                bitty_config::types::is_valid_scratchpad_name(name),
+                "validators disagree on {name:?}"
+            );
+        }
+        assert_eq!(
+            bitty_ui::MAX_SCRATCHPAD_NAME_LEN,
+            bitty_config::types::MAX_SCRATCHPAD_NAME_LEN
+        );
+        assert_eq!(
+            bitty_ui::MAX_SCRATCHPADS,
+            bitty_config::types::MAX_SCRATCHPADS
+        );
     }
 
     /// Whether the first grid row of `view`'s tile carries glyph ink.
@@ -5156,124 +5779,124 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn scratchpad_show_restores_primary_ownership_to_parked_owner() {
-        // CodeRabbit #1671: hiding the primary owner moves ownership to the
-        // survivor (the shell stays reachable through it); showing hands
-        // ownership back to the returning leaf so it paints the primary grid
-        // and routes input to it instead of rendering erased and buffering
-        // headless.
+    fn scratchpad_overlay_keeps_primary_shell_live_across_hide_and_show() {
+        // Issue #3205: parking the primary owner shows it as a float overlay,
+        // so it keeps the primary grid and PTY — its shell stays typable and
+        // paints while shown. Hiding moves focus and ownership to the tiled
+        // survivor; showing takes them back.
         require_pty!();
         let (mut rt, owner, other) = primary_attached_pair();
-        // Baseline: typing on the session-less owner reaches the shell.
-        assert!(rt.push_input_bytes(b"x"), "owner routes to primary shell");
-        rt.scratchpad_hide(owner).expect("hide owner");
+        rt.scratchpad_hide(owner).expect("park owner");
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(rt.primary_view(), Some(owner));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "the shown overlay keeps the primary shell"
+        );
+        rt.tick().expect("headless tick presents");
+        assert!(
+            leaf_row_has_ink(&rt, owner),
+            "the overlay paints the primary grid"
+        );
+        assert!(
+            !leaf_row_has_ink(&rt, other),
+            "no grid is duplicated onto the survivor"
+        );
+
+        // Hide: focus and ownership return to the tiled survivor.
+        assert_eq!(rt.scratchpad_toggle(None).expect("hide"), None);
+        assert!(!rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
         assert_eq!(rt.focused_view(), Some(other));
         assert_eq!(rt.primary_view(), Some(other));
         assert!(
             rt.push_input_bytes(b"x"),
             "survivor keeps the shell reachable"
         );
-        let restored = rt.scratchpad_show().expect("show");
-        assert_eq!(restored, owner);
+
+        // Show again: the same ViewId returns as the focused overlay.
+        let shown = rt.scratchpad_show().expect("show");
+        assert_eq!(shown, owner);
         assert_eq!(rt.focused_view(), Some(owner));
-        assert_eq!(
-            rt.primary_view(),
-            Some(owner),
-            "ownership returns to the parked owner"
-        );
+        assert_eq!(rt.primary_view(), Some(owner));
         assert!(rt.is_primary_view(&owner));
         assert!(
             rt.push_input_bytes(b"x"),
-            "restored owner routes to primary shell again"
+            "shown overlay routes to the primary shell again"
         );
         rt.tick().expect("headless tick presents");
-        assert!(
-            leaf_row_has_ink(&rt, owner),
-            "owner paints the primary grid"
-        );
-        assert!(
-            !leaf_row_has_ink(&rt, other),
-            "no grid is duplicated onto the survivor"
-        );
+        assert!(leaf_row_has_ink(&rt, owner));
+        assert!(!leaf_row_has_ink(&rt, other));
     }
 
     #[test]
     #[cfg(unix)]
-    fn scratchpad_show_keeps_primary_ownership_for_non_owner() {
-        // CodeRabbit #1671, other direction: parking a non-owner leaves
-        // ownership alone, and showing it must not steal ownership. Typing on
-        // the session-less non-owner buffers instead of reaching another
-        // view's shell, and only the owner's tile paints the grid.
+    fn scratchpad_show_takes_primary_ownership_for_the_shown_overlay() {
+        // Issue #3205 (deliberate deviation from the CTX-0954 handoff rule):
+        // the shown scratchpad is the focused, painted surface, so it owns the
+        // primary grid until it hides. The previous owner's pane session is
+        // never killed — only grid ownership moves.
         require_pty!();
         let (mut rt, owner, other) = primary_attached_pair();
         assert!(rt.set_focus(other));
-        rt.scratchpad_hide(other).expect("hide non-owner");
-        assert_eq!(rt.primary_view(), Some(owner));
-        let restored = rt.scratchpad_show().expect("show");
-        assert_eq!(restored, other);
+        rt.scratchpad_hide(other).expect("park non-owner");
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
         assert_eq!(rt.focused_view(), Some(other));
         assert_eq!(
             rt.primary_view(),
-            Some(owner),
-            "show must not steal ownership"
+            Some(other),
+            "the shown overlay owns the primary grid"
         );
-        let buffered = rt.pending_input_len();
-        assert!(
-            !rt.push_input_bytes(b"x"),
-            "non-owner never reaches the shell"
-        );
-        assert_eq!(rt.pending_input_len(), buffered + 1);
+        assert!(rt.push_input_bytes(b"x"), "the shown overlay is typable");
         rt.tick().expect("headless tick presents");
+        assert!(leaf_row_has_ink(&rt, other), "overlay paints the grid");
         assert!(
-            leaf_row_has_ink(&rt, owner),
-            "owner paints the primary grid"
+            !leaf_row_has_ink(&rt, owner),
+            "the previous owner's tile stays erased"
         );
-        assert!(!leaf_row_has_ink(&rt, other), "non-owner tile stays erased");
+
+        // Hiding returns ownership to the surviving tiled leaf.
+        assert_eq!(rt.scratchpad_toggle(None).expect("hide"), None);
+        assert_eq!(rt.focused_view(), Some(owner));
+        assert_eq!(rt.primary_view(), Some(owner));
+        assert!(rt.push_input_bytes(b"x"));
     }
 
     #[test]
     #[cfg(unix)]
-    fn scratchpad_show_does_not_steal_rehomed_primary_ownership() {
-        // CodeRabbit #1671 follow-up: hiding the owner hands ownership to the
-        // survivor, but closing the survivor's workspace re-homes it to a new
-        // leaf. Showing the parked leaf must not steal it back: the restored
-        // leaf stays session-less, typing buffers, and only live grids paint.
+    fn scratchpad_overlay_survives_a_workspace_close_and_keeps_focus() {
+        // Issue #3205 cross-workspace contract: a shown scratchpad is
+        // window-global. Closing the active workspace while it is focused must
+        // not hide it, clear its focus, or hand its primary grid away.
         require_pty!();
         let (mut rt, owner, _survivor) = primary_attached_pair();
         rt.workspace_new().expect("second workspace");
         assert!(rt.workspace_switch(0));
         assert_eq!(rt.focused_view(), Some(owner));
-        rt.scratchpad_hide(owner).expect("hide owner");
-        // Close the survivor's (active) workspace: ownership re-homes to the
-        // remaining workspace's focused leaf.
+        rt.scratchpad_hide(owner).expect("park owner");
+        assert!(rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD));
+        assert_eq!(rt.focused_view(), Some(owner));
+
         assert!(matches!(
             rt.workspace_close_request(),
             WsCloseRequest::Closed { .. }
         ));
-        let new_owner = rt.focused_view().expect("new focus");
-        assert_ne!(new_owner, owner);
-        assert_eq!(rt.primary_view(), Some(new_owner));
-        // Show the parked leaf: focus returns, ownership must not.
-        let restored = rt.scratchpad_show().expect("show");
-        assert_eq!(restored, owner);
-        assert_eq!(rt.focused_view(), Some(owner));
-        assert_eq!(
-            rt.primary_view(),
-            Some(new_owner),
-            "show must not steal re-homed ownership"
-        );
-        assert!(!rt.is_primary_view(&owner));
-        let buffered = rt.pending_input_len();
-        assert!(!rt.push_input_bytes(b"x"), "nobody owns the input");
-        assert_eq!(rt.pending_input_len(), buffered + 1);
-        // Paint: the parked leaf stays erased (it owns no grid); the new
-        // owner's own session grid carries no primary marker either.
-        rt.tick().expect("headless tick presents");
-        assert!(!leaf_row_has_ink(&rt, owner), "parked leaf stays erased");
         assert!(
-            !leaf_row_has_ink(&rt, new_owner),
-            "no grid is duplicated onto the new owner"
+            rt.scratchpad_visible(bitty_ui::DEFAULT_SCRATCHPAD),
+            "a window-global scratchpad survives the closed workspace"
         );
+        assert_eq!(
+            rt.focused_view(),
+            Some(owner),
+            "the shown overlay keeps focus across the close"
+        );
+        assert_eq!(rt.primary_view(), Some(owner));
+        assert!(
+            rt.push_input_bytes(b"x"),
+            "the surviving overlay keeps the primary shell"
+        );
+        rt.tick().expect("headless tick presents");
+        assert!(leaf_row_has_ink(&rt, owner));
     }
 
     #[test]

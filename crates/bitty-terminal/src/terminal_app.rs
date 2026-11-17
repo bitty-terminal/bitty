@@ -936,6 +936,13 @@ pub(crate) struct TerminalApp {
     /// has a platform context. Bounded by the registry ceiling so input can
     /// never queue unbounded window creation.
     pub(crate) pending_new_windows: usize,
+    /// Scratchpad slot waiting for a GUI plugin panel (issue #3205).
+    ///
+    /// Set when a plugin-backed scratchpad is triggered; the next
+    /// `bitty.panel.create` materialization adopts its leaf into this slot
+    /// instead of splitting the focused pane. Cleared on adoption or on a
+    /// dispatch refusal so it can never leak into an unrelated panel.
+    pub(crate) pending_plugin_scratchpad: Option<String>,
     /// Secondary windows whose first surface attach was deferred because the
     /// OS window reported no size yet (bitty#1765, slice 2).
     ///
@@ -1155,7 +1162,7 @@ pub(crate) struct TerminalApp {
     /// revalidated at execution time. Bounded
     /// ([`INPUT_COMMAND_QUEUE_CAPACITY`], drop-newest with an attributed
     /// diagnostic); never drained from input, redraw, or PTY-readable arms.
-    pending_input_commands: std::collections::VecDeque<bitty_config::ChromeAction>,
+    pub(crate) pending_input_commands: std::collections::VecDeque<bitty_config::ChromeAction>,
     /// Cumulative dropped input-path command invocations (CTX-1324).
     pending_input_commands_dropped: u64,
     /// Live accessibility projection owner (bitty#1768).
@@ -1246,6 +1253,7 @@ impl TerminalApp {
             window: WindowState::new(theme_name, source),
             windows: crate::window_registry::WindowRegistry::new(),
             pending_new_windows: 0,
+            pending_plugin_scratchpad: None,
             deferred_window_surfaces: Vec::new(),
             window_surface_drops_logged: 0,
             pty_rx: None,
@@ -1319,6 +1327,7 @@ impl TerminalApp {
             window: WindowState::new(theme_name, source),
             windows: crate::window_registry::WindowRegistry::new(),
             pending_new_windows: 0,
+            pending_plugin_scratchpad: None,
             deferred_window_surfaces: Vec::new(),
             window_surface_drops_logged: 0,
             pty_rx: Some(pty_rx),
@@ -3302,6 +3311,9 @@ impl TerminalApp {
                 | A::WorkspacePrevOccupied
                 | A::WorkspaceFocus(_)
                 | A::WorkspaceMove(_)
+                | A::ScratchpadToggle(_)
+                | A::ScratchpadMove(_)
+                | A::ScratchpadToTiled(_)
         )
     }
 

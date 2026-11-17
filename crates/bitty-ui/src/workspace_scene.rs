@@ -35,10 +35,11 @@
 //! imported here). They are joined by the runtime, never converted: no
 //! `From` bridge exists in either direction.
 //!
-//! Scratchpad: the candidate keeps the accepted special hidden workspace
-//! per window ([`ScratchpadSlot`](crate::scratchpad::ScratchpadSlot)) and
-//! does **not** add a scene layer for it — whether the scratchpad becomes
-//! a layer stays Open for the owning RFC.
+//! Scratchpad: the candidate keeps the accepted window-global named slots
+//! ([`Scratchpads`](crate::scratchpad::Scratchpads)) and does **not** add a
+//! scene layer for them — shown slots ride the runtime's `Float` composite,
+//! and whether they become a first-class scene layer stays Open for the
+//! owning RFC.
 //!
 //! No window leak: no layer, command, or value here exposes a window
 //! handle, native surface, or OS window identifier.

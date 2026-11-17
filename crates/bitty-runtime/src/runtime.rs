@@ -110,8 +110,8 @@ use bitty_term_state::{
 };
 use bitty_ui::{
     CellPos, FloatStore, Focus, FocusDirection, Gaps, LayoutNode, OverlayTier, PersistentSelection,
-    PinnedStore, Rect as UiRect, ScratchpadSlot, SearchHighlight, Selection, SelectionKind, View,
-    ViewId, search::SearchState,
+    PinnedStore, Rect as UiRect, ScratchpadGeometry, Scratchpads, SearchHighlight, Selection,
+    SelectionKind, View, ViewId, search::SearchState,
 };
 use bitty_vt::{
     BoundedString, ClipboardOp, DynamicColorOp, DynamicColorTarget, Notification,
@@ -934,24 +934,16 @@ pub struct Runtime {
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
     workspace_mru: std::collections::VecDeque<usize>,
-    /// Hidden per-window scratchpad slot (CTX-0954, CW-10).
+    /// Named cross-workspace scratchpad slots (issue #3205; CTX-0954 origin).
     ///
-    /// Holds at most one parked leaf detached from the live layout; it never
-    /// enters the layout solver and survives workspace switches. Occupancy is
-    /// exposed to plugins through [`Runtime::workspace_summaries`] (count +
-    /// presence on every row, under the existing `workspace.read` grant), so
-    /// the bar renders its indicator without any panel capability.
-    scratchpad: ScratchpadSlot,
-    /// Parked primary owner and the post-hide handoff owner (CTX-0954,
-    /// CodeRabbit #1671 follow-up).
-    ///
-    /// Set by [`Runtime::scratchpad_hide`] when the parked leaf owns the
-    /// primary shell: `(parked leaf, primary_view after the handoff)`.
-    /// [`Runtime::scratchpad_show`] restores ownership only while
-    /// `primary_view` still matches the recorded handoff (including `None`)
-    /// — a workspace close may have re-homed it elsewhere since. `None`
-    /// while the slot is empty or the parked leaf never owned the shell.
-    scratchpad_primary_owner: Option<(ViewId, Option<ViewId>)>,
+    /// Each occupied slot owns one detached leaf. A shown slot composites as a
+    /// `Float` overlay over the active workspace and survives workspace
+    /// switches; a hidden slot parks the same `ViewId`, so the pane/plugin
+    /// session keyed by it stays alive. The store never enters the layout
+    /// solver. Occupancy is exposed to plugins through
+    /// [`Runtime::workspace_summaries`] (count + presence on every row, under
+    /// the existing `workspace.read` grant).
+    scratchpads: Scratchpads,
     /// Window-global pinned floating panels (CTX-1077, issue #1757).
     ///
     /// Holds every pinned leaf detached from the live layout; pinned leaves
@@ -2565,8 +2557,7 @@ impl Runtime {
             next_workspace_id_raw: 1,
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
-            scratchpad: ScratchpadSlot::new(),
-            scratchpad_primary_owner: None,
+            scratchpads: Scratchpads::new(),
             pinned: PinnedStore::new(),
             pinned_offsets: std::collections::HashMap::new(),
             floats: FloatStore::new(),
@@ -2901,8 +2892,7 @@ impl Runtime {
             next_workspace_id_raw: 1,
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
-            scratchpad: ScratchpadSlot::new(),
-            scratchpad_primary_owner: None,
+            scratchpads: Scratchpads::new(),
             pinned: PinnedStore::new(),
             pinned_offsets: std::collections::HashMap::new(),
             floats: FloatStore::new(),

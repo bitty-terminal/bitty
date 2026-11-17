@@ -92,11 +92,12 @@ pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 /// [`WORKSPACE_NAME_MAX_CHARS`].
 pub const WORKSPACE_RENAME_MAX_BYTES: usize = 256;
 
-/// Maximum parked panels one `bitty.workspace.list()` row reports (CTX-0954).
+/// Maximum occupied scratchpad slots one `bitty.workspace.list()` row
+/// reports (CTX-0954; named slots issue #3205).
 ///
-/// Mirrors the Core single-slot invariant (`ScratchpadSlot` holds at most one
-/// parked leaf): occupancy is `0` (empty) or `1` (occupied), never more.
-pub const SCRATCHPAD_COUNT_MAX: usize = 1;
+/// Mirrors the Core bound (`bitty_ui::MAX_SCRATCHPADS` = 32 named slots), so
+/// the marshalled count never reports a truncated value.
+pub const SCRATCHPAD_COUNT_MAX: usize = 32;
 
 /// Attention flags for one workspace in `bitty.workspace.list()` (CTX-0889).
 ///
@@ -132,8 +133,8 @@ pub struct WorkspaceInfo {
     pub active: bool,
     /// Number of panels (layout leaves).
     pub panel_count: usize,
-    /// Parked panels in the window scratchpad slot (`0` or `1`; window-global,
-    /// identical on every row of one result).
+    /// Occupied named scratchpad slots in every window row (`0..=32`,
+    /// window-global, identical on every row of one result; issue #3205).
     pub scratchpad_count: usize,
     /// Whether the window scratchpad slot holds a parked panel.
     pub scratchpad_occupied: bool,
@@ -3038,7 +3039,7 @@ fn bounded_workspace_name(name: &str) -> String {
 
 /// Marshal workspace rows into the bounded Lua array shape (CTX-0889).
 ///
-/// CTX-0954: each row carries `scratchpad_count` (integer `0`/`1`) and
+/// CTX-0954: each row carries `scratchpad_count` (occupied named slots) and
 /// `scratchpad_occupied` (bool) under the same `workspace.read` grant as the
 /// rest of the row; no panel capability is consulted.
 fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
@@ -10071,9 +10072,9 @@ mod tests {
 
     #[test]
     fn workspace_list_value_carries_scratchpad_occupancy() {
-        // CTX-0954: empty vs occupied rows marshal count + presence alongside
-        // the existing shape; over-bound counts clamp to the single-slot
-        // ceiling so a misbehaving host source stays bounded.
+        // CTX-0954 / #3205: empty vs occupied rows marshal count + presence
+        // alongside the existing shape; over-bound counts clamp to the
+        // named-slot ceiling so a misbehaving host source stays bounded.
         let row = |id: u64, count: usize, occupied: bool| WorkspaceInfo {
             id,
             name: format!("ws{id}"),
@@ -10103,8 +10104,8 @@ mod tests {
         let occupied = table(1);
         assert_eq!(
             occupied.get("scratchpad_count"),
-            Some(&LuaValue::Integer(1)),
-            "clamped to the single-slot ceiling"
+            Some(&LuaValue::Integer(SCRATCHPAD_COUNT_MAX as i64)),
+            "clamped to the named-slot ceiling"
         );
         assert_eq!(
             occupied.get("scratchpad_occupied"),

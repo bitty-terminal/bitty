@@ -156,6 +156,11 @@ pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
             out.push(e);
         }
     }
+    if let Some(entries) = &plan.scratchpads {
+        if let Err(e) = crate::types::validate_scratchpads(entries) {
+            out.push(e);
+        }
+    }
     if let Some(v) = &plan.scrollbar {
         if let Err(e) = v.validate() {
             out.push(e);

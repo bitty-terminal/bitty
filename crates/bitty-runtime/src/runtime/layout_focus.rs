@@ -1437,6 +1437,19 @@ impl Runtime {
         Self::configured_float_rect(&self.config.floating, self.container)
     }
 
+    /// Per-scratchpad backdrop opacity override (issue #3205).
+    ///
+    /// `None` when `view` is not a shown scratchpad or its slot inherits the
+    /// global `floating.background_opacity`.
+    #[must_use]
+    pub(super) fn scratchpad_background_opacity(&self, view: ViewId) -> Option<f32> {
+        self.scratchpads
+            .visible_entries()
+            .into_iter()
+            .find(|entry| entry.view_id() == view)
+            .and_then(|entry| entry.geometry().background_opacity)
+    }
+
     /// True when `id` is a workspace-detached floating panel (CTX-1861).
     #[must_use]
     pub fn is_detached_float(&self, id: ViewId) -> bool {
@@ -1501,6 +1514,29 @@ impl Runtime {
     pub fn set_floating_config(&mut self, floating: crate::config::FloatingPanelConfig) {
         self.config.floating = floating;
         self.pending_full_redraw = true;
+    }
+
+    /// Replaces the named scratchpad definitions (live config reload, issue
+    /// #3205).
+    ///
+    /// Existing slots keep their panels and their resolved geometry; the new
+    /// table governs the next auto-spawn and the next parked panel. Returns
+    /// `false` (state untouched) when a spec fails validation or a name
+    /// repeats, so a bad reload can never arm an unbounded/unlaunchable slot.
+    pub fn set_scratchpad_specs(&mut self, specs: Vec<crate::config::ScratchpadSpec>) -> bool {
+        if specs.len() > crate::config::MAX_SCRATCHPADS {
+            return false;
+        }
+        for (index, spec) in specs.iter().enumerate() {
+            if spec.validate().is_err()
+                || specs[..index].iter().any(|other| other.name == spec.name)
+            {
+                return false;
+            }
+        }
+        self.config.scratchpads = specs;
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Effective cell extent of anchored overlay `id` (issue #2945).
@@ -1691,7 +1727,10 @@ impl Runtime {
         // present in the base layout are skipped defensively, exactly like
         // pins.
         let scene: LayoutNode;
-        let scene = if self.pinned.is_empty() && self.floats.is_empty() {
+        let scene = if self.pinned.is_empty()
+            && self.floats.is_empty()
+            && self.scratchpads.visible_ids().is_empty()
+        {
             &self.layout
         } else {
             let base_ids = self.layout.leaf_ids();
@@ -1763,6 +1802,56 @@ impl Runtime {
                         ))
                     }),
             );
+            // Issue #3205: shown scratchpad slots composite last, above pins:
+            // a scratchpad is the transient "bring it to me" surface, so it
+            // never hides behind sticky chrome. Bounds come from the slot's
+            // resolved geometry (global `floating` defaults + per-scratchpad
+            // overrides) with the same depth cascade and container clamp the
+            // pin/float stores use, so stacked scratchpads stay clickable.
+            for (depth, entry) in self
+                .scratchpads
+                .visible_entries()
+                .into_iter()
+                .filter(|entry| !base_ids.contains(&entry.view_id()))
+                .enumerate()
+            {
+                let view = entry.view().clone();
+                let geometry = entry.geometry();
+                let floating = crate::config::FloatingPanelConfig {
+                    width_ratio: geometry.width,
+                    height_ratio: geometry.height,
+                    centered: geometry.centered,
+                    x_ratio: geometry.x,
+                    y_ratio: geometry.y,
+                    background_opacity: geometry.background_opacity,
+                    background: None,
+                };
+                let base = Self::configured_float_rect(&floating, self.container);
+                let size = self.anchored_overlay_size(entry.view_id(), base);
+                let step = u16::try_from(depth).unwrap_or(u16::MAX);
+                let max_x = self
+                    .container
+                    .x
+                    .saturating_add(self.container.width.saturating_sub(size.0));
+                let max_y = self
+                    .container
+                    .y
+                    .saturating_add(self.container.height.saturating_sub(size.1));
+                let origin_x = i32::from(base.x) + i32::from(PIN_CASCADE_DX.saturating_mul(step));
+                let origin_y = i32::from(base.y) + i32::from(PIN_CASCADE_DY.saturating_mul(step));
+                let x = origin_x.clamp(i32::from(self.container.x), i32::from(max_x));
+                let y = origin_y.clamp(i32::from(self.container.y), i32::from(max_y));
+                layers.push(bitty_ui::OverlayLayer::new(
+                    OverlayTier::Float,
+                    LayoutNode::leaf(view),
+                    UiRect::new(
+                        x.max(0).min(i32::from(u16::MAX)) as u16,
+                        y.max(0).min(i32::from(u16::MAX)) as u16,
+                        size.0,
+                        size.1,
+                    ),
+                ));
+            }
             scene = LayoutNode::overlay_stack(self.layout.clone(), layers);
             &scene
         };
@@ -2136,6 +2225,11 @@ impl Runtime {
                 stored.reflow_to_rect(rect);
             } else if let Some(stored) = self.floats.find_mut(frame.view) {
                 stored.reflow_to_rect(rect);
+            } else if let Some(stored) = self.scratchpads.find_view_mut(frame.view) {
+                // Issue #3205: a shown scratchpad paints at its own frame, so
+                // its scroll/selection math reads the same extent as the pin
+                // and float stores.
+                stored.reflow_to_rect(rect);
             }
         }
     }
@@ -2170,7 +2264,10 @@ impl Runtime {
         // Cheap gate: without a composited overlay there is nothing for the
         // pointer rule to add, so the hot path skips the present solve (and
         // the tiled behaviour stays byte-identical).
-        if self.floats.is_empty() && self.pinned.is_empty() && self.scratchpad.is_empty() {
+        if self.floats.is_empty()
+            && self.pinned.is_empty()
+            && self.scratchpads.visible_ids().is_empty()
+        {
             return None;
         }
         let pos = self.last_cursor?;
@@ -2414,6 +2511,7 @@ impl Runtime {
             .find_leaf(id)
             .or_else(|| self.floats.get(id))
             .or_else(|| self.pinned.get(id))
+            .or_else(|| self.scratchpads.find_view(id))
     }
 
     /// Mutable shared view lookup across layout, detached floats, and pins
@@ -2426,6 +2524,9 @@ impl Runtime {
             return Some(stored);
         }
         if let Some(stored) = self.pinned.find_mut(id) {
+            return Some(stored);
+        }
+        if let Some(stored) = self.scratchpads.find_view_mut(id) {
             return Some(stored);
         }
         None
@@ -3338,7 +3439,9 @@ impl Runtime {
             let preserve_floating_focus = self.focus.focused().is_some_and(|focused| {
                 closed.is_some()
                     && closed != Some(focused)
-                    && (self.floats.contains(focused) || self.pinned.contains(focused))
+                    && (self.floats.contains(focused)
+                        || self.pinned.contains(focused)
+                        || self.scratchpads.is_view_visible(focused))
             });
             if !preserve_floating_focus {
                 self.focus.clear();
@@ -3346,7 +3449,9 @@ impl Runtime {
         } else if let Some(focused) = self.focus.focused() {
             let preserve_floating_focus = (closed.is_some() || preserve_border_drag)
                 && closed != Some(focused)
-                && (self.floats.contains(focused) || self.pinned.contains(focused));
+                && (self.floats.contains(focused)
+                    || self.pinned.contains(focused)
+                    || self.scratchpads.is_view_visible(focused));
             if !leaf_ids.contains(&focused) && !preserve_floating_focus {
                 // Issue #2521 review: prefer the outgoing tree's sibling
                 // survivor when the closed pane held focus; only fall back
@@ -3466,6 +3571,7 @@ impl Runtime {
         if self.layout.leaf_ids().contains(&id)
             || self.pinned.contains(id)
             || self.floats.contains(id)
+            || self.scratchpads.is_view_visible(id)
         {
             // Issue #2939: remember where the pane was entered. A click or a
             // hover leaves the pointer inside the target frame, which becomes
@@ -3686,6 +3792,7 @@ impl Runtime {
             .into_iter()
             .chain(self.floats.ids())
             .chain(self.pinned.ids())
+            .chain(self.scratchpads.visible_ids())
             .collect()
     }
 

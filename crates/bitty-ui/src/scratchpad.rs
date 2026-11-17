@@ -1,34 +1,41 @@
-//! Hidden per-window scratchpad slot (CW-10, issue #989).
+//! Named cross-workspace scratchpad slots (issue #3205, CTX-1862).
 //!
-//! A scratchpad leaf is parked outside the layout tree in a single hidden
-//! slot owned by the window (one [`ScratchpadSlot`] instance per window).
-//! Hiding detaches the leaf via [`LayoutNode::remove_leaf`](crate::layout::LayoutNode::remove_leaf)
-//! and stamps it [`PresentationMode::Scratchpad`]
-//! through the CW-08 gate; showing restores it beside its recorded anchor
-//! via [`LayoutNode::insert_beside`](crate::layout::LayoutNode::insert_beside)
-//! and stamps it back to `Tiled`. Toggling routes through the workspace
-//! command registry as `bitty.workspace:scratchpad-toggle` (see
-//! [`SCRATCHPAD_CMD_TOGGLE`] and [`apply_scratchpad_toggle`]).
+//! A scratchpad is a **presentation mode of the same [`View`]**, never a new
+//! panel type and never a second layout manager. Every named slot
+//! ([`Scratchpads`]) holds at most one [`ScratchpadEntry`]: a live leaf that
+//! is detached from every layout tree while the slot owns it.
 //!
-//! # Decision: single slot, not a bounded stack
+//! # Show / hide / restore
 //!
-//! The issue left open whether the slot holds one leaf or a bounded stack.
-//! This slice implements a single slot: hide fails with
-//! [`ScratchpadError::Occupied`] while a leaf is parked, and the parked
-//! leaf's mode, anchor, and drop side are preserved verbatim for restore.
-//! A stack would need ordering, eviction, and per-entry anchor policy with
-//! no consumer yet; if a second consumer arrives, the open item is to
-//! revisit, not to pre-build.
+//! - **Show** stamps the entry [`PresentationMode::Floating`]: the runtime
+//!   composites it over the active workspace scene at
+//!   [`OverlayTier::Float`](crate::layout::OverlayTier), cross-workspace, so
+//!   switching workspaces never hides it.
+//! - **Hide** stamps it [`PresentationMode::Scratchpad`] and keeps it parked
+//!   in the slot. The entry keeps its [`View`] (and therefore its `ViewId`),
+//!   so the runtime's pane/plugin session keyed by that id stays alive: a
+//!   scratchpad is not a PTY, and hiding never kills one.
+//! - **To tiled** ([`Scratchpads::to_tiled`]) returns the entry to the live
+//!   layout beside the anchor recorded when it was parked and stamps it
+//!   [`PresentationMode::Tiled`]. This is the explicit "give it back to the
+//!   tiling" verb, distinct from show/hide.
+//! - **Park** ([`Scratchpads::park`]) moves an existing layout leaf into an
+//!   empty named slot and shows it. The vacated slot collapses because the
+//!   leaf leaves the tree, exactly like the pinned/detached-float stores.
+//!
+//! The store itself never paints and never enters the layout solver; it only
+//! stores detached leaves. Multi-name bookkeeping is ordered by first park so
+//! present paint order and command output stay deterministic.
 //!
 //! # Distinct from `Visibility`
 //!
-//! The parked state here is storage (the leaf is out of the tree), never a
-//! display flag. `Visibility::ScratchpadHidden` (computed display state in
-//! the `bitty-runtime` registry) is deliberately untouched: this module
-//! never reads or writes `Visibility`, and no variant is added anywhere.
+//! The parked state here is storage (the leaf is out of every tree), never a
+//! display flag. `Visibility::ScratchpadHidden` (computed display state in the
+//! `bitty-runtime` registry) is deliberately untouched: this module never
+//! reads or writes `Visibility`, and no variant is added anywhere.
 //!
-//! Deterministic, headless, bounded (at most one parked leaf); this module
-//! adds no new crate dependency.
+//! Deterministic, headless, bounded ([`MAX_SCRATCHPADS`]); this module adds no
+//! new crate dependency.
 
 #![forbid(unsafe_code)]
 
@@ -37,44 +44,176 @@ use crate::layout::LayoutNode;
 use crate::presentation::PresentationMode;
 use crate::view::{View, ViewId};
 
-/// Workspace command toggling the hidden scratchpad slot.
+/// Name of the scratchpad the bare `toggle_scratchpad` verb addresses.
+pub const DEFAULT_SCRATCHPAD: &str = "default";
+
+/// Upper bound on named scratchpad slots (bounded against untrusted input).
+pub const MAX_SCRATCHPADS: usize = 32;
+
+/// Upper bound on a scratchpad slot name in bytes.
+pub const MAX_SCRATCHPAD_NAME_LEN: usize = 32;
+
+/// Workspace command toggling the default scratchpad slot.
 ///
 /// `<owner>.<name>:<command>` grammar (see
-/// [`QualifiedCommand`](crate::panel::QualifiedCommand)); routed by
-/// [`apply_scratchpad_toggle`]. With `target = Some(id)` and a vacant slot
-/// the leaf hides; with an occupied slot the parked leaf shows (the target
-/// is ignored); with a vacant slot and `target = None` the call fails with
-/// [`ScratchpadError::MissingTarget`].
+/// [`QualifiedCommand`](crate::panel::QualifiedCommand)). Retained for the
+/// existing `command:bitty.workspace:scratchpad-toggle` binding; it is the
+/// [`DEFAULT_SCRATCHPAD`] slot without a name suffix.
 pub const SCRATCHPAD_CMD_TOGGLE: &str = "bitty.workspace:scratchpad-toggle";
 
-/// Error for [`ScratchpadSlot`] hide/show/toggle and [`apply_scratchpad_toggle`].
+/// Workspace command prefix toggling a named scratchpad slot
+/// (`bitty.workspace:scratchpad-toggle:<name>`).
+pub const SCRATCHPAD_CMD_TOGGLE_NAMED: &str = "bitty.workspace:scratchpad-toggle:";
+
+/// Workspace command moving the focused panel into a scratchpad slot and
+/// showing it (`bitty.workspace:scratchpad-move[:<name>]`).
+pub const SCRATCHPAD_CMD_MOVE: &str = "bitty.workspace:scratchpad-move";
+
+/// Workspace command prefix moving the focused panel into a named slot.
+pub const SCRATCHPAD_CMD_MOVE_NAMED: &str = "bitty.workspace:scratchpad-move:";
+
+/// Workspace command returning a scratchpad entry to the tiling
+/// (`bitty.workspace:scratchpad-to-tiled[:<name>]`).
+pub const SCRATCHPAD_CMD_TO_TILED: &str = "bitty.workspace:scratchpad-to-tiled";
+
+/// Workspace command prefix returning a named entry to the tiling.
+pub const SCRATCHPAD_CMD_TO_TILED_NAMED: &str = "bitty.workspace:scratchpad-to-tiled:";
+
+/// Per-scratchpad size/position overrides, resolved against the global
+/// `floating` config by the caller (`bitty-runtime`).
+///
+/// Fractions are the same units as [`FloatStore`](crate::floated::FloatStore)
+/// geometry: width/height in `(0.0, 1.0]` of the container, `x`/`y` in
+/// `[0.0, 1.0]` when explicitly positioned, and `centered` ignored when both
+/// ratios are `None`. [`Default`] is the accepted float default (80% of each
+/// axis, centered).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScratchpadGeometry {
+    /// Width fraction of the container.
+    pub width: f32,
+    /// Height fraction of the container.
+    pub height: f32,
+    /// Whether to center the entry in the container.
+    pub centered: bool,
+    /// Horizontal anchor ratio when not centered.
+    pub x: Option<f32>,
+    /// Vertical anchor ratio when not centered.
+    pub y: Option<f32>,
+    /// Optional per-scratchpad backdrop opacity override in `[0.0, 1.0]`.
+    pub background_opacity: Option<f32>,
+}
+
+impl Default for ScratchpadGeometry {
+    fn default() -> Self {
+        Self {
+            width: crate::presentation::DEFAULT_FLOAT_SIZE_RATIO,
+            height: crate::presentation::DEFAULT_FLOAT_SIZE_RATIO,
+            centered: true,
+            x: None,
+            y: None,
+            background_opacity: None,
+        }
+    }
+}
+
+/// One parsed scratchpad workspace command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScratchpadCommand {
+    /// Toggle visibility of `name` (park the target when the slot is empty).
+    Toggle(String),
+    /// Move the focused panel into `name`, or restore its visible entry to
+    /// the tiling.
+    Move(String),
+    /// Return `name`'s entry to the tiling.
+    ToTiled(String),
+}
+
+impl ScratchpadCommand {
+    /// Parses `bitty.workspace:scratchpad-*` commands. Returns `None` for
+    /// every other command (unknown commands never touch a slot).
+    #[must_use]
+    pub fn parse(command: &str) -> Option<Self> {
+        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_TOGGLE_NAMED) {
+            return is_valid_scratchpad_name(rest).then(|| Self::Toggle(rest.to_string()));
+        }
+        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_MOVE_NAMED) {
+            return is_valid_scratchpad_name(rest).then(|| Self::Move(rest.to_string()));
+        }
+        if let Some(rest) = command.strip_prefix(SCRATCHPAD_CMD_TO_TILED_NAMED) {
+            return is_valid_scratchpad_name(rest).then(|| Self::ToTiled(rest.to_string()));
+        }
+        match command {
+            SCRATCHPAD_CMD_TOGGLE => Some(Self::Toggle(DEFAULT_SCRATCHPAD.to_string())),
+            SCRATCHPAD_CMD_MOVE => Some(Self::Move(DEFAULT_SCRATCHPAD.to_string())),
+            SCRATCHPAD_CMD_TO_TILED => Some(Self::ToTiled(DEFAULT_SCRATCHPAD.to_string())),
+            _ => None,
+        }
+    }
+}
+
+/// True when `name` is an accepted scratchpad slot name: 1..=32 ASCII bytes,
+/// lowercase letters, digits, `-`, `_`. Rejecting uppercase keeps the keymap
+/// action grammar (which lowercases its argument) unambiguous.
+#[must_use]
+pub fn is_valid_scratchpad_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SCRATCHPAD_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Error for [`Scratchpads`] transitions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScratchpadError {
-    /// A leaf is already parked; hide leaves the tree untouched.
-    Occupied,
-    /// Nothing is parked; show leaves the tree untouched.
-    Vacant,
-    /// Toggle-to-hide needs a target leaf id.
-    MissingTarget,
+    /// `name` is not an accepted slot name.
+    InvalidName(String),
+    /// The slot already holds an entry; the tree is untouched.
+    Occupied(String),
+    /// The slot holds no entry; the tree is untouched.
+    Vacant(String),
+    /// The bounded slot table is full.
+    TooManySlots,
     /// No leaf with this id exists; the tree is untouched.
     LeafNotFound(ViewId),
+    /// Only `Tiled`/`Floating`/`Scratchpad` leaves park (`Fullscreen` has its
+    /// own verb). The tree is untouched.
+    UnsupportedMode {
+        /// Mode the leaf had before the refusal.
+        current: PresentationMode,
+    },
+    /// Parking would strand an empty live layout (the tree holds a single
+    /// leaf); the tree is untouched.
+    StrandedLayout,
     /// The [`PresentationMode::can_transition`] gate rejected the mode
-    /// stamp; the tree is restored to its prior shape.
+    /// stamp; the tree/layout is restored to its prior shape.
     Rejected {
+        /// Mode before the attempted stamp.
         from: PresentationMode,
+        /// Mode the transition requested.
         to: PresentationMode,
     },
-    /// `command` is not [`SCRATCHPAD_CMD_TOGGLE`].
+    /// `command` is not a scratchpad workspace command.
     UnknownCommand(String),
 }
 
 impl std::fmt::Display for ScratchpadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Occupied => f.write_str("scratchpad slot already occupied"),
-            Self::Vacant => f.write_str("scratchpad slot is empty"),
-            Self::MissingTarget => f.write_str("scratchpad hide needs a target leaf"),
+            Self::InvalidName(name) => write!(f, "invalid scratchpad name: {name:?}"),
+            Self::Occupied(name) => write!(f, "scratchpad '{name}' already holds a panel"),
+            Self::Vacant(name) => write!(f, "scratchpad '{name}' is empty"),
+            Self::TooManySlots => {
+                write!(f, "too many scratchpads: max {MAX_SCRATCHPADS} named slots")
+            }
             Self::LeafNotFound(id) => write!(f, "scratchpad target not found: {id}"),
+            Self::UnsupportedMode { current } => {
+                write!(
+                    f,
+                    "scratchpad needs a tiled, floating, or scratchpad leaf, found {current}"
+                )
+            }
+            Self::StrandedLayout => f.write_str("scratchpad move would strand an empty layout"),
             Self::Rejected { from, to } => {
                 write!(f, "scratchpad transition rejected: {from} -> {to}")
             }
@@ -85,68 +224,218 @@ impl std::fmt::Display for ScratchpadError {
 
 impl std::error::Error for ScratchpadError {}
 
-/// Parked leaf plus its restore anchor: the neighboring leaf id at hide
-/// time and which side the parked leaf returns to (`after == false` puts
-/// the restored leaf before the anchor).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HiddenEntry {
+/// One named slot: the detached [`View`] plus its restore anchor and
+/// per-scratchpad geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScratchpadEntry {
+    name: String,
     view: View,
+    visible: bool,
     anchor: Option<ViewId>,
     after: bool,
+    geometry: ScratchpadGeometry,
 }
 
-impl HiddenEntry {
-    /// The parked leaf (stamped `Scratchpad`).
+impl ScratchpadEntry {
+    /// Slot name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The detached leaf (stamped `Floating` while visible, `Scratchpad`
+    /// while hidden).
     #[must_use]
     pub fn view(&self) -> &View {
         &self.view
     }
 
-    /// The neighboring leaf id recorded at hide time, if any.
+    /// The leaf id (stable across hide/show/restore).
+    #[must_use]
+    pub fn view_id(&self) -> ViewId {
+        self.view.id()
+    }
+
+    /// Whether the entry is currently shown as a float overlay.
+    #[must_use]
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// The neighboring leaf id recorded when the entry was parked.
     #[must_use]
     pub fn anchor(&self) -> Option<ViewId> {
         self.anchor
     }
+
+    /// Per-scratchpad geometry overrides.
+    #[must_use]
+    pub fn geometry(&self) -> ScratchpadGeometry {
+        self.geometry
+    }
 }
 
-/// Single hidden per-window scratchpad slot (CW-10).
+/// Window-global named scratchpad store (issue #3205).
 ///
-/// Holds at most one parked [`HiddenEntry`]; all transitions are total and
-/// deterministic. The slot itself never paints and never enters the layout
-/// solver: it only stores the detached leaf between hide and show.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ScratchpadSlot {
-    hidden: Option<HiddenEntry>,
+/// Holds at most one [`ScratchpadEntry`] per name and at most
+/// [`MAX_SCRATCHPADS`] names. All transitions are total and deterministic.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Scratchpads {
+    entries: Vec<ScratchpadEntry>,
 }
 
-impl ScratchpadSlot {
-    /// Creates an empty slot.
+impl Scratchpads {
+    /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
-        Self { hidden: None }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
-    /// True when no leaf is parked.
+    /// True when no slot holds an entry.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.hidden.is_none()
+        self.entries.is_empty()
     }
 
-    /// The parked leaf, if any.
+    /// Number of occupied slots (visible and hidden).
     #[must_use]
-    pub fn peek(&self) -> Option<&View> {
-        self.hidden.as_ref().map(|h| &h.view)
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
-    /// Parks leaf `id`: detaches it from `tree` and stamps it `Scratchpad`.
+    /// Occupied slot names in park order.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// True when `name` holds an entry.
+    #[must_use]
+    pub fn contains_name(&self, name: &str) -> bool {
+        self.entries.iter().any(|e| e.name == name)
+    }
+
+    /// True when `id` is owned by any slot.
+    #[must_use]
+    pub fn contains_view(&self, id: ViewId) -> bool {
+        self.entries.iter().any(|e| e.view.id() == id)
+    }
+
+    /// The entry named `name`, if occupied.
+    #[must_use]
+    pub fn entry(&self, name: &str) -> Option<&ScratchpadEntry> {
+        self.entries.iter().find(|e| e.name == name)
+    }
+
+    /// The detached leaf named `name`, if occupied.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&View> {
+        self.entry(name).map(ScratchpadEntry::view)
+    }
+
+    /// Mutable access to the detached leaf named `name` (present-time reflow).
+    #[must_use]
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut View> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.name == name)
+            .map(|e| &mut e.view)
+    }
+
+    /// Mutable access to a detached leaf by id.
+    #[must_use]
+    pub fn find_view_mut(&mut self, id: ViewId) -> Option<&mut View> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.view.id() == id)
+            .map(|e| &mut e.view)
+    }
+
+    /// The detached leaf with `id`, if any (hidden or visible).
+    #[must_use]
+    pub fn find_view(&self, id: ViewId) -> Option<&View> {
+        self.entries
+            .iter()
+            .find(|e| e.view.id() == id)
+            .map(|e| &e.view)
+    }
+
+    /// True when `name` is currently shown as a float overlay.
+    #[must_use]
+    pub fn is_visible(&self, name: &str) -> bool {
+        self.entry(name).is_some_and(ScratchpadEntry::visible)
+    }
+
+    /// True when `id` belongs to a slot that is currently shown.
+    #[must_use]
+    pub fn is_view_visible(&self, id: ViewId) -> bool {
+        self.entries.iter().any(|e| e.visible && e.view.id() == id)
+    }
+
+    /// Visible entries in park order (present paint order), with their
+    /// geometry.
+    #[must_use]
+    pub fn visible_entries(&self) -> Vec<&ScratchpadEntry> {
+        self.entries.iter().filter(|e| e.visible).collect()
+    }
+
+    /// Ids of every detached leaf (visible and hidden), in park order.
+    #[must_use]
+    pub fn ids(&self) -> Vec<ViewId> {
+        self.entries.iter().map(|e| e.view.id()).collect()
+    }
+
+    /// Ids of visible entries in present paint order.
+    #[must_use]
+    pub fn visible_ids(&self) -> Vec<ViewId> {
+        self.entries
+            .iter()
+            .filter(|e| e.visible)
+            .map(|e| e.view.id())
+            .collect()
+    }
+
+    /// Parks leaf `id` into an empty slot `name` and shows it.
     ///
-    /// Fails with [`ScratchpadError::Occupied`] (tree untouched) while a
-    /// leaf is parked, or [`ScratchpadError::LeafNotFound`] for an unknown
-    /// id. When the CW-08 gate rejects the stamp, the leaf is restored to
-    /// its prior position and [`ScratchpadError::Rejected`] is returned.
-    pub fn hide(&mut self, tree: &mut LayoutNode, id: ViewId) -> Result<(), ScratchpadError> {
-        if self.hidden.is_some() {
-            return Err(ScratchpadError::Occupied);
+    /// Fails closed with the tree untouched for an invalid/occupied name, a
+    /// full slot table, a single-leaf layout, an unknown id, an unsupported
+    /// mode (`Fullscreen` has its own verb), or a rejected stamp.
+    ///
+    /// `Tiled`, `Floating`, and an in-tree `Scratchpad`-stamped leaf (a spawn
+    /// rule may have stamped it) all park.
+    pub fn park(
+        &mut self,
+        name: &str,
+        tree: &mut LayoutNode,
+        id: ViewId,
+        geometry: ScratchpadGeometry,
+    ) -> Result<ViewId, ScratchpadError> {
+        self.park_leaf(name, tree, id, geometry, true)
+    }
+
+    /// [`Self::park`] with an explicit initial visibility (session restore
+    /// and plugin adoption reuse the anchor bookkeeping).
+    fn park_leaf(
+        &mut self,
+        name: &str,
+        tree: &mut LayoutNode,
+        id: ViewId,
+        geometry: ScratchpadGeometry,
+        visible: bool,
+    ) -> Result<ViewId, ScratchpadError> {
+        if !is_valid_scratchpad_name(name) {
+            return Err(ScratchpadError::InvalidName(name.to_string()));
+        }
+        if self.contains_name(name) {
+            return Err(ScratchpadError::Occupied(name.to_string()));
+        }
+        if self.entries.len() >= MAX_SCRATCHPADS {
+            return Err(ScratchpadError::TooManySlots);
+        }
+        if tree.leaf_count() <= 1 {
+            return Err(ScratchpadError::StrandedLayout);
         }
         let ids = tree.leaf_ids();
         let pos = ids
@@ -166,70 +455,181 @@ impl ScratchpadSlot {
             return Err(ScratchpadError::LeafNotFound(id));
         };
         let from = view.presentation();
-        if !PresentationMode::request_transition(&mut view, PresentationMode::Scratchpad) {
+        if !matches!(
+            from,
+            PresentationMode::Tiled | PresentationMode::Floating | PresentationMode::Scratchpad
+        ) {
             Self::restore_view(tree, view, anchor, after);
+            return Err(ScratchpadError::UnsupportedMode { current: from });
+        }
+        let target = if visible {
+            PresentationMode::Floating
+        } else {
+            PresentationMode::Scratchpad
+        };
+        if !PresentationMode::request_transition(&mut view, target) {
+            Self::restore_view(tree, view, anchor, after);
+            return Err(ScratchpadError::Rejected { from, to: target });
+        }
+        self.entries.push(ScratchpadEntry {
+            name: name.to_string(),
+            view,
+            visible,
+            anchor,
+            after,
+            geometry,
+        });
+        Ok(id)
+    }
+
+    /// Creates an empty visible entry around a freshly allocated leaf
+    /// (auto-spawn on first trigger). The leaf has never lived in a tree, so
+    /// there is no anchor; `to_tiled` docks it beside the first live leaf.
+    ///
+    /// Fails closed for an invalid/occupied name or a full slot table.
+    pub fn create(
+        &mut self,
+        name: &str,
+        view: View,
+        geometry: ScratchpadGeometry,
+    ) -> Result<ViewId, ScratchpadError> {
+        if !is_valid_scratchpad_name(name) {
+            return Err(ScratchpadError::InvalidName(name.to_string()));
+        }
+        if self.contains_name(name) {
+            return Err(ScratchpadError::Occupied(name.to_string()));
+        }
+        if self.entries.len() >= MAX_SCRATCHPADS {
+            return Err(ScratchpadError::TooManySlots);
+        }
+        let id = view.id();
+        let mut view = view;
+        let from = view.presentation();
+        if !PresentationMode::request_transition(&mut view, PresentationMode::Floating) {
+            return Err(ScratchpadError::Rejected {
+                from,
+                to: PresentationMode::Floating,
+            });
+        }
+        self.entries.push(ScratchpadEntry {
+            name: name.to_string(),
+            view,
+            visible: true,
+            anchor: None,
+            after: true,
+            geometry,
+        });
+        Ok(id)
+    }
+
+    /// Shows the entry named `name` as a float overlay. Idempotent when it is
+    /// already visible.
+    pub fn show(&mut self, name: &str) -> Result<ViewId, ScratchpadError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.name == name)
+            .ok_or_else(|| ScratchpadError::Vacant(name.to_string()))?;
+        let from = entry.view.presentation();
+        if !PresentationMode::request_transition(&mut entry.view, PresentationMode::Floating) {
+            return Err(ScratchpadError::Rejected {
+                from,
+                to: PresentationMode::Floating,
+            });
+        }
+        entry.visible = true;
+        Ok(entry.view.id())
+    }
+
+    /// Hides the entry named `name`: it stays parked with its `ViewId` (and
+    /// therefore its pane/plugin session) intact.
+    pub fn hide(&mut self, name: &str) -> Result<ViewId, ScratchpadError> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.name == name)
+            .ok_or_else(|| ScratchpadError::Vacant(name.to_string()))?;
+        let from = entry.view.presentation();
+        if !PresentationMode::request_transition(&mut entry.view, PresentationMode::Scratchpad) {
             return Err(ScratchpadError::Rejected {
                 from,
                 to: PresentationMode::Scratchpad,
             });
         }
-        self.hidden = Some(HiddenEntry {
-            view,
-            anchor,
-            after,
-        });
-        Ok(())
+        entry.visible = false;
+        Ok(entry.view.id())
     }
 
-    /// Restores the parked leaf beside its anchor and stamps it `Tiled`.
+    /// Toggles `name`: shows a hidden entry, hides a visible one. Returns the
+    /// entry id and its new visibility.
+    pub fn toggle_visibility(&mut self, name: &str) -> Result<(ViewId, bool), ScratchpadError> {
+        let visible = self
+            .entry(name)
+            .ok_or_else(|| ScratchpadError::Vacant(name.to_string()))?
+            .visible;
+        if visible {
+            self.hide(name).map(|id| (id, false))
+        } else {
+            self.show(name).map(|id| (id, true))
+        }
+    }
+
+    /// Returns the entry named `name` to the tiling as a fresh split beside
+    /// its recorded anchor, stamped `Tiled`.
     ///
-    /// Returns the restored leaf id. Fails with [`ScratchpadError::Vacant`]
-    /// when nothing is parked. A missing anchor (leaf closed meanwhile)
-    /// falls back to docking beside the first live leaf; an empty tree
-    /// becomes the restored leaf.
-    pub fn show(&mut self, tree: &mut LayoutNode) -> Result<ViewId, ScratchpadError> {
-        let entry = self.hidden.take().ok_or(ScratchpadError::Vacant)?;
-        let mut view = entry.view;
-        let from = view.presentation();
-        if !PresentationMode::request_transition(&mut view, PresentationMode::Tiled) {
-            self.hidden = Some(HiddenEntry {
-                view,
-                anchor: entry.anchor,
-                after: entry.after,
-            });
+    /// The slot is emptied. A stale anchor (leaf closed meanwhile) falls back
+    /// to docking beside the first live leaf; an empty tree becomes the
+    /// restored leaf.
+    pub fn to_tiled(
+        &mut self,
+        name: &str,
+        tree: &mut LayoutNode,
+    ) -> Result<ViewId, ScratchpadError> {
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .ok_or_else(|| ScratchpadError::Vacant(name.to_string()))?;
+        let mut entry = self.entries.remove(pos);
+        let from = entry.view.presentation();
+        if !PresentationMode::request_transition(&mut entry.view, PresentationMode::Tiled) {
+            // Put it back exactly as it was: a refused restore must leave the
+            // slot byte-identical.
+            let mut view = entry.view;
+            let _ = PresentationMode::request_transition(&mut view, from);
+            entry.view = view;
+            self.entries.insert(pos, entry);
             return Err(ScratchpadError::Rejected {
                 from,
                 to: PresentationMode::Tiled,
             });
         }
-        let id = view.id();
-        Self::restore_view(tree, view, entry.anchor, entry.after);
+        let id = entry.view.id();
+        Self::restore_view(tree, entry.view, entry.anchor, entry.after);
         Ok(id)
     }
 
-    /// Toggles the slot: shows the parked leaf when occupied, otherwise
-    /// hides `target`. Returns the restored id on show, `None` on hide.
-    pub fn toggle(
-        &mut self,
-        tree: &mut LayoutNode,
-        target: Option<ViewId>,
-    ) -> Result<Option<ViewId>, ScratchpadError> {
-        if self.hidden.is_some() {
-            return self.show(tree).map(Some);
-        }
-        let id = target.ok_or(ScratchpadError::MissingTarget)?;
-        self.hide(tree, id).map(|()| None)
+    /// Discards the entry owning `id` without restoring it to any tree
+    /// (dead-panel teardown after its child exits while parked).
+    pub fn discard(&mut self, id: ViewId) -> Option<View> {
+        let pos = self.entries.iter().position(|e| e.view.id() == id)?;
+        Some(self.entries.remove(pos).view)
     }
 
-    /// Discards parked leaf `id` without restoring it to any tree
-    /// (issue #2167: dead-panel teardown after its child exits while
-    /// parked). Returns the removed [`View`] when present, `None`
-    /// otherwise. Anchor metadata leaves with the entry.
-    pub fn discard(&mut self, id: ViewId) -> Option<View> {
-        if self.hidden.as_ref().is_some_and(|h| h.view.id() == id) {
-            return self.hidden.take().map(|h| h.view);
-        }
-        None
+    /// Discards the entry named `name` without restoring it to any tree
+    /// (rollback after a failed auto-spawn).
+    pub fn discard_name(&mut self, name: &str) -> Option<View> {
+        let pos = self.entries.iter().position(|e| e.name == name)?;
+        Some(self.entries.remove(pos).view)
+    }
+
+    /// Removes every entry and returns the detached leaves (session restore
+    /// installs a whole new world).
+    pub fn drain_views(&mut self) -> Vec<View> {
+        self.entries
+            .drain(..)
+            .map(|entry| entry.view)
+            .collect::<Vec<_>>()
     }
 
     /// Puts `view` back into `tree` beside `anchor` (or a fallback dock).
@@ -260,22 +660,46 @@ impl ScratchpadSlot {
     }
 }
 
-/// Applies workspace command `command` to `slot`/`tree` (CW-10
-/// command-registry path).
+/// Applies a parsed scratchpad [`ScratchpadCommand`] to `store`/`tree`.
 ///
-/// Only [`SCRATCHPAD_CMD_TOGGLE`] is accepted; anything else fails with
-/// [`ScratchpadError::UnknownCommand`] and touches neither the slot nor
-/// the tree. Otherwise delegates to [`ScratchpadSlot::toggle`].
-pub fn apply_scratchpad_toggle(
-    slot: &mut ScratchpadSlot,
+/// `target` is the focused leaf the `Move`/`Toggle` verb parks when the slot
+/// is empty. Returns the affected entry id and, for hide/show transitions,
+/// whether it is now visible (`None` when the command moved it to the tiling
+/// or parked it).
+pub fn apply_scratchpad_command(
+    store: &mut Scratchpads,
     tree: &mut LayoutNode,
-    command: &str,
+    command: &ScratchpadCommand,
     target: Option<ViewId>,
-) -> Result<Option<ViewId>, ScratchpadError> {
-    if command != SCRATCHPAD_CMD_TOGGLE {
-        return Err(ScratchpadError::UnknownCommand(command.to_owned()));
+    geometry: ScratchpadGeometry,
+) -> Result<Option<(ViewId, bool)>, ScratchpadError> {
+    match command {
+        ScratchpadCommand::Toggle(name) => {
+            if store.contains_name(name) {
+                store.toggle_visibility(name).map(Some)
+            } else {
+                let id = target.ok_or(ScratchpadError::Vacant(name.clone()))?;
+                store
+                    .park(name, tree, id, geometry)
+                    .map(|id| Some((id, true)))
+            }
+        }
+        ScratchpadCommand::Move(name) => {
+            if let Some(entry) = store.entry(name) {
+                if entry.visible {
+                    store.to_tiled(name, tree).map(|_| None)
+                } else {
+                    store.show(name).map(|id| Some((id, true)))
+                }
+            } else {
+                let id = target.ok_or(ScratchpadError::Vacant(name.clone()))?;
+                store
+                    .park(name, tree, id, geometry)
+                    .map(|id| Some((id, true)))
+            }
+        }
+        ScratchpadCommand::ToTiled(name) => store.to_tiled(name, tree).map(|_| None),
     }
-    slot.toggle(tree, target)
 }
 
 #[cfg(test)]
@@ -291,170 +715,424 @@ mod tests {
         LayoutNode::split(SplitAxis::Horizontal, 0.5, leaf(1), leaf(2))
     }
 
-    #[test]
-    fn hide_show_roundtrip_restores_order_and_modes() {
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        assert!(slot.is_empty());
-
-        slot.hide(&mut tree, ViewId::new(1)).expect("hide leaf 1");
-        assert!(!slot.is_empty());
-        // Leaf detached; parked copy stamped Scratchpad through the gate.
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
-        assert_eq!(
-            slot.peek().expect("parked").presentation(),
-            PresentationMode::Scratchpad
-        );
-
-        let restored = slot.show(&mut tree).expect("show");
-        assert_eq!(restored, ViewId::new(1));
-        assert!(slot.is_empty());
-        // Anchor was leaf 2 (following), restored before it: order kept.
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
-        assert_eq!(
-            tree.find_leaf(ViewId::new(1)).expect("leaf").presentation(),
-            PresentationMode::Tiled
-        );
-        // Layout covers the container exactly after restore.
-        let alloc = tree.layout(Rect::new(0, 0, 80, 24));
-        assert_eq!(alloc.len(), 2);
-        assert_eq!(alloc[0].1.width as u32 + alloc[1].1.width as u32, 80);
-    }
-
-    #[test]
-    fn discard_removes_parked_leaf_without_restoring_issue_2167() {
-        // Issue #2167: a parked panel whose child exits must leave the
-        // slot empty, never a dead parked leaf that restores as a ghost.
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        slot.hide(&mut tree, ViewId::new(1)).expect("hide leaf 1");
-        let removed = slot.discard(ViewId::new(1)).expect("discard parked");
-        assert_eq!(removed.id(), ViewId::new(1));
-        assert!(slot.is_empty());
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
-        assert!(slot.discard(ViewId::new(1)).is_none());
-        assert!(slot.discard(ViewId::new(404)).is_none());
-    }
-
-    #[test]
-    fn hide_occupied_or_unknown_leaves_tree_untouched() {
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        slot.hide(&mut tree, ViewId::new(1)).expect("hide");
-        let before = tree.clone();
-        assert_eq!(
-            slot.hide(&mut tree, ViewId::new(2)),
-            Err(ScratchpadError::Occupied)
-        );
-        assert_eq!(tree, before);
-        assert_eq!(
-            slot.hide(&mut tree, ViewId::new(404)),
-            Err(ScratchpadError::Occupied),
-            "occupancy is checked before lookup"
-        );
-        assert_eq!(tree, before);
-
-        let mut slot2 = ScratchpadSlot::new();
-        let before2 = tree.clone();
-        assert_eq!(
-            slot2.hide(&mut tree, ViewId::new(404)),
-            Err(ScratchpadError::LeafNotFound(ViewId::new(404)))
-        );
-        assert_eq!(tree, before2);
-    }
-
-    #[test]
-    fn show_vacant_fails() {
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        assert_eq!(slot.show(&mut tree), Err(ScratchpadError::Vacant));
-        assert_eq!(tree, pair(), "vacant show touches nothing");
-    }
-
-    #[test]
-    fn toggle_hides_then_shows_target_ignored_on_show() {
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        assert_eq!(
-            slot.toggle(&mut tree, None),
-            Err(ScratchpadError::MissingTarget)
-        );
-        assert_eq!(slot.toggle(&mut tree, Some(ViewId::new(2))), Ok(None));
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1)]);
-        // Occupied: target ignored, parked leaf returns.
-        assert_eq!(
-            slot.toggle(&mut tree, Some(ViewId::new(1))),
-            Ok(Some(ViewId::new(2)))
-        );
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
-    }
-
-    #[test]
-    fn unknown_command_rejected_before_lookup() {
-        let mut tree = pair();
-        let mut slot = ScratchpadSlot::new();
-        let before = tree.clone();
-        assert_eq!(
-            apply_scratchpad_toggle(
-                &mut slot,
-                &mut tree,
-                "bitty.workspace:nope",
-                Some(ViewId::new(1))
-            ),
-            Err(ScratchpadError::UnknownCommand(
-                "bitty.workspace:nope".to_string()
-            ))
-        );
-        assert_eq!(tree, before);
-        assert!(slot.is_empty());
-        // Registered command routes through the registry grammar path.
-        let mut registry = crate::panel::CommandRegistry::new();
-        let owner = crate::panel::PanelId::new(7);
-        registry
-            .register(owner, SCRATCHPAD_CMD_TOGGLE)
-            .expect("toggle command registers");
-        assert_eq!(registry.owner_of(SCRATCHPAD_CMD_TOGGLE), Some(owner));
-        assert_eq!(
-            apply_scratchpad_toggle(
-                &mut slot,
-                &mut tree,
-                SCRATCHPAD_CMD_TOGGLE,
-                Some(ViewId::new(1))
-            ),
-            Ok(None)
-        );
-        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)]);
-    }
-
-    #[test]
-    fn show_after_anchor_closed_docks_beside_first_live_leaf() {
-        let mut tree = LayoutNode::split(
+    fn triple() -> LayoutNode {
+        LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             leaf(1),
-            LayoutNode::split(SplitAxis::Vertical, 0.5, leaf(2), leaf(3)),
-        );
-        let mut slot = ScratchpadSlot::new();
-        // Hide leaf 2; anchor is leaf 3 (following).
-        slot.hide(&mut tree, ViewId::new(2)).expect("hide");
-        // Close the anchor meanwhile.
-        assert!(tree.remove_leaf(ViewId::new(3)).is_some());
-        let restored = slot.show(&mut tree).expect("show with dead anchor");
-        assert_eq!(restored, ViewId::new(2));
-        assert_eq!(tree.leaf_count(), 2);
-        assert!(tree.find_leaf(ViewId::new(2)).is_some());
-        let alloc = tree.layout(Rect::new(0, 0, 80, 24));
-        assert_eq!(alloc.len(), 2);
+            LayoutNode::split(SplitAxis::Horizontal, 0.5, leaf(2), leaf(3)),
+        )
     }
 
     #[test]
-    fn show_into_emptied_tree_becomes_leaf() {
-        let mut tree = LayoutNode::leaf(View::new(ViewId::new(1), 80, 24));
-        let mut slot = ScratchpadSlot::new();
-        slot.hide(&mut tree, ViewId::new(1))
-            .expect("hide sole leaf");
-        assert_eq!(tree.leaf_count(), 0);
-        assert_eq!(slot.show(&mut tree), Ok(ViewId::new(1)));
+    fn park_detaches_and_shows_as_floating_overlay() {
+        let mut tree = pair();
+        let mut store = Scratchpads::new();
+        assert!(store.is_empty());
+
+        store
+            .park(
+                DEFAULT_SCRATCHPAD,
+                &mut tree,
+                ViewId::new(1),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park leaf 1");
+
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(2)], "slot collapses");
+        assert_eq!(store.len(), 1);
+        assert!(store.contains_name(DEFAULT_SCRATCHPAD));
+        assert!(store.contains_view(ViewId::new(1)));
+        assert!(store.is_visible(DEFAULT_SCRATCHPAD));
+        assert_eq!(store.visible_ids(), vec![ViewId::new(1)]);
+        assert_eq!(
+            store
+                .get(DEFAULT_SCRATCHPAD)
+                .expect("parked")
+                .presentation(),
+            PresentationMode::Floating,
+            "a shown scratchpad paints as a cross-workspace float overlay"
+        );
+    }
+
+    #[test]
+    fn hide_keeps_view_identity_and_show_returns_the_same_view() {
+        let mut tree = pair();
+        let mut store = Scratchpads::new();
+        store
+            .park(
+                "notes",
+                &mut tree,
+                ViewId::new(1),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park");
+        let parked = store.get("notes").expect("parked").clone();
+
+        let hidden = store.hide("notes").expect("hide");
+        assert_eq!(hidden, ViewId::new(1));
+        assert!(!store.is_visible("notes"));
+        assert!(store.visible_ids().is_empty());
+        assert_eq!(
+            store.get("notes").expect("still parked").presentation(),
+            PresentationMode::Scratchpad
+        );
+        assert_eq!(
+            store.get("notes").expect("still parked").id(),
+            parked.id(),
+            "hiding parks the same view, so its session id survives"
+        );
+        assert!(
+            tree.leaf_ids() == vec![ViewId::new(2)],
+            "hide never re-tiles"
+        );
+
+        assert_eq!(store.show("notes").expect("show"), ViewId::new(1));
+        assert!(store.is_visible("notes"));
+        assert_eq!(
+            store.get("notes").expect("shown").presentation(),
+            PresentationMode::Floating
+        );
+        assert!(
+            !tree.leaf_ids().contains(&ViewId::new(1)),
+            "showing a scratchpad never inserts it into the layout"
+        );
+    }
+
+    #[test]
+    fn named_slots_are_independent_and_bounded() {
+        let mut tree = triple();
+        let mut store = Scratchpads::new();
+        store
+            .park(
+                "alpha",
+                &mut tree,
+                ViewId::new(1),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park alpha");
+        store
+            .park(
+                "beta",
+                &mut tree,
+                ViewId::new(2),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park beta");
+        assert_eq!(store.names(), vec!["alpha", "beta"]);
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(3)]);
+
+        store.hide("alpha").expect("hide alpha");
+        assert!(!store.is_visible("alpha"));
+        assert!(store.is_visible("beta"));
+        assert_eq!(store.visible_ids(), vec![ViewId::new(2)]);
+
+        // Occupied names are refused without touching the tree or store.
+        let before = store.clone();
+        assert_eq!(
+            store.park(
+                "alpha",
+                &mut tree,
+                ViewId::new(3),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::Occupied("alpha".to_string()))
+        );
+        assert_eq!(store, before);
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(3)]);
+
+        // Invalid names are refused the same way.
+        assert_eq!(
+            store.park(
+                "Bad Name",
+                &mut tree,
+                ViewId::new(3),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::InvalidName("Bad Name".to_string()))
+        );
+        assert!(!is_valid_scratchpad_name(""));
+        assert!(!is_valid_scratchpad_name(
+            &"x".repeat(MAX_SCRATCHPAD_NAME_LEN + 1)
+        ));
+        assert!(is_valid_scratchpad_name("build-logs_2"));
+
+        // The bounded table refuses a 33rd name.
+        let mut full_tree = LayoutNode::stack((10..=80).map(leaf).collect());
+        let mut full = Scratchpads::new();
+        let ids = full_tree.leaf_ids();
+        for (index, id) in ids.iter().take(MAX_SCRATCHPADS).enumerate() {
+            full.park(
+                &format!("s{index}"),
+                &mut full_tree,
+                *id,
+                ScratchpadGeometry::default(),
+            )
+            .expect("park within bound");
+        }
+        let remaining = full_tree.leaf_ids()[0];
+        assert_eq!(
+            full.park(
+                "overflow",
+                &mut full_tree,
+                remaining,
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::TooManySlots)
+        );
+    }
+
+    #[test]
+    fn to_tiled_restores_beside_anchor_and_stamps_tiled() {
+        let mut tree = triple();
+        let mut store = Scratchpads::new();
+        store
+            .park(
+                "notes",
+                &mut tree,
+                ViewId::new(2),
+                ScratchpadGeometry::default(),
+            )
+            .expect("park leaf 2");
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(3)]);
+
+        let restored = store.to_tiled("notes", &mut tree).expect("to tiled");
+        assert_eq!(restored, ViewId::new(2));
+        assert!(store.is_empty());
+        // Anchor was leaf 3 (following neighbor): restored before it.
+        assert_eq!(
+            tree.leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2), ViewId::new(3)]
+        );
+        assert_eq!(
+            tree.find_leaf(ViewId::new(2)).expect("leaf").presentation(),
+            PresentationMode::Tiled
+        );
+        let alloc = tree.layout(Rect::new(0, 0, 80, 24));
+        assert_eq!(alloc.len(), 3);
+        assert!(
+            alloc
+                .iter()
+                .all(|(_, rect)| !rect.is_empty() && rect.right() <= 80 && rect.bottom() <= 24),
+            "every restored leaf is allocated inside the container"
+        );
+        assert_eq!(
+            store.to_tiled("notes", &mut tree),
+            Err(ScratchpadError::Vacant("notes".to_string()))
+        );
+    }
+
+    #[test]
+    fn refused_park_leaves_tree_and_store_untouched() {
+        let mut sole = leaf(1);
+        let mut store = Scratchpads::new();
+        assert_eq!(
+            store.park(
+                DEFAULT_SCRATCHPAD,
+                &mut sole,
+                ViewId::new(1),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::StrandedLayout)
+        );
+        assert_eq!(sole.leaf_ids(), vec![ViewId::new(1)]);
+        assert!(store.is_empty());
+
+        let mut tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::with_presentation(
+                ViewId::new(1),
+                40,
+                24,
+                PresentationMode::Fullscreen,
+            )),
+            leaf(2),
+        );
+        assert_eq!(
+            store.park(
+                DEFAULT_SCRATCHPAD,
+                &mut tree,
+                ViewId::new(1),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::UnsupportedMode {
+                current: PresentationMode::Fullscreen
+            })
+        );
+        // The rejected leaf returns to its exact slot, store untouched.
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert!(store.is_empty());
+
+        let mut tree = pair();
+        assert_eq!(
+            store.park(
+                DEFAULT_SCRATCHPAD,
+                &mut tree,
+                ViewId::new(404),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::LeafNotFound(ViewId::new(404)))
+        );
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn create_makes_a_visible_spawn_target_and_discard_rolls_back() {
+        let mut store = Scratchpads::new();
+        let view = View::new(ViewId::new(9), 80, 24);
+        let id = store
+            .create("btop", view, ScratchpadGeometry::default())
+            .expect("create slot");
+        assert_eq!(id, ViewId::new(9));
+        assert!(store.is_visible("btop"));
+        assert_eq!(
+            store.get("btop").expect("entry").presentation(),
+            PresentationMode::Floating
+        );
+        // A second create for the same name is refused.
+        assert_eq!(
+            store.create(
+                "btop",
+                View::new(ViewId::new(10), 80, 24),
+                ScratchpadGeometry::default()
+            ),
+            Err(ScratchpadError::Occupied("btop".to_string()))
+        );
+        let removed = store.discard_name("btop").expect("rollback");
+        assert_eq!(removed.id(), ViewId::new(9));
+        assert!(store.is_empty());
+
+        // A created slot has no anchor; to_tiled docks beside the first leaf.
+        let mut tree = pair();
+        store
+            .create(
+                "lazygit",
+                View::new(ViewId::new(11), 80, 24),
+                ScratchpadGeometry::default(),
+            )
+            .expect("create");
+        assert_eq!(
+            store.to_tiled("lazygit", &mut tree).expect("tile"),
+            ViewId::new(11)
+        );
+        assert_eq!(
+            tree.leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(11), ViewId::new(2)]
+        );
+    }
+
+    #[test]
+    fn command_grammar_and_apply_toggle_hide_show() {
+        assert_eq!(
+            ScratchpadCommand::parse(SCRATCHPAD_CMD_TOGGLE),
+            Some(ScratchpadCommand::Toggle(DEFAULT_SCRATCHPAD.to_string()))
+        );
+        assert_eq!(
+            ScratchpadCommand::parse("bitty.workspace:scratchpad-toggle:logs"),
+            Some(ScratchpadCommand::Toggle("logs".to_string()))
+        );
+        assert_eq!(
+            ScratchpadCommand::parse("bitty.workspace:scratchpad-move"),
+            Some(ScratchpadCommand::Move(DEFAULT_SCRATCHPAD.to_string()))
+        );
+        assert_eq!(
+            ScratchpadCommand::parse("bitty.workspace:scratchpad-to-tiled:logs"),
+            Some(ScratchpadCommand::ToTiled("logs".to_string()))
+        );
+        assert_eq!(ScratchpadCommand::parse("bitty.workspace:nope"), None);
+        assert_eq!(
+            ScratchpadCommand::parse("bitty.workspace:scratchpad-toggle:Bad Name"),
+            None,
+            "invalid slot names never parse"
+        );
+
+        let mut tree = pair();
+        let mut store = Scratchpads::new();
+        let toggle = ScratchpadCommand::parse(SCRATCHPAD_CMD_TOGGLE).expect("parse");
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &toggle,
+                Some(ViewId::new(1)),
+                ScratchpadGeometry::default()
+            ),
+            Ok(Some((ViewId::new(1), true)))
+        );
+        assert!(store.is_visible(DEFAULT_SCRATCHPAD));
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &toggle,
+                Some(ViewId::new(2)),
+                ScratchpadGeometry::default()
+            ),
+            Ok(Some((ViewId::new(1), false))),
+            "toggle hides the shown entry and ignores the target"
+        );
+        assert!(!store.is_visible(DEFAULT_SCRATCHPAD));
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &toggle,
+                None,
+                ScratchpadGeometry::default()
+            ),
+            Ok(Some((ViewId::new(1), true)))
+        );
+
+        let to_tiled = ScratchpadCommand::parse(SCRATCHPAD_CMD_TO_TILED).expect("parse");
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &to_tiled,
+                None,
+                ScratchpadGeometry::default()
+            ),
+            Ok(None)
+        );
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+    }
+
+    #[test]
+    fn move_command_parks_then_restores_visible_entry_to_tiled() {
+        let mut tree = pair();
+        let mut store = Scratchpads::new();
+        let mv = ScratchpadCommand::parse("bitty.workspace:scratchpad-move:notes").expect("parse");
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &mv,
+                Some(ViewId::new(2)),
+                ScratchpadGeometry::default()
+            ),
+            Ok(Some((ViewId::new(2), true)))
+        );
+        assert!(store.is_visible("notes"));
         assert_eq!(tree.leaf_ids(), vec![ViewId::new(1)]);
+
+        // The second Move restores the visible panel to the tiling.
+        assert_eq!(
+            apply_scratchpad_command(
+                &mut store,
+                &mut tree,
+                &mv,
+                Some(ViewId::new(1)),
+                ScratchpadGeometry::default()
+            ),
+            Ok(None)
+        );
+        assert!(store.is_empty());
+        assert_eq!(tree.leaf_ids(), vec![ViewId::new(1), ViewId::new(2)]);
+        assert_eq!(
+            tree.find_leaf(ViewId::new(2)).expect("leaf").presentation(),
+            PresentationMode::Tiled
+        );
     }
 }

@@ -255,7 +255,8 @@ pub use config::{
     MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_BACKGROUND_IMAGE_ROOTS, MAX_PASTE_CONFIRM_TIMEOUT_SECS,
     MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, MIN_PASTE_CONFIRM_TIMEOUT_SECS,
     PanelLayoutMode, RuntimeConfig, RuntimeViewBackground, RuntimeViewOutline, RuntimeViewStyle,
-    RuntimeViewTarget, TEXT_STACK_ENV, TextStack, TextStackPreference, ViewAppearanceRule,
+    RuntimeViewTarget, ScratchpadSpawn, ScratchpadSpec, TEXT_STACK_ENV, TextStack,
+    TextStackPreference, ViewAppearanceRule,
 };
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};
@@ -305,7 +306,8 @@ pub use runtime::workspace_memory::{
     WorkspaceMemoryRow, bounded_layout_leaf_ids,
 };
 pub use runtime::workspaces::{
-    MAX_WORKSPACES, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary, WsCloseRequest,
+    MAX_WORKSPACES, ScratchpadActivation, WORKSPACE_NAME_MAX_CHARS, WorkspaceSummary,
+    WsCloseRequest,
 };
 pub use runtime::{
     ActivationGesture, AnimationCurve, AnimationKind, AnimationPolicy, BandContent, ChromeBands,
@@ -328,13 +330,14 @@ pub use runtime::tabs::{TabHost, TabOutcome, TabRequest, panel_of_view, panel_re
 // The runtime depends on `bitty-ui` only via these owned value types; no
 // render/platform/pty coupling is introduced through them.
 pub use bitty_ui::{
-    DecoratedView, Decoration, DecorationError, DropPlan, DropSpec, FLOATING_CMD_TOGGLE,
-    FloatStore, Focus, FocusDirection, Gaps, LayoutNode, MIN_PANE_COLS, MIN_PANE_ROWS,
-    OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE, PresentationMode,
-    PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS, ResizeEdge, SCRATCHPAD_CMD_TOGGLE,
-    ScrollbarMode, SplitAxis, View, ViewId, drop_plan_for_point, dwindle_split_axis,
-    largest_area_leaf, largest_splittable_leaf, layout::remove_leaf, smart_split_axis,
-    splittable_axis, survivor_after_close,
+    DEFAULT_SCRATCHPAD, DecoratedView, Decoration, DecorationError, DropPlan, DropSpec,
+    FLOATING_CMD_TOGGLE, FloatStore, Focus, FocusDirection, Gaps, LayoutNode, MIN_PANE_COLS,
+    MIN_PANE_ROWS, OverlayLayer, OverlayTier, PIN_CMD_TOGGLE, PSEUDO_CMD_TOGGLE, PresentationMode,
+    PseudoConstraint, PseudoError, RESIZE_HANDLE_CELLS, ResizeEdge, SCRATCHPAD_CMD_MOVE,
+    SCRATCHPAD_CMD_MOVE_NAMED, SCRATCHPAD_CMD_TO_TILED, SCRATCHPAD_CMD_TO_TILED_NAMED,
+    SCRATCHPAD_CMD_TOGGLE, SCRATCHPAD_CMD_TOGGLE_NAMED, ScrollbarMode, SplitAxis, View, ViewId,
+    drop_plan_for_point, dwindle_split_axis, largest_area_leaf, largest_splittable_leaf,
+    layout::remove_leaf, smart_split_axis, splittable_axis, survivor_after_close,
 };
 
 // CTX-0355: the resolved terminal palette crosses the app/runtime seam on

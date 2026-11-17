@@ -128,6 +128,10 @@ pub struct ConfigPlan {
     pub decoration: Option<DecorationConfig>,
     /// Floating panel defaults (`floating = { ... }`).
     pub floating: Option<FloatingConfig>,
+    /// Named scratchpad slots (`scratchpads = { <name> = { ... } }`, issue
+    /// #3205). A present entry carries overrides; cross-layer merge is per
+    /// name per field.
+    pub scratchpads: Option<Vec<crate::types::ScratchpadConfig>>,
     /// Per-`View` appearance overrides (RFC-0001/OQ-041, CTX-0343
     /// `views.<selector>.*`). A present entry carries its parsed selector and
     /// the closed override field set; absent means "this layer says
@@ -375,6 +379,9 @@ impl ConfigPlan {
         if let Some(f) = &self.floating {
             f.validate()?;
         }
+        if let Some(scratchpads) = &self.scratchpads {
+            crate::types::validate_scratchpads(scratchpads)?;
+        }
         if let Some(views) = &self.views {
             for entry in views {
                 entry.validate()?;
@@ -442,6 +449,7 @@ impl ConfigPlan {
             && self.chrome.is_none()
             && self.decoration.is_none()
             && self.floating.is_none()
+            && self.scratchpads.is_none()
             && self.views.is_none()
             && self.scrollbar.is_none()
             && self.mouse.is_none()

@@ -207,6 +207,7 @@ fn runtime_adopts(field: &str) -> bool {
             | "floating.y"
             | "floating.background_opacity"
             | "floating.background"
+            | "scratchpads"
     ) || field.starts_with("appearance.animations")
         || field == "views"
         || field.starts_with(bitty_config::VIEWS_FIELD_PREFIX)
@@ -476,6 +477,18 @@ pub(crate) fn apply_live_presentation(
     runtime.set_floating_config(bitty_runtime::FloatingPanelConfig::from_config(
         &effective.floating,
     ));
+    // Issue #3205: swap the named scratchpad table; a bad table leaves the
+    // previous definitions in place (the reload engine already validated it).
+    let scratchpads: Vec<bitty_runtime::ScratchpadSpec> = effective
+        .scratchpads
+        .iter()
+        .map(|entry| bitty_runtime::ScratchpadSpec::from_config(entry, &effective.floating))
+        .collect();
+    if !runtime.set_scratchpad_specs(scratchpads) {
+        crate::logging::warn(|| {
+            String::from("bitty: scratchpads config rejected at reload — keeping previous")
+        });
+    }
     runtime
         .set_window_padding(effective.window.padding)
         .map_err(|err| format!("window.padding: {err}"))?;

@@ -85,6 +85,25 @@ The exact at-cap/just-past-cap boundary (all five string families) is also
 pinned deterministically by `crates/bitty-vt/tests/control_string_cap.rs`,
 which the stable workspace gates run.
 
+## Campaign driver (nightly and owner-driven)
+
+`scripts/fuzz-campaign.sh` is the bounded campaign driver behind the nightly
+`.github/workflows/fuzz-campaign.yml` workflow and the owner-facing
+`just fuzz-campaign <secs>` recipe: it seeds `fuzz/corpus/<target>` from the
+retained corpora above, runs each target for the budget with a pinned
+`-timeout`/`-rss_limit_mb`, classifies any artifact the run adds under
+`fuzz/artifacts/<target>/`, and writes `summary.json` / `summary.md` (target,
+seconds fuzzed, runs, crashes, OOM, timeouts) next to the per-target logs and
+copied artifacts. It exits non-zero on a crash, OOM, or timeout, so a campaign
+is a single command and a single evidence record; the runbook and the
+P0-AC-002 mapping are in `specifications/fuzz-campaign-ctx-1877-evidence.md`.
+
+Targets come from the `[[bin]]` entries in `fuzz/Cargo.toml`, so a new target
+joins the campaign without editing the workflow. `control_string_cap` keeps its
+generated seeds (see above) and is the one target run with
+`-max_len=4198432`. The scratch corpus is trimmed to 2000 units per target
+after a run and the retained corpora here are never modified by the driver.
+
 ## Corpus retention policy on new findings
 
 - A crash/hang is a finding: fix it, then commit the **minimized** artifact
@@ -181,6 +200,10 @@ stays the canonical corpus record.
 - The `fuzz/` target crate is compile-checked with `cargo +nightly fuzz build`
   (or `cargo check --manifest-path fuzz/Cargo.toml`); it is outside the stable
   workspace and does not affect `just check`.
+- `just fuzz-campaign-test` (part of `just check`) stubs `cargo` and pins the
+  campaign driver's plan, budget clamp, evidence schema, and finding
+  classification; it also fails if `ci.yml` ever runs the campaign, so the
+  nightly stays out of the PR-required checks.
 - `fuzz/corpora/vt/` retention itself satisfies P0-AC-002
   `corpus retained in-repo`; the SHA256 manifest satisfies the risk-evidence
   RFC artifact `corpus hash` requirement.

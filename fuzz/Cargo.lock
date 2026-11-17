@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-term-state"
-version = "0.0.31"
+version = "0.0.44"
 dependencies = [
  "bitty-vt",
  "unicode-bidi",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "bitty-vt"
-version = "0.0.31"
+version = "0.0.44"
 dependencies = [
  "miniz_oxide",
  "vte",

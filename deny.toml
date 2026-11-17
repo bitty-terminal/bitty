@@ -40,7 +40,19 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # vendored tree. The compensating controls (a synthetic-lock audit snippet and
 # the same 2027-03-31 re-audit bound) are recorded in
 # `vendor/winit/PATCHES.md`.
-ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436", "RUSTSEC-2026-0009"]
+# RUSTSEC-2026-0543 (chrono unmaintained, all versions): `chrono` has no
+# patched release (`patched = []`), so no lockfile move can clear the advisory;
+# it enters the graph only for the restricted Lua `os.date` local-calendar
+# conversion (`bitty-lua/src/stdlib.rs`) plus one `bitty-runtime` test. The
+# advisory is informational (upstream unmaintained, no source-visible
+# vulnerability), the crate is used for calendar fields only, and the two
+# recommended replacements are both blocked today: `time >= 0.3.47` needs rustc
+# 1.88 (above the workspace MSRV 1.85) and the `jiff` migration is a dependency
+# adoption decision of its own. Time bound (P0-AC-034, ADR-0004 exception
+# policy): adopt `jiff` or a maintained replacement, or drop this ignore, no
+# later than 2027-03-31 or when the MSRV moves to 1.88, whichever comes first;
+# any extension needs a dated ADR-0004 revision.
+ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436", "RUSTSEC-2026-0009", "RUSTSEC-2026-0543"]
 
 [bans]
 multiple-versions = "warn"

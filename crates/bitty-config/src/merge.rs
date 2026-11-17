@@ -621,6 +621,133 @@ fn merge_floating(
     }
 }
 
+/// Deep-merges named scratchpad entries per name per field (issue #3205).
+///
+/// A name absent from the effective table is appended in declaration order;
+/// a present name merges leaf by leaf, so a lower layer's `cmd` survives a
+/// higher layer that only overrides `width`. `name` is the table key and is
+/// never merged.
+fn merge_scratchpads(
+    effective: &mut EffectiveConfig,
+    acc: &mut MergeAccumulators<'_>,
+    src: &ConfigSource,
+    is_policy: bool,
+    entries: &[crate::types::ScratchpadConfig],
+) {
+    let mut touched = false;
+    for entry in entries {
+        let index = match effective
+            .scratchpads
+            .iter()
+            .position(|slot| slot.name == entry.name)
+        {
+            Some(index) => index,
+            None => {
+                effective.scratchpads.push(crate::types::ScratchpadConfig {
+                    name: entry.name.clone(),
+                    ..Default::default()
+                });
+                effective.scratchpads.len() - 1
+            }
+        };
+        let slot = &mut effective.scratchpads[index];
+        let base = format!("scratchpads.{}", entry.name);
+        let mut field_touched = false;
+        field_touched |= merge_view_leaf(
+            entry.cmd.as_ref(),
+            &mut slot.cmd,
+            &base,
+            "cmd",
+            src,
+            is_policy,
+            acc,
+        );
+        if !entry.args.is_empty() && slot.args != entry.args {
+            // Argument lists replace as one value: an empty `args` means
+            // "this layer says nothing", never "clear the inherited argv".
+            slot.args.clone_from(&entry.args);
+            field_touched = true;
+        }
+        field_touched |= merge_view_leaf(
+            entry.cwd.as_ref(),
+            &mut slot.cwd,
+            &base,
+            "cwd",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.command.as_ref(),
+            &mut slot.command,
+            &base,
+            "command",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.width.as_ref(),
+            &mut slot.width,
+            &base,
+            "width",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.height.as_ref(),
+            &mut slot.height,
+            &base,
+            "height",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.centered.as_ref(),
+            &mut slot.centered,
+            &base,
+            "centered",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.x.as_ref(),
+            &mut slot.x,
+            &base,
+            "x",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.y.as_ref(),
+            &mut slot.y,
+            &base,
+            "y",
+            src,
+            is_policy,
+            acc,
+        );
+        field_touched |= merge_view_leaf(
+            entry.background_opacity.as_ref(),
+            &mut slot.background_opacity,
+            &base,
+            "background_opacity",
+            src,
+            is_policy,
+            acc,
+        );
+        touched |= field_touched;
+    }
+    if touched {
+        acc.attribution
+            .insert("scratchpads".to_string(), src.clone());
+    }
+}
+
 fn merge_views(
     effective: &mut EffectiveConfig,
     acc: &mut MergeAccumulators<'_>,
@@ -2209,6 +2336,15 @@ fn merge_layers_inner(
                 policy_violations: &mut policy_violations,
             };
             merge_floating(&mut effective, &mut acc, src, is_policy, floating);
+        }
+        if let Some(scratchpads) = &plan.scratchpads {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_scratchpads(&mut effective, &mut acc, src, is_policy, scratchpads);
         }
 
         // CTX-0343: `views` entries deep-merge per selector per field (see
@@ -3799,6 +3935,15 @@ fn merge_layers_allow_policy_violations(
                 policy_violations: &mut policy_violations,
             };
             merge_floating(&mut effective, &mut acc, src, is_policy, floating);
+        }
+        if let Some(scratchpads) = &plan.scratchpads {
+            let mut acc = MergeAccumulators {
+                policy_fields: &mut policy_fields,
+                attribution: &mut attribution,
+                conflicts: &mut conflicts,
+                policy_violations: &mut policy_violations,
+            };
+            merge_scratchpads(&mut effective, &mut acc, src, is_policy, scratchpads);
         }
         // CTX-0343: `views` entries deep-merge per selector per field (see
         // `merge_views`); absent fields inherit, so a lower layer's explicit

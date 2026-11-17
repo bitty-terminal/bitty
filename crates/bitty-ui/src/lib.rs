@@ -49,9 +49,13 @@
 //!   [`target_provider::TargetSnapshot`] freezes one cold-path collection
 //!   per hint-session entry (UX-29) with fail-closed epoch revalidation
 //!   and no per-frame polling.
-//! - [`scratchpad::ScratchpadSlot`] — single hidden per-window scratchpad
-//!   slot with anchor-preserving hide/show/toggle (CW-10), routed as
-//!   `bitty.workspace:scratchpad-toggle`.
+//! - [`scratchpad::Scratchpads`] — named cross-workspace scratchpad slots
+//!   (issue #3205): a shown entry paints as a `Float` overlay over the active
+//!   workspace, hiding parks it with its `ViewId` intact, and `to_tiled`
+//!   returns it to the layout. The keymap action grammar is the routed surface
+//!   (`toggle_scratchpad[:<name>]`, `move_to_scratchpad[:<name>]`,
+//!   `scratchpad_to_tiled[:<name>]`); the legacy `bitty.workspace:` command
+//!   string form is only the bare [`scratchpad::SCRATCHPAD_CMD_TOGGLE`].
 //! - [`drag::DragHistory`] — bounded (`32`, `DropOldest`) undo history for
 //!   drag/resize sessions (CW-09). The PW drag family builds on it (CTX-0663):
 //!   [`drag::DragMoveSession`] (UX-01 Mod+drag move, `bitty.workspace:drag-move`),
@@ -326,7 +330,8 @@ pub use scene_style::{
     SceneStyle, SceneStyleError, StyleArg, StyleField, StylePaintOp, StyleSource, StyleValue,
 };
 pub use scratchpad::{
-    HiddenEntry, SCRATCHPAD_CMD_TOGGLE, ScratchpadError, ScratchpadSlot, apply_scratchpad_toggle,
+    DEFAULT_SCRATCHPAD, MAX_SCRATCHPAD_NAME_LEN, MAX_SCRATCHPADS, SCRATCHPAD_CMD_TOGGLE,
+    ScratchpadEntry, ScratchpadError, ScratchpadGeometry, Scratchpads, is_valid_scratchpad_name,
 };
 pub use scrollbar::{
     MIN_THUMB_HEIGHT_PX, SCROLLBAR_PROXIMITY_PX, ScrollbarHit, ScrollbarMode, ThumbSpan, TrackRect,

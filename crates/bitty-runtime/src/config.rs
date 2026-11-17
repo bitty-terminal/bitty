@@ -953,6 +953,152 @@ impl std::fmt::Display for TextStack {
 /// Default floating panel size fraction (`0.8` = 80% of container).
 pub const DEFAULT_FLOATING_SIZE_RATIO: f32 = 0.8;
 
+/// Maximum named scratchpad slots in one runtime config (issue #3205).
+pub const MAX_SCRATCHPADS: usize = bitty_ui::MAX_SCRATCHPADS;
+
+/// How an empty scratchpad is populated on its first trigger (issue #3205).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScratchpadSpawn {
+    /// Spawn a PTY running `cmd` with `args` in `cwd` (direct argv exec).
+    Pty {
+        /// Program to exec (`argv[0]`).
+        cmd: String,
+        /// Extra arguments.
+        args: Vec<String>,
+        /// Absolute working directory.
+        cwd: Option<String>,
+    },
+    /// Launch a GUI plugin command (`<owner>:<command>`).
+    Plugin {
+        /// Qualified plugin command.
+        command: String,
+    },
+}
+
+/// One resolved named scratchpad definition (issue #3205).
+///
+/// Geometry leaves are already resolved against the global `floating`
+/// config, so the present path never has to consult two tables.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScratchpadSpec {
+    /// Slot name.
+    pub name: String,
+    /// What to launch on the first trigger; `None` means the slot only holds
+    /// panels moved into it manually.
+    pub spawn: Option<ScratchpadSpawn>,
+    /// Resolved geometry overrides.
+    pub geometry: bitty_ui::ScratchpadGeometry,
+}
+
+impl ScratchpadSpec {
+    /// Resolves one `bitty-config` entry against the global floating defaults.
+    #[must_use]
+    pub fn from_config(
+        entry: &bitty_config::types::ScratchpadConfig,
+        global: &bitty_config::FloatingConfig,
+    ) -> Self {
+        let spawn = match (&entry.cmd, &entry.command) {
+            (Some(cmd), _) => Some(ScratchpadSpawn::Pty {
+                cmd: cmd.clone(),
+                args: entry.args.clone(),
+                cwd: entry.cwd.clone(),
+            }),
+            (None, Some(command)) => Some(ScratchpadSpawn::Plugin {
+                command: command.clone(),
+            }),
+            (None, None) => None,
+        };
+        Self {
+            name: entry.name.clone(),
+            spawn,
+            geometry: bitty_ui::ScratchpadGeometry {
+                width: entry.width.unwrap_or_else(|| global.resolve_width()),
+                height: entry.height.unwrap_or_else(|| global.resolve_height()),
+                centered: entry.centered.unwrap_or_else(|| global.resolve_centered()),
+                x: entry.x.or(global.x),
+                y: entry.y.or(global.y),
+                background_opacity: entry.background_opacity.or(global.background_opacity),
+            },
+        }
+    }
+
+    /// Validates the resolved spec (fail-closed).
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if !bitty_ui::is_valid_scratchpad_name(&self.name) {
+            return Err(RuntimeError::InvalidConfig(
+                "scratchpad name must be 1..=32 lowercase ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        if let Some(spawn) = &self.spawn {
+            match spawn {
+                ScratchpadSpawn::Pty { cmd, args, cwd } => {
+                    if cmd.trim().is_empty() {
+                        return Err(RuntimeError::InvalidConfig(
+                            "scratchpad cmd must not be blank",
+                        ));
+                    }
+                    if args.len() > bitty_config::types::MAX_SCRATCHPAD_ARGS {
+                        return Err(RuntimeError::InvalidConfig(
+                            "scratchpad args must contain <= MAX_SCRATCHPAD_ARGS entries",
+                        ));
+                    }
+                    if cwd.as_deref().is_some_and(|dir| {
+                        dir.trim().is_empty() || !std::path::Path::new(dir).is_absolute()
+                    }) {
+                        return Err(RuntimeError::InvalidConfig(
+                            "scratchpad cwd must be an absolute path",
+                        ));
+                    }
+                }
+                ScratchpadSpawn::Plugin { command } => {
+                    let valid = match command.split_once(':') {
+                        Some((owner, action)) => !owner.is_empty() && !action.is_empty(),
+                        None => false,
+                    };
+                    if !valid {
+                        return Err(RuntimeError::InvalidConfig(
+                            "scratchpad command must be '<owner>:<command>'",
+                        ));
+                    }
+                }
+            }
+        }
+        let geometry = self.geometry;
+        if !(geometry.width.is_finite() && geometry.width > 0.0 && geometry.width <= 1.0) {
+            return Err(RuntimeError::InvalidConfig(
+                "scratchpad width must be finite within (0.0, 1.0]",
+            ));
+        }
+        if !(geometry.height.is_finite() && geometry.height > 0.0 && geometry.height <= 1.0) {
+            return Err(RuntimeError::InvalidConfig(
+                "scratchpad height must be finite within (0.0, 1.0]",
+            ));
+        }
+        if let Some(x) = geometry.x {
+            if !(x.is_finite() && (0.0..=1.0).contains(&x)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "scratchpad x must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(y) = geometry.y {
+            if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "scratchpad y must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        if let Some(opacity) = geometry.background_opacity {
+            if !(opacity.is_finite() && (0.0..=1.0).contains(&opacity)) {
+                return Err(RuntimeError::InvalidConfig(
+                    "scratchpad background_opacity must be finite within [0.0, 1.0]",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Runtime floating panel defaults (CTX-1861).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloatingPanelConfig {
@@ -1369,6 +1515,8 @@ pub struct RuntimeConfig {
     pub panel_layout_mode: PanelLayoutMode,
     /// Floating panel geometry and appearance defaults (CTX-1861).
     pub floating: FloatingPanelConfig,
+    /// Named scratchpad definitions (issue #3205), in declaration order.
+    pub scratchpads: Vec<ScratchpadSpec>,
 }
 
 /// Layout mode for adaptive panel creation (`NewPanel` / `Mod+N`).
@@ -1506,6 +1654,7 @@ impl Default for RuntimeConfig {
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
             floating: FloatingPanelConfig::default(),
+            scratchpads: Vec::new(),
         }
     }
 }
@@ -1625,6 +1774,7 @@ impl RuntimeConfig {
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
             floating: FloatingPanelConfig::default(),
+            scratchpads: Vec::new(),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1876,6 +2026,22 @@ impl RuntimeConfig {
             ));
         }
         self.floating.validate()?;
+        if self.scratchpads.len() > MAX_SCRATCHPADS {
+            return Err(RuntimeError::InvalidConfig(
+                "scratchpads must contain <= MAX_SCRATCHPADS named slots",
+            ));
+        }
+        for (index, spec) in self.scratchpads.iter().enumerate() {
+            spec.validate()?;
+            if self.scratchpads[..index]
+                .iter()
+                .any(|other| other.name == spec.name)
+            {
+                return Err(RuntimeError::InvalidConfig(
+                    "scratchpad names must be unique",
+                ));
+            }
+        }
         Ok(())
     }
 

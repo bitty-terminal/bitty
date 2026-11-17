@@ -247,9 +247,9 @@ use crate::types::{
     AppearanceConfig, BackgroundFit, BackgroundPosition, DecorationConfig, FloatingConfig,
     FontConfig, KeymapEntry, LayoutConfig, MAX_BACKGROUND_IMAGE_PATH_BYTES,
     MAX_DECORATION_BORDER_WIDTH_PX, MAX_FONT_FAMILY_LEN, MAX_PLUGIN_ID_LEN,
-    MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, OutlineColor, PluginSpec, ScrollbarConfig,
-    ScrollbarMode, SelectionConfig, SessionConfig, StyleConfig, TerminalConfig,
-    ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
+    MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX, OutlineColor, PluginSpec,
+    ScratchpadConfig, ScrollbarConfig, ScrollbarMode, SelectionConfig, SessionConfig, StyleConfig,
+    TerminalConfig, ViewAppearanceOverride, ViewOverride, ViewSelector, WindowConfig,
 };
 
 /// Config directory name under the XDG config root.
@@ -2520,6 +2520,68 @@ fn build_plan_from_data(
             Some(cfg)
         }
     };
+    // Issue #3205: `scratchpads = { <name> = { ... } }` declares named
+    // cross-workspace scratchpad slots. Raw Lua data is typed here; names,
+    // bounds, and the cmd/command exclusivity fail closed via
+    // `validate_scratchpads` (also reached by `plan.validate()`).
+    let scratchpads = match data.scratchpads {
+        None => None,
+        Some(entries) if entries.is_empty() => None,
+        Some(entries) => {
+            let check_ratio =
+                |val: Option<f64>, field: String| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && v > 0.0 && v <= 1.0 => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within (0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
+            let check_unit =
+                |val: Option<f64>, field: String| -> Result<Option<f32>, ConfigError> {
+                    match val {
+                        None => Ok(None),
+                        Some(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Ok(Some(v as f32)),
+                        Some(v) => Err(ConfigError::validation(
+                            field,
+                            format!("must be finite within [0.0, 1.0] (found {v})"),
+                        )),
+                    }
+                };
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let cfg = ScratchpadConfig {
+                    cmd: entry.cmd,
+                    args: entry.args.unwrap_or_default(),
+                    cwd: entry.cwd,
+                    command: entry.command,
+                    width: check_ratio(entry.width, format!("scratchpads.{}.width", entry.name))?,
+                    height: check_ratio(
+                        entry.height,
+                        format!("scratchpads.{}.height", entry.name),
+                    )?,
+                    centered: entry.centered,
+                    x: check_unit(entry.x, format!("scratchpads.{}.x", entry.name))?,
+                    y: check_unit(entry.y, format!("scratchpads.{}.y", entry.name))?,
+                    background_opacity: check_unit(
+                        entry.background_opacity,
+                        format!("scratchpads.{}.background_opacity", entry.name),
+                    )?,
+                    name: entry.name,
+                };
+                cfg.validate()?;
+                out.push(cfg);
+            }
+            // Lua table iteration order is not declaration order, so sort the
+            // slots by name for a deterministic plan (present cascade, summaries,
+            // and diagnostics all read this order).
+            out.sort_by(|a, b| a.name.cmp(&b.name));
+            crate::types::validate_scratchpads(&out)?;
+            Some(out)
+        }
+    };
     // CTX-0343 (RFC-0001/OQ-041): `views` is a closed-selector table of
     // per-field appearance overrides. The Lua extractor already rejected
     // unknown/reserved fields and wrong leaf types with the offending key
@@ -3098,6 +3160,7 @@ fn build_plan_from_data(
         session,
         decoration,
         floating,
+        scratchpads,
         views,
         scrollbar,
         mouse,
@@ -8266,5 +8329,156 @@ return {
                 "must reject invalid floating config: {bad}"
             );
         }
+    }
+
+    #[test]
+    fn scratchpads_parse_merge_and_validate_issue_3205() {
+        // `cwd` must be an absolute path for the parser *and* the validator,
+        // and the literal has to be platform-independent: a root-only POSIX
+        // path such as "/tmp" has no prefix on Windows, so `is_absolute()` is
+        // false there and the parse fails. Build the fixture from the platform
+        // temp dir with forward slashes, which is the separator a Lua string
+        // literal can carry (a backslash would start an escape).
+        let absolute_cwd = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+        assert!(
+            std::path::Path::new(&absolute_cwd).is_absolute(),
+            "the fixture cwd must be absolute on this platform: {absolute_cwd}"
+        );
+        assert!(
+            !absolute_cwd.contains(['"', '\\']),
+            "the fixture cwd must be expressible as a Lua string: {absolute_cwd}"
+        );
+        let lua = r##"
+return {
+    scratchpads = {
+        default = { cmd = "btop", args = { "--utf-force" }, cwd = "@CWD@", width = 0.6, background_opacity = 0.9 },
+        files = { command = "bitty-terminal.file-manager:open", height = 0.4, centered = false, x = 0.1 },
+        manual = { width = 0.5 },
+    },
+}
+"##
+        .replace("@CWD@", &absolute_cwd);
+        let source = ConfigSource::new(LayerKind::User, Some("scratchpads.lua"));
+        let plan = parse_lua_config(&lua, &source).expect("valid scratchpads");
+        let entries = plan.scratchpads.as_ref().expect("scratchpads present");
+        assert_eq!(entries.len(), 3);
+        let default = entries
+            .iter()
+            .find(|entry| entry.name == "default")
+            .expect("default slot");
+        assert_eq!(default.cmd.as_deref(), Some("btop"));
+        assert_eq!(default.args, vec!["--utf-force".to_string()]);
+        assert_eq!(default.cwd.as_deref(), Some(absolute_cwd.as_str()));
+        assert_eq!(default.width, Some(0.6));
+        assert_eq!(default.background_opacity, Some(0.9));
+        assert!(default.command.is_none());
+        let files = entries
+            .iter()
+            .find(|entry| entry.name == "files")
+            .expect("files slot");
+        assert_eq!(
+            files.command.as_deref(),
+            Some("bitty-terminal.file-manager:open")
+        );
+        assert_eq!(files.height, Some(0.4));
+        assert_eq!(files.centered, Some(false));
+        assert_eq!(files.x, Some(0.1));
+        let manual = entries
+            .iter()
+            .find(|entry| entry.name == "manual")
+            .expect("manual slot");
+        assert!(manual.cmd.is_none() && manual.command.is_none());
+        assert_eq!(manual.width, Some(0.5));
+        assert!(!plan.is_empty(), "plan with scratchpads must not be empty");
+        plan.validate()
+            .expect("plan with valid scratchpads validates");
+        assert!(crate::collect_diagnostics(&plan).is_empty());
+
+        // Per-name per-field merge: a higher layer that only overrides
+        // `width` inherits the lower layer's cmd/args/cwd.
+        use crate::merge::merge_layers;
+        use crate::plan::LayeredPlan;
+        use crate::types::ScratchpadConfig;
+
+        let mut override_plan = ConfigPlan::new();
+        override_plan.scratchpads = Some(vec![ScratchpadConfig {
+            name: String::from("default"),
+            width: Some(0.7),
+            ..Default::default()
+        }]);
+        let merged = merge_layers(vec![
+            LayeredPlan::new(source.clone(), plan.clone()),
+            LayeredPlan::new(
+                ConfigSource::new(LayerKind::Cli, None::<&str>),
+                override_plan,
+            ),
+        ])
+        .expect("merge_layers succeeds");
+        let merged_default = merged
+            .effective
+            .scratchpads
+            .iter()
+            .find(|entry| entry.name == "default")
+            .expect("merged default");
+        assert_eq!(merged_default.width, Some(0.7), "higher layer wins");
+        assert_eq!(
+            merged_default.cmd.as_deref(),
+            Some("btop"),
+            "lower layer cmd is inherited"
+        );
+        assert_eq!(merged_default.args, vec!["--utf-force".to_string()]);
+        assert_eq!(merged.effective.scratchpads.len(), 3, "order preserved");
+
+        // Parsed slots are sorted by name for determinism (Lua table
+        // iteration order is not declaration order).
+        let names: Vec<&str> = merged
+            .effective
+            .scratchpads
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["default", "files", "manual"]);
+        let manual = merged
+            .effective
+            .scratchpads
+            .iter()
+            .find(|entry| entry.name == "manual")
+            .expect("manual slot");
+        assert!(manual.cmd.is_none() && manual.command.is_none());
+
+        // Fail-closed matrix.
+        for bad in [
+            r#"return { scratchpads = { Bad = { cmd = "btop" } } }"#,
+            r#"return { scratchpads = { default = { cmd = "btop", command = "a:b" } } }"#,
+            r#"return { scratchpads = { default = { cmd = "  " } } }"#,
+            r#"return { scratchpads = { default = { cwd = "relative/dir" } } }"#,
+            r#"return { scratchpads = { default = { cmd = "btop", width = 0.0 } } }"#,
+            r#"return { scratchpads = { default = { cmd = "btop", height = 1.5 } } }"#,
+            r#"return { scratchpads = { default = { cmd = "btop", x = 1.2 } } }"#,
+            r#"return { scratchpads = { default = { cmd = "btop", background_opacity = 1.1 } } }"#,
+            r#"return { scratchpads = { default = { command = "not-qualified" } } }"#,
+            r#"return { scratchpads = { default = { bogus = 1 } } }"#,
+        ] {
+            assert!(
+                parse_lua_config(bad, &source).is_err(),
+                "must reject invalid scratchpads config: {bad}"
+            );
+        }
+
+        // Duplicate names on a hand-built plan fail validation.
+        let mut duplicate = ConfigPlan::new();
+        duplicate.scratchpads = Some(vec![
+            ScratchpadConfig {
+                name: String::from("dup"),
+                cmd: Some(String::from("a")),
+                ..Default::default()
+            },
+            ScratchpadConfig {
+                name: String::from("dup"),
+                cmd: Some(String::from("b")),
+                ..Default::default()
+            },
+        ]);
+        assert!(duplicate.validate().is_err());
     }
 }

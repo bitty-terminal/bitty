@@ -102,6 +102,13 @@
 //! `new_panel` (adaptive dwindle axis, new-second, focus follows), plus the
 //! floating-toggle entry (CTX-0962 #1695): `alt+a` `toggle_floating`
 //! (Mod-aware via the `alt` slot; fish reserves `alt+v` so `Mod+v` is out).
+//! Issue #3205 adds the cross-workspace scratchpad pair: `shift+alt+s`
+//! `toggle_scratchpad` (show/hide the `default` slot as a float overlay,
+//! auto-spawning it on first use) and `ctrl+alt+s` `move_to_scratchpad`
+//! (move the focused panel in, or return the shown panel to the tiling);
+//! `alt+s` stays `toggle_split` (issue #3155). Both new chords carry the
+//! `alt` slot so a Super flip rebinds them to `shift+super+s` /
+//! `ctrl+super+s`.
 //! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
 //! `focus:<n>`); those actions stay parseable and user-bindable but are
 //! no longer bound by default — workspace numbers won the Alt slot per
@@ -1030,6 +1037,23 @@ pub enum ChromeAction {
     /// (same byte-identical discipline as [`Self::TogglePalette`]); the user
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
+    /// Toggle a named cross-workspace scratchpad (`toggle_scratchpad[:<name>]`,
+    /// issue #3205).
+    ///
+    /// A shown slot paints as a float overlay over the active workspace and
+    /// survives workspace switches; toggling again parks it without killing
+    /// its PTY/plugin session. The bare spelling addresses the `default`
+    /// slot. Default chord `shift+alt+s` (Mod-aware: `shift+super+s` under a
+    /// Super flip). When the slot is empty and `scratchpads.<name>` declares
+    /// a `cmd`/`command`, the first trigger auto-spawns it.
+    ScratchpadToggle(Option<String>),
+    /// Move the focused panel into a named scratchpad, or return the shown
+    /// scratchpad's panel to the tiling (`move_to_scratchpad[:<name>]`,
+    /// issue #3205). Default chord `ctrl+alt+s`.
+    ScratchpadMove(Option<String>),
+    /// Return a scratchpad's panel to the tiling as a `Tiled` leaf
+    /// (`scratchpad_to_tiled[:<name>]`, issue #3205). Manual bind only.
+    ScratchpadToTiled(Option<String>),
     /// Open a tab for a panel the strip does not project
     /// (`tab_open`, ghostty's `new_tab` spelling as an alias).
     ///
@@ -1349,10 +1373,16 @@ impl ChromeAction {
                 Ok(Self::TabClose)
             }
             "toggle_scratchpad" | "scratchpad_toggle" => {
-                reject_arg(arg, trimmed)?;
-                Ok(Self::InvokeCommand(CommandInvocation::new(
-                    "bitty.workspace:scratchpad-toggle",
-                )))
+                let name = require_scratchpad_name(arg, trimmed)?;
+                Ok(Self::ScratchpadToggle(name))
+            }
+            "move_to_scratchpad" | "scratchpad_move" => {
+                let name = require_scratchpad_name(arg, trimmed)?;
+                Ok(Self::ScratchpadMove(name))
+            }
+            "scratchpad_to_tiled" | "to_tiled_from_scratchpad" => {
+                let name = require_scratchpad_name(arg, trimmed)?;
+                Ok(Self::ScratchpadToTiled(name))
             }
             "command" | "invoke_command" | "run_command" => {
                 // Original-case tail: the head/arg split above lowered the
@@ -1430,6 +1460,18 @@ impl ChromeAction {
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
             Self::TogglePinned => "toggle_pinned".to_string(),
+            Self::ScratchpadToggle(name) => match name {
+                None => "toggle_scratchpad".to_string(),
+                Some(name) => format!("toggle_scratchpad:{name}"),
+            },
+            Self::ScratchpadMove(name) => match name {
+                None => "move_to_scratchpad".to_string(),
+                Some(name) => format!("move_to_scratchpad:{name}"),
+            },
+            Self::ScratchpadToTiled(name) => match name {
+                None => "scratchpad_to_tiled".to_string(),
+                Some(name) => format!("scratchpad_to_tiled:{name}"),
+            },
             Self::NewWindow => "new_window".to_string(),
             Self::TabOpen => "tab_open".to_string(),
             Self::TabNext => "tab_next".to_string(),
@@ -1495,6 +1537,11 @@ impl ChromeAction {
             Self::TogglePalette => "Toggle the command palette overlay.",
             Self::ToggleFloating => "Toggle the focused panel between tiled and floating.",
             Self::TogglePinned => "Toggle the focused panel pinned state.",
+            Self::ScratchpadToggle(_) => "Toggle a named cross-workspace scratchpad overlay.",
+            Self::ScratchpadMove(_) => {
+                "Move the focused panel into a scratchpad, or return it to the tiling."
+            }
+            Self::ScratchpadToTiled(_) => "Return a scratchpad panel to the tiling.",
             Self::NewWindow => "Request a new OS window through the platform.",
             Self::TabOpen => "Open a tab for a panel the strip does not project.",
             Self::TabNext => "Switch to the next tab projection in strip order.",
@@ -1580,6 +1627,9 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::TogglePalette,
         ChromeAction::ToggleFloating,
         ChromeAction::TogglePinned,
+        ChromeAction::ScratchpadToggle(None),
+        ChromeAction::ScratchpadMove(None),
+        ChromeAction::ScratchpadToTiled(None),
         ChromeAction::TabOpen,
         ChromeAction::TabNext,
         ChromeAction::TabClose,
@@ -1705,7 +1755,7 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, tab_open, tab_next, tab_close, toggle_scratchpad, new_window, command:<owner:command>";
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, tab_open, tab_next, tab_close, toggle_scratchpad[:<name>], move_to_scratchpad[:<name>], scratchpad_to_tiled[:<name>], new_window, command:<owner:command>";
 
 /// Plugin id that owns the help/which-key overlay after the Core retirement
 /// (ADR-0014 / issue #2397).
@@ -1794,6 +1844,26 @@ fn require_dir_arg(arg: Option<&str>, raw: &str) -> Result<SplitDir, ConfigError
         _ => Err(ConfigError::validation(
             "keymaps[].action",
             format!("action '{raw}' needs a direction (e.g. '{raw}:left')"),
+        )),
+    }
+}
+
+/// Parse an optional `:<name>` scratchpad slot argument (issue #3205).
+///
+/// Absent means the `default` slot (`None`). A present name must be a valid
+/// slot name (1..=32 lowercase ASCII letters/digits/`-`/`_`); the action
+/// grammar lowercases its argument, so uppercase is refused rather than
+/// silently aliased.
+fn require_scratchpad_name(arg: Option<&str>, raw: &str) -> Result<Option<String>, ConfigError> {
+    match arg {
+        None => Ok(None),
+        Some(name) if crate::types::is_valid_scratchpad_name(name) => Ok(Some(name.to_string())),
+        Some(name) => Err(ConfigError::validation(
+            "keymaps[].action",
+            format!(
+                "action '{raw}' has an invalid scratchpad name {name:?}: expected 1..=32 \
+                 lowercase ASCII letters, digits, '-' or '_'"
+            ),
         )),
     }
 }
@@ -2200,6 +2270,13 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // and vertical (Hyprland `togglesplit` parity; rebinds to `super+s` under
     // `mod_key = "super"`).
     ("alt+s", "toggle_split"),
+    // Issue #3205: `shift+alt+s` toggles the `default` scratchpad as a
+    // cross-workspace float overlay, and `ctrl+alt+s` moves the focused panel
+    // into it (or returns the shown panel to the tiling). `alt+s` stays
+    // `toggle_split` (issue #3155); both new chords carry the Mod slot so a
+    // Super flip rebinds them to `shift+super+s` / `ctrl+super+s`.
+    ("shift+alt+s", "toggle_scratchpad"),
+    ("ctrl+alt+s", "move_to_scratchpad"),
     ("alt+t", "workspace_new"),
     ("alt+-", "workspace_prev"),
     ("alt+=", "workspace_next"),
@@ -2938,6 +3015,65 @@ mod tests {
     }
 
     #[test]
+    fn scratchpad_default_bindings_map_actions_issue_3205() {
+        // Issue #3205: `shift+alt+s` toggles the default scratchpad overlay,
+        // `ctrl+alt+s` moves/restores it, and the pre-existing `alt+s`
+        // `toggle_split` binding (issue #3155) stays intact.
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('s'), false, true, true)),
+            Some(ChromeAction::ScratchpadToggle(None)),
+            "shift+alt+s = toggle_scratchpad"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('s'), true, true, false)),
+            Some(ChromeAction::ScratchpadMove(None)),
+            "ctrl+alt+s = move_to_scratchpad"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('s'), false, true, false)),
+            Some(ChromeAction::ToggleSplit),
+            "alt+s keeps toggle_split"
+        );
+        // Named slots are a user bind: the same pair with an explicit name.
+        let user = EffectiveConfig {
+            keymaps: vec![
+                KeymapEntry {
+                    chord: "shift+alt+l".into(),
+                    action: "toggle_scratchpad:logs".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "ctrl+alt+l".into(),
+                    action: "move_to_scratchpad:logs".into(),
+                    context: "global".into(),
+                },
+                KeymapEntry {
+                    chord: "ctrl+alt+t".into(),
+                    action: "scratchpad_to_tiled:logs".into(),
+                    context: "global".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let named = resolve_keymaps(&user).expect("named binds resolve");
+        assert_eq!(
+            match_keymap(&named, key_ref(KeyName::Char('l'), false, true, true)),
+            Some(ChromeAction::ScratchpadToggle(Some("logs".into())))
+        );
+        assert_eq!(
+            match_keymap(&named, key_ref(KeyName::Char('l'), true, true, false)),
+            Some(ChromeAction::ScratchpadMove(Some("logs".into())))
+        );
+        assert_eq!(
+            match_keymap(&named, key_ref(KeyName::Char('t'), true, true, false)),
+            Some(ChromeAction::ScratchpadToTiled(Some("logs".into())))
+        );
+        // A scratchpad action is no longer manual-bind-only: it ships.
+        assert!(!ChromeAction::ScratchpadToggle(None).is_manual_bind_only());
+    }
+
+    #[test]
     fn mod_key_parse_rejects_fail_closed() {
         // Empty, overlong, unknown, and ctrl/shift (shell-shadow mods) all
         // fail closed on the `mod_key` field.
@@ -3039,6 +3175,17 @@ mod tests {
             match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false)),
             None,
             "alt+a unbound under super mod"
+        );
+        // Issue #3205: both scratchpad chords follow the Mod slot.
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('s'), false, true)),
+            Some(ChromeAction::ScratchpadToggle(None)),
+            "shift+super+s toggles the default scratchpad"
+        );
+        assert_eq!(
+            match_keymap(&maps, key_ref_super(KeyName::Char('s'), true, false)),
+            Some(ChromeAction::ScratchpadMove(None)),
+            "ctrl+super+s moves the focused panel into the scratchpad"
         );
         // ... and the mod-independent fixed chords are untouched.
         assert_eq!(
@@ -4153,8 +4300,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                103,
-                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155) + 3 tab chords (issue #3169)"
+                105,
+                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155) + 3 tab chords (issue #3169) + 2 scratchpad chords (issue #3205)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -5016,14 +5163,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                103,
-                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155 + 3 tab chords, issue #3169)",
+                105,
+                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155 + 3 tab chords, issue #3169 + 2 scratchpad chords, issue #3205)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                103 + entries.len(),
+                105 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );
@@ -5947,12 +6094,32 @@ mod tests {
         for alias in ["toggle_scratchpad", "scratchpad_toggle"] {
             assert_eq!(
                 ChromeAction::parse(alias).expect("parses"),
-                ChromeAction::InvokeCommand(CommandInvocation::new(
-                    "bitty.workspace:scratchpad-toggle"
-                )),
-                "alias {alias} maps to scratchpad-toggle command"
+                ChromeAction::ScratchpadToggle(None),
+                "alias {alias} addresses the default scratchpad slot"
             );
         }
+        // Issue #3205: named slots parse from the `:<name>` suffix; an invalid
+        // name fails closed instead of silently aliasing.
+        assert_eq!(
+            ChromeAction::parse("toggle_scratchpad:logs").expect("parses"),
+            ChromeAction::ScratchpadToggle(Some("logs".to_string()))
+        );
+        assert_eq!(
+            ChromeAction::parse("move_to_scratchpad:build-logs_2").expect("parses"),
+            ChromeAction::ScratchpadMove(Some("build-logs_2".to_string()))
+        );
+        assert_eq!(
+            ChromeAction::parse("scratchpad_to_tiled:notes").expect("parses"),
+            ChromeAction::ScratchpadToTiled(Some("notes".to_string()))
+        );
+        assert_eq!(
+            ChromeAction::parse("move_to_scratchpad").expect("parses"),
+            ChromeAction::ScratchpadMove(None)
+        );
+        assert!(
+            ChromeAction::parse("toggle_scratchpad:Bad Name").is_err(),
+            "invalid scratchpad names are refused"
+        );
 
         // Custom user rebinding via EffectiveConfig keymaps:
         let user_cfg = EffectiveConfig {

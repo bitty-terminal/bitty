@@ -266,6 +266,9 @@ pub const LIVE_FIELDS: &[&str] = &[
     "hints_enabled",
     "keymaps",
     "panel_rules",
+    // Issue #3205: scratchpad definitions are read on the next trigger, so a
+    // reload never has to restart a live slot; the runtime swaps the spec table.
+    "scratchpads",
     // CTX-0963 (#1697): the tiled resize step is read at keypress time from
     // the effective config (no PTY recreation, no layout rebuild), so it
     // reconciles live like the keymaps — unlike `layout.gaps_in/out`, which
@@ -1037,6 +1040,11 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "panel_rules",
         format!("{:?}", old.panel_rules),
         format!("{:?}", new.panel_rules),
+    );
+    push_if_changed(
+        "scratchpads",
+        format!("{:?}", old.scratchpads),
+        format!("{:?}", new.scratchpads),
     );
 
     // CTX-0343: `views` diffs are keyed by canonical selector so an added,

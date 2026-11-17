@@ -36,6 +36,14 @@ pub(crate) const PALETTE_PLUGIN_ID: &str = "bitty-terminal.palette";
 /// closed when the plugin did not register the verb.
 pub(crate) const PALETTE_COMMAND_TOGGLE: &str = "toggle";
 
+/// Scratchpad verb behind the core-owned keymap actions (issue #3205).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScratchpadVerb {
+    Toggle,
+    Move,
+    ToTiled,
+}
+
 /// App-side modifier mirror for keymap matching (CTX-0153).
 ///
 /// `KeyEvent` carries no modifier field (modifiers arrive as separate
@@ -1195,67 +1203,213 @@ impl TerminalApp {
         self.runtime.workspace_prev_in(&occupied)
     }
 
-    /// Toggle the window scratchpad slot for the core-owned keymap command
-    /// (CTX-1241, issue #2091).
+    /// Drives one named scratchpad verb (issue #3205).
     ///
-    /// `command:bitty.workspace:scratchpad-toggle` routes here instead of
-    /// the host-mediated plugin path, so show/hide works with no plugin
-    /// runtime alive. Shows the parked leaf when occupied (the focused
-    /// target is ignored); otherwise hides the focused leaf through the
-    /// `bitty.workspace:scratchpad-toggle` string dispatch
-    /// (`Runtime::scratchpad_toggle`). Validate on the live tree BEFORE
-    /// touching zoom (mirroring `TogglePinned`): a non-tiled focused leaf
-    /// rejects with a warning and zero state change (a floating or
-    /// fullscreen leaf would silently return as tiled, and a scratchpad
-    /// stamp never sits in-tree). For a valid toggle, zoom restores next
-    /// so the mutation lands on the real tree, not the zoom proxy —
-    /// except when the backed-up tree holds a single leaf (CodeRabbit PR
-    /// #1903 discipline): hiding there refuses (it would strand an empty
-    /// live layout), so restoring first would consume the zoom backup
-    /// behind a refused action. Skipping the restore on `Some(1)` keeps a
-    /// refused toggle byte-identical; show never refuses on leaf count,
-    /// and a show landing in the proxy is covered by the stale-backup
-    /// discipline on disengage. No focused pane warns and keeps everything.
-    /// Never a window close (the caller keeps the `false` return).
-    fn apply_scratchpad_toggle(&mut self) {
-        const CMD: &str = bitty_runtime::SCRATCHPAD_CMD_TOGGLE;
-        let hiding = !self.runtime.scratchpad_occupied();
-        let focused = if hiding {
-            let Some(id) = self.runtime.focused_view() else {
-                eprintln!("warning: keymap command:{CMD} has no focused pane — ignoring");
+    /// `toggle_scratchpad[:<name>]` shows/hides/auto-spawns the slot without
+    /// touching the focused panel; `move_to_scratchpad[:<name>]` parks the
+    /// focused panel (or returns the shown one to the tiling); and
+    /// `scratchpad_to_tiled[:<name>]` always returns the slot's panel to the
+    /// tiling. Preconditions are checked before zoom is restored, so a
+    /// refused verb leaves layout, focus, sessions, and the zoom backup
+    /// byte-identical. A PTY spawn failure rolls the freshly created slot
+    /// back; a plugin launch arms adoption and enqueues the command on the
+    /// bounded cold queue (never a VM entry on the input hot path).
+    fn apply_scratchpad_verb(&mut self, label: &str, name: Option<String>, verb: ScratchpadVerb) {
+        let name = name.unwrap_or_else(|| bitty_runtime::DEFAULT_SCRATCHPAD.to_string());
+        let occupied = self.runtime.scratchpad_has_name(&name);
+        let focused = self.runtime.focused_view();
+        if verb == ScratchpadVerb::Move && !occupied {
+            let Some(target) = focused else {
+                eprintln!(
+                    "warning: keymap {label} has no focused pane and slot '{name}' is empty — ignoring"
+                );
                 return;
             };
+            if !self.runtime.layout().leaf_ids().contains(&target) {
+                eprintln!("warning: keymap {label} needs a tiled focused pane — ignoring");
+                return;
+            }
+            if self.runtime.layout().leaf_count() <= 1 {
+                eprintln!("warning: keymap {label} would strand an empty layout — ignoring");
+                return;
+            }
+        }
+        self.restore_zoom();
+        let result = match verb {
+            ScratchpadVerb::Toggle => self.runtime.scratchpad_toggle_named(&name, None),
+            ScratchpadVerb::Move => self.runtime.scratchpad_move_named(&name, focused),
+            ScratchpadVerb::ToTiled => self
+                .runtime
+                .scratchpad_to_tiled_named(&name)
+                .map(bitty_runtime::ScratchpadActivation::RestoredToTiled),
+        };
+        match result {
+            Ok(activation) => self.finish_scratchpad_activation(label, activation),
+            Err(err) => eprintln!("warning: keymap {label} refused ({err}) — ignoring"),
+        }
+    }
+
+    /// Applies the effects a headless runtime cannot: PTY spawn or plugin
+    /// dispatch (issue #3205).
+    fn finish_scratchpad_activation(
+        &mut self,
+        label: &str,
+        activation: bitty_runtime::ScratchpadActivation,
+    ) {
+        use bitty_runtime::ScratchpadActivation as Act;
+        match activation {
+            Act::Shown(id) => eprintln!("bitty: keymap {label} -> {id:?} shown as float overlay"),
+            Act::Hidden(id) => eprintln!("bitty: keymap {label} -> {id:?} parked"),
+            Act::RestoredToTiled(id) => {
+                eprintln!("bitty: keymap {label} -> {id:?} restored to tiled")
+            }
+            Act::Spawn { name, view, spawn } => {
+                self.spawn_scratchpad_pty(label, &name, view, spawn)
+            }
+            Act::LaunchPlugin { name, command } => {
+                // Enqueue first, then arm adoption only when the bounded queue
+                // accepted the action (an overflow drop must not leave a
+                // pending slot that a later, unrelated panel would adopt).
+                let action = bitty_config::ChromeAction::InvokeCommand(
+                    bitty_config::CommandInvocation::new(command.clone()),
+                );
+                if self.enqueue_input_command(action) {
+                    // The latch carries the launched command, so the dispatch
+                    // that the queue promised can clear it on a refusal
+                    // instead of adopting the next unrelated panel.
+                    self.pending_plugin_scratchpad =
+                        Some(crate::terminal_app::PendingPluginScratchpad {
+                            slot: name.clone(),
+                            command: command.clone(),
+                        });
+                    eprintln!("bitty: keymap {label} -> slot '{name}' launching {command}");
+                } else {
+                    eprintln!(
+                        "warning: keymap {label} dropped the launch of {command} — slot '{name}' stays empty"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Clears the armed scratchpad adoption latch when `qualified` is the
+    /// command it was waiting for (issue #3205 review).
+    ///
+    /// `pending_plugin_scratchpad` is consumed by the next panel
+    /// materialization, but a refused dispatch produces no panel: leaving it
+    /// armed would adopt the next *unrelated* plugin panel into the slot. The
+    /// latch travels with the qualified command for exactly this comparison.
+    fn clear_pending_scratchpad_launch(&mut self, qualified: &str) {
+        let armed = self
+            .pending_plugin_scratchpad
+            .as_ref()
+            .is_some_and(|pending| pending.command == qualified);
+        if !armed {
+            return;
+        }
+        if let Some(pending) = self.pending_plugin_scratchpad.take() {
+            let slot = pending.slot;
+            eprintln!(
+                "bitty: plugin launch for scratchpad '{slot}' was refused — the slot stays empty"
+            );
+        }
+    }
+
+    /// Spawns the PTY of a freshly created scratchpad slot, rolling the slot
+    /// back when the spawn is refused (issue #3205).
+    fn spawn_scratchpad_pty(
+        &mut self,
+        label: &str,
+        name: &str,
+        view: ViewId,
+        spawn: bitty_runtime::ScratchpadSpawn,
+    ) {
+        let bitty_runtime::ScratchpadSpawn::Pty { cmd, args, cwd } = spawn else {
+            // The runtime only returns `Spawn` for PTY specs.
+            self.runtime.scratchpad_discard(name);
+            return;
+        };
+        let (cols, rows) = self.runtime.presented_frame_cells(view).unwrap_or((80, 24));
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let cwd_path = cwd.as_deref().map(std::path::Path::new);
+        match self
+            .runtime
+            .spawn_shell_for_view_in(view, &cmd, &argv, cols, rows, cwd_path)
+        {
+            Ok(()) => eprintln!(
+                "bitty: keymap {label} -> slot '{name}' spawned {cmd} in {view:?} pid={:?}",
+                self.runtime.pane_pid(&view)
+            ),
+            Err(err) => {
+                // No empty floating ghost: the slot rolls back with its leaf.
+                self.runtime.scratchpad_discard(name);
+                eprintln!(
+                    "warning: keymap {label} spawn failed ({err}) — slot '{name}' rolled back"
+                );
+            }
+        }
+    }
+
+    /// Toggle the window scratchpad slot for the legacy
+    /// `command:bitty.workspace:scratchpad-toggle` path (CTX-1241, #2091;
+    /// issue #3205 keeps the command reachable with no plugin runtime).
+    ///
+    /// Shows the parked slot when occupied; otherwise parks the focused tiled
+    /// leaf. The keymap chord now uses [`Self::apply_scratchpad_verb`] (show/
+    /// hide only), so this target-taking shape stays a compatibility surface.
+    fn apply_scratchpad_toggle(&mut self) {
+        // A shown/hidden slot only flips visibility; the focused view's mode is
+        // irrelevant (the slot's panel lives outside the layout).
+        if self.runtime.scratchpad_occupied() {
+            self.restore_zoom();
+            match self
+                .runtime
+                .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, None)
+            {
+                Ok(activation) => {
+                    self.finish_scratchpad_activation("scratchpad-toggle", activation)
+                }
+                Err(err) => {
+                    eprintln!("warning: keymap scratchpad-toggle refused ({err}) — ignoring")
+                }
+            }
+            return;
+        }
+        // Empty slot: the legacy command parks the focused tiled leaf. Do not
+        // consume a single-leaf zoom backup behind a refusal (CodeRabbit PR
+        // #1903 discipline).
+        if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+            self.restore_zoom();
+        }
+        let focused = self.runtime.focused_view();
+        if let Some(id) = focused {
             let current = match self.runtime.layout().find_leaf(id) {
                 Some(leaf) => leaf.presentation(),
                 None => {
-                    eprintln!(
-                        "warning: keymap command:{CMD} found no focused pane {id:?} — ignoring"
-                    );
+                    eprintln!("warning: keymap scratchpad-toggle needs a tiled pane — ignoring");
                     return;
                 }
             };
             if !matches!(
                 current,
-                PresentationMode::Tiled | PresentationMode::Scratchpad
+                PresentationMode::Tiled | PresentationMode::Floating | PresentationMode::Scratchpad
             ) {
                 eprintln!(
-                    "warning: keymap command:{CMD} needs a tiled leaf, found {current} — ignoring"
+                    "warning: keymap scratchpad-toggle needs a tiled leaf, found {current} — ignoring"
                 );
                 return;
             }
-            Some(id)
-        } else {
-            self.runtime.focused_view()
-        };
-        if !hiding || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
-            self.restore_zoom();
         }
-        match self.runtime.scratchpad_toggle(focused) {
-            Ok(None) => eprintln!("bitty: keymap command:{CMD} -> {focused:?} parked"),
-            Ok(Some(restored)) => {
-                eprintln!("bitty: keymap command:{CMD} -> {restored:?} restored")
-            }
-            Err(err) => eprintln!("warning: keymap command:{CMD} refused ({err}) — ignoring"),
+        if self.runtime.layout().leaf_count() <= 1 {
+            eprintln!("warning: keymap scratchpad-toggle would strand an empty layout — ignoring");
+            return;
+        }
+        match self
+            .runtime
+            .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, focused)
+        {
+            Ok(activation) => self.finish_scratchpad_activation("scratchpad-toggle", activation),
+            Err(err) => eprintln!("warning: keymap scratchpad-toggle refused ({err}) — ignoring"),
         }
     }
 
@@ -1302,18 +1456,58 @@ impl TerminalApp {
             eprintln!("warning: plugin panel materialize refused: {err}");
             return;
         }
+        // Issue #3205: a scratchpad-triggered plugin command adopts its panel
+        // into that slot instead of splitting the focused pane. The pending
+        // latch is consumed either way, so it can never leak into an unrelated
+        // later panel; an occupied/refused slot falls back to the normal
+        // placement path below. A refused launch never reaches here armed: the
+        // dispatch clears the latch (see `clear_pending_scratchpad_launch`).
+        let adopt_slot = self
+            .pending_plugin_scratchpad
+            .take()
+            .filter(|pending| !self.runtime.scratchpad_has_name(&pending.slot));
         let mount_gen = scene_host
             .borrow()
             .registry()
             .controller_generation(panel_id)
             .unwrap_or(generation);
-        if self.runtime.layout().leaf_count() == 0 {
+        if let Some(pending) = adopt_slot.as_ref() {
+            let name = pending.slot.as_str();
             if let Err(err) = scene_host
                 .borrow_mut()
                 .mount_panel(panel_id, mount_gen, new_id)
             {
                 eprintln!("warning: plugin panel mount failed: {err}");
                 return;
+            }
+            match self
+                .runtime
+                .scratchpad_adopt(name, View::new(new_id, 80, 24))
+            {
+                Ok(id) => {
+                    eprintln!(
+                        "bitty: plugin panel {panel_id:?} adopted into scratchpad '{name}' as {id:?}"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: plugin panel scratchpad adoption refused ({err}) — placing normally"
+                    );
+                    // The panel is mounted; fall through to normal placement
+                    // without a second mount.
+                }
+            }
+        }
+        if self.runtime.layout().leaf_count() == 0 {
+            if adopt_slot.is_none() {
+                if let Err(err) = scene_host
+                    .borrow_mut()
+                    .mount_panel(panel_id, mount_gen, new_id)
+                {
+                    eprintln!("warning: plugin panel mount failed: {err}");
+                    return;
+                }
             }
             let layout = LayoutNode::leaf(View::new(new_id, 80, 24));
             self.runtime.set_layout(layout);
@@ -1337,12 +1531,14 @@ impl TerminalApp {
             eprintln!("warning: plugin panel split found no target pane — ignoring");
             return;
         }
-        if let Err(err) = scene_host
-            .borrow_mut()
-            .mount_panel(panel_id, mount_gen, new_id)
-        {
-            eprintln!("warning: plugin panel mount failed: {err}");
-            return;
+        if adopt_slot.is_none() {
+            if let Err(err) = scene_host
+                .borrow_mut()
+                .mount_panel(panel_id, mount_gen, new_id)
+            {
+                eprintln!("warning: plugin panel mount failed: {err}");
+                return;
+            }
         }
         self.runtime.set_layout(layout);
         self.runtime
@@ -1862,6 +2058,9 @@ impl TerminalApp {
                 let args = match Self::command_args(invocation.args_json()) {
                     Ok(args) => args,
                     Err(diagnostic) => {
+                        // Issue #3205: a refused launch must not stay armed for
+                        // the next unrelated plugin panel.
+                        self.clear_pending_scratchpad_launch(qualified);
                         eprintln!(
                             "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
                         );
@@ -1875,9 +2074,15 @@ impl TerminalApp {
                         }
                         eprintln!("bitty: keymap command:{qualified} -> invoked");
                     }
-                    Err(diagnostic) => eprintln!(
-                        "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
-                    ),
+                    Err(diagnostic) => {
+                        // Issue #3205: the scratchpad launch that queued this
+                        // command produced no panel, so drop its adoption
+                        // latch instead of adopting an unrelated panel later.
+                        self.clear_pending_scratchpad_launch(qualified);
+                        eprintln!(
+                            "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
+                        );
+                    }
                 }
             }
             A::NewSplit(dir) => {
@@ -2726,6 +2931,18 @@ impl TerminalApp {
                         eprintln!("warning: keymap toggle_pinned refused ({err}) — ignoring")
                     }
                 }
+            }
+            // Issue #3205: named scratchpad verbs. Each routes through the
+            // runtime's validated store transition; the app only performs the
+            // PTY/plugin side effects the headless runtime cannot.
+            A::ScratchpadToggle(name) => {
+                self.apply_scratchpad_verb("toggle_scratchpad", name, ScratchpadVerb::Toggle)
+            }
+            A::ScratchpadMove(name) => {
+                self.apply_scratchpad_verb("move_to_scratchpad", name, ScratchpadVerb::Move)
+            }
+            A::ScratchpadToTiled(name) => {
+                self.apply_scratchpad_verb("scratchpad_to_tiled", name, ScratchpadVerb::ToTiled)
             }
             A::IncreaseFontSize => {
                 // CTX-0263 per-window font zoom: mutates only this window's
@@ -6289,12 +6506,12 @@ mod tests {
 
     #[test]
     fn chrome_scratchpad_command_toggle_roundtrips_without_plugin_runtime() {
-        // CTX-1241 (issue #2091, verify1 A4): the keymap spelling
-        // `command:bitty.workspace:scratchpad-toggle` must reach the core
-        // slot with no plugin runtime alive. Parked via the chord, the
-        // focused leaf leaves the tree; toggling again restores it beside
-        // its anchor with layout order and focus preserved. Neither
-        // toggle is a window close.
+        // CTX-1241 (issue #2091, verify1 A4) + issue #3205: the keymap
+        // spelling `command:bitty.workspace:scratchpad-toggle` must reach the
+        // core slot with no plugin runtime alive. The legacy command parks the
+        // focused leaf as a shown float overlay; toggling again hides it while
+        // the slot keeps the same view, and `scratchpad_to_tiled` gives it
+        // back to the tiling. No toggle is a window close.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime.set_layout(two_pane_layout());
@@ -6309,12 +6526,25 @@ mod tests {
             app.runtime.scratchpad_occupied(),
             "first toggle parks the focused leaf"
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
-        assert!(!app.apply_chrome_action(toggle), "show is not a close");
         assert!(
-            !app.runtime.scratchpad_occupied(),
-            "second toggle restores the parked leaf"
+            app.runtime
+                .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD),
+            "the parked leaf shows as a float overlay"
         );
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(!app.apply_chrome_action(toggle), "show/hide is not a close");
+        assert!(
+            app.runtime.scratchpad_occupied(),
+            "the hidden slot keeps its panel"
+        );
+        assert!(
+            !app.runtime
+                .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
+        );
+
+        // `scratchpad_to_tiled` is the explicit restore verb.
+        assert!(!app.apply_chrome_action(ChromeAction::ScratchpadToTiled(None)));
+        assert!(!app.runtime.scratchpad_occupied());
         assert_eq!(
             app.runtime.layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)],
@@ -6338,9 +6568,10 @@ mod tests {
 
     #[test]
     fn chrome_scratchpad_command_toggle_fails_closed_without_state_change() {
-        // CTX-1241: hiding the live layout's last leaf or a non-tiled leaf
-        // refuses loudly with layout, slot, and focus untouched (a floating
-        // or fullscreen leaf would silently return as tiled).
+        // CTX-1241 / #3205: refusing the sole-leaf park or a Fullscreen leaf
+        // leaves layout, slot, and focus untouched. `Floating` and an in-tree
+        // `Scratchpad` stamp both park (issue #3205 widened the accepted
+        // source modes for the legacy command).
         use bitty_config::ChromeAction;
         let toggle =
             || ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into());
@@ -6354,7 +6585,7 @@ mod tests {
         assert_eq!(format!("{:?}", app.runtime.layout()), before);
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
 
-        for mode in [PresentationMode::Floating, PresentationMode::Fullscreen] {
+        for mode in [PresentationMode::Floating, PresentationMode::Scratchpad] {
             let mut app = workspace_test_app();
             app.runtime.set_layout(two_pane_layout());
             assert!(app.runtime.set_focus(ViewId::new(1)));
@@ -6362,19 +6593,37 @@ mod tests {
             let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
             assert!(PresentationMode::request_transition(leaf, mode));
             app.runtime.set_layout(seeded);
-            let before = format!("{:?}", app.runtime.layout());
             app.apply_chrome_action(toggle());
             assert!(
-                !app.runtime.scratchpad_occupied(),
-                "refusal on {mode} parks nothing"
+                app.runtime.scratchpad_occupied(),
+                "{mode} leaf parks into the slot"
             );
-            assert_eq!(
-                format!("{:?}", app.runtime.layout()),
-                before,
-                "refusal on {mode} keeps the layout byte-identical"
-            );
-            assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+            assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
         }
+
+        // Fullscreen has its own verb and is refused fail-closed.
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        let mut seeded = app.runtime.layout().clone();
+        let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
+        assert!(PresentationMode::request_transition(
+            leaf,
+            PresentationMode::Fullscreen
+        ));
+        app.runtime.set_layout(seeded);
+        let before = format!("{:?}", app.runtime.layout());
+        app.apply_chrome_action(toggle());
+        assert!(
+            !app.runtime.scratchpad_occupied(),
+            "refusal on fullscreen parks nothing"
+        );
+        assert_eq!(
+            format!("{:?}", app.runtime.layout()),
+            before,
+            "refusal on fullscreen keeps the layout byte-identical"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -6418,6 +6667,69 @@ mod tests {
             "refusal keeps the layout byte-identical"
         );
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    /// Runtime config with one plugin-backed scratchpad slot (`logs`).
+    fn plugin_scratchpad_runtime() -> Runtime {
+        let mut runtime = Runtime::with_defaults().expect("runtime must build");
+        runtime.set_layout(two_pane_layout());
+        assert!(
+            runtime.set_scratchpad_specs(vec![bitty_runtime::ScratchpadSpec {
+                name: String::from("logs"),
+                spawn: Some(bitty_runtime::ScratchpadSpawn::Plugin {
+                    command: String::from("bitty-featured.devtools:plugins"),
+                }),
+                geometry: bitty_ui::ScratchpadGeometry::default(),
+            }]),
+            "the plugin scratchpad spec validates"
+        );
+        runtime
+    }
+
+    #[test]
+    fn refused_scratchpad_launch_does_not_arm_adoption() {
+        // Issue #3205 review: the adoption latch is only consumed by the next
+        // panel materialization, so a refused launch used to leave it armed
+        // and the next *unrelated* plugin panel landed in the scratchpad slot.
+        // The latch now travels with the command the launch queued and is
+        // dropped when that dispatch is refused.
+        use bitty_config::ChromeAction;
+        let mut app = TerminalApp::with_theme(
+            plugin_scratchpad_runtime(),
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+                .expect("defaults"),
+            SpawnSpec::default(),
+        );
+        assert!(
+            !app.apply_input_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from(
+                "logs"
+            )))),
+            "arming the launch is not a close request"
+        );
+        assert_eq!(
+            app.pending_input_commands.len(),
+            1,
+            "the launch was queued on the cold path"
+        );
+        let armed = app
+            .pending_plugin_scratchpad
+            .as_ref()
+            .expect("an accepted launch arms the adoption latch");
+        assert_eq!(armed.slot, "logs");
+        assert_eq!(armed.command, "bitty-featured.devtools:plugins");
+        assert!(app.runtime.scratchpad_names().is_empty(), "no slot yet");
+
+        // No plugin runtime is alive, so the dispatch is refused. Adoption
+        // must not survive it: nothing will ever fill this slot.
+        app.pump_cold_commands();
+        assert_eq!(app.pending_input_commands.len(), 0, "the queue drained");
+        assert!(
+            app.pending_plugin_scratchpad.is_none(),
+            "a refused launch must not adopt the next unrelated plugin panel"
+        );
+        assert!(app.runtime.scratchpad_names().is_empty());
     }
 
     #[test]
@@ -11741,8 +12053,10 @@ claims = []
         use bitty_config::ChromeAction;
         let toggle = ChromeAction::parse("toggle_scratchpad").expect("alias parses");
 
-        // 1. A leaf stamped `PresentationMode::Scratchpad` by a spawn rule can
-        // be hidden by `toggle_scratchpad`.
+        // 1. The chord shows/hides only; it never steals the focused panel. A
+        // configured-free empty default slot refuses with layout and focus
+        // untouched (issue #3205 changed the chord from the legacy
+        // hide-the-focused-leaf shape).
         let mut app = workspace_test_app();
         let mut seeded = two_pane_layout();
         seeded
@@ -11753,41 +12067,62 @@ claims = []
         assert!(app.runtime.set_focus(ViewId::new(1)));
         app.apply_chrome_action(toggle.clone());
         assert!(
-            app.runtime.scratchpad_occupied(),
-            "rule-stamped Scratchpad leaf must hide into the scratchpad slot"
+            !app.runtime.scratchpad_occupied(),
+            "an empty unconfigured slot refuses the chord"
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
-
-        // 2. Showing into a zoomed 1-leaf workspace restores zoom first so the
-        // restored scratchpad leaf does not get trapped in the zoom proxy.
-        assert!(app.runtime.set_focus(ViewId::new(2)));
-        app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
-        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
-        app.apply_chrome_action(toggle.clone());
-        assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
-            "showing scratchpad into a zoomed 1-leaf workspace must restore zoom first"
-        );
-        assert!(!app.runtime.scratchpad_occupied());
         assert_eq!(
             app.runtime.layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)]
         );
 
-        // 3. Showing when `focused_view()` is `None` (e.g., emptied base) still
-        // restores the parked scratchpad leaf.
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        // 2. The legacy command still parks a rule-stamped Scratchpad leaf;
+        // it shows as an overlay and keeps the primary ownership rule.
+        app.apply_chrome_action(ChromeAction::InvokeCommand(
+            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
+        ));
+        assert!(
+            app.runtime.scratchpad_occupied(),
+            "rule-stamped Scratchpad leaf must park into the scratchpad slot"
+        );
+        assert!(
+            app.runtime
+                .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
+        );
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+
+        // 3. Hiding a shown scratchpad restores zoom first so the hide lands on
+        // the real tree, not the zoom proxy.
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
         app.apply_chrome_action(toggle.clone());
+        assert!(
+            !app.chrome.zoom.is_zoomed(&app.runtime),
+            "hiding the shown scratchpad must restore zoom first"
+        );
         assert!(app.runtime.scratchpad_occupied());
+        assert!(
+            !app.runtime
+                .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
+        );
+
+        // 4. Showing with `focused_view()` == None (e.g. an emptied base) still
+        // works: the window-global slot does not need a focused tiled leaf.
         let mut empty = app.runtime.layout().clone();
         empty.remove_leaf(ViewId::new(2));
         app.runtime.set_layout_closing(empty, ViewId::new(2));
         assert_eq!(app.runtime.focused_view(), None);
         app.apply_chrome_action(toggle);
-        assert!(!app.runtime.scratchpad_occupied());
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(1)]);
+        assert!(
+            app.runtime
+                .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
+        );
         assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(
+            app.runtime.layout().leaf_count(),
+            0,
+            "no tiled leaf is minted"
+        );
     }
 
     #[test]
@@ -11816,6 +12151,76 @@ claims = []
             2,
             "new_split while a pinned panel is focused must split the tiled base"
         );
+    }
+
+    #[test]
+    fn chrome_scratchpad_named_verbs_park_hide_and_restore_3205() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+
+        // An empty, unconfigured default slot refuses the toggle without
+        // stealing the focused pane or touching the layout.
+        app.apply_chrome_action(ChromeAction::ScratchpadToggle(None));
+        assert!(!app.runtime.scratchpad_occupied());
+        assert_eq!(app.runtime.layout().leaf_ids().len(), 2);
+
+        // `move_to_scratchpad:<name>` parks the focused pane into the slot and
+        // shows it as a cross-workspace float overlay.
+        app.apply_chrome_action(ChromeAction::ScratchpadMove(Some(String::from("logs"))));
+        assert!(app.runtime.scratchpad_visible("logs"));
+        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(
+            !app.runtime.layout().leaf_ids().contains(&ViewId::new(1)),
+            "a shown scratchpad never re-enters the layout"
+        );
+
+        // The toggle hides it (parks the same id) without restoring to tiled.
+        app.apply_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from("logs"))));
+        assert!(!app.runtime.scratchpad_visible("logs"));
+        assert!(app.runtime.scratchpad_has_name("logs"));
+        assert!(!app.runtime.layout().leaf_ids().contains(&ViewId::new(1)));
+
+        // `scratchpad_to_tiled` returns the same panel to the tiling.
+        app.apply_chrome_action(ChromeAction::ScratchpadToTiled(Some(String::from("logs"))));
+        assert!(!app.runtime.scratchpad_has_name("logs"));
+        assert_eq!(
+            app.runtime.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2)],
+            "to_tiled docks before the recorded anchor"
+        );
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+    }
+
+    #[test]
+    fn chrome_scratchpad_first_trigger_spawns_and_rolls_back_on_failure_3205() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(
+            app.runtime
+                .set_scratchpad_specs(vec![bitty_runtime::ScratchpadSpec {
+                    name: String::from("broken"),
+                    spawn: Some(bitty_runtime::ScratchpadSpawn::Pty {
+                        cmd: String::from("bitty-3205-definitely-not-a-program"),
+                        args: Vec::new(),
+                        cwd: None,
+                    }),
+                    geometry: bitty_ui::ScratchpadGeometry::default(),
+                },])
+        );
+
+        // The first trigger reserves the slot leaf and asks the app to spawn;
+        // the spawn fails, so the slot rolls back instead of leaving an empty
+        // floating ghost (layout/focus untouched).
+        let before = app.runtime.layout().clone();
+        app.apply_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from("broken"))));
+        assert!(!app.runtime.scratchpad_has_name("broken"));
+        assert_eq!(app.runtime.layout(), &before);
+        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]

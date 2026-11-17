@@ -4544,17 +4544,18 @@ impl Runtime {
                 let mut float_layer = (frame.tier == Some(OverlayTier::Float))
                     .then(bitty_render::grid::FloatDrawLayer::default);
                 let effective_float_opacity = self
-                    .config
-                    .floating
-                    .background_opacity
+                    .scratchpad_background_opacity(view_id)
                     .unwrap_or_else(|| {
-                        bitty_render::window::sanitize_window_background_opacity(
-                            self.config.window_background_opacity,
-                        )
+                        self.config.floating.background_opacity.unwrap_or_else(|| {
+                            bitty_render::window::sanitize_window_background_opacity(
+                                self.config.window_background_opacity,
+                            )
+                        })
                     })
                     .clamp(0.0, 1.0);
                 let custom_float_bg = self.config.floating.background.is_some()
                     || self.config.floating.background_opacity.is_some()
+                    || self.scratchpad_background_opacity(view_id).is_some()
                     || (effective_float_opacity - 1.0).abs() > f32::EPSILON;
                 let mut default_cell_bg = self.renderer.theme_palette().background;
                 if fade < 1.0 {

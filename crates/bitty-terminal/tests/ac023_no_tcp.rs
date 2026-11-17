@@ -1,10 +1,13 @@
-//! `P0-AC-023` no-TCP cell (bitty#2921, CTX-1865).
+//! No-TCP cell (bitty#2921, CTX-1865).
 //!
 //! The security corpus records that no external no-TCP scan exists: the claim
 //! that the daemon/instance holds no listening TCP socket and no outbound TCP
 //! connection during a full session lifecycle has never been observed from
 //! outside the process. This target is that observation on the live
-//! terminal-instance surface.
+//! terminal-instance surface. It does not claim a specific `AC-0xx` id: the
+//! daemon corpus maps `P0-AC-023` to child scope limitation
+//! (`crates/bitty-daemon/README.md:719`), and which criterion this rolls up
+//! into is the security reviewer's call.
 //!
 //! The scan runs three times over one instance's lifetime, plus an abort arm:
 //!
@@ -46,14 +49,14 @@ fn live_instance_holds_no_tcp_sockets_across_its_lifecycle() {
     // A zero result only means something if the same scan can see a socket.
     let control = tcp_absence::self_check();
     println!(
-        "AC023 control: the scan attributed {control} LISTEN row(s) to this test process's \
+        "NOTCP control: the scan attributed {control} LISTEN row(s) to this test process's \
          own loopback listener, so a zero instance result is not vacuous"
     );
 
     // ── startup ──────────────────────────────────────────────────────────
     let mut instance = TestInstance::spawn_test_mode("ac023-notcp", true);
     println!(
-        "AC023 instance pid={} socket={}",
+        "NOTCP instance pid={} socket={}",
         instance.pid(),
         instance.socket()
     );
@@ -107,7 +110,7 @@ fn live_instance_holds_no_tcp_sockets_across_its_lifecycle() {
         "no process may outlive an orderly stop, found {pids_after_stop:?}"
     );
     tcp_absence::scan_pids(&pids_after_stop).assert_no_tcp("after-stop");
-    println!("AC023 after-stop: the process group is empty, so no TCP socket can outlive the stop");
+    println!("NOTCP after-stop: the process group is empty, so no TCP socket can outlive the stop");
 
     // ── abort ────────────────────────────────────────────────────────────
     // An abrupt stop must not leave a socket behind either. The fixture
@@ -132,7 +135,7 @@ fn live_instance_holds_no_tcp_sockets_across_its_lifecycle() {
     );
     tcp_absence::scan_pids(&pids_after_abort).assert_no_tcp("after-abort");
     println!(
-        "AC023 after-abort: pid {aborted_pid} was killed, its group is empty, and zero TCP rows were \
+        "NOTCP after-abort: pid {aborted_pid} was killed, its group is empty, and zero TCP rows were \
          ever attributed to it"
     );
 }

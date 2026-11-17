@@ -1,4 +1,4 @@
-//! `P0-AC-024` plugin denial cells (bitty#2921, CTX-1865).
+//! Plugin denial cells (bitty#2921, CTX-1865).
 //!
 //! Two cells the security corpus records as unproven, at the layer that owns
 //! the refusal:
@@ -28,8 +28,11 @@
 //!
 //! # What this target does not claim
 //!
-//! It is not the AC-024 acceptance record: the criterion also wants the live
-//! daemon campaign, which stays open on bitty#2921. Run it with
+//! It is not an acceptance record and it does not claim an `AC-0xx` id: the
+//! daemon corpus maps `P0-AC-024` to the MCP/Agent read-only default
+//! (`crates/bitty-daemon/tests/agent_readonly.rs:1`), so the criterion these
+//! cells roll up into is the security reviewer's call. The live daemon campaign
+//! also stays open on bitty#2921. Run it with
 //! `cargo test -p bitty-plugin-host --test denial_evidence --offline -- --nocapture`.
 
 use bitty_plugin_host::{
@@ -85,8 +88,8 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
         chain.contains("host-ceiling") || chain.contains("user-policy"),
         "the refusal must name the layer that withheld it: {chain}"
     );
-    println!("AC024 network gain refused: {}", denial.kind);
-    println!("AC024 reason chain:\n{chain}");
+    println!("DENY network gain refused: {}", denial.kind);
+    println!("DENY reason chain:\n{chain}");
 
     // The dedicated `NetworkConnect` kind refuses the same request, so the
     // denial is not an artefact of the request kind chosen above.
@@ -94,7 +97,7 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
         .expect_err("the network kind must refuse a destination no layer grants");
     assert_eq!(denial.kind, DenialKind::ExceedsPolicy);
     println!(
-        "AC024 network.connect kind refused: {} ({})",
+        "DENY network.connect kind refused: {} ({})",
         denial.kind, denial.request_kind
     );
 
@@ -118,7 +121,7 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
         effective.caps
     );
     println!(
-        "AC024 control: fully granted destination authorizes {} capabilities",
+        "DENY control: fully granted destination authorizes {} capabilities",
         effective.caps.len()
     );
 
@@ -136,7 +139,7 @@ fn plugin_cannot_gain_network_capability_through_the_effective_set() {
         .expect_err("silent layers never confer a destination");
     assert_eq!(denial.kind, DenialKind::ExceedsPolicy);
     println!(
-        "AC024 denied by default across silent layers: {}",
+        "DENY denied by default across silent layers: {}",
         denial.kind
     );
 }
@@ -176,7 +179,7 @@ fn plugin_fs_request_cannot_escape_its_granted_roots() {
                     ),
                     "{label} ({request}) must deny as hostile/invalid, got {kind:?}"
                 );
-                println!("AC024 fs escape {request:?} denied: {}", kind.as_str());
+                println!("DENY fs escape {request:?} denied: {}", kind.as_str());
             }
             // Consent must never be offered for an escape: consent names a
             // concrete sensitive path the user picks, never a traversal.
@@ -220,5 +223,5 @@ fn plugin_fs_request_cannot_escape_its_granted_roots() {
         "a sibling prefix is an out-of-scope deny: {:?}",
         sibling.decision
     );
-    println!("AC024 fs control: in-scope allows, sibling prefix denied OutsideScope");
+    println!("DENY fs control: in-scope allows, sibling prefix denied OutsideScope");
 }

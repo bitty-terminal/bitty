@@ -1,4 +1,4 @@
-//! `P0-AC-024` plugin network denial (bitty#2921, CTX-1865).
+//! Plugin network denial (bitty#2921, CTX-1865).
 //!
 //! The security corpus records that a plugin attempting `connect()` has no
 //! test proving the refusal, and this target is the Lua half of that cell:
@@ -29,9 +29,13 @@
 //!
 //! # What this target does not claim
 //!
-//! It is not the AC-024 acceptance record: the criterion also wants the
-//! runtime-host denial recorded with its class and the live daemon campaign,
-//! which stay open on bitty#2921. Run it with
+//! It is not an acceptance record, and it does not claim an `AC-0xx` id: the
+//! daemon corpus currently maps `P0-AC-024` to the MCP/Agent read-only default
+//! (`crates/bitty-daemon/tests/agent_readonly.rs:1`) and `P0-AC-023` to child
+//! scope limitation (`crates/bitty-daemon/README.md:719`), and which criterion
+//! the plugin-denial cell rolls up into is the security reviewer's call. The
+//! criterion also wants the runtime-host denial recorded with its class and the
+//! live daemon campaign, which stay open on bitty#2921. Run it with
 //! `cargo test -p bitty-lua --test plugin_network_denial --offline -- --nocapture`.
 
 use std::cell::RefCell;
@@ -161,7 +165,7 @@ fn plugin_vm_exposes_no_socket_or_connect_binding() {
         "#,
     );
     println!(
-        "AC024 plugin VM surface: no socket/connect binding in the stdlib, and no network head on the bitty host module"
+        "DENY plugin VM surface: no socket/connect binding in the stdlib, and no network head on the bitty host module"
     );
 }
 
@@ -190,7 +194,7 @@ fn require_of_a_socket_module_fails_typed() {
                 "#,
             ),
         );
-        println!("AC024 require({module}) refused with a typed RuntimeError naming the module");
+        println!("DENY require({module}) refused with a typed RuntimeError naming the module");
     }
 
     // The production rooted source-only `require`: a module that exists on
@@ -230,6 +234,6 @@ fn require_of_a_socket_module_fails_typed() {
         "#,
     );
     println!(
-        "AC024 rooted source-only require: a loaded module sees connect/socket as nil and a call through the absent binding is a typed RuntimeError"
+        "DENY rooted source-only require: a loaded module sees connect/socket as nil and a call through the absent binding is a typed RuntimeError"
     );
 }

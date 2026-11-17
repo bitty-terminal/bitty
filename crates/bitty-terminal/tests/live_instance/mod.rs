@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use bitty_ipc::frame::{MAX_FRAME_BYTES, encode_frame};
 
-/// External scan of the instance's TCP sockets (`P0-AC-023`/CTX-1865).
+/// External scan of the instance's TCP sockets (bitty#2921, CTX-1865).
 pub(crate) mod tcp_absence;
 
 /// Binary under test (fails to compile if the `[[bin]]` rename regresses).

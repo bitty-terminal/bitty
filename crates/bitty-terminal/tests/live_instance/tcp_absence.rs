@@ -1,4 +1,4 @@
-//! External no-TCP scan for one live instance (`P0-AC-023`, bitty#2921 /
+//! External no-TCP scan for one live instance (bitty#2921 /
 //! CTX-1865).
 //!
 //! The acceptance criterion is an *external* scan: the daemon/instance process
@@ -59,7 +59,7 @@ impl TcpScan {
     /// would show up in [`TcpScan::other`].
     pub(crate) fn assert_no_tcp(&self, phase: &str) {
         println!(
-            "AC023 {phase}: pids={:?} tcp_rows_attributed={} (listen={}, established={}, other={}), rows_total={} via `{}`",
+            "NOTCP {phase}: pids={:?} tcp_rows_attributed={} (listen={}, established={}, other={}), rows_total={} via `{}`",
             self.pids,
             self.listening.len() + self.established.len() + self.other.len(),
             self.listening.len(),
@@ -117,7 +117,7 @@ fn ss_binary() -> PathBuf {
         }
     }
     panic!(
-        "AC023 no-TCP cell cannot run: no `ss` binary in {SS_CANDIDATES:?} or on PATH, so the \
+        "NOTCP no-TCP cell cannot run: no `ss` binary in {SS_CANDIDATES:?} or on PATH, so the \
          external scan the criterion names cannot be performed. Install iproute2 or point \
          {SS_ENV} at it. This cell fails rather than reporting a pass it did not observe."
     );
@@ -133,10 +133,10 @@ pub(crate) fn scan_pids(pids: &[u32]) -> TcpScan {
     let output = Command::new(&ss)
         .args(["-tanp", "-H"])
         .output()
-        .unwrap_or_else(|err| panic!("AC023 cannot run `{command}`: {err}"));
+        .unwrap_or_else(|err| panic!("NOTCP cannot run `{command}`: {err}"));
     assert!(
         output.status.success(),
-        "AC023 `{command}` failed with {}: {}",
+        "NOTCP `{command}` failed with {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
@@ -199,7 +199,7 @@ pub(crate) fn self_check() -> usize {
     let observed = scan.listening.len();
     assert!(
         observed >= 1,
-        "AC023 control failed: `{}` did not attribute the loopback listener held by pid {pid} to \
+        "NOTCP control failed: `{}` did not attribute the loopback listener held by pid {pid} to \
          it, so a zero result for the instance would be vacuous. Scan rows: listen={:?} \
          established={:?} other={:?} (of {} total rows)",
         scan.command,

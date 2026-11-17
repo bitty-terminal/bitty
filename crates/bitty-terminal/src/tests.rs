@@ -10092,6 +10092,8 @@ fn init_preview_baseline_prefers_loaded_config() {
         xdg_config_home: Some(&prof_root_s),
         xdg_data_home: None,
         home: None,
+        appdata: None,
+        localappdata: None,
         stdin_is_tty: true,
         platform_shell: None,
     };
@@ -11504,6 +11506,8 @@ fn init_env<'a>(
         xdg_config_home,
         xdg_data_home: None,
         home,
+        appdata: None,
+        localappdata: None,
         stdin_is_tty,
         platform_shell: None,
     }
@@ -12998,6 +13002,142 @@ fn init_dispatch_interactive_plugins_and_components() {
     );
     assert!(printed.contains("no selected plugin declares"), "{printed}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_dispatch_yes_resolves_windows_appdata_and_localappdata_without_home() {
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+
+    // APPDATA only (XDG_CONFIG_HOME and HOME unset): <APPDATA>/bitty/init.lua
+    // + <APPDATA>/bitty/profiles/default.lua + <APPDATA>/bitty/bitty-plugins.lua.
+    let appdata = init_test_dir("win-appdata");
+    let appdata_s = appdata.display().to_string();
+    let local_store = init_test_dir("win-local-store");
+    let local_store_s = local_store.display().to_string();
+    let mut plugin_args = args.clone();
+    plugin_args.init_plugins = Some("bitty-terminal.shell-integration".to_string());
+    let env = InitEnv {
+        bitty_config: None,
+        bitty_profile: None,
+        shell: None,
+        xdg_config_home: None,
+        xdg_data_home: None,
+        home: None,
+        appdata: Some(&appdata_s),
+        localappdata: Some(&local_store_s),
+        stdin_is_tty: false,
+        platform_shell: None,
+    };
+    assert_eq!(
+        run_init_subcommand_with_io(&plugin_args, &env, &mut input, &mut output),
+        0
+    );
+    let bitty_dir = appdata.join("bitty");
+    assert!(
+        bitty_dir.join("init.lua").exists(),
+        "selector written under %APPDATA%"
+    );
+    assert!(
+        bitty_dir.join("profiles").join("default.lua").exists(),
+        "default profile written under %APPDATA%"
+    );
+    let ledger = bitty_dir.join("bitty-plugins.lua");
+    assert!(ledger.exists(), "plugin ledger written under %APPDATA%");
+    assert!(
+        std::fs::read_to_string(&ledger)
+            .expect("ledger readable")
+            .contains("bitty-terminal.shell-integration")
+    );
+
+    // Preview baseline also resolves under %APPDATA% when XDG/HOME are unset.
+    std::fs::write(
+        bitty_dir.join("profiles").join("winprof.lua"),
+        "return {\n  appearance = { theme = \"tokyo-night\" },\n}\n",
+    )
+    .expect("write winprof");
+    let mut prof_args = Args::new();
+    prof_args.profile = Some("winprof".to_string());
+    let baseline = crate::init::init_preview_baseline(&prof_args, &env);
+    assert_eq!(
+        baseline.appearance.theme.as_deref(),
+        Some("tokyo-night"),
+        "preview baseline loads profile from %APPDATA%"
+    );
+
+    // LOCALAPPDATA fallback when APPDATA, XDG_CONFIG_HOME, and HOME are all unset.
+    let local = init_test_dir("win-localappdata");
+    let local_s = local.display().to_string();
+    let local_env = InitEnv {
+        bitty_config: None,
+        bitty_profile: None,
+        shell: None,
+        xdg_config_home: None,
+        xdg_data_home: None,
+        home: None,
+        appdata: None,
+        localappdata: Some(&local_s),
+        stdin_is_tty: false,
+        platform_shell: None,
+    };
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &local_env, &mut input, &mut output),
+        0
+    );
+    assert!(
+        local.join("bitty").join("init.lua").exists(),
+        "selector written under %LOCALAPPDATA% fallback"
+    );
+    assert!(
+        local
+            .join("bitty")
+            .join("profiles")
+            .join("default.lua")
+            .exists(),
+        "default profile written under %LOCALAPPDATA% fallback"
+    );
+
+    // Plugin inventory reads installed store under %LOCALAPPDATA% when XDG/HOME are unset.
+    let store_pkgs = local.join("bitty").join("plugins");
+    std::fs::create_dir_all(&store_pkgs).expect("store root");
+    bitty_runtime::plugin_runtime::write_index(
+        &store_pkgs,
+        &[init_plugin_record("bitty-terminal.bar", "0.1.0", true)],
+    )
+    .expect("write localappdata index");
+    let inventory = crate::init::init_plugin_inventory_for_env(&local_env);
+    assert!(
+        inventory.warning.is_none(),
+        "valid store produces no warning: {:?}",
+        inventory.warning
+    );
+    assert_eq!(inventory.installed.len(), 1);
+    assert_eq!(inventory.installed[0].id, "bitty-terminal.bar");
+
+    // All config roots unset/blank -> exit 2 and writes nothing.
+    let empty_env = InitEnv {
+        bitty_config: None,
+        bitty_profile: None,
+        shell: None,
+        xdg_config_home: Some(" "),
+        xdg_data_home: None,
+        home: None,
+        appdata: Some(""),
+        localappdata: Some("  "),
+        stdin_is_tty: false,
+        platform_shell: None,
+    };
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &empty_env, &mut input, &mut output),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(&appdata);
+    let _ = std::fs::remove_dir_all(&local_store);
+    let _ = std::fs::remove_dir_all(&local);
 }
 
 #[test]

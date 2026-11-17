@@ -58,7 +58,7 @@ use bitty_runtime::plugin_runtime::{
 
 use crate::config_cli::AppConfig;
 use crate::plugin::{
-    PluginState, init_plugin_state_path, load_state_for_inspect, rows_for_inspect,
+    PluginState, init_plugin_state_path_with_platform_env, load_state_for_inspect, rows_for_inspect,
 };
 
 /// Replacement for values behind a credential-shaped setting key.
@@ -181,19 +181,27 @@ impl RuntimeInspectContext {
             // it would never consult.
             None
         } else {
-            init_plugin_state_path(
+            init_plugin_state_path_with_platform_env(
                 env.config_path.as_deref(),
                 env.bitty_config_env.as_deref(),
                 env.xdg_config_home.as_deref(),
                 env.home.as_deref(),
+                env.appdata.as_deref(),
+                env.localappdata.as_deref(),
             )
             .ok()
         };
-        let data_home =
-            bitty_runtime::data_home_for(env.xdg_data_home.as_deref(), env.home.as_deref());
-        let plugin_store = crate::plugin_runtime::store_root_for(
+        let data_home = bitty_runtime::data_home_with_platform_env(
             env.xdg_data_home.as_deref(),
             env.home.as_deref(),
+            env.localappdata.as_deref(),
+            env.appdata.as_deref(),
+        );
+        let plugin_store = crate::plugin_runtime::store_root_with_platform_env(
+            env.xdg_data_home.as_deref(),
+            env.home.as_deref(),
+            env.localappdata.as_deref(),
+            env.appdata.as_deref(),
         );
         let extension_user_root =
             components_root_for(env.components_dir.as_deref(), data_home.as_deref());
@@ -916,6 +924,26 @@ mod tests {
                 PathBuf::from("/appdata")
                     .join(bitty_config::file::CONFIG_DIR_NAME)
                     .join(bitty_config::file::PROFILES_DIR_NAME)
+            )
+        );
+        assert_eq!(
+            context.plugin_ledger,
+            Some(
+                PathBuf::from("/appdata")
+                    .join(bitty_config::file::CONFIG_DIR_NAME)
+                    .join(crate::plugin::STATE_FILE_NAME)
+            )
+        );
+        assert_eq!(
+            context.plugin_store,
+            Some(PathBuf::from("/localappdata").join("bitty").join("plugins"))
+        );
+        assert_eq!(
+            context.extension_user_root,
+            Some(
+                PathBuf::from("/localappdata")
+                    .join("bitty")
+                    .join("extensions")
             )
         );
 

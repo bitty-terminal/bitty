@@ -2612,6 +2612,10 @@ impl PolicyProvenance {
     }
 }
 
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|trimmed| !trimmed.is_empty())
+}
+
 /// Pure policy-file path for one file name with injected environment values.
 ///
 /// Mirrors the XDG derivation in `bitty-config` (`$XDG_CONFIG_HOME` else
@@ -2623,17 +2627,30 @@ pub fn user_policy_path_with_env(
     xdg_config_home: Option<&str>,
     home: Option<&str>,
 ) -> Option<String> {
-    if let Some(xdg) = xdg_config_home {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            return Some(format!("{trimmed}/bitty/{USER_POLICY_FILE_NAME}"));
-        }
+    user_policy_path_with_platform_env(xdg_config_home, home, None, None)
+}
+
+/// Platform-aware policy-file path with Windows `%APPDATA%` / `%LOCALAPPDATA%`
+/// injected. Precedence matches `bitty-config`:
+/// `$XDG_CONFIG_HOME` > `%APPDATA%` > `$HOME/.config` > `%LOCALAPPDATA%`.
+#[must_use]
+pub fn user_policy_path_with_platform_env(
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+) -> Option<String> {
+    if let Some(xdg) = non_empty_trimmed(xdg_config_home) {
+        return Some(format!("{xdg}/bitty/{USER_POLICY_FILE_NAME}"));
     }
-    if let Some(home) = home {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return Some(format!("{trimmed}/.config/bitty/{USER_POLICY_FILE_NAME}"));
-        }
+    if let Some(roaming) = non_empty_trimmed(appdata) {
+        return Some(format!("{roaming}/bitty/{USER_POLICY_FILE_NAME}"));
+    }
+    if let Some(home) = non_empty_trimmed(home) {
+        return Some(format!("{home}/.config/bitty/{USER_POLICY_FILE_NAME}"));
+    }
+    if let Some(local) = non_empty_trimmed(localappdata) {
+        return Some(format!("{local}/bitty/{USER_POLICY_FILE_NAME}"));
     }
     None
 }
@@ -2842,6 +2859,7 @@ mod policy_tests {
     use super::{
         AgentRequest, CapabilityScope, DenialKind, EffectiveStack, PolicyProvenance, RequestKind,
         authorize, parse_policy, project_policy_path, user_policy_path_with_env,
+        user_policy_path_with_platform_env,
     };
 
     fn stack_with(user_text: &str, project_text: Option<&str>) -> EffectiveStack {
@@ -2977,6 +2995,36 @@ mod policy_tests {
             Some("/home/u/.config/bitty/capabilities.conf".to_string())
         );
         assert_eq!(user_policy_path_with_env(None, None), None);
+        assert_eq!(
+            user_policy_path_with_platform_env(
+                Some(" /xdg "),
+                Some("/home/u"),
+                Some("C:/Roaming"),
+                Some("C:/Local")
+            ),
+            Some("/xdg/bitty/capabilities.conf".to_string())
+        );
+        assert_eq!(
+            user_policy_path_with_platform_env(
+                Some("  "),
+                Some("/home/u"),
+                Some(" C:/Roaming "),
+                Some("C:/Local")
+            ),
+            Some("C:/Roaming/bitty/capabilities.conf".to_string())
+        );
+        assert_eq!(
+            user_policy_path_with_platform_env(None, Some("/home/u"), None, Some("C:/Local")),
+            Some("/home/u/.config/bitty/capabilities.conf".to_string())
+        );
+        assert_eq!(
+            user_policy_path_with_platform_env(None, Some(" "), Some(""), Some(" C:/Local ")),
+            Some("C:/Local/bitty/capabilities.conf".to_string())
+        );
+        assert_eq!(
+            user_policy_path_with_platform_env(None, None, Some("  "), Some("")),
+            None
+        );
         assert_eq!(
             project_policy_path("/repo"),
             "/repo/.bitty/capabilities.conf".to_string()

@@ -86,11 +86,7 @@ impl AppConfigManage {
         let profiles_dir = config_dir.join(bitty_config::file::PROFILES_DIR_NAME);
         let ledger_path = config_dir.join(bitty_config::plugin_ledger::LEDGER_FILE_NAME);
         let wheel_config_dir = config_dir.parent().map(|parent| parent.join("wheel"));
-        let wheel_data_dir = crate::plugin_runtime::data_home_for(
-            std::env::var("XDG_DATA_HOME").ok().as_deref(),
-            std::env::var("HOME").ok().as_deref(),
-        )
-        .map(|base| base.join("wheel"));
+        let wheel_data_dir = crate::plugin_runtime::data_home().map(|base| base.join("wheel"));
         let wheel_env_probe =
             Rc::new(|key: &str| std::env::var_os(key).is_some_and(|val| !val.is_empty()));
         Some(Self {

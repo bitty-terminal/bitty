@@ -1157,40 +1157,78 @@ impl PanelGenerationPort for AppPanelGenerationPort {
     }
 }
 
-/// Resolved XDG plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
+/// Resolved plugin store root (`$XDG_DATA_HOME/bitty/plugins`,
+/// `%LOCALAPPDATA%\bitty\plugins`, `$HOME/.local/share/bitty/plugins`, or
+/// `%APPDATA%\bitty\plugins`).
 ///
 /// `pub(crate)` for the VM-less `bitty list services` catalog (dynapi
 /// observability, bitty#2002), which discovers the same store without
 /// loading any plugin VM.
 pub(crate) fn store_root() -> Option<PathBuf> {
-    store_root_for(
+    store_root_with_platform_env(
         std::env::var("XDG_DATA_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
     )
 }
 
-/// Resolved XDG plugin store root from explicit environment values.
+/// Resolved plugin store root from explicit XDG/HOME values.
 ///
-/// Shared by startup discovery and the `bitty plugin` package-manager CLI so
-/// both resolve the exact same store without reading process environment
-/// inside the CLI (hermetic tests pass the values in).
+/// Test-only shim without Windows environment injection; delegates to
+/// [`store_root_with_platform_env`].
+#[cfg(test)]
 pub(crate) fn store_root_for(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
-    data_home_for(xdg_data_home, home).map(|base| base.join("bitty").join("plugins"))
+    store_root_with_platform_env(xdg_data_home, home, None, None)
+}
+
+/// Platform-aware plugin store root from explicit environment values.
+///
+/// Shared by startup discovery, `bitty init`, and the `bitty plugin`
+/// package-manager CLI so all resolve the exact same store without reading
+/// process environment inside hermetic callers.
+pub(crate) fn store_root_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    data_home_with_platform_env(xdg_data_home, home, localappdata, appdata)
+        .map(|base| base.join("bitty").join("plugins"))
 }
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment values.
 ///
 /// Delegates to [`bitty_runtime::data_home_for`], the single resolver shared
 /// with the native component root (DIR-030).
+///
+/// Test-only shim; production callers use
+/// [`data_home_with_platform_env`] so Windows roots are honoured.
+#[cfg(test)]
 pub(crate) fn data_home_for(xdg_data_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
     bitty_runtime::data_home_for(xdg_data_home, home)
 }
 
-/// `$XDG_DATA_HOME` or `$HOME/.local/share`.
-fn data_home() -> Option<PathBuf> {
-    data_home_for(
+/// Platform-aware data root from explicit environment values.
+///
+/// Delegates to [`bitty_runtime::data_home_with_platform_env`].
+pub(crate) fn data_home_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    bitty_runtime::data_home_with_platform_env(xdg_data_home, home, localappdata, appdata)
+}
+
+/// Live-environment data root (`$XDG_DATA_HOME`, `%LOCALAPPDATA%`, `$HOME`,
+/// `%APPDATA%` precedence).
+pub(crate) fn data_home() -> Option<PathBuf> {
+    data_home_with_platform_env(
         std::env::var("XDG_DATA_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
     )
 }
 
@@ -5753,6 +5791,42 @@ error("activation fails after mounting the terminal slot scene")
         assert_eq!(
             release.capture_sessions, 0,
             "an edge that revoked nothing must record nothing"
+        );
+    }
+
+    #[test]
+    fn store_root_with_platform_env_resolves_windows_roots() {
+        assert_eq!(
+            store_root_with_platform_env(None, None, Some("C:/Local"), None),
+            Some(PathBuf::from("C:/Local").join("bitty").join("plugins"))
+        );
+        assert_eq!(
+            store_root_with_platform_env(None, None, None, Some("C:/Roaming")),
+            Some(PathBuf::from("C:/Roaming").join("bitty").join("plugins"))
+        );
+        assert_eq!(
+            store_root_with_platform_env(
+                Some("/xdg"),
+                Some("/home/u"),
+                Some("C:/Local"),
+                Some("C:/Roaming"),
+            ),
+            Some(PathBuf::from("/xdg").join("bitty").join("plugins"))
+        );
+        assert_eq!(
+            store_root_for(None, Some("/home/u")),
+            Some(
+                PathBuf::from("/home/u")
+                    .join(".local")
+                    .join("share")
+                    .join("bitty")
+                    .join("plugins")
+            )
+        );
+        assert_eq!(data_home_for(None, None), None);
+        assert_eq!(
+            store_root_with_platform_env(None, None, Some(" "), Some("")),
+            None
         );
     }
 }

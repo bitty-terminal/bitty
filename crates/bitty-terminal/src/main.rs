@@ -892,6 +892,8 @@ fn main() {
         let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
         let home = std::env::var("HOME").ok();
+        let appdata = std::env::var("APPDATA").ok();
+        let localappdata = std::env::var("LOCALAPPDATA").ok();
         let cwd = std::env::current_dir()
             .ok()
             .map(|path| path.display().to_string());
@@ -901,6 +903,8 @@ fn main() {
             xdg_config_home: xdg_config_home.as_deref(),
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
+            appdata: appdata.as_deref(),
+            localappdata: localappdata.as_deref(),
             cwd: cwd.as_deref(),
             pre_format: args.plugin_format.as_deref(),
             pre_no_color: args.plugin_no_color,
@@ -931,6 +935,8 @@ fn main() {
         let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
         let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
         let home = std::env::var("HOME").ok();
+        let localappdata = std::env::var("LOCALAPPDATA").ok();
+        let appdata = std::env::var("APPDATA").ok();
         let components_dir = std::env::var("BITTY_COMPONENTS_DIR").ok();
         let system_components_dir = std::env::var("BITTY_SYSTEM_COMPONENTS_DIR").ok();
         let component_state_dir = std::env::var("BITTY_COMPONENT_STATE_DIR").ok();
@@ -938,6 +944,8 @@ fn main() {
         let context = component::ComponentContext {
             xdg_data_home: xdg_data_home.as_deref(),
             home: home.as_deref(),
+            localappdata: localappdata.as_deref(),
+            appdata: appdata.as_deref(),
             components_dir: components_dir.as_deref(),
             system_components_dir: system_components_dir.as_deref(),
             xdg_state_home: xdg_state_home.as_deref(),

@@ -168,15 +168,23 @@ fn plugin_candidates() -> Vec<String> {
     let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
     let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
-    let state_path = crate::plugin::init_plugin_state_path(
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
+    let state_path = crate::plugin::init_plugin_state_path_with_platform_env(
         None,
         bitty_config_env.as_deref(),
         xdg_config_home.as_deref(),
         home.as_deref(),
+        appdata.as_deref(),
+        localappdata.as_deref(),
     )
     .ok();
-    let store_root =
-        crate::plugin_runtime::store_root_for(xdg_data_home.as_deref(), home.as_deref());
+    let store_root = crate::plugin_runtime::store_root_with_platform_env(
+        xdg_data_home.as_deref(),
+        home.as_deref(),
+        localappdata.as_deref(),
+        appdata.as_deref(),
+    );
     plugin_candidates_from(state_path.as_deref(), store_root.as_deref())
 }
 

@@ -160,6 +160,10 @@ pub use wsl::{
 /// definition instead of a mirrored copy that could drift.
 pub use bitty_network_wire::{ErrorKind, Grant, GrantHost, Method, PROTOCOL_VERSION};
 
+fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|trimmed| !trimmed.is_empty())
+}
+
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment
 /// values (empty or whitespace-only values count as unset).
 ///
@@ -171,13 +175,36 @@ pub fn data_home_for(
     xdg_data_home: Option<&str>,
     home: Option<&str>,
 ) -> Option<std::path::PathBuf> {
-    if let Some(xdg) = xdg_data_home {
-        if !xdg.trim().is_empty() {
-            return Some(std::path::PathBuf::from(xdg));
-        }
+    data_home_with_platform_env(xdg_data_home, home, None, None)
+}
+
+/// Platform-aware data root with Windows `%LOCALAPPDATA%` / `%APPDATA%`
+/// injected. Precedence: `$XDG_DATA_HOME` > `%LOCALAPPDATA%` >
+/// `$HOME/.local/share` > `%APPDATA%`.
+///
+/// Every root comes from the caller (no hard-coded host paths); empty or
+/// whitespace-only values are skipped. Returns `None` only when no root
+/// is usable.
+#[must_use]
+pub fn data_home_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if let Some(xdg) = non_empty_trimmed(xdg_data_home) {
+        return Some(std::path::PathBuf::from(xdg));
     }
-    home.filter(|home| !home.trim().is_empty())
-        .map(|home| std::path::PathBuf::from(home).join(".local").join("share"))
+    if let Some(local) = non_empty_trimmed(localappdata) {
+        return Some(std::path::PathBuf::from(local));
+    }
+    if let Some(home) = non_empty_trimmed(home) {
+        return Some(std::path::PathBuf::from(home).join(".local").join("share"));
+    }
+    if let Some(roaming) = non_empty_trimmed(appdata) {
+        return Some(std::path::PathBuf::from(roaming));
+    }
+    None
 }
 
 /// Developer-only override of the component root (tests; not a user
@@ -305,3 +332,49 @@ pub(crate) const COMPONENT_EXIT_RECHECK: Duration = Duration::from_millis(10);
 
 /// Stderr read chunk size for the capture thread.
 pub(crate) const COMPONENT_STDERR_READ_CHUNK: usize = 4 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{data_home_for, data_home_with_platform_env};
+
+    #[test]
+    fn data_home_with_platform_env_respects_precedence_and_trimming() {
+        assert_eq!(
+            data_home_with_platform_env(
+                Some("  /xdg-data  "),
+                Some("/home/u"),
+                Some("C:/Local"),
+                Some("C:/Roaming"),
+            ),
+            Some(PathBuf::from("/xdg-data"))
+        );
+        assert_eq!(
+            data_home_with_platform_env(
+                Some("   "),
+                Some("/home/u"),
+                Some(" C:/Local "),
+                Some("C:/Roaming"),
+            ),
+            Some(PathBuf::from("C:/Local"))
+        );
+        assert_eq!(
+            data_home_with_platform_env(None, Some(" /home/u "), Some(""), Some("C:/Roaming")),
+            Some(PathBuf::from("/home/u/.local/share"))
+        );
+        assert_eq!(
+            data_home_with_platform_env(None, Some("  "), None, Some(" C:/Roaming ")),
+            Some(PathBuf::from("C:/Roaming"))
+        );
+        assert_eq!(
+            data_home_with_platform_env(Some(""), Some("  "), Some(" "), Some("")),
+            None
+        );
+        assert_eq!(
+            data_home_for(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/share"))
+        );
+        assert_eq!(data_home_for(None, None), None);
+    }
+}

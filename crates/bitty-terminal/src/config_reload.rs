@@ -797,11 +797,13 @@ fn enabled_managed_plugins(ledger: Option<&Path>) -> Option<Vec<String>> {
 /// CLI mutation and the launch baseline read one file. `None` (no config root)
 /// leaves bundled ids out of the comparison.
 fn managed_ledger_path(config_path: Option<&str>) -> Option<PathBuf> {
-    crate::plugin::init_plugin_state_path(
+    crate::plugin::init_plugin_state_path_with_platform_env(
         config_path,
         std::env::var("BITTY_CONFIG").ok().as_deref(),
         std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
     )
     .ok()
 }

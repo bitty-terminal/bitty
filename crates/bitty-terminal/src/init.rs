@@ -3238,7 +3238,12 @@ pub(crate) fn init_plugin_inventory(
 /// data root both leave the bundled catalog usable.
 pub(crate) fn init_plugin_inventory_for_env(env: &InitEnv<'_>) -> InitPluginInventory {
     let bundled = bitty_plugin_host::bundled::bundled_ids_sorted();
-    let store = match crate::plugin_runtime::store_root_for(env.xdg_data_home, env.home) {
+    let store = match crate::plugin_runtime::store_root_with_platform_env(
+        env.xdg_data_home,
+        env.home,
+        env.localappdata,
+        env.appdata,
+    ) {
         Some(root) => load_index(&root).map_err(|error| error.to_string()),
         None => Ok(Vec::new()),
     };
@@ -6398,6 +6403,10 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) xdg_data_home: Option<&'a str>,
     /// Stands in for `HOME` (XDG fallback root).
     pub(crate) home: Option<&'a str>,
+    /// Stands in for `APPDATA` (Windows roaming config / fallback data root).
+    pub(crate) appdata: Option<&'a str>,
+    /// Stands in for `LOCALAPPDATA` (Windows local data / fallback config root).
+    pub(crate) localappdata: Option<&'a str>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
     pub(crate) stdin_is_tty: bool,
     /// Stands in for the host platform default-shell probe (CTX-1755).
@@ -6421,7 +6430,7 @@ pub(crate) fn run_init_subcommand(args: &Args) -> i32 {
 }
 
 /// [`run_init_subcommand`] with injected `BITTY_CONFIG`/`SHELL` values; the
-/// remaining environment (XDG root, `BITTY_PROFILE`, TTY-ness) is
+/// remaining environment (XDG/Windows roots, `BITTY_PROFILE`, TTY-ness) is
 /// read live. Tests use [`run_init_subcommand_with_io`] for full hermeticity.
 pub(crate) fn run_init_subcommand_with_env(
     args: &Args,
@@ -6431,6 +6440,8 @@ pub(crate) fn run_init_subcommand_with_env(
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
     let data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
+    let appdata = std::env::var("APPDATA").ok();
+    let localappdata = std::env::var("LOCALAPPDATA").ok();
     let profile = std::env::var("BITTY_PROFILE").ok();
     let env = InitEnv {
         bitty_config: bitty_config_env,
@@ -6439,6 +6450,8 @@ pub(crate) fn run_init_subcommand_with_env(
         xdg_config_home: xdg.as_deref(),
         xdg_data_home: data_home.as_deref(),
         home: home.as_deref(),
+        appdata: appdata.as_deref(),
+        localappdata: localappdata.as_deref(),
         stdin_is_tty: std::io::stdin().is_terminal(),
         platform_shell: None,
     };
@@ -6493,10 +6506,12 @@ pub(crate) fn init_preview_baseline(
     }
     let explicit =
         bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.bitty_config);
-    let probed = bitty_config::file::probe_config_path_with_env(
+    let probed = bitty_config::file::probe_config_path_with_platform_env(
         explicit.as_deref(),
         env.xdg_config_home,
         env.home,
+        env.appdata,
+        env.localappdata,
         &|path| path.exists(),
     );
     // CodeRabbit 1877: preserve the load error instead of discarding it
@@ -6545,8 +6560,8 @@ pub(crate) fn init_preview_baseline(
                 &requested,
                 env.xdg_config_home,
                 env.home,
-                None,
-                None,
+                env.appdata,
+                env.localappdata,
             ),
         };
         match chain {
@@ -6772,15 +6787,19 @@ pub(crate) fn run_init_subcommand_with_io(
     // as the `config` subcommand and startup.
     let explicit =
         bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.bitty_config);
-    let target = match bitty_config::file::probe_config_path_with_env(
+    let target = match bitty_config::file::probe_config_path_with_platform_env(
         explicit.as_deref(),
         env.xdg_config_home,
         env.home,
+        env.appdata,
+        env.localappdata,
         &|path| path.exists(),
     ) {
         Some(probed) => probed.path,
         None => {
-            eprintln!("bitty init: no config root ($XDG_CONFIG_HOME or $HOME unset)");
+            eprintln!(
+                "bitty init: no config root ($XDG_CONFIG_HOME, %APPDATA%, $HOME, or %LOCALAPPDATA% unset)"
+            );
             return 2;
         }
     };
@@ -7196,11 +7215,13 @@ pub(crate) fn run_init_subcommand_with_io(
         // per-plugin consent only on explicit opt-in, component hints
         // only (never silent fetch), shell-init printed (never evaled).
         if !plugin_ids.is_empty() {
-            let state_path = match crate::plugin::init_plugin_state_path(
+            let state_path = match crate::plugin::init_plugin_state_path_with_platform_env(
                 args.config_path.as_deref(),
                 env.bitty_config,
                 env.xdg_config_home,
                 env.home,
+                env.appdata,
+                env.localappdata,
             ) {
                 Ok(path) => Some(path),
                 Err(message) => {

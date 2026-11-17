@@ -357,13 +357,20 @@ fn the_edge_records_the_capture_family_the_generation_edge_revoked() {
     assert_eq!(unreported.total(), 1, "the grant row alone");
 }
 
-/// A report is refused for a generation the container does not bind, and it is
-/// never carried into a later generation's record.
+/// A report is refused for a generation the container does not bind, and the
+/// refusal stores nothing, so no later edge can carry it.
 ///
 /// The report is per container and names one generation, so a late report (after
-/// the release) and a report for another container's generation must fail closed
-/// instead of landing on whatever edge runs next. [`PanelError::StaleHandle`] is
-/// that refusal, counted like every other stale handle.
+/// the release) and a report for another generation must fail closed instead of
+/// landing on whatever edge runs next. [`PanelError::StaleHandle`] is that
+/// refusal, counted like every other stale handle.
+///
+/// "Never carried" is asserted where it can fail. The pending-report read is
+/// empty after the refusal, and that is the only place the ordering shows: the
+/// release record alone cannot, because its fold is keyed by generation and
+/// drops a stale report anonymously. Then the successor's edge runs with no
+/// report of its own and must record `capture_sessions == 0`, so a report that
+/// was stored under the wrong generation cannot surface there either.
 #[test]
 fn a_capture_report_for_another_generation_is_refused_and_never_carried() {
     let mut reg = registry();
@@ -402,10 +409,20 @@ fn a_capture_report_for_another_generation_is_refused_and_never_carried() {
     );
     assert_eq!(reg.error_count("StaleHandle"), 1);
 
-    // The refusal stored nothing, so the successor's edge records no capture
-    // family it never lost.
-    reg.note_capture_release(panel, successor)
-        .expect("the successor's own edge reports its own session");
+    // The refusal stored nothing: no report is pending for this panel at all.
+    // This is the discriminating read. The release record alone cannot show it,
+    // because the fold is keyed by generation and would drop a stale report
+    // anyway — an implementation that stored the report *before* refusing leaves
+    // `Some(first)` here while still recording `0` on the successor's release.
+    assert_eq!(
+        reg.capture_edge_report_generation(panel),
+        None,
+        "a refused report is refused before anything is stored"
+    );
+
+    // The successor's edge then runs with no report of its own (its generation
+    // revoked nothing), and its record counts no capture family: the stale
+    // report is not carried into the generation that replaced it.
     reg.release_generation_scope(panel, successor)
         .expect("successor edge");
     let record = reg
@@ -413,7 +430,12 @@ fn a_capture_report_for_another_generation_is_refused_and_never_carried() {
         .expect("the successor's record replaced the predecessor's");
     assert_eq!(record.generation, successor);
     assert_eq!(
-        record.capture_sessions, 1,
-        "one report, one session: the stale report was not counted on top"
+        record.capture_sessions, 0,
+        "the refused report was never carried into the successor's release"
+    );
+    assert_eq!(
+        reg.capture_edge_report_generation(panel),
+        None,
+        "the release consumed nothing because nothing was pending"
     );
 }

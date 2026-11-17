@@ -3194,6 +3194,26 @@ impl PanelRegistry {
         Ok(())
     }
 
+    /// The generation a pending capture-edge report names for a panel
+    /// (`bitty#2476` AC-3, OQ-084 D.4), or `None` when no report is pending.
+    ///
+    /// Only a report naming the panel's current binding generation is retained:
+    /// [`Self::note_capture_release`] refuses any other generation **before** it
+    /// stores anything, so a refused report can never be folded into a later
+    /// generation's [`GenerationReleaseRecord`]. This read makes that ordering
+    /// observable: the release record alone cannot show it, because the fold is
+    /// keyed by generation and drops a mis-keyed report anonymously.
+    ///
+    /// `Some` names the generation whose edge revoked a capture session and has
+    /// not run its release yet; the release for that generation folds the report
+    /// in and clears it, and the panel's disposal drops it.
+    #[must_use]
+    pub fn capture_edge_report_generation(&self, panel_id: PanelId) -> Option<Generation> {
+        self.capture_edge_reports
+            .get(&panel_id)
+            .map(|report| report.generation)
+    }
+
     /// Runs the unbind release for one controller generation (OQ-084 A.2/B-4).
     ///
     /// The release covers every generation-owned family, in one call:

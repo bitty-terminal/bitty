@@ -235,6 +235,14 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/tests/ci-local.test.sh
 
+      # CTX-1877: the fuzz campaign itself is nightly-only (see
+      # `.github/workflows/fuzz-campaign.yml`), but the driver's evidence
+      # classification must be proven on every PR. The test stubs cargo, so it
+      # needs no nightly toolchain and takes about a second.
+      - name: Check the fuzz campaign driver
+        if: matrix.shard == 1
+        run: bash scripts/tests/fuzz-campaign.test.sh
+
       - name: Check Rust formatting
         if: matrix.shard == 1
         run: cargo fmt --all -- --check

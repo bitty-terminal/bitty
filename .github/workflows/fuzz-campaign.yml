@@ -1,0 +1,380 @@
+name: Fuzz campaign (nightly)
+
+# bitty#3227 (CTX-1877): risk R-001 / acceptance criterion P0-AC-002 asks for a
+# long-running fuzz campaign over the VT parser family with zero crashes, hangs,
+# or memory-safety findings. The cargo-fuzz targets and the retained corpora
+# already existed; before this workflow the only campaign evidence was a
+# hand-run record, so nothing re-executed the acceptance after a parser change.
+#
+# `scripts/fuzz-campaign.sh` is the driver: this workflow and the owner-facing
+# `just fuzz-campaign <secs>` recipe call the same script, so one budget rule,
+# one libFuzzer flag set, and one evidence schema cover both. The workflow owns
+# only runner concerns: the dynamic target matrix, the nightly toolchain, the
+# version-pinned cargo-fuzz install, corpus caching, and artifact publication.
+#
+# Deliberately NOT part of the PR-required check set (branch protection lists
+# only the CI `Quality gates` and platform jobs, and `ci.yml` runs the driver
+# test but never the campaign): a multi-minute campaign on every push would
+# spend the review budget without new signal. The nightly cadence is the
+# regression detector; an hours-long campaign is an owner action through the
+# recipe.
+#
+# Evidence: each matrix job uploads `summary.json`, `summary.md`, per-target
+# logs, the artifacts a run produced, and the corpus it discovered, even when
+# the campaign fails. The `report` job merges the per-target records into one
+# `summary.json` for the whole run — the record a security-corpus entry cites —
+# carrying the per-target and campaign-level provenance, and refusing `clean`
+# unless every expected target reported. Keep the schema stable:
+# `scripts/tests/fuzz-campaign.test.sh` pins it, and that test runs in PR CI.
+
+on:
+  schedule:
+    # 04:47 UTC daily: off the top of the hour and clear of the 03:17 soak.
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Wall-clock budget per fuzz target, in seconds (10..1800)"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  # A campaign is never superseded: cancelling a nightly mid-run would delete
+  # the evidence the run exists to produce (and waste the fuzzing already done).
+  group: fuzz-campaign-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # One target tree per runner, matching the PR jobs' layout.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  targets:
+    name: Enumerate fuzz targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      # Space-separated so the report job can prove every expected target
+      # reported, not just that the survivors are clean.
+      targets: ${{ steps.enumerate.outputs.targets }}
+      matrix: ${{ steps.enumerate.outputs.matrix }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Enumerated from `fuzz/Cargo.toml` instead of a literal list: a new
+      # target must not silently escape the campaign (the soak campaign learned
+      # the same lesson when its third ignored test overflowed a fixed budget).
+      - name: Enumerate fuzz targets
+        id: enumerate
+        run: |
+          set -euo pipefail
+          targets="$(scripts/fuzz-campaign.sh --list-targets)"
+          if [[ -z "$targets" ]]; then
+            echo "::error::no fuzz targets found in fuzz/Cargo.toml"
+            exit 1
+          fi
+          matrix="$(printf '%s\n' "$targets" | jq -R . | jq -sc '{target: .}')"
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "targets=$(printf '%s' "$targets" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
+          echo "fuzz targets: $(printf '%s' "$targets" | paste -sd, -)"
+
+  campaign:
+    name: Fuzz ${{ matrix.target }}
+    needs: targets
+    runs-on: ubuntu-24.04
+    # Budget accounting inside the 60-minute job timeout:
+    #
+    #   1800 s MAX_FUZZ_SECS (dispatch ceiling, build included in its        = 30 min
+    #     hard-kill slack below)
+    #   + 300 s per-target hard-kill slack                                  =  5 min
+    #   + 300 s cap-seed generation (the cap target only)                   =  5 min
+    #   + ~180 s checkout, toolchain, cargo-fuzz install, uploads           =  3 min
+    #
+    # The nightly default is 600 s per target, so the scheduled run sits far
+    # inside this bound; only a deliberate 1800 s dispatch approaches 43 min of
+    # it, which leaves real headroom on a slow runner instead of a timeout.
+    timeout-minutes: 60
+    strategy:
+      # One finding must not erase the other targets' evidence.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    env:
+      # Validity is enforced by the "Clamp campaign budget" step below.
+      BITTY_FUZZ_SECS: ${{ inputs.duration_secs || '600' }}
+      BITTY_FUZZ_EVIDENCE_DIR: ${{ github.workspace }}/fuzz-evidence/${{ matrix.target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The campaign only reads the tree; never leave the job token in the
+          # local git config for later steps.
+          persist-credentials: false
+
+      - name: Clamp campaign budget
+        run: |
+          set -euo pipefail
+          secs="${BITTY_FUZZ_SECS//[!0-9]/}"
+          if [[ -z "$secs" ]]; then secs=600; fi
+          if (( secs < 10 )); then secs=10; fi
+          if (( secs > 1800 )); then secs=1800; fi
+          echo "BITTY_FUZZ_SECS=$secs" >>"$GITHUB_ENV"
+          echo "per-target budget: ${secs}s"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          # cargo-fuzz needs nightly for the sanitizer build. Deliberately not
+          # date-pinned: the fuzz crate tracks the current nightly, and the
+          # `cargo_fuzz`/`toolchain` fields in the evidence record which one ran.
+          toolchain: nightly
+
+      - name: Resolve cargo-fuzz pin
+        id: cargo-fuzz-pin
+        run: echo "version=$(scripts/fuzz-campaign.sh --pinned-cargo-fuzz)" >>"$GITHUB_OUTPUT"
+
+      # The installed binary is tiny and toolchain-independent, so cache it
+      # instead of paying `cargo install` on every run.
+      - name: Restore cargo-fuzz
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ steps.cargo-fuzz-pin.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+          restore-keys: |
+            cargo-fuzz-${{ steps.cargo-fuzz-pin.outputs.version }}-${{ runner.os }}-
+
+      # The pin in the key protects against a wrong version; this probe also
+      # rejects a partial or poisoned entry, which a bare exit-status check
+      # would accept.
+      - name: Install cargo-fuzz (pinned)
+        run: |
+          set -euo pipefail
+          pin="${{ steps.cargo-fuzz-pin.outputs.version }}"
+          version="$(cargo fuzz --version 2>/dev/null || true)"
+          if [[ "$version" == *"cargo-fuzz $pin"* ]]; then
+            echo "cached $version"
+            exit 0
+          fi
+          cargo install --locked --version "$pin" cargo-fuzz
+          version="$(cargo fuzz --version)"
+          if [[ "$version" != *"cargo-fuzz $pin"* ]]; then
+            echo "::error::cargo-fuzz $pin install did not take effect: $version"
+            exit 1
+          fi
+
+      # Rolling ISO-week key: one entry per target per week instead of one per
+      # night, because the Actions cache quota is repository-wide and the
+      # required checks depend on theirs surviving. The newest matching key is
+      # restored; coverage that matters is also uploaded as an artifact below.
+      - name: Resolve corpus cache week
+        id: corpus-week
+        run: echo "week=$(date -u +%G-W%V)" >>"$GITHUB_OUTPUT"
+
+      - name: Restore corpus (${{ matrix.target }})
+        id: corpus-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ steps.corpus-week.outputs.week }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      # `--generate-cap-seeds` is inert for every other target: the driver only
+      # materializes the over-cap inputs when the cap target's corpus is empty.
+      - name: Run campaign (${{ matrix.target }})
+        run: |
+          set -euo pipefail
+          mkdir -p "$BITTY_FUZZ_EVIDENCE_DIR"
+          ./scripts/fuzz-campaign.sh \
+            --secs "$BITTY_FUZZ_SECS" \
+            --targets "${{ matrix.target }}" \
+            --out-dir "$BITTY_FUZZ_EVIDENCE_DIR" \
+            --generate-cap-seeds
+
+      - name: Publish evidence summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -f "$BITTY_FUZZ_EVIDENCE_DIR/summary.md" ]]; then
+            cat "$BITTY_FUZZ_EVIDENCE_DIR/summary.md" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::no campaign summary was written; the run ended before the first target finished"
+          fi
+
+      - name: Upload campaign evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-campaign-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            ${{ env.BITTY_FUZZ_EVIDENCE_DIR }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
+          # Diagnostic logs and artifacts. The merged record below is the one a
+          # security-corpus entry cites, and it keeps the provenance itself, so
+          # it outlives these.
+          retention-days: 30
+
+      # The generated over-cap seeds are ~50 MiB of derivable input, so they are
+      # not uploaded on a successful run; the rolling corpus cache persists them
+      # and a cache miss regenerates them. Every other corpus is discovered
+      # coverage and is retained as an artifact.
+      - name: Upload discovered corpus
+        if: always() && matrix.target != 'control_string_cap'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      # A failed cap campaign keeps the units it discovered: without this the
+      # success-path exclusion plus a success-gated cache would lose them.
+      - name: Upload cap corpus when the campaign fails
+        if: failure() && matrix.target == 'control_string_cap'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Save even when the campaign failed: a finding is exactly when its
+      # corpus is worth keeping. A duplicate weekly key (two runs in one week)
+      # is not a campaign failure, hence continue-on-error.
+      - name: Save corpus (${{ matrix.target }})
+        if: always() && steps.corpus-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ steps.corpus-week.outputs.week }}
+
+  report:
+    name: Campaign summary
+    needs: [targets, campaign]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      EXPECTED_TARGETS: ${{ needs.targets.outputs.targets }}
+    steps:
+      - name: Download per-target evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: fuzz-campaign-*
+          path: evidence
+
+      # One record per run, so a security-corpus citation points at a single
+      # artifact instead of five. The merge carries the campaign-level and
+      # per-target provenance (revision, dirty flag, rustc, cargo-fuzz, the
+      # libFuzzer flags, timestamps) and compares the received targets with the
+      # enumerated set: a target that died before writing its summary makes the
+      # run `incomplete`, never `clean`.
+      - name: Merge campaign evidence
+        run: |
+          set -euo pipefail
+          mapfile -t summaries < <(find evidence -name summary.json | sort)
+          if (( ${#summaries[@]} == 0 )); then
+            echo "::error::no per-target summary.json was uploaded"
+            exit 1
+          fi
+          mkdir -p campaign-summary
+          jq -s '
+            . as $records
+            | ($records | [.[].targets[].target] | sort | unique) as $received
+            | ($ENV.EXPECTED_TARGETS | split(" ") | map(select(length > 0)) | sort) as $expected
+            | ([$records[].targets[].result] | unique) as $results
+            | {
+                campaign: "bitty-fuzz-campaign",
+                acceptance: "R-001 / P0-AC-002 long-running cargo-fuzz campaign",
+                issue: "bitty#3227",
+                workflow_run: env.GITHUB_RUN_ID,
+                event: env.GITHUB_EVENT_NAME,
+                ref: env.GITHUB_REF_NAME,
+                revision: ([$records[] | .revision] | unique | if length == 1 then .[0] else "mixed" end),
+                revision_dirty: ([$records[] | .revision_dirty] | any),
+                toolchain: ([$records[] | .toolchain] | unique | if length == 1 then .[0] else "mixed" end),
+                cargo_fuzz: ([$records[] | .cargo_fuzz] | unique | if length == 1 then .[0] else "mixed" end),
+                libfuzzer: ([$records[] | .libfuzzer | tojson] | unique | if length == 1 then (.[0] | fromjson) else "mixed" end),
+                started_utc: ([$records[] | .started_utc] | min),
+                finished_utc: ([$records[] | .finished_utc] | max),
+                requested_secs: ([$records[] | .requested_secs] | unique),
+                expected_targets: $expected,
+                received_targets: $received,
+                missing_targets: ($expected - $received),
+                unexpected_targets: ($received - $expected),
+                targets: ([$records[] as $r | $r.targets[] | . + {
+                  provenance: {
+                    revision: $r.revision,
+                    revision_dirty: $r.revision_dirty,
+                    toolchain: $r.toolchain,
+                    cargo_fuzz: $r.cargo_fuzz,
+                    libfuzzer: $r.libfuzzer,
+                    started_utc: $r.started_utc,
+                    finished_utc: $r.finished_utc
+                  }
+                }] | sort_by(.target)),
+                totals: {
+                  targets: ($received | length),
+                  expected: ($expected | length),
+                  secs_fuzzed: ([$records[].targets[].secs_fuzzed] | add // 0),
+                  runs: ([$records[].targets[].runs] | add // 0),
+                  new_units: ([$records[].targets[].new_units] | add // 0),
+                  peak_rss_mb: ([$records[].targets[].peak_rss_mb] | max // 0),
+                  crashes: ([$records[].targets[].crashes] | add // 0),
+                  leaks: ([$records[].targets[].leaks] | add // 0),
+                  slow_units: ([$records[].targets[].slow_units] | add // 0),
+                  oom: ([$records[].targets[].oom] | add // 0),
+                  timeouts: ([$records[].targets[].timeouts] | add // 0),
+                  other_artifacts: ([$records[].targets[].other_artifacts] | add // 0)
+                },
+                result: (
+                  if ($results | any(. == "finding")) then "finding"
+                  elif ($results | any(. == "error")) then "error"
+                  elif ($results | any(. == "inconclusive")) then "inconclusive"
+                  elif (($expected | length) == 0 or (($expected - $received) | length) > 0) then "incomplete"
+                  else "clean" end)
+              }
+          ' "${summaries[@]}" >campaign-summary/summary.json
+          jq -r '"campaign result: \(.result); targets \(.totals.targets)/\(.totals.expected), fuzzed \(.totals.secs_fuzzed)s, runs \(.totals.runs), crashes \(.totals.crashes), leaks \(.totals.leaks), oom \(.totals.oom), timeouts \(.totals.timeouts), missing: \(.missing_targets | join(","))"' campaign-summary/summary.json
+          {
+            echo
+            echo "- Revision: \`$(jq -r '.revision' campaign-summary/summary.json)\` (dirty: $(jq -r '.revision_dirty' campaign-summary/summary.json))"
+            echo "- Toolchain: $(jq -r '.toolchain' campaign-summary/summary.json), $(jq -r '.cargo_fuzz' campaign-summary/summary.json)"
+            echo "- Targets: $(jq -r '.totals.targets' campaign-summary/summary.json) of $(jq -r '.totals.expected' campaign-summary/summary.json) expected; missing: $(jq -r '.missing_targets | join(",")' campaign-summary/summary.json)"
+            echo
+            echo "| Target | Secs fuzzed | Runs | Crashes | Leaks | Slow units | OOM | Timeouts | Result |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            jq -r '.targets[] | "| `\(.target)` | \(.secs_fuzzed) | \(.runs) | \(.crashes) | \(.leaks) | \(.slow_units) | \(.oom) | \(.timeouts) | \(.result) |"' campaign-summary/summary.json
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload campaign summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-campaign-summary-${{ github.run_id }}
+          path: campaign-summary/summary.json
+          if-no-files-found: error
+          # The citable record: it carries the full provenance, so it stands
+          # alone after the 30-day per-target diagnostics expire.
+          retention-days: 90
+
+      # The matrix job already fails on a finding; this keeps a run whose only
+      # surviving output is the merged record from reporting green as well.
+      - name: Enforce campaign result
+        run: |
+          set -euo pipefail
+          result="$(jq -r '.result' campaign-summary/summary.json)"
+          if [[ "$result" != "clean" ]]; then
+            echo "::error::campaign result is $result (missing targets: $(jq -r '.missing_targets | join(",")' campaign-summary/summary.json))"
+            exit 1
+          fi

@@ -623,7 +623,7 @@ commit-check message:
 # Local CI-equivalent gate. Registry-free by contract: `catalog-test` runs
 # hermetic fixtures; the strict registry drift gate is `check-registry` and
 # needs a bitty-plugins checkout (see CONTRIBUTING.md).
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test freebsd-pkg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test freebsd-pkg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test fuzz-campaign-test actionlint markdownlint catalog-test nix-patch-test
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies
@@ -736,6 +736,29 @@ soak-campaign secs="120":
         -p bitty-runtime --test soak_campaign \
         -p bitty-daemon --test soak_campaign \
         -- --ignored --nocapture --test-threads=1
+
+# Bounded cargo-fuzz campaign driver (bitty#3227, CTX-1877; risk R-001 /
+# P0-AC-002). Runs every target in `fuzz/Cargo.toml` for `secs` seconds each
+# (default 600) through `scripts/fuzz-campaign.sh`, which seeds from the
+# committed `fuzz/corpora/`, owns the libFuzzer timeout/RSS bounds, and writes
+# `summary.json`, `summary.md`, per-target logs, and any finding artifact
+# under `recording/fuzz-campaign/` (gitignored). Any crash, leak, slow unit,
+# OOM, timeout, or unclassified artifact exits non-zero, and a run that
+# executed nothing is inconclusive rather than clean. Extra arguments pass
+# through to the driver (`--targets a,b`, `--out-dir <dir>`).
+#
+# Requires nightly plus `cargo-fuzz` (`rustup toolchain install nightly`,
+# `cargo install --locked --version 0.13.2 cargo-fuzz`). Linux-first: the hard
+# kill needs `timeout` (or `gtimeout`), and without GNU `find -printf` the
+# corpus retention trim is skipped with a warning. The nightly
+# `fuzz-campaign.yml` workflow runs the same driver per target outside the
+# PR-required checks. Run a bounded campaign over every fuzz target and keep
+# its evidence record.
+fuzz-campaign secs="600" *args:
+    ./scripts/fuzz-campaign.sh --secs {{secs}} {{args}}
+
+fuzz-campaign-test:
+    ./scripts/tests/fuzz-campaign.test.sh
 
 # Daily-driver dogfood session planner (CTX-0643, PERF-10). Headless-safe:
 # loads the clamped session config, prints the bounded cycle plan and the

@@ -5603,6 +5603,39 @@ struct OpOutput {
     changed: bool,
 }
 
+/// Store root one `bitty plugin` verb resolves.
+///
+/// `install`/`remove` write packages, and `doctor --repair` rewrites the
+/// index, so they resolve the effective root: an upgraded Windows install must
+/// act on the packages it already has rather than on an empty new root
+/// (CTX-1876). `doctor` **without** `--repair` only diagnoses, so it resolves
+/// read-only — merely reporting on a store must not move or copy it, and a
+/// diagnosis is exactly what an operator runs when the store is suspect.
+fn plugin_store_root_for(
+    verb: PluginVerb,
+    repair: bool,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    if verb == PluginVerb::Doctor && !repair {
+        crate::plugin_runtime::read_only_store_root_with_platform_env(
+            xdg_data_home,
+            home,
+            localappdata,
+            appdata,
+        )
+    } else {
+        crate::plugin_runtime::effective_store_root_with_platform_env(
+            xdg_data_home,
+            home,
+            localappdata,
+            appdata,
+        )
+    }
+}
+
 /// Run one `bitty plugin` invocation; returns the process exit code.
 pub fn run_plugin_subcommand(
     raw: &[String],
@@ -5644,9 +5677,14 @@ pub fn run_plugin_subcommand(
     };
     // Resolved once from injected environment values (never process env here).
     // CTX-1876: the effective resolver adopts a pre-`%LOCALAPPDATA%` store on
-    // the first run after an upgrade, so `install`/`remove`/`doctor` act on the
-    // packages the user already has instead of an empty new root.
-    let store_root = crate::plugin_runtime::effective_store_root_with_platform_env(
+    // the first run after an upgrade, so `install`/`remove`/`doctor --repair`
+    // act on the packages the user already has instead of an empty new root.
+    // Adoption is a write, though, so `doctor` without `--repair` — a verb
+    // whose whole contract is diagnosis — resolves read-only and leaves the
+    // store exactly where it is (see [`plugin_store_root_for`]).
+    let store_root = plugin_store_root_for(
+        request.verb,
+        request.repair,
         context.xdg_data_home,
         context.home,
         context.localappdata,
@@ -9692,6 +9730,87 @@ mod tests {
         let mut output = Vec::new();
         let code = run_plugin_subcommand(&owned, &context, &mut input, &mut output);
         (code, String::from_utf8(output).expect("utf-8"))
+    }
+
+    /// `bitty plugin doctor` diagnoses a legacy store without adopting it.
+    ///
+    /// The pre-fix dispatch resolved the effective root before it looked at
+    /// the verb, so the one command an operator runs when the store looks
+    /// wrong was the one that moved it (CTX-1876 review).
+    #[test]
+    fn doctor_without_repair_never_adopts_the_legacy_store() {
+        let dir = scratch_dir("doctor-legacy-store");
+        let home = dir.join("home");
+        let legacy = home.join(".local/share/bitty/plugins");
+        let package = legacy.join("packages/xuepoo.legacy/0.1.0");
+        let new_root = dir.join("local").join("bitty").join("plugins");
+        std::fs::create_dir_all(package.join("lua")).expect("package tree");
+        std::fs::write(package.join("bitty-plugin.toml"), "[plugin]\n").expect("manifest");
+        std::fs::write(package.join("lua/init.lua"), "return {}\n").expect("init");
+        std::fs::write(legacy.join("current.json"), "{\"v\":1,\"plugins\":[]}").expect("index");
+        let home = home.to_string_lossy().into_owned();
+        let local = dir.join("local").to_string_lossy().into_owned();
+        let config = dir.join("bitty.lua");
+        let config_path = config.to_string_lossy().into_owned();
+
+        let context = PluginContext {
+            config_path: Some(config_path.as_str()),
+            home: Some(home.as_str()),
+            localappdata: Some(local.as_str()),
+            ..PluginContext::default()
+        };
+        let owned: Vec<String> = ["doctor"]
+            .iter()
+            .map(|token| (*token).to_string())
+            .collect();
+        let mut input = Cursor::new(Vec::new());
+        let mut output = Vec::new();
+        let _code = run_plugin_subcommand(&owned, &context, &mut input, &mut output);
+        let report = String::from_utf8(output).expect("utf-8");
+
+        assert!(
+            legacy.join("current.json").is_file(),
+            "diagnosis must not move the legacy store: {report}"
+        );
+        assert!(package.is_dir(), "the package tree is untouched");
+        assert!(!new_root.exists(), "diagnosis creates no new root");
+        assert!(!new_root.parent().expect("parent").exists());
+        assert!(
+            report.contains(&legacy.display().to_string()),
+            "doctor reports the store the packages live in: {report}"
+        );
+    }
+
+    /// The verbs that act on the store still adopt it.
+    #[test]
+    fn the_adopting_plugin_verbs_move_the_legacy_store() {
+        for (verb, repair) in [(PluginVerb::Install, false), (PluginVerb::Doctor, true)] {
+            let dir = scratch_dir("plugin-store-adopt");
+            let home = dir.join("home");
+            let legacy = home.join(".local/share/bitty/plugins");
+            let new_root = dir.join("local").join("bitty").join("plugins");
+            std::fs::create_dir_all(legacy.join("packages/xuepoo.legacy/0.1.0"))
+                .expect("package tree");
+            std::fs::write(legacy.join("current.json"), "{\"v\":1,\"plugins\":[]}").expect("index");
+            let home_value = home.to_string_lossy().into_owned();
+            let local_value = dir.join("local").to_string_lossy().into_owned();
+
+            assert_eq!(
+                plugin_store_root_for(
+                    verb,
+                    repair,
+                    None,
+                    Some(&home_value),
+                    Some(&local_value),
+                    None
+                ),
+                Some(new_root.clone()),
+                "{verb:?} (repair: {repair}) acts on the effective root"
+            );
+            assert!(!legacy.exists(), "{verb:?} moved the tree");
+            assert!(new_root.join("current.json").is_file());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     fn state_path(dir: &Path) -> PathBuf {

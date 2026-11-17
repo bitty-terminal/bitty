@@ -197,12 +197,26 @@ impl RuntimeInspectContext {
             env.localappdata.as_deref(),
             env.appdata.as_deref(),
         );
-        let plugin_store = crate::plugin_runtime::effective_store_root_with_platform_env(
-            env.xdg_data_home.as_deref(),
-            env.home.as_deref(),
-            env.localappdata.as_deref(),
-            env.appdata.as_deref(),
-        );
+        // `--safe` documents "read no external configuration or store state"
+        // (main.rs maps the flag straight into this builder), and resolving
+        // the effective root adopts a legacy store — a write. Safe mode is the
+        // recovery path, so it names the root without moving or copying
+        // anything; only a read-only snapshot of the live root is safe to take.
+        let plugin_store = if safe_mode {
+            crate::plugin_runtime::read_only_store_root_with_platform_env(
+                env.xdg_data_home.as_deref(),
+                env.home.as_deref(),
+                env.localappdata.as_deref(),
+                env.appdata.as_deref(),
+            )
+        } else {
+            crate::plugin_runtime::effective_store_root_with_platform_env(
+                env.xdg_data_home.as_deref(),
+                env.home.as_deref(),
+                env.localappdata.as_deref(),
+                env.appdata.as_deref(),
+            )
+        };
         let extension_user_root =
             components_root_for(env.components_dir.as_deref(), data_home.as_deref());
         let extension_system_root =
@@ -959,6 +973,51 @@ mod tests {
             context.config_dir,
             Some(PathBuf::from("/xdg").join(bitty_config::file::CONFIG_DIR_NAME))
         );
+    }
+
+    /// `--safe` reads no store state, so it must not adopt one either.
+    ///
+    /// The pre-fix builder resolved the effective root unconditionally, so
+    /// `bitty --safe --runtime-inspect` (and any other safe-mode snapshot)
+    /// moved or copied an upgraded Windows install's plugin tree while
+    /// claiming to read nothing external.
+    #[test]
+    fn safe_mode_snapshot_does_not_adopt_the_legacy_plugin_store() {
+        let base = scratch("safe-store");
+        let home = base.join("home");
+        let legacy = home.join(".local/share/bitty/plugins");
+        let new_root = base.join("local").join("bitty").join("plugins");
+        std::fs::create_dir_all(legacy.join("packages/xuepoo.legacy/0.1.0"))
+            .expect("legacy package tree");
+        std::fs::write(legacy.join("current.json"), "{\"v\":1,\"plugins\":[]}")
+            .expect("legacy store index");
+        let env = InspectEnv {
+            home: Some(home.to_string_lossy().into_owned()),
+            localappdata: Some(base.join("local").to_string_lossy().into_owned()),
+            ..InspectEnv::default()
+        };
+
+        let safe = RuntimeInspectContext::from_app(&app_config(), &env, true);
+        assert_eq!(
+            safe.plugin_store.as_deref(),
+            Some(legacy.as_path()),
+            "--safe still names the store the packages live in"
+        );
+        assert!(
+            legacy.join("current.json").is_file(),
+            "safe mode must not move the legacy tree"
+        );
+        assert!(
+            !base.join("local").exists(),
+            "safe mode creates no new root"
+        );
+
+        // The contrast that makes the assertion discriminate: the normal
+        // snapshot adopts, which is what safe mode must not do.
+        let normal = RuntimeInspectContext::from_app(&app_config(), &env, false);
+        assert_eq!(normal.plugin_store, Some(new_root));
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

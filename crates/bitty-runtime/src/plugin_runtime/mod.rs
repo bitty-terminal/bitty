@@ -132,7 +132,7 @@ pub use keybindings::{
     MAX_KEYMAP_SUGGESTION_CONFLICTS, SuggestedBinding, SuggestedBindingDirectory,
     SuggestedChordConflict,
 };
-pub use legacy_store::{LegacyStoreAdoption, adopt_legacy_store};
+pub use legacy_store::{LegacyStoreAdoption, adopt_legacy_store, read_only_store_root};
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
     OVERLAY_CAPTURE_TIMEOUT_MS, OWNER_RELEASE_REASONS, OverlayCapture, RELEASE_REASONS,

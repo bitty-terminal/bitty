@@ -1240,14 +1240,24 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 
 /// Platform-aware store root plus the one-time legacy-store adoption.
 ///
-/// This is the root every production consumer must use: startup discovery,
-/// `bitty list plugins`/`list services`, `bitty init`, `bitty plugin install`
-/// and `bitty extension` all resolve the store through it, so a Windows
-/// install upgraded across bitty#3226 keeps discovering the packages it
-/// already installed instead of seeing an empty `%LOCALAPPDATA%` store. The
-/// first call moves the legacy tree into the new root
-/// ([`bitty_runtime::plugin_runtime::adopt_legacy_store`]); later calls find
-/// the new root present and touch nothing.
+/// This is the root every production consumer that *acts on* the store must
+/// use: startup discovery, `bitty list plugins`/`list services`, `bitty init`,
+/// `bitty plugin install`/`remove`/`doctor --repair` and `bitty extension` all
+/// resolve the store through it, so a Windows install upgraded across
+/// bitty#3226 keeps discovering the packages it already installed instead of
+/// seeing an empty `%LOCALAPPDATA%` store. The first call moves the legacy tree
+/// into the new root ([`bitty_runtime::plugin_runtime::adopt_legacy_store`]);
+/// later calls find the new root present and touch nothing.
+///
+/// Callers that must not mutate the store (`--safe`, `bitty plugin doctor`
+/// without `--repair`, shell completion) use
+/// [`read_only_store_root_with_platform_env`] instead: adoption is a write, so
+/// it cannot happen behind a verb whose contract is to read nothing.
+///
+/// Resolution is convergent: when adoption loses a race with another caller
+/// resolving the same store, the answer is re-read from the filesystem, so
+/// this never returns the legacy path that the winner has already renamed
+/// away (see [`LegacyStoreAdoption::store_root`]).
 pub(crate) fn effective_store_root_with_platform_env(
     xdg_data_home: Option<&str>,
     home: Option<&str>,
@@ -1266,6 +1276,9 @@ pub(crate) fn effective_store_root_with_platform_env(
         return Some(root);
     }
     let outcome = adopt_legacy_store(&root, &legacy);
+    // `outcome.store_root` re-probes both roots, so a lost race resolves to
+    // the winner's new root instead of the legacy path it renamed away.
+    let resolved = outcome.store_root(&root, &legacy);
     match outcome {
         LegacyStoreAdoption::NoLegacyRoot
         | LegacyStoreAdoption::NewRootPresent
@@ -1277,6 +1290,9 @@ pub(crate) fn effective_store_root_with_platform_env(
                 root.display()
             )
         }),
+        // Another caller adopted the store while this one was failing: its
+        // root holds the packages, so nothing was lost and nothing is wrong.
+        LegacyStoreAdoption::Failed if resolved != legacy => {}
         LegacyStoreAdoption::Failed => crate::logging::warn(|| {
             format!(
                 "bitty: could not move the pre-existing plugin store from {} to {}; continuing to read the legacy root",
@@ -1284,8 +1300,75 @@ pub(crate) fn effective_store_root_with_platform_env(
                 root.display()
             )
         }),
+        // A transient enumeration failure is diagnosed, never acted on: the
+        // legacy tree is left exactly as it is and keeps serving the store.
+        LegacyStoreAdoption::Unreadable => crate::logging::warn(|| {
+            format!(
+                "bitty: could not read the pre-existing plugin store at {}; leaving it in place and continuing to read it",
+                legacy.display()
+            )
+        }),
     }
-    Some(outcome.store_root(&root, &legacy).to_path_buf())
+    Some(resolved.to_path_buf())
+}
+
+/// Platform-aware store root for callers that must not mutate the store.
+///
+/// Same precedence as [`effective_store_root_with_platform_env`] — an
+/// existing new root wins, otherwise a legacy root that still holds packages
+/// is the store — but resolved without creating, moving, or copying anything
+/// ([`bitty_runtime::plugin_runtime::read_only_store_root`]).
+///
+/// This is what `--safe` (whose contract is "read no external configuration
+/// or store state"), `bitty plugin doctor` without `--repair` (diagnosis
+/// only), and the fail-soft shell-completion helper resolve with. Adoption is
+/// idempotent and non-destructive, but safe mode is the recovery path and a
+/// completion must never move a store as a side effect of listing a word.
+pub(crate) fn read_only_store_root_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    let root = store_root_with_platform_env(xdg_data_home, home, localappdata, appdata)?;
+    let Some(legacy) = legacy_store_root_with_platform_env(xdg_data_home, home, localappdata)
+    else {
+        return Some(root);
+    };
+    if legacy == root {
+        return Some(root);
+    }
+    Some(bitty_runtime::plugin_runtime::read_only_store_root(&root, &legacy).to_path_buf())
+}
+
+/// Store root startup discovery resolves, honouring `--safe`.
+///
+/// Safe mode documents that nothing external is read, so it resolves
+/// read-only: an upgraded Windows install must not have its plugin tree moved
+/// or copied by the very mode an operator starts when the store is suspect.
+pub(crate) fn startup_store_root_with_platform_env(
+    safe_mode: bool,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    if safe_mode {
+        read_only_store_root_with_platform_env(xdg_data_home, home, localappdata, appdata)
+    } else {
+        effective_store_root_with_platform_env(xdg_data_home, home, localappdata, appdata)
+    }
+}
+
+/// Live-environment startup store root for `safe_mode`.
+fn startup_store_root(safe_mode: bool) -> Option<PathBuf> {
+    startup_store_root_with_platform_env(
+        safe_mode,
+        std::env::var("XDG_DATA_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("LOCALAPPDATA").ok().as_deref(),
+        std::env::var("APPDATA").ok().as_deref(),
+    )
 }
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment values.
@@ -1423,6 +1506,12 @@ pub(crate) struct StartupSeed<'a> {
 /// loop so `bitty.terminal.snapshot` reflects committed state, workspace
 /// reads serve published rows, and `bitty.panel.set_pinned` validates plus
 /// applies through the tick drain.
+///
+/// The store root is resolved *before* the runtime is built, and resolving it
+/// may adopt a legacy store — a write. `--safe` therefore resolves read-only
+/// (CTX-1876 review): safe mode is the recovery path, so it must not move or
+/// copy the plugin tree, and its contract is to read no external store state at
+/// all.
 pub(crate) fn discover_and_activate(
     safe_mode: bool,
     cols: usize,
@@ -1434,7 +1523,7 @@ pub(crate) fn discover_and_activate(
         cols,
         rows,
         seed,
-        store_root(),
+        startup_store_root(safe_mode),
         dev_roots(),
         // CTX-1348: `~`-rooted `fs.read` grants resolve against the
         // environment-derived home. No literal host path is embedded.
@@ -6077,6 +6166,116 @@ error("activation fails after mounting the terminal slot scene")
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].id, "xuepoo.present");
         assert!(legacy.is_dir(), "the legacy tree is never merged in");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two callers resolving the store at the same moment must both end up on a
+    /// root that exists and holds the packages.
+    ///
+    /// This is the shape the reviewer reproduced: startup discovery, `bitty
+    /// list plugins`, `bitty plugin doctor`, and a shell completion all adopt,
+    /// so any two can overlap. The loser's rename fails because the winner
+    /// moved the tree, its copy fails for the same reason, and the pre-fix
+    /// `Failed` arm then handed back the legacy root the winner had already
+    /// renamed away — an empty store, i.e. exactly the invisible-plugin
+    /// symptom this migration exists to remove.
+    #[test]
+    fn concurrent_store_resolution_never_hands_back_a_missing_root() {
+        for round in 0..64u32 {
+            let base = store_migration_scratch(&format!("race-{round}"));
+            let home_dir = base.join("home");
+            let legacy = home_dir.join(".local/share/bitty/plugins");
+            plant_installed_store(&legacy, "xuepoo.legacy");
+            let home = home_dir.to_string_lossy().into_owned();
+            let local = base.join("local").to_string_lossy().into_owned();
+            let barrier = std::sync::Barrier::new(2);
+            let mut resolved: Vec<PathBuf> = Vec::new();
+
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for _ in 0..2 {
+                    let home = home.clone();
+                    let local = local.clone();
+                    let barrier = &barrier;
+                    handles.push(scope.spawn(move || {
+                        barrier.wait();
+                        effective_store_root_with_platform_env(
+                            None,
+                            Some(&home),
+                            Some(&local),
+                            None,
+                        )
+                    }));
+                }
+                for handle in handles {
+                    resolved.push(handle.join().expect("resolver thread").expect("store root"));
+                }
+            });
+
+            for root in &resolved {
+                assert!(root.is_dir(), "round {round}: {root:?} does not exist");
+                let rows = crate::plugin::store_discovery_rows_at(Some(root));
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "round {round}: {root:?} does not hold the package: {rows:?}"
+                );
+                assert_eq!(rows[0].id, "xuepoo.legacy");
+            }
+            // Single authority: both callers converge on the same root.
+            assert_eq!(resolved[0], resolved[1], "round {round}: roots diverged");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// `--safe` and the read-only surfaces must not move a legacy store.
+    ///
+    /// Safe mode is documented as reading no external configuration or store
+    /// state, and it is the recovery path an operator starts when the store is
+    /// suspect; `bitty plugin doctor` without `--repair` and shell completion
+    /// read it too. Resolving the effective root used to adopt as a side
+    /// effect, which meant merely *looking* at an upgraded install relocated
+    /// it.
+    #[test]
+    fn safe_mode_and_read_only_resolution_leave_a_legacy_store_in_place() {
+        let base = store_migration_scratch("safe");
+        let home_dir = base.join("home");
+        let legacy = home_dir.join(".local/share/bitty/plugins");
+        let new_root = base.join("local").join("bitty").join("plugins");
+        plant_installed_store(&legacy, "xuepoo.legacy");
+        let home = home_dir.to_string_lossy().into_owned();
+        let local = base.join("local").to_string_lossy().into_owned();
+
+        // `bitty --safe`: startup resolves the store read-only, and still names
+        // the root the packages actually live in.
+        assert_eq!(
+            startup_store_root_with_platform_env(true, None, Some(&home), Some(&local), None),
+            Some(legacy.clone())
+        );
+        assert!(
+            legacy.join("current.json").is_file(),
+            "--safe leaves the legacy tree alone"
+        );
+        assert!(!new_root.exists(), "--safe creates no new root");
+        assert!(!new_root.parent().expect("parent").exists());
+
+        // The same resolution serves `bitty plugin doctor` without `--repair`
+        // and the completion helper.
+        assert_eq!(
+            read_only_store_root_with_platform_env(None, Some(&home), Some(&local), None),
+            Some(legacy.clone())
+        );
+        assert!(legacy.join("current.json").is_file());
+        assert!(!new_root.exists());
+
+        // The contrast that makes the assertion discriminate: the adopting
+        // resolver, used by the verbs that act on the store, does move it.
+        assert_eq!(
+            startup_store_root_with_platform_env(false, None, Some(&home), Some(&local), None),
+            Some(new_root.clone())
+        );
+        assert!(!legacy.exists());
+        assert!(new_root.join("current.json").is_file());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

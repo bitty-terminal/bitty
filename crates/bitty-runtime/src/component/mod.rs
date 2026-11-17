@@ -193,7 +193,7 @@ pub fn data_home_for(
 /// lifecycle, so it ranks below `$HOME` as a last resort. Configuration
 /// resolves the opposite way (`$XDG_CONFIG_HOME` > `%APPDATA%` >
 /// `$HOME/.config` > `%LOCALAPPDATA%`, see
-/// `bitty_config::file::config_root_with_platform_env`), because roaming is
+/// `bitty_config::file::config_dir_with_platform_env`), because roaming is
 /// exactly right for settings and wrong for data. Do not reorder either list
 /// to "tidy" it: both orders are load-bearing, and moving these roots strands
 /// an installed store or component tier (CTX-1876, CTX-1878). The state root

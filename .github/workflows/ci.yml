@@ -1793,7 +1793,7 @@ jobs:
           if ($version -notmatch '^bitty \S+') { throw "bitty.com --version printed '$version'" }
           Write-Host "bitty.com --version => $version (exit 0, synchronous)"
           $headless = ([string](& $com --headless --log-level error 2>&1 | Out-String)).Trim()
-          if ($LASTEXITCODE -ne 0) { throw "bitty.com --headless exited $LASTEXITCODE: $headless" }
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --headless exited ${LASTEXITCODE}: $headless" }
           Write-Host 'bitty.com --headless OK (exit 0, synchronous)'
           # An invalid flag is an argv-only failure: the usage error must reach
           # this console with exit 2 instead of vanishing into a detached window.

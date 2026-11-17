@@ -976,7 +976,7 @@ try {
   $versionOutput = [string](& $destCom --version 2>&1 | Out-String)
   $versionOutput = $versionOutput.Trim()
   if ($LASTEXITCODE -ne 0) {
-    throw "install smoke failed: $destCom --version exited $LASTEXITCODE`: $versionOutput"
+    throw "install smoke failed: $destCom --version exited ${LASTEXITCODE}: $versionOutput"
   }
   if ($versionOutput -notmatch 'bitty \S+') {
     throw "install smoke failed: $destCom --version printed no version line: '$versionOutput'"

@@ -541,9 +541,13 @@ jobs:
             throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
           }
           $expected = @('CHANGELOG.md', 'LICENSE', 'README.md', 'bitty.com', 'bitty.exe', 'bitty.ico')
-          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name } | Sort-Object)
-          if (Compare-Object $expected $actual) {
-            throw "archive contents mismatch: $($actual -join ', ')"
+          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+          # Order-independent, case-sensitive set comparison (Sort-Object is
+          # case-insensitive by default, so Compare-Object would false-fail).
+          $missing = @($expected | Where-Object { $actual -cnotcontains $_ })
+          $extra = @($actual | Where-Object { $expected -cnotcontains $_ })
+          if ($missing.Count -ne 0 -or $extra.Count -ne 0) {
+            throw "archive contents mismatch: missing [$($missing -join ', ')] unexpected [$($extra -join ', ')]"
           }
           $exe = Join-Path $dest 'bitty.exe'
           $com = Join-Path $dest 'bitty.com'

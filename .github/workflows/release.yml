@@ -981,9 +981,13 @@ jobs:
             if ($dirs.Count -ne 0) {
               throw "unexpected directories in $arch archive root: $($dirs.Name -join ', ')"
             }
-            $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name } | Sort-Object)
-            if (Compare-Object $expected $actual) {
-              throw "$arch archive contents mismatch: $($actual -join ', ')"
+            $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+            # Order-independent, case-sensitive set comparison (Sort-Object is
+            # case-insensitive by default, so Compare-Object would false-fail).
+            $missing = @($expected | Where-Object { $actual -cnotcontains $_ })
+            $extra = @($actual | Where-Object { $expected -cnotcontains $_ })
+            if ($missing.Count -ne 0 -or $extra.Count -ne 0) {
+              throw "$arch archive contents mismatch: missing [$($missing -join ', ')] unexpected [$($extra -join ', ')]"
             }
             Write-Host "$arch payload OK: $($actual -join ', ')"
           }

@@ -9775,8 +9775,12 @@ mod tests {
         assert!(package.is_dir(), "the package tree is untouched");
         assert!(!new_root.exists(), "diagnosis creates no new root");
         assert!(!new_root.parent().expect("parent").exists());
+        // Path separators are platform-native (`\` on Windows) while the
+        // report prints the resolved root: normalize both sides before
+        // matching, the way the `plugins/` layout assertions do.
+        let norm = |s: &str| s.replace('\\', "/");
         assert!(
-            report.contains(&legacy.display().to_string()),
+            norm(&report).contains(&norm(&legacy.display().to_string())),
             "doctor reports the store the packages live in: {report}"
         );
     }

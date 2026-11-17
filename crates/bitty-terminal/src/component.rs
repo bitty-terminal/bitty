@@ -1200,6 +1200,7 @@ pub fn run_component_subcommand(
         context.component_state_dir,
         context.xdg_state_home,
         context.home,
+        context.localappdata,
     );
 
     // Name aliases (#2381): resolve one `bitty-` prefix for every verb that

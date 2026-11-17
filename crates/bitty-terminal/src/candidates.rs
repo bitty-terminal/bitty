@@ -179,7 +179,7 @@ fn plugin_candidates() -> Vec<String> {
         localappdata.as_deref(),
     )
     .ok();
-    let store_root = crate::plugin_runtime::store_root_with_platform_env(
+    let store_root = crate::plugin_runtime::effective_store_root_with_platform_env(
         xdg_data_home.as_deref(),
         home.as_deref(),
         localappdata.as_deref(),

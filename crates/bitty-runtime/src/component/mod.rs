@@ -27,7 +27,8 @@
 //!   without system fallback. [`discover_components`] merges both tiers for
 //!   `bitty extension list`.
 //! - [`read_component_activation`] reads the bounded activation projection
-//!   the broker writes under `$XDG_STATE_HOME/bitty/extensions/<name>` on
+//!   the broker writes under `$XDG_STATE_HOME/bitty/extensions/<name>`
+//!   (`%LOCALAPPDATA%\bitty\extensions\<name>` on Windows) on
 //!   spawn, crash, idle/shutdown stop, and fail-closed denial, so `list`
 //!   reports the last recorded transition (`installed`, `active`,
 //!   `denied:<class>`, `crashed`, `stopped`) for either install tier without
@@ -181,6 +182,24 @@ pub fn data_home_for(
 /// Platform-aware data root with Windows `%LOCALAPPDATA%` / `%APPDATA%`
 /// injected. Precedence: `$XDG_DATA_HOME` > `%LOCALAPPDATA%` >
 /// `$HOME/.local/share` > `%APPDATA%`.
+///
+/// The order is deliberate and is not an alphabetical accident. On Windows,
+/// `%LOCALAPPDATA%` is the native per-user root for machine-bound application
+/// data — the same lifecycle role `$XDG_DATA_HOME` plays — while `$HOME` there
+/// only exists when a POSIX shell (Git for Windows, MSYS, an installer script)
+/// exported it, so the compatibility variable ranks below the native root.
+/// `%APPDATA%` is *roaming*: syncing an installed plugin store, a component
+/// tier, or content-addressed packages across machines is the wrong
+/// lifecycle, so it ranks below `$HOME` as a last resort. Configuration
+/// resolves the opposite way (`$XDG_CONFIG_HOME` > `%APPDATA%` >
+/// `$HOME/.config` > `%LOCALAPPDATA%`, see
+/// `bitty_config::file::config_root_with_platform_env`), because roaming is
+/// exactly right for settings and wrong for data. Do not reorder either list
+/// to "tidy" it: both orders are load-bearing, and moving these roots strands
+/// an installed store or component tier (CTX-1876, CTX-1878). The state root
+/// ([`crate::component::state_home_for`]) follows this list
+/// (`$XDG_STATE_HOME` > `%LOCALAPPDATA%` > `$HOME/.local/state`) for the same
+/// reason.
 ///
 /// Every root comes from the caller (no hard-coded host paths); empty or
 /// whitespace-only values are skipped. Returns `None` only when no root

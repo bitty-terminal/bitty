@@ -23,11 +23,12 @@ use std::rc::Rc;
 use bitty_ipc::MAX_SNAPSHOT_ZONES;
 use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
-    BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
-    PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind, PanelEdgeRelease,
-    PanelEdgeReport, PanelGenerationPort, PanelPinHandler, PanelPinQueue, PanelSceneBackend,
-    PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TargetSource,
-    TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource, controller_generation,
+    BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LegacyStoreAdoption,
+    LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
+    PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort, PanelPinHandler, PanelPinQueue,
+    PanelSceneBackend, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
+    TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
+    adopt_legacy_store, controller_generation,
 };
 use bitty_runtime::registry::{
     Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType,
@@ -1165,7 +1166,7 @@ impl PanelGenerationPort for AppPanelGenerationPort {
 /// observability, bitty#2002), which discovers the same store without
 /// loading any plugin VM.
 pub(crate) fn store_root() -> Option<PathBuf> {
-    store_root_with_platform_env(
+    effective_store_root_with_platform_env(
         std::env::var("XDG_DATA_HOME").ok().as_deref(),
         std::env::var("HOME").ok().as_deref(),
         std::env::var("LOCALAPPDATA").ok().as_deref(),
@@ -1184,9 +1185,11 @@ pub(crate) fn store_root_for(xdg_data_home: Option<&str>, home: Option<&str>) ->
 
 /// Platform-aware plugin store root from explicit environment values.
 ///
-/// Shared by startup discovery, `bitty init`, and the `bitty plugin`
-/// package-manager CLI so all resolve the exact same store without reading
-/// process environment inside hermetic callers.
+/// Pure resolution: shared by startup discovery, `bitty init`, and the
+/// `bitty plugin` package-manager CLI so all resolve the exact same store
+/// without reading process environment inside hermetic callers. Production
+/// callers use [`effective_store_root_with_platform_env`], which resolves the
+/// same root and then adopts a legacy store once (CTX-1876).
 pub(crate) fn store_root_with_platform_env(
     xdg_data_home: Option<&str>,
     home: Option<&str>,
@@ -1195,6 +1198,94 @@ pub(crate) fn store_root_with_platform_env(
 ) -> Option<PathBuf> {
     data_home_with_platform_env(xdg_data_home, home, localappdata, appdata)
         .map(|base| base.join("bitty").join("plugins"))
+}
+
+/// Pre-change plugin store root for an upgraded Windows install (CTX-1876).
+///
+/// Before bitty#3226 adopted `%APPDATA%`/`%LOCALAPPDATA%`, the store resolved
+/// `$HOME/.local/share/bitty/plugins` whenever `$XDG_DATA_HOME` was unset, so
+/// this is the root a Windows install that had `HOME` set actually wrote to.
+/// It is returned only for that population, in that order of tests:
+///
+/// - `$XDG_DATA_HOME` unset — it always outranked `$HOME`, so a store written
+///   through it never lived here;
+/// - `%LOCALAPPDATA%` set — it is what now outranks `$HOME`, which is the
+///   only way the legacy root can have been shadowed;
+/// - `$HOME` set — nothing else could have named the legacy root.
+///
+/// The condition is an environment shape, not a build target: no `cfg`
+/// gate, so the migration stays live on any host and testable off Windows.
+fn legacy_store_root_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+) -> Option<PathBuf> {
+    if non_empty(xdg_data_home).is_some() || non_empty(localappdata).is_none() {
+        return None;
+    }
+    non_empty(home).map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("bitty")
+            .join("plugins")
+    })
+}
+
+/// Trimmed, non-empty environment value (empty and whitespace-only count as
+/// unset).
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Platform-aware store root plus the one-time legacy-store adoption.
+///
+/// This is the root every production consumer must use: startup discovery,
+/// `bitty list plugins`/`list services`, `bitty init`, `bitty plugin install`
+/// and `bitty extension` all resolve the store through it, so a Windows
+/// install upgraded across bitty#3226 keeps discovering the packages it
+/// already installed instead of seeing an empty `%LOCALAPPDATA%` store. The
+/// first call moves the legacy tree into the new root
+/// ([`bitty_runtime::plugin_runtime::adopt_legacy_store`]); later calls find
+/// the new root present and touch nothing.
+pub(crate) fn effective_store_root_with_platform_env(
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+    localappdata: Option<&str>,
+    appdata: Option<&str>,
+) -> Option<PathBuf> {
+    let root = store_root_with_platform_env(xdg_data_home, home, localappdata, appdata)?;
+    let Some(legacy) = legacy_store_root_with_platform_env(xdg_data_home, home, localappdata)
+    else {
+        return Some(root);
+    };
+    // `$HOME/.local/share/bitty/plugins` can only equal the resolved root when
+    // `%LOCALAPPDATA%` names the same path; adoption would then be a no-op
+    // rename onto itself.
+    if legacy == root {
+        return Some(root);
+    }
+    let outcome = adopt_legacy_store(&root, &legacy);
+    match outcome {
+        LegacyStoreAdoption::NoLegacyRoot
+        | LegacyStoreAdoption::NewRootPresent
+        | LegacyStoreAdoption::Moved => {}
+        LegacyStoreAdoption::Copied => crate::logging::warn(|| {
+            format!(
+                "bitty: copied the pre-existing plugin store from {} to {} (the legacy tree is left in place)",
+                legacy.display(),
+                root.display()
+            )
+        }),
+        LegacyStoreAdoption::Failed => crate::logging::warn(|| {
+            format!(
+                "bitty: could not move the pre-existing plugin store from {} to {}; continuing to read the legacy root",
+                legacy.display(),
+                root.display()
+            )
+        }),
+    }
+    Some(outcome.store_root(&root, &legacy).to_path_buf())
 }
 
 /// `$XDG_DATA_HOME` or `$HOME/.local/share` from explicit environment values.
@@ -5828,5 +5919,164 @@ error("activation fails after mounting the terminal slot scene")
             store_root_with_platform_env(None, None, Some(" "), Some("")),
             None
         );
+    }
+
+    /// Scratch root for the CTX-1876 adoption tests.
+    fn store_migration_scratch(tag: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ctx1876-store-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Plant one installed package plus its store index at `root`, using the
+    /// real manifest hash and content digest the loader re-verifies.
+    fn plant_installed_store(root: &Path, id: &str) {
+        use bitty_runtime::plugin_runtime::{
+            PluginRecord, SourceClass, content_digest, write_index,
+        };
+        let package = root.join("packages").join(id).join("0.1.0");
+        std::fs::create_dir_all(package.join("lua")).expect("package dirs");
+        let manifest = format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Legacy Store\"\nversion = \"0.1.0\"\ndescription = \"pre-APPDATA store\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[lazy]\ncommands = []\nevents = []\n"
+        );
+        std::fs::write(package.join("bitty-plugin.toml"), manifest).expect("manifest");
+        std::fs::write(package.join("lua/init.lua"), "return {}\n").expect("init");
+        let hash = bitty_runtime::plugin_runtime::manifest_toml::parse_manifest(
+            &std::fs::read(package.join("bitty-plugin.toml")).expect("manifest bytes"),
+        )
+        .expect("manifest parses")
+        .manifest_hash();
+        let record = PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: "0.1.0".to_string(),
+            root: format!("packages/{id}/0.1.0"),
+            manifest_hash: hash,
+            content_digest: content_digest(&package).expect("digest"),
+            enabled: true,
+            granted: Vec::new(),
+        };
+        write_index(root, &[record]).expect("write store index");
+    }
+
+    /// CTX-1876 acceptance: a package that an upgraded Windows install wrote
+    /// to `$HOME/.local/share/bitty/plugins` is still discovered afterwards.
+    ///
+    /// This is the population bitty#3226 stranded: Windows, `HOME` set, and a
+    /// non-empty legacy plugin root.
+    #[test]
+    fn upgraded_windows_install_still_discovers_its_legacy_store_packages() {
+        let base = store_migration_scratch("legacy");
+        let home = base.join("home");
+        let local = base.join("local");
+        let legacy = home.join(".local/share/bitty/plugins");
+        let new_root = local.join("bitty/plugins");
+        plant_installed_store(&legacy, "xuepoo.legacy");
+        let home = home.to_string_lossy().into_owned();
+        let local = local.to_string_lossy().into_owned();
+
+        // The symptom: the post-bitty#3226 root holds no index, so discovery
+        // over it is an empty store and every installed plugin goes invisible.
+        assert!(
+            store_root_with_platform_env(None, Some(&home), Some(&local), None).is_some_and(
+                |root| bitty_runtime::plugin_runtime::resolution::load_index(&root)
+                    .is_ok_and(|records| records.is_empty())
+            )
+        );
+
+        let root = effective_store_root_with_platform_env(None, Some(&home), Some(&local), None)
+            .expect("store root");
+        assert_eq!(root, new_root);
+        // Discovered through the same index-plus-manifest read `bitty list
+        // plugins` and startup discovery use, so the package bytes moved with
+        // the index and the record still re-verifies.
+        let rows = crate::plugin::store_discovery_rows_at(Some(&root));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "xuepoo.legacy");
+        assert_eq!(
+            rows[0].name, "Legacy Store",
+            "the package moved, not just the index"
+        );
+        assert!(!legacy.exists(), "the adopted tree is not left behind");
+
+        // Idempotent: a second start resolves the same root and moves nothing.
+        assert_eq!(
+            effective_store_root_with_platform_env(None, Some(&home), Some(&local), None),
+            Some(new_root)
+        );
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The migration is scoped to the population that can have a legacy store;
+    /// every other shape keeps the resolved root untouched.
+    #[test]
+    fn legacy_store_adoption_covers_only_the_windows_home_population() {
+        let base = store_migration_scratch("population");
+        let home_dir = base.join("home");
+        let legacy = home_dir.join(".local/share/bitty/plugins");
+        plant_installed_store(&legacy, "xuepoo.legacy");
+        let home = home_dir.to_string_lossy().into_owned();
+        let local = base.join("local").to_string_lossy().into_owned();
+
+        // `$XDG_DATA_HOME` always outranked `$HOME`, so it is never adopted.
+        let xdg = base.join("xdg").to_string_lossy().into_owned();
+        assert_eq!(
+            effective_store_root_with_platform_env(Some(&xdg), Some(&home), Some(&local), None),
+            Some(PathBuf::from(&xdg).join("bitty").join("plugins"))
+        );
+        assert!(
+            legacy.is_dir(),
+            "an XDG install keeps its legacy tree alone"
+        );
+
+        // Without `%LOCALAPPDATA%` the root did not change, so nothing moves.
+        assert_eq!(
+            effective_store_root_with_platform_env(None, Some(&home), Some("  "), None),
+            Some(legacy.clone())
+        );
+        assert!(legacy.is_dir());
+
+        // An empty legacy root is not a population: no new root is created.
+        let empty_home = base.join("empty-home");
+        std::fs::create_dir_all(empty_home.join(".local/share/bitty/plugins"))
+            .expect("empty legacy root");
+        let empty_local = base.join("empty-local");
+        assert_eq!(
+            effective_store_root_with_platform_env(
+                None,
+                Some(empty_home.to_str().expect("utf-8")),
+                Some(empty_local.to_str().expect("utf-8")),
+                None,
+            ),
+            Some(empty_local.join("bitty").join("plugins"))
+        );
+        assert!(!empty_local.exists());
+
+        // An existing new root is authoritative: discovery never reads two
+        // indexes, so the legacy tree stays where it is.
+        let present_local = base.join("present-local");
+        let present_root = present_local.join("bitty/plugins");
+        plant_installed_store(&present_root, "xuepoo.present");
+        assert_eq!(
+            effective_store_root_with_platform_env(
+                None,
+                Some(&home),
+                Some(present_local.to_str().expect("utf-8")),
+                None,
+            ),
+            Some(present_root.clone())
+        );
+        let rows = crate::plugin::store_discovery_rows_at(Some(&present_root));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "xuepoo.present");
+        assert!(legacy.is_dir(), "the legacy tree is never merged in");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

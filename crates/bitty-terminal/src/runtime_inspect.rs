@@ -197,7 +197,7 @@ impl RuntimeInspectContext {
             env.localappdata.as_deref(),
             env.appdata.as_deref(),
         );
-        let plugin_store = crate::plugin_runtime::store_root_with_platform_env(
+        let plugin_store = crate::plugin_runtime::effective_store_root_with_platform_env(
             env.xdg_data_home.as_deref(),
             env.home.as_deref(),
             env.localappdata.as_deref(),
@@ -211,6 +211,7 @@ impl RuntimeInspectContext {
             env.component_state_dir.as_deref(),
             env.xdg_state_home.as_deref(),
             env.home.as_deref(),
+            env.localappdata.as_deref(),
         );
         let profile = if safe_mode {
             None

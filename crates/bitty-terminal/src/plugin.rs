@@ -5643,7 +5643,10 @@ pub fn run_plugin_subcommand(
         }
     };
     // Resolved once from injected environment values (never process env here).
-    let store_root = crate::plugin_runtime::store_root_with_platform_env(
+    // CTX-1876: the effective resolver adopts a pre-`%LOCALAPPDATA%` store on
+    // the first run after an upgrade, so `install`/`remove`/`doctor` act on the
+    // packages the user already has instead of an empty new root.
+    let store_root = crate::plugin_runtime::effective_store_root_with_platform_env(
         context.xdg_data_home,
         context.home,
         context.localappdata,

@@ -868,11 +868,9 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 # valid from any shell.
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
-$kind = 'zip'
-
 if ($DryRun) {
   Write-BittyLog "dry-run: version pointer: $CdnBase/install/latest.txt"
-  Write-BittyLog "dry-run: TAG=$tag VERSION=$versionBare TARGET=$shortTarget KIND=$kind"
+  Write-BittyLog "dry-run: TAG=$tag VERSION=$versionBare TARGET=$shortTarget KIND=zip"
   Write-BittyLog "dry-run: artifact URL: $url"
   Write-BittyLog "dry-run: sidecar URL: $shaUrl"
   Write-BittyLog "dry-run: install dir: $InstallDir"

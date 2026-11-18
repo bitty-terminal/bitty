@@ -30,13 +30,13 @@ use bitty_runtime::plugin_runtime::{
     TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
     adopt_legacy_store, controller_generation,
 };
-use bitty_runtime::register_declared_panel_provider;
 use bitty_runtime::registry::{
     Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
     PanelType, PlaceholderReason, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
+use bitty_runtime::{PanelDeclarationError, register_declared_panel_provider};
 use bitty_term_state::{State, ZoneKind};
 
 /// Environment override for a local-path development plugin root.
@@ -558,6 +558,15 @@ pub(crate) struct PluginSession {
     /// Bounded queue of plugin panel layout operations (create/close Dwindle
     /// leaves) drained by `TerminalApp::apply_plugin_panel_requests` (CTX-1859).
     pub(crate) panel_layout_ops: Option<PluginPanelLayoutQueue>,
+    /// What the activation edge did with each active generation's declared
+    /// provider contract (bitty#3243, row 13).
+    ///
+    /// One typed outcome per `[panel.provider]` declaration the edge
+    /// attempted, in discovery order; empty when no package declares one. The
+    /// composition root reports it once
+    /// ([`report_panel_provider_activations`]) and a test reads the refusal
+    /// reason here instead of parsing log text.
+    pub(crate) panel_provider_activations: Vec<PanelProviderActivation>,
 }
 
 /// Maximum queued plugin panel layout operations per tick (bounded).
@@ -2070,16 +2079,15 @@ pub(crate) fn discover_with_roots(
     // `PROVIDER_MANIFEST_VERSION_V1` survive into the restore, where the
     // container presents `incompatible` instead of binding a contract this
     // runtime cannot read.
-    if let Some(panels) = panels.as_ref() {
-        let declared = register_declared_panel_providers(&runtime, panels);
-        if declared > 0 {
-            crate::logging::info(|| {
-                format!(
-                    "bitty: {declared} plugin provider contract(s) registered from manifest declarations"
-                )
-            });
-        }
-    }
+    //
+    // The edge keeps the typed outcome of each attempt rather than formatting
+    // it away: the composition root reports it below
+    // (`report_panel_provider_activations`) and a test can read the refusal
+    // reason without parsing log text.
+    let panel_provider_activations = panels
+        .as_ref()
+        .map(|panels| register_declared_panel_providers(&runtime, panels))
+        .unwrap_or_default();
     Some(PluginSession {
         runtime,
         snapshot,
@@ -2092,7 +2100,108 @@ pub(crate) fn discover_with_roots(
         scene_target,
         focused_workspace,
         panel_layout_ops,
+        panel_provider_activations,
     })
+}
+
+/// What the activation edge did with one generation's declared provider
+/// contract (bitty#3243, row 13).
+///
+/// A declaration is untrusted input that the manifest reader already shaped, so
+/// the edge reports *why* one did not become a descriptor as the typed
+/// [`PanelDeclarationError`] instead of a formatted string: the composition root
+/// decides how to surface a refusal, and a test can match on the reason without
+/// parsing log output.
+#[derive(Debug)]
+pub(crate) enum PanelProviderActivation {
+    /// The owner holds the declared contract. `generation` is the counter the
+    /// registry minted for this registration; re-declaring an identical
+    /// descriptor on a resume keeps the number the owner already had, so the
+    /// answer a restore reads does not churn.
+    Registered {
+        /// Plugin whose manifest carried the declaration.
+        plugin: String,
+        /// Provider generation the owner's descriptor is at.
+        generation: u64,
+    },
+    /// The registry or the kind mapping refused the declaration. Nothing was
+    /// registered for this owner, and its panels restore with the bounded
+    /// placeholder they already get when no provider answers for their kind.
+    Refused {
+        /// Plugin whose manifest carried the declaration.
+        plugin: String,
+        /// Typed reason, carried out unchanged.
+        error: PanelDeclarationError,
+    },
+    /// The panel host was borrowed by another holder, so the declaration was
+    /// not attempted. Distinct from [`Self::Refused`]: the declaration itself
+    /// may be valid, the edge simply could not reach the registry at that
+    /// instant. It is never retried behind the holder's back.
+    HostBusy {
+        /// Plugin whose manifest carried the declaration.
+        plugin: String,
+    },
+}
+
+impl PanelProviderActivation {
+    /// Plugin id the outcome belongs to.
+    pub(crate) fn plugin(&self) -> &str {
+        match self {
+            Self::Registered { plugin, .. }
+            | Self::Refused { plugin, .. }
+            | Self::HostBusy { plugin } => plugin,
+        }
+    }
+
+    /// Typed refusal reason, when the declaration did not become a descriptor.
+    ///
+    /// [`Self::HostBusy`] has no [`PanelDeclarationError`]: the registry never
+    /// saw the declaration.
+    pub(crate) fn refusal(&self) -> Option<&PanelDeclarationError> {
+        match self {
+            Self::Refused { error, .. } => Some(error),
+            Self::Registered { .. } | Self::HostBusy { .. } => None,
+        }
+    }
+}
+
+/// Reports the activation edge's declared-provider outcomes (bitty#3243,
+/// row 13).
+///
+/// Called once by the composition root after
+/// [`discover_and_activate`] returns. A registration is informational; a
+/// refusal is a warning because it is fail-closed rather than fatal — the
+/// plugin still runs, its panels just restore with the placeholder their kind
+/// gets when no provider answers. The typed reason travels through
+/// [`PanelDeclarationError`]'s own `Display`, so the log line names the
+/// registry rule that refused instead of a re-worded copy of it.
+pub(crate) fn report_panel_provider_activations(activations: &[PanelProviderActivation]) {
+    for activation in activations {
+        let plugin = activation.plugin();
+        if let Some(error) = activation.refusal() {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin '{plugin}' provider declaration refused: {error}; its panels keep the placeholder for their kind"
+                )
+            });
+            continue;
+        }
+        if let PanelProviderActivation::Registered { generation, .. } = activation {
+            crate::logging::info(|| {
+                format!(
+                    "bitty: plugin '{plugin}' provider contract registered from its manifest declaration (generation {generation})"
+                )
+            });
+            continue;
+        }
+        if matches!(activation, PanelProviderActivation::HostBusy { .. }) {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin '{plugin}' provider declaration not registered (panel host busy)"
+                )
+            });
+        }
+    }
 }
 
 /// Registers every active generation's declared provider contract on `panels`.
@@ -2104,15 +2213,17 @@ pub(crate) fn discover_with_roots(
 /// that generation's own activation grant snapshot, so a generation denied
 /// `panel.provider` registers nothing.
 ///
-/// Returns how many descriptors this edge registered. A declined or refused
-/// declaration is not an activation failure: the plugin's panels restore with
-/// the bounded placeholder they already get when no provider answers for their
-/// kind, so the only effect of a refusal is the absence of a descriptor.
+/// Returns one typed outcome per declaration attempted, in discovery order. A
+/// declined or refused declaration is not an activation failure: the plugin's
+/// panels restore with the bounded placeholder they already get when no
+/// provider answers for their kind, so the only effect of a refusal is the
+/// absence of a descriptor plus the reason
+/// [`report_panel_provider_activations`] surfaces.
 fn register_declared_panel_providers(
     runtime: &PluginRuntime,
     panels: &Rc<RefCell<PanelRuntime>>,
-) -> usize {
-    let mut registered = 0;
+) -> Vec<PanelProviderActivation> {
+    let mut activations = Vec::new();
     for id in runtime.discovered_ids() {
         if runtime.state(&id) != Some(&LifecycleState::Active) {
             continue;
@@ -2127,28 +2238,29 @@ fn register_declared_panel_providers(
             .services(&id)
             .is_some_and(|services| services.has_granted_capability(PANEL_PROVIDER_CAPABILITY));
         let Ok(mut host) = panels.try_borrow_mut() else {
-            // A borrowed host is not this edge's to write: the declaration is
-            // simply not registered, never retried behind the holder's back.
-            crate::logging::warn(|| {
-                format!(
-                    "bitty: plugin '{id}' provider declaration not registered (panel host busy)"
-                )
+            activations.push(PanelProviderActivation::HostBusy {
+                plugin: id.as_str().to_string(),
             });
             continue;
         };
-        match register_declared_panel_provider(
+        let outcome = register_declared_panel_provider(
             &mut host,
             id.as_str(),
             declaration,
             capability_granted,
-        ) {
-            Ok(_) => registered += 1,
-            Err(error) => crate::logging::warn(|| {
-                format!("bitty: plugin '{id}' provider declaration refused: {error}")
-            }),
-        }
+        );
+        activations.push(match outcome {
+            Ok(generation) => PanelProviderActivation::Registered {
+                plugin: id.as_str().to_string(),
+                generation,
+            },
+            Err(error) => PanelProviderActivation::Refused {
+                plugin: id.as_str().to_string(),
+                error,
+            },
+        });
     }
-    registered
+    activations
 }
 
 /// Build and install the inspection snapshot for one runtime mode.
@@ -3294,6 +3406,109 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
                 .map(bitty_runtime::registry::PanelProviderManifest::version),
             Some(2),
             "the install's observation must not shadow the declared contract with V1"
+        );
+        // The edge reports the typed outcome, so the composition root (and this
+        // row) read what happened instead of parsing log text.
+        assert_eq!(session.panel_provider_activations.len(), 1);
+        let activation = &session.panel_provider_activations[0];
+        assert_eq!(activation.plugin(), "acme.notes");
+        assert!(
+            activation.refusal().is_none(),
+            "a declaration the registry admitted must not report a refusal"
+        );
+        let generation = match activation {
+            PanelProviderActivation::Registered { generation, .. } => *generation,
+            other => panic!("activation must report a registration: {other:?}"),
+        };
+        assert_eq!(
+            panels.borrow().provider_generation_of("acme.notes"),
+            Some(generation),
+            "the reported generation must be the one the registry minted"
+        );
+    }
+
+    /// A declaration the registry refuses is reported as the typed error, leaves
+    /// no descriptor behind, and does not disturb a sibling generation's
+    /// registration (bitty#3243, row 13: fail-closed and observable).
+    ///
+    /// The owner of a provider descriptor is the plugin id, but the registry's
+    /// provider-id grammar is narrower than the plugin-id grammar (`owner.name`
+    /// with 1..=16-byte segments vs 1..=64), so a long-id package that ships a
+    /// `[panel.provider]` declaration is exactly the shipped shape that reaches
+    /// a refusal without any test-only call: discovery admits it, activation
+    /// makes it live, and the declaration edge refuses the descriptor.
+    #[test]
+    fn a_refused_provider_declaration_is_typed_and_registers_nothing() {
+        const REFUSED_ID: &str = "acme.notes-with-a-long-owner-segment";
+        let root = pin_test_dir("provider-declaration-refused");
+        write_provider_probe(&root, "acme.notes", 1, &["helper"]);
+        write_provider_probe(&root, REFUSED_ID, 1, &["helper"]);
+        let live = two_leaf_runtime();
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: None,
+            focused_workspace: None,
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, None, vec![root], None, None)
+            .expect("dev root must yield a session");
+        let refused = bitty_plugin_host::manifest::PluginId::new(REFUSED_ID).expect("plugin id");
+        assert_eq!(
+            session.runtime.state(&refused),
+            Some(&LifecycleState::Active),
+            "the refusal under test must come from the declaration edge, not a failed activation"
+        );
+        let panels = session
+            .panels
+            .clone()
+            .expect("the shipped panel host must exist");
+        assert!(
+            panels.borrow().provider_manifest(REFUSED_ID).is_none(),
+            "a refused declaration must leave no descriptor (fail-closed, no half registration)"
+        );
+        assert_eq!(
+            panels
+                .borrow()
+                .provider_manifest("acme.notes")
+                .map(bitty_runtime::registry::PanelProviderManifest::version),
+            Some(1),
+            "a refused sibling must not take the admitted registration down with it"
+        );
+        let outcomes: Vec<&PanelProviderActivation> = session
+            .panel_provider_activations
+            .iter()
+            .filter(|activation| activation.plugin() == REFUSED_ID)
+            .collect();
+        assert_eq!(outcomes.len(), 1, "one outcome per attempted declaration");
+        let Some(error) = outcomes[0].refusal() else {
+            panic!(
+                "the refused declaration must report a typed error, got {:?}",
+                outcomes[0]
+            );
+        };
+        // Matched as the registry's own `InvalidOwner` for this exact owner: the
+        // edge carries the typed value out unchanged rather than a formatted
+        // copy. The wording of the reason is the registry's, so the assertion
+        // pins the variant and the offending id, not that string.
+        assert!(
+            matches!(
+                error,
+                PanelDeclarationError::Registry(
+                    bitty_runtime::registry::ProviderContractError::InvalidOwner { value, .. }
+                ) if value == REFUSED_ID
+            ),
+            "the edge must carry the registry's own typed reason out, got {error:?}"
         );
     }
 

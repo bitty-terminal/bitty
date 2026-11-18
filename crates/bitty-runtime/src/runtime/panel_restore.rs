@@ -293,10 +293,26 @@ pub trait PanelRestoreDriverSource: std::fmt::Debug {
 ///   driver's own `panel.*` set, read back from the registry, so a first bind on
 ///   the restored container commits exactly what the runtime granted the same
 ///   owner here: nothing is widened, and nothing is invented from the record.
+/// - [`PanelDriverAnswer::Missing`] when the owner is not the only owner driving
+///   live containers of the record's kind. The durable record carries no owner
+///   (`RFC-OQ-9`, bitty#3239 row 16), so a kind that several plugins drive names
+///   no single creator for the record: binding it to whichever of them happens
+///   to hold a container would attribute one plugin's panel to another plugin's
+///   provider. The record keeps the `unloaded` placeholder instead.
 /// - [`PanelDriverAnswer::Missing`] when a readable descriptor exists but this
 ///   process holds no live container of that owner and kind to read a resolution
 ///   from. A first bind has no predecessor ceiling and would have to commit a
 ///   grant set out of thin air; `unloaded` is the honest answer instead.
+/// - [`PanelDriverAnswer::Missing`] when the owner holds several live containers
+///   of the kind with different committed resolutions. Choosing one of them
+///   would make the answer depend on which container the registry enumerated
+///   first; a restore may not pick one, so it binds none.
+///
+/// The answer is a function of the world, never of allocation order: it is
+/// assembled from sets of owners and grant sets rather than from the first
+/// container that matches, so the same world answers the same thing whatever
+/// order its containers were created in. See
+/// `tests/panel_provider_registration.rs` for the row that asserts it.
 pub struct HostProviderDriverSource {
     host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>,
 }
@@ -354,28 +370,70 @@ impl PanelRestoreDriverSource for HostProviderDriverSource {
     }
 }
 
-/// The `panel.*` grant set `host` already committed for a live container of
-/// `owner` and `kind`, if it holds one.
+/// The `panel.*` grant set `host` already committed for the live containers of
+/// `owner` and `kind`, if the world names exactly one such resolution.
 ///
 /// Read back from the registry ([`PanelRuntime::panel_granted_capabilities`]),
 /// never assembled from a catalog: the set is exactly what a bind of the same
 /// owner and kind earned in this process.
+///
+/// Owner **and** kind are one predicate, and the answer is assembled from sets
+/// rather than from the first matching container, for two reasons that are both
+/// about not naming an owner the world does not name:
+///
+/// * The durable record carries no owner (`RFC-OQ-9`, bitty#3239 row 16), so the
+///   only facts that can attribute a container to a plugin are the live ones.
+///   Taking the first container of the kind and comparing owners *afterwards*
+///   makes both the attribution and the answer a function of allocation order:
+///   when two plugins drive one [`PanelType`] the record was either bound to the
+///   plugin that created it, bound to the other plugin, or `unloaded`, depending
+///   only on which container the registry enumerated first. `PanelType` is a
+///   closed set of generic kinds shared by every plugin, so several drivers per
+///   kind is an ordinary world, not an edge.
+/// * A resolution is authority: handing a record a set that belongs to a
+///   different owner than the one that created its container widens that
+///   plugin's reach on a panel it never had. So when the kind is driven by more
+///   than one owner, or by one owner that committed two different resolutions,
+///   there is no single answer and this returns `None` (the caller answers
+///   [`PanelDriverAnswer::Missing`]) instead of picking one.
+///
+/// An unbound container (no owner) is not a candidate: it holds no controller
+/// generation to read grants from and attributes nothing.
 fn live_resolution(
     host: &PanelRuntime,
     owner: &str,
     panel_type: PanelType,
 ) -> Option<BTreeSet<String>> {
-    host.live_panel_records()
-        .into_iter()
-        .find(|record| record.panel_type == panel_type)
-        .and_then(|record| {
-            let live_owner = record.owner?;
-            if live_owner.as_str() != owner {
-                return None;
-            }
-            host.panel_granted_capabilities(record.id, record.grant_generation)
-                .cloned()
-        })
+    let mut owners: BTreeSet<String> = BTreeSet::new();
+    let mut resolutions: BTreeSet<BTreeSet<String>> = BTreeSet::new();
+    for record in host.live_panel_records() {
+        if record.panel_type != panel_type {
+            continue;
+        }
+        let Some(live_owner) = record.owner else {
+            continue;
+        };
+        owners.insert(live_owner.as_str().to_string());
+        if live_owner.as_str() != owner {
+            continue;
+        }
+        if let Some(grants) = host.panel_granted_capabilities(record.id, record.grant_generation) {
+            resolutions.insert(grants.clone());
+        }
+    }
+    // Exactly one owner drives the kind, and it is the one whose descriptor this
+    // answer is for: otherwise the record has no single creator to restore.
+    if owners.len() != 1 || !owners.contains(owner) {
+        return None;
+    }
+    // Exactly one resolution among that owner's containers: several distinct
+    // ones would make "the" resolution an enumeration-order fact.
+    let mut resolutions = resolutions.into_iter();
+    let resolution = resolutions.next()?;
+    if resolutions.next().is_some() {
+        return None;
+    }
+    Some(resolution)
 }
 
 // ---------------------------------------------------------------------------

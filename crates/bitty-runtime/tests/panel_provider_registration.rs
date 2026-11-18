@@ -35,6 +35,20 @@
 //!   this runtime cannot read: the container is retained, presents
 //!   `incompatible`, and is granted nothing (bitty#3239 row 13).
 //!
+//! * `a_kind_driven_by_two_owners_is_not_bound_to_either` and
+//!   `the_same_world_resolves_the_same_in_either_allocation_order` — the
+//!   resolution is owner-qualified and order-independent: two plugins driving
+//!   one container kind make the record unattributable (`unloaded`), in either
+//!   allocation order, instead of binding it to whichever provider the registry
+//!   happened to enumerate first;
+//! * `two_providers_declaring_the_same_kind_resolve_to_no_driver` and
+//!   `a_descriptor_without_a_live_container_does_not_bind` — the two branches
+//!   where no single answer exists: ambiguous descriptors, and a descriptor with
+//!   no committed resolution behind it;
+//! * `a_missing_manifest_and_an_empty_one_do_not_read_the_same` — the restore
+//!   summary's panel field is an observable that distinguishes "no manifest"
+//!   from "a manifest with no records".
+//!
 //! The filesystem is real: the backend writes and reads the actual session and
 //! manifest files under a per-test temporary directory. Every test removes it.
 
@@ -50,7 +64,7 @@ use bitty_runtime::registry::{
     PROVIDER_MANIFEST_VERSION_V1, PanelProviderManifest, PanelRegistryConfig, PanelRuntime,
     PanelType, PlaceholderReason,
 };
-use bitty_runtime::runtime::panel_restore::PanelRestoreOutcome;
+use bitty_runtime::runtime::panel_restore::{PanelRestoreOutcome, PanelRestoreReport};
 use bitty_runtime::{
     LayoutNode, PaneAttachment, PaneRoute, PaneSnapshot, PresentationMode, Runtime, SessionError,
     SessionFileBackend, SessionSnapshot, View, ViewId, WorkspaceSnapshot, panel_manifest_path,
@@ -523,6 +537,302 @@ fn a_record_with_no_matching_provider_comes_back_unloaded() {
         placeholder_of(&host, panel),
         Some(PlaceholderReason::Unloaded),
         "the retained container presents `unloaded`, not nothing"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Identity: owner and kind, never allocation order
+// ---------------------------------------------------------------------------
+
+/// A second plugin in the same process: it drives a container of the same kind
+/// but does not declare itself a provider.
+fn other_owner() -> PluginId {
+    PluginId::new("beau.notes").expect("valid plugin id")
+}
+
+/// The world the allocation-order defect was about: two plugins driving one
+/// `PanelType`, only one of them a provider.
+///
+/// `provider_first` chooses which container the registry is handed first and
+/// changes nothing else, so the two hosts describe the same world in two
+/// insertion orders.
+fn host_with_two_drivers(provider_first: bool) -> Rc<RefCell<PanelRuntime>> {
+    let host = Rc::new(RefCell::new(
+        PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+    ));
+    let drivers: [(PluginId, BTreeSet<String>); 2] = if provider_first {
+        [
+            (owner(), resolution()),
+            (other_owner(), non_provider_resolution()),
+        ]
+    } else {
+        [
+            (other_owner(), non_provider_resolution()),
+            (owner(), resolution()),
+        ]
+    };
+    for (plugin, grants) in drivers {
+        let handle = host
+            .borrow_mut()
+            .create_panel(
+                PanelType::Helper,
+                Some(bitty_runtime::registry::WorkspaceId::new(1)),
+            )
+            .expect("the container allocates");
+        let controller = handle.generation.next().expect("a controller generation");
+        host.borrow_mut()
+            .rebind_panel(handle.id, controller, &plugin, &grants, &BTreeSet::new())
+            .expect("the driver binds");
+    }
+    host
+}
+
+/// Save one record from `owner()`'s helper container, load it in a fresh
+/// runtime, install `host` through the composition-root entry point, and answer
+/// what the deferred commit did.
+fn restore_into(host: Rc<RefCell<PanelRuntime>>, label: &str) -> PanelRestoreReport {
+    let root = temp_root(label);
+    let path = session_path(&root);
+    let (writer_runtime, _writer_host, backend) = writer("logs");
+    writer_runtime
+        .save_session_to_path(&path)
+        .expect("the session saves");
+    let mut second = loader(backend);
+    second
+        .load_session_from_path(&path)
+        .expect("the session loads");
+    second.install_shared_scene_host(host);
+    let report = second.panel_restore_report().clone();
+    let _ = fs::remove_dir_all(&root);
+    report
+}
+
+/// One restore's outcome as a comparable, content-free shape: the variant each
+/// record reached and, for a placeholder, why.
+fn outcome_shape(report: &PanelRestoreReport) -> Vec<String> {
+    report
+        .panels()
+        .iter()
+        .map(|panel| match &panel.outcome {
+            PanelRestoreOutcome::Bound { .. } => String::from("bound"),
+            PanelRestoreOutcome::Placeholder { reason, .. } => format!("placeholder:{reason:?}"),
+            PanelRestoreOutcome::Dropped { reason, .. } => format!("dropped:{reason:?}"),
+        })
+        .collect()
+}
+
+/// A record whose kind two plugins drive is bound to neither of them.
+///
+/// The durable record carries no owner (`RFC-OQ-9`, bitty#3239 row 16), so when
+/// more than one plugin drives its container kind there is no single creator to
+/// restore it to. The provider here allocated its container **first**, which is
+/// exactly the ordering the round-2 review found binding the record: before the
+/// fix this row reported `bound == 1`, attributing the other plugin's panel to
+/// `acme.notes` and committing `acme.notes`' resolution on it.
+#[test]
+fn a_kind_driven_by_two_owners_is_not_bound_to_either() {
+    let host = host_with_two_drivers(true);
+
+    let report = restore_into(Rc::clone(&host), "two-owners-provider-first");
+
+    assert_eq!(
+        host.borrow().providers_for_type(PanelType::Helper),
+        vec![owner().as_str().to_string()],
+        "the ambiguity is in the live containers, not in the descriptors: exactly one \
+         provider declares the kind, so the answer cannot come from the descriptor set"
+    );
+    assert_eq!(report.len(), 1, "one record, one outcome: {report:?}");
+    assert_eq!(
+        report.bound(),
+        0,
+        "a record with no owner of its own may not be handed to one plugin's provider: {report:?}"
+    );
+    let PanelRestoreOutcome::Placeholder { panel, reason, .. } = report.panels()[0].outcome else {
+        panic!("an unattributable record keeps its container: {report:?}");
+    };
+    assert_eq!(
+        reason,
+        PlaceholderReason::Unloaded,
+        "the honest answer is `unloaded`, not another plugin's resolution"
+    );
+    assert_eq!(
+        placeholder_of(&host, panel),
+        Some(PlaceholderReason::Unloaded),
+        "the retained container presents the placeholder"
+    );
+}
+
+/// The same world in both allocation orders resolves the same way.
+///
+/// This is the invariant the round-2 defect broke: resolution used to take the
+/// first live container of the kind and compare owners afterwards, so
+/// provider-first answered `bound` and bystander-first answered `unloaded` for
+/// one and the same world. Both orders are constructed here and their outcomes
+/// compared, so an implementation that reads containers in enumeration order
+/// fails one of the two.
+#[test]
+fn the_same_world_resolves_the_same_in_either_allocation_order() {
+    let provider_first = restore_into(host_with_two_drivers(true), "order-provider-first");
+    let bystander_first = restore_into(host_with_two_drivers(false), "order-bystander-first");
+
+    assert_eq!(
+        outcome_shape(&provider_first),
+        outcome_shape(&bystander_first),
+        "the same world with the allocation order swapped must resolve the same: \
+         provider-first={provider_first:?} bystander-first={bystander_first:?}"
+    );
+    assert_eq!(
+        provider_first.bound(),
+        bystander_first.bound(),
+        "the bind count may not depend on which container was allocated first"
+    );
+    // Spelled out so the row cannot pass by both orders being wrong in the same
+    // way: an unattributable record is bound to nobody in either order.
+    assert_eq!(provider_first.bound(), 0, "{provider_first:?}");
+    assert_eq!(bystander_first.bound(), 0, "{bystander_first:?}");
+}
+
+/// Two providers declaring one kind are an ambiguity the restore does not
+/// resolve by picking one: the record keeps its container, `unloaded`.
+#[test]
+fn two_providers_declaring_the_same_kind_resolve_to_no_driver() {
+    let host = Rc::new(RefCell::new(
+        PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+    ));
+    for plugin in [owner(), other_owner()] {
+        let handle = host
+            .borrow_mut()
+            .create_panel(
+                PanelType::Helper,
+                Some(bitty_runtime::registry::WorkspaceId::new(1)),
+            )
+            .expect("the container allocates");
+        let controller = handle.generation.next().expect("a controller generation");
+        host.borrow_mut()
+            .rebind_panel(
+                handle.id,
+                controller,
+                &plugin,
+                &resolution(),
+                &BTreeSet::new(),
+            )
+            .expect("the driver binds");
+    }
+
+    let report = restore_into(Rc::clone(&host), "two-providers");
+
+    assert_eq!(
+        host.borrow().providers_for_type(PanelType::Helper).len(),
+        2,
+        "both plugins declared the kind"
+    );
+    assert_eq!(report.len(), 1, "one record, one outcome: {report:?}");
+    assert_eq!(report.bound(), 0, "an ambiguous kind binds to no driver");
+    let PanelRestoreOutcome::Placeholder { reason, .. } = report.panels()[0].outcome else {
+        panic!("an ambiguous record keeps its container: {report:?}");
+    };
+    assert_eq!(reason, PlaceholderReason::Unloaded);
+}
+
+/// A readable descriptor with no live container behind it does not bind: there
+/// is no committed resolution to read, and a first bind may not invent one.
+#[test]
+fn a_descriptor_without_a_live_container_does_not_bind() {
+    let host = Rc::new(RefCell::new(
+        PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+    ));
+    let declared = PanelProviderManifest::parse(
+        owner().as_str(),
+        vec![PanelType::Helper],
+        PROVIDER_MANIFEST_VERSION_V1,
+    )
+    .expect("the declaration parses");
+    host.borrow_mut()
+        .register_panel_provider(declared, true)
+        .expect("the declaration registers");
+
+    let report = restore_into(Rc::clone(&host), "descriptor-only");
+
+    assert!(
+        host.borrow().provider_manifest(owner().as_str()).is_some(),
+        "the row exercises the descriptor-without-container branch, not the no-descriptor one"
+    );
+    assert_eq!(report.len(), 1, "one record, one outcome: {report:?}");
+    assert_eq!(
+        report.bound(),
+        0,
+        "no live container, no resolution to bind"
+    );
+    let PanelRestoreOutcome::Placeholder { reason, .. } = report.panels()[0].outcome else {
+        panic!("a record with no readable resolution keeps its container: {report:?}");
+    };
+    assert_eq!(reason, PlaceholderReason::Unloaded);
+}
+
+/// A missing manifest and a manifest with zero records are different facts and
+/// must not read the same.
+///
+/// The counts alone cannot tell them apart — both are `0` records over `0`
+/// configured — so the shipped startup line prints the presence flag as well.
+/// This is the consumer of [`PanelManifestLoad::present`] that check 3 of the
+/// round-2 review found missing.
+#[test]
+fn a_missing_manifest_and_an_empty_one_do_not_read_the_same() {
+    let root = temp_root("presence");
+    let path = session_path(&root);
+    let mut writer_runtime = Runtime::with_defaults().expect("defaults build");
+    let backend = Arc::new(DiskBackend {
+        snapshot: canned_snapshot(),
+    });
+    writer_runtime.set_session_backend(Some(backend.clone()));
+    // An installed host that holds no container: a complete observation of an
+    // empty world, which is the one case that legitimately writes an empty
+    // document.
+    writer_runtime.install_shared_scene_host(Rc::new(RefCell::new(
+        PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+    )));
+    writer_runtime
+        .save_session_to_path(&path)
+        .expect("the session saves");
+
+    let mut second = loader(backend);
+    let empty = second
+        .load_session_from_path(&path)
+        .expect("the session loads");
+    assert!(
+        empty.panels.present,
+        "a zero-record sidecar is still present"
+    );
+    assert_eq!(empty.panels.records, 0);
+
+    fs::remove_file(panel_manifest_path(&path)).expect("the manifest removes");
+    let mut third = loader(Arc::new(DiskBackend {
+        snapshot: canned_snapshot(),
+    }));
+    let missing = third
+        .load_session_from_path(&path)
+        .expect("a missing manifest never costs the session");
+    assert!(!missing.panels.present, "no sidecar was read");
+
+    assert_eq!(
+        (empty.panels.records, empty.panels.configured),
+        (missing.panels.records, missing.panels.configured),
+        "the counts are identical, so they cannot be the whole observable"
+    );
+    assert_ne!(
+        empty.panels.to_string(),
+        missing.panels.to_string(),
+        "the shipped line must distinguish an absent manifest from an empty one"
+    );
+    assert_eq!(
+        missing.panels.to_string(),
+        "present=false records=0 configured=0"
+    );
+    assert_eq!(
+        empty.panels.to_string(),
+        "present=true records=0 configured=0"
     );
 
     let _ = fs::remove_dir_all(&root);

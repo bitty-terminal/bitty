@@ -1042,11 +1042,17 @@ pub struct Runtime {
     panel_restore_inputs: Vec<panel_restore::PanelRestoreInput>,
     /// Port that answers what drives a persisted record (bitty#3243).
     ///
-    /// Installed by the composition root before the session restore; the plugin
-    /// host owns which plugin is installed for a record, so Core asks rather
-    /// than deriving it. `None` is the shipped state: every decoded record
-    /// resolves to a missing driver, and its container comes back with the
-    /// `unloaded` placeholder instead of the panel disappearing.
+    /// Installed at the panel-host install
+    /// ([`Runtime::install_shared_scene_host`](Runtime::install_shared_scene_host)),
+    /// which in the shipped order runs *after* the session restore — that is why
+    /// a restore defers its panel step instead of deciding it. The plugin host
+    /// owns which plugin is installed for a record, so Core asks rather than
+    /// deriving it. The shipped state of a runtime that installed a panel host
+    /// is `Some(HostProviderDriverSource)` over that host; an unset port (a
+    /// runtime with no host, or one whose composition root has not installed it
+    /// yet) answers every decoded record as a missing driver, and its container
+    /// comes back with the `unloaded` placeholder instead of the panel
+    /// disappearing.
     panel_restore_driver_source: Option<std::rc::Rc<dyn panel_restore::PanelRestoreDriverSource>>,
     /// Whether the last restore's panel records are waiting for a panel host.
     ///

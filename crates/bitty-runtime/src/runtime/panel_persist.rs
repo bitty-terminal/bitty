@@ -71,7 +71,9 @@
 //!   registered for the plugins it observed driving containers. A record whose
 //!   kind no descriptor declares resolves to [`PanelDriverAnswer::Missing`],
 //!   which restores its container with `unloaded` rather than making the panel
-//!   disappear.
+//!   disappear — and so does a record of a kind more than one plugin drives in
+//!   this process, because the record carries no owner to say which of them
+//!   created it, and a resolution may never be borrowed from another owner.
 //!
 //! # Workspace ordinals
 //!
@@ -147,6 +149,19 @@ pub struct PanelManifestLoad {
     /// [`Self::records`] when a record's durable key names no container kind
     /// this runtime mints.
     pub configured: usize,
+}
+
+impl std::fmt::Display for PanelManifestLoad {
+    /// Renders presence and counts as one log field
+    /// (`present=true records=1 configured=1`), so "no sidecar" and "a sidecar
+    /// with zero records" never print the same thing.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "present={} records={} configured={}",
+            self.present, self.records, self.configured
+        )
+    }
 }
 
 impl Runtime {

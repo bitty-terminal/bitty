@@ -1187,13 +1187,12 @@ fn main() {
             bitty_runtime::SessionStartupOutcome::Restored(summary) => {
                 logging::info(|| {
                     format!(
-                        "bitty: session restored (workspaces={} panes={} lines={} pending={} panels={}/{}; inactive panes respawn on first switch)",
+                        "bitty: session restored (workspaces={} panes={} lines={} pending={} panels: {}; inactive panes respawn on first switch)",
                         summary.workspaces,
                         summary.panes,
                         summary.scrollback_lines,
                         summary.pending,
-                        summary.panels.records,
-                        summary.panels.configured
+                        summary.panels
                     )
                 });
                 true

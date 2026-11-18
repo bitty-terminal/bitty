@@ -76,7 +76,10 @@ pub struct WorkspaceSlot {
     /// Not persisted: [`WorkspaceSnapshot::seq`](crate::WorkspaceSnapshot::seq)
     /// carries no id, and session restore mints a fresh slot id instead of
     /// reconstructing one from the snapshot index or `seq`. The restore path's
-    /// index-to-id resolution therefore remains open (OQ-084 B-2).
+    /// index-to-id resolution is the persisted workspace ordinal: a panel record
+    /// names `1..=n` of the persisted session and the restore resolves it to the
+    /// slot at that index, then attributes the restored container to this id
+    /// (OQ-084 B-2).
     pub id: WorkspaceId,
     /// Creation sequence (stable identity across index shifts).
     pub seq: u64,

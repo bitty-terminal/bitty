@@ -51,6 +51,7 @@ fn manifest(id: &str, capability: Option<&str>, host: Option<(&str, u16)>) -> Pl
         ids.insert(CapabilityId::parse(capability).expect("valid capability"));
     }
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("valid plugin id"),
             name: "Acceptance plugin".to_string(),

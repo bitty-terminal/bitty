@@ -90,6 +90,7 @@ pub fn shell_integration_manifest() -> PluginManifest {
     caps.ids
         .insert(CapabilityId::parse("terminal.semantic-read").expect("known capability"));
     PluginManifest {
+        panel_provider: None,
         identity: bundled_identity(
             "bitty-terminal.shell-integration",
             "Shell Integration",

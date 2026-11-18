@@ -52,6 +52,7 @@ fn test_workspace_manifest() -> PluginManifest {
     })
     .collect();
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: bitty_plugin_host::PluginId::new("bitty-terminal.workspace")
                 .expect("test plugin id must be valid"),

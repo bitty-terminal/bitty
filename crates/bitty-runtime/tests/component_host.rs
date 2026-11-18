@@ -129,6 +129,7 @@ fn plugin_manifest(id: &str, network_capability: Option<&str>) -> PluginManifest
         ids.insert(CapabilityId::parse(capability).expect("valid capability"));
     }
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("valid plugin id"),
             name: "Component test".to_string(),
@@ -565,6 +566,7 @@ fn real_bitty_net_request() {
     let plugin = "acme.net-test";
     let capability = format!("network.connect:127.0.0.1:{port}");
     let manifest = PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(plugin).expect("valid id"),
             name: "Net test".to_string(),

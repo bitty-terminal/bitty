@@ -81,6 +81,17 @@ pub const CMD_SCHEMA_MAX_DEPTH: usize = 16;
 pub const MAX_NEXT_STEPS: usize = 8;
 /// Maximum bytes of one `[hints] next_steps` entry.
 pub const MAX_NEXT_STEP_BYTES: usize = 512;
+/// Maximum panel kinds one `[panel.provider]` declaration may name.
+///
+/// Mirrors `bitty_runtime::registry::MAX_PROVIDER_TYPES` (8), the registry-side
+/// bound the declaration is later registered under; the two are kept equal so a
+/// manifest that parses here can never be refused there for its size alone. The
+/// closed kind vocabulary itself lives in `bitty_ui::panel::PanelType`, which
+/// this crate does not depend on — the runtime's manifest reader maps the names
+/// onto it and refuses a name it cannot map.
+pub const MAX_PANEL_PROVIDER_TYPES: usize = 8;
+/// Maximum bytes of one panel kind name in a `[panel.provider]` declaration.
+pub const MAX_PANEL_PROVIDER_TYPE_LEN: usize = 32;
 
 // ── plugin id ────────────────────────────────────────────────────────────
 
@@ -2461,6 +2472,111 @@ pub struct SchemaSummary {
     pub properties: Vec<String>,
 }
 
+/// Provider-contract declaration (`[panel.provider]`, bitty#3243).
+///
+/// A plugin that drives panels declares two facts here: the provider contract
+/// version it speaks, and the panel kinds it drives. The runtime's manifest
+/// reader (`bitty_runtime::plugin_runtime::manifest_toml`) parses the section
+/// and maps the kind names onto the closed `PanelType` vocabulary, so this
+/// crate's shape stays independent of the UI model.
+///
+/// # Why the declaration is not in the grant hash
+///
+/// A declaration is a *contract statement*, not authority: the authority is the
+/// `panel.provider` capability, which does enter
+/// [`PluginManifest::canonical_bytes`]. A declaration cannot widen a grant —
+/// the worst it can do is name kinds, and every kind a provider may create is
+/// already gated by `panel.create` at the call edge — while a *higher* contract
+/// version can only make the runtime stricter (it refuses to bind a panel to a
+/// provider whose contract it cannot read). Adding or changing one therefore
+/// never invalidates the grant pin, exactly like `[settings]` and
+/// `[hints] next_steps`. Validation still fails closed: a declaration without
+/// the `panel.provider` capability request is refused, so a manifest can never
+/// describe provider behaviour it never asked to be allowed to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelProviderDeclaration {
+    /// Provider contract version the plugin speaks.
+    ///
+    /// `1` is the contract the runtime reads today
+    /// (`PROVIDER_MANIFEST_VERSION_V1`); a version above it is admitted at
+    /// registration and refuses every bind, so the restored container presents
+    /// `incompatible` instead of a grant set the runtime cannot interpret.
+    pub contract: u32,
+    /// Panel kinds the plugin drives, in declaration order.
+    ///
+    /// Canonical lowercase names of the closed kind vocabulary
+    /// (`terminal`, `rich`, `browser`, `helper`, `canvas`). `terminal` is
+    /// refused: a PTY is the session's, never a provider's.
+    pub types: Vec<String>,
+}
+
+impl PanelProviderDeclaration {
+    /// Validate this declaration as untrusted input (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// [`PluginError`] naming the first violation: contract `0` (not a schema
+    /// version), an empty or oversized kind list, a malformed, overlong, or
+    /// duplicated kind name, the `terminal` kind, or a declaration in a
+    /// manifest that does not request the `panel.provider` capability.
+    pub fn validate(&self) -> Result<(), PluginError> {
+        if self.contract == 0 {
+            return Err(PluginError::manifest(
+                "panel.provider.contract",
+                "provider contract version must be at least 1",
+            ));
+        }
+        if self.types.is_empty() {
+            return Err(PluginError::manifest(
+                "panel.provider.types",
+                "a provider declaration must name at least one panel type",
+            ));
+        }
+        if self.types.len() > MAX_PANEL_PROVIDER_TYPES {
+            return Err(PluginError::LimitExceeded {
+                field: "panel.provider.types".to_string(),
+                limit: MAX_PANEL_PROVIDER_TYPES,
+                actual: self.types.len(),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for panel_type in &self.types {
+            if panel_type.is_empty() || panel_type.len() > MAX_PANEL_PROVIDER_TYPE_LEN {
+                return Err(PluginError::manifest(
+                    "panel.provider.types",
+                    format!("panel type names must be 1..={MAX_PANEL_PROVIDER_TYPE_LEN} bytes"),
+                ));
+            }
+            let shaped = panel_type
+                .bytes()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase())
+                && panel_type.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                });
+            if !shaped {
+                return Err(PluginError::manifest(
+                    "panel.provider.types",
+                    format!("panel type '{panel_type}' must match [a-z][a-z0-9_-]*"),
+                ));
+            }
+            if panel_type == "terminal" {
+                return Err(PluginError::manifest(
+                    "panel.provider.types",
+                    "the terminal kind is the session's, not a provider's",
+                ));
+            }
+            if !seen.insert(panel_type.clone()) {
+                return Err(PluginError::Duplicate {
+                    kind: "panel-provider-type".to_string(),
+                    value: panel_type.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The full candidate manifest for `bitty-plugin.toml`.
 ///
 /// This is the in-memory, already-parsed shape. TOML parsing itself is
@@ -2515,6 +2631,18 @@ pub struct PluginManifest {
     /// [`PluginManifest::canonical_bytes`]: adding or changing a hint
     /// never invalidates the grant pin bound to the hash.
     pub next_steps: Vec<String>,
+    /// Provider-contract declaration (`[panel.provider]`, bitty#3243).
+    ///
+    /// Present only when the plugin drives panels and says so. Absent is the
+    /// shipped default and keeps the pre-existing behaviour byte for byte: the
+    /// composition root then mints a provider descriptor from what it observes
+    /// driving a container, at the contract version this runtime reads.
+    ///
+    /// Like [`PluginManifest::settings`] and [`PluginManifest::next_steps`] it
+    /// stays out of [`PluginManifest::canonical_bytes`]: a declaration states a
+    /// contract, it does not grant authority, so adding or changing one never
+    /// invalidates the grant pin (see [`PanelProviderDeclaration`]).
+    pub panel_provider: Option<PanelProviderDeclaration>,
     /// Declared source pin (`[source] sha256`, bitty#2069).
     ///
     /// Lowercase-hex SHA-256 of the plugin's module tree, computed exactly like
@@ -2538,9 +2666,10 @@ impl PluginManifest {
     /// interface schemas and backing capability heads), required services, Layer-2 `tools`
     /// declarations, structured `network.egress` destinations, lazy command
     /// declarations (with schemas), and `[limits]`
-    /// budgets. Display-only planes stay out: `[settings]` declarations and
-    /// `[hints] next_steps` never enter the hash, so adding or changing one
-    /// never invalidates the grant pin. Used to bind grant records to the exact
+    /// budgets. Display-only planes stay out: `[settings]` declarations,
+    /// `[hints] next_steps`, and the `[panel.provider]` contract declaration
+    /// never enter the hash, so adding or changing one never invalidates the
+    /// grant pin. Used to bind grant records to the exact
     /// manifest that was approved (`hash(manifest) == record.manifest_hash`).
     /// Raising `tools.<name>.required` from `false` to `true` changes the hash
     /// and is a capability increase whose grant must be re-confirmed.
@@ -2944,6 +3073,28 @@ impl PluginManifest {
             }
         }
 
+        // Provider-contract declaration (`[panel.provider]`, bitty#3243): the
+        // contract version the plugin speaks and the kinds it drives. Present
+        // only for plugins that ask for `panel.provider`; a declaration without
+        // that request is refused, so a manifest cannot describe provider
+        // behaviour it never asked to be allowed to perform. Contract metadata
+        // only — it never enters `canonical_bytes` (see
+        // [`PanelProviderDeclaration`]).
+        if let Some(declaration) = &self.panel_provider {
+            declaration.validate()?;
+            let requests_provider = self
+                .capabilities
+                .ids
+                .iter()
+                .any(|id| id.as_str() == "panel.provider");
+            if !requests_provider {
+                return Err(PluginError::manifest(
+                    "panel.provider",
+                    "a provider declaration requires the 'panel.provider' capability request",
+                ));
+            }
+        }
+
         // Source pin (`[source] sha256`, bitty#2069): exactly one lowercase-hex
         // SHA-256. Shape is validated here; the value is verified against the
         // staged module tree by the installer, never trusted as a claim.
@@ -3208,6 +3359,7 @@ mod tests {
 
     fn minimal_manifest(id: &str) -> PluginManifest {
         PluginManifest {
+            panel_provider: None,
             identity: minimal_identity(id),
             compat: Compat {
                 bitty: Some(">=0.5,<1.0".to_string()),

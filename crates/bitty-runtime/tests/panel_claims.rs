@@ -77,6 +77,7 @@ fn lazy_manifest(id: &str) -> PluginManifest {
     caps.ids
         .insert(CapabilityId::parse("ui.overlay.focus").expect("probe capability parses"));
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("probe id parses"),
             name: "PanelProbe".to_string(),

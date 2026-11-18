@@ -1092,6 +1092,7 @@ mod tests {
         // The grant intersects the manifest's declared capabilities, so the
         // fixture plugin must declare `clipboard.write` first.
         let manifest = PluginManifest {
+            panel_provider: None,
             identity: PluginIdentity {
                 id: plugin_id.clone(),
                 name: "Test".to_string(),

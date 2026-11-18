@@ -1351,6 +1351,7 @@ mod tests {
 
     fn minimal_manifest(id: &str, events: Vec<&str>) -> PluginManifest {
         PluginManifest {
+            panel_provider: None,
             identity: PluginIdentity {
                 id: PluginId::new(id).unwrap(),
                 name: "Test".to_string(),

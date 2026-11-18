@@ -54,8 +54,8 @@
 //!
 //! # Reachability of the skew gate
 //!
-//! Row 13's restore half now has a producer chain for its two convergence
-//! inputs, and one gap remains, stated plainly:
+//! Row 13's restore half has a producer chain for both of its convergence
+//! inputs:
 //!
 //! - **The records.** They have a production producer:
 //!   [`Runtime::save_session_to_path`](Runtime::save_session_to_path) encodes a
@@ -63,16 +63,20 @@
 //!   [`Runtime::load_session_from_path`](Runtime::load_session_from_path)
 //!   decodes it and configures the records before the restore plans them
 //!   (`crate::runtime::panel_persist`, bitty#3243).
-//! - **The provider manifest.** `PanelRuntime::register_panel_provider`
-//!   (`crates/bitty-runtime/src/registry/host.rs`) still has no production
-//!   caller: no plugin package carries a provider-contract declaration, so
-//!   [`PanelRuntime::provider_manifest`] answers `None` for every owner in a
-//!   shipped binary and `provider_contract_outruns_runtime` remains constant
-//!   `false` there. `panel.provider` is a capability token, not a declaration,
-//!   and the plugin manifest grammar
-//!   (`crates/bitty-runtime/src/plugin_runtime/manifest_toml.rs`) accepts no
-//!   provider-contract field, so no activation point could register one. That
-//!   half is the open residual of bitty#3243.
+//! - **The provider manifest.** The composition root registers one per plugin
+//!   it observed driving a container with `panel.provider` granted, at the host
+//!   install ([`Runtime::install_shared_scene_host`], see
+//!   `Runtime::register_live_panel_providers`), and installs the host-backed
+//!   [`HostProviderDriverSource`] for the restore to ask. A record is therefore
+//!   matched against a descriptor this process registered for its container
+//!   kind, and a descriptor declaring a contract newer than this runtime reads
+//!   presents `incompatible` instead of being treated as absent. What no in-tree
+//!   declaration source can do yet is *declare* a version above
+//!   [`PROVIDER_MANIFEST_VERSION_V1`]:
+//!   the descriptors minted here attest the contract the container was created
+//!   under, and the plugin package grammar carries no provider-contract field
+//!   (`crate::plugin_runtime::manifest_toml`). That declaration is the remaining
+//!   residual of bitty#3243.
 //! - **The panel host at restore time.** A restore that finds no host no
 //!   longer drops its records: the planned step is deferred and committed when
 //!   the composition root installs the host
@@ -123,7 +127,7 @@
 //! refused restore leaves them in place, and the per-record outcome stays
 //! readable through [`Runtime::panel_restore_report`] afterwards.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bitty_plugin_host::PluginId;
 use bitty_ui::panel_recovery::PlaceholderReason;
@@ -133,11 +137,12 @@ use bitty_ui::{
 };
 
 use crate::registry::{
-    PanelError, PanelHandle, PanelId, PanelProviderManifest, PanelRuntime, PanelState, PanelType,
-    WorkspaceId,
+    PANEL_PROVIDER_CAPABILITY, PROVIDER_MANIFEST_VERSION_V1, PanelError, PanelHandle, PanelId,
+    PanelProviderManifest, PanelRuntime, PanelState, PanelType, WorkspaceId,
 };
 
 use super::Runtime;
+use super::panel_persist::panel_type_of_persistent_id;
 
 // ---------------------------------------------------------------------------
 // Inputs: the record plus the facts it cannot carry
@@ -175,7 +180,7 @@ pub enum PanelDriverAnswer {
     /// the persisted record, which the host decides; and the provider manifest
     /// the driver registered may declare a schema newer than this runtime reads,
     /// which the restore observes for itself
-    /// ([`PROVIDER_MANIFEST_VERSION_V1`](crate::registry::PROVIDER_MANIFEST_VERSION_V1))
+    /// ([`PROVIDER_MANIFEST_VERSION_V1`])
     /// and refuses to bind through.
     Older,
 }
@@ -242,21 +247,135 @@ impl PanelRestoreBinding {
 /// supplies them through this port instead of Core guessing them from a title
 /// or a key.
 ///
-/// The port is asked once per decoded record on load
+/// `panel_type` is Core's own derivation from the durable key (the save side
+/// mints `<panel type>-<allocation id>`), so a source that knows better may
+/// correct it; the answer carries both halves together, because a record
+/// restored with its kind from one resolution and its driver from another is a
+/// mismatch no later edge could detect.
+///
+/// The port is asked once per decoded record whose key names a container kind
 /// ([`Runtime::load_session_from_path`](Runtime::load_session_from_path)), and
-/// its answer becomes the record's [`PanelRestoreInput`]. It must be installed
-/// before the session restore runs; a runtime without one restores every record
-/// as [`PanelDriverAnswer::Missing`], which retains the container with the
+/// again every time a restore plans those records
+/// (`Runtime::plan_panel_restore`) — including the deferred commit a host
+/// install runs, which is the first moment the shipped order has a panel host
+/// to answer from. A runtime without a port restores every record as
+/// [`PanelDriverAnswer::Missing`], which retains the container with the
 /// `unloaded` placeholder rather than resurrecting a panel no installed driver
 /// can serve.
 ///
-/// No production implementation is landed yet: the plugin host has no
-/// provider-registration point to build one from (bitty#3243 residual), so a
-/// shipped process is the `Missing` case above. The port exists so that slice
-/// adds an implementation rather than a second code path.
+/// [`HostProviderDriverSource`] is the production implementation: the
+/// composition root installs it when it installs the panel host, so a record is
+/// matched against the provider descriptor this process registered for its
+/// container kind.
 pub trait PanelRestoreDriverSource: std::fmt::Debug {
-    /// What `record` restores as in this process.
-    fn resolve(&self, record: &PersistedPanel) -> PanelRestoreBinding;
+    /// What `record`, which the durable key names as `panel_type`, restores as
+    /// in this process.
+    fn resolve(&self, record: &PersistedPanel, panel_type: PanelType) -> PanelRestoreBinding;
+}
+
+/// The production [`PanelRestoreDriverSource`]: answers from the provider
+/// descriptors installed on the panel host (bitty#3243).
+///
+/// A record's container kind is matched against
+/// [`PanelRuntime::providers_for_type`] — the descriptors the composition root
+/// registered for the plugins this process observed driving containers of that
+/// kind (`Runtime::register_live_panel_providers`) — and the answer is:
+///
+/// - [`PanelDriverAnswer::Missing`] when no provider declares the kind, or when
+///   more than one does: an ambiguity is not a fact a restore may resolve by
+///   picking one.
+/// - [`PanelDriverAnswer::Older`] when the one provider that declares the kind
+///   declares a contract newer than this runtime reads
+///   ([`PROVIDER_MANIFEST_VERSION_V1`]).
+///   The container is retained and presents `incompatible` (bitty#3239 row 13).
+/// - [`PanelDriverAnswer::Installed`] with the resolution this process already
+///   committed for a live container of the same owner and kind. That is the
+///   driver's own `panel.*` set, read back from the registry, so a first bind on
+///   the restored container commits exactly what the runtime granted the same
+///   owner here: nothing is widened, and nothing is invented from the record.
+/// - [`PanelDriverAnswer::Missing`] when a readable descriptor exists but this
+///   process holds no live container of that owner and kind to read a resolution
+///   from. A first bind has no predecessor ceiling and would have to commit a
+///   grant set out of thin air; `unloaded` is the honest answer instead.
+pub struct HostProviderDriverSource {
+    host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>,
+}
+
+impl HostProviderDriverSource {
+    /// Answers from `host`'s provider registry and live containers.
+    #[must_use]
+    pub fn new(host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>) -> Self {
+        Self { host }
+    }
+}
+
+impl std::fmt::Debug for HostProviderDriverSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostProviderDriverSource").finish()
+    }
+}
+
+impl PanelRestoreDriverSource for HostProviderDriverSource {
+    fn resolve(&self, _record: &PersistedPanel, panel_type: PanelType) -> PanelRestoreBinding {
+        let missing = || PanelRestoreBinding::new(panel_type, PanelDriverAnswer::Missing);
+        // A host borrowed elsewhere cannot be read: the record keeps the
+        // `unloaded` answer rather than waiting on a borrow a restore may not
+        // take (the commit itself drops the record as `PanelHostBusy`).
+        let Ok(host) = self.host.try_borrow() else {
+            return missing();
+        };
+        let owners = host.providers_for_type(panel_type);
+        let [owner] = owners.as_slice() else {
+            // None declares the kind, or several do: no single driver to name.
+            return missing();
+        };
+        let Some(manifest) = host.provider_manifest(owner) else {
+            return missing();
+        };
+        if manifest.requires_newer_runtime() {
+            // The declaration is admitted (that is what makes the skew
+            // observable) and nothing may bind through it.
+            return PanelRestoreBinding::new(panel_type, PanelDriverAnswer::Older);
+        }
+        let Some(resolution) = live_resolution(&host, owner, panel_type) else {
+            return missing();
+        };
+        let Ok(owner) = PluginId::new(owner) else {
+            return missing();
+        };
+        PanelRestoreBinding::new(
+            panel_type,
+            PanelDriverAnswer::Installed {
+                owner,
+                resolution,
+                consented: BTreeSet::new(),
+            },
+        )
+    }
+}
+
+/// The `panel.*` grant set `host` already committed for a live container of
+/// `owner` and `kind`, if it holds one.
+///
+/// Read back from the registry ([`PanelRuntime::panel_granted_capabilities`]),
+/// never assembled from a catalog: the set is exactly what a bind of the same
+/// owner and kind earned in this process.
+fn live_resolution(
+    host: &PanelRuntime,
+    owner: &str,
+    panel_type: PanelType,
+) -> Option<BTreeSet<String>> {
+    host.live_panel_records()
+        .into_iter()
+        .find(|record| record.panel_type == panel_type)
+        .and_then(|record| {
+            let live_owner = record.owner?;
+            if live_owner.as_str() != owner {
+                return None;
+            }
+            host.panel_granted_capabilities(record.id, record.grant_generation)
+                .cloned()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -424,10 +543,12 @@ impl Runtime {
 
     /// Installs (or clears) the port that answers what drives a persisted record.
     ///
-    /// Installed by the composition root before the session restore, so the
-    /// records a durable manifest decodes into carry the driver facts the record
-    /// itself cannot (see [`PanelRestoreDriverSource`]). Clearing it is the
-    /// shipped state today.
+    /// Installed by the composition root when it installs the panel host
+    /// ([`Self::install_shared_scene_host`]), so the records a durable manifest
+    /// decodes into carry the driver facts the record itself cannot (see
+    /// [`PanelRestoreDriverSource`]). A composition root that installs its own
+    /// port keeps it: the host install only supplies the default
+    /// [`HostProviderDriverSource`] when none is installed.
     pub fn set_panel_restore_driver_source(
         &mut self,
         source: Option<std::rc::Rc<dyn PanelRestoreDriverSource>>,
@@ -439,6 +560,82 @@ impl Runtime {
     #[must_use]
     pub fn panel_restore_driver_source(&self) -> Option<std::rc::Rc<dyn PanelRestoreDriverSource>> {
         self.panel_restore_driver_source.clone()
+    }
+
+    /// Registers one provider descriptor per plugin this process observed
+    /// driving a live container of the installed panel host (bitty#3243,
+    /// provider-registration half).
+    ///
+    /// Called by [`Self::install_shared_scene_host`], which is the first moment
+    /// this process holds both a panel host and the containers plugins created
+    /// in it, and which runs before the deferred panel step commits — so a
+    /// restored record is matched against a descriptor that exists.
+    ///
+    /// Every fact comes from the host: the owner a container is bound to
+    /// ([`PanelRuntime::live_panel_records`]), the kinds that owner drives, and
+    /// whether the container's committed grant set holds
+    /// [`PANEL_PROVIDER_CAPABILITY`] ([`PanelRuntime::panel_granted_capabilities`]).
+    /// A plugin that drives a container without the provider capability is not
+    /// declaring itself a provider, so it mints no descriptor; an owner that
+    /// already has one keeps it, because this is an observation, not a reload.
+    ///
+    /// The descriptor declares [`PROVIDER_MANIFEST_VERSION_V1`]: this runtime
+    /// can attest the contract it read a container under, and nothing stronger.
+    /// A descriptor declaring a newer contract is admitted by the registry and
+    /// still presents `incompatible` at the bind edge; no in-tree declaration
+    /// source can mint one yet (bitty#3243 residual, the package grammar carries
+    /// no provider-contract field).
+    ///
+    /// Returns how many descriptors were registered. A host borrowed elsewhere is
+    /// not observed (`0`): a save or a restore holding the host is not a world
+    /// this call may describe.
+    pub(super) fn register_live_panel_providers(&mut self) -> usize {
+        let Some(host) = self.scene_host.clone() else {
+            return 0;
+        };
+        // Grouped by owner: a descriptor declares the whole observed kind set at
+        // once, because a second registration for the same owner is refused.
+        let mut declared: BTreeMap<String, Vec<PanelType>> = BTreeMap::new();
+        {
+            let Ok(host) = host.try_borrow() else {
+                return 0;
+            };
+            for record in host.live_panel_records() {
+                let Some(owner) = record.owner else {
+                    continue;
+                };
+                // Terminal containers are the PTY path's, never a provider's.
+                if record.panel_type == PanelType::Terminal {
+                    continue;
+                }
+                let declares = host
+                    .panel_granted_capabilities(record.id, record.grant_generation)
+                    .is_some_and(|grants| grants.contains(PANEL_PROVIDER_CAPABILITY));
+                if !declares {
+                    continue;
+                }
+                let kinds = declared.entry(owner.as_str().to_string()).or_default();
+                if !kinds.contains(&record.panel_type) {
+                    kinds.push(record.panel_type);
+                }
+            }
+        }
+        let mut registered = 0;
+        for (owner, kinds) in declared {
+            let Ok(manifest) =
+                PanelProviderManifest::parse(&owner, kinds, PROVIDER_MANIFEST_VERSION_V1)
+            else {
+                // An owner id the provider grammar refuses declares nothing;
+                // its containers still restore, as `unloaded`.
+                continue;
+            };
+            let outcome =
+                self.with_scene_host_mut(|host| host.register_panel_provider(manifest, true));
+            if matches!(outcome, Some(Ok(_))) {
+                registered += 1;
+            }
+        }
+        registered
     }
 
     /// Whether a restore's panel records are waiting for a panel host.
@@ -473,12 +670,19 @@ impl Runtime {
     /// Pure: nothing here touches the layout, the focus, a pane session, or the
     /// panel registry. It is the pre-mutation half of the step, so a refusal
     /// ([`ManifestError`]) leaves the runtime exactly as it was.
+    ///
+    /// The driver bindings are resolved here rather than taken from the answers
+    /// recorded at load: in the shipped order the load runs before the panel
+    /// host exists, so the facts a binding needs arrive later, and a deferred
+    /// commit planned against the load-time answers would restore every record
+    /// as if no driver were installed.
     pub(super) fn plan_panel_restore(
         &self,
         restored_slots: usize,
     ) -> Result<Vec<PlannedPanel>, ManifestError> {
+        let inputs = self.resolved_panel_restore_inputs();
         let mut manifest = RestartManifest::new();
-        for input in &self.panel_restore_inputs {
+        for input in &inputs {
             // Over-cap record sets fail closed here, before any mutation, with
             // the same typed error a decoded document would produce.
             manifest.push(input.record.clone())?;
@@ -487,7 +691,7 @@ impl Runtime {
         let records = plan_restore(&manifest, self.panel_restore_policy)?;
         let mut planned = Vec::with_capacity(records.len());
         for (index, record) in records.into_iter().enumerate() {
-            let Some(input) = self.panel_restore_inputs.get(index) else {
+            let Some(input) = inputs.get(index) else {
                 continue;
             };
             planned.push(PlannedPanel {
@@ -498,6 +702,38 @@ impl Runtime {
             });
         }
         Ok(planned)
+    }
+
+    /// The configured records with their driver bindings resolved through the
+    /// installed port.
+    ///
+    /// The load side resolves the bindings of the records it decodes, and this
+    /// resolves them again because the port's answer is a function of the state
+    /// at the moment it is asked: a deferred commit runs after the composition
+    /// root installed the panel host, which is when the provider descriptors
+    /// exist. A record whose durable key names no container kind is left
+    /// exactly as configured — the load side already refuses to configure one,
+    /// and a source may not invent a kind for it.
+    fn resolved_panel_restore_inputs(&self) -> Vec<PanelRestoreInput> {
+        let Some(source) = self.panel_restore_driver_source.clone() else {
+            return self.panel_restore_inputs.clone();
+        };
+        self.panel_restore_inputs
+            .iter()
+            .map(
+                |input| match panel_type_of_persistent_id(&input.record.key.persistent) {
+                    Some(panel_type) => {
+                        let binding = source.resolve(&input.record, panel_type);
+                        PanelRestoreInput::new(
+                            input.record.clone(),
+                            binding.panel_type,
+                            binding.driver,
+                        )
+                    }
+                    None => input.clone(),
+                },
+            )
+            .collect()
     }
 
     /// Releases every container attributed to a workspace of the outgoing world.
@@ -725,7 +961,7 @@ fn restored_slot_of(persisted_workspace: u64, restored_slots: usize) -> Option<u
 /// the restore input: a driver that answers
 /// [`PanelDriverAnswer::Installed`] for a container whose provider manifest
 /// declares a schema above
-/// [`PROVIDER_MANIFEST_VERSION_V1`](crate::registry::PROVIDER_MANIFEST_VERSION_V1)
+/// [`PROVIDER_MANIFEST_VERSION_V1`]
 /// cannot be bound — this runtime cannot read what the provider would commit —
 /// so the container keeps a `incompatible` placeholder rather than a grant set
 /// nobody can interpret (bitty#3239 row 13, Decision E rule 3).
@@ -734,12 +970,12 @@ fn restored_slot_of(persisted_workspace: u64, restored_slots: usize) -> Option<u
 /// driven by a plugin that never declares `panel.provider`, and their first
 /// bind is unchanged.
 ///
-/// Constant `false` in a shipped binary today: no production caller registers a
-/// provider manifest, because a plugin package carries no provider-contract
-/// declaration to register (bitty#3243 residual). The restore records that feed
-/// this predicate do have a production producer, so the predicate is evaluated
-/// on every restored record of a shipped restore — it just has no registered
-/// manifest to answer `true` for until that half lands.
+/// Evaluated for every restored record whose driver answers `Installed`. The
+/// descriptors this process mints at the host install
+/// (`Runtime::register_live_panel_providers`) declare the version this runtime
+/// reads, so they answer `false`; a descriptor declaring a newer contract is
+/// admitted by the registry, and this predicate is the gate that keeps the
+/// container away from a bind this runtime could not interpret.
 fn provider_contract_outruns_runtime(host: &PanelRuntime, owner: &PluginId) -> bool {
     host.provider_manifest(owner.as_str())
         .is_some_and(PanelProviderManifest::requires_newer_runtime)

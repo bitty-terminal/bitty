@@ -1179,10 +1179,17 @@ impl PanelRuntime {
     /// Duplicate owners are rejected, not shadowed; each registration mints a
     /// fresh generation so reload swaps provider content atomically.
     ///
-    /// No production caller yet: this is reached only from
-    /// `crates/bitty-runtime/tests/`, since a plugin package declares
-    /// `panel.provider` as a capability token and carries no provider manifest.
-    /// The registration point is part of the bitty#3239 row 13 follow-up.
+    /// The production caller is
+    /// [`Runtime::install_shared_scene_host`](crate::Runtime::install_shared_scene_host)
+    /// (bitty#3243): when the composition root installs the panel host, the
+    /// runtime mints one descriptor per plugin that drives a live container of
+    /// that host and whose committed grant set holds `panel.provider`. The
+    /// descriptor declares the container kinds the plugin was observed driving
+    /// and the contract this runtime reads, because an observation under this
+    /// runtime's own ABI is the strongest declaration available — the plugin
+    /// package grammar carries no provider-contract field
+    /// (`crate::plugin_runtime::manifest_toml`, bitty#3243 residual). Reload and
+    /// plugin-declared descriptors stay this method's business.
     ///
     /// # Errors
     ///
@@ -1223,14 +1230,32 @@ impl PanelRuntime {
     /// the skew and present `incompatible` rather than treating the provider as
     /// absent (bitty#3239 row 13).
     ///
-    /// Answers `None` for every owner in a shipped binary: [`Self::register_panel_provider`]
-    /// has no caller outside `crates/bitty-runtime/tests/`, because a plugin
-    /// package declares `panel.provider` as a capability token and carries no
-    /// provider manifest to register. The reader is therefore a seam until that
-    /// producer exists (bitty#3239 row 13 stays open).
+    /// Answers `Some` for the plugins the composition root observed driving a
+    /// live container with `panel.provider` granted
+    /// ([`Runtime::install_shared_scene_host`](crate::Runtime::install_shared_scene_host)),
+    /// and `None` for every other owner: a plugin that never created a panel in
+    /// this process declares nothing, and this reader does not guess a
+    /// declaration for it (bitty#3243).
     #[must_use]
     pub fn provider_manifest(&self, owner: &str) -> Option<&PanelProviderManifest> {
         self.providers.get(owner)
+    }
+
+    /// The committed panel-scoped grant set of `panel` when `generation` is its
+    /// binding key (see [`PanelRegistry::panel_granted_capabilities`]).
+    ///
+    /// Read-only. The provider-registration point
+    /// ([`Runtime::install_shared_scene_host`](crate::Runtime::install_shared_scene_host))
+    /// reads it to decide whether a live container's driver holds
+    /// `panel.provider`, and the restore driver source reads it to carry a
+    /// driver's resolution onto the container it restores.
+    #[must_use]
+    pub fn panel_granted_capabilities(
+        &self,
+        panel: super::panel::PanelId,
+        generation: Generation,
+    ) -> Option<&BTreeSet<String>> {
+        self.registry.panel_granted_capabilities(panel, generation)
     }
 
     /// Registration generation for `owner`, if registered.

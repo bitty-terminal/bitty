@@ -560,6 +560,12 @@ pub struct SessionRestoreSummary {
     pub scrollback_lines: usize,
     /// Panes stashed for hydration when their shell spawns.
     pub pending: usize,
+    /// What the panel restart manifest beside the session file carried
+    /// (bitty#3243). A clean start for panels only: `present == false` means
+    /// the session restored and no panel record was configured, and a lower
+    /// `configured` than `records` means some record's durable key named no
+    /// container kind this runtime mints.
+    pub panels: super::panel_persist::PanelManifestLoad,
 }
 
 /// Counts from a successful save (no contents, safe to log).
@@ -1482,6 +1488,10 @@ impl Runtime {
             panes,
             scrollback_lines,
             pending,
+            // Replaced by `load_session_from_path`, which is the only caller
+            // that decoded a manifest; a direct `apply_session_snapshot` caller
+            // saw none.
+            panels: super::panel_persist::PanelManifestLoad::default(),
         })
     }
 
@@ -1743,7 +1753,10 @@ impl Runtime {
     /// the panel step instead of arriving after the restore that consumes them.
     /// It is total and never fatal — see
     /// [`Runtime::load_panel_manifest_from_path`] — so a missing or refused
-    /// manifest costs the panels' containers, never the session.
+    /// manifest costs the panels' containers, never the session. What it found
+    /// is consumed here into [`SessionRestoreSummary::panels`]: it is the
+    /// restore handoff, and a caller that logs the summary reports the panel
+    /// outcome instead of dropping it.
     pub fn load_session_from_path(
         &mut self,
         path: &Path,
@@ -1752,8 +1765,10 @@ impl Runtime {
         let bytes = backend.load_session_bytes(path)?;
         let snap = backend.decode_snapshot(&bytes)?;
         // bitty#3243: the load-side producer of the panel restore records.
-        self.load_panel_manifest_from_path(path);
-        self.apply_session_snapshot(&snap)
+        let panels = self.load_panel_manifest_from_path(path);
+        let mut summary = self.apply_session_snapshot(&snap)?;
+        summary.panels = panels;
+        Ok(summary)
     }
 
     /// Startup restore with injected environment roots (hermetic twin for
@@ -2158,6 +2173,7 @@ mod tests {
             panes: 1,
             scrollback_lines: 0,
             pending: 0,
+            panels: crate::runtime::panel_persist::PanelManifestLoad::default(),
         };
         assert!(matches!(
             startup_outcome_from_load(Ok(summary)),

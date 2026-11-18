@@ -226,7 +226,7 @@ struct Drivers {
 }
 
 impl PanelRestoreDriverSource for Drivers {
-    fn resolve(&self, _record: &PersistedPanel) -> PanelRestoreBinding {
+    fn resolve(&self, _record: &PersistedPanel, _panel_type: PanelType) -> PanelRestoreBinding {
         PanelRestoreBinding::new(
             PanelType::Helper,
             PanelDriverAnswer::Installed {

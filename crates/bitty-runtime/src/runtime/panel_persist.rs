@@ -12,7 +12,7 @@
 //! - **Save.** [`Runtime::save_panel_manifest_to_path`] walks the installed panel
 //!   host once
 //!   ([`PanelRuntime::live_panel_records`](crate::registry::PanelRuntime::live_panel_records)),
-//!   mints one durable record per live container, and commits
+//!   mints one durable record per restorable live container, and commits
 //!   [`bitty_ui::encode_manifest`]'s document to a sidecar path beside the
 //!   session file. It uses the same
 //!   [`SessionFileBackend`](super::session::SessionFileBackend) as the session
@@ -44,8 +44,10 @@
 //!
 //! A missing, unreadable, or rejected document is a clean start **for panels
 //! only**: the session restores, the panel step plans zero records, and the
-//! caller sees it in [`PanelManifestLoad::present`]. A rejected *session* still
-//! refuses the whole restore, unchanged.
+//! answer is surfaced on the restore summary
+//! ([`SessionRestoreSummary::panels`](super::session::SessionRestoreSummary))
+//! rather than dropped. A rejected *session* still refuses the whole restore,
+//! unchanged.
 //!
 //! # What a record carries, and what it cannot
 //!
@@ -63,12 +65,13 @@
 //!   **not** restored: a record is not a data channel, and a container allocated
 //!   as the wrong kind would present chrome for a panel nobody asked for.
 //! - **The driver answer** comes from the port the composition root installs
-//!   ([`crate::PanelRestoreDriverSource`]). With no port installed every record
-//!   resolves to [`PanelDriverAnswer::Missing`], which is the shipped case: the
-//!   container is restored and presents `unloaded` instead of the panel
-//!   disappearing. Mapping a record to its installed plugin needs the owner
-//!   field `RFC-OQ-9` has not decided yet, and that is the open half of
-//!   bitty#3243.
+//!   ([`crate::PanelRestoreDriverSource`]). The host install supplies the
+//!   production implementation (`HostProviderDriverSource`), which matches the
+//!   record's container kind against the provider descriptors this process
+//!   registered for the plugins it observed driving containers. A record whose
+//!   kind no descriptor declares resolves to [`PanelDriverAnswer::Missing`],
+//!   which restores its container with `unloaded` rather than making the panel
+//!   disappear.
 //!
 //! # Workspace ordinals
 //!
@@ -193,6 +196,11 @@ impl Runtime {
     ///
     /// Records are resolved to [`PanelRestoreInput`]s here, once per record,
     /// through the installed [`super::panel_restore::PanelRestoreDriverSource`].
+    /// The restore resolves them again when it plans them
+    /// (`Runtime::apply_deferred_panel_restore` and the eager path both plan
+    /// through the same call): at load the panel host — and with it the provider
+    /// descriptors — does not exist yet in the shipped order, so the answers
+    /// recorded here are the ones this process could give before activation.
     pub fn load_panel_manifest_from_path(&mut self, session_path: &Path) -> PanelManifestLoad {
         let Some(backend) = self.session_backend.clone() else {
             return PanelManifestLoad::default();
@@ -299,16 +307,20 @@ impl Runtime {
     }
 
     /// Resolves one decoded record to the restore input the panel step applies.
+    ///
+    /// The container kind is Core's own derivation from the durable key, and a
+    /// record whose key names no kind this runtime mints is not configured at
+    /// all: a record is not a data channel, and a source may not invent a kind
+    /// for it. The driver answer comes from the installed port, or — with none
+    /// installed — is [`PanelDriverAnswer::Missing`].
     fn panel_restore_input_of(&self, record: &PersistedPanel) -> Option<PanelRestoreInput> {
+        let panel_type = panel_type_of_persistent_id(&record.key.persistent)?;
         let binding = match self.panel_restore_driver_source.as_ref() {
-            Some(source) => source.resolve(record),
-            // No port installed: the shipped case. The kind comes from the
-            // durable key's prefix and the driver is simply absent, so the
-            // container comes back presenting `unloaded`.
-            None => PanelRestoreBinding::new(
-                panel_type_of_persistent_id(&record.key.persistent)?,
-                PanelDriverAnswer::Missing,
-            ),
+            Some(source) => source.resolve(record, panel_type),
+            // No port installed: the kind comes from the durable key's prefix
+            // and the driver is simply absent, so the container comes back
+            // presenting `unloaded`.
+            None => PanelRestoreBinding::new(panel_type, PanelDriverAnswer::Missing),
         };
         Some(PanelRestoreInput::new(
             record.clone(),
@@ -332,7 +344,7 @@ fn persistent_id_of(record: &LivePanelRecord) -> Option<PersistentId> {
 }
 
 /// The container kind a durable key names, if this runtime mints one.
-fn panel_type_of_persistent_id(persistent: &PersistentId) -> Option<PanelType> {
+pub(super) fn panel_type_of_persistent_id(persistent: &PersistentId) -> Option<PanelType> {
     let (prefix, _) = persistent.as_str().split_once('-')?;
     PanelType::parse(prefix).filter(|panel_type| *panel_type != PanelType::Terminal)
 }

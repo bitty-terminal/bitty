@@ -206,11 +206,36 @@ impl Runtime {
     /// one out. The install runs before the first painted frame of a shipped
     /// window, so a restored container is presented with its placeholder or its
     /// first bind inside the same startup.
+    ///
+    /// The install is the composition root's provider-registration point
+    /// (bitty#3243). Before the deferred step commits it:
+    ///
+    /// 1. registers one [`PanelProviderManifest`](crate::registry::PanelProviderManifest)
+    ///    per plugin this process observed driving a live container of `host`
+    ///    with `panel.provider` granted (`Runtime::register_live_panel_providers`),
+    ///    so a restored record's container kind has a descriptor to match;
+    /// 2. installs the host-backed
+    ///    [`HostProviderDriverSource`](super::panel_restore::HostProviderDriverSource)
+    ///    as the restore driver source, unless the composition root installed its
+    ///    own port, so the record's driver answer comes from those descriptors.
+    ///
+    /// Both run before the commit, which is what makes a record restored by a
+    /// shipped process resolve to the provider that actually drives it.
     pub fn install_shared_scene_host(
         &mut self,
         host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>,
     ) {
         self.scene_host = Some(host);
+        self.register_live_panel_providers();
+        // A port the composition root installed itself is authoritative: this
+        // only supplies the default, never replaces a decision a caller made.
+        if self.panel_restore_driver_source.is_none() {
+            if let Some(host) = self.scene_host.clone() {
+                self.set_panel_restore_driver_source(Some(std::rc::Rc::new(
+                    super::panel_restore::HostProviderDriverSource::new(host),
+                )));
+            }
+        }
         self.apply_deferred_panel_restore();
         self.pending_full_redraw = true;
     }

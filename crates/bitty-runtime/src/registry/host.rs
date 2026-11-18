@@ -1150,6 +1150,29 @@ impl PanelRuntime {
         self.presentation_observations.get(&panel).copied()
     }
 
+    /// Every live container's persisted-shape facts, in `PanelId` order.
+    ///
+    /// The registry owns allocation facts; the facade owns the RUN-21 lease
+    /// entry, which is where `set_panel_description` stores a panel's title, so
+    /// the title is merged in here rather than read from the record (whose
+    /// `title` field no shipped edge writes).
+    ///
+    /// The save side of the restart manifest (bitty#3243) is the only caller: it
+    /// holds the shared handle, not the registry.
+    #[must_use]
+    pub fn live_panel_records(&self) -> Vec<super::panel::LivePanelRecord> {
+        let mut records = self.registry.live_panel_records();
+        for record in &mut records {
+            if record.title.is_none() {
+                record.title = self
+                    .leases
+                    .get(&record.id)
+                    .and_then(|entry| entry.title.clone());
+            }
+        }
+        records
+    }
+
     /// Registers a validated provider manifest behind the `panel.provider`
     /// capability gate (CW-23 surface, live through the host).
     ///

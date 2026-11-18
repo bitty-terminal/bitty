@@ -199,11 +199,19 @@ impl Runtime {
     /// panel slots (OQ-051) and hands the same `Rc` to
     /// `bitty.ui.mount`/`ui.update`; the present loop never creates a second
     /// scene store.
+    ///
+    /// This is also where a session restore's deferred panel step commits
+    /// (bitty#3243): the shipped order restores the session before the panel
+    /// host exists, so the restore defers its records rather than bounding every
+    /// one out. The install runs before the first painted frame of a shipped
+    /// window, so a restored container is presented with its placeholder or its
+    /// first bind inside the same startup.
     pub fn install_shared_scene_host(
         &mut self,
         host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>,
     ) {
         self.scene_host = Some(host);
+        self.apply_deferred_panel_restore();
         self.pending_full_redraw = true;
     }
 

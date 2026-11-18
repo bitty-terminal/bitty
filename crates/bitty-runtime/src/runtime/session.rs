@@ -1463,18 +1463,15 @@ impl Runtime {
                 }
             }
         }
-        // bitty#3239 row 14: the panel step commits inside the same restore
-        // transaction, once the restored workspaces carry their fresh
+        // bitty#3239 row 14 / bitty#3243: the panel step commits inside the same
+        // restore transaction, once the restored workspaces carry their fresh
         // `WorkspaceId`s and before the first painted frame. Every record mints
         // a fresh `PanelId`; a record whose driver is absent keeps its container
-        // with the Core-owned placeholder. The step is bounded: it reports one
-        // outcome per record and never aborts a restore whose world is already
-        // installed.
-        self.panel_restore_report = self.commit_panel_restore(planned_panels);
-        // The records are consumed by the restore that applied them: a second
-        // restore without new records applies no panels instead of minting a
-        // duplicate container for a record that already has one.
-        self.panel_restore_inputs.clear();
+        // with the Core-owned placeholder. When this runtime has no panel host
+        // yet — the shipped order activates plugins after the restore — the step
+        // is deferred instead of bounding every record out with
+        // `PanelRestoreDrop::NoPanelHost`, and the host install commits it.
+        self.apply_panel_restore(planned_panels);
         // CTX-0873: a restore can change the workspace count across one,
         // which reserves or releases the bar band.
         self.refresh_chrome_band();
@@ -1673,6 +1670,15 @@ impl Runtime {
     /// Core validation runs before any backend call, so an invalid snapshot
     /// never reaches the filesystem; the backend enforces the byte ceilings
     /// again on the way through.
+    ///
+    /// The panel restart manifest (bitty#3243) is persisted beside the session
+    /// file after it, through the same backend: the session bytes are the
+    /// authoritative document and the manifest is advisory identity, so a
+    /// manifest that cannot be written fails this call *after* the session is
+    /// already committed — the answer says so rather than pretending the pair
+    /// was atomic. A runtime whose panel host cannot be observed
+    /// ([`Runtime::capture_restart_manifest`] answering `None`) leaves the
+    /// previous manifest in place.
     pub fn save_session_to_path(&self, path: &Path) -> Result<SessionSaveSummary, SessionError> {
         let backend = self
             .session_backend
@@ -1682,6 +1688,8 @@ impl Runtime {
         validate_snapshot(&snap)?;
         let bytes = backend.encode_snapshot(&snap)?;
         backend.commit_session_bytes(path, &bytes)?;
+        // bitty#3243: the save-side producer of the panel restore records.
+        self.save_panel_manifest_to_path(path)?;
         Ok(SessionSaveSummary {
             workspaces: snap.workspaces.len(),
             panes: snap
@@ -1729,6 +1737,13 @@ impl Runtime {
     /// With no backend injected this behaves as a missing file (quiet clean
     /// start); the whole snapshot is validated again by
     /// [`Runtime::apply_session_snapshot`] before any mutation.
+    ///
+    /// The panel restart manifest beside the session file (bitty#3243) is
+    /// decoded *before* the snapshot applies, so its records are configured for
+    /// the panel step instead of arriving after the restore that consumes them.
+    /// It is total and never fatal — see
+    /// [`Runtime::load_panel_manifest_from_path`] — so a missing or refused
+    /// manifest costs the panels' containers, never the session.
     pub fn load_session_from_path(
         &mut self,
         path: &Path,
@@ -1736,6 +1751,8 @@ impl Runtime {
         let backend = self.session_backend.clone().ok_or(SessionError::NotFound)?;
         let bytes = backend.load_session_bytes(path)?;
         let snap = backend.decode_snapshot(&bytes)?;
+        // bitty#3243: the load-side producer of the panel restore records.
+        self.load_panel_manifest_from_path(path);
         self.apply_session_snapshot(&snap)
     }
 

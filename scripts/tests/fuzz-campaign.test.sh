@@ -14,6 +14,12 @@ cd "$(dirname "$0")/../.."
 scratch="${TMPDIR:-/tmp}/bitty"
 mkdir -p "$scratch"
 TMP="$(mktemp -d "$scratch/fuzz-campaign-test.XXXXXX")"
+# The sanitizer probe looks for the target binary in CARGO_TARGET_DIR (cargo's
+# own fallback is `fuzz/target`). Pin it at an empty scratch tree so a developer
+# build elsewhere on the host cannot leak into a test expectation; the probe
+# cases below swap in trees they populate themselves.
+export CARGO_TARGET_DIR="$TMP/cargo-target"
+mkdir -p "$CARGO_TARGET_DIR"
 DRIVER_PID=""
 CHILD_PID=""
 cleanup() {
@@ -66,6 +72,20 @@ write_artifact() { # name
 
 stats() {
   cat <<'LOG'
+#1234	pulse  cov: 321 ft: 456 corp: 12/345b lim: 4096 exec/s: 176 rss: 321Mb
+Done 1234 runs in 7 second(s)
+stat::number_of_executed_units: 1234
+stat::average_exec_per_sec: 176
+stat::new_units_added: 12
+stat::slowest_unit_time_sec: 0
+stat::peak_rss_mb: 321
+LOG
+}
+
+# A libFuzzer build whose log carries no coverage counters: the run executed
+# but cannot prove what it covered, so it must never read as `clean`.
+stats_without_coverage() {
+  cat <<'LOG'
 Done 1234 runs in 7 second(s)
 stat::number_of_executed_units: 1234
 stat::average_exec_per_sec: 176
@@ -80,6 +100,15 @@ case " $* " in
   case "${FAKE_FUZZ_MODE:-clean}" in
   clean)
     stats
+    exit 0
+    ;;
+  nocoverage)
+    stats_without_coverage
+    exit 0
+    ;;
+  leaknocov)
+    write_artifact leak-deadbeef
+    stats_without_coverage
     exit 0
     ;;
   crash)
@@ -223,6 +252,120 @@ if grep -Eq '/(home|Users|mnt|tmp)/' "$TMP/out-clean/summary.json"; then
   fail 'summary.json must not embed host paths'
 fi
 
+# --- provenance the acceptance needs: sanitizer, corpus digest, coverage
+# (CTX-1880). Each is recorded per target, and an absent one cannot read clean.
+expect_eq 'schema carries the sanitizer name' 'address' "$(jq -r '.sanitizer.name' "$TMP/out-clean/summary.json")"
+expect_eq 'schema carries the forwarded sanitizer flag' '--sanitizer=address' "$(jq -r '.sanitizer.cargo_fuzz_flag' "$TMP/out-clean/summary.json")"
+expect_eq 'schema carries the instrumentation flag' '-Zsanitizer=address' "$(jq -r '.sanitizer.instrumentation' "$TMP/out-clean/summary.json")"
+expect_eq 'schema carries leak detection' 'lsan' "$(jq -r '.sanitizer.leak_detection' "$TMP/out-clean/summary.json")"
+expect_eq 'schema records the leak-detection source' 'asan-runtime' "$(jq -r '.sanitizer.leak_detection_source' "$TMP/out-clean/summary.json")"
+expect_eq 'schema records -detect_leaks' '1' "$(jq -r '.libfuzzer.detect_leaks' "$TMP/out-clean/summary.json")"
+expect_eq 'target records its sanitizer' 'address' "$(jq -r '.targets[0].sanitizer' "$TMP/out-clean/summary.json")"
+expect_eq 'target records the coverage counter' '321' "$(jq -r '.targets[0].coverage_edges' "$TMP/out-clean/summary.json")"
+expect_eq 'target records the feature counter' '456' "$(jq -r '.targets[0].coverage_features' "$TMP/out-clean/summary.json")"
+expect_eq 'target records no missing evidence' '[]' "$(jq -c '.targets[0].evidence_missing' "$TMP/out-clean/summary.json")"
+grep -Fq -- '--sanitizer=address' "$TMP/cargo-calls" || fail 'the driver must forward --sanitizer to cargo-fuzz'
+grep -Fq -- '-detect_leaks=1' "$TMP/cargo-calls" || fail 'the driver must forward -detect_leaks for an ASan build'
+digest="$(jq -r '.targets[0].corpus_digest' "$TMP/out-clean/summary.json")"
+case "$digest" in
+'' | *[!0-9a-f]*)
+  fail "corpus digest must be lowercase hex, got '$digest'"
+  ;;
+esac
+expect_eq 'corpus digest is a sha256' '64' "$(printf '%s' "$digest" | wc -c | tr -d ' ')"
+[ -f "$TMP/out-clean/corpus/vt_parser.sha256" ] ||
+  fail 'every target must write a corpus digest artifact'
+grep -Fq "$digest" "$TMP/out-clean/corpus/vt_parser.sha256" ||
+  fail 'the corpus digest artifact must carry the recorded digest'
+expect_eq 'targets.tsv carries every recorded column' '29' \
+  "$(awk -F '\t' '{ print NF; exit }' "$TMP/out-clean/targets.tsv")"
+grep -Fq '## Provenance per target' "$TMP/out-clean/summary.md" ||
+  fail 'summary.md must carry the provenance table'
+grep -Fq 'Cov' "$TMP/out-clean/summary.md" || fail 'summary.md must carry the coverage column'
+
+# --- the digest is a function of the corpus, not of the walk order or the run
+rm -rf "$TMP/out-digest-a" "$TMP/out-digest-b" "$TMP/out-digest-c"
+run_fails 0 clean "$TMP/out-digest-a"
+pristine="$(jq -r '.targets[0].corpus_digest' "$TMP/out-digest-a/summary.json")"
+printf 'digest-probe-unit' >"$TMP/corpus/vt_parser/added.bin"
+run_fails 0 clean "$TMP/out-digest-b"
+if [ "$pristine" = "$(jq -r '.targets[0].corpus_digest' "$TMP/out-digest-b/summary.json")" ]; then
+  fail 'a new corpus unit must change the digest'
+fi
+rm -f "$TMP/corpus/vt_parser/added.bin"
+run_fails 0 clean "$TMP/out-digest-c"
+expect_eq 'the digest is stable for one corpus' "$pristine" \
+  "$(jq -r '.targets[0].corpus_digest' "$TMP/out-digest-c/summary.json")"
+
+# --- an absent fact cannot read as clean: no coverage counters -> inconclusive
+rm -rf "$TMP/out-nocov"
+run_fails 4 nocoverage "$TMP/out-nocov"
+expect_eq 'a run without coverage counters' 'inconclusive' "$(jq -r '.result' "$TMP/out-nocov/summary.json")"
+expect_eq 'a run without coverage counters (target)' 'inconclusive' \
+  "$(jq -r '.targets[0].result' "$TMP/out-nocov/summary.json")"
+expect_eq 'absent coverage is null, never zero' 'null' \
+  "$(jq -r '.targets[0].coverage_edges' "$TMP/out-nocov/summary.json")"
+expect_eq 'the missing fact is named' 'coverage' \
+  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-nocov/summary.json")"
+grep -Fq 'missing evidence (coverage)' "$TMP/last.log" ||
+  fail 'the driver must say why it refused clean'
+
+# --- missing provenance never hides a finding
+rm -rf "$TMP/out-leaknocov"
+run_fails 1 leaknocov "$TMP/out-leaknocov"
+expect_eq 'a leak without coverage counters is still a finding' 'finding' \
+  "$(jq -r '.result' "$TMP/out-leaknocov/summary.json")"
+expect_eq 'the leak is still counted' '1' "$(jq -r '.targets[0].leaks' "$TMP/out-leaknocov/summary.json")"
+rm -f "$TMP/artifacts/vt_parser/leak-deadbeef"
+
+# --- the sanitizer record is checked against the build it claims
+mkdir -p "$TMP/bare-target/release"
+printf 'stub fuzz binary, no sanitizer runtime\n' >"$TMP/bare-target/release/vt_parser"
+chmod +x "$TMP/bare-target/release/vt_parser"
+CARGO_TARGET_DIR="$TMP/bare-target"
+rm -rf "$TMP/out-nosan"
+run_fails 4 clean "$TMP/out-nosan"
+expect_eq 'a build without the ASan marker cannot read clean' 'inconclusive' \
+  "$(jq -r '.targets[0].result' "$TMP/out-nosan/summary.json")"
+expect_eq 'the contradiction is named' 'sanitizer-build' \
+  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-nosan/summary.json")"
+expect_eq 'the probe outcome is recorded' 'mismatch' \
+  "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-nosan/summary.json")"
+expect_eq 'an unverified sanitizer is not claimed verified' 'false' \
+  "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-nosan/summary.json")"
+printf 'stub fuzz binary with __asan_init linked\n' >"$TMP/bare-target/release/vt_parser"
+rm -rf "$TMP/out-san"
+run_fails 0 clean "$TMP/out-san"
+expect_eq 'a probed ASan build restores clean' 'clean' "$(jq -r '.targets[0].result' "$TMP/out-san/summary.json")"
+expect_eq 'a probed ASan build records the probe' 'found' \
+  "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-san/summary.json")"
+expect_eq 'a probed ASan build is verified' 'true' \
+  "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-san/summary.json")"
+CARGO_TARGET_DIR="$TMP/cargo-target"
+
+# --- an unknown sanitizer is a usage error, not a recorded identity
+SANITIZER_BAD_RC=0
+SANITIZER=bogus FAKE_FUZZ_MODE=plan FAKE_FUZZ_CALLS="$TMP/cargo-calls" CARGO="$TMP/bin/cargo" \
+  ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-badsan" \
+  --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
+  SANITIZER_BAD_RC=$?
+expect_eq 'an unknown sanitizer is rejected' '2' "$SANITIZER_BAD_RC"
+grep -Fq 'unknown sanitizer' "$TMP/last.log" || fail 'an unknown sanitizer must name the defect'
+
+# --- a sanitizer-free build cannot evidence memory safety either
+SANITIZER_NONE_RC=0
+SANITIZER=none FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" CARGO="$TMP/bin/cargo" \
+  ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-nosannot" \
+  --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
+  SANITIZER_NONE_RC=$?
+expect_eq 'a sanitizer-free build cannot read clean' '4' "$SANITIZER_NONE_RC"
+expect_eq 'a sanitizer-free build records its sanitizer' 'none' \
+  "$(jq -r '.targets[0].sanitizer' "$TMP/out-nosannot/summary.json")"
+expect_eq 'a sanitizer-free build names the gap' 'sanitizer-none' \
+  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-nosannot/summary.json")"
+expect_eq 'a sanitizer-free build records no leak detection' 'none' \
+  "$(jq -r '.sanitizer.leak_detection' "$TMP/out-nosannot/summary.json")"
+
 # --- a pre-seeded artifact is never `clean`, even when the run adds no new name.
 # libFuzzer derives an artifact name from the input that produced it
 # (`leak-<sha1>`, `timeout-<sha1>`, ...), so a run that re-discovers an input an
@@ -343,7 +486,9 @@ else
   fi
 fi
 
-# --- the cap -max_len is derived from the generator source, not duplicated
+# --- the cap -max_len has one owner: the checked-in derived file the driver
+# reads, kept equal to the Rust generator constant (CTX-1880 gap F10). The
+# driver must not carry the number itself.
 extract_constant() { # constant-name file
   awk -v name="$1" '
     $0 ~ "pub const " name ": usize[[:space:]]*=" {
@@ -372,8 +517,10 @@ multiply_terms() { # "4 * 1024 * 1024" -> 4194304
   done
   printf '%s' "$value"
 }
+
 generator=crates/bitty-vt/tests/control_string_cap.rs
 iterm2=crates/bitty-vt/src/iterm2_osc.rs
+cap_file=fuzz/control_string_cap.max_len
 wire="$(multiply_terms "$(extract_constant ITERM2_OSC_MAX_WIRE_BYTES "$iterm2")")"
 attribute="$(multiply_terms "$(extract_constant ITERM2_OSC_MAX_ATTRIBUTE_BYTES "$iterm2")")"
 prefix_len="$(awk -F'"' '/pub const ITERM2_OSC_PREFIX: &\[u8\] = b"/{ print length($2) }' "$iterm2")"
@@ -381,13 +528,24 @@ if [ -z "$wire" ] || [ -z "$attribute" ] || [ -z "$prefix_len" ]; then
   fail 'cap derivation: could not read the iTerm2 constants the generator uses'
 else
   expected_max_len=$(((attribute + 1 + wire) + prefix_len + 2 + 19))
-  driver_max_len="$(awk -F= '/^CAP_MAX_LEN=/{ print $2 }' scripts/fuzz-campaign.sh)"
-  expect_eq 'cap -max_len matches the generator' "$expected_max_len" "$driver_max_len"
+  [ -f "$cap_file" ] || fail "cap derivation: $cap_file must exist"
+  recorded_max_len="$(awk -F= '/^max_len=/{ print $2 }' "$cap_file")"
+  expect_eq 'cap -max_len matches the generator' "$expected_max_len" "$recorded_max_len"
   grep -Fq 'FUZZ_MAX_LEN: usize = CAP + 19' "$generator" ||
     fail 'cap derivation: the generator no longer defines FUZZ_MAX_LEN as CAP + 19'
+  grep -Fq 'fuzz_max_len_file_matches_generator' "$generator" ||
+    fail 'cap derivation: the generator test must keep the derived file equal to FUZZ_MAX_LEN'
+  grep -Fq 'control_string_cap.max_len' scripts/fuzz-campaign.sh ||
+    fail 'cap derivation: the driver must read the derived max_len file'
+  if grep -Fq '4198432' scripts/fuzz-campaign.sh; then
+    fail 'cap derivation: the driver must not carry its own copy of the cap literal'
+  fi
+  dry_run_plan="$(./scripts/fuzz-campaign.sh --dry-run 2>&1)"
+  case "$dry_run_plan" in
+  *"-max_len=$expected_max_len"*) ;;
+  *) fail 'cap derivation: the dry-run plan must print the cap target -max_len' ;;
+  esac
 fi
-
-# --- wiring: the driver test runs in PR CI; the campaign itself never does
 grep -Fq 'fuzz-campaign' justfile || fail 'justfile must expose the fuzz-campaign recipe'
 grep -Fq 'fuzz-campaign-test' justfile || fail 'justfile must expose the driver test recipe'
 workflow=.github/workflows/fuzz-campaign.yml

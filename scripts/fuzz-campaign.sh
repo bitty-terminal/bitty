@@ -43,18 +43,36 @@
 # exits 0 without executing anything is `inconclusive` — never `clean`.
 #
 # Evidence schema (`summary.json`): campaign, acceptance, revision,
-# revision_dirty, toolchain, cargo_fuzz, libfuzzer flags, started/finished UTC,
-# requested_secs, targets[] {target, secs_requested, secs_actual, secs_fuzzed,
-# runs, exec_per_sec, new_units, corpus_seeds, corpus_delta, peak_rss_mb,
-# crashes, leaks, slow_units, oom, timeouts, other_artifacts, exit_code,
-# result, artifacts[], pre_existing_artifacts, pre_existing_artifact_names[]},
+# revision_dirty, toolchain, cargo_fuzz, sanitizer{name, cargo_fuzz_flag,
+# instrumentation, leak_detection, leak_detection_source}, libfuzzer flags,
+# started/finished UTC, requested_secs, targets[] {target, secs_requested,
+# secs_actual, secs_fuzzed, runs, exec_per_sec, new_units, corpus_seeds,
+# corpus_delta, corpus_units, corpus_digest, coverage_edges, coverage_features,
+# peak_rss_mb, crashes, leaks, slow_units, oom, timeouts, other_artifacts,
+# exit_code, result, sanitizer, sanitizer_verified, evidence_missing,
+# artifacts[], pre_existing_artifacts, pre_existing_artifact_names[]},
 # totals{...}, result. `secs_actual` is the wall clock of the whole per-target
 # step (build plus run); `secs_fuzzed` is libFuzzer's own `Done <runs> runs in
-# <secs> second(s)` budget. No host path is recorded, so a summary is safe to
-# attach to a security-corpus record as-is.
+# <secs> second(s)` budget. No host path is recorded — the corpus digest is a
+# bare hex string — so a summary is safe to attach to a security-corpus record
+# as-is.
+#
+# P0-AC-002 evidence completeness (CTX-1880, bitty#3235): a `clean` result is
+# only recorded when the run also carries the three provenance facts the
+# acceptance needs — which sanitizer build produced it and with which flags, a
+# sha256 digest over the corpus the run ended with, and a coverage signal
+# (libFuzzer's own `cov:`/`ft:` counters). Each is recorded per target. When one
+# cannot be captured the target is downgraded to `inconclusive` with the missing
+# fact named in `evidence_missing`; it is never recorded `clean`. A
+# `SANITIZER=none` build counts as missing: it can report zero leaks without
+# saying anything about memory safety. Findings and runner errors keep their
+# precedence, so missing provenance can only ever remove a `clean`, never
+# manufacture or hide a finding.
 #
 # Bounds: --secs 10..86400 (default 600); -timeout 1..600 (default 25);
-# -rss_limit_mb 256..16384 (default 2048); each target's process runs in its
+# -rss_limit_mb 256..16384 (default 2048); coverage counters are accepted only
+# as integers in 0..4294967295 (anything else is treated as absent, not as a
+# zero); each target's process runs in its
 # own session and is hard-killed at the budget plus HARD_LIMIT_SLACK_SECS, so a
 # wedged build cannot hang the caller. The caller and its child are trapped on
 # INT/TERM/HUP: the child session is terminated and the work directory removed.
@@ -110,13 +128,27 @@ MIN_RSS_LIMIT_MB=256
 MAX_RSS_LIMIT_MB=16384
 
 # The cap target feeds whole control strings, so it is the one target whose
-# inputs exceed libFuzzer's 1 MiB default mutation cap. This mirrors
-# `FUZZ_MAX_LEN` in `crates/bitty-vt/tests/control_string_cap.rs` (`CAP + 19`,
-# where `CAP = ITERM2_OSC_MAX_ATTRIBUTE_BYTES + 1 +
-# ITERM2_OSC_MAX_WIRE_BYTES + ITERM2_OSC_PREFIX.len() + 2`); the driver test
-# re-derives the value from that source and fails when the two drift apart.
+# inputs exceed libFuzzer's 1 MiB default mutation cap. The value has exactly
+# one owner in the tree: `CONTROL_STRING_MAX_BYTES` in
+# `crates/bitty-vt/src/parser.rs` (the parser-wide cap) plus the generator
+# headroom in `FUZZ_MAX_LEN` in `crates/bitty-vt/tests/control_string_cap.rs`.
+# The driver carries no copy of the number: it reads the derived, checked-in
+# `fuzz/control_string_cap.max_len`, which the generator test asserts equal to
+# `FUZZ_MAX_LEN`, so a drift fails `cargo test -p bitty-vt` and this driver's
+# test instead of silently fuzzing a different bound (CTX-1880 review gap F10).
 CAP_TARGET="control_string_cap"
-CAP_MAX_LEN=4198432
+CAP_MAX_LEN_FILE="$FUZZ_DIR/$CAP_TARGET.max_len"
+
+# libFuzzer counters are u32 in its own statistics; anything outside this range
+# is a parse failure, not a large number.
+MAX_COUNTER_VALUE=4294967295
+
+# The sanitizer build the campaign records and runs. `cargo-fuzz 0.13.2`
+# defaults to `address`, and `--sanitizer` pins it explicitly so the forwarded
+# flag — not an unstated default — is what the record names. ASan on Linux
+# carries LSan, which is why the leak class is memory-safety evidence.
+DEFAULT_SANITIZER="address"
+SANITIZER="${SANITIZER:-$DEFAULT_SANITIZER}"
 
 # Corpus units retained per target after a run (see the header bounds).
 MAX_CORPUS_FILES=2000
@@ -132,6 +164,20 @@ FIND_PRINTF=0
 if find "$FUZZ_DIR" -maxdepth 1 -printf '' >/dev/null 2>&1; then
   FIND_PRINTF=1
 fi
+
+# sha256 implementation for the corpus digest: GNU coreutils, or BSD `shasum`.
+# Without either, the digest is an absent fact and a target cannot be recorded
+# clean (see the completeness rule in the header) — the campaign still runs.
+HASH_CMD=()
+if command -v sha256sum >/dev/null 2>&1; then
+  HASH_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  HASH_CMD=(shasum -a 256)
+fi
+
+hash_file() {
+  "${HASH_CMD[@]}" -- "$1" | awk '{ print $1 }'
+}
 
 SECS="$DEFAULT_SECS"
 TARGETS=""
@@ -305,6 +351,142 @@ stat_value() {
   awk -v key="$2" '$1 == key ":" { value = $2 } END { print value + 0 }' "$1"
 }
 
+# --- provenance helpers (CTX-1880) -----------------------------------------
+
+# `--sanitizer` value cargo-fuzz accepts. An unknown name is rejected before
+# the run, so the record can never carry a made-up sanitizer identity.
+valid_sanitizer() {
+  case "$1" in
+  address | leak | memory | thread | none) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Symbol each sanitizer runtime installs in the fuzz binary; `none` links no
+# runtime, so it has no marker to probe for.
+sanitizer_marker() {
+  case "$1" in
+  address) printf '__asan_init' ;;
+  leak) printf '__lsan_init' ;;
+  memory) printf '__msan_init' ;;
+  thread) printf '__tsan_init' ;;
+  *) printf '' ;;
+  esac
+}
+
+# LeakSanitizer is not a separate build here: with `--sanitizer=address` the
+# ASan runtime links LSan, and libFuzzer's `-detect_leaks` (on by default,
+# passed explicitly below) drives it. That is why a `leak-*` artifact counts as
+# a memory-safety finding for this campaign.
+sanitizer_leak_detection() {
+  case "$1" in
+  address | leak) printf 'lsan' ;;
+  *) printf 'none' ;;
+  esac
+}
+
+# Best-effort probe of the instrumentation the run actually built: look for the
+# runtime symbol in the target binary. A binary that is found and lacks the
+# marker contradicts the recorded sanitizer and blocks `clean`; a binary that
+# cannot be located (custom profile, exotic layout, a stubbed toolchain) leaves
+# the record at "declared", which is all the forwarded `--sanitizer` flag
+# claims. The probe never upgrades a claim into a finding, it only refuses to
+# certify the opposite.
+probe_sanitizer_build() { # target marker -> found | mismatch | absent | not-applicable
+  local target="$1" marker="$2" root binary
+  if [ -z "$marker" ]; then
+    printf 'not-applicable'
+    return 0
+  fi
+  # The binary this run just built lives in exactly one tree: the caller's
+  # CARGO_TARGET_DIR when set, else cargo-fuzz's own `fuzz/target`.
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    root="$CARGO_TARGET_DIR"
+  else
+    root="$FUZZ_DIR/target"
+  fi
+  [ -d "$root" ] || { printf 'absent'; return 0; }
+  binary="$(
+    find "$root" -maxdepth 3 -type f -name "$target" -perm -u+x 2>/dev/null |
+      { read -r found || true; printf '%s' "${found:-}"; }
+  )" || true
+  if [ -z "$binary" ]; then
+    printf 'absent'
+  elif grep -aqF -- "$marker" "$binary" 2>/dev/null; then
+    printf 'found'
+  else
+    printf 'mismatch'
+  fi
+}
+
+# Last integer that follows an exact token in the fuzz log (`cov:`, `ft:`,
+# `stat::cov:`). Prints nothing when the token never carried a number, which
+# keeps "absent" distinguishable from "zero" — the whole point of the
+# completeness rule below.
+last_number_after() {
+  awk -v token="$2" '
+    {
+      for (i = 1; i < NF; i++) {
+        if ($i == token && $(i + 1) ~ /^[0-9]+$/) value = $(i + 1)
+      }
+    }
+    END { if (value != "") print value }
+  ' "$1"
+}
+
+# One bounded coverage counter: libFuzzer's per-target `cov` (edges) or `ft`
+# (frontier features) from its last pulse line, falling back to the final
+# `stat::` block. Values outside libFuzzer's own u32 range are treated as a
+# parse failure, never as a large number. Prints nothing when unavailable.
+coverage_counter() { # log cov|ft
+  local value
+  value="$(last_number_after "$1" "$2:")"
+  if [ -z "$value" ]; then
+    value="$(last_number_after "$1" "stat::$2:")"
+  fi
+  case "$value" in
+  '' | *[!0-9]*) return 0 ;;
+  esac
+  if [ "${#value}" -gt 10 ] || [ "$value" -gt "$MAX_COUNTER_VALUE" ]; then
+    return 0
+  fi
+  printf '%s' "$value"
+}
+
+# `-max_len` for the cap target, read from the single-owner derived file.
+# Missing or malformed is an environment error: fuzzing the cap with libFuzzer's
+# 1 MiB default would silently test a different bound than the record claims.
+cap_max_len() {
+  local value
+  [ -f "$CAP_MAX_LEN_FILE" ] ||
+    env_die "$CAP_MAX_LEN_FILE is missing; it carries the cap target's -max_len (owner: CONTROL_STRING_MAX_BYTES in crates/bitty-vt/src/parser.rs)"
+  value="$(awk -F= '
+    /^[[:space:]]*#/ { next }
+    $1 == "max_len" { gsub(/[^0-9]/, "", $2); value = $2 }
+    END { print value }
+  ' "$CAP_MAX_LEN_FILE")"
+  is_uint "$value" && [ "$value" -gt 0 ] ||
+    env_die "$CAP_MAX_LEN_FILE has no positive integer max_len"
+  printf '%s' "$value"
+}
+
+# Deterministic digest of a corpus directory: sha256 over the name-sorted
+# `<unit-sha256>  <unit-name>` manifest. Independent of directory-walk order and
+# of the host path (no path is recorded), and it changes when a unit is added,
+# removed, renamed, or rewritten. Empty output means no sha256 tool on this
+# host, which makes the digest an absent fact rather than a guessed one.
+corpus_digest() {
+  local dir="$1"
+  [ "${#HASH_CMD[@]}" -gt 0 ] || return 0
+  (
+    cd "$dir" 2>/dev/null || exit 1
+    find . -maxdepth 1 -type f -name '*.bin' -print | LC_ALL=C sort |
+      while IFS= read -r unit; do
+        printf '%s  %s\n' "$(hash_file "$unit")" "${unit#./}"
+      done
+  ) | "${HASH_CMD[@]}" | awk '{ print $1 }'
+}
+
 # libFuzzer's `Done <runs> runs in <secs> second(s)` summary line.
 done_runs() {
   awk '$1 == "Done" && $2 ~ /^[0-9]+$/ { runs = $2 } END { print runs + 0 }' "$1"
@@ -323,11 +505,13 @@ render_summary_json() {
   "acceptance": "R-001 / P0-AC-002 long-running cargo-fuzz campaign",
   "issue": "bitty#3227",
   "task": "CTX-1877",
+  "evidence_task": "CTX-1880",
   "revision": "$revision",
   "revision_dirty": $dirty,
   "toolchain": "$toolchain_version",
   "cargo_fuzz": "$cargo_fuzz",
-  "libfuzzer": {"max_total_time_secs": $SECS, "timeout_secs": $TIMEOUT_SECS, "rss_limit_mb": $RSS_LIMIT_MB, "workers": 1},
+  "sanitizer": {"name": "$SANITIZER", "cargo_fuzz_flag": "--sanitizer=$SANITIZER", "instrumentation": "$SANITIZER_INSTRUMENTATION", "leak_detection": "$SANITIZER_LEAK_DETECTION", "leak_detection_source": "$SANITIZER_LEAK_SOURCE"},
+  "libfuzzer": {"max_total_time_secs": $SECS, "timeout_secs": $TIMEOUT_SECS, "rss_limit_mb": $RSS_LIMIT_MB, "workers": 1, "detect_leaks": $SANITIZER_DETECT_LEAKS},
   "started_utc": "$started",
   "finished_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "requested_secs": $SECS,
@@ -344,9 +528,15 @@ JSON
         }
         return out "]"
       }
+      function num(value) {
+        return (value ~ /^[0-9]+$/) ? value + 0 : "null"
+      }
+      function json_string(value) {
+        return (value == "" || value == "-") ? "null" : "\"" value "\""
+      }
       {
         if (count++) printf ",\n"
-        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s, \"pre_existing_artifacts\": %d, \"pre_existing_artifact_names\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, json_list($19), $20, json_list($21)
+        printf "    {\"target\": \"%s\", \"secs_requested\": %d, \"secs_actual\": %d, \"secs_fuzzed\": %d, \"runs\": %d, \"exec_per_sec\": %d, \"new_units\": %d, \"corpus_seeds\": %d, \"corpus_delta\": %d, \"peak_rss_mb\": %d, \"crashes\": %d, \"leaks\": %d, \"slow_units\": %d, \"oom\": %d, \"timeouts\": %d, \"other_artifacts\": %d, \"exit_code\": %d, \"result\": \"%s\", \"artifacts\": %s, \"pre_existing_artifacts\": %d, \"pre_existing_artifact_names\": %s, \"sanitizer\": \"%s\", \"sanitizer_probe\": \"%s\", \"sanitizer_verified\": %s, \"corpus_digest\": %s, \"corpus_units\": %s, \"coverage_edges\": %s, \"coverage_features\": %s, \"evidence_missing\": %s}", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, json_list($19), $20, json_list($21), $22, $23, ($24 == "true" ? "true" : "false"), json_string($25), num($26), num($27), num($28), json_list($29)
         fuzzed += $4
         runs += $5
         new_units += $7
@@ -378,17 +568,18 @@ render_summary_md() {
     cat <<MD
 # fuzz campaign summary
 
-- Campaign: \`bitty-fuzz-campaign\` (R-001 / P0-AC-002 evidence; bitty#3227, CTX-1877)
+- Campaign: \`bitty-fuzz-campaign\` (R-001 / P0-AC-002 evidence; bitty#3227, CTX-1877; completeness CTX-1880)
 - Revision: \`$REVISION\` (dirty: $REVISION_DIRTY), $TOOLCHAIN_VERSION, $CARGO_FUZZ_DETECTED
+- Sanitizer: \`$SANITIZER\` (\`--sanitizer=$SANITIZER\`, \`$SANITIZER_INSTRUMENTATION\`, leak detection: $SANITIZER_LEAK_DETECTION)
 - Started: $started
 - Budget: $SECS s per target, \`-timeout=$TIMEOUT_SECS\`, \`-rss_limit_mb=$RSS_LIMIT_MB\`, \`-workers=1\`
 
-| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Crashes | Leaks | Slow units | OOM | Timeouts | Pre-existing | Result |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Target | Secs fuzzed | Runs | Exec/s | New units | Seeds | Peak RSS (MB) | Cov | FT | Crashes | Leaks | Slow units | OOM | Timeouts | Pre-existing | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 MD
     awk -F '\t' '
       {
-        printf "| `%s` | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $11, $12, $13, $14, $15, $20, $18
+        printf "| `%s` | %d | %d | %d | %d | %d | %d | %s | %s | %d | %d | %d | %d | %d | %d | %s |\n", $1, $4, $5, $6, $7, $8, $10, $27, $28, $11, $12, $13, $14, $15, $20, $18
         fuzzed += $4
         runs += $5
         crashes += $11
@@ -403,7 +594,14 @@ MD
       }
       END {
         overall = has_finding ? "finding" : (has_error ? "error" : (has_inconclusive ? "inconclusive" : "clean"))
-        printf "| **total** | %d | %d | – | – | – | – | %d | %d | %d | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, pre_existing + 0, overall
+        printf "| **total** | %d | %d | – | – | – | – | – | – | %d | %d | %d | %d | %d | %d | **%s** |\n", fuzzed + 0, runs + 0, crashes + 0, leaks + 0, slow + 0, oom + 0, timeouts + 0, pre_existing + 0, overall
+      }
+    ' "$WORK_TARGETS"
+    printf '\n## Provenance per target\n\n| Target | Sanitizer | Build probe | Corpus units | Corpus sha256 | Coverage source | Missing evidence |\n| --- | --- | --- | --- | --- | --- | --- |\n'
+    awk -F '\t' '
+      {
+        missing = ($29 == "-" || $29 == "") ? "none" : $29
+        printf "| `%s` | %s | %s | %s | %s | %s | %s |\n", $1, $22, $23, $26, $25, "libFuzzer cov/ft", missing
       }
     ' "$WORK_TARGETS"
     if [ -s "$WORK_FINDINGS" ]; then
@@ -461,8 +659,10 @@ generate_cap_seeds() {
 }
 
 record_target() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" \
+    "${14}" "${15}" "${16}" "${17}" "${18}" "${19}" "${20}" "${21}" "${22}" \
+    "${23}" "${24}" "${25}" "${26}" "${27}" "${28}" "${29}" \
     >>"$WORK_TARGETS"
 }
 
@@ -503,10 +703,11 @@ run_target() {
     "-rss_limit_mb=$RSS_LIMIT_MB"
     "-workers=1"
     "-print_final_stats=1"
+    "-detect_leaks=$SANITIZER_DETECT_LEAKS"
     "-artifact_prefix=$artifacts_dir/"
   )
   if [ "$target" = "$CAP_TARGET" ]; then
-    fuzz_args+=("-max_len=$CAP_MAX_LEN")
+    fuzz_args+=("-max_len=$(cap_max_len)")
   fi
 
   list_file_names "$artifacts_dir" | sort >"$WORK_DIR/artifacts-pre-$target.txt"
@@ -525,7 +726,7 @@ run_target() {
   fi
 
   set +e
-  "${runner[@]}" "$CARGO" "+$TOOLCHAIN" fuzz run "$target" "$corpus_dir" -- "${fuzz_args[@]}" \
+  "${runner[@]}" "$CARGO" "+$TOOLCHAIN" fuzz run --sanitizer="$SANITIZER" "$target" "$corpus_dir" -- "${fuzz_args[@]}" \
     >"$log" 2>&1 &
   CHILD_PID=$!
   wait "$CHILD_PID"
@@ -597,6 +798,35 @@ run_target() {
   new_units="$(stat_value "$log" 'stat::new_units_added')"
   peak_rss="$(stat_value "$log" 'stat::peak_rss_mb')"
 
+  # Coverage signal (CTX-1880): libFuzzer's own edge (`cov`) and frontier-feature
+  # (`ft`) counters from the last pulse line. A read, not a target: the
+  # criterion is zero findings, so no numeric coverage floor is asserted here —
+  # but an unreadable counter is an absent fact and blocks `clean` below.
+  local coverage_edges coverage_features
+  coverage_edges="$(coverage_counter "$log" cov)"
+  coverage_features="$(coverage_counter "$log" ft)"
+
+  # Corpus digest (CTX-1880): taken over the corpus the run ended with, before
+  # the retention trim, so it describes the units that produced the coverage
+  # above. The digest is a bare hex string, never a host path.
+  local corpus_units corpus_sha
+  corpus_units="$(count_seeds "$corpus_dir")"
+  corpus_sha="$(corpus_digest "$corpus_dir" || true)"
+  if [ -n "$corpus_sha" ]; then
+    mkdir -p "$OUT_DIR/corpus"
+    printf '%s  %s.corpus  units=%s  algorithm=sha256\n' \
+      "$corpus_sha" "$target" "$corpus_units" >"$OUT_DIR/corpus/$target.sha256"
+  fi
+
+  # Sanitizer identity (CTX-1880): the flag the driver forwarded is the claim;
+  # the binary probe can only contradict it (a located binary without the
+  # runtime symbol), never invent one.
+  local sanitizer_probe sanitizer_verified=false
+  sanitizer_probe="$(probe_sanitizer_build "$target" "$(sanitizer_marker "$SANITIZER")")"
+  if [ "$sanitizer_probe" = "found" ]; then
+    sanitizer_verified=true
+  fi
+
   # Precedence: an artifact is a finding regardless of the exit status (a leak
   # can exit 0), and so is an artifact that was already there before the run —
   # P0-AC-002 counts findings, not new file names. A non-zero exit without an
@@ -616,6 +846,35 @@ run_target() {
     result="clean"
   fi
 
+  # Evidence completeness (CTX-1880): a run that cannot name its sanitizer
+  # build, its corpus, or its coverage is not P0-AC-002 evidence even when it
+  # found nothing, so it cannot read as `clean`. Only `clean` is downgraded:
+  # findings and runner errors keep their precedence, so missing provenance can
+  # never hide one.
+  local -a missing=()
+  if [ "$SANITIZER" = "none" ]; then
+    # A build without a sanitizer can report zero leaks and still say nothing
+    # about memory safety, which is the clause the campaign exists to evidence.
+    missing+=("sanitizer-none")
+  elif [ "$sanitizer_probe" = "mismatch" ]; then
+    missing+=("sanitizer-build")
+  fi
+  if [ -z "$corpus_sha" ]; then
+    missing+=("corpus-digest")
+  fi
+  if [ -z "$coverage_edges" ] || [ -z "$coverage_features" ]; then
+    missing+=("coverage")
+  fi
+  local evidence_missing="-"
+  if [ "${#missing[@]}" -gt 0 ]; then
+    evidence_missing="$(printf '%s ' "${missing[@]}")"
+    evidence_missing="${evidence_missing% }"
+    if [ "$result" = "clean" ]; then
+      echo "fuzz-campaign: $target recorded inconclusive, not clean: missing evidence ($evidence_missing)" >&2
+      result="inconclusive"
+    fi
+  fi
+
   local corpus_delta=$(($(count_files "$corpus_dir") - corpus_before))
   local artifact_list="-" pre_existing_list="-"
   if [ -n "$new_artifacts" ]; then
@@ -628,12 +887,14 @@ run_target() {
   record_target "$target" "$SECS" "$secs_actual" "$secs_fuzzed" "$runs" "$exec_per_sec" \
     "$new_units" "$corpus_seeds" "$corpus_delta" "$peak_rss" "$crashes" "$leaks" \
     "$slow_units" "$oom" "$timeouts" "$other" "$exit_code" "$result" "$artifact_list" \
-    "$pre_existing_count" "$pre_existing_list"
+    "$pre_existing_count" "$pre_existing_list" "$SANITIZER" "$sanitizer_probe" \
+    "$sanitizer_verified" "${corpus_sha:--}" "$corpus_units" "${coverage_edges:--}" \
+    "${coverage_features:--}" "$evidence_missing"
 
   write_summaries "$STARTED_UTC"
   trim_corpus "$corpus_dir" || echo "fuzz-campaign: warning: corpus trim failed for $target" >&2
 
-  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs crashes=$crashes leaks=$leaks slow_units=$slow_units oom=$oom timeouts=$timeouts pre_existing=$pre_existing_count exit=$exit_code)"
+  echo "fuzz-campaign: $target -> $result (fuzzed=${secs_fuzzed}s runs=$runs cov=${coverage_edges:--} ft=${coverage_features:--} crashes=$crashes leaks=$leaks slow_units=$slow_units oom=$oom timeouts=$timeouts pre_existing=$pre_existing_count digest=${corpus_sha:0:12} sanitizer=$SANITIZER/$sanitizer_probe exit=$exit_code)"
 }
 
 main() {
@@ -660,6 +921,23 @@ main() {
   SECS="$(clamp "$SECS" "$MIN_SECS" "$MAX_SECS")"
   TIMEOUT_SECS="$(clamp "$TIMEOUT_SECS" "$MIN_TIMEOUT_SECS" "$MAX_TIMEOUT_SECS")"
   RSS_LIMIT_MB="$(clamp "$RSS_LIMIT_MB" "$MIN_RSS_LIMIT_MB" "$MAX_RSS_LIMIT_MB")"
+
+  # Sanitizer identity (CTX-1880): pinned, validated, and derived once so the
+  # forwarded flag, the record, and the leak-detection claim cannot disagree.
+  valid_sanitizer "$SANITIZER" ||
+    die "unknown sanitizer '$SANITIZER' (known: address, leak, memory, thread, none)"
+  if [ "$SANITIZER" = "none" ]; then
+    SANITIZER_INSTRUMENTATION="none (no sanitizer runtime linked)"
+  else
+    SANITIZER_INSTRUMENTATION="-Zsanitizer=$SANITIZER"
+  fi
+  SANITIZER_LEAK_DETECTION="$(sanitizer_leak_detection "$SANITIZER")"
+  SANITIZER_LEAK_SOURCE="none"
+  SANITIZER_DETECT_LEAKS=0
+  if [ "$SANITIZER_LEAK_DETECTION" = "lsan" ]; then
+    SANITIZER_LEAK_SOURCE="asan-runtime"
+    SANITIZER_DETECT_LEAKS=1
+  fi
 
   local all_targets selected=""
   all_targets="$(list_targets)"
@@ -690,7 +968,9 @@ main() {
     echo "fuzz-campaign: dry-run"
     echo "  targets: $(printf '%s' "$selected" | paste -sd, -)"
     echo "  secs: $SECS"
-    echo "  libfuzzer: -timeout=$TIMEOUT_SECS -rss_limit_mb=$RSS_LIMIT_MB -workers=1 -print_final_stats=1"
+    echo "  libfuzzer: -timeout=$TIMEOUT_SECS -rss_limit_mb=$RSS_LIMIT_MB -workers=1 -print_final_stats=1 -detect_leaks=$SANITIZER_DETECT_LEAKS"
+    echo "  sanitizer: $SANITIZER (--sanitizer=$SANITIZER, $SANITIZER_INSTRUMENTATION, leak detection: $SANITIZER_LEAK_DETECTION)"
+    echo "  evidence: sanitizer identity, corpus sha256, and cov/ft counters per target (a missing fact downgrades clean to inconclusive)"
     echo "  toolchain: $TOOLCHAIN"
     echo "  cargo-fuzz (CI pin): $CARGO_FUZZ_VERSION"
     echo "  corpus-dir: $CORPUS_DIR"
@@ -703,6 +983,9 @@ main() {
         echo "  $target: seeds=$(count_seeds "$seeds_dir") from committed corpus"
       else
         echo "  $target: no committed corpus (scratch corpus only)"
+      fi
+      if [ "$target" = "$CAP_TARGET" ]; then
+        echo "  $target: -max_len=$(cap_max_len) from $(basename "$CAP_MAX_LEN_FILE")"
       fi
     done <<<"$selected"
     exit 0

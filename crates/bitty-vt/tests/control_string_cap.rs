@@ -159,6 +159,11 @@ const CAP: usize = bitty_vt::ITERM2_OSC_MAX_BODY_BYTES + bitty_vt::ITERM2_OSC_PR
 /// would hide the parser cap from every mutation. The largest generated seed
 /// is [`CAP`] + 11 bytes (introducer, cap, one byte past, 8-byte resync tail);
 /// this value adds a little mutation headroom on top.
+///
+/// This constant is the owner of the number. The shell driver cannot evaluate
+/// Rust, so it reads `fuzz/control_string_cap.max_len` — a checked-in derived
+/// file that [`fuzz_max_len_file_matches_generator`] keeps equal to this value
+/// (CTX-1880, review gap F10: the driver used to carry its own copy).
 const FUZZ_MAX_LEN: usize = CAP + 19;
 
 /// Hard heap bound for one 256 MiB shape. Post-fix the peak is the cap plus
@@ -544,4 +549,33 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// The campaign driver reads the cap target's `-max_len` from the checked-in
+/// derived file, so the number keeps a single owner: [`FUZZ_MAX_LEN`] here,
+/// spelled from [`CAP`] and the public iTerm2 constants (CTX-1880, review gap
+/// F10). Before this check the shell driver carried its own copy and only the
+/// shell test compared the two, so a stale Rust-side number could pass
+/// `cargo test` while the campaign fuzzed a different bound than it recorded.
+#[test]
+fn fuzz_max_len_file_matches_generator() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fuzz/control_string_cap.max_len");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let recorded = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| line.strip_prefix("max_len="))
+        .unwrap_or_else(|| panic!("{} has no `max_len=` line", path.display()));
+    assert_eq!(
+        recorded
+            .trim()
+            .parse::<usize>()
+            .unwrap_or_else(|error| panic!("{} is not an integer: {error}", path.display())),
+        FUZZ_MAX_LEN,
+        "{} must record FUZZ_MAX_LEN",
+        path.display()
+    );
 }

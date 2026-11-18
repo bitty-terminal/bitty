@@ -1,0 +1,15 @@
+# control_string_cap.max_len — libFuzzer `-max_len` for the `control_string_cap`
+# fuzz target (CTX-1880, bitty#3235).
+#
+# Single owner of the number: `CONTROL_STRING_MAX_BYTES` in
+# `crates/bitty-vt/src/parser.rs` (the parser-wide control-string cap, itself
+# spelled from the iTerm2 constants) plus the mutation headroom in `FUZZ_MAX_LEN`
+# in `crates/bitty-vt/tests/control_string_cap.rs`. This file is the derived
+# value the shell driver reads, because bash cannot evaluate a Rust constant; it
+# is not a second opinion.
+#
+# `control_string_cap::fuzz_max_len_file_matches_generator` asserts this value
+# equals `FUZZ_MAX_LEN`, and `scripts/tests/fuzz-campaign.test.sh` re-derives it
+# from the iTerm2 constants, so a drift fails `cargo test -p bitty-vt` and PR CI
+# instead of silently fuzzing a different bound.
+max_len=4198432

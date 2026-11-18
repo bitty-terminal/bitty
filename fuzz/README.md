@@ -77,8 +77,12 @@ gitignored scratch corpus, self-checks the boundary, and prints the command:
 
 ```sh
 cargo test -p bitty-vt --test control_string_cap -- --ignored --nocapture generate_cap_seeds
-# libFuzzer's default mutation cap is 1 MiB, so pass -max_len for this target:
-cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap -- -max_len=4198432 -runs=64
+# libFuzzer's default mutation cap is 1 MiB, so pass -max_len for this target.
+# The value is not written here: it lives in `fuzz/control_string_cap.max_len`,
+# which the campaign driver reads and the generator test keeps equal to
+# `FUZZ_MAX_LEN` in `crates/bitty-vt/tests/control_string_cap.rs`:
+cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap \
+    -- -max_len="$(awk -F= '/^max_len=/{ print $2 }' fuzz/control_string_cap.max_len)" -runs=64
 ```
 
 The exact at-cap/just-past-cap boundary (all five string families) is also
@@ -91,22 +95,27 @@ which the stable workspace gates run.
 `.github/workflows/fuzz-campaign.yml` workflow and the owner-facing
 `just fuzz-campaign <secs>` recipe: it seeds `fuzz/corpus/<target>` from the
 retained corpora above, runs each target for the budget with pinned
-`-timeout`/`-rss_limit_mb`/`-artifact_prefix`, classifies any artifact the run
-adds, and writes `summary.json` / `summary.md` (target, seconds fuzzed, runs,
-crashes, leaks, slow units, OOM, timeouts) next to the per-target logs and
-copied artifacts. Every artifact class is a finding — a `leak-*` is a
-memory-safety finding, a `slow-unit-*` is the hang class, and an unclassified
-artifact is a finding until someone classifies it — a non-zero exit with no
-artifact is a runner error, and a run that executed nothing is `inconclusive`
-rather than clean. So a campaign is a single command and a single evidence
-record; the runbook and the P0-AC-002 mapping are in
+`-timeout`/`-rss_limit_mb`/`-artifact_prefix`/`--sanitizer`, classifies any
+artifact the run adds, and writes `summary.json` / `summary.md` (target,
+seconds fuzzed, runs, crashes, leaks, slow units, OOM, timeouts, sanitizer,
+corpus digest, `cov`/`ft` coverage) next to the per-target logs, the corpus
+digest artifacts, and copied artifacts. Every artifact class is a finding — a
+`leak-*` is a memory-safety finding, a `slow-unit-*` is the hang class, and an
+unclassified artifact is a finding until someone classifies it — a non-zero
+exit with no artifact is a runner error, and a run that executed nothing is
+`inconclusive` rather than clean. A run that cannot state which sanitizer build
+produced it, the digest of the corpus it ended with, or its coverage counters is
+also `inconclusive`: the record must prove its provenance, not just its finding
+count. So a campaign is a single command and a single evidence record; the
+runbook and the P0-AC-002 field mapping are in
 `specifications/fuzz-campaign-ctx-1877-evidence.md`.
 
 Targets come from the `[[bin]]` entries in `fuzz/Cargo.toml`, so a new target
 joins the campaign without editing the workflow. `control_string_cap` keeps its
-generated seeds (see above) and is the one target run with
-`-max_len=4198432`. The scratch corpus is trimmed to 2000 units per target
-after a run and the retained corpora here are never modified by the driver.
+generated seeds (see above) and is the one target run with `-max_len`, read from
+`fuzz/control_string_cap.max_len` (the driver carries no copy of the number).
+The scratch corpus is trimmed to 2000 units per target after a run and the
+retained corpora here are never modified by the driver.
 
 ## Corpus retention policy on new findings
 

@@ -396,7 +396,7 @@ for entry in \
   'LSAN_OPTIONS|verbosity=1:detect_leaks=FALSE|disabled' \
   'LSAN_OPTIONS|detect_leaks=true:detect_leaks=0|disabled' \
   'ASAN_OPTIONS|detect_leaks=0:detect_leaks=1|effective' \
-  'ASAN_OPTIONS|log_path=/tmp/x y/log:verbosity=1|effective'; do
+  'ASAN_OPTIONS|log_path=/var/log/x y/log:verbosity=1|effective'; do
   case_index=$((case_index + 1))
   variable="${entry%%|*}"
   rest="${entry#*|}"

@@ -106,6 +106,72 @@ fn height_range(min: i64, max: i64) -> Vec<(&'static str, LuaValue)> {
     ]
 }
 
+/// One `Table` kind over a dense rows array; cells are joined by `" | "` when
+/// painted.
+fn table_value(rows: Vec<Vec<&str>>, style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            LuaValue::array(
+                row.into_iter()
+                    .map(|cell| LuaValue::String(cell.to_string()))
+                    .collect(),
+            )
+        })
+        .collect();
+    LuaValue::table([
+        ("kind", LuaValue::String("Table".to_string())),
+        ("rows", LuaValue::array(rows)),
+        ("style", style_table(style)),
+    ])
+}
+
+/// One `List` kind over child nodes. The bridge composes a `List` like a
+/// `Column` (`scene_bridge::scene_node_of`), so on this surface the "items"
+/// are child nodes rather than `ListModel` items.
+fn list_value(children: Vec<LuaValue>, style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("List".to_string())),
+        ("children", LuaValue::array(children)),
+        ("style", style_table(style)),
+    ])
+}
+
+fn code_block_value(content: &str, style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("CodeBlock".to_string())),
+        ("content", LuaValue::String(content.to_string())),
+        ("style", style_table(style)),
+    ])
+}
+
+fn rule_value(style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("Rule".to_string())),
+        ("style", style_table(style)),
+    ])
+}
+
+fn image_value(placement: i64, style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    LuaValue::table([
+        ("kind", LuaValue::String("Image".to_string())),
+        ("placement", LuaValue::Integer(placement)),
+        ("style", style_table(style)),
+    ])
+}
+
+/// Adds a `style` table to any node value, so a container can carry the range
+/// too instead of only a leaf.
+fn with_style(node: LuaValue, style: Vec<(&'static str, LuaValue)>) -> LuaValue {
+    match node {
+        LuaValue::Table(mut pairs) => {
+            pairs.push((LuaValue::String("style".to_string()), style_table(style)));
+            LuaValue::Table(pairs)
+        }
+        other => other,
+    }
+}
+
 fn mount_of(id: u64) -> RichMount {
     RichMount {
         id: BlockId(id),
@@ -164,6 +230,30 @@ fn rings(paint: &ScenePaint) -> Vec<(i32, i32, u32, u32)> {
 /// Ring heights in physical pixels, in op order.
 fn ring_heights(paint: &ScenePaint) -> Vec<u32> {
     rings(paint).into_iter().map(|ring| ring.3).collect()
+}
+
+/// Reserved image rectangles as `(placement id, rect)`, in op order.
+fn images(paint: &ScenePaint) -> Vec<(u64, RectPx)> {
+    paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Image { placement, rect } => Some((placement.0, *rect)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Painted solid fills, in op order.
+fn fills(paint: &ScenePaint) -> Vec<RectPx> {
+    paint
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            ScenePaintOp::Fill { rect, .. } => Some(*rect),
+            _ => None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +499,329 @@ fn a_capped_bordered_block_never_paints_into_the_next_column_sibling() {
             "border fill {fill:?} overlapped the sibling allocation {sibling_alloc:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-kind coverage evidence: the same range on every remaining kind
+// ---------------------------------------------------------------------------
+//
+// These rows are coverage evidence, not gates. The range is generic through
+// `SceneNode::Styled`, so every row below also passes at the base commit; the
+// mechanism is discriminated by the sabotage recorded on the PR, not here.
+// What they add is the per-kind fact the accepted claim lacked: each kind's
+// own measure reaches the painted rows through the same shipped chain.
+//
+// Two kinds measure differently from the rest and only one direction is
+// observable on them: `Rule` and `Image` measure exactly one content row, so a
+// `max_height` of 1 is the identity and a `max_height` of 0 is the degenerate
+// `0/0` range — only their floor moves a sibling. `List` is composed as a
+// `Column` by the bridge, so its items are child nodes on this surface; the
+// capped and floored rows are those children's rows.
+
+#[test]
+fn a_table_max_height_paints_at_most_the_capped_rows() {
+    // Three table rows measure three content rows; a 2-row cap leaves the two
+    // header/body rows painted and puts the next sibling on row 2. The
+    // unbounded reading of the same table puts it on row 3, so the cap is what
+    // moved it.
+    let rows = vec![vec!["h1", "h2"], vec!["r1", "r2"], vec!["r3", "r4"]];
+    let capped = column_value(vec![
+        table_value(rows.clone(), vec![("max_height", LuaValue::Integer(2))]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&capped).expect("a table cap is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "h1 | h2".to_string()),
+            (1, 0, "r1 | r2".to_string()),
+            (2, 0, "Z".to_string()),
+        ],
+        "the third table row is clipped and the sibling lands on row 2"
+    );
+
+    let uncapped = column_value(vec![table_value(rows, vec![]), text_value("Z")]);
+    let paint = paint_of(&read_and_mount(&uncapped).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "h1 | h2".to_string()),
+            (1, 0, "r1 | r2".to_string()),
+            (2, 0, "r3 | r4".to_string()),
+            (3, 0, "Z".to_string()),
+        ],
+        "the uncapped table paints all three rows"
+    );
+}
+
+#[test]
+fn a_list_min_height_pushes_the_next_sibling_to_the_floored_row() {
+    // One list item measures one row; a 4-row floor holds the box open without
+    // inventing items, so the only painted text is the item and the sibling
+    // starts on row 4.
+    let floored = column_value(vec![
+        list_value(
+            vec![text_value("i1")],
+            vec![("min_height", LuaValue::Integer(4))],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&floored).expect("a list floor is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "i1".to_string()), (4, 0, "Z".to_string())],
+        "the floor widens the list box without inventing items"
+    );
+
+    let unfloored = column_value(vec![
+        list_value(vec![text_value("i1")], vec![]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&unfloored).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(0, 0, "i1".to_string()), (1, 0, "Z".to_string())],
+        "the unfloored list is one row tall"
+    );
+}
+
+#[test]
+fn a_list_max_height_paints_at_most_the_capped_rows() {
+    // Three items measure three rows; a 2-row cap paints the first two and puts
+    // the sibling on row 2.
+    let capped = column_value(vec![
+        list_value(
+            vec![text_value("i1"), text_value("i2"), text_value("i3")],
+            vec![("max_height", LuaValue::Integer(2))],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&capped).expect("a list cap is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "i1".to_string()),
+            (1, 0, "i2".to_string()),
+            (2, 0, "Z".to_string()),
+        ],
+        "the third item is clipped and the sibling lands on row 2"
+    );
+
+    let uncapped = column_value(vec![
+        list_value(
+            vec![text_value("i1"), text_value("i2"), text_value("i3")],
+            vec![],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&uncapped).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "i1".to_string()),
+            (1, 0, "i2".to_string()),
+            (2, 0, "i3".to_string()),
+            (3, 0, "Z".to_string()),
+        ],
+        "the uncapped list paints all three items"
+    );
+}
+
+#[test]
+fn a_code_block_max_height_paints_at_most_the_capped_lines() {
+    // A lang-free code block measures one row per content line: three lines, a
+    // 2-line cap, so "l3" is never painted and the sibling lands on row 2.
+    let capped = column_value(vec![
+        code_block_value("l1\nl2\nl3", vec![("max_height", LuaValue::Integer(2))]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&capped).expect("a code block cap is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "l1".to_string()),
+            (1, 0, "l2".to_string()),
+            (2, 0, "Z".to_string()),
+        ],
+        "the third line is clipped and the sibling lands on row 2"
+    );
+
+    let uncapped = column_value(vec![
+        code_block_value("l1\nl2\nl3", vec![]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&uncapped).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "l1".to_string()),
+            (1, 0, "l2".to_string()),
+            (2, 0, "l3".to_string()),
+            (3, 0, "Z".to_string()),
+        ],
+        "the uncapped code block paints all three lines"
+    );
+}
+
+#[test]
+fn a_rule_min_height_pushes_the_next_sibling_to_the_floored_row() {
+    // A rule measures one content row, so a 3-row floor is the only observable
+    // direction: the rule itself stays on its own row (the stroke is one pixel
+    // inside row 0) and the sibling starts on row 3.
+    let floored = column_value(vec![
+        rule_value(vec![("min_height", LuaValue::Integer(3))]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&floored).expect("a rule floor is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(3, 0, "Z".to_string())],
+        "the sibling lands on the floored row"
+    );
+    let cell = surface().cell;
+    let stroke = fills(&paint);
+    assert_eq!(stroke.len(), 1, "one rule paints exactly one stroke");
+    assert_eq!(
+        stroke[0],
+        RectPx::new(
+            0,
+            i32::try_from(cell.height / 2).unwrap(),
+            cell.width * u32::from(surface().cols()),
+            1
+        ),
+        "the stroke stays on row 0: the floor moved the sibling, not the rule"
+    );
+
+    let unfloored = column_value(vec![rule_value(vec![]), text_value("Z")]);
+    let paint = paint_of(&read_and_mount(&unfloored).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(1, 0, "Z".to_string())],
+        "an unfloored rule is one row tall"
+    );
+}
+
+#[test]
+fn an_image_min_height_pushes_the_next_sibling_to_the_floored_row() {
+    // An image measures one content row, so a 3-row floor is the only
+    // observable direction: the placement keeps its one-row reservation on
+    // row 0 and the sibling starts on row 3.
+    let floored = column_value(vec![
+        image_value(7, vec![("min_height", LuaValue::Integer(3))]),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&floored).expect("an image floor is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(3, 0, "Z".to_string())],
+        "the sibling lands on the floored row"
+    );
+    let cell = surface().cell;
+    assert_eq!(
+        images(&paint),
+        vec![(
+            7,
+            RectPx::new(0, 0, cell.width * u32::from(surface().cols()), cell.height)
+        )],
+        "the placement keeps its one-row reservation on row 0"
+    );
+
+    let unfloored = column_value(vec![image_value(7, vec![]), text_value("Z")]);
+    let paint = paint_of(&read_and_mount(&unfloored).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![(1, 0, "Z".to_string())],
+        "an unfloored image is one row tall"
+    );
+}
+
+#[test]
+fn a_styled_floor_around_a_styled_cap_keeps_the_outer_floor() {
+    // A 2-row cap inside a 5-row floor: the cap clips the three text rows to
+    // two and the floor still holds the box open, so the sibling lands on row
+    // 5 either way. Both numbers are painted facts, and the pair shows the two
+    // directions composing rather than one overriding the other.
+    let capped_inside_floor = column_value(vec![
+        with_style(
+            column_value(vec![styled_text_value(
+                "a\nb\nc",
+                vec![("max_height", LuaValue::Integer(2))],
+            )]),
+            vec![("min_height", LuaValue::Integer(5))],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&capped_inside_floor).expect("nested range is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "a".to_string()),
+            (1, 0, "b".to_string()),
+            (5, 0, "Z".to_string()),
+        ],
+        "the inner cap clips to two rows and the outer floor still holds row 5"
+    );
+
+    let floor_only = column_value(vec![
+        with_style(
+            column_value(vec![text_value("a\nb\nc")]),
+            vec![("min_height", LuaValue::Integer(5))],
+        ),
+        text_value("Z"),
+    ]);
+    let paint = paint_of(&read_and_mount(&floor_only).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "a".to_string()),
+            (1, 0, "b".to_string()),
+            (2, 0, "c".to_string()),
+            (5, 0, "Z".to_string()),
+        ],
+        "without the cap the floor alone never clips a row"
+    );
+}
+
+#[test]
+fn a_row_holding_a_capped_table_shrinks_to_the_cap_for_the_next_sibling() {
+    // A row is as tall as its tallest child, so a 1-row capped table makes the
+    // row one row tall: the table paints one row, the horizontal sibling keeps
+    // its column, and the vertical sibling lands on row 1 instead of row 3.
+    let rows = vec![vec!["t1", "u1"], vec!["t2", "u2"], vec!["t3", "u3"]];
+    let capped = column_value(vec![
+        row_value(vec![
+            table_value(rows.clone(), vec![("max_height", LuaValue::Integer(1))]),
+            text_value("Z"),
+        ]),
+        text_value("after"),
+    ]);
+    let paint = paint_of(&read_and_mount(&capped).expect("a capped table in a row is valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "t1 | u1".to_string()),
+            (0, 7, "Z".to_string()),
+            (1, 0, "after".to_string()),
+        ],
+        "the row shrinks to the capped table and the next sibling lands on row 1"
+    );
+
+    let uncapped = column_value(vec![
+        row_value(vec![table_value(rows, vec![]), text_value("Z")]),
+        text_value("after"),
+    ]);
+    let paint = paint_of(&read_and_mount(&uncapped).expect("valid"));
+    assert_eq!(
+        lines(&paint),
+        vec![
+            (0, 0, "t1 | u1".to_string()),
+            (1, 0, "t2 | u2".to_string()),
+            (2, 0, "t3 | u3".to_string()),
+            (0, 7, "Z".to_string()),
+            (3, 0, "after".to_string()),
+        ],
+        "the uncapped row is three rows tall"
+    );
 }
 
 // ---------------------------------------------------------------------------

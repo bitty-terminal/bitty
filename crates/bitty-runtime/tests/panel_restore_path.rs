@@ -1,0 +1,498 @@
+#![forbid(unsafe_code)]
+//! Panel restore on the session-restore path (bitty#3239 row 14).
+//!
+//! Row 14's closing condition: `plan_restore` invoked from the session-restore
+//! path, minting a fresh `PanelId` per record, refusing `StableIdentity`, and
+//! presenting the appropriate placeholder for a missing/denied/older driver.
+//! The rows below drive the shipped path — `Runtime::load_session_from_path`,
+//! the same step `restore_session_on_startup` runs — with a stub backend that
+//! only replays a canned snapshot; nothing here reaches the filesystem.
+//!
+//! What each row pins:
+//!
+//! * the production chain: one record becomes a container with a **fresh**
+//!   `PanelId` (the persisted id is advisory) and a first bind that grants the
+//!   driver's whole resolution;
+//! * `StableIdentity` is refused for the whole restore before any mutation —
+//!   layout, focus, session flag, and the panel registry all stay as they were,
+//!   and the refusal is a typed diagnostic;
+//! * one row per driver refusal: missing → `unloaded`, denied → `denied`
+//!   (`Unavailable`), older → `incompatible`. Each keeps the container, presents
+//!   the Core-owned placeholder scene, and binds nothing;
+//! * the bounded remainder: a record whose workspace names no restored slot is
+//!   dropped rather than re-homed, and a runtime with no panel host drops with
+//!   its own typed reason instead of panicking.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use bitty_plugin_host::PluginId;
+use bitty_runtime::registry::{
+    PanelRegistryConfig, PanelRuntime, PanelState, PanelType, PlaceholderReason,
+};
+use bitty_runtime::runtime::panel_restore::{
+    PanelDriverAnswer, PanelRestoreDrop, PanelRestoreInput, PanelRestoreOutcome,
+};
+use bitty_runtime::{
+    LayoutNode, PaneAttachment, PaneRoute, PaneSnapshot, PresentationMode, Runtime, SessionError,
+    SessionFileBackend, SessionSnapshot, View, ViewId, WorkspaceSnapshot,
+};
+use bitty_ui::{PanelId, PanelRestoreKey, PersistedPanel, PersistencePolicy, PersistentId};
+
+const CREATE: &str = "panel.create";
+const FOCUS: &str = "panel.focus";
+
+/// Replays one canned snapshot; never touches the filesystem.
+#[derive(Debug)]
+struct CannedBackend {
+    snapshot: SessionSnapshot,
+}
+
+impl SessionFileBackend for CannedBackend {
+    fn encode_snapshot(&self, _snap: &SessionSnapshot) -> Result<Vec<u8>, SessionError> {
+        Ok(Vec::new())
+    }
+
+    fn decode_snapshot(&self, _bytes: &[u8]) -> Result<SessionSnapshot, SessionError> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn commit_session_bytes(&self, _path: &Path, _bytes: &[u8]) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    fn load_session_bytes(&self, _path: &Path) -> Result<Vec<u8>, SessionError> {
+        Ok(Vec::new())
+    }
+
+    fn session_file_for(
+        &self,
+        _xdg_state_home: Option<&str>,
+        _home: Option<&str>,
+    ) -> Option<PathBuf> {
+        None
+    }
+
+    fn session_file(&self) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// One workspace, one leaf, one attached pane: the smallest snapshot the
+/// restore accepts.
+fn canned_snapshot() -> SessionSnapshot {
+    SessionSnapshot {
+        version: bitty_runtime::SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: String::from("restore"),
+            layout: LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            focus: Some(ViewId::new(1)),
+            panes: vec![PaneSnapshot {
+                view: ViewId::new(1),
+                cwd: None,
+                scrollback: Vec::new(),
+                attach: Some(PaneAttachment::Session),
+                route: PaneRoute::Terminal,
+                mode: PresentationMode::Tiled,
+            }],
+            floats: Vec::new(),
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: Vec::new(),
+    }
+}
+
+/// A runtime with a session backend and an installed panel host.
+fn runtime() -> (Runtime, Arc<CannedBackend>) {
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let backend = Arc::new(CannedBackend {
+        snapshot: canned_snapshot(),
+    });
+    rt.set_session_backend(Some(backend.clone()));
+    let host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds");
+    rt.install_scene_host(host);
+    (rt, backend)
+}
+
+/// The session path only needs a path to hand the backend; the stub ignores it.
+fn session_path() -> PathBuf {
+    PathBuf::from("panel-restore-path")
+}
+
+fn key(workspace: u64, persistent: &str) -> PanelRestoreKey {
+    PanelRestoreKey::new(
+        bitty_ui::WorkspaceId::new(workspace),
+        PersistentId::new(persistent).expect("valid persistent id"),
+    )
+}
+
+/// A record whose persisted (advisory) id is deliberately far from the ids the
+/// registry mints, so a restore that reused it would be visible.
+fn persisted(workspace: u64, persistent: &str, title: &str) -> PersistedPanel {
+    PersistedPanel::new(PanelId::new(9), key(workspace, persistent), title).expect("record builds")
+}
+
+fn resolution() -> BTreeSet<String> {
+    [CREATE, FOCUS]
+        .iter()
+        .map(|item| (*item).to_string())
+        .collect()
+}
+
+fn owner() -> PluginId {
+    PluginId::new("acme.notes").expect("valid plugin id")
+}
+
+/// Reads the placeholder and the recovery record set of a panel through the
+/// installed host.
+fn unbound_reason(rt: &Runtime, panel: PanelId) -> Option<PlaceholderReason> {
+    let host = rt.scene_host().expect("panel host installed");
+    let host = host.borrow();
+    host.unbound_container_records(panel)
+        .expect("container exists")
+        .placeholder()
+}
+
+#[test]
+fn a_session_restore_mints_a_fresh_panel_id_and_first_binds_the_installed_driver() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    let record = persisted(workspace, "logs", "logs");
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        record.clone(),
+        PanelType::Helper,
+        PanelDriverAnswer::Installed {
+            owner: owner(),
+            resolution: resolution(),
+            consented: BTreeSet::new(),
+        },
+    )]);
+
+    let summary = rt
+        .load_session_from_path(&session_path())
+        .expect("the restore applies");
+
+    assert_eq!(summary.workspaces, 1, "the session itself restored");
+    let report = rt.panel_restore_report();
+    assert_eq!(report.len(), 1, "one record, one outcome");
+    assert_eq!(report.bound(), 1);
+    let PanelRestoreOutcome::Bound {
+        panel,
+        workspace: restored_workspace,
+        grants,
+    } = report.panels()[0].outcome.clone()
+    else {
+        panic!("the installed driver must bind: {:?}", report.panels()[0]);
+    };
+    assert_ne!(
+        panel, record.id,
+        "restart re-mints identity: the persisted id is advisory and never the container id"
+    );
+    assert_eq!(
+        report.panels()[0].persisted_id,
+        record.id,
+        "the record's advisory id is reported so a caller can correlate"
+    );
+    assert_eq!(report.panels()[0].title, "logs", "the title travels across");
+    assert_eq!(
+        report.panels()[0].key,
+        record.key,
+        "the (WorkspaceId, PersistentId) key travels across"
+    );
+    assert_eq!(
+        grants,
+        resolution(),
+        "a first bind commits the driver's whole resolution"
+    );
+    assert_ne!(
+        restored_workspace.get(),
+        workspace,
+        "the container is attributed to the freshly minted slot id"
+    );
+
+    // The registry agrees: the container is live, bound to the generation the
+    // bind committed, and holding exactly the granted set.
+    let host = rt.scene_host().expect("panel host installed");
+    let host = host.borrow();
+    assert_eq!(
+        host.panel_count(),
+        1,
+        "one record restores exactly one container"
+    );
+    assert_eq!(
+        host.registry().controller_generation(panel),
+        Some(panel_bind(panel, &host)),
+        "the restored container is bound to the generation the first bind committed"
+    );
+    for capability in [CREATE, FOCUS] {
+        assert!(
+            host.registry().is_panel_capability_granted(
+                panel,
+                panel_bind(panel, &host),
+                capability
+            ),
+            "{capability} must be granted by the first bind"
+        );
+    }
+    assert_eq!(
+        unbound_reason(&rt, panel),
+        None,
+        "a bound container presents no placeholder"
+    );
+    assert!(
+        rt.panel_restore_records().is_empty(),
+        "the restore consumed the records it applied, so a replay cannot mint a second container"
+    );
+}
+
+/// The controller generation the host bound `panel` to.
+fn panel_bind(panel: PanelId, host: &PanelRuntime) -> bitty_runtime::Generation {
+    host.registry()
+        .controller_generation(panel)
+        .expect("the container is bound")
+}
+
+#[test]
+fn a_stable_identity_policy_refuses_the_whole_restore_before_any_mutation() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    rt.set_panel_persistence_policy(PersistencePolicy::StableIdentity);
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Missing,
+    )]);
+
+    let layout_before = rt.layout().clone();
+    let focus_before = rt.focused_view();
+    let error = rt
+        .load_session_from_path(&session_path())
+        .expect_err("stable-identity cannot key a restore");
+
+    assert_eq!(
+        error,
+        SessionError::PanelRestoreRefused(bitty_ui::ManifestError::StableIdentityUnsupported),
+        "the refusal is the plan's own typed error"
+    );
+    assert!(
+        error.to_string().contains("stable-identity"),
+        "the diagnostic names the refused policy: {error}"
+    );
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        layout_before.leaf_ids(),
+        "a refused restore leaves the layout unchanged"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        focus_before,
+        "a refused restore leaves the focus unchanged"
+    );
+    assert!(
+        !rt.session_restored(),
+        "no restore marker is set: nothing was applied"
+    );
+    let host = rt.scene_host().expect("panel host installed");
+    assert_eq!(
+        host.borrow().panel_count(),
+        0,
+        "a refused restore allocates no container"
+    );
+    assert!(
+        rt.panel_restore_report().is_empty(),
+        "a refused restore reports nothing applied"
+    );
+}
+
+#[test]
+fn a_missing_driver_keeps_the_container_with_an_unloaded_placeholder() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Missing,
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the restore applies");
+
+    let report = rt.panel_restore_report();
+    let PanelRestoreOutcome::Placeholder {
+        panel,
+        workspace: restored_workspace,
+        reason,
+    } = report.panels()[0].outcome.clone()
+    else {
+        panic!("a missing driver presents a placeholder: {report:?}");
+    };
+    assert_eq!(reason, PlaceholderReason::Unloaded);
+    assert_eq!(
+        unbound_reason(&rt, panel),
+        Some(PlaceholderReason::Unloaded),
+        "the container presents the unloaded placeholder"
+    );
+    assert_placeholder_kept_the_container(&rt, panel, restored_workspace.get());
+}
+
+#[test]
+fn a_denied_driver_keeps_the_container_with_a_denied_placeholder() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Denied,
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the restore applies");
+
+    let report = rt.panel_restore_report();
+    let PanelRestoreOutcome::Placeholder {
+        panel,
+        workspace: restored_workspace,
+        reason,
+    } = report.panels()[0].outcome.clone()
+    else {
+        panic!("a denied driver presents a placeholder: {report:?}");
+    };
+    assert_eq!(
+        reason,
+        PlaceholderReason::Denied,
+        "a denial is `denied`, which Decision E classes as `unavailable`"
+    );
+    assert_eq!(
+        unbound_reason(&rt, panel),
+        Some(PlaceholderReason::Denied),
+        "the container presents the denied placeholder"
+    );
+    assert_placeholder_kept_the_container(&rt, panel, restored_workspace.get());
+}
+
+#[test]
+fn an_older_driver_keeps_the_container_with_an_incompatible_placeholder() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Older,
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the restore applies");
+
+    let report = rt.panel_restore_report();
+    let PanelRestoreOutcome::Placeholder {
+        panel,
+        workspace: restored_workspace,
+        reason,
+    } = report.panels()[0].outcome.clone()
+    else {
+        panic!("an older driver presents a placeholder: {report:?}");
+    };
+    assert_eq!(
+        reason,
+        PlaceholderReason::Incompatible,
+        "an older driver is `incompatible`: nothing is downgraded or partially applied"
+    );
+    assert_eq!(
+        unbound_reason(&rt, panel),
+        Some(PlaceholderReason::Incompatible)
+    );
+    assert_placeholder_kept_the_container(&rt, panel, restored_workspace.get());
+}
+
+/// Shared assertion for the three refusal rows: the container exists, is
+/// unbound, never mounted, keeps the record's workspace attribution, and
+/// renders the Core-owned placeholder scene.
+fn assert_placeholder_kept_the_container(rt: &Runtime, panel: PanelId, workspace: u64) {
+    let host = rt.scene_host().expect("panel host installed");
+    let host = host.borrow();
+    assert_eq!(host.panel_count(), 1, "the container is retained");
+    assert_eq!(
+        host.registry().controller_generation(panel),
+        None,
+        "the container is unbound: nothing was applied"
+    );
+    let epoch = host
+        .panel_allocation_generation(panel)
+        .expect("the container has an allocation epoch");
+    assert_eq!(
+        host.panel_state(panel, epoch).expect("container exists"),
+        PanelState::Created,
+        "the restored container was never mounted by a driver"
+    );
+    assert_eq!(
+        host.registry()
+            .panels_for_workspace(bitty_runtime::registry::WorkspaceId::new(workspace)),
+        vec![panel],
+        "the record's workspace attribution survives the refusal"
+    );
+    assert!(
+        host.registry()
+            .placeholder_block(panel)
+            .expect("the placeholder scene builds")
+            .is_some(),
+        "the Core-owned placeholder surface is present"
+    );
+}
+
+#[test]
+fn a_record_whose_workspace_is_gone_is_dropped_not_rehomed() {
+    let (mut rt, _backend) = runtime();
+    // `99` names no slot this window presents.
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(99, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Missing,
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the session still restores");
+
+    let report = rt.panel_restore_report();
+    assert_eq!(
+        report.panels()[0].outcome,
+        PanelRestoreOutcome::Dropped {
+            reason: PanelRestoreDrop::WorkspaceGone
+        },
+        "an unresolvable workspace is a bounded drop, never a re-home"
+    );
+    let host = rt.scene_host().expect("panel host installed");
+    assert_eq!(
+        host.borrow().panel_count(),
+        0,
+        "a dropped record allocates nothing"
+    );
+}
+
+#[test]
+fn a_runtime_without_a_panel_host_drops_the_record_with_a_typed_reason() {
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let backend = Arc::new(CannedBackend {
+        snapshot: canned_snapshot(),
+    });
+    rt.set_session_backend(Some(backend));
+    let workspace = rt.active_workspace_id().get();
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Missing,
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the session still restores without a panel host");
+
+    assert_eq!(
+        rt.panel_restore_report().panels()[0].outcome,
+        PanelRestoreOutcome::Dropped {
+            reason: PanelRestoreDrop::NoPanelHost
+        },
+        "no registry means nothing to restore into, reported not panicked"
+    );
+}

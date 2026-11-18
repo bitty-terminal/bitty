@@ -165,6 +165,10 @@ case " $* " in
   echo 'cargo-fuzz 0.13.2'
   exit 0
   ;;
+*"-vV"*)
+  echo 'host: x86_64-unknown-linux-gnu'
+  exit 0
+  ;;
 *"--version"*)
   echo 'cargo 1.100.0-nightly (stub)'
   exit 0
@@ -318,6 +322,17 @@ expect_eq 'a leak without coverage counters is still a finding' 'finding' \
 expect_eq 'the leak is still counted' '1' "$(jq -r '.targets[0].leaks' "$TMP/out-leaknocov/summary.json")"
 rm -f "$TMP/artifacts/vt_parser/leak-deadbeef"
 
+# --- a discovered unit is saved under its content hash, without a `.bin` name
+printf 'content-hash unit' >"$TMP/corpus/vt_parser/0123456789abcdef"
+rm -rf "$TMP/out-digest-hash"
+run_fails 0 clean "$TMP/out-digest-hash"
+if [ "$pristine" = "$(jq -r '.targets[0].corpus_digest' "$TMP/out-digest-hash/summary.json")" ]; then
+  fail 'an extensionless corpus unit must change the digest'
+fi
+expect_eq 'corpus units count extensionless units' '1' \
+  "$(( $(jq -r '.targets[0].corpus_units' "$TMP/out-digest-hash/summary.json") - $(jq -r '.targets[0].corpus_units' "$TMP/out-digest-c/summary.json") ))"
+rm -f "$TMP/corpus/vt_parser/0123456789abcdef"
+
 # --- the sanitizer record is checked against the build it claims
 mkdir -p "$TMP/bare-target/release"
 printf 'stub fuzz binary, no sanitizer runtime\n' >"$TMP/bare-target/release/vt_parser"
@@ -352,19 +367,27 @@ SANITIZER=bogus FAKE_FUZZ_MODE=plan FAKE_FUZZ_CALLS="$TMP/cargo-calls" CARGO="$T
 expect_eq 'an unknown sanitizer is rejected' '2' "$SANITIZER_BAD_RC"
 grep -Fq 'unknown sanitizer' "$TMP/last.log" || fail 'an unknown sanitizer must name the defect'
 
-# --- a sanitizer-free build cannot evidence memory safety either
-SANITIZER_NONE_RC=0
-SANITIZER=none FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" CARGO="$TMP/bin/cargo" \
-  ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-nosannot" \
-  --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
-  SANITIZER_NONE_RC=$?
-expect_eq 'a sanitizer-free build cannot read clean' '4' "$SANITIZER_NONE_RC"
-expect_eq 'a sanitizer-free build records its sanitizer' 'none' \
-  "$(jq -r '.targets[0].sanitizer' "$TMP/out-nosannot/summary.json")"
-expect_eq 'a sanitizer-free build names the gap' 'sanitizer-none' \
-  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-nosannot/summary.json")"
-expect_eq 'a sanitizer-free build records no leak detection' 'none' \
-  "$(jq -r '.sanitizer.leak_detection' "$TMP/out-nosannot/summary.json")"
+# --- a build whose sanitizer cannot evidence memory safety cannot read clean
+for entry in none:sanitizer-none:none memory:sanitizer-leaks-unchecked:none; do
+  name="${entry%%:*}"
+  rest="${entry#*:}"
+  expected_gap="${rest%%:*}"
+  expected_leak_detection="${rest#*:}"
+  SANITIZER_RC=0
+  SANITIZER="$name" FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" CARGO="$TMP/bin/cargo" \
+    ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-san-$name" \
+    --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
+    SANITIZER_RC=$?
+  expect_eq "a $name build cannot read clean" '4' "$SANITIZER_RC"
+  expect_eq "a $name build records its sanitizer" "$name" \
+    "$(jq -r '.targets[0].sanitizer' "$TMP/out-san-$name/summary.json")"
+  expect_eq "a $name build names the gap" "$expected_gap" \
+    "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-san-$name/summary.json")"
+  expect_eq "a $name build records effective leak detection" "$expected_leak_detection" \
+    "$(jq -r '.sanitizer.leak_detection' "$TMP/out-san-$name/summary.json")"
+  expect_eq "a $name build records -detect_leaks" '0' \
+    "$(jq -r '.libfuzzer.detect_leaks' "$TMP/out-san-$name/summary.json")"
+done
 
 # --- a pre-seeded artifact is never `clean`, even when the run adds no new name.
 # libFuzzer derives an artifact name from the input that produced it

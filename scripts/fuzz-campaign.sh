@@ -377,10 +377,12 @@ sanitizer_marker() {
 # LeakSanitizer is not a separate build here: with `--sanitizer=address` the
 # ASan runtime links LSan, and libFuzzer's `-detect_leaks` (on by default,
 # passed explicitly below) drives it. That is why a `leak-*` artifact counts as
-# a memory-safety finding for this campaign.
+# a memory-safety finding for this campaign. libFuzzer only calls into LSan for
+# an ASan build, so every other sanitizer records `none` — the record states the
+# effective check, not the hope that a runtime would run it.
 sanitizer_leak_detection() {
   case "$1" in
-  address | leak) printf 'lsan' ;;
+  address) printf 'lsan' ;;
   *) printf 'none' ;;
   esac
 }
@@ -393,23 +395,33 @@ sanitizer_leak_detection() {
 # claims. The probe never upgrades a claim into a finding, it only refuses to
 # certify the opposite.
 probe_sanitizer_build() { # target marker -> found | mismatch | absent | not-applicable
-  local target="$1" marker="$2" root binary
+  local target="$1" marker="$2" root candidate binary=""
   if [ -z "$marker" ]; then
     printf 'not-applicable'
     return 0
   fi
   # The binary this run just built lives in exactly one tree: the caller's
-  # CARGO_TARGET_DIR when set, else cargo-fuzz's own `fuzz/target`.
+  # CARGO_TARGET_DIR when set, else cargo-fuzz's own `fuzz/target`. Cargo puts it
+  # under the host triple; a bare `release/` copy is the fallback for a caller
+  # that passed `--target-dir` or a host whose triple could not be read. Probing
+  # those exact paths — not "the first match" — keeps a stale build in the other
+  # profile from answering for this run.
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     root="$CARGO_TARGET_DIR"
   else
     root="$FUZZ_DIR/target"
   fi
-  [ -d "$root" ] || { printf 'absent'; return 0; }
-  binary="$(
-    find "$root" -maxdepth 3 -type f -name "$target" -perm -u+x 2>/dev/null |
-      { read -r found || true; printf '%s' "${found:-}"; }
-  )" || true
+  local -a candidates=()
+  if [ -n "${HOST_TRIPLE:-}" ]; then
+    candidates+=("$root/$HOST_TRIPLE/release/$target")
+  fi
+  candidates+=("$root/release/$target")
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      binary="$candidate"
+      break
+    fi
+  done
   if [ -z "$binary" ]; then
     printf 'absent'
   elif grep -aqF -- "$marker" "$binary" 2>/dev/null; then
@@ -471,18 +483,24 @@ cap_max_len() {
 }
 
 # Deterministic digest of a corpus directory: sha256 over the name-sorted
-# `<unit-sha256>  <unit-name>` manifest. Independent of directory-walk order and
-# of the host path (no path is recorded), and it changes when a unit is added,
-# removed, renamed, or rewritten. Empty output means no sha256 tool on this
-# host, which makes the digest an absent fact rather than a guessed one.
+# `<unit-sha256>  <unit-name>` manifest. Every regular file counts, because
+# libFuzzer saves a discovered unit under its content hash, without the `.bin`
+# suffix the committed seeds carry — hashing only `*.bin` would leave exactly
+# the units a run discovered out of the record. Independent of directory-walk
+# order and of the host path (no path is recorded), and it changes when a unit is
+# added, removed, renamed, or rewritten. An unreadable unit fails the whole
+# digest rather than producing a shorter manifest that still looks valid. Empty
+# output means the digest is an absent fact, not a guessed one.
 corpus_digest() {
   local dir="$1"
   [ "${#HASH_CMD[@]}" -gt 0 ] || return 0
   (
     cd "$dir" 2>/dev/null || exit 1
-    find . -maxdepth 1 -type f -name '*.bin' -print | LC_ALL=C sort |
+    find . -maxdepth 1 -type f -print | LC_ALL=C sort |
       while IFS= read -r unit; do
-        printf '%s  %s\n' "$(hash_file "$unit")" "${unit#./}"
+        sum="$(hash_file "$unit")" || exit 1
+        [ -n "$sum" ] || exit 1
+        printf '%s  %s\n' "$sum" "${unit#./}"
       done
   ) | "${HASH_CMD[@]}" | awk '{ print $1 }'
 }
@@ -810,7 +828,7 @@ run_target() {
   # the retention trim, so it describes the units that produced the coverage
   # above. The digest is a bare hex string, never a host path.
   local corpus_units corpus_sha
-  corpus_units="$(count_seeds "$corpus_dir")"
+  corpus_units="$(count_files "$corpus_dir")"
   corpus_sha="$(corpus_digest "$corpus_dir" || true)"
   if [ -n "$corpus_sha" ]; then
     mkdir -p "$OUT_DIR/corpus"
@@ -856,6 +874,11 @@ run_target() {
     # A build without a sanitizer can report zero leaks and still say nothing
     # about memory safety, which is the clause the campaign exists to evidence.
     missing+=("sanitizer-none")
+  elif [ "$SANITIZER_LEAK_DETECTION" != "lsan" ]; then
+    # libFuzzer only drives LSan for an ASan build. Another sanitizer may be a
+    # fine campaign, but it cannot evidence the leak clause, so it is recorded
+    # as the gap it is rather than folded into a clean result.
+    missing+=("sanitizer-leaks-unchecked")
   elif [ "$sanitizer_probe" = "mismatch" ]; then
     missing+=("sanitizer-build")
   fi
@@ -1008,6 +1031,9 @@ main() {
   command -v "$CARGO" >/dev/null 2>&1 || env_die "cargo not found on PATH"
   TOOLCHAIN_VERSION="$("$CARGO" "+$TOOLCHAIN" --version 2>&1)" ||
     env_die "toolchain '$TOOLCHAIN' is not installed (rustup toolchain install $TOOLCHAIN)"
+  # Where cargo puts this run's fuzz binary (`<target-dir>/<host-triple>/release`).
+  # Best-effort: an empty value only costs the probe one candidate path.
+  HOST_TRIPLE="$("$CARGO" "+$TOOLCHAIN" -vV 2>/dev/null | awk '$1 == "host:" { print $2; exit }' || true)"
   CARGO_FUZZ_DETECTED="$("$CARGO" fuzz --version 2>&1)" ||
     env_die "cargo-fuzz is not installed (cargo install --locked --version $CARGO_FUZZ_VERSION cargo-fuzz)"
 

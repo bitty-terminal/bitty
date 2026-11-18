@@ -190,15 +190,19 @@ evidence:
 
 | Addition           | Recorded as                                                                                   | How it is captured                                                                                                                                                                                                                                    | Absent means                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified`      | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the target binary is probed for the runtime symbol (`__asan_init`, ...) and a located binary without it is a contradiction | `sanitizer-build` on a contradiction, `sanitizer-none` for a `SANITIZER=none` build; `clean` is refused both ways |
-| Corpus digest      | `targets[].corpus_digest`, `.corpus_units`, `corpus/<target>.sha256`                           | sha256 over the name-sorted `<unit-sha256>  <unit-name>` manifest of the corpus the run ended with (before the retention trim)                                                                                                                         | `corpus-digest`; a host without `sha256sum`/`shasum` cannot claim clean |
+| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified`      | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the target binary this run built (`<target-dir>/<host-triple>/release/<target>`, with a bare `release/` fallback) is probed for the runtime symbol (`__asan_init`, ...) and a binary without it is a contradiction | `sanitizer-build` on a contradiction; `sanitizer-none` for a `SANITIZER=none` build; `sanitizer-leaks-unchecked` for a sanitizer libFuzzer does not drive LSan with; `clean` is refused in all three |
+| Corpus digest      | `targets[].corpus_digest`, `.corpus_units`, `corpus/<target>.sha256`                           | sha256 over the name-sorted `<unit-sha256>  <unit-name>` manifest of every regular file in the corpus the run ended with (before the retention trim) — discovered units are named by content hash, so a `*.bin` filter would omit exactly what the run found — and an unreadable unit fails the digest instead of shortening it | `corpus-digest`; a host without `sha256sum`/`shasum` cannot claim clean |
 | Coverage signal    | `targets[].coverage_edges`, `.coverage_features`                                               | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters from its last pulse line, parsed as bounded integers (`0..2^32-1`, anything else is absent)                                                                                        | `coverage`; `clean` is refused                                      |
 
 The rules are ordered so that they can only ever subtract a `clean`: a finding,
 an artifact left in the directory, libFuzzer's error exit, or a runner error
 keeps its precedence, so missing provenance can never hide a finding (the driver
 test pins both directions — a `leak-*` with no coverage counters is still
-`finding`, exit 1).
+`finding`, exit 1). The sanitizer row covers every build that cannot evidence
+the leak clause: `none` links no runtime at all, and `leak`/`memory`/`thread`
+are sanitizers libFuzzer does not drive LSan with, so their runs are recorded
+`inconclusive` (`sanitizer-none`, `sanitizer-leaks-unchecked`) rather than
+folded into a clean count.
 
 ### Field to P0-AC-002 clause
 

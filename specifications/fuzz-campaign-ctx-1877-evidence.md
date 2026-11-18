@@ -202,8 +202,9 @@ test pins both directions — a `leak-*` with no coverage counters is still
 `finding`, exit 1). The sanitizer row covers every build that cannot evidence
 the leak clause: `none` links no runtime at all; `leak`/`memory`/`thread` are
 sanitizers libFuzzer does not drive LSan with; and an inherited
-`ASAN_OPTIONS=detect_leaks=0` (or `LSAN_OPTIONS=…`) makes the runtime skip the
-check even when `-detect_leaks=1` is passed, which `leak_detection_effective`
+`ASAN_OPTIONS=detect_leaks=0` (or `LSAN_OPTIONS=…`, read with the runtime's own
+`:`/`,` separators and `0`/`false` Booleans) makes the runtime skip the check
+even when `-detect_leaks=1` is passed, which `leak_detection_effective`
 records and `leak_detection_disabled_by` names. All of those runs are recorded
 `inconclusive` (`sanitizer-none`, `sanitizer-leaks-unchecked`) rather than
 folded into a clean count.

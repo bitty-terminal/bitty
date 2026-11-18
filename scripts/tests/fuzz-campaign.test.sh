@@ -379,22 +379,48 @@ expect_eq 'an unidentifiable build is not claimed verified' 'false' \
   "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-unprobed/summary.json")"
 CARGO_TARGET_DIR="$TMP/cargo-target"
 
-# --- an inherited ASAN_OPTIONS=detect_leaks=0 means no leak check happened
-rm -rf "$TMP/out-leaksoff"
-LEAKSOFF_RC=0
-ASAN_OPTIONS='detect_leaks=0' FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" \
-  CARGO="$TMP/bin/cargo" \
-  ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-leaksoff" \
-  --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
-  LEAKSOFF_RC=$?
-expect_eq 'a run with leak detection disabled cannot read clean' '4' "$LEAKSOFF_RC"
-expect_eq 'disabled leak detection is named' 'sanitizer-leaks-unchecked' \
-  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-leaksoff/summary.json")"
-expect_eq 'the effective leak state is recorded' 'false' \
-  "$(jq -r '.sanitizer.leak_detection_effective' "$TMP/out-leaksoff/summary.json")"
-expect_eq 'the disabling option is recorded' 'ASAN_OPTIONS=detect_leaks=0' \
-  "$(jq -r '.sanitizer.leak_detection_disabled_by' "$TMP/out-leaksoff/summary.json")"
-grep -Fq 'disables the leak check' "$TMP/last.log" || fail 'the driver must warn about disabled leak detection'
+# --- an inherited sanitizer option can disable the leak check: the runtime's
+# parser takes `:` and `,` as separators and `0`/`false` as a Boolean, so the
+# record must read the options the same way.
+case_index=0
+for entry in \
+  'ASAN_OPTIONS|detect_leaks=0|disabled' \
+  'ASAN_OPTIONS|abort_on_error=1:detect_leaks=0|disabled' \
+  'ASAN_OPTIONS|detect_leaks=0,detect_leaks=0|disabled' \
+  'LSAN_OPTIONS|detect_leaks=false|disabled' \
+  'LSAN_OPTIONS|verbosity=1:detect_leaks=FALSE|disabled' \
+  'ASAN_OPTIONS|detect_leaks=0:detect_leaks=1|effective'; do
+  case_index=$((case_index + 1))
+  variable="${entry%%|*}"
+  rest="${entry#*|}"
+  options="${rest%|*}"
+  expected="${rest##*|}"
+  out="$TMP/out-leak-$case_index"
+  rm -rf "$out"
+  leak_rc=0
+  env "$variable=$options" FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" \
+    CARGO="$TMP/bin/cargo" \
+    ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$out" \
+    --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
+    leak_rc=$?
+  if [ "$expected" = "disabled" ]; then
+    expect_eq "$variable=$options cannot read clean" '4' "$leak_rc"
+    expect_eq "$variable=$options names the gap" 'sanitizer-leaks-unchecked' \
+      "$(jq -r '.targets[0].evidence_missing[0]' "$out/summary.json")"
+    expect_eq "$variable=$options records leak detection off" 'false' \
+      "$(jq -r '.sanitizer.leak_detection_effective' "$out/summary.json")"
+    expect_eq "$variable=$options records the disabling option" "$variable=detect_leaks=0" \
+      "$(jq -r '.sanitizer.leak_detection_disabled_by' "$out/summary.json")"
+    grep -Fq 'disables the leak check' "$TMP/last.log" ||
+      fail "the driver must warn when $variable=$options disables the leak check"
+  else
+    expect_eq "$variable=$options stays clean" '0' "$leak_rc"
+    expect_eq "$variable=$options records leak detection on" 'true' \
+      "$(jq -r '.sanitizer.leak_detection_effective' "$out/summary.json")"
+    expect_eq "$variable=$options records no disabling option" '' \
+      "$(jq -r '.sanitizer.leak_detection_disabled_by' "$out/summary.json")"
+  fi
+done
 
 # --- an unreadable corpus unit fails the digest instead of shortening it
 unreadable="$TMP/corpus/vt_parser/unreadable.bin"

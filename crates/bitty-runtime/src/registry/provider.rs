@@ -52,7 +52,13 @@ pub const MAX_PROVIDER_TYPES: usize = 8;
 /// Maximum `owner`/`name` segment length (mirrors the topic owner grammar).
 pub const MAX_PROVIDER_OWNER_SEGMENT_LEN: usize = 16;
 
-/// Manifest schema version accepted by v1.
+/// The manifest schema version this runtime reads.
+///
+/// A manifest at a *higher* version is admitted rather than refused
+/// ([`PanelProviderManifest::parse`]): refusing at registration would delete the
+/// skew from every surface a bind could observe, and a panel whose provider
+/// speaks a newer contract has to keep its container and present
+/// `incompatible` instead (bitty#3239 row 13, Decision E rule 3).
 pub const PROVIDER_MANIFEST_VERSION_V1: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -76,7 +82,7 @@ pub enum ProviderContractError {
     TooManyTypes { max: usize, current: usize },
     /// Same panel type declared twice.
     DuplicateType { panel_type: String },
-    /// Unsupported manifest schema version.
+    /// A manifest with no usable schema version (`0`).
     UnsupportedVersion { version: u32 },
 }
 
@@ -125,6 +131,14 @@ impl PanelProviderManifest {
     /// Validates `owner` (`owner.name` grammar), the type list (non-empty,
     /// bounded, deduplicated), and the schema version.
     ///
+    /// A version **above** [`PROVIDER_MANIFEST_VERSION_V1`] is admitted: this
+    /// runtime cannot read the contract it declares, but the declaration is
+    /// still a fact a bind has to observe, and refusing it here would leave a
+    /// panel whose provider is too new indistinguishable from one whose
+    /// provider is not installed. Such a manifest reports
+    /// [`Self::requires_newer_runtime`] and no bind commits it
+    /// (bitty#3239 row 13). Only `0` is refused: it is not a schema version.
+    ///
     /// # Errors
     ///
     /// [`ProviderContractError`] variants describing the first violation;
@@ -135,7 +149,7 @@ impl PanelProviderManifest {
         version: u32,
     ) -> Result<Self, ProviderContractError> {
         validate_owner(owner)?;
-        if version != PROVIDER_MANIFEST_VERSION_V1 {
+        if version == 0 {
             return Err(ProviderContractError::UnsupportedVersion { version });
         }
         if types.is_empty() {
@@ -179,6 +193,20 @@ impl PanelProviderManifest {
     #[must_use]
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Whether this manifest declares a contract newer than the one this
+    /// runtime reads ([`PROVIDER_MANIFEST_VERSION_V1`]).
+    ///
+    /// A manifest that answers `true` is registered like any other — the
+    /// declaration is what makes the skew observable — but nothing may bind a
+    /// panel to it: the runtime cannot read what the provider would commit, so
+    /// the panel keeps its container and presents
+    /// [`PlaceholderReason::Incompatible`](bitty_ui::panel_recovery::PlaceholderReason::Incompatible)
+    /// instead of a partial grant (bitty#3239 row 13, Decision E rule 3).
+    #[must_use]
+    pub const fn requires_newer_runtime(&self) -> bool {
+        self.version > PROVIDER_MANIFEST_VERSION_V1
     }
 
     /// Whether this provider declares `panel_type`.
@@ -262,6 +290,11 @@ impl PanelProviderRegistry {
     /// Registers a validated manifest. `capability_granted` carries the
     /// host's `panel.provider` grant; without it registration fails closed.
     /// Returns the registration generation.
+    ///
+    /// A manifest whose contract is newer than this runtime reads is admitted
+    /// as a record like any other ([`PanelProviderManifest::requires_newer_runtime`]):
+    /// registration is not a bind, and the bind edge is what presents
+    /// `incompatible` for it.
     ///
     /// # Errors
     ///
@@ -397,9 +430,43 @@ mod tests {
             })
         );
         assert_eq!(
-            PanelProviderManifest::parse("example.git", vec![PanelType::Terminal], 99),
-            Err(ProviderContractError::UnsupportedVersion { version: 99 })
+            PanelProviderManifest::parse("example.git", vec![PanelType::Terminal], 0),
+            Err(ProviderContractError::UnsupportedVersion { version: 0 }),
+            "zero is not a schema version"
         );
+    }
+
+    /// bitty#3239 row 13: a manifest above the supported schema is admitted, so
+    /// the skew exists as a registered record instead of being deleted at the
+    /// gate, and it reports itself as needing a newer runtime. Fails if `parse`
+    /// goes back to `version != PROVIDER_MANIFEST_VERSION_V1`, because the
+    /// manifest never exists to register.
+    #[test]
+    fn a_newer_manifest_is_admitted_and_declares_it_needs_a_newer_runtime() {
+        let current = manifest("example.git", vec![PanelType::Terminal]);
+        assert_eq!(current.version(), PROVIDER_MANIFEST_VERSION_V1);
+        assert!(
+            !current.requires_newer_runtime(),
+            "the schema this runtime reads is not a skew"
+        );
+
+        let newer = PanelProviderManifest::parse("example.git", vec![PanelType::Terminal], 2)
+            .expect("a manifest above v1 is admitted");
+        assert_eq!(newer.version(), 2);
+        assert!(newer.requires_newer_runtime());
+        assert!(newer.declares(PanelType::Terminal));
+
+        // Registration keeps the record: an unregistered manifest cannot be
+        // observed by the bind edge, and dropping it here would present
+        // `unloaded` for a provider that is installed.
+        let mut registry = PanelProviderRegistry::new();
+        let generation = registry
+            .register(newer.clone(), true)
+            .expect("a newer manifest registers");
+        assert_eq!(registry.generation_of("example.git"), Some(generation));
+        let registered = registry.get("example.git").expect("the record is kept");
+        assert!(registered.requires_newer_runtime());
+        assert_eq!(registered.version(), 2);
     }
 
     #[test]

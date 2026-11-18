@@ -90,16 +90,20 @@
 //!   a live disable entry and a live enable/rebind path in the plugin host, not
 //!   a test-side reason token; `PGO-4`/`PGO-20`'s crash arm cover the fault
 //!   direction that *is* reachable.
-//! - **PGO-11** (provider version records): no production path presents
-//!   `incompatible` — `PlaceholderReason::Incompatible` has no producer
-//!   (`dispose_inner` passes `Unloaded`/`Disabled`/`Reloaded`, `rollback` passes
-//!   `Crashed`, and `PanelRegistry::present_placeholder` takes the reason token
-//!   from its caller), and the only versioned provider record,
-//!   `PanelProviderManifest`, refuses every version other than 1 at
-//!   `registry/provider.rs:138`, so there is no newer-provider-over-older-record
-//!   direction and no tolerant reader to drive. The persisted panel manifest
+//! - **PGO-11** (provider version records): the restore edge now homes the
+//!   *newer-provider-over-older-runtime* direction — the container of a record
+//!   whose driver registered a provider manifest above
+//!   `PROVIDER_MANIFEST_VERSION_V1` is retained and presents `incompatible`,
+//!   read in `tests/panel_restore_path.rs`
+//!   (`a_provider_manifest_newer_than_the_runtime_keeps_the_container_with_an_incompatible_placeholder`,
+//!   with `a_provider_manifest_at_the_supported_schema_still_first_binds` as the
+//!   version-comparison control). What stays without a row here is the
+//!   **live** direction: no `bitty.panel.create`/rebind path reads a provider
+//!   manifest, so a generation that binds without a restore still commits its
+//!   own resolution. The persisted panel manifest
 //!   (`bitty-ui/src/panel_persist.rs:367`) has a version gate and unknown-field
-//!   tolerance, but it carries identity, not provider content.
+//!   tolerance, but it carries identity, not provider content, so the
+//!   older-provider-over-newer-record half is unchanged.
 //! - **PGO-15's read half** (a displaced generation reading its successor's
 //!   state): the refusal half is homed above, but the read half has no seam.
 //!   The panel-scoped bus (`PanelEventBus::queued_events_for_panel`,

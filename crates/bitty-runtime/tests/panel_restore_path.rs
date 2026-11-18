@@ -407,6 +407,133 @@ fn an_older_driver_keeps_the_container_with_an_incompatible_placeholder() {
     assert_placeholder_kept_the_container(&rt, panel, restored_workspace.get());
 }
 
+/// bitty#3239 row 13: an installed driver whose registered provider manifest
+/// declares a schema newer than the runtime reads never binds. The container
+/// stays, presents `incompatible`, and applies nothing.
+///
+/// Discriminates the skew gate in `Runtime::restore_one_panel`
+/// (`runtime/panel_restore.rs`, the `provider_contract_outruns_runtime` branch
+/// of the `PanelDriverAnswer::Installed` arm): reverted to bind unconditionally,
+/// this row restores a `Bound` outcome and no placeholder. It also needs
+/// `PanelProviderManifest::parse` to admit a version above
+/// `PROVIDER_MANIFEST_VERSION_V1`, because the manifest could not be registered
+/// at all before.
+#[test]
+fn a_provider_manifest_newer_than_the_runtime_keeps_the_container_with_an_incompatible_placeholder()
+{
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    register_provider(&rt, owner().as_str(), 2);
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Installed {
+            owner: owner(),
+            resolution: resolution(),
+            consented: BTreeSet::new(),
+        },
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the session still restores");
+
+    let report = rt.panel_restore_report();
+    assert_eq!(
+        report.bound(),
+        0,
+        "a contract this runtime cannot read is never committed: {report:?}"
+    );
+    let PanelRestoreOutcome::Placeholder {
+        panel,
+        workspace: restored_workspace,
+        reason,
+    } = report.panels()[0].outcome.clone()
+    else {
+        panic!("an unreadable provider contract presents a placeholder: {report:?}");
+    };
+    assert_eq!(
+        reason,
+        PlaceholderReason::Incompatible,
+        "the driver's provider outruns this runtime: `incompatible`, not `unloaded`"
+    );
+    assert_eq!(
+        unbound_reason(&rt, panel),
+        Some(PlaceholderReason::Incompatible),
+        "the retained container presents the placeholder"
+    );
+    assert_placeholder_kept_the_container(&rt, panel, restored_workspace.get());
+    assert_nothing_was_granted(&rt, panel, &resolution());
+}
+
+/// The skew gate is a version comparison, not a blanket refusal: a driver whose
+/// provider registered the schema this runtime reads still first-binds.
+///
+/// Discriminates the same line as the row above from the other side — a gate
+/// that refused every registered provider, or that ignored `version()`, turns
+/// this row red.
+#[test]
+fn a_provider_manifest_at_the_supported_schema_still_first_binds() {
+    let (mut rt, _backend) = runtime();
+    let workspace = rt.active_workspace_id().get();
+    register_provider(
+        &rt,
+        owner().as_str(),
+        bitty_runtime::registry::PROVIDER_MANIFEST_VERSION_V1,
+    );
+    rt.set_panel_restore_records(vec![PanelRestoreInput::new(
+        persisted(workspace, "logs", "logs"),
+        PanelType::Helper,
+        PanelDriverAnswer::Installed {
+            owner: owner(),
+            resolution: resolution(),
+            consented: BTreeSet::new(),
+        },
+    )]);
+
+    rt.load_session_from_path(&session_path())
+        .expect("the restore applies");
+
+    let report = rt.panel_restore_report();
+    assert_eq!(report.bound(), 1, "the current schema binds: {report:?}");
+    assert_eq!(
+        unbound_reason(&rt, report.panels()[0].restored_id().expect("container")),
+        None,
+        "a bound container presents no placeholder"
+    );
+}
+
+/// Registers one provider manifest on the installed panel host.
+fn register_provider(rt: &Runtime, owner: &str, version: u32) {
+    let host = rt.scene_host().expect("panel host installed");
+    let manifest = bitty_runtime::registry::PanelProviderManifest::parse(
+        owner,
+        vec![PanelType::Helper],
+        version,
+    )
+    .expect("the manifest parses");
+    host.borrow_mut()
+        .register_panel_provider(manifest, true)
+        .expect("the provider registers");
+}
+
+/// Every capability the refused driver offered is ungranted on the container's
+/// allocation epoch, so nothing was applied by the refused bind.
+fn assert_nothing_was_granted(rt: &Runtime, panel: PanelId, resolution: &BTreeSet<String>) {
+    let host = rt.scene_host().expect("panel host installed");
+    let host = host.borrow();
+    let epoch = host
+        .panel_allocation_generation(panel)
+        .expect("the container has an allocation epoch");
+    for capability in resolution {
+        assert!(
+            !host
+                .registry()
+                .is_panel_capability_granted(panel, epoch, capability),
+            "{capability} must not be granted by a refused bind"
+        );
+    }
+}
+
 /// Shared assertion for the three refusal rows: the container exists, is
 /// unbound, never mounted, keeps the record's workspace attribution, and
 /// renders the Core-owned placeholder scene.

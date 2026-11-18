@@ -1187,6 +1187,18 @@ impl PanelRuntime {
         self.providers.providers_for_type(panel_type)
     }
 
+    /// The registered manifest for `owner`, if `owner` is registered.
+    ///
+    /// Read-only. A manifest that declares a newer contract than this runtime
+    /// reads stays visible here ([`PanelProviderManifest::requires_newer_runtime`])
+    /// instead of being dropped at registration, so the bind edge can observe
+    /// the skew and present `incompatible` rather than treating the provider as
+    /// absent (bitty#3239 row 13).
+    #[must_use]
+    pub fn provider_manifest(&self, owner: &str) -> Option<&PanelProviderManifest> {
+        self.providers.get(owner)
+    }
+
     /// Registration generation for `owner`, if registered.
     #[must_use]
     pub fn provider_generation_of(&self, owner: &str) -> Option<u64> {

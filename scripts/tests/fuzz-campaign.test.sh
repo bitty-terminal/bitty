@@ -208,9 +208,55 @@ if ! CARGO="$TMP/bin/cargo" FAKE_FUZZ_CALLS="$TMP/cargo-calls" \
   ./scripts/fuzz-campaign.sh --dry-run >"$TMP/plan.log" 2>&1; then
   fail 'dry-run must exit 0 without a toolchain'
 fi
-for target in $(./scripts/fuzz-campaign.sh --list-targets); do
-  grep -Fq "$target" "$TMP/plan.log" || fail "dry-run plan must list target $target"
+# The expected set is derived from `fuzz/Cargo.toml` itself, never from
+# `--list-targets` (bitty#3237 review): taking the expectation from the code
+# under test made the assertion self-referential — a `list_targets` that skipped
+# a target simply did not iterate for it, and the suite stayed green. The two
+# extractions below are independent of the driver: the count of `[[bin]]`
+# sections, and each section's `path` field (whose `fuzz_targets/<stem>.rs` stem
+# is the target cargo-fuzz actually builds), cross-checked against each other and
+# against the driver's list in BOTH directions — no target may go missing and no
+# extra target may appear.
+manifest=fuzz/Cargo.toml
+[ -f "$manifest" ] || fail "the fuzz manifest must exist at $manifest"
+manifest_bins="$(grep -c '^\[\[bin\]\]' "$manifest" || true)"
+manifest_targets="$(awk '
+  /^\[\[bin\]\]/ { in_bin = 1; next }
+  /^\[/ { in_bin = 0 }
+  in_bin && /^[[:space:]]*path[[:space:]]*=/ {
+    n = split($0, fields, "\"")
+    if (n >= 2 && fields[2] ~ /^fuzz_targets\/[^\/]+\.rs$/) {
+      name = fields[2]
+      sub(/^fuzz_targets\//, "", name)
+      sub(/\.rs$/, "", name)
+      print name
+    }
+    in_bin = 0
+  }
+' "$manifest" | LC_ALL=C sort)"
+manifest_count="$(printf '%s\n' "$manifest_targets" | sed '/^$/d' | wc -l | tr -d ' ')"
+expect_eq 'every [[bin]] section declares a fuzz_targets/<name>.rs path' \
+  "$manifest_bins" "$manifest_count"
+[ "$manifest_count" -gt 0 ] || fail "manifest oracle found no targets in $manifest"
+listed_targets="$(./scripts/fuzz-campaign.sh --list-targets | LC_ALL=C sort)"
+expect_eq 'the driver enumerates as many targets as the manifest declares' \
+  "$manifest_count" "$(printf '%s\n' "$listed_targets" | sed '/^$/d' | wc -l | tr -d ' ')"
+for target in $manifest_targets; do
+  if ! printf '%s\n' "$listed_targets" | grep -Fxq -- "$target"; then
+    fail "the driver dropped manifest target $target from --list-targets"
+  fi
+  grep -Fq -- "$target" "$TMP/plan.log" || fail "dry-run plan must list target $target"
 done
+for target in $listed_targets; do
+  if ! printf '%s\n' "$manifest_targets" | grep -Fxq -- "$target"; then
+    fail "the driver lists '$target', which $manifest does not declare"
+  fi
+done
+# The plan's own target list must be exactly the manifest set as well: the
+# driver's default selection is what the campaign actually runs.
+plan_targets="$(sed -n 's/^[[:space:]]*targets:[[:space:]]*//p' "$TMP/plan.log" |
+  tr ',' '\n' | sed '/^$/d' | LC_ALL=C sort)"
+expect_eq 'dry-run plan target set' "$manifest_targets" "$plan_targets"
 grep -Fq 'secs: 600' "$TMP/plan.log" || fail 'dry-run must show the default 600 s budget'
 if [ -e "$TMP/cargo-calls" ]; then
   fail 'dry-run must not invoke cargo'
@@ -672,6 +718,131 @@ if grep -Eq '^  (push|pull_request|pull_request_target):' "$workflow"; then
 fi
 grep -Fq 'expected_targets' "$workflow" || fail 'the merged record must carry the expected target set'
 grep -Fq 'missing_targets' "$workflow" || fail 'the merged record must carry the missing target set'
+
+# --- report job: execute the merge rule instead of grepping for it. The jq
+# program is extracted from the workflow (one owner, no second copy to drift)
+# and run over synthetic per-target legs. This pins the sanitizer/incomplete
+# rule that a `grep -Fq` above would let regress silently: agreeing legs may
+# merge to `clean`, a disagreeing sanitizer identity must merge to `incomplete`,
+# and finding/inconclusive precedence must survive the new rule.
+if command -v jq >/dev/null 2>&1; then
+  merge_jq="$(awk '
+    /^[[:space:]]*jq -s([[:space:]]|$)/ { grab = 1; next }
+    grab && /summaries\[@\]/ { grab = 0; found = 1; next }
+    grab { sub(/^[[:space:]]+/, ""); print }
+    END { exit(found ? 0 : 1) }
+  ' "$workflow")" || merge_jq=""
+  merge_lines="$(printf '%s\n' "$merge_jq" | awk 'NF { n++ } END { print n + 0 }')"
+  if [ "$merge_lines" -lt 20 ]; then
+    fail 'the report job merge program could not be extracted from the workflow'
+  else
+    write_leg() { # path target sanitizer result
+      jq -n --arg t "$2" --arg s "$3" --arg r "$4" '
+        ($s == "address") as $asan
+        | {
+            campaign: "bitty-fuzz-campaign",
+            revision: "0123456789abcdef0123456789abcdef01234567",
+            revision_dirty: false,
+            toolchain: "nightly (stub)",
+            cargo_fuzz: "0.13.2",
+            sanitizer: {
+              name: $s,
+              cargo_fuzz_flag: ("--sanitizer=" + $s),
+              instrumentation: (if $asan then "-Zsanitizer=address" else "none (no sanitizer runtime linked)" end),
+              leak_detection: (if $asan then "lsan" else "none" end),
+              leak_detection_source: (if $asan then "asan-runtime" else "none" end),
+              leak_detection_effective: $asan,
+              leak_detection_disabled_by: null
+            },
+            libfuzzer: {
+              max_total_time_secs: 600, timeout_secs: 25, rss_limit_mb: 2048,
+              workers: 1, detect_leaks: (if $asan then 1 else 0 end)
+            },
+            started_utc: "2026-11-18T00:00:00Z",
+            finished_utc: "2026-11-18T00:10:00Z",
+            requested_secs: 600,
+            targets: [{
+              target: $t,
+              secs_fuzzed: 601, secs_actual: 640, runs: 1000, exec_per_sec: 1,
+              new_units: 1, coverage_edges: 12, coverage_features: 34,
+              corpus_seeds: 5, corpus_delta: 1, corpus_units: 6,
+              corpus_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+              sanitizer: $s, sanitizer_probe: "found", sanitizer_verified: $asan,
+              evidence_missing: [], peak_rss_mb: 100,
+              crashes: 0, leaks: 0, slow_units: 0, oom: 0, timeouts: 0,
+              other_artifacts: 0, pre_existing_artifacts: 0,
+              pre_existing_artifact_names: [],
+              exit_code: 0, result: $r
+            }]
+          }' >"$1"
+    }
+    merge_to() { # out-file expected-targets leg...
+      local out="$1" expected="$2"
+      shift 2
+      EXPECTED_TARGETS="$expected" GITHUB_RUN_ID=1 \
+        GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF_NAME=main \
+        jq -s "$merge_jq" "$@" >"$out" 2>"$TMP/merge.err"
+    }
+    merged_field() { # file filter
+      jq -r "$2" "$1" 2>/dev/null || printf '<unreadable>'
+    }
+    write_leg "$TMP/leg-a.json" vt_parser address clean
+    write_leg "$TMP/leg-b.json" osc_string address clean
+    if merge_to "$TMP/merged-clean.json" 'vt_parser osc_string' \
+      "$TMP/leg-a.json" "$TMP/leg-b.json"; then
+      expect_eq 'two agreeing clean legs merge to clean' 'clean' \
+        "$(merged_field "$TMP/merged-clean.json" '.result')"
+      expect_eq 'the merged record counts both targets' '2' \
+        "$(merged_field "$TMP/merged-clean.json" '.totals.targets')"
+      expect_eq 'the merged record keeps the sanitizer identity' 'address' \
+        "$(merged_field "$TMP/merged-clean.json" '.sanitizer.name')"
+    else
+      fail "the merge program failed on two clean legs: $(cat "$TMP/merge.err")"
+    fi
+    # A leg built for a different sanitizer cannot merge into a clean campaign.
+    write_leg "$TMP/leg-mixed.json" osc_string leak clean
+    if merge_to "$TMP/merged-mixed.json" 'vt_parser osc_string' \
+      "$TMP/leg-a.json" "$TMP/leg-mixed.json"; then
+      expect_eq 'disagreeing sanitizer identities merge to incomplete' 'incomplete' \
+        "$(merged_field "$TMP/merged-mixed.json" '.result')"
+      expect_eq 'the merged sanitizer is recorded as mixed' 'mixed' \
+        "$(merged_field "$TMP/merged-mixed.json" '.sanitizer')"
+    else
+      fail "the merge program failed on disagreeing legs: $(cat "$TMP/merge.err")"
+    fi
+    # The new rule sits after finding/inconclusive precedence and cannot soften
+    # either of them.
+    write_leg "$TMP/leg-inconclusive.json" osc_string address inconclusive
+    if merge_to "$TMP/merged-inconclusive.json" 'vt_parser osc_string' \
+      "$TMP/leg-a.json" "$TMP/leg-inconclusive.json"; then
+      expect_eq 'an inconclusive leg stays inconclusive' 'inconclusive' \
+        "$(merged_field "$TMP/merged-inconclusive.json" '.result')"
+    else
+      fail "the merge program failed on an inconclusive leg: $(cat "$TMP/merge.err")"
+    fi
+    write_leg "$TMP/leg-finding.json" osc_string leak finding
+    if merge_to "$TMP/merged-finding.json" 'vt_parser osc_string' \
+      "$TMP/leg-a.json" "$TMP/leg-finding.json"; then
+      expect_eq 'a finding outranks a disagreeing sanitizer' 'finding' \
+        "$(merged_field "$TMP/merged-finding.json" '.result')"
+    else
+      fail "the merge program failed on a finding leg: $(cat "$TMP/merge.err")"
+    fi
+    # A leg that died before uploading its summary makes the run incomplete and
+    # names the missing target.
+    if merge_to "$TMP/merged-missing.json" 'vt_parser osc_string' "$TMP/leg-a.json"; then
+      expect_eq 'a missing leg makes the run incomplete' 'incomplete' \
+        "$(merged_field "$TMP/merged-missing.json" '.result')"
+      expect_eq 'the missing target is named' 'osc_string' \
+        "$(merged_field "$TMP/merged-missing.json" '.missing_targets | join(",")')"
+    else
+      fail "the merge program failed on a missing leg: $(cat "$TMP/merge.err")"
+    fi
+  fi
+else
+  echo 'fuzz-campaign.test.sh: skipping the merge-record case (no jq)' >&2
+fi
+
 grep -Fq 'bash scripts/tests/fuzz-campaign.test.sh' .github/workflows/ci.yml ||
   fail 'the campaign driver test must run in PR CI'
 if grep -Fq 'scripts/fuzz-campaign.sh' .github/workflows/ci.yml; then

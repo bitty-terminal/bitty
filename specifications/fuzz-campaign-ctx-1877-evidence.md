@@ -12,12 +12,16 @@ build and its flags, a corpus digest artifact, and a bounded coverage signal,
 and a run that cannot state them is `inconclusive` rather than `clean` (see
 "Evidence completeness").
 
-This document is the runbook for that machinery plus the measured run that
-validated it. It lands in this repository only; the canonical security corpus
-and the R-001 risk-state move stay with the separate `bitty-docs` task. It does
-**not** claim P0-AC-002 closure: the acceptance also needs a campaign recorded
-against a named revision and independent auditor review (see "How this feeds
-P0-AC-002").
+This document is the runbook for that machinery, plus the CTX-1877 60 s smoke
+campaign retained below as history. It lands in this repository only; the
+canonical security corpus and the R-001 risk-state move stay with the separate
+`bitty-docs` task. It does **not** claim P0-AC-002 closure: the acceptance also
+needs a campaign recorded against a named revision and independent auditor
+review (see "How this feeds P0-AC-002"). The CTX-1880 change that made the
+provenance fields mandatory was authored on a host with no nightly toolchain and
+reports no campaign of its own: the historical run below predates every field
+that turns a record into evidence, and the current rules are pinned by the
+stubbed driver test instead.
 
 ## What was added
 
@@ -216,21 +220,36 @@ folded into a clean count.
 | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | A **long-running** campaign, not a one-off            | `requested_secs`, `targets[].secs_fuzzed`, `targets[].secs_actual`, `targets[].runs`, `started_utc`/`finished_utc`; the merged record's `expected_targets`/`received_targets`/`missing_targets` |
 | **Zero crashes**                                      | `targets[].crashes`, `artifacts[]`, `pre_existing_artifacts`, `targets[].result`                                                                                                                  |
+| **Zero crashes** — the artifact directory was empty at start | `targets[].pre_existing_artifact_names` (with `.pre_existing_artifacts`): a file already present blocks `clean`, because libFuzzer reuses the name of a re-discovered input, so a stale artifact could otherwise launder a clean count |
 | **Zero hangs**                                        | `targets[].slow_units`, `targets[].timeouts`, and `libfuzzer.timeout_secs` — the bound that defines a hang                                                                                       |
 | **Zero memory-safety findings**                       | `targets[].leaks` **with** `sanitizer.leak_detection_effective: true` and the `sanitizer.instrumentation` that produced it: `leaks: 0` is memory-safety evidence only when the build had the sanitizer *and* the runtime actually ran the leak check |
+| **Zero memory-safety findings** — the leak check was requested of the runtime | `libfuzzer.detect_leaks` (the `-detect_leaks=` value the driver forwarded, `1` only for an ASan build whose runtime still has the check enabled; `0` means the campaign never asked for it, so `leaks: 0` proves nothing) |
+| **Zero memory-safety findings** — the binary is the sanitizer build the flag names | `targets[].sanitizer_probe` (`found`/`mismatch`/`absent`/`not-applicable`: the located build's runtime symbol), `targets[].sanitizer_verified` (`false` on `absent`/`mismatch`; a `mismatch` is a contradiction and blocks `clean`) |
 | **Corpus retained in-repo, with a hash artifact**      | `targets[].corpus_seeds`, `.corpus_units`, `.corpus_digest`, `corpus/<target>.sha256`                                                                                                            |
 | **Provenance an auditor can re-run**                  | `revision`, `revision_dirty`, `toolchain`, `cargo_fuzz`, `sanitizer.*`, `libfuzzer`, `targets[].coverage_edges`/`.coverage_features`                                                              |
+| **Provenance an auditor can re-run** — nothing silently missing | `targets[].evidence_missing`: empty on every target is a precondition of `clean`; a named gap (`coverage`, `corpus-digest`, `sanitizer-build`, `sanitizer-none`, `sanitizer-leaks-unchecked`) makes the run `inconclusive` whatever its finding counts are, so a reviewer can see which clause the record cannot support instead of reading a bare zero |
 
 A review that finds a `clean` record missing any row of the first table returns
 `NEEDS-FIX`. The corpus hash and the sanitizer identity are what make
 `leaks: 0` mean "no memory-safety finding under ASan/LSan", instead of "nothing
 looked".
 
-## Measured run (this change)
+## CTX-1877 60 s smoke campaign (historical; predates the provenance fields)
 
-Machinery smoke on the authoring host: Linux x86_64, 24 hardware threads,
-`cargo 1.100.0-nightly`, `cargo-fuzz 0.13.2`, budget 60 s per target, target
-cache outside the worktree.
+This table is the CTX-1877 machinery smoke run, kept as history. It was recorded
+by the driver as it existed then — before this change added the sanitizer
+identity, the corpus digest and the coverage counters — which is why it carries
+none of those columns. Under the schema in "Evidence record" the same run would
+have had to record `sanitizer.*`, a per-target `corpus_digest` and `cov`/`ft`,
+and its `clean` would depend on an empty `evidence_missing` on every target.
+It is therefore evidence that the driver ran end to end, **not** evidence that
+the current `clean` rule holds, and it is not the run that validated this
+schema.
+
+Machinery smoke on the CTX-1877 authoring host: Linux x86_64, 24 hardware
+threads, `cargo 1.100.0-nightly`, `cargo-fuzz 0.13.2`, budget 60 s per target,
+target cache outside the worktree. The CTX-1880 host has no nightly toolchain,
+so this run cannot be repeated or extended here.
 
 ```sh
 CARGO_TARGET_DIR=<task cache> just fuzz-campaign 60 --generate-cap-seeds
@@ -245,20 +264,23 @@ CARGO_TARGET_DIR=<task cache> just fuzz-campaign 60 --generate-cap-seeds
 | `parser_to_state`    | 61          | 2,544   | 41     | 536       | 30    | 392           | 0       | 0   | 0        |
 | **total**            | 307         | 141,480 | –      | 4,595     | –     | 653           | 0       | 0   | 0        |
 
-Result `clean`, exit 0: no artifact of any class (`crash-*`, `leak-*`,
-`slow-unit-*`, `oom-*`, `timeout-*`, unclassified), `slowest_unit_time_sec: 0`
-on every target, and every target executed its budget (the execution floor that
-a later `inconclusive` class now enforces). The
+Outcome as recorded then: `result: clean`, exit 0, with no artifact of any class
+(`crash-*`, `leak-*`, `slow-unit-*`, `oom-*`, `timeout-*`, unclassified),
+`slowest_unit_time_sec: 0` on every target, and every target executing its
+budget. That `clean` is a statement about finding counts alone — the fields that
+would have let it stand as provenance evidence did not exist yet. The
 `vt_parser` seed count is high because the run resumed a scratch corpus left by
 an aborted attempt, which also exercised the retention trim (766 oldest units
 removed, 2000 kept). `control_string_cap` executes slowly by design: its inputs
 are megabytes at the parser cap, so 98 executions in 63 s is the expected shape,
 not a stall.
 
-This is a machinery record, **not** campaign evidence for P0-AC-002: 60 s per
-target is a smoke budget. The 300 s-per-target SEC-19 record
-(`sec19-fuzz-campaign-ctx-1202-evidence.md`) remains the longest reported run
-until the nightly has accumulated real history or an owner campaign runs for
+This is a historical machinery record, **not** campaign evidence for P0-AC-002
+and not a validation of the current schema: 60 s per target is a smoke budget,
+and the columns above predate the sanitizer, corpus-digest and coverage fields
+that this change makes preconditions of `clean`. The 300 s-per-target SEC-19
+record (`sec19-fuzz-campaign-ctx-1202-evidence.md`) remains the longest reported
+run until the nightly has accumulated real history or an owner campaign runs for
 hours.
 
 ## How this feeds P0-AC-002
@@ -356,7 +378,11 @@ scripts/tests/fuzz-campaign.test.sh` and `shfmt -d` — clean.
   campaign itself stays nightly-only; the test guards that split by asserting
   the workflow's triggers are `schedule`/`workflow_dispatch` only and that
   `ci.yml` never invokes the driver.
-- The measured run above — `result: clean`, exit 0.
+- The CTX-1877 smoke campaign above — recorded then as `result: clean`, exit 0,
+  on a CTX-1877 host. It is retained history, not a gate result for this change:
+  it predates the sanitizer, corpus-digest and coverage fields, so it says
+  nothing about the CTX-1880 `clean` rule, and the CTX-1880 host has no nightly
+  toolchain to re-measure it with.
 
 ### Gates run for CTX-1880 (this change)
 
@@ -371,7 +397,14 @@ exited 0:
 - `RUSTDOCFLAGS="-D warnings" cargo doc -p bitty-vt --no-deps --offline`
 - `shellcheck -S warning scripts/fuzz-campaign.sh scripts/tests/fuzz-campaign.test.sh`
 - `actionlint -color .github/workflows/fuzz-campaign.yml`
-- `bash scripts/tests/fuzz-campaign.test.sh` (`just fuzz-campaign-test`) — PASS
+- `bash scripts/tests/fuzz-campaign.test.sh` (`just fuzz-campaign-test`) — PASS.
+  Two of its assertions carry the weight: the expected target set is derived from
+  `fuzz/Cargo.toml` outside the driver, in both directions, so a `list_targets`
+  that drops a target fails the suite (verified by excluding `parser_to_state`
+  from the enumeration: three assertions fail, exit 1), and the report job's
+  merge program is executed over synthetic per-target legs, so the
+  sanitizer/`incomplete` rule is pinned by a test rather than a token grep
+  (verified by deleting that clause: the merge case fails, exit 1).
 - `just scratch-paths` — OK
 
 Not run, and why: `just ci-local` (`act` needs github.com and concurrent `act`

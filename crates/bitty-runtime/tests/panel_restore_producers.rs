@@ -319,9 +319,10 @@ fn a_save_writes_a_manifest_for_every_live_panel() {
     let _ = fs::remove_dir_all(&root);
 }
 
-/// A world with no panels writes an empty document rather than no document.
+/// A world with an installed host and no live container writes an empty
+/// document rather than no document: an empty host *is* a complete observation.
 #[test]
-fn a_save_with_no_live_panels_writes_an_empty_manifest() {
+fn a_save_with_an_installed_host_and_no_live_panels_writes_an_empty_manifest() {
     let root = temp_root("save-empty");
     let path = session_path(&root);
     let mut rt = Runtime::with_defaults().expect("defaults build");
@@ -329,6 +330,15 @@ fn a_save_with_no_live_panels_writes_an_empty_manifest() {
         snapshot: canned_snapshot(),
     });
     rt.set_session_backend(Some(backend));
+    // A stale document proves the save replaces it rather than merely never
+    // writing one.
+    fs::create_dir_all(&root).expect("scratch dir");
+    fs::write(
+        panel_manifest_path(&path),
+        b"v=2;id=helper-1;ws=1;pid=acme;title=stale",
+    )
+    .expect("seed a stale manifest");
+    rt.install_scene_host(PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"));
 
     rt.save_session_to_path(&path).expect("the session saves");
 
@@ -337,6 +347,41 @@ fn a_save_with_no_live_panels_writes_an_empty_manifest() {
     assert!(
         document.is_empty(),
         "no records, and no stale document left"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A runtime with no panel host has not observed the panels' world at all, so
+/// it writes nothing and the previous document survives.
+///
+/// Answer `Some(empty)` from `capture_restart_manifest` for a host-less runtime
+/// and this row fails on its first assertion: a plugin-less (or plugin-failed)
+/// start would erase the records a run that *did* have the host wrote.
+#[test]
+fn a_save_without_a_panel_host_leaves_the_previous_manifest_alone() {
+    let root = temp_root("save-no-host");
+    let path = session_path(&root);
+    let mut rt = Runtime::with_defaults().expect("defaults build");
+    let backend = Arc::new(DiskBackend {
+        snapshot: canned_snapshot(),
+    });
+    rt.set_session_backend(Some(backend));
+    let previous = b"v=2;id=helper-1;ws=1;pid=acme;title=kept";
+    fs::create_dir_all(&root).expect("scratch dir");
+    fs::write(panel_manifest_path(&path), previous).expect("seed the previous manifest");
+
+    assert!(
+        rt.capture_restart_manifest().is_none(),
+        "no host is not an observation of an empty world"
+    );
+    rt.save_session_to_path(&path)
+        .expect("the session still saves");
+
+    let document =
+        fs::read(panel_manifest_path(&path)).expect("the previous manifest is still there");
+    assert_eq!(
+        document, previous,
+        "an unobservable panel world must not erase the records a host-bearing run wrote"
     );
     let _ = fs::remove_dir_all(&root);
 }

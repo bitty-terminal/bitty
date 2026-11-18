@@ -24,6 +24,7 @@ use bitty_runtime::{
 #[derive(Debug)]
 struct StubBackend {
     calls: Mutex<Vec<&'static str>>,
+    accessed: Mutex<Vec<(&'static str, PathBuf)>>,
     files: Mutex<HashMap<PathBuf, Vec<u8>>>,
     fail_commit: AtomicBool,
     fail_decode: AtomicBool,
@@ -58,6 +59,7 @@ impl StubBackend {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             calls: Mutex::new(Vec::new()),
+            accessed: Mutex::new(Vec::new()),
             files: Mutex::new(HashMap::new()),
             fail_commit: AtomicBool::new(false),
             fail_decode: AtomicBool::new(false),
@@ -71,6 +73,27 @@ impl StubBackend {
 
     fn record(&self, call: &'static str) {
         self.calls.lock().expect("stub lock").push(call);
+    }
+
+    fn record_path(&self, call: &'static str, path: &Path) {
+        self.accessed
+            .lock()
+            .expect("stub lock")
+            .push((call, path.to_path_buf()));
+    }
+
+    /// Reads or writes of exactly `call` naming exactly `path`.
+    ///
+    /// The seam contract is per file: the panel manifest (bitty#3243) rides
+    /// the same backend beside the session file, so a total call count cannot
+    /// say which document a call was for.
+    fn path_count(&self, call: &'static str, path: &Path) -> usize {
+        self.accessed
+            .lock()
+            .expect("stub lock")
+            .iter()
+            .filter(|(c, p)| *c == call && p == path)
+            .count()
     }
 
     fn call_count(&self, call: &'static str) -> usize {
@@ -103,6 +126,7 @@ impl SessionFileBackend for StubBackend {
 
     fn commit_session_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
         self.record("commit");
+        self.record_path("commit", path);
         if self.fail_commit.load(Ordering::SeqCst) {
             return Err(SessionError::Io(String::from("stub commit refused")));
         }
@@ -115,6 +139,7 @@ impl SessionFileBackend for StubBackend {
 
     fn load_session_bytes(&self, path: &Path) -> Result<Vec<u8>, SessionError> {
         self.record("load");
+        self.record_path("load", path);
         self.files
             .lock()
             .expect("stub lock")
@@ -367,7 +392,17 @@ fn present_backend_save_then_load_round_trips_through_the_seam() {
 
     let mut fresh = present_runtime(&backend);
     let restore = fresh.load_session_from_path(&path).expect("load works");
-    assert_eq!(backend.call_count("load"), 1);
+    // The session document is read exactly once. The manifest probe
+    // (bitty#3243) is a second read through the same backend, and it names the
+    // sidecar path — which is why the contract is asserted per path rather than
+    // by total count.
+    assert_eq!(backend.path_count("load", &path), 1);
+    assert_eq!(
+        backend.call_count("load"),
+        2,
+        "session bytes load once, the panel manifest probe reads once"
+    );
+    assert_eq!(backend.path_count("commit", &path), 1);
     assert_eq!(backend.call_count("decode"), 1);
     assert_eq!(restore.workspaces, 1);
     assert!(fresh.session_restored());

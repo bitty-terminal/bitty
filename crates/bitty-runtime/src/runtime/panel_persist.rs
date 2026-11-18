@@ -17,7 +17,10 @@
 //!   session file. It uses the same
 //!   [`SessionFileBackend`](super::session::SessionFileBackend) as the session
 //!   bytes, so the write keeps the backend's atomic temp-plus-rename and size
-//!   ceiling — Core never touches the filesystem directly.
+//!   ceiling — Core never touches the filesystem directly. A runtime with no
+//!   installed panel host writes nothing (`PanelManifestSave::Unchanged`): it
+//!   has not observed the panels' world, and an empty document from it would
+//!   erase what a run with the host recorded.
 //! - **Load.** [`Runtime::load_panel_manifest_from_path`] reads that document
 //!   back, decodes it through [`bitty_ui::decode_manifest`], and configures the
 //!   records the session restore plans. It runs before
@@ -119,11 +122,12 @@ pub enum PanelManifestSave {
         /// Document bytes committed.
         bytes: usize,
     },
-    /// Nothing was observed because the panel host was borrowed elsewhere or
-    /// the live set could not be represented as a complete document, so the
-    /// previous document, if any, is untouched. A partial document is never
-    /// written: a restore that silently lost records would present an
-    /// incomplete workspace as a complete one.
+    /// Nothing was observed because no panel host is installed, the host was
+    /// borrowed elsewhere, or the live set could not be represented as a
+    /// complete document, so the previous document, if any, is untouched. A
+    /// document is never written from an unobservable or partial world: a
+    /// restore that silently lost records would present an incomplete
+    /// workspace as a complete one.
     Unchanged,
 }
 
@@ -223,20 +227,22 @@ impl Runtime {
 
     /// The durable record set of the world this runtime presents now.
     ///
-    /// `None` when the manifest cannot be observed completely right now: the
-    /// installed panel host is already borrowed (a save issued from inside a
-    /// panel edge), or the live container set cannot be written inside
-    /// [`MAX_PERSIST_PANELS`]. Neither is an error — the caller keeps the
-    /// previous document rather than replacing it with a partial one.
+    /// `None` when the manifest cannot be observed completely right now: no
+    /// panel host is installed at all, the installed host is already borrowed
+    /// (a save issued from inside a panel edge), or the live container set
+    /// cannot be written inside [`MAX_PERSIST_PANELS`]. None of them is an
+    /// error — the caller keeps the previous document rather than replacing it
+    /// with a partial or fabricated one.
     ///
-    /// A runtime with no panel host is `Some(empty)`: there is no container to
-    /// record, which is a complete observation, not a missing one.
+    /// No host is `None` rather than `Some(empty)` on purpose: a plugin-less
+    /// (or plugin-failed) start has not observed the panels' world at all, and
+    /// writing an empty document from it would erase the records a run that
+    /// *did* have the host wrote. The empty document belongs to a runtime whose
+    /// installed host holds no live container — that is a complete observation.
     #[must_use]
     pub fn capture_restart_manifest(&self) -> Option<RestartManifest> {
         let mut manifest = RestartManifest::new();
-        let Some(host) = self.scene_host.clone() else {
-            return Some(manifest);
-        };
+        let host = self.scene_host.clone()?;
         let Ok(host) = host.try_borrow() else {
             return None;
         };

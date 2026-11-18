@@ -59,6 +59,12 @@ pub const MAX_PROVIDER_OWNER_SEGMENT_LEN: usize = 16;
 /// skew from every surface a bind could observe, and a panel whose provider
 /// speaks a newer contract has to keep its container and present
 /// `incompatible` instead (bitty#3239 row 13, Decision E rule 3).
+///
+/// Admitting it changes no shipped behaviour yet: nothing outside
+/// `crates/bitty-runtime/tests/` registers a manifest
+/// (`PanelRuntime::register_panel_provider` has no production caller) and no
+/// bind applies a manifest payload, so the wider admission only makes the skew
+/// expressible for the restore gate that observes it.
 pub const PROVIDER_MANIFEST_VERSION_V1: u32 = 1;
 
 // ---------------------------------------------------------------------------

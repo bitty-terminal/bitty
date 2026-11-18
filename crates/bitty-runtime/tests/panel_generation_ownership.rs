@@ -90,17 +90,23 @@
 //!   a live disable entry and a live enable/rebind path in the plugin host, not
 //!   a test-side reason token; `PGO-4`/`PGO-20`'s crash arm cover the fault
 //!   direction that *is* reachable.
-//! - **PGO-11** (provider version records): the restore edge now homes the
-//!   *newer-provider-over-older-runtime* direction — the container of a record
-//!   whose driver registered a provider manifest above
-//!   `PROVIDER_MANIFEST_VERSION_V1` is retained and presents `incompatible`,
-//!   read in `tests/panel_restore_path.rs`
+//! - **PGO-11** (provider version records): implemented on the restore edge but
+//!   **not reachable in a shipped binary**, so this row remains open. The rule
+//!   is in place — the container of a record whose driver registered a provider
+//!   manifest above `PROVIDER_MANIFEST_VERSION_V1` is retained and presents
+//!   `incompatible`, read in `tests/panel_restore_path.rs`
 //!   (`a_provider_manifest_newer_than_the_runtime_keeps_the_container_with_an_incompatible_placeholder`,
 //!   with `a_provider_manifest_at_the_supported_schema_still_first_binds` as the
-//!   version-comparison control). What stays without a row here is the
-//!   **live** direction: no `bitty.panel.create`/rebind path reads a provider
-//!   manifest, so a generation that binds without a restore still commits its
-//!   own resolution. The persisted panel manifest
+//!   version-comparison control) — but both of its inputs are test-only:
+//!   `Runtime::set_panel_restore_records` and
+//!   `PanelRuntime::register_panel_provider` have no caller outside
+//!   `crates/bitty-runtime/tests/`, nothing encodes/decodes a restart manifest
+//!   on the session save/load path, and a plugin package carries no provider
+//!   declaration to register. The shipped restore also runs before the panel
+//!   host exists, so it drops every record as `NoPanelHost`. What stays without
+//!   a row here as well is the **live** direction: no `bitty.panel.create`/
+//!   rebind path reads a provider manifest, so a generation that binds without a
+//!   restore still commits its own resolution. The persisted panel manifest
 //!   (`bitty-ui/src/panel_persist.rs:367`) has a version gate and unknown-field
 //!   tolerance, but it carries identity, not provider content, so the
 //!   older-provider-over-newer-record half is unchanged.

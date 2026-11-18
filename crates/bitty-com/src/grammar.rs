@@ -125,16 +125,25 @@ pub const GUI_FLAGS: &[&str] = &[
 enum ValueRule {
     /// Swallows a non-flag token; a missing value is not a usage error.
     Plain,
-    /// Swallows a non-flag token or a negative number; no validation.
-    Numeric,
     /// Swallows a non-flag token or a negative number and needs a finite
     /// number (`--split-ratio`).
     Finite,
     /// Swallows a non-flag token and needs a known level (`--log-level`).
     Level,
-    /// Requires a value token; a missing one is a usage error (`--layout`,
-    /// `--focus`).
-    Required,
+    /// Swallows a non-flag token or a negative number and needs a point size
+    /// the config merge accepts, i.e. finite and within `(0, 128]`
+    /// (`--font-size`).
+    FontSize,
+    /// Swallows a non-flag token or a negative number and needs an opacity the
+    /// config merge accepts, i.e. finite and within `[0.0, 1.0]`
+    /// (`--opacity`).
+    WindowOpacity,
+    /// Requires a value token and needs a spec the startup layout builder
+    /// accepts (`--layout`: `single|split[:axis[:ratio]]|stack[:n]|overlay[:x,y,w,h]`).
+    Layout,
+    /// Requires a value token and needs a spec the startup focus check accepts
+    /// (`--focus`: `next|prev|up|down|left|right|<id>`).
+    Focus,
     /// Optional `axis[:ratio]` value; a consumed bare ratio is a usage error
     /// (`--split`).
     Split,
@@ -147,10 +156,12 @@ impl ValueRule {
             "--format" | "--socket" | "--instance" | "--scrollback" | "--close-confirm"
             | "--gaps-in" | "--gaps-out" | "--border" | "--radius" | "--plugins" | "--theme"
             | "--font-family" | "--config" | "--profile" => Some(Self::Plain),
-            "--font-size" | "--opacity" => Some(Self::Numeric),
+            "--font-size" => Some(Self::FontSize),
+            "--opacity" => Some(Self::WindowOpacity),
             "--split-ratio" => Some(Self::Finite),
             "--log-level" => Some(Self::Level),
-            "--layout" | "--focus" => Some(Self::Required),
+            "--layout" => Some(Self::Layout),
+            "--focus" => Some(Self::Focus),
             "--split" => Some(Self::Split),
             _ => None,
         }
@@ -166,13 +177,14 @@ impl ValueRule {
         match name {
             "--format" | "--socket" | "--instance" | "--scrollback" | "--close-confirm"
             | "--gaps-in" | "--gaps-out" | "--border" | "--radius" | "--plugins" | "--theme"
-            | "--font-family" | "--config" | "--profile" | "--font-size" | "--opacity" => {
-                Some(Self::Plain)
-            }
+            | "--font-family" | "--config" | "--profile" => Some(Self::Plain),
+            "--font-size" => Some(Self::FontSize),
+            "--opacity" => Some(Self::WindowOpacity),
             "--split-ratio" => Some(Self::Finite),
             "--log-level" => Some(Self::Level),
             "--split" => Some(Self::Split),
-            "--layout" | "--focus" => Some(Self::Required),
+            "--layout" => Some(Self::Layout),
+            "--focus" => Some(Self::Focus),
             _ => None,
         }
     }
@@ -183,8 +195,8 @@ impl ValueRule {
             return false;
         };
         match self {
-            Self::Plain | Self::Required | Self::Level => !next.starts_with('-'),
-            Self::Numeric | Self::Finite => {
+            Self::Plain | Self::Layout | Self::Focus | Self::Level => !next.starts_with('-'),
+            Self::Finite | Self::FontSize | Self::WindowOpacity => {
                 !next.starts_with('-') || looks_like_negative_number(next)
             }
             Self::Split => split_value_is_axis(next),
@@ -194,21 +206,28 @@ impl ValueRule {
     /// True when a *missing* value is a usage error rather than a default.
     fn requires_value(self) -> bool {
         match self {
-            Self::Plain | Self::Numeric | Self::Split => false,
-            Self::Required | Self::Finite | Self::Level => true,
+            Self::Plain | Self::Split | Self::FontSize | Self::WindowOpacity => false,
+            Self::Finite | Self::Level | Self::Layout | Self::Focus => true,
         }
     }
 
     /// True when this rule turns the *value* into a usage error (exit 2).
     ///
-    /// `--layout`/`--focus` only fail when the value is missing entirely, which
-    /// the caller handles through [`Self::swallows`].
+    /// Every arm mirrors the check the real binary performs before any window
+    /// exists: `--split-ratio`/`--log-level`/`--split` at parse time,
+    /// `--font-size`/`--opacity` at the config merge, `--layout` when the
+    /// startup layout is built and `--focus` when the startup focus spec is
+    /// validated. The diagnostic itself belongs to the child.
     fn rejects_value(self, value: &str) -> bool {
         match self {
-            Self::Plain | Self::Numeric | Self::Required => false,
+            Self::Plain => false,
             Self::Finite => !is_finite_number(value),
             Self::Level => !is_known_level(value),
             Self::Split => !split_value_has_axis(value),
+            Self::FontSize => !is_valid_font_size(value),
+            Self::WindowOpacity => !is_valid_opacity(value),
+            Self::Layout => !is_valid_layout_spec(value),
+            Self::Focus => !is_valid_focus_spec(value),
         }
     }
 }
@@ -379,9 +398,113 @@ fn is_known_level(value: &str) -> bool {
     )
 }
 
+/// Mirrors the `--font-size` half of `bitty_config`'s
+/// `CliOverrides::validate_appearance_overrides`: the merge parses the raw as a
+/// finite `f32` and validates it as `font.size`, so the accepted range is
+/// `(0, 128]`. A blank raw is not an override at all (the parser warns and
+/// ignores it), so it stays a desktop launch.
+fn is_valid_font_size(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match trimmed.parse::<f32>() {
+        Ok(size) => size.is_finite() && size > 0.0 && size <= 128.0,
+        Err(_) => false,
+    }
+}
+
+/// Mirrors the `--opacity` half of `CliOverrides::validate_appearance_overrides`:
+/// the merge parses the raw as a finite `f32` and validates it as
+/// `window.opacity`, i.e. `[0.0, 1.0]`. A blank raw is not an override.
+fn is_valid_opacity(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match trimmed.parse::<f32>() {
+        Ok(opacity) => opacity.is_finite() && (0.0..=1.0).contains(&opacity),
+        Err(_) => false,
+    }
+}
+
+/// True when `--layout <spec>` names a layout the startup builder accepts.
+///
+/// Mirrors `bitty_terminal`'s `layout_cmd::parse_layout_spec`, whose `None`
+/// makes `try_build_layout` fail closed with exit 2 before the window exists:
+/// `single|leaf|1`, `split[:axis[:ratio]]`, `stack[:n]` and
+/// `overlay[:x,y,w,h]`, each with the real clamping (a finite ratio and any
+/// numeric stack count are accepted; the builder clamps loudly afterwards).
+fn is_valid_layout_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == "single" || trimmed == "leaf" || trimmed == "1" {
+        return true;
+    }
+    if trimmed.starts_with("split") {
+        let rest = trimmed.trim_start_matches("split").trim_start_matches(':');
+        if rest.is_empty() {
+            return true;
+        }
+        let mut parts = rest.split(':');
+        let axis = parts.next().unwrap_or("").trim();
+        let ratio = parts.next().map(str::trim);
+        // Trailing junk (`split:h:0.5:extra`) is malformed.
+        if parts.next().is_some() {
+            return false;
+        }
+        if !is_split_axis(axis) {
+            return false;
+        }
+        return match ratio {
+            Some(value) => is_finite_number(value),
+            None => true,
+        };
+    }
+    if trimmed.starts_with("stack") {
+        let rest = trimmed.trim_start_matches("stack").trim_start_matches(':');
+        return rest.is_empty() || rest.parse::<usize>().is_ok();
+    }
+    if trimmed.starts_with("overlay") {
+        let rest = trimmed
+            .trim_start_matches("overlay")
+            .trim_start_matches(':');
+        if rest.is_empty() {
+            return true;
+        }
+        let mut count = 0usize;
+        let mut valid = true;
+        for part in rest.split(',') {
+            count += 1;
+            if part.trim().parse::<u16>().is_err() {
+                valid = false;
+            }
+        }
+        return valid && count == 4;
+    }
+    false
+}
+
+/// True when `--focus <spec>` names a target the startup focus check accepts.
+///
+/// Mirrors `bitty_terminal`'s `layout_cmd::is_valid_focus_spec`: the direction
+/// words and their short aliases, or a numeric view id.
+fn is_valid_focus_spec(spec: &str) -> bool {
+    let lower = spec.to_ascii_lowercase();
+    match lower.as_str() {
+        "next" | "n" | "prev" | "previous" | "p" | "up" | "down" | "left" | "right" => true,
+        _ => spec.trim().parse::<u64>().is_ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Mode, classify};
+    use std::process::Command;
+
+    use super::{Mode, classify, classify_with_env, headless_requested_by_env};
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| String::from(*arg)).collect()
@@ -455,6 +578,90 @@ mod tests {
         (&["--split=sideways"], Mode::WaitCli, "unknown axis"),
         (&["--layout"], Mode::WaitCli, "missing layout"),
         (&["--focus"], Mode::WaitCli, "missing focus"),
+        // Value errors the real binary reaches before any window exists.
+        (
+            &["--layout", "garbage"],
+            Mode::WaitCli,
+            "unknown layout spec",
+        ),
+        (&["--layout=garbage"], Mode::WaitCli, "unknown layout spec"),
+        (&["--layout="], Mode::WaitCli, "empty layout spec"),
+        (
+            &["--layout", "stack:abc"],
+            Mode::WaitCli,
+            "unparsable stack count",
+        ),
+        (
+            &["--layout", "split:h:1.5:extra"],
+            Mode::WaitCli,
+            "trailing layout junk",
+        ),
+        (
+            &["--layout", "single"],
+            Mode::DetachGui,
+            "valid leaf layout",
+        ),
+        (
+            &["--layout=split:h:0.3"],
+            Mode::DetachGui,
+            "valid split layout",
+        ),
+        (
+            &["--layout", "stack:2"],
+            Mode::DetachGui,
+            "valid stack layout",
+        ),
+        (
+            &["--focus", "sideways"],
+            Mode::WaitCli,
+            "unknown focus direction",
+        ),
+        (
+            &["--focus=sideways"],
+            Mode::WaitCli,
+            "unknown focus direction",
+        ),
+        (
+            &["--focus", "next"],
+            Mode::DetachGui,
+            "valid focus direction",
+        ),
+        (&["--focus=1"], Mode::DetachGui, "valid numeric focus id"),
+        (&["--font-size", "abc"], Mode::WaitCli, "non-numeric size"),
+        (&["--font-size=abc"], Mode::WaitCli, "non-numeric size"),
+        (
+            &["--font-size", "-3"],
+            Mode::WaitCli,
+            "size below the range",
+        ),
+        (
+            &["--font-size", "129"],
+            Mode::WaitCli,
+            "size above the range",
+        ),
+        (
+            &["--font-size", "12.5"],
+            Mode::DetachGui,
+            "valid point size",
+        ),
+        (
+            &["--font-size="],
+            Mode::DetachGui,
+            "a blank = value is not an override",
+        ),
+        (&["--opacity", "abc"], Mode::WaitCli, "non-numeric opacity"),
+        (&["--opacity=abc"], Mode::WaitCli, "non-numeric opacity"),
+        (
+            &["--opacity", "1.5"],
+            Mode::WaitCli,
+            "opacity above the range",
+        ),
+        (&["--opacity", "0.9"], Mode::DetachGui, "valid opacity"),
+        (
+            &["--opacity="],
+            Mode::DetachGui,
+            "a blank = value is not an override",
+        ),
         (
             &["htop", "--bogus"],
             Mode::DetachGui,
@@ -483,11 +690,135 @@ mod tests {
             classify(&argv(&["--split-ratio", "-0.5", "--split", "h"])),
             Mode::DetachGui
         );
+        // A negative size is swallowed as a value too, but the merge rejects it
+        // as out of range, so the child must own the diagnostic.
         assert_eq!(
             classify(&argv(&["--font-size", "-3"])),
-            Mode::DetachGui,
-            "negative point sizes are values"
+            Mode::WaitCli,
+            "a non-positive point size is a merge error"
         );
+        // A dash token that is not a number is not a value: it is an unknown
+        // flag, which is a usage error on its own.
+        assert_eq!(
+            classify(&argv(&["--font-size", "-abc"])),
+            Mode::WaitCli,
+            "a non-numeric dash token is an unknown flag"
+        );
+    }
+
+    #[test]
+    fn layout_specs_are_validated_like_the_startup_builder() {
+        for (spec, expected) in [
+            ("garbage", Mode::WaitCli),
+            ("", Mode::WaitCli),
+            ("stack:abc", Mode::WaitCli),
+            ("split:sideways", Mode::WaitCli),
+            ("split:h:abc", Mode::WaitCli),
+            ("split:h:0.5:extra", Mode::WaitCli),
+            ("overlay:1,2,3", Mode::WaitCli),
+            ("single", Mode::DetachGui),
+            ("1", Mode::DetachGui),
+            ("split", Mode::DetachGui),
+            ("split:v:0.4", Mode::DetachGui),
+            ("stack", Mode::DetachGui),
+            ("stack:3", Mode::DetachGui),
+            ("overlay", Mode::DetachGui),
+            ("overlay:5,5,20,10", Mode::DetachGui),
+            ("Single", Mode::DetachGui),
+        ] {
+            assert_eq!(
+                classify(&argv(&["--layout", spec])),
+                expected,
+                "--layout {spec:?}"
+            );
+            let joined = format!("--layout={spec}");
+            assert_eq!(
+                classify(&argv(&[joined.as_str()])),
+                expected,
+                "--layout={spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_specs_are_validated_like_the_startup_check() {
+        for (spec, expected) in [
+            ("sideways", Mode::WaitCli),
+            ("", Mode::WaitCli),
+            ("nextt", Mode::WaitCli),
+            ("-1", Mode::WaitCli),
+            ("next", Mode::DetachGui),
+            ("n", Mode::DetachGui),
+            ("previous", Mode::DetachGui),
+            ("right", Mode::DetachGui),
+            ("0", Mode::DetachGui),
+            ("7", Mode::DetachGui),
+        ] {
+            assert_eq!(
+                classify(&argv(&["--focus", spec])),
+                expected,
+                "--focus {spec:?}"
+            );
+            let joined = format!("--focus={spec}");
+            assert_eq!(
+                classify(&argv(&[joined.as_str()])),
+                expected,
+                "--focus={spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_values_are_validated_like_the_config_merge() {
+        // `--font-size` is accepted only within `(0, 128]`; a blank value is
+        // not an override at all.
+        for (value, expected) in [
+            ("abc", Mode::WaitCli),
+            ("0", Mode::WaitCli),
+            ("-3", Mode::WaitCli),
+            ("nan", Mode::WaitCli),
+            ("inf", Mode::WaitCli),
+            ("128.5", Mode::WaitCli),
+            ("12.5", Mode::DetachGui),
+            ("1", Mode::DetachGui),
+            ("128", Mode::DetachGui),
+            ("", Mode::DetachGui),
+        ] {
+            assert_eq!(
+                classify(&argv(&["--font-size", value])),
+                expected,
+                "--font-size {value:?}"
+            );
+            let joined = format!("--font-size={value}");
+            assert_eq!(
+                classify(&argv(&[joined.as_str()])),
+                expected,
+                "--font-size={value:?}"
+            );
+        }
+        // `--opacity` is accepted only within `[0.0, 1.0]`.
+        for (value, expected) in [
+            ("abc", Mode::WaitCli),
+            ("1.5", Mode::WaitCli),
+            ("-0.1", Mode::WaitCli),
+            ("nan", Mode::WaitCli),
+            ("0", Mode::DetachGui),
+            ("0.9", Mode::DetachGui),
+            ("1", Mode::DetachGui),
+            ("", Mode::DetachGui),
+        ] {
+            assert_eq!(
+                classify(&argv(&["--opacity", value])),
+                expected,
+                "--opacity {value:?}"
+            );
+            let joined = format!("--opacity={value}");
+            assert_eq!(
+                classify(&argv(&[joined.as_str()])),
+                expected,
+                "--opacity={value:?}"
+            );
+        }
     }
 
     #[test]
@@ -524,5 +855,66 @@ mod tests {
         assert_eq!(classify(&[]), Mode::DetachGui);
         assert_eq!(classify(&argv(&["-v", "--safe"])), Mode::DetachGui);
         assert_eq!(classify(&argv(&["--dry-run"])), Mode::DetachGui);
+    }
+
+    /// Marker that turns the probe test below into the child assertion.
+    const PROBE_ENV: &str = "BITTY_COM_HEADLESS_ENV_PROBE";
+    /// The expected `headless_requested_by_env()` answer for the child.
+    const PROBE_EXPECT: &str = "BITTY_COM_HEADLESS_ENV_EXPECT";
+    /// Filter that selects the probe in the re-executed test binary.
+    const PROBE_TEST: &str = "grammar::tests::headless_env_probe_child";
+
+    /// The `BITTY_HEADLESS` fallback must be proven through the reader, not
+    /// assumed: the variable is set in a child run of this test binary (edition
+    /// 2024 makes `std::env::set_var` unsafe and this crate forbids `unsafe`)
+    /// and the child asks [`headless_requested_by_env`] itself.
+    #[test]
+    fn headless_env_fallback_reads_the_environment() {
+        for (value, expected) in [
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("TRUE"), true),
+            (Some("0"), false),
+            (Some("yes"), false),
+            (None, false),
+        ] {
+            let mut probe = Command::new(std::env::current_exe().expect("test binary path"));
+            probe
+                .args(["--exact", PROBE_TEST, "--nocapture", "--test-threads=1"])
+                .env(PROBE_ENV, "1")
+                .env(PROBE_EXPECT, if expected { "true" } else { "false" });
+            match value {
+                Some(value) => probe.env("BITTY_HEADLESS", value),
+                None => probe.env_remove("BITTY_HEADLESS"),
+            };
+            let output = probe.output().expect("re-exec the probe");
+            assert!(
+                output.status.success(),
+                "child probe failed for BITTY_HEADLESS={value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// Child half of [`headless_env_fallback_reads_the_environment`]: it reads
+    /// the real environment variable and must agree with the expected answer.
+    #[test]
+    fn headless_env_probe_child() {
+        if std::env::var_os(PROBE_ENV).is_none() {
+            return;
+        }
+        let expected = std::env::var(PROBE_EXPECT).as_deref() == Ok("true");
+        assert_eq!(headless_requested_by_env(), expected, "reader answer");
+        let want = if expected {
+            Mode::WaitCli
+        } else {
+            Mode::DetachGui
+        };
+        assert_eq!(
+            classify_with_env(&[], headless_requested_by_env()),
+            want,
+            "a bare launch must follow the env fallback"
+        );
     }
 }

@@ -18,9 +18,14 @@
 //! # Scope
 //!
 //! Only argv is compared, plus the `BITTY_HEADLESS` fallback both sides read.
-//! Failures that happen after a GUI launch has already begun (config merge
-//! errors, layout build errors) are not argv classification and stay owned by
-//! the real binary.
+//! The four flags whose *values* the real binary rejects before any window
+//! exists are part of that argv decision, so [`expected_mode`] runs the same
+//! validators: `--layout` at the startup layout build, `--focus` at the focus
+//! check, and `--font-size`/`--opacity` at the config merge. Failures that
+//! depend on the user's config file, profile chain or display environment are
+//! file and machine state rather than argv, and stay owned by the real binary.
+//! (`--theme` names are resolved against the preset registry, which this
+//! dependency-free crate does not duplicate.)
 
 use crate::cli::{Args, SUBCOMMANDS, help_canonical_cmd, parse_args};
 use crate::plus::PlusAction;
@@ -55,10 +60,85 @@ fn expected_mode(args: &Args) -> bitty_com::Mode {
         || args.test_mode
         || args.unknown_flag.is_some()
         || args.cli_value_error.is_some()
+        || pre_window_value_error(args)
     {
         bitty_com::Mode::WaitCli
     } else {
         bitty_com::Mode::DetachGui
+    }
+}
+
+/// True when a value the parser stores without validating is rejected by the
+/// startup check the real binary runs before any window exists.
+///
+/// The parser records `--layout`/`--focus`/`--font-size`/`--opacity` as raw
+/// text; the failures happen in `apply_startup_layout_and_focus` (layout build,
+/// `is_valid_focus_spec`) and in the config merge
+/// (`CliOverrides::validate_appearance_overrides`). This mirrors those call
+/// sites, so the corpus expectation comes from real code rather than a
+/// hand-written table.
+#[cfg(test)]
+fn pre_window_value_error(args: &Args) -> bool {
+    if crate::layout_cmd::try_build_layout(args, 80, 24).is_err() {
+        return true;
+    }
+    if let Some(spec) = args.focus.as_deref() {
+        if !crate::layout_cmd::is_valid_focus_spec(spec) {
+            return true;
+        }
+    }
+    if let Some(raw) = args.font_size.as_deref() {
+        if cli_font_size_rejected(raw) {
+            return true;
+        }
+    }
+    if let Some(raw) = args.opacity.as_deref() {
+        if cli_opacity_rejected(raw) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `--font-size` check inside
+/// `CliOverrides::validate_appearance_overrides`: a blank raw is not an
+/// override, everything else must parse as a finite number and validate as
+/// `font.size`.
+#[cfg(test)]
+fn cli_font_size_rejected(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.parse::<f32>() {
+        Ok(size) => bitty_config::types::FontConfig {
+            family: String::from("cli"),
+            size,
+            ..Default::default()
+        }
+        .validate()
+        .is_err(),
+        Err(_) => true,
+    }
+}
+
+/// The `--opacity` check inside `validate_appearance_overrides`: a blank raw is
+/// not an override, everything else must parse as a finite number and validate
+/// as `window.opacity`.
+#[cfg(test)]
+fn cli_opacity_rejected(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.parse::<f32>() {
+        Ok(opacity) => bitty_config::types::WindowConfig {
+            opacity,
+            ..Default::default()
+        }
+        .validate()
+        .is_err(),
+        Err(_) => true,
     }
 }
 
@@ -128,9 +208,24 @@ const CORPUS: &[(&[&str], bitty_com::Mode, &str)] = &[
         "--layout= takes a value",
     ),
     (
+        &["--layout", "stack:2"],
+        bitty_com::Mode::DetachGui,
+        "--layout accepts a stack count",
+    ),
+    (
+        &["--layout=split:h:0.3"],
+        bitty_com::Mode::DetachGui,
+        "--layout= accepts a split spec",
+    ),
+    (
         &["--focus", "next"],
         bitty_com::Mode::DetachGui,
         "--focus takes a value",
+    ),
+    (
+        &["--focus=1"],
+        bitty_com::Mode::DetachGui,
+        "--focus= takes a numeric id",
     ),
     (
         &["--theme", "dark"],
@@ -173,14 +268,19 @@ const CORPUS: &[(&[&str], bitty_com::Mode, &str)] = &[
         "--font-size takes a size",
     ),
     (
-        &["--font-size", "-3"],
+        &["--font-size=12.5"],
         bitty_com::Mode::DetachGui,
-        "a negative size is a value",
+        "--font-size= takes a size",
     ),
     (
         &["--opacity", "0.9"],
         bitty_com::Mode::DetachGui,
         "--opacity takes a value",
+    ),
+    (
+        &["--opacity=0.5"],
+        bitty_com::Mode::DetachGui,
+        "--opacity= takes a value",
     ),
     (&["--safe"], bitty_com::Mode::DetachGui, "safe-mode launch"),
     (&["-v"], bitty_com::Mode::DetachGui, "verbose launch"),
@@ -586,6 +686,69 @@ const CORPUS: &[(&[&str], bitty_com::Mode, &str)] = &[
         &["--focus"],
         bitty_com::Mode::WaitCli,
         "a missing focus is a usage error",
+    ),
+    // Values the parser stores raw and the startup checks reject before any
+    // window exists (bitty#3224 review): the proxy must wait so the child's own
+    // exit 2 reaches the caller instead of vanishing into a detached launch.
+    (
+        &["--layout", "garbage"],
+        bitty_com::Mode::WaitCli,
+        "an unknown layout spec fails the layout build",
+    ),
+    (
+        &["--layout="],
+        bitty_com::Mode::WaitCli,
+        "an empty layout spec fails the layout build",
+    ),
+    (
+        &["--layout", "stack:abc"],
+        bitty_com::Mode::WaitCli,
+        "an unparsable stack count fails the layout build",
+    ),
+    (
+        &["--focus", "sideways"],
+        bitty_com::Mode::WaitCli,
+        "an unknown focus direction fails the focus check",
+    ),
+    (
+        &["--focus=sideways"],
+        bitty_com::Mode::WaitCli,
+        "an unknown focus direction fails the focus check",
+    ),
+    (
+        &["--font-size", "abc"],
+        bitty_com::Mode::WaitCli,
+        "a non-numeric size fails the config merge",
+    ),
+    (
+        &["--font-size=abc"],
+        bitty_com::Mode::WaitCli,
+        "a non-numeric size fails the config merge",
+    ),
+    (
+        &["--font-size", "-3"],
+        bitty_com::Mode::WaitCli,
+        "a non-positive size fails the config merge",
+    ),
+    (
+        &["--font-size", "129"],
+        bitty_com::Mode::WaitCli,
+        "a size above 128 fails the config merge",
+    ),
+    (
+        &["--opacity", "abc"],
+        bitty_com::Mode::WaitCli,
+        "a non-numeric opacity fails the config merge",
+    ),
+    (
+        &["--opacity=abc"],
+        bitty_com::Mode::WaitCli,
+        "a non-numeric opacity fails the config merge",
+    ),
+    (
+        &["--opacity", "1.5"],
+        bitty_com::Mode::WaitCli,
+        "an opacity above 1.0 fails the config merge",
     ),
 ];
 

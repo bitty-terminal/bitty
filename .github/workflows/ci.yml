@@ -1801,14 +1801,35 @@ jobs:
           if ($LASTEXITCODE -ne 2) { throw "bitty.com <invalid flag> exited $LASTEXITCODE (want 2)" }
           if ($usage -notmatch 'unknown flag') { throw "usage error missing from the console streams: '$usage'" }
           Write-Host 'bitty.com invalid-flag usage error OK (exit 2, synchronous)'
-          # A bare launch is the desktop path: return 0 immediately and leave the
-          # GUI child running detached (never waited on).
+          # A bare launch is the desktop path: the proxy must return 0 without
+          # waiting for its child, and this step must reap that child (a leaked
+          # GUI process would keep running for the rest of the job). Console
+          # allocation is structural (`bitty.exe` is GUI-subsystem and
+          # `launch.rs` spawns it with `DETACHED_PROCESS`); what the probe can
+          # prove from the console side is the non-waiting return plus the reap.
+          $guiBefore = @(Get-Process -Name bitty -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
           $watch = [System.Diagnostics.Stopwatch]::StartNew()
-          & $com
-          $detachCode = $LASTEXITCODE
+          $bare = Start-Process -FilePath $com -PassThru -NoNewWindow
+          if (-not ($bare.WaitForExit(60000))) {
+            Stop-Process -Id $bare.Id -Force -ErrorAction SilentlyContinue
+            throw 'bare bitty.com did not return within 60s: the desktop path waited for its child'
+          }
+          $bare.WaitForExit()
           $watch.Stop()
-          if ($detachCode -ne 0) { throw "bare bitty.com exited $detachCode (want 0)" }
-          Write-Host ("bare launch detached in {0} ms (exit 0)" -f $watch.ElapsedMilliseconds)
+          if ($bare.ExitCode -ne 0) { throw "bare bitty.com exited $($bare.ExitCode) (want 0)" }
+          # Reap every child this probe started, then prove none survived.
+          $guiChildren = @(Get-Process -Name bitty -ErrorAction SilentlyContinue |
+            Where-Object { $guiBefore -notcontains $_.Id })
+          foreach ($gui in $guiChildren) {
+            Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
+            # A process that already exited can still race the handle; the
+            # re-sample below is the real proof.
+            try { [void]$gui.WaitForExit(30000) } catch { }
+          }
+          $leaked = @(Get-Process -Name bitty -ErrorAction SilentlyContinue |
+            Where-Object { $guiBefore -notcontains $_.Id })
+          if ($leaked.Count -ne 0) { throw "$($leaked.Count) detached bitty.exe child(ren) survived the reap" }
+          Write-Host ("bare launch returned in {0} ms (exit 0, no wait); {1} detached GUI child(ren) reaped" -f $watch.ElapsedMilliseconds, $guiChildren.Count)
 
       - name: Run doctests
         shell: bash

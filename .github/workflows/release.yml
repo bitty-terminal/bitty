@@ -1041,6 +1041,11 @@ jobs:
           if ($LASTEXITCODE -ne 2) { throw "bitty.com <invalid flag> exited $LASTEXITCODE (want 2)" }
           if ($usage -notmatch 'unknown flag') { throw "bitty.com <invalid flag> printed no usage error: '$usage'" }
           Write-Host 'bitty.com console contract OK (blocking version + usage-error exit codes)'
+          # `pwsh -command` reports the last NATIVE command's code, not 0, so the
+          # deliberate exit-2 invalid-flag probe above would fail this step even
+          # though every assertion passed (same leak as the CI leg, bitty#3224).
+          # Pin the step result explicitly instead of inheriting `$LASTEXITCODE`.
+          exit 0
 
   # Windows x64 setup installer (CTX-1064 / #1810): Inno Setup 6 wizard
   # compiled on windows-latest (choco install, no paid infra). Input is the

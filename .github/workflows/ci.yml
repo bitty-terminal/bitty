@@ -1830,6 +1830,12 @@ jobs:
             Where-Object { $guiBefore -notcontains $_.Id })
           if ($leaked.Count -ne 0) { throw "$($leaked.Count) detached bitty.exe child(ren) survived the reap" }
           Write-Host ("bare launch returned in {0} ms (exit 0, no wait); {1} detached GUI child(ren) reaped" -f $watch.ElapsedMilliseconds, $guiChildren.Count)
+          # `pwsh -command` reports the last NATIVE command's code, not 0, so the
+          # deliberate exit-2 invalid-flag probe above would fail this step even
+          # though every assertion passed (bitty#3224 round 2, Windows leg
+          # 134477856527: all five probe lines printed, exit code 1). Pin the
+          # step result explicitly instead of inheriting `$LASTEXITCODE`.
+          exit 0
 
       - name: Run doctests
         shell: bash

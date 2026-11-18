@@ -471,6 +471,7 @@ fn mouse(button: MouseButton, state: PressState) -> bitty_platform::MouseEvent {
 
 fn minimal_plugin_manifest(id: &str, events: Vec<&str>) -> PluginManifest {
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("valid plugin id"),
             name: "Soak campaign fixture".to_string(),

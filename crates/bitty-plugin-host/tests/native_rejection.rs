@@ -29,6 +29,7 @@ use bitty_plugin_host::{
 
 fn minimal_manifest(id: &str) -> PluginManifest {
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("valid plugin id"),
             name: "Native audit fixture".to_string(),

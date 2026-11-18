@@ -27,6 +27,7 @@ fn host_manifest(id: &str, commands: Vec<&str>, events: Vec<&str>) -> HostManife
         CapabilityRequests, Compat, LazyCommand, LazyTriggers, PluginIdentity, QualifiedName,
     };
     HostManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: HostPid::new(id).unwrap(),
             name: "Test".to_string(),

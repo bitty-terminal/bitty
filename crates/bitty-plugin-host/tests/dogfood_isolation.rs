@@ -20,6 +20,7 @@ fn pid(s: &str) -> PluginId {
 fn minimal_manifest(id: &str, events: Vec<&str>) -> bitty_plugin_host::PluginManifest {
     use bitty_plugin_host::{CapabilityRequests, Compat, LazyTriggers, PluginIdentity};
     bitty_plugin_host::PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: pid(id),
             name: "Dogfood".to_string(),

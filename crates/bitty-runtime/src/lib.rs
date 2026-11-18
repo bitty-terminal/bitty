@@ -287,6 +287,7 @@ pub use runtime::layout_focus::{
     HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
 };
 pub use runtime::pane_cwd::{PaneCwd, PaneCwdError};
+pub use runtime::panel_declaration::{PanelDeclarationError, register_declared_panel_provider};
 pub use runtime::panel_persist::{
     PANEL_MANIFEST_FILE_SUFFIX, PanelManifestLoad, PanelManifestSave, panel_manifest_path,
 };

@@ -6651,6 +6651,7 @@ plugin-api = "^1.0"
             CapabilityRequests, Compat, LazyTriggers, PluginIdentity, PluginLimits,
         };
         PluginManifest {
+            panel_provider: None,
             identity: PluginIdentity {
                 id: PluginId::new("xuepoo.test").expect("id"),
                 name: "Test".to_string(),

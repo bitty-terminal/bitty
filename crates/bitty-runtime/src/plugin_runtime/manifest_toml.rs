@@ -9,9 +9,9 @@
 //!
 //! Supported sections: `[plugin]`, `[compat]`, `[capabilities]`, `[lazy]`,
 //! `[limits]`, `[dependencies]`, `[settings]`, `[hints]`, `[source]`,
-//! `[services.provided]`, `[services.required]`, `[tools.git]` (accepted
-//! Layer-2 v1, CTX-0425), `[[capabilities.filesystem]]` and
-//! `[[network.egress]]` (array-of-tables).
+//! `[panel.provider]`, `[services.provided]`, `[services.required]`,
+//! `[tools.git]` (accepted Layer-2 v1, CTX-0425), `[[capabilities.filesystem]]`
+//! and `[[network.egress]]` (array-of-tables).
 //! Strings, booleans, arrays of strings, and (in `[limits]` only) bare
 //! non-negative integers are supported. Inline-table values are accepted for
 //! the declared shapes only: `[dependencies]` `{ version, prerelease }`,
@@ -36,10 +36,12 @@ use std::collections::BTreeSet;
 use bitty_plugin_host::capability::CapabilityId;
 use bitty_plugin_host::manifest::{
     ACCEPTED_TOOLS, CapabilityRequests, Compat, FilesystemRequest, FsAccess, LazyCommand,
-    LazyTriggers, MAX_PROVIDED_SERVICES, NetworkEgress, PluginDependency, PluginIdentity,
-    PluginLimits, PluginManifest, ProvidedService, QualifiedName, SettingDecl, SettingDefault,
-    SettingKind, ToolDeclaration,
+    LazyTriggers, MAX_PROVIDED_SERVICES, NetworkEgress, PanelProviderDeclaration, PluginDependency,
+    PluginIdentity, PluginLimits, PluginManifest, ProvidedService, QualifiedName, SettingDecl,
+    SettingDefault, SettingKind, ToolDeclaration,
 };
+
+use crate::registry::PanelType;
 
 /// Parse a bounded `bitty-plugin.toml` body.
 ///
@@ -109,6 +111,13 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
     // digest. Shape-validated by [`PluginManifest::validate`]; the installer
     // verifies it against the staged tree.
     let mut source_sha256: Option<String> = None;
+    // `[panel.provider]` declaration (bitty#3243): the provider contract
+    // version the plugin speaks plus the panel kinds it drives. Both keys are
+    // required once the section is present, and the kinds are mapped onto the
+    // closed [`PanelType`](crate::registry::PanelType) vocabulary here so the
+    // host crate's shape stays free of the UI model.
+    let mut panel_provider_contract: Option<u32> = None;
+    let mut panel_provider_types: Option<Vec<String>> = None;
 
     let flush_filesystem_entry = |fs_access: &mut Option<String>,
                                   fs_paths: &mut Option<Vec<String>>,
@@ -241,7 +250,8 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
             }
             match inner.as_str() {
                 "plugin" | "compat" | "capabilities" | "lazy" | "limits" | "dependencies"
-                | "services.provided" | "services.required" | "settings" | "hints" | "source" => {
+                | "services.provided" | "services.required" | "settings" | "hints" | "source"
+                | "panel.provider" => {
                     flush_filesystem_entry(
                         &mut fs_access,
                         &mut fs_paths,
@@ -469,6 +479,27 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     other => return Err(format!("unsupported [source] key '{other}'")),
                 }
             }
+            "panel.provider" => {
+                if !seen_keys.insert(section_key) {
+                    return Err(format!("duplicate key '{key}' in [panel.provider]"));
+                }
+                match key.as_str() {
+                    "contract" => {
+                        let raw = parse_limit_u64(&value, "panel.provider.contract")
+                            .map_err(|e| format!("invalid [panel.provider]: {e}"))?;
+                        panel_provider_contract = Some(u32::try_from(raw).map_err(|_| {
+                            "invalid [panel.provider]: contract version exceeds u32".to_string()
+                        })?);
+                    }
+                    "types" => {
+                        panel_provider_types = Some(
+                            parse_panel_provider_types(&value)
+                                .map_err(|e| format!("invalid [panel.provider] types: {e}"))?,
+                        );
+                    }
+                    other => return Err(format!("unsupported [panel.provider] key '{other}'")),
+                }
+            }
             "dependencies" | "services.provided" | "services.required" | "settings" => {
                 if !seen_keys.insert(section_key) {
                     return Err(format!("duplicate key '{key}' in [{section}]"));
@@ -568,7 +599,28 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
         }
         parsed_dependencies.push(dep);
     }
+    // `[panel.provider]` (bitty#3243): present only when the section named at
+    // least one key, and then complete — a declaration that named a contract
+    // but no kinds (or the reverse) is refused rather than half-honoured. The
+    // mapping onto `PanelType` happened in `parse_panel_provider_types`.
+    let panel_provider = match (panel_provider_contract, panel_provider_types) {
+        (None, None) => None,
+        (Some(contract), Some(types)) => Some(PanelProviderDeclaration { contract, types }),
+        (Some(_), None) => {
+            return Err(
+                "[panel.provider] is missing 'types = [...]' (the panel kinds it drives)"
+                    .to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "[panel.provider] is missing 'contract = <version>' (the provider contract it speaks)"
+                    .to_string(),
+            );
+        }
+    };
     let manifest = PluginManifest {
+        panel_provider,
         identity,
         compat: Compat {
             bitty: compat_bitty,
@@ -1252,6 +1304,39 @@ fn reject_inline_keys(
         }
     }
     Ok(())
+}
+
+/// Parse a `[panel.provider] types` list into the closed panel-kind vocabulary.
+///
+/// Each name must be a kind this runtime mints ([`PanelType::parse`]) and must
+/// not be `terminal`: a PTY belongs to the session's pane path, never to a
+/// plugin provider, and the registry refuses a terminal declaration too. Names
+/// are stored in their canonical `PanelType::as_str()` spelling, so the value
+/// the deployment registers is the value this runtime read — never a
+/// case-folded or truncated variant of it. Duplicates fail closed: a
+/// declaration that names one kind twice is ambiguous about what it drives.
+fn parse_panel_provider_types(value: &str) -> Result<Vec<String>, String> {
+    let raw = parse_array(value)?;
+    if raw.is_empty() {
+        return Err("a provider declaration must name at least one panel type".to_string());
+    }
+    let mut types: Vec<String> = Vec::with_capacity(raw.len());
+    for name in raw {
+        let Some(panel_type) = PanelType::parse(&name) else {
+            return Err(format!(
+                "unknown panel type '{name}' (expected terminal, rich, browser, helper, or canvas)"
+            ));
+        };
+        if panel_type == PanelType::Terminal {
+            return Err("the terminal kind is the session's, not a provider's".to_string());
+        }
+        let canonical = panel_type.as_str().to_string();
+        if types.contains(&canonical) {
+            return Err(format!("duplicate panel type '{canonical}'"));
+        }
+        types.push(canonical);
+    }
+    Ok(types)
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>, String> {

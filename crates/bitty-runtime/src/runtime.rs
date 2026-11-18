@@ -150,6 +150,7 @@ pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod pane_cwd;
+pub mod panel_declaration;
 pub mod panel_persist;
 pub mod panel_restore;
 pub mod panel_rules;

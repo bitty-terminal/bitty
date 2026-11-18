@@ -110,6 +110,7 @@ fn file_manager_manifest() -> bitty_plugin_host::PluginManifest {
         paths: vec![FILE_MANAGER_FS_WRITE_PATTERN.to_string()],
     });
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(FILE_MANAGER_ID).expect("valid id"),
             name: FILE_MANAGER_NAME.to_string(),

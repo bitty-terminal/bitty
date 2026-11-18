@@ -45,6 +45,7 @@ const CAP_BETA: &str = "clipboard.write";
 
 fn minimal(id: &str) -> PluginManifest {
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("fixture id must parse"),
             name: "Fixture".to_string(),

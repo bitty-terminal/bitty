@@ -24,15 +24,16 @@ use bitty_ipc::MAX_SNAPSHOT_ZONES;
 use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LegacyStoreAdoption,
-    LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
+    LifecycleState, LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
     PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort, PanelPinHandler, PanelPinQueue,
     PanelSceneBackend, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
     TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
     adopt_legacy_store, controller_generation,
 };
+use bitty_runtime::register_declared_panel_provider;
 use bitty_runtime::registry::{
-    Generation, PanelError, PanelId, PanelRegistryConfig, PanelRuntime, PanelType,
-    PlaceholderReason, WorkspaceId,
+    Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
+    PanelType, PlaceholderReason, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
@@ -2059,6 +2060,26 @@ pub(crate) fn discover_with_roots(
             Err(error) => crate::logging::warn(|| format!("bitty: plugin '{id}' failed: {error}")),
         }
     }
+    // bitty#3243 (row 13 closing condition): a generation that came up with a
+    // `[panel.provider]` declaration registers it now, at the moment activation
+    // made it live, through the same `register_panel_provider` the host install
+    // uses. The shipped order installs the panel host into the app *after* this
+    // point (`TerminalApp::with_panel_scene_host`), and the install's
+    // observation then finds the owner already registered and leaves the
+    // declared contract alone — which is what lets a declared version above
+    // `PROVIDER_MANIFEST_VERSION_V1` survive into the restore, where the
+    // container presents `incompatible` instead of binding a contract this
+    // runtime cannot read.
+    if let Some(panels) = panels.as_ref() {
+        let declared = register_declared_panel_providers(&runtime, panels);
+        if declared > 0 {
+            crate::logging::info(|| {
+                format!(
+                    "bitty: {declared} plugin provider contract(s) registered from manifest declarations"
+                )
+            });
+        }
+    }
     Some(PluginSession {
         runtime,
         snapshot,
@@ -2072,6 +2093,62 @@ pub(crate) fn discover_with_roots(
         focused_workspace,
         panel_layout_ops,
     })
+}
+
+/// Registers every active generation's declared provider contract on `panels`.
+///
+/// Called once at the activation edge of [`discover_with_roots`], after
+/// `activate_discovered` has run and before the composition root installs the
+/// host into the app's runtime (bitty#3243). One descriptor per generation whose
+/// manifest carries a `[panel.provider]` declaration; the capability flag is
+/// that generation's own activation grant snapshot, so a generation denied
+/// `panel.provider` registers nothing.
+///
+/// Returns how many descriptors this edge registered. A declined or refused
+/// declaration is not an activation failure: the plugin's panels restore with
+/// the bounded placeholder they already get when no provider answers for their
+/// kind, so the only effect of a refusal is the absence of a descriptor.
+fn register_declared_panel_providers(
+    runtime: &PluginRuntime,
+    panels: &Rc<RefCell<PanelRuntime>>,
+) -> usize {
+    let mut registered = 0;
+    for id in runtime.discovered_ids() {
+        if runtime.state(&id) != Some(&LifecycleState::Active) {
+            continue;
+        }
+        let Some(package) = runtime.discovered_package(&id) else {
+            continue;
+        };
+        let Some(declaration) = package.manifest.panel_provider.as_ref() else {
+            continue;
+        };
+        let capability_granted = runtime
+            .services(&id)
+            .is_some_and(|services| services.has_granted_capability(PANEL_PROVIDER_CAPABILITY));
+        let Ok(mut host) = panels.try_borrow_mut() else {
+            // A borrowed host is not this edge's to write: the declaration is
+            // simply not registered, never retried behind the holder's back.
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin '{id}' provider declaration not registered (panel host busy)"
+                )
+            });
+            continue;
+        };
+        match register_declared_panel_provider(
+            &mut host,
+            id.as_str(),
+            declaration,
+            capability_granted,
+        ) {
+            Ok(_) => registered += 1,
+            Err(error) => crate::logging::warn(|| {
+                format!("bitty: plugin '{id}' provider declaration refused: {error}")
+            }),
+        }
+    }
+    registered
 }
 
 /// Build and install the inspection snapshot for one runtime mode.

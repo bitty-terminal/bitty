@@ -67,6 +67,7 @@ use bitty_ui::{LayoutNode, Rect as UiRect, SplitAxis, View, ViewId};
 
 fn minimal_plugin_manifest(id: &str, events: Vec<&str>) -> PluginManifest {
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(id).expect("valid plugin id"),
             name: "Integration fixture".to_string(),

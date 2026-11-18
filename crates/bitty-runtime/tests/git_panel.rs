@@ -142,6 +142,7 @@ fn git_panel_manifest() -> bitty_plugin_host::PluginManifest {
         paths: vec![GIT_PANEL_FS_READ_PATTERN.to_string()],
     });
     PluginManifest {
+        panel_provider: None,
         identity: PluginIdentity {
             id: PluginId::new(GIT_PANEL_ID).expect("valid id"),
             name: GIT_PANEL_NAME.to_string(),

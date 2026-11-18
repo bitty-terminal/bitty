@@ -28,7 +28,10 @@
 //!    resolution granted, because `panel.create` is the authorization. A record
 //!    whose driver is missing, denied, or older keeps its container and presents
 //!    the Core-owned placeholder for that reason (`unloaded`, `denied`,
-//!    `incompatible`).
+//!    `incompatible`). A driver that answers installed while the provider
+//!    manifest it registered declares a contract newer than this runtime reads
+//!    is treated as older: the bind is refused here, so the container presents
+//!    `incompatible` rather than a grant set nobody can interpret.
 //! 4. **Bounds the rest.** A record whose workspace names no slot in the
 //!    restored session, or that the registry refuses to allocate or bind, is
 //!    dropped with a typed reason instead of being retried or silently
@@ -37,14 +40,51 @@
 //!
 //! # What this module does not decide
 //!
-//! The driver answer is an input, not a probe. Which plugin is installed, which
-//! capability a permission denies, and whether a persisted record was written
-//! under a newer schema than the installed provider supports are facts the
-//! plugin host owns; Core owns only the bounded outcome. The persisted record
-//! still carries no creating owner, no panel type, and no provider contract
-//! version (bitty#3239 rows 13 and 16 stay open, and the record's field set is
-//! `RFC-OQ-9`'s pending persistence contract), so this module asks for exactly
-//! the three facts the record cannot carry and decides nothing about them.
+//! The driver answer is an input, not a probe. Which plugin is installed, and
+//! which capability a permission denies, are facts the plugin host owns; Core
+//! owns only the bounded outcome. The one skew this module reads for itself is
+//! the provider contract version: a registered manifest that declares a schema
+//! newer than the runtime reads is visible through
+//! [`PanelRuntime::provider_manifest`], and a record driven by it never binds.
+//! The persisted record still carries no creating owner, no panel type, and no
+//! provider contract version (bitty#3239 row 16 stays open, and the record's
+//! field set is `RFC-OQ-9`'s pending persistence contract), so this module asks
+//! for exactly the facts the record cannot carry and decides nothing else about
+//! them.
+//!
+//! # Reachability of the skew gate
+//!
+//! The `incompatible` branch below is a seam, not a shipped producer, and this
+//! note is the honest half of the claim: both of its preconditions are supplied
+//! only by tests in this tree, so a binary built from it cannot present
+//! `incompatible` from here yet, and bitty#3239 row 13 stays open.
+//!
+//! - **The records.** [`Runtime::set_panel_restore_records`] has no caller
+//!   outside `crates/bitty-runtime/tests/`: both constructors seed the input
+//!   list empty, nothing decodes a [`RestartManifest`]
+//!   ([`bitty_ui::decode_manifest`]) into records on load, and nothing encodes
+//!   one ([`bitty_ui::encode_manifest`]) on save. A production restore
+//!   therefore plans zero records.
+//! - **The provider manifest.** `PanelRuntime::register_panel_provider`
+//!   (`crates/bitty-runtime/src/registry/host.rs`) is test-only as well, so
+//!   [`PanelRuntime::provider_manifest`] answers `None` for every owner and
+//!   `provider_contract_outruns_runtime` is constant `false`. No plugin
+//!   package surface could change that today: `panel.provider` is a capability
+//!   token, not a declaration, and the plugin manifest grammar accepts no
+//!   provider-contract field, so there is no activation point that could
+//!   register a manifest even if one existed.
+//!
+//! The shipped process also restores before it owns a panel host:
+//! `bitty-terminal` runs `Runtime::restore_session_on_startup`
+//! (`crates/bitty-terminal/src/main.rs`) and only afterwards activates plugins,
+//! which is where the panel host is constructed and later installed into the
+//! runtime. A production restore drops every configured record with
+//! [`PanelRestoreDrop::NoPanelHost`] even when records are supplied. Making the
+//! branch observable end to end needs all three: the persistence producer, a
+//! provider-contract declaration on the plugin manifest plus its registration,
+//! and a panel host present at restore time. What this module commits once those
+//! exist — retain the container, present `incompatible`, grant nothing — is
+//! proven on the restore chain in `tests/panel_restore_path.rs`.
 //!
 //! The workspace side resolves through the persisted workspace ordinal. A
 //! record's [`PanelRestoreKey`] names the workspace the panel belonged to by
@@ -88,7 +128,8 @@ use bitty_ui::{
 };
 
 use crate::registry::{
-    PanelError, PanelHandle, PanelId, PanelRuntime, PanelState, PanelType, WorkspaceId,
+    PanelError, PanelHandle, PanelId, PanelProviderManifest, PanelRuntime, PanelState, PanelType,
+    WorkspaceId,
 };
 
 use super::Runtime;
@@ -121,9 +162,16 @@ pub enum PanelDriverAnswer {
     /// A driver is installed but a required capability is denied (safe mode
     /// included): the container presents `denied` and is `unavailable`.
     Denied,
-    /// A driver is installed but its panel contract is older than the
-    /// persisted record: nothing is downgraded or partially applied, and the
-    /// container presents `incompatible`.
+    /// A driver is installed but its panel contract cannot be read by this
+    /// runtime: nothing is downgraded or partially applied, and the container
+    /// presents `incompatible`.
+    ///
+    /// Two skews answer this way. The driver's own contract may be older than
+    /// the persisted record, which the host decides; and the provider manifest
+    /// the driver registered may declare a schema newer than this runtime reads,
+    /// which the restore observes for itself
+    /// ([`PROVIDER_MANIFEST_VERSION_V1`](crate::registry::PROVIDER_MANIFEST_VERSION_V1))
+    /// and refuses to bind through.
     Older,
 }
 
@@ -466,7 +514,18 @@ impl Runtime {
                 owner,
                 resolution,
                 consented,
-            } => bind_restored_panel(&mut host, handle, workspace, owner, resolution, consented),
+            } => {
+                // The one skew this step can observe for itself: the driver is
+                // installed, but the provider manifest it registered declares a
+                // contract newer than this runtime reads. Binding would commit
+                // a resolution this runtime cannot interpret, so the container
+                // keeps its placeholder instead (bitty#3239 row 13).
+                if provider_contract_outruns_runtime(&host, owner) {
+                    present_restored_placeholder(&mut host, handle, workspace, "incompatible")
+                } else {
+                    bind_restored_panel(&mut host, handle, workspace, owner, resolution, consented)
+                }
+            }
             PanelDriverAnswer::Missing => {
                 present_restored_placeholder(&mut host, handle, workspace, "unloaded")
             }
@@ -511,6 +570,31 @@ impl Runtime {
 fn restored_slot_of(persisted_workspace: u64, restored_slots: usize) -> Option<usize> {
     let slot = usize::try_from(persisted_workspace).ok()?.checked_sub(1)?;
     (slot < restored_slots).then_some(slot)
+}
+
+/// Whether the driver's registered provider contract is newer than this
+/// runtime reads.
+///
+/// The answer comes from the provider registry the panel host owns, never from
+/// the restore input: a driver that answers
+/// [`PanelDriverAnswer::Installed`] for a container whose provider manifest
+/// declares a schema above
+/// [`PROVIDER_MANIFEST_VERSION_V1`](crate::registry::PROVIDER_MANIFEST_VERSION_V1)
+/// cannot be bound — this runtime cannot read what the provider would commit —
+/// so the container keeps a `incompatible` placeholder rather than a grant set
+/// nobody can interpret (bitty#3239 row 13, Decision E rule 3).
+///
+/// An owner that registered no provider manifest is not a skew: most panels are
+/// driven by a plugin that never declares `panel.provider`, and their first
+/// bind is unchanged.
+///
+/// Constant `false` in a shipped binary today: no production caller registers a
+/// provider manifest and no production caller configures restore records, so
+/// this predicate is only ever evaluated on a runtime a test built (see the
+/// module's reachability note and bitty#3239 row 13).
+fn provider_contract_outruns_runtime(host: &PanelRuntime, owner: &PluginId) -> bool {
+    host.provider_manifest(owner.as_str())
+        .is_some_and(PanelProviderManifest::requires_newer_runtime)
 }
 
 /// First-binds a freshly allocated container: no predecessor, no ceiling, and

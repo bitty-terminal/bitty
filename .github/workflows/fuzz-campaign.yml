@@ -293,10 +293,12 @@ jobs:
             | ($records | [.[].targets[].target] | sort | unique) as $received
             | ($ENV.EXPECTED_TARGETS | split(" ") | map(select(length > 0)) | sort) as $expected
             | ([$records[].targets[].result] | unique) as $results
+            | ([$records[].sanitizer.name] | unique) as $sanitizer_names
             | {
                 campaign: "bitty-fuzz-campaign",
                 acceptance: "R-001 / P0-AC-002 long-running cargo-fuzz campaign",
                 issue: "bitty#3227",
+                evidence_task: "CTX-1880",
                 workflow_run: env.GITHUB_RUN_ID,
                 event: env.GITHUB_EVENT_NAME,
                 ref: env.GITHUB_REF_NAME,
@@ -304,6 +306,7 @@ jobs:
                 revision_dirty: ([$records[] | .revision_dirty] | any),
                 toolchain: ([$records[] | .toolchain] | unique | if length == 1 then .[0] else "mixed" end),
                 cargo_fuzz: ([$records[] | .cargo_fuzz] | unique | if length == 1 then .[0] else "mixed" end),
+                sanitizer: ([$records[] | .sanitizer | tojson] | unique | if length == 1 then (.[0] | fromjson) else "mixed" end),
                 libfuzzer: ([$records[] | .libfuzzer | tojson] | unique | if length == 1 then (.[0] | fromjson) else "mixed" end),
                 started_utc: ([$records[] | .started_utc] | min),
                 finished_utc: ([$records[] | .finished_utc] | max),
@@ -343,6 +346,7 @@ jobs:
                   elif ($results | any(. == "error")) then "error"
                   elif ($results | any(. == "inconclusive")) then "inconclusive"
                   elif (($expected | length) == 0 or (($expected - $received) | length) > 0) then "incomplete"
+                  elif (($sanitizer_names | length) > 1) then "incomplete"
                   else "clean" end)
               }
           ' "${summaries[@]}" >campaign-summary/summary.json
@@ -351,11 +355,12 @@ jobs:
             echo
             echo "- Revision: \`$(jq -r '.revision' campaign-summary/summary.json)\` (dirty: $(jq -r '.revision_dirty' campaign-summary/summary.json))"
             echo "- Toolchain: $(jq -r '.toolchain' campaign-summary/summary.json), $(jq -r '.cargo_fuzz' campaign-summary/summary.json)"
+            echo "- Sanitizer: $(jq -r '.sanitizer | if type == "object" then .name + " (leak detection: " + .leak_detection + ", flag " + .cargo_fuzz_flag + ")" else . end' campaign-summary/summary.json)"
             echo "- Targets: $(jq -r '.totals.targets' campaign-summary/summary.json) of $(jq -r '.totals.expected' campaign-summary/summary.json) expected; missing: $(jq -r '.missing_targets | join(",")' campaign-summary/summary.json)"
             echo
-            echo "| Target | Secs fuzzed | Runs | Crashes | Leaks | Slow units | OOM | Timeouts | Result |"
-            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
-            jq -r '.targets[] | "| `\(.target)` | \(.secs_fuzzed) | \(.runs) | \(.crashes) | \(.leaks) | \(.slow_units) | \(.oom) | \(.timeouts) | \(.result) |"' campaign-summary/summary.json
+            echo "| Target | Secs fuzzed | Runs | Cov | FT | Crashes | Leaks | Slow units | OOM | Timeouts | Corpus sha256 | Result |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            jq -r '.targets[] | "| `\(.target)` | \(.secs_fuzzed) | \(.runs) | \(.coverage_edges // "-") | \(.coverage_features // "-") | \(.crashes) | \(.leaks) | \(.slow_units) | \(.oom) | \(.timeouts) | \(.corpus_digest // "-") | \(.result) |"' campaign-summary/summary.json
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Upload campaign summary

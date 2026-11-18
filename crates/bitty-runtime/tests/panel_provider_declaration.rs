@@ -337,6 +337,37 @@ fn a_redeclaration_swaps_the_registered_contract() {
     );
 }
 
+/// A refused replacement keeps the descriptor the owner already holds
+/// (bitty#3243 review F2).
+///
+/// The swap is unregister + register, so an ungated replacement would drop the
+/// old descriptor before the registry refuses the new one. Revert the
+/// capability pre-check in `register_declared_panel_provider` and this row
+/// fails on the last assertion (`None`): the owner ends up with no provider at
+/// all, which would silently downgrade a live generation to the placeholder.
+#[test]
+fn a_refused_replacement_keeps_the_registered_descriptor() {
+    let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds");
+    register_declared_panel_provider(&mut host, "acme.notes", &declaration("acme.notes", 2), true)
+        .expect("the granted declaration registers");
+
+    let refused = register_declared_panel_provider(
+        &mut host,
+        "acme.notes",
+        &declaration("acme.notes", 3),
+        false,
+    );
+    assert!(
+        refused.is_err(),
+        "a generation without the grant must not replace a descriptor"
+    );
+    assert_eq!(
+        host.provider_manifest("acme.notes").map(|m| m.version()),
+        Some(2),
+        "the refused replacement must leave the registered contract in place"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A backend that really writes both documents
 // ---------------------------------------------------------------------------

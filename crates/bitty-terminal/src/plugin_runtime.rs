@@ -3221,6 +3221,82 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         live
     }
 
+    /// A plugin package whose manifest carries a `[panel.provider]` declaration
+    /// (bitty#3243): the contract version it speaks and the kinds it drives.
+    fn write_provider_probe(root: &Path, id: &str, contract: u32, types: &[&str]) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let kinds: Vec<String> = types.iter().map(|kind| format!("\"{kind}\"")).collect();
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\npanel.create = true\npanel.provider = true\n\n[panel.provider]\ncontract = {contract}\ntypes = [{}]\n",
+                kinds.join(", "),
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            "-- provider declaration probe\n",
+        )
+        .expect("init");
+    }
+
+    /// bitty#3243 row 13: the composition root's activation edge registers the
+    /// declaration a package ships, and the host install does not shadow it.
+    ///
+    /// This is the only row that crosses the `bitty-terminal` edge: revert the
+    /// `register_declared_panel_providers` call in `discover_with_roots` and it
+    /// fails at the first assertion (`None`), because the install's observation
+    /// only mints `PROVIDER_MANIFEST_VERSION_V1` for owners holding a live
+    /// container and this generation created none.
+    #[test]
+    fn a_declared_provider_contract_survives_activation_and_the_host_install() {
+        let root = pin_test_dir("provider-declaration");
+        write_provider_probe(&root, "acme.notes", 2, &["helper"]);
+        let mut live = two_leaf_runtime();
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: None,
+            focused_workspace: None,
+        };
+        let session = discover_with_roots(false, 80, 24, &seed, None, None, vec![root], None, None)
+            .expect("dev root must yield a session");
+        let panels = session
+            .panels
+            .clone()
+            .expect("the shipped panel host must exist");
+        assert_eq!(
+            panels
+                .borrow()
+                .provider_manifest("acme.notes")
+                .map(bitty_runtime::registry::PanelProviderManifest::version),
+            Some(2),
+            "activation must register the contract the package declares"
+        );
+        live.install_shared_scene_host(Rc::clone(&panels));
+        assert_eq!(
+            panels
+                .borrow()
+                .provider_manifest("acme.notes")
+                .map(bitty_runtime::registry::PanelProviderManifest::version),
+            Some(2),
+            "the install's observation must not shadow the declared contract with V1"
+        );
+    }
+
     fn pin_test_app(
         tag: &str,
         id: &str,

@@ -46,8 +46,7 @@
 //! generation's own activation grant snapshot, so a plugin that requested
 //! `panel.provider` and was denied registers nothing and its containers restore
 //! `unloaded`/`denied` exactly as before. A declaration is also not authority
-//! for the manifest hash (see
-//! [`PanelProviderDeclaration`](bitty_plugin_host::manifest::PanelProviderDeclaration)):
+//! for the manifest hash (see [`PanelProviderDeclaration`]):
 //! the only two facts it carries are a contract version, which can make the
 //! runtime *stricter*, and a kind list, whose creation edge is already gated by
 //! `panel.create`.
@@ -158,10 +157,32 @@ pub fn register_declared_panel_provider(
         }
     }
     // A changed declaration replaces the generation's contract; the registry
-    // refuses duplicate owners, so the swap is unregister + register.
-    if host.provider_manifest(owner).is_some() {
-        let _ = host.unregister_panel_provider(owner);
+    // refuses duplicate owners, so the swap is unregister + register. The
+    // capability is re-checked before anything is dropped: the registry would
+    // refuse the replacement anyway, and a refused replacement must leave the
+    // descriptor this owner already holds in place (bitty#3243 review F2).
+    let previous = if host.provider_manifest(owner).is_some() {
+        if !capability_granted {
+            return Err(PanelDeclarationError::Registry(
+                ProviderContractError::CapabilityDenied {
+                    owner: owner.to_string(),
+                },
+            ));
+        }
+        host.unregister_panel_provider(owner).ok()
+    } else {
+        None
+    };
+    match host.register_panel_provider(manifest, capability_granted) {
+        Ok(generation) => Ok(generation),
+        Err(error) => {
+            // Belt and braces: a refusal after the swap still restores what the
+            // owner had. The manifest was registered under a grant, so the
+            // restore carries the same capability answer the swap was given.
+            if let Some(previous) = previous {
+                let _ = host.register_panel_provider(previous, true);
+            }
+            Err(PanelDeclarationError::Registry(error))
+        }
     }
-    host.register_panel_provider(manifest, capability_granted)
-        .map_err(PanelDeclarationError::Registry)
 }

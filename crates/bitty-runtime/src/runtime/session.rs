@@ -1245,9 +1245,12 @@ impl Runtime {
     /// [`bitty_ui::plan_restore`] before any mutation — a refused policy or
     /// record set returns [`SessionError::PanelRestoreRefused`] with the runtime
     /// untouched — and committed after the restored workspaces exist, each
-    /// record minting a fresh [`PanelId`](crate::registry::PanelId). A record
-    /// whose driver is missing, denied, or older keeps its container with the
-    /// Core-owned placeholder. The per-record outcomes are read back with
+    /// record minting a fresh [`PanelId`](crate::registry::PanelId) and
+    /// resolving its persisted workspace ordinal to the restored slot at that
+    /// index. A record whose driver is missing, denied, or older keeps its
+    /// container with the Core-owned placeholder. Installing the restored world
+    /// also releases the containers attributed to the replaced world's slot ids,
+    /// which no longer exist. The per-record outcomes are read back with
     /// [`Runtime::panel_restore_report`].
     pub fn apply_session_snapshot(
         &mut self,
@@ -1326,6 +1329,13 @@ impl Runtime {
                 floats,
             });
         }
+        // bitty#3239 row 14 (CTX-1886): a restore replaces the whole slot table,
+        // so the ids of the outgoing world die with it. Release every container
+        // attributed to one of them first: an attribution to a slot id that no
+        // longer exists is unreachable from every workspace edge and would
+        // never be swept by a later close, so the panel registry would keep
+        // counting a container nothing can present or dispose.
+        self.release_panels_of_outgoing_world();
         self.workspaces = workspaces;
         self.active_workspace = snap.active;
         self.workspace_mru = snap.mru.iter().copied().collect::<VecDeque<_>>();

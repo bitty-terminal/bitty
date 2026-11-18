@@ -46,16 +46,29 @@
 //! `RFC-OQ-9`'s pending persistence contract), so this module asks for exactly
 //! the three facts the record cannot carry and decides nothing about them.
 //!
-//! The workspace side is resolved the only way it can be: a record's
-//! [`PanelRestoreKey`] names a [`bitty_ui::WorkspaceId`], and a workspace id is
-//! per-window attribution rather than durable identity — [`Runtime`] mints a
-//! fresh [`WorkspaceId`] for every restored slot. The step therefore resolves
-//! the record's workspace through the slot being replaced (by raw attribution
-//! value; the two newtypes are distinct types over the same number) and
-//! restores the container into that slot's fresh id. A record whose workspace is
-//! not a slot of the restored session is dropped, never re-homed onto another
-//! workspace: which persisted index maps to which live workspace is the open
-//! half of the persistence contract, and guessing it here would decide it.
+//! The workspace side resolves through the persisted workspace ordinal. A
+//! record's [`PanelRestoreKey`] names the workspace the panel belonged to by
+//! the ordinal that workspace occupied in the persisted session (1-based — the
+//! `ws:N` index the window presents, and the origin the slot minter starts
+//! from), while [`Runtime`] mints a fresh [`WorkspaceId`] for every restored
+//! slot: a slot id is per-window attribution and no restored slot ever keeps
+//! the id it had. The step therefore resolves the ordinal against the restored
+//! slot list — `ordinal - 1`, bounded by the number of slots the snapshot
+//! restores — and restores the container into that slot's fresh id. Resolution
+//! is never by raw value against the live slots: after a restart the persisted
+//! value names no live id, so every record would drop on every window but the
+//! one that happened to mint that number. A record whose ordinal falls outside
+//! the restored session is dropped, never re-homed onto another workspace.
+//!
+//! # The outgoing world
+//!
+//! A restore replaces the whole slot table, so the ids of the world it replaces
+//! die with it. The step releases the containers attributed to those outgoing
+//! slots before the restored world is installed, so no container is left
+//! attributed to a workspace that no longer exists — an attribution no later
+//! workspace edge could reach and no later close sweep would ever visit.
+//! Containers created without a workspace attribution are window-global and are
+//! left alone.
 //!
 //! # Lifetime of the records
 //!
@@ -112,20 +125,6 @@ pub enum PanelDriverAnswer {
     /// persisted record: nothing is downgraded or partially applied, and the
     /// container presents `incompatible`.
     Older,
-}
-
-impl PanelDriverAnswer {
-    /// The Decision E reason token this answer presents, or `None` when the
-    /// record takes a bind instead.
-    #[must_use]
-    pub fn placeholder_token(&self) -> Option<&'static str> {
-        match self {
-            Self::Installed { .. } => None,
-            Self::Missing => Some("unloaded"),
-            Self::Denied => Some("denied"),
-            Self::Older => Some("incompatible"),
-        }
-    }
 }
 
 /// One persisted panel record plus the restore-time facts it cannot carry.
@@ -225,18 +224,6 @@ pub struct RestoredPanel {
     pub outcome: PanelRestoreOutcome,
 }
 
-impl RestoredPanel {
-    /// The container this record became, if one was allocated.
-    #[must_use]
-    pub fn restored_id(&self) -> Option<PanelId> {
-        match self.outcome {
-            PanelRestoreOutcome::Bound { panel, .. }
-            | PanelRestoreOutcome::Placeholder { panel, .. } => Some(panel),
-            PanelRestoreOutcome::Dropped { .. } => None,
-        }
-    }
-}
-
 /// Outcome of the panel step of one session restore (content-free: ids, keys,
 /// titles, and the bounded outcome, never panel content).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -267,18 +254,6 @@ impl PanelRestoreReport {
     #[must_use]
     pub fn bound(&self) -> usize {
         self.count(|outcome| matches!(outcome, PanelRestoreOutcome::Bound { .. }))
-    }
-
-    /// Records whose container was retained with a placeholder.
-    #[must_use]
-    pub fn placeholders(&self) -> usize {
-        self.count(|outcome| matches!(outcome, PanelRestoreOutcome::Placeholder { .. }))
-    }
-
-    /// Records that came back as nothing.
-    #[must_use]
-    pub fn dropped(&self) -> usize {
-        self.count(|outcome| matches!(outcome, PanelRestoreOutcome::Dropped { .. }))
     }
 
     fn count(&self, predicate: impl Fn(&PanelRestoreOutcome) -> bool) -> usize {
@@ -321,12 +296,6 @@ impl Runtime {
         self.panel_restore_policy = policy;
     }
 
-    /// The policy the next restore plans panel records under.
-    #[must_use]
-    pub fn panel_persistence_policy(&self) -> PersistencePolicy {
-        self.panel_restore_policy
-    }
-
     /// Configures the panel records the next session restore applies.
     ///
     /// Records are applied in the order given and are consumed by the restore
@@ -347,11 +316,6 @@ impl Runtime {
     #[must_use]
     pub fn panel_restore_records(&self) -> &[PanelRestoreInput] {
         &self.panel_restore_inputs
-    }
-
-    /// Drops every configured panel record, so the next restore applies none.
-    pub fn clear_panel_restore_records(&mut self) {
-        self.panel_restore_inputs.clear();
     }
 
     /// What the last successful session restore did with the configured panel
@@ -385,7 +349,7 @@ impl Runtime {
                 continue;
             };
             planned.push(PlannedPanel {
-                slot: self.restored_slot_of(record.key.workspace.get(), restored_slots),
+                slot: restored_slot_of(record.key.workspace.get(), restored_slots),
                 record,
                 panel_type: input.panel_type,
                 driver: input.driver.clone(),
@@ -394,25 +358,39 @@ impl Runtime {
         Ok(planned)
     }
 
-    /// Resolves a record's persisted workspace to the slot being replaced.
+    /// Releases every container attributed to a workspace of the outgoing world.
     ///
-    /// The record's key carries [`bitty_ui::WorkspaceId`] — the targeting
-    /// newtype — while the runtime names slots with
-    /// [`crate::registry::WorkspaceId`]; the two are distinct types over the
-    /// same raw attribution value, so the raw value is what is matched. A
-    /// [`WorkspaceId`] is per-window attribution and the restore replaces every
-    /// slot with a freshly minted id, so the record is matched against the
-    /// slots that exist right now and the answer is the index whose replacement
-    /// inherits it. `None` when the value names no slot that is being restored;
-    /// the record is then dropped rather than re-homed, because which persisted
-    /// index owns which live workspace is the open half of the persistence
-    /// contract.
-    fn restored_slot_of(&self, workspace: u64, restored_slots: usize) -> Option<usize> {
-        let slot = self
-            .workspaces
-            .iter()
-            .position(|candidate| candidate.id.get() == workspace)?;
-        (slot < restored_slots).then_some(slot)
+    /// A restore replaces the whole slot table, and a slot [`WorkspaceId`] is a
+    /// per-window attribution the minter never reuses, so the ids of the world
+    /// being replaced die with it. A container still attributed to one of them
+    /// would be unreachable: no restored workspace resolves to that id, and
+    /// every later sweep (the one a workspace close runs) walks live slots
+    /// only, so nothing would ever dispose it and the registry would keep
+    /// counting it. The step therefore runs the same per-workspace disposal a
+    /// workspace close runs, for every outgoing slot, before the restored world
+    /// is installed.
+    ///
+    /// Containers created without a workspace attribution are window-global and
+    /// are left alone: no dead slot id is involved, so nothing orphans them. A
+    /// host the composition root is holding across the restore cannot be
+    /// borrowed, and the release is skipped for that restore — the same bounded
+    /// borrow the panel step itself takes (`PanelHostBusy`), never a panic
+    /// inside Core.
+    pub(super) fn release_panels_of_outgoing_world(&mut self) {
+        // Collected first: the sweep needs the host mutably, and the ids must
+        // be the outgoing ones (the caller replaces the table right after).
+        let outgoing: Vec<WorkspaceId> = self.workspaces.iter().map(|slot| slot.id).collect();
+        self.with_scene_host_mut(|host| {
+            for workspace in outgoing {
+                // The sweep is fail-fast and reports what it could not release.
+                // A refusal there is a registry invariant violation (the sweep
+                // disposes each container at its own allocation epoch, so a
+                // stale handle cannot arise), and the world it belonged to is
+                // already gone from the layout domain, so there is no second
+                // path to retry it on.
+                let _ = host.dispose_workspace_panels(workspace);
+            }
+        });
     }
 
     /// Commits the planned panel step after the restored world is installed.
@@ -507,6 +485,32 @@ impl Runtime {
         }
         outcome
     }
+}
+
+/// Resolves a record's persisted workspace ordinal to the restored slot it
+/// lands in.
+///
+/// A record's key carries [`bitty_ui::WorkspaceId`] — the targeting newtype —
+/// while the runtime names slots with [`WorkspaceId`]. The two are distinct
+/// types over the same number, but the number is not the same fact in each: the
+/// record's value is the *persisted workspace ordinal* (1-based, the `ws:N`
+/// index the window presents and the origin the slot minter starts from), and a
+/// live slot id is per-window attribution that the minter mints fresh for every
+/// restored slot. Matching the raw value against the live slots — what this
+/// step used to do — resolves at most the one workspace the starting window
+/// happened to mint, so every record from a second or later workspace of the
+/// persisted session dropped as `WorkspaceGone`; in the production shape (one
+/// workspace at startup) that is every record but the first workspace's.
+///
+/// Resolution is therefore by the ordinal, against the slots the snapshot is
+/// about to restore: `ordinal - 1` for the zero-based slot list, bounded by
+/// `restored_slots`. `None` when the ordinal falls outside that range (a
+/// zeroed key, or one past the persisted session's last workspace); the record
+/// is then dropped rather than re-homed onto another workspace, because a
+/// restore may not guess which workspace a record meant.
+fn restored_slot_of(persisted_workspace: u64, restored_slots: usize) -> Option<usize> {
+    let slot = usize::try_from(persisted_workspace).ok()?.checked_sub(1)?;
+    (slot < restored_slots).then_some(slot)
 }
 
 /// First-binds a freshly allocated container: no predecessor, no ceiling, and

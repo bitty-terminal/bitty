@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A Windows install upgraded across the `%LOCALAPPDATA%` precedence change
+  keeps its plugin store and its plugin state (`CTX-1876`; bitty#3236,
+  bitty#3226):** the data root now prefers `%LOCALAPPDATA%` over `$HOME`, so a
+  Windows install that had `HOME` exported and had installed plugins under
+  `$HOME/.local/share/bitty/plugins` discovered none of them, and the
+  `plugins-state` sibling that holds each plugin's `store.json` was stranded
+  the same way. Both entries are now resolved by one data-root resolver that
+  adopts a pre-`%LOCALAPPDATA%` tree into the current root exactly once
+  (rename, with a bounded copy fallback when the two roots sit on different
+  volumes) and, if the move cannot be made, keeps reading the legacy tree
+  instead of switching to an empty root. `--safe`, `bitty plugin doctor`
+  without `--repair`, and shell completion resolve the same precedence
+  read-only and never move anything. Plugin discovery stays single-authority:
+  an existing current root is never merged with a legacy one, so exactly one
+  index is read and the deny-by-default capability model is unchanged.
+  Windows path precedence, in order: `$XDG_DATA_HOME`, `%LOCALAPPDATA%`,
+  `$HOME/.local/share`, `%APPDATA%`; the component state root ranks
+  `$XDG_STATE_HOME`, `%LOCALAPPDATA%`, `$HOME/.local/state`.
+
 ## [0.0.31] - 2026-10-29
 
 ### Added

@@ -1294,6 +1294,15 @@ fn main() {
     let live_history = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.history));
+    // bitty#3243 (row 13): report what the activation edge did with each
+    // package's declared provider contract. A refusal is fail-closed, not
+    // fatal — the plugin runs and its panels restore with the bounded
+    // placeholder their kind gets when no provider answers — so a refused
+    // declaration is a warning carrying the registry's own typed reason, never
+    // a startup failure.
+    if let Some(session) = plugin_session.as_ref() {
+        plugin_runtime::report_panel_provider_activations(&session.panel_provider_activations);
+    }
     // bitty#2785: the production panel host and its Core-published scene
     // target. The app installs the host into the present loop; the plugin
     // services attach scenes through the same handle.

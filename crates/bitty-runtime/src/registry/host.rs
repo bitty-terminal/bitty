@@ -1179,17 +1179,21 @@ impl PanelRuntime {
     /// Duplicate owners are rejected, not shadowed; each registration mints a
     /// fresh generation so reload swaps provider content atomically.
     ///
-    /// The production caller is
-    /// [`Runtime::install_shared_scene_host`](crate::Runtime::install_shared_scene_host)
-    /// (bitty#3243): when the composition root installs the panel host, the
+    /// The production callers are two seams of the same edge. The composition
+    /// root's activation edge (`bitty-terminal`'s `plugin_runtime`)
+    /// registers the `[panel.provider]` declaration a package ships, through
+    /// [`register_declared_panel_provider`](crate::register_declared_panel_provider),
+    /// once per activation generation. The host install
+    /// ([`Runtime::install_shared_scene_host`](crate::Runtime::install_shared_scene_host))
+    /// then observes: when the composition root installs the panel host, the
     /// runtime mints one descriptor per plugin that drives a live container of
     /// that host and whose committed grant set holds `panel.provider`. The
     /// descriptor declares the container kinds the plugin was observed driving
     /// and the contract this runtime reads, because an observation under this
-    /// runtime's own ABI is the strongest declaration available — the plugin
-    /// package grammar carries no provider-contract field
-    /// (`crate::plugin_runtime::manifest_toml`, bitty#3243 residual). Reload and
-    /// plugin-declared descriptors stay this method's business.
+    /// runtime's own ABI is the strongest declaration available. A plugin that
+    /// declared a contract keeps it: the observation's `DuplicateOwner`
+    /// refusal is tolerated, so `V1` never shadows a declared version. Reload
+    /// and plugin-declared descriptors stay this method's business.
     ///
     /// # Errors
     ///

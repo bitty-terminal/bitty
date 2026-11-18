@@ -151,6 +151,7 @@ locally, a per-target upload in CI):
 | `toolchain`, `cargo_fuzz`                                 | `rustc` and `cargo-fuzz` versions actually used                                              |
 | `sanitizer.name`, `.cargo_fuzz_flag`, `.instrumentation`  | The sanitizer build: the forwarded `--sanitizer=<name>`, its `-Zsanitizer=` instrumentation, and the leak-detection runtime it implies |
 | `sanitizer.leak_detection`, `.leak_detection_source`      | `lsan` for an ASan build (`asan-runtime`): the reason a `leak-*` is memory-safety evidence   |
+| `sanitizer.leak_detection_effective`, `.leak_detection_disabled_by` | Whether the leak check actually runs, and the inherited option that would disable it (`ASAN_OPTIONS=detect_leaks=0` / `LSAN_OPTIONS=...`) |
 | `libfuzzer`                                               | `-max_total_time`, `-timeout`, `-rss_limit_mb`, `-workers`, `-detect_leaks` for the run      |
 | `targets[].secs_fuzzed`                                   | libFuzzer's own `Done <runs> runs in <secs> second(s)` budget                                |
 | `targets[].secs_actual`                                   | Wall clock of the whole per-target step, including its build                                 |
@@ -190,7 +191,7 @@ evidence:
 
 | Addition           | Recorded as                                                                                   | How it is captured                                                                                                                                                                                                                                    | Absent means                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified`      | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the target binary this run built (`<target-dir>/<host-triple>/release/<target>`, with a bare `release/` fallback) is probed for the runtime symbol (`__asan_init`, ...) and a binary without it is a contradiction | `sanitizer-build` on a contradiction; `sanitizer-none` for a `SANITIZER=none` build; `sanitizer-leaks-unchecked` for a sanitizer libFuzzer does not drive LSan with; `clean` is refused in all three |
+| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified`      | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the exact binary this run built (`<target-dir>/<host-triple>/release/<target>` — never a bare `release/` copy, which cargo does not write) is probed for the runtime symbol (`__asan_init`, ...) and a binary without it is a contradiction, while an unidentifiable build reports `absent` | `sanitizer-build` on a contradiction; `sanitizer-none` for a `SANITIZER=none` build; `sanitizer-leaks-unchecked` for a sanitizer libFuzzer does not drive LSan with, or a run whose sanitizer options disable the check; `clean` is refused in all cases |
 | Corpus digest      | `targets[].corpus_digest`, `.corpus_units`, `corpus/<target>.sha256`                           | sha256 over the name-sorted `<unit-sha256>  <unit-name>` manifest of every regular file in the corpus the run ended with (before the retention trim) — discovered units are named by content hash, so a `*.bin` filter would omit exactly what the run found — and an unreadable unit fails the digest instead of shortening it | `corpus-digest`; a host without `sha256sum`/`shasum` cannot claim clean |
 | Coverage signal    | `targets[].coverage_edges`, `.coverage_features`                                               | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters from its last pulse line, parsed as bounded integers (`0..2^32-1`, anything else is absent)                                                                                        | `coverage`; `clean` is refused                                      |
 
@@ -199,8 +200,11 @@ an artifact left in the directory, libFuzzer's error exit, or a runner error
 keeps its precedence, so missing provenance can never hide a finding (the driver
 test pins both directions — a `leak-*` with no coverage counters is still
 `finding`, exit 1). The sanitizer row covers every build that cannot evidence
-the leak clause: `none` links no runtime at all, and `leak`/`memory`/`thread`
-are sanitizers libFuzzer does not drive LSan with, so their runs are recorded
+the leak clause: `none` links no runtime at all; `leak`/`memory`/`thread` are
+sanitizers libFuzzer does not drive LSan with; and an inherited
+`ASAN_OPTIONS=detect_leaks=0` (or `LSAN_OPTIONS=…`) makes the runtime skip the
+check even when `-detect_leaks=1` is passed, which `leak_detection_effective`
+records and `leak_detection_disabled_by` names. All of those runs are recorded
 `inconclusive` (`sanitizer-none`, `sanitizer-leaks-unchecked`) rather than
 folded into a clean count.
 
@@ -387,12 +391,14 @@ prose adds no finding of another class.
   needs a build step in the driver; the derived file plus two drift tests is the
   cheaper shape today.
 
-- The binary probe behind `sanitizer_verified` is best-effort: it looks in
-  `CARGO_TARGET_DIR` (or `fuzz/target`) at depth 3. A build laid out elsewhere
-  records `sanitizer_probe: absent`, which is "declared by the forwarded flag",
-  not "verified". Asking cargo-fuzz for the artifact path would tighten this,
-  and the pinned 0.13.2 cannot print it. A *located* binary that lacks the
-  runtime symbol is a hard contradiction, which is the direction that matters.
+- The binary probe behind `sanitizer_verified` is exact but best-effort: it looks
+  at `<CARGO_TARGET_DIR|fuzz/target>/<host-triple>/release/<target>` and nothing
+  else. A build cargo placed elsewhere, or a host whose triple cannot be read,
+  records `sanitizer_probe: absent` — "declared by the forwarded flag", never
+  "verified" — and a bare `release/` copy is deliberately ignored because cargo
+  does not write one, so it can only be a stale build. A *located* binary that
+  lacks the runtime symbol is the hard contradiction that blocks `clean`, which
+  is the direction that matters.
 - The corpus digest proves which corpus a run ended with, not that the corpus is
   the committed one: reproducibility still needs the same revision plus that
   digest. Keeping the digest in the merged nightly record is what lets a later

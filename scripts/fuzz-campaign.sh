@@ -387,6 +387,30 @@ sanitizer_leak_detection() {
   esac
 }
 
+# A leak check that the runtime has been told to skip is not a leak check:
+# `__lsan_do_recoverable_leak_check` returns zero when `detect_leaks=0` is in
+# the sanitizer options (LLVM `sanitizer/lsan_interface.h`), so an inherited
+# `ASAN_OPTIONS=detect_leaks=0` would otherwise let a run report `lsan` and
+# `clean` while never looking. The last `detect_leaks=` in the options wins, as
+# it does in the runtime's own parser. Prints the deciding pair, or nothing.
+leak_detection_disabled_by() {
+  local variable options value
+  for variable in ASAN_OPTIONS LSAN_OPTIONS; do
+    case "$variable" in
+    ASAN_OPTIONS) options="${ASAN_OPTIONS:-}" ;;
+    LSAN_OPTIONS) options="${LSAN_OPTIONS:-}" ;;
+    esac
+    [ -n "$options" ] || continue
+    value="$(printf '%s' "$options" | tr ',' '\n' |
+      awk -F= '$1 == "detect_leaks" { found = $2 } END { print found }')"
+    if [ "${value:-1}" = "0" ]; then
+      printf '%s=detect_leaks=0' "$variable"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Best-effort probe of the instrumentation the run actually built: look for the
 # runtime symbol in the target binary. A binary that is found and lacks the
 # marker contradicts the recorded sanitizer and blocks `clean`; a binary that
@@ -400,29 +424,25 @@ probe_sanitizer_build() { # target marker -> found | mismatch | absent | not-app
     printf 'not-applicable'
     return 0
   fi
-  # The binary this run just built lives in exactly one tree: the caller's
-  # CARGO_TARGET_DIR when set, else cargo-fuzz's own `fuzz/target`. Cargo puts it
-  # under the host triple; a bare `release/` copy is the fallback for a caller
-  # that passed `--target-dir` or a host whose triple could not be read. Probing
-  # those exact paths — not "the first match" — keeps a stale build in the other
-  # profile from answering for this run.
+  # The binary this run just built lives in exactly one place: cargo puts it
+  # under the host triple (`<target-dir>/<host-triple>/release/<target>`), with
+  # `<target-dir>` either the caller's CARGO_TARGET_DIR or cargo-fuzz's own
+  # `fuzz/target`. A bare `release/` copy is NOT accepted as a substitute: cargo
+  # never writes one, so it can only be a stale build from another run, and
+  # answering for a binary this run did not produce is worse than saying
+  # "unverified".
+  if [ -z "${HOST_TRIPLE:-}" ]; then
+    echo "fuzz-campaign: warning: host triple unknown; cannot probe the sanitizer build for $target" >&2
+    printf 'absent'
+    return 0
+  fi
   if [ -n "${CARGO_TARGET_DIR:-}" ]; then
     root="$CARGO_TARGET_DIR"
   else
     root="$FUZZ_DIR/target"
   fi
-  local -a candidates=()
-  if [ -n "${HOST_TRIPLE:-}" ]; then
-    candidates+=("$root/$HOST_TRIPLE/release/$target")
-  fi
-  candidates+=("$root/release/$target")
-  for candidate in "${candidates[@]}"; do
-    if [ -f "$candidate" ]; then
-      binary="$candidate"
-      break
-    fi
-  done
-  if [ -z "$binary" ]; then
+  binary="$root/$HOST_TRIPLE/release/$target"
+  if [ ! -f "$binary" ]; then
     printf 'absent'
   elif grep -aqF -- "$marker" "$binary" 2>/dev/null; then
     printf 'found'
@@ -528,7 +548,7 @@ render_summary_json() {
   "revision_dirty": $dirty,
   "toolchain": "$toolchain_version",
   "cargo_fuzz": "$cargo_fuzz",
-  "sanitizer": {"name": "$SANITIZER", "cargo_fuzz_flag": "--sanitizer=$SANITIZER", "instrumentation": "$SANITIZER_INSTRUMENTATION", "leak_detection": "$SANITIZER_LEAK_DETECTION", "leak_detection_source": "$SANITIZER_LEAK_SOURCE"},
+  "sanitizer": {"name": "$SANITIZER", "cargo_fuzz_flag": "--sanitizer=$SANITIZER", "instrumentation": "$SANITIZER_INSTRUMENTATION", "leak_detection": "$SANITIZER_LEAK_DETECTION", "leak_detection_effective": $SANITIZER_LEAK_EFFECTIVE, "leak_detection_disabled_by": "$SANITIZER_LEAK_DISABLED_BY", "leak_detection_source": "$SANITIZER_LEAK_SOURCE"},
   "libfuzzer": {"max_total_time_secs": $SECS, "timeout_secs": $TIMEOUT_SECS, "rss_limit_mb": $RSS_LIMIT_MB, "workers": 1, "detect_leaks": $SANITIZER_DETECT_LEAKS},
   "started_utc": "$started",
   "finished_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
@@ -829,7 +849,9 @@ run_target() {
   # above. The digest is a bare hex string, never a host path.
   local corpus_units corpus_sha
   corpus_units="$(count_files "$corpus_dir")"
-  corpus_sha="$(corpus_digest "$corpus_dir" || true)"
+  # No `|| true` inside the substitution: a failed digest must not leave the
+  # partial hash it printed on stdout in the record.
+  corpus_sha="$(corpus_digest "$corpus_dir")" || corpus_sha=""
   if [ -n "$corpus_sha" ]; then
     mkdir -p "$OUT_DIR/corpus"
     printf '%s  %s.corpus  units=%s  algorithm=sha256\n' \
@@ -874,10 +896,10 @@ run_target() {
     # A build without a sanitizer can report zero leaks and still say nothing
     # about memory safety, which is the clause the campaign exists to evidence.
     missing+=("sanitizer-none")
-  elif [ "$SANITIZER_LEAK_DETECTION" != "lsan" ]; then
-    # libFuzzer only drives LSan for an ASan build. Another sanitizer may be a
-    # fine campaign, but it cannot evidence the leak clause, so it is recorded
-    # as the gap it is rather than folded into a clean result.
+  elif [ "$SANITIZER_LEAK_EFFECTIVE" != "true" ]; then
+    # Either libFuzzer does not drive LSan for this sanitizer, or the runtime was
+    # told to skip the check. A campaign in that state may still find crashes,
+    # but it cannot evidence the leak clause, so it is recorded as the gap it is.
     missing+=("sanitizer-leaks-unchecked")
   elif [ "$sanitizer_probe" = "mismatch" ]; then
     missing+=("sanitizer-build")
@@ -957,9 +979,18 @@ main() {
   SANITIZER_LEAK_DETECTION="$(sanitizer_leak_detection "$SANITIZER")"
   SANITIZER_LEAK_SOURCE="none"
   SANITIZER_DETECT_LEAKS=0
+  SANITIZER_LEAK_EFFECTIVE=false
+  SANITIZER_LEAK_DISABLED_BY=""
   if [ "$SANITIZER_LEAK_DETECTION" = "lsan" ]; then
     SANITIZER_LEAK_SOURCE="asan-runtime"
     SANITIZER_DETECT_LEAKS=1
+    if SANITIZER_LEAK_DISABLED_BY="$(leak_detection_disabled_by)"; then
+      # The runtime was told to skip the check; the flag alone does not buy it.
+      echo "fuzz-campaign: warning: $SANITIZER_LEAK_DISABLED_BY disables the leak check this campaign relies on" >&2
+    else
+      SANITIZER_LEAK_DISABLED_BY=""
+      SANITIZER_LEAK_EFFECTIVE=true
+    fi
   fi
 
   local all_targets selected=""

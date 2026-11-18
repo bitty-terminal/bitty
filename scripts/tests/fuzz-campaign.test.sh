@@ -262,6 +262,10 @@ expect_eq 'schema carries the sanitizer name' 'address' "$(jq -r '.sanitizer.nam
 expect_eq 'schema carries the forwarded sanitizer flag' '--sanitizer=address' "$(jq -r '.sanitizer.cargo_fuzz_flag' "$TMP/out-clean/summary.json")"
 expect_eq 'schema carries the instrumentation flag' '-Zsanitizer=address' "$(jq -r '.sanitizer.instrumentation' "$TMP/out-clean/summary.json")"
 expect_eq 'schema carries leak detection' 'lsan' "$(jq -r '.sanitizer.leak_detection' "$TMP/out-clean/summary.json")"
+expect_eq 'schema records effective leak detection' 'true' \
+  "$(jq -r '.sanitizer.leak_detection_effective' "$TMP/out-clean/summary.json")"
+expect_eq 'schema records no disabling option' '' \
+  "$(jq -r '.sanitizer.leak_detection_disabled_by' "$TMP/out-clean/summary.json")"
 expect_eq 'schema records the leak-detection source' 'asan-runtime' "$(jq -r '.sanitizer.leak_detection_source' "$TMP/out-clean/summary.json")"
 expect_eq 'schema records -detect_leaks' '1' "$(jq -r '.libfuzzer.detect_leaks' "$TMP/out-clean/summary.json")"
 expect_eq 'target records its sanitizer' 'address' "$(jq -r '.targets[0].sanitizer' "$TMP/out-clean/summary.json")"
@@ -333,10 +337,10 @@ expect_eq 'corpus units count extensionless units' '1' \
   "$(( $(jq -r '.targets[0].corpus_units' "$TMP/out-digest-hash/summary.json") - $(jq -r '.targets[0].corpus_units' "$TMP/out-digest-c/summary.json") ))"
 rm -f "$TMP/corpus/vt_parser/0123456789abcdef"
 
-# --- the sanitizer record is checked against the build it claims
-mkdir -p "$TMP/bare-target/release"
-printf 'stub fuzz binary, no sanitizer runtime\n' >"$TMP/bare-target/release/vt_parser"
-chmod +x "$TMP/bare-target/release/vt_parser"
+# --- the sanitizer record is checked against the build this run produced
+triple=x86_64-unknown-linux-gnu
+mkdir -p "$TMP/bare-target/$triple/release"
+printf 'stub fuzz binary, no sanitizer runtime\n' >"$TMP/bare-target/$triple/release/vt_parser"
 CARGO_TARGET_DIR="$TMP/bare-target"
 rm -rf "$TMP/out-nosan"
 run_fails 4 clean "$TMP/out-nosan"
@@ -348,7 +352,7 @@ expect_eq 'the probe outcome is recorded' 'mismatch' \
   "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-nosan/summary.json")"
 expect_eq 'an unverified sanitizer is not claimed verified' 'false' \
   "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-nosan/summary.json")"
-printf 'stub fuzz binary with __asan_init linked\n' >"$TMP/bare-target/release/vt_parser"
+printf 'stub fuzz binary with __asan_init linked\n' >"$TMP/bare-target/$triple/release/vt_parser"
 rm -rf "$TMP/out-san"
 run_fails 0 clean "$TMP/out-san"
 expect_eq 'a probed ASan build restores clean' 'clean' "$(jq -r '.targets[0].result' "$TMP/out-san/summary.json")"
@@ -356,7 +360,60 @@ expect_eq 'a probed ASan build records the probe' 'found' \
   "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-san/summary.json")"
 expect_eq 'a probed ASan build is verified' 'true' \
   "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-san/summary.json")"
+
+# A stale build in a bare `release/` tree must not answer for this run.
+mkdir -p "$TMP/bare-target/release"
+printf 'stale binary, no sanitizer runtime\n' >"$TMP/bare-target/release/vt_parser"
+rm -rf "$TMP/out-stale"
+run_fails 0 clean "$TMP/out-stale"
+expect_eq 'a stale bare-release build is ignored' 'found' \
+  "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-stale/summary.json")"
+
+# With no build under the host triple the probe says "unverified", not "found".
+rm -rf "$TMP/bare-target/$triple"
+rm -rf "$TMP/out-unprobed"
+run_fails 0 clean "$TMP/out-unprobed"
+expect_eq 'an unidentifiable build is not verified' 'absent' \
+  "$(jq -r '.targets[0].sanitizer_probe' "$TMP/out-unprobed/summary.json")"
+expect_eq 'an unidentifiable build is not claimed verified' 'false' \
+  "$(jq -r '.targets[0].sanitizer_verified' "$TMP/out-unprobed/summary.json")"
 CARGO_TARGET_DIR="$TMP/cargo-target"
+
+# --- an inherited ASAN_OPTIONS=detect_leaks=0 means no leak check happened
+rm -rf "$TMP/out-leaksoff"
+LEAKSOFF_RC=0
+ASAN_OPTIONS='detect_leaks=0' FAKE_FUZZ_MODE=clean FAKE_FUZZ_CALLS="$TMP/cargo-calls" \
+  CARGO="$TMP/bin/cargo" \
+  ./scripts/fuzz-campaign.sh --secs 10 --targets vt_parser --out-dir "$TMP/out-leaksoff" \
+  --corpus-dir "$TMP/corpus" --artifacts-dir "$TMP/artifacts" >"$TMP/last.log" 2>&1 ||
+  LEAKSOFF_RC=$?
+expect_eq 'a run with leak detection disabled cannot read clean' '4' "$LEAKSOFF_RC"
+expect_eq 'disabled leak detection is named' 'sanitizer-leaks-unchecked' \
+  "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-leaksoff/summary.json")"
+expect_eq 'the effective leak state is recorded' 'false' \
+  "$(jq -r '.sanitizer.leak_detection_effective' "$TMP/out-leaksoff/summary.json")"
+expect_eq 'the disabling option is recorded' 'ASAN_OPTIONS=detect_leaks=0' \
+  "$(jq -r '.sanitizer.leak_detection_disabled_by' "$TMP/out-leaksoff/summary.json")"
+grep -Fq 'disables the leak check' "$TMP/last.log" || fail 'the driver must warn about disabled leak detection'
+
+# --- an unreadable corpus unit fails the digest instead of shortening it
+unreadable="$TMP/corpus/vt_parser/unreadable.bin"
+printf 'cannot read me' >"$unreadable"
+chmod 000 "$unreadable"
+if [ -r "$unreadable" ]; then
+  echo 'skip: this user can read a 0000 file, so the digest cannot be made to fail' >&2
+else
+  rm -rf "$TMP/out-noread"
+  run_fails 4 clean "$TMP/out-noread"
+  expect_eq 'a failed digest cannot read clean' 'inconclusive' \
+    "$(jq -r '.targets[0].result' "$TMP/out-noread/summary.json")"
+  expect_eq 'a failed digest is recorded as null' 'null' \
+    "$(jq -r '.targets[0].corpus_digest' "$TMP/out-noread/summary.json")"
+  expect_eq 'a failed digest is named' 'corpus-digest' \
+    "$(jq -r '.targets[0].evidence_missing[0]' "$TMP/out-noread/summary.json")"
+fi
+chmod 644 "$unreadable"
+rm -f "$unreadable"
 
 # --- an unknown sanitizer is a usage error, not a recorded identity
 SANITIZER_BAD_RC=0
@@ -387,6 +444,8 @@ for entry in none:sanitizer-none:none memory:sanitizer-leaks-unchecked:none; do
     "$(jq -r '.sanitizer.leak_detection' "$TMP/out-san-$name/summary.json")"
   expect_eq "a $name build records -detect_leaks" '0' \
     "$(jq -r '.libfuzzer.detect_leaks' "$TMP/out-san-$name/summary.json")"
+  expect_eq "a $name build records effective leak detection" 'false' \
+    "$(jq -r '.sanitizer.leak_detection_effective' "$TMP/out-san-$name/summary.json")"
 done
 
 # --- a pre-seeded artifact is never `clean`, even when the run adds no new name.

@@ -20,6 +20,9 @@ TMP="$(mktemp -d "$scratch/fuzz-campaign-test.XXXXXX")"
 # cases below swap in trees they populate themselves.
 export CARGO_TARGET_DIR="$TMP/cargo-target"
 mkdir -p "$CARGO_TARGET_DIR"
+# Sanitizer options inherited from the developer's shell would change the
+# recorded leak-detection state; the cases that need them set them explicitly.
+unset ASAN_OPTIONS LSAN_OPTIONS
 DRIVER_PID=""
 CHILD_PID=""
 cleanup() {
@@ -386,10 +389,14 @@ case_index=0
 for entry in \
   'ASAN_OPTIONS|detect_leaks=0|disabled' \
   'ASAN_OPTIONS|abort_on_error=1:detect_leaks=0|disabled' \
+  'ASAN_OPTIONS|abort_on_error=1 detect_leaks=0|disabled' \
   'ASAN_OPTIONS|detect_leaks=0,detect_leaks=0|disabled' \
+  'ASAN_OPTIONS|detect_leaks="0"|disabled' \
   'LSAN_OPTIONS|detect_leaks=false|disabled' \
   'LSAN_OPTIONS|verbosity=1:detect_leaks=FALSE|disabled' \
-  'ASAN_OPTIONS|detect_leaks=0:detect_leaks=1|effective'; do
+  'LSAN_OPTIONS|detect_leaks=true:detect_leaks=0|disabled' \
+  'ASAN_OPTIONS|detect_leaks=0:detect_leaks=1|effective' \
+  'ASAN_OPTIONS|log_path=/tmp/x y/log:verbosity=1|effective'; do
   case_index=$((case_index + 1))
   variable="${entry%%|*}"
   rest="${entry#*|}"

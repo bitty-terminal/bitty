@@ -391,10 +391,11 @@ sanitizer_leak_detection() {
 # `__lsan_do_recoverable_leak_check` returns zero when `detect_leaks=0` is in
 # the sanitizer options (LLVM `sanitizer/lsan_interface.h`), so an inherited
 # `ASAN_OPTIONS=detect_leaks=0` would otherwise let a run report `lsan` and
-# `clean` while never looking. The runtime's own parser accepts `:` and `,` as
-# separators and `0`/`false` as a Boolean (compiler-rt
-# `sanitizer_flag_parser.cpp`), and the last occurrence wins, so this reads the
-# options the same way. Prints the deciding pair, or nothing.
+# `clean` while never looking. Options are split the way the runtime's own
+# parser splits them (`:`/`,`, and whitespace tolerated), values are unquoted,
+# `0`/`false` are the Boolean off-switch, and the last occurrence wins — the
+# fail-closed reading of every spelling that could disable the check. Prints the
+# deciding pair, or nothing.
 leak_detection_disabled_by() {
   local variable options value
   for variable in ASAN_OPTIONS LSAN_OPTIONS; do
@@ -403,10 +404,11 @@ leak_detection_disabled_by() {
     LSAN_OPTIONS) options="${LSAN_OPTIONS:-}" ;;
     esac
     [ -n "$options" ] || continue
-    value="$(printf '%s' "$options" | tr ',:' '\n' |
+    value="$(printf '%s' "$options" | tr ',: \t' '\n\n\n\n' |
       awk -F= '
         $1 == "detect_leaks" {
           setting = tolower($2)
+          gsub(/["'"'"'[:space:]]/, "", setting)
           found = (setting == "0" || setting == "false") ? "0" : "1"
         }
         END { print found }

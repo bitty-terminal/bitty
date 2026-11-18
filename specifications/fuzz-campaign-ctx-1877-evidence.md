@@ -150,8 +150,8 @@ locally, a per-target upload in CI):
 | `revision`, `revision_dirty`                              | Commit the campaign ran against; a dirty tree is recorded, not hidden                        |
 | `toolchain`, `cargo_fuzz`                                 | `rustc` and `cargo-fuzz` versions actually used                                              |
 | `sanitizer.name`, `.cargo_fuzz_flag`, `.instrumentation`  | The sanitizer build: the forwarded `--sanitizer=<name>`, its `-Zsanitizer=` instrumentation, and the leak-detection runtime it implies |
-| `sanitizer.leak_detection`, `.leak_detection_source`      | `lsan` for an ASan build (`asan-runtime`): the reason a `leak-*` is memory-safety evidence   |
-| `sanitizer.leak_detection_effective`, `.leak_detection_disabled_by` | Whether the leak check actually runs, and the inherited option that would disable it (`ASAN_OPTIONS=detect_leaks=0` / `LSAN_OPTIONS=...`) |
+| `sanitizer.leak_detection`, `.leak_detection_source`      | The leak-checking runtime the build is *intended* to use (`lsan` for ASan, `none` otherwise) — intent, not proof that a check ran |
+| `sanitizer.leak_detection_effective`, `.leak_detection_disabled_by` | Whether the leak check actually runs, and the inherited option that would disable it (`ASAN_OPTIONS=detect_leaks=0` / `LSAN_OPTIONS=...`); only `true` makes `leaks: 0` an evidence claim |
 | `libfuzzer`                                               | `-max_total_time`, `-timeout`, `-rss_limit_mb`, `-workers`, `-detect_leaks` for the run      |
 | `targets[].secs_fuzzed`                                   | libFuzzer's own `Done <runs> runs in <secs> second(s)` budget                                |
 | `targets[].secs_actual`                                   | Wall clock of the whole per-target step, including its build                                 |
@@ -202,10 +202,11 @@ test pins both directions — a `leak-*` with no coverage counters is still
 `finding`, exit 1). The sanitizer row covers every build that cannot evidence
 the leak clause: `none` links no runtime at all; `leak`/`memory`/`thread` are
 sanitizers libFuzzer does not drive LSan with; and an inherited
-`ASAN_OPTIONS=detect_leaks=0` (or `LSAN_OPTIONS=…`, read with the runtime's own
-`:`/`,` separators and `0`/`false` Booleans) makes the runtime skip the check
-even when `-detect_leaks=1` is passed, which `leak_detection_effective`
-records and `leak_detection_disabled_by` names. All of those runs are recorded
+`ASAN_OPTIONS=detect_leaks=0` (or `LSAN_OPTIONS=…`) makes the runtime skip the
+check even when `-detect_leaks=1` is passed — read with the runtime's `:`/`,`
+separators, tolerant of whitespace and quoting, with `0`/`false` as the Boolean
+— which `leak_detection_effective` records and `leak_detection_disabled_by`
+names. All of those runs are recorded
 `inconclusive` (`sanitizer-none`, `sanitizer-leaks-unchecked`) rather than
 folded into a clean count.
 
@@ -216,7 +217,7 @@ folded into a clean count.
 | A **long-running** campaign, not a one-off            | `requested_secs`, `targets[].secs_fuzzed`, `targets[].secs_actual`, `targets[].runs`, `started_utc`/`finished_utc`; the merged record's `expected_targets`/`received_targets`/`missing_targets` |
 | **Zero crashes**                                      | `targets[].crashes`, `artifacts[]`, `pre_existing_artifacts`, `targets[].result`                                                                                                                  |
 | **Zero hangs**                                        | `targets[].slow_units`, `targets[].timeouts`, and `libfuzzer.timeout_secs` — the bound that defines a hang                                                                                       |
-| **Zero memory-safety findings**                       | `targets[].leaks` together with `sanitizer.leak_detection`/`.instrumentation`: a leak count is memory-safety evidence only for a build that had the sanitizer                                        |
+| **Zero memory-safety findings**                       | `targets[].leaks` **with** `sanitizer.leak_detection_effective: true` and the `sanitizer.instrumentation` that produced it: `leaks: 0` is memory-safety evidence only when the build had the sanitizer *and* the runtime actually ran the leak check |
 | **Corpus retained in-repo, with a hash artifact**      | `targets[].corpus_seeds`, `.corpus_units`, `.corpus_digest`, `corpus/<target>.sha256`                                                                                                            |
 | **Provenance an auditor can re-run**                  | `revision`, `revision_dirty`, `toolchain`, `cargo_fuzz`, `sanitizer.*`, `libfuzzer`, `targets[].coverage_edges`/`.coverage_features`                                                              |
 

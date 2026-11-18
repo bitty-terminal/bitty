@@ -140,3 +140,8 @@ bitty-config = { version = "0.0.45", path = "../bitty-config", features = ["io-d
 # `LuaValue` type Core validates; test-only, never linked into the binary.
 bitty-lua = { path = "../bitty-lua" }
 bitty-test-support = { path = "../bitty-test-support" }
+# bitty#3224: the Windows console companion proxy's argv classifier. Test-only
+# here: `com_parity_tests` runs one corpus through this crate and through the
+# real parser so the duplicated classification grammar cannot drift silently.
+# The crate is pure `std` and links nothing else, on every platform.
+bitty-com = { version = "0.0.45", path = "../bitty-com" }

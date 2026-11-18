@@ -133,16 +133,19 @@ expect_absent "$SMOKE" '--version | grep' \
   "post-release smoke never pipes bitty --version straight into grep"
 
 # Two bash legs (install.sh + Homebrew) compare the exact table output; two
-# PowerShell legs (install.ps1 + Scoop) anchor the same regex.
+# PowerShell legs (install.ps1 + Scoop) anchor the same regex. Since bitty#3224
+# the install.ps1 leg also drives its `bitty.com` console companion, which
+# reuses that leg's `$pattern` (so the escape/anchor counts stay at two) while
+# adding one more fail-closed comparison and one more captured-output call.
 expect_count "$SMOKE" 'scripts/check-version-output.sh' 2 \
   "Bash post-release legs use the strict native version parser"
-expect_count "$SMOKE" '-cnotmatch' 2 \
+expect_count "$SMOKE" '-cnotmatch' 3 \
   "PowerShell post-release legs throw on a non-matching version"
 expect_count "$SMOKE" '[regex]::Escape($expected)' 2 \
   "PowerShell post-release legs escape the expected version"
 expect_count "$SMOKE" "'\\Abitty '" 2 \
   "PowerShell post-release legs anchor the complete version line"
-expect_count "$SMOKE" '2>&1 | Out-String' 2 \
+expect_count "$SMOKE" '2>&1 | Out-String' 3 \
   "PowerShell post-release legs capture native stdout and stderr"
 expect_contains "$SMOKE" 'Test-Path -LiteralPath $shim -PathType Leaf' \
   "Scoop smoke requires an existing shim file"

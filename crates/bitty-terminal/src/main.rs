@@ -1843,6 +1843,8 @@ pub(crate) fn spawn_startup_shells(
 }
 
 #[cfg(test)]
+mod com_parity_tests;
+#[cfg(test)]
 mod help_width;
 #[cfg(test)]
 mod session_storage_tests;

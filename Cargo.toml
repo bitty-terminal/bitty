@@ -2,6 +2,10 @@
 members = [
   "crates/bitty-terminal",
   "crates/bitty-config",
+  # bitty#3224: the Windows console companion proxy shipped as `bitty.com`
+  # next to `bitty.exe`. Pure `std` and dependency-free, so every non-Windows
+  # leg compiles it too (the CLI-grammar parity test lives in bitty-terminal).
+  "crates/bitty-com",
   "crates/bitty-daemon",
   "crates/bitty-lua",
   "crates/bitty-package",

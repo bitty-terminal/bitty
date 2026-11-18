@@ -17,28 +17,21 @@
     Windows x64:
       https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-x86_64.zip
     Windows arm64:
-      https://cdn.bitty.run/releases/<TAG>/bitty-aarch64-pc-windows-msvc.exe
+      https://cdn.bitty.run/releases/<TAG>/bitty-<VERSION>-windows-aarch64.zip
   Each row has a <artifact>.sha256 sidecar at the same URL with .sha256
   appended, verified before installing (fail closed on mismatch). There are
   no signatures in 0.1.0: verification is hash-only (signing deferred past
   0.2.0 per #1810).
 
-  Windows x64 fetches the portable ZIP (bitty.exe plus bitty.ico, LICENSE,
-  README.md, CHANGELOG.md at the archive root, assembled by
-  scripts/make-windows-zip.sh and verified by verify-windows-zip) and installs
-  bitty.exe plus the display icon from it. Windows arm64 fetches the bare exe
-  because the ZIP matrix builds x64 only; both arches install first-class,
-  only the container differs until the ZIP matrix extends (recorded
-  follow-up, not a parity gap). arm64 shortcuts fall back to the executable
-  icon until #2929 embeds the mascot in bitty.exe.
-
-  Scoop-portable parity: the Scoop manifest (generated at tag time into the
-  external scoop-bucket repo) ships bare bitty exes from the same R2-backed
-  CDN, while this script fetches the portable ZIP (x64) or bare exe (arm64)
-  from that CDN. GitHub Releases carries the same bytes and is the documented
-  fallback for both paths. Parity is payload parity — the same bitty.exe runs
-  in both paths — not URL parity. Like Scoop, this script installs user-local
-  with no admin rights and no Rust toolchain.
+  Both arches fetch the portable ZIP (bitty.exe, bitty.com, bitty.ico,
+  LICENSE, README.md, CHANGELOG.md at the archive root, assembled by
+  scripts/make-windows-zip.sh and verified by verify-windows-zip) and install
+  bitty.exe plus its console companion bitty.com and the display icon from it.
+  bitty.com (bitty#3224) is the console proxy that makes a shell invocation
+  block on CLI subcommands: `bitty.exe` is a GUI-subsystem binary, and Windows
+  resolves a bare `bitty` to the `.COM` file first. It is required, not
+  optional, so a ZIP without it fails the install closed instead of silently
+  leaving `bitty init` inert.
 
   Windows discoverability: after the smoke test the script creates a per-user
   Start Menu shortcut (Bitty.lnk), appends the install directory to the user
@@ -782,11 +775,14 @@ function Get-BittyTarget {
 
 function Get-BittyArtifact {
   param([string]$ShortTarget, [string]$VersionBare)
+  # Both arches ship the portable ZIP (bitty#3224): the archive is the only
+  # container that can carry bitty.exe and its bitty.com console companion
+  # together, and the pair is what makes a shell launch block on CLI commands.
   if ($ShortTarget -eq 'x64') {
     return "bitty-$VersionBare-windows-x86_64.zip"
   }
   if ($ShortTarget -eq 'arm64') {
-    return 'bitty-aarch64-pc-windows-msvc.exe'
+    return "bitty-$VersionBare-windows-aarch64.zip"
   }
   throw "no bootstrap artifact for target: $ShortTarget"
 }
@@ -872,14 +868,9 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 # valid from any shell.
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
-$kind = 'exe'
-if ($shortTarget -eq 'x64') {
-  $kind = 'zip'
-}
-
 if ($DryRun) {
   Write-BittyLog "dry-run: version pointer: $CdnBase/install/latest.txt"
-  Write-BittyLog "dry-run: TAG=$tag VERSION=$versionBare TARGET=$shortTarget KIND=$kind"
+  Write-BittyLog "dry-run: TAG=$tag VERSION=$versionBare TARGET=$shortTarget KIND=zip"
   Write-BittyLog "dry-run: artifact URL: $url"
   Write-BittyLog "dry-run: sidecar URL: $shaUrl"
   Write-BittyLog "dry-run: install dir: $InstallDir"
@@ -904,7 +895,7 @@ if ($DryRun) {
     Write-BittyLog "dry-run: would write the uninstaller: $(Join-Path $InstallDir 'uninstall.ps1')"
     Write-BittyLog "dry-run: would register the app-list entry: $(Get-BittyUninstallKeyPath) (Bitty $versionBare)"
   }
-  Write-BittyLog 'dry-run: would download, verify SHA256, and install bitty.exe (no changes made)'
+  Write-BittyLog 'dry-run: would download, verify SHA256, and install bitty.exe with bitty.com (no changes made)'
   return
 }
 
@@ -941,27 +932,33 @@ try {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
   }
   $destExe = Join-Path $InstallDir 'bitty.exe'
+  $destCom = Join-Path $InstallDir 'bitty.com'
   $destIcon = Join-Path $InstallDir 'bitty.ico'
-  if ($kind -eq 'zip') {
-    $extractDir = Join-Path $stage 'unpacked'
-    New-Item -ItemType Directory -Path $extractDir | Out-Null
-    Expand-Archive -Path $artifactPath -DestinationPath $extractDir -Force
-    $rootExe = Join-Path $extractDir 'bitty.exe'
-    if (-not (Test-Path $rootExe -PathType Leaf)) {
-      throw "portable ZIP missing bitty.exe at the archive root"
-    }
-    Copy-Item -Path $rootExe -Destination $destExe -Force
-    # The portable ZIP carries the display icon (bitty.ico) at the archive
-    # root; keep it next to the exe so the shortcut and the app-list entry can
-    # point at it. Older archives without one simply keep the exe icon.
-    $rootIcon = Join-Path $extractDir 'bitty.ico'
-    if (Test-Path -LiteralPath $rootIcon -PathType Leaf) {
-      Copy-Item -Path $rootIcon -Destination $destIcon -Force
-    }
-  } else {
-    Copy-Item -Path $artifactPath -Destination $destExe -Force
+  $extractDir = Join-Path $stage 'unpacked'
+  New-Item -ItemType Directory -Path $extractDir | Out-Null
+  Expand-Archive -Path $artifactPath -DestinationPath $extractDir -Force
+  $rootExe = Join-Path $extractDir 'bitty.exe'
+  if (-not (Test-Path $rootExe -PathType Leaf)) {
+    throw "portable ZIP missing bitty.exe at the archive root"
   }
-  Write-BittyLog "installed bitty to $destExe"
+  Copy-Item -Path $rootExe -Destination $destExe -Force
+  # bitty#3224: the console companion proxy is part of the payload contract, not
+  # an optional extra. Without it a shell invocation of `bitty` resolves to the
+  # GUI-subsystem bitty.exe, which never blocks, so `bitty init` looks inert.
+  # Fail closed on an archive that does not carry it.
+  $rootCom = Join-Path $extractDir 'bitty.com'
+  if (-not (Test-Path -LiteralPath $rootCom -PathType Leaf)) {
+    throw 'portable ZIP missing bitty.com at the archive root (the console companion proxy)'
+  }
+  Copy-Item -Path $rootCom -Destination $destCom -Force
+  # The portable ZIP carries the display icon (bitty.ico) at the archive
+  # root; keep it next to the exe so the shortcut and the app-list entry can
+  # point at it. Older archives without one simply keep the exe icon.
+  $rootIcon = Join-Path $extractDir 'bitty.ico'
+  if (Test-Path -LiteralPath $rootIcon -PathType Leaf) {
+    Copy-Item -Path $rootIcon -Destination $destIcon -Force
+  }
+  Write-BittyLog "installed bitty to $destExe with its console companion $destCom"
   # One icon source for the shortcut and the app-list DisplayIcon: the shipped
   # .ico when present, the executable otherwise (#2929 will make bitty.exe the
   # single source by embedding the mascot).
@@ -970,26 +967,21 @@ try {
     $iconSource = $destIcon
   }
   Write-BittyLog "icon source: $iconSource"
-  # #2929: bitty.exe links as a Windows GUI-subsystem binary, and PowerShell
-  # runs a GUI-subsystem child asynchronously: a bare `& $destExe --version`
-  # returns before the process exits, never sets $LASTEXITCODE (reading it
-  # under StrictMode throws), and can hand back an empty version line. Run the
-  # smoke as an explicit process so the exit code and the captured output are
-  # the real ones.
-  $smokeOut = Join-Path $stage 'smoke.stdout'
-  $smokeErr = Join-Path $stage 'smoke.stderr'
-  $smoke = Start-Process -FilePath $destExe -ArgumentList '--version' -Wait -PassThru `
-    -NoNewWindow -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
-  $versionOutput = [string](Get-Content -LiteralPath $smokeOut -Raw -ErrorAction SilentlyContinue)
+  # Smoke through the console companion: `& $destCom --version` is a plain
+  # blocking console child (bitty.com inherits this process's streams, waits for
+  # bitty.exe, and returns its exit code), so $LASTEXITCODE and the captured
+  # output are the real ones. That is also the contract this install exists to
+  # guarantee: before bitty.com, a GUI-subsystem child ran asynchronously and
+  # could hand back an empty version line (#2929).
+  $versionOutput = [string](& $destCom --version 2>&1 | Out-String)
   $versionOutput = $versionOutput.Trim()
-  if ($smoke.ExitCode -ne 0) {
-    $smokeDiagnostics = [string](Get-Content -LiteralPath $smokeErr -Raw -ErrorAction SilentlyContinue)
-    throw "install smoke failed: $destExe --version exited $($smoke.ExitCode): $($smokeDiagnostics.Trim())"
+  if ($LASTEXITCODE -ne 0) {
+    throw "install smoke failed: $destCom --version exited ${LASTEXITCODE}: $versionOutput"
   }
   if ($versionOutput -notmatch 'bitty \S+') {
-    throw "install smoke failed: $destExe --version printed no version line: '$versionOutput'"
+    throw "install smoke failed: $destCom --version printed no version line: '$versionOutput'"
   }
-  Write-BittyLog "smoke OK: $versionOutput"
+  Write-BittyLog "smoke OK (via bitty.com): $versionOutput"
   $markerPrefix = Split-Path -Path $InstallDir -Parent
   Write-BittyInstallMarker -Channel 'script' -Prefix $markerPrefix -BinDir $InstallDir `
     -VersionBare $versionBare -BinaryPath $destExe

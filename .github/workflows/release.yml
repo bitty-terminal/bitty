@@ -297,7 +297,7 @@ jobs:
           PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu: /
-        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon -p bitty-com --target ${{ matrix.target }}
 
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
@@ -307,7 +307,7 @@ jobs:
           # install has no VCRUNTIME140.dll and refuses to start the process
           # (bitty#3007). Static CRT keeps the ZIP and the setup self-contained.
           RUSTFLAGS: ${{ contains(matrix.target, 'windows') && format('{0} -C target-feature=+crt-static', steps.release-flags.outputs.flags) || steps.release-flags.outputs.flags }}
-        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon -p bitty-com --target ${{ matrix.target }}
 
       # CTX-2402: the fail-closed builder-path gate. Stripping cannot remove
       # panic-location paths, so this proves the remap actually applied on
@@ -324,6 +324,11 @@ jobs:
           bash scripts/check-release-paths.sh --binary "$bin"
           if [[ "$TARGET" == *linux* ]]; then
             bash scripts/check-release-paths.sh --binary "target/${TARGET}/release/bittyd"
+          fi
+          # bitty#3224: bitty.com ships with the terminal on Windows, so it goes
+          # through the same builder-path gate as the other shipped binaries.
+          if [[ "$TARGET" == *windows* ]]; then
+            bash scripts/check-release-paths.sh --binary "target/${TARGET}/release/bitty-com.exe"
           fi
 
       # CTX-0502: host-cross is verified (#819), so a wrong-architecture
@@ -374,6 +379,21 @@ jobs:
             sha256sum "dist/bitty-${TARGET}${EXT}" | tee "dist/bitty-${TARGET}${EXT}.sha256"
           else
             shasum -a 256 "dist/bitty-${TARGET}${EXT}" | tee "dist/bitty-${TARGET}${EXT}.sha256"
+          fi
+          # bitty#3224: the Windows console companion proxy travels with the
+          # terminal. It is staged outside `dist/` on purpose: it only works next
+          # to `bitty.exe`, so it must not become a standalone published release
+          # asset. The ZIP job and the installer consume it and rename it to
+          # `bitty.com`.
+          if [[ "$TARGET" == *windows* ]]; then
+            COM="target/${TARGET}/release/bitty-com.exe"
+            if [[ ! -f "$COM" ]]; then
+              echo "::error::Console companion $COM not found"
+              ls -lh "target/${TARGET}/release/" || true
+              exit 1
+            fi
+            mkdir -p com
+            cp "$COM" "com/bitty-com-${TARGET}.exe"
           fi
           # The session host ships on Linux cells only: elsewhere the
           # containment plan is `refused`, so a daemon there could not create a
@@ -457,6 +477,18 @@ jobs:
         with:
           name: bitty-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      # bitty#3224: the console companion is an intermediate for the Windows
+      # packagers, not a published payload (it exits 1 unless `bitty.exe` sits
+      # next to it), so it travels in its own artifact.
+      - name: Upload console companion (Windows)
+        if: contains(matrix.target, 'windows')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bitty-com-${{ matrix.target }}
+          path: com/bitty-com-${{ matrix.target }}.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -839,23 +871,43 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # Windows x86_64 portable ZIP (CTX-0455 / 034 item 10): unzip-and-run with no
-  # installer. The archive is assembled on Linux from the x86_64 MSVC artifact
-  # (fixed payload list, `bitty.exe` at the archive root) and a clean Windows
-  # runner then expands it and runs the executable. The bare `.exe` assets keep
-  # shipping for Scoop and direct downloads; ARM64 stays a bare `.exe` for now.
+  # Windows portable ZIPs (CTX-0455 / 034 item 10, bitty#3224): unzip-and-run
+  # with no installer, for both Windows architectures. Each archive is assembled
+  # on Linux from that architecture's MSVC artifacts (fixed payload list at the
+  # archive root: `bitty.exe`, `bitty.com`, `bitty.ico`, LICENSE, README.md,
+  # CHANGELOG.md) and expansion is verified on a clean Windows runner.
+  #
+  # `bitty.com` is the console companion proxy: `bitty.exe` links as a
+  # GUI-subsystem executable, so Windows resolves a shell invocation of `bitty`
+  # to the `.COM` file first and that proxy decides between a blocking console
+  # run and a detached window. The archive therefore always carries the pair.
+  # The bare `.exe` assets keep shipping for direct downloads.
   windows-zip:
-    name: Windows x86_64 Portable ZIP
+    name: Windows portable ZIP (${{ matrix.arch }})
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x86_64
+          - target: aarch64-pc-windows-msvc
+            arch: aarch64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Download x86_64 executable
+      - name: Download ${{ matrix.target }} artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: bitty-x86_64-pc-windows-msvc
+          name: bitty-${{ matrix.target }}
+          path: dist
+
+      - name: Download ${{ matrix.target }} console companion
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-com-${{ matrix.target }}
           path: dist
 
       - name: Resolve release version
@@ -874,73 +926,126 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "release version: $version"
 
-      - name: Assemble portable ZIP
+      - name: Assemble ${{ matrix.arch }} portable ZIP
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          ZIP="dist/bitty-${VERSION}-windows-x86_64.zip"
+          ZIP="dist/bitty-${VERSION}-windows-${ARCH}.zip"
           bash scripts/make-windows-zip.sh \
             --version "$VERSION" \
-            --exe dist/bitty-x86_64-pc-windows-msvc.exe \
+            --arch "$ARCH" \
+            --exe "dist/bitty-${TARGET}.exe" \
+            --com "dist/bitty-com-${TARGET}.exe" \
             --output "$ZIP"
           sha256sum "$ZIP" | tee "$ZIP.sha256"
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bitty-x86_64-pc-windows-msvc-zip
-          path: dist/bitty-*-windows-x86_64.zip*
+          name: bitty-windows-zip-${{ matrix.arch }}
+          path: dist/bitty-*-windows-${{ matrix.arch }}.zip*
           if-no-files-found: error
           retention-days: 14
 
-  # Clean-runner acceptance for the portable ZIP (034 item 10): a fresh Windows
-  # runner expands the published archive and runs `bitty.exe --version`.
+  # Clean-runner acceptance for the portable ZIPs (034 item 10, bitty#3224): a
+  # fresh Windows runner expands both published archives, asserts the fixed
+  # payload (including `bitty.com`), runs `bitty.exe --version` directly, and
+  # then drives the same version call *through the proxy* plus an invalid-flag
+  # usage error, which must come back synchronously with exit 2. The aarch64
+  # archive is inspected only: this runner is x64, so its binaries are not
+  # executed (the payload and name contract is what CI can prove here).
   verify-windows-zip:
     name: Verify Windows ZIP unzip-and-run
     needs: windows-zip
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - name: Download portable ZIP
+      - name: Download x86_64 portable ZIP
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: bitty-x86_64-pc-windows-msvc-zip
-          path: pkg
+          name: bitty-windows-zip-x86_64
+          path: pkg/x64
 
-      - name: Expand archive and run bitty.exe
+      - name: Download aarch64 portable ZIP
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-windows-zip-aarch64
+          path: pkg/arm64
+
+      - name: Expand archives, run bitty.exe, and run bitty.com
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $zip = Get-ChildItem -Path pkg -Filter '*.zip' | Select-Object -First 1
-          if (-not $zip) { throw 'portable ZIP artifact not found' }
-          Write-Host "archive: $($zip.Name)"
-          if ($zip.BaseName -notmatch '^bitty-(?<version>.+)-windows-x86_64$') {
-            throw "unexpected archive name: $($zip.BaseName)"
+          $expected = @('CHANGELOG.md', 'LICENSE', 'README.md', 'bitty.com', 'bitty.exe', 'bitty.ico')
+          $values = @{}
+          foreach ($arch in @('x86_64', 'aarch64')) {
+            $zip = Get-ChildItem -Path (Join-Path 'pkg' $arch) -Filter '*.zip' | Select-Object -First 1
+            if (-not $zip) { throw "portable ZIP artifact not found for $arch" }
+            Write-Host "archive: $($zip.Name)"
+            $namePattern = '^bitty-(?<version>.+)-windows-' + [regex]::Escape($arch) + '$'
+            if ($zip.BaseName -notmatch $namePattern) {
+              throw "unexpected archive name: $($zip.BaseName)"
+            }
+            $values["version_$arch"] = $Matches['version']
+            $dest = Join-Path $env:RUNNER_TEMP "bitty-portable-zip-$arch"
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+            Expand-Archive -Path $zip.FullName -DestinationPath $dest
+            $dirs = @(Get-ChildItem -Path $dest -Directory)
+            if ($dirs.Count -ne 0) {
+              throw "unexpected directories in $arch archive root: $($dirs.Name -join ', ')"
+            }
+            $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+            # Order-independent, case-sensitive set comparison (Sort-Object is
+            # case-insensitive by default, so Compare-Object would false-fail).
+            $missing = @($expected | Where-Object { $actual -cnotcontains $_ })
+            $extra = @($actual | Where-Object { $expected -cnotcontains $_ })
+            if ($missing.Count -ne 0 -or $extra.Count -ne 0) {
+              throw "$arch archive contents mismatch: missing [$($missing -join ', ')] unexpected [$($extra -join ', ')]"
+            }
+            Write-Host "$arch payload OK: $($actual -join ', ')"
           }
-          $version = $Matches['version']
-          $dest = Join-Path $env:RUNNER_TEMP 'bitty-portable-zip'
-          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
-          Expand-Archive -Path $zip.FullName -DestinationPath $dest
-          $dirs = @(Get-ChildItem -Path $dest -Directory)
-          if ($dirs.Count -ne 0) {
-            throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
+          if ($values['version_x86_64'] -ne $values['version_aarch64']) {
+            throw "archives disagree on the version: $($values['version_x86_64']) vs $($values['version_aarch64'])"
           }
-          $expected = @('bitty.exe', 'bitty.ico', 'LICENSE', 'README.md', 'CHANGELOG.md')
-          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
-          if (Compare-Object $expected $actual) {
-            throw "archive contents mismatch: $($actual -join ', ')"
-          }
-          $exe = Join-Path $dest 'bitty.exe'
-          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "bitty.exe is not a file: $exe" }
-          $output = (& $exe --version 2>&1 | Out-String)
-          $code = $LASTEXITCODE
-          if ($code -ne 0) { throw "bitty --version exited $code" }
+          $version = $values['version_x86_64']
           $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'
-          Write-Host "bitty --version => $($output.TrimEnd())"
-          if ($output -cnotmatch $pattern) {
-            throw "version mismatch: archive $version, binary '$output'"
+          $dest = Join-Path $env:RUNNER_TEMP 'bitty-portable-zip-x86_64'
+          $exe = Join-Path $dest 'bitty.exe'
+          $com = Join-Path $dest 'bitty.com'
+          if (-not (Test-Path -LiteralPath $com -PathType Leaf)) { throw "bitty.com is not a file: $com" }
+          # bitty.exe is a GUI-subsystem binary, so PowerShell starts it
+          # asynchronously: drive it as an explicit process to read the real
+          # exit code and the captured output.
+          $stdout = Join-Path $env:RUNNER_TEMP 'bitty-exe-version.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'bitty-exe-version.err.txt'
+          $proc = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru `
+            -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          if ($proc.ExitCode -ne 0) {
+            throw "bitty.exe --version exited $($proc.ExitCode): $(Get-Content -Raw $stderr)"
           }
+          $direct = ([string](Get-Content -LiteralPath $stdout -Raw)).Trim()
+          if ($direct -cnotmatch $pattern) { throw "bitty.exe --version mismatch: '$direct'" }
+          Write-Host "bitty.exe --version => $direct"
+          # bitty#3224: the proxy must block, inherit this console's streams, and
+          # return the wrapped exit code. Drive it exactly like a shell does.
+          $viaProxy = ([string](& $com --version 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --version exited $LASTEXITCODE" }
+          if ($viaProxy -cnotmatch $pattern) { throw "bitty.com --version mismatch: '$viaProxy'" }
+          Write-Host "bitty.com --version => $viaProxy"
+          # An invalid CLI flag is a console invocation too: the usage error must
+          # arrive here with exit 2 instead of vanishing into a detached window.
+          $usage = ([string](& $com --definitely-not-a-flag 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 2) { throw "bitty.com <invalid flag> exited $LASTEXITCODE (want 2)" }
+          if ($usage -notmatch 'unknown flag') { throw "bitty.com <invalid flag> printed no usage error: '$usage'" }
+          Write-Host 'bitty.com console contract OK (blocking version + usage-error exit codes)'
+          # `pwsh -command` reports the last NATIVE command's code, not 0, so the
+          # deliberate exit-2 invalid-flag probe above would fail this step even
+          # though every assertion passed (same leak as the CI leg, bitty#3224).
+          # Pin the step result explicitly instead of inheriting `$LASTEXITCODE`.
+          exit 0
 
   # Windows x64 setup installer (CTX-1064 / #1810): Inno Setup 6 wizard
   # compiled on windows-latest (choco install, no paid infra). Input is the
@@ -964,6 +1069,14 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bitty-x86_64-pc-windows-msvc
+          path: dist
+
+      # bitty#3224: the setup installs `bitty.exe` and its `bitty.com` console
+      # companion, so the staging directory needs both.
+      - name: Download x86_64 console companion
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-com-x86_64-pc-windows-msvc
           path: dist
 
       - name: Resolve release version
@@ -990,6 +1103,9 @@ jobs:
           set -euo pipefail
           mkdir -p dist/wininst-stage
           cp dist/bitty-x86_64-pc-windows-msvc.exe dist/wininst-stage/bitty.exe
+          # bitty#3224: the setup must install the console companion too, or a
+          # shell launch of `bitty` resolves to the GUI binary and never blocks.
+          cp dist/bitty-com-x86_64-pc-windows-msvc.exe dist/wininst-stage/bitty.com
           cp LICENSE README.md CHANGELOG.md dist/wininst-stage/
           ls -lh dist/wininst-stage/
           bash scripts/check-windows-installer.sh
@@ -1162,6 +1278,14 @@ jobs:
           foreach ($f in @('LICENSE', 'README.md', 'CHANGELOG.md')) {
             if (-not (Test-Path (Join-Path $installDir $f) -PathType Leaf)) { throw "payload missing after install: $f" }
           }
+          # bitty#3224: the setup installs the console companion next to the GUI
+          # binary, and the proxy must block and report the same version.
+          $com = Join-Path $installDir 'bitty.com'
+          if (-not (Test-Path $com -PathType Leaf)) { throw "bitty.com missing after install: $com" }
+          $viaPay = ([string](& $com --version 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "installed bitty.com --version exited $LASTEXITCODE" }
+          if ($viaPay -cnotmatch $pattern) { throw "installed bitty.com --version mismatch: '$viaPay'" }
+          Write-Host "installed bitty.com --version => $viaPay"
           $startMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Bitty\Bitty.lnk'
           if (-not (Test-Path $startMenu)) { throw "Start Menu shortcut missing: $startMenu" }
           Write-Host "Start Menu shortcut OK: $startMenu"
@@ -1789,8 +1913,11 @@ jobs:
           VERSION="${TAG#v}"
           # GitHub Releases fallback is documented in the rendered manifest.
           BASE_URL="https://cdn.bitty.run/releases/${TAG}"
-          X64_ASSET="bitty-x86_64-pc-windows-msvc.exe"
-          ARM64_ASSET="bitty-aarch64-pc-windows-msvc.exe"
+          # bitty#3224: Scoop installs the portable ZIP, whose archived
+          # `bitty.com` (console companion proxy) becomes the `bitty` shim and
+          # whose `bitty.exe` becomes the Start Menu shortcut.
+          X64_ASSET="bitty-${VERSION}-windows-x86_64.zip"
+          ARM64_ASSET="bitty-${VERSION}-windows-aarch64.zip"
           # Fetch the artifact plus its published sidecar and fail closed on a
           # mismatch; the sidecar digest is what the manifest embeds. The shared
           # verifier (CTX-1433, #2364) pins `${BASE_URL}/${asset}.sha256`.
@@ -2490,6 +2617,14 @@ jobs:
               if ($out -cnotmatch $pattern) {
                 throw "unexpected bitty version: '$out' (want $expected)"
               }
+              # bitty#3224: the live install must also expose the console
+              # companion, and a bare `bitty` must resolve to it (`.COM` first).
+              $com = Join-Path $env:LocalAppData 'bitty\bin\bitty.com'
+              if (-not (Test-Path -LiteralPath $com -PathType Leaf)) { throw "bitty.com is not a file: $com" }
+              $viaProxy = ([string](& $com --version 2>&1 | Out-String)).Trim()
+              if ($LASTEXITCODE -ne 0) { throw "installed bitty.com --version exited $LASTEXITCODE" }
+              if ($viaProxy -cnotmatch $pattern) { throw "bitty.com --version mismatch: '$viaProxy'" }
+              Write-Host "bitty.com --version => $viaProxy"
           - channel: "Windows Scoop (R2)"
             os: windows-latest
             run: |
@@ -2499,6 +2634,14 @@ jobs:
               irm get.scoop.sh | iex
               scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
               scoop install bitty
+              # bitty#3224: the manifest installs the portable ZIP and shims its
+              # `bitty.com` member, so the console companion must be extracted.
+              $appDir = (scoop prefix bitty | Select-Object -First 1)
+              if ([string]::IsNullOrWhiteSpace($appDir)) { throw 'scoop prefix bitty returned no directory' }
+              $appCom = Join-Path $appDir.Trim() 'bitty.com'
+              if (-not (Test-Path -LiteralPath $appCom -PathType Leaf)) {
+                throw "scoop install did not extract bitty.com: $appCom"
+              }
               $shim = (scoop which bitty | Select-Object -First 1)
               if ([string]::IsNullOrWhiteSpace($shim)) { throw 'scoop which bitty returned no path' }
               $shim = $shim.Trim()

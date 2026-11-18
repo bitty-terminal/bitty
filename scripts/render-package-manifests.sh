@@ -13,13 +13,22 @@
 #     --sha-intel HEX --sha-arm HEX
 #   scripts/render-package-manifests.sh scoop --version X.Y.Z \
 #     --base-url https://cdn.bitty.run/releases/vX.Y.Z \
-#     --x64-asset NAME --arm64-asset NAME \
+#     --x64-asset bitty-X.Y.Z-windows-x86_64.zip \
+#     --arm64-asset bitty-X.Y.Z-windows-aarch64.zip \
 #     --sha-x64 HEX --sha-arm64 HEX
 #
 # The rendered manifest goes to stdout. Inputs are validated before rendering:
 # the version is X.Y.Z (optionally with a prerelease/build suffix), the base URL
 # is exactly the R2/CDN release path, asset names are plain basenames, and every
 # digest is a lowercase 64-hex SHA-256. Exit 2 on usage or validation errors.
+#
+# bitty#3224: the Scoop manifest installs the portable ZIP, not the bare
+# executables, because the shim and the Start Menu shortcut point at the two
+# files *inside* the archive: `bitty.com` (the console companion proxy) is the
+# `bitty` shim and `bitty.exe` (the GUI binary) is the Bitty shortcut. Scoop only
+# resolves `bin`/`shortcuts` entries against extracted archive members, so a
+# bare-`.exe` payload cannot express that pair; the renderer therefore requires
+# `bitty-<version>-windows-<arch>.zip` asset names.
 set -euo pipefail
 
 MODE=""
@@ -128,6 +137,14 @@ for sha in "$SHA_A" "$SHA_B"; do
   [[ "$sha" =~ ^[0-9a-f]{64}$ ]] ||
     die "digest must be a lowercase 64-hex SHA-256, got: $sha"
 done
+# Scoop resolves `bin`/`shortcuts` inside the extracted archive, so its payload
+# must be the portable ZIP for each architecture (bitty#3224).
+if [[ "$MODE" == scoop ]]; then
+  [[ "$ASSET_A" =~ ^bitty-[0-9]+\.[0-9]+\.[0-9]+-windows-x86_64\.zip$ ]] ||
+    die "Scoop x64 asset must be bitty-<version>-windows-x86_64.zip, got: $ASSET_A"
+  [[ "$ASSET_B" =~ ^bitty-[0-9]+\.[0-9]+\.[0-9]+-windows-aarch64\.zip$ ]] ||
+    die "Scoop arm64 asset must be bitty-<version>-windows-aarch64.zip, got: $ASSET_B"
+fi
 
 render_homebrew() {
   cat <<EOF
@@ -162,6 +179,11 @@ EOF
 }
 
 render_scoop() {
+  # The archive carries `bitty.exe` (GUI binary) and `bitty.com` (the console
+  # companion proxy, bitty#3224) at its root. The `bitty` shim must be the
+  # `.com` file: it is the name `%PATHEXT%` resolves first from a shell, and it
+  # is what makes `bitty init` block and print. The shortcut stays the GUI
+  # binary so a Start Menu launch never allocates a console window.
   cat <<EOF
 {
     "version": "${VERSION}",
@@ -173,14 +195,14 @@ render_scoop() {
         "64bit": {
             "url": "${BASE_URL}/${ASSET_A}",
             "hash": "${SHA_A}",
-            "bin": [["${ASSET_A}", "bitty"]],
-            "shortcuts": [["${ASSET_A}", "Bitty"]]
+            "bin": [["bitty.com", "bitty"]],
+            "shortcuts": [["bitty.exe", "Bitty"]]
         },
         "arm64": {
             "url": "${BASE_URL}/${ASSET_B}",
             "hash": "${SHA_B}",
-            "bin": [["${ASSET_B}", "bitty"]],
-            "shortcuts": [["${ASSET_B}", "Bitty"]]
+            "bin": [["bitty.com", "bitty"]],
+            "shortcuts": [["bitty.exe", "Bitty"]]
         }
     },
     "checkver": {

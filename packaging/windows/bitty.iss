@@ -18,9 +18,12 @@
 ;     ISCC.exe /DMyAppVersion="<version>" /DMySourceDir="<stage>" bitty.iss
 ;     The release workflow resolves it from the tag, the workflow input, or
 ;     the Cargo workspace version, in that order.
-;   MySourceDir  — absolute directory staging bitty.exe plus LICENSE,
-;     README.md, and CHANGELOG.md (the portable-ZIP payload without
-;     bitty.ico, which only install.ps1 uses). Absolute
+;   MySourceDir  — absolute directory staging bitty.exe, bitty.com, plus
+;     LICENSE, README.md, and CHANGELOG.md (the portable-ZIP payload without
+;     bitty.ico, which only install.ps1 uses). bitty.com (bitty#3224) is the
+;     console companion proxy that makes a shell invocation block on CLI
+;     subcommands; the per-user install must carry it next to bitty.exe or
+;     `bitty init` looks inert from cmd/PowerShell. Absolute
 ;     because relative Source paths resolve against the script directory.
 ;
 ; Unsigned 0.1.0: no SignTool is configured below (only a commented stub for
@@ -86,6 +89,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#MySourceDir}\bitty.exe"; DestDir: "{app}"; Flags: ignoreversion
+; bitty#3224: the console companion proxy. `%PATHEXT%` resolves `bitty` to the
+; .COM file first, so a shell launch blocks on CLI subcommands instead of
+; starting the GUI-subsystem bitty.exe asynchronously.
+Source: "{#MySourceDir}\bitty.com"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion

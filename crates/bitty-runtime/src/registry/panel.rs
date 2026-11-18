@@ -1619,6 +1619,41 @@ impl WorkspaceDisposeReport {
     }
 }
 
+/// One live container's facts, in the shape the restart manifest needs
+/// (bitty#3243).
+///
+/// Read through [`PanelRegistry::live_panel_records`]. This is an
+/// *allocation-time* view: `id` and `generation` are the container's handle and
+/// its allocation epoch, and neither is an identity a restart may reuse — a
+/// restore mints both fresh from the registry. `workspace` is the runtime's own
+/// minted [`WorkspaceId`] attribution (a per-window value, not a persisted
+/// ordinal), and `owner` is the plugin currently bound, absent on a container
+/// that never took a controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LivePanelRecord {
+    /// The container's live handle.
+    pub id: PanelId,
+    /// The container's allocation epoch (OQ-084 B.1). Never a controller
+    /// generation, and never a durable identity.
+    pub generation: Generation,
+    /// Container kind.
+    pub panel_type: PanelType,
+    /// The workspace this container is attributed to, if any.
+    pub workspace: Option<WorkspaceId>,
+    /// The title `PanelRuntime::set_panel_description` stored, if any.
+    pub title: Option<String>,
+    /// The generation that keys this container's panel-scoped grant row (the
+    /// bound controller generation when one exists, otherwise the allocation
+    /// epoch — see `PanelRegistry::panel_granted_capabilities`).
+    ///
+    /// Distinct from [`Self::generation`] on purpose: the allocation epoch
+    /// fences allocation, and this key fences the grants. A container that is
+    /// bound answers grants for its controller generation, not its epoch.
+    pub grant_generation: Generation,
+    /// The plugin the container is bound to, if any.
+    pub owner: Option<bitty_plugin_host::PluginId>,
+}
+
 /// The facts a workspace sweep stamps on a panel's disposal record before the
 /// panel record leaves the registry (OQ-084 C.9).
 ///
@@ -2745,6 +2780,40 @@ impl PanelRegistry {
     #[must_use]
     pub fn attributed_workspace_count(&self) -> usize {
         self.workspace_panels.len()
+    }
+
+    /// Every live container's persisted-shape facts, in `PanelId` order.
+    ///
+    /// The save side of the restart manifest (bitty#3243) walks the registry
+    /// once per save, so this is the one enumeration the durable producer
+    /// needs: which containers exist, what kind each is, which workspace
+    /// attributes it, and which plugin (if any) drives it. `title` is the
+    /// title `PanelRuntime::set_panel_description` stored, `None` until it did.
+    ///
+    /// Identity here is allocation identity: `id` is the live handle and
+    /// `generation` its allocation epoch, neither of which crosses a restart
+    /// (a restore mints both fresh). Nothing is filtered: a terminal-typed
+    /// container is reported like any other, and the caller decides which
+    /// kinds belong in a durable record.
+    #[must_use]
+    pub fn live_panel_records(&self) -> Vec<LivePanelRecord> {
+        let mut records: Vec<LivePanelRecord> = self
+            .panels
+            .values()
+            .map(|record| LivePanelRecord {
+                id: record.id,
+                generation: record.generation,
+                panel_type: record.panel_type,
+                workspace: record.workspace,
+                title: record.title.clone(),
+                grant_generation: record.grant_key_generation(),
+                owner: record.owner().cloned(),
+            })
+            .collect();
+        // A `HashMap` walk has no order; a durable document must be stable so
+        // two saves of the same world are byte-identical.
+        records.sort_by_key(|record| record.id.0);
+        records
     }
 
     /// The facts a workspace sweep stamps on a panel's disposal record before
@@ -4366,6 +4435,31 @@ impl PanelRegistry {
         self.capabilities
             .get(&(panel_id, key))
             .is_some_and(|set| set.contains(capability))
+    }
+
+    /// The committed panel-scoped grant set of `panel_id` when `generation` is
+    /// the record's binding key (the controller generation once one is bound,
+    /// otherwise the allocation epoch).
+    ///
+    /// Read-only companion to [`Self::is_panel_capability_granted`], and the
+    /// only way to read a whole grant set at once. The restore side of the
+    /// panel restart manifest (bitty#3243) carries a driver's resolution onto
+    /// the container it restores, and that resolution is the set this registry
+    /// already committed for the driver here — never a set assembled from the
+    /// durable record or from the capability catalog, so a restore cannot grant
+    /// anything the runtime did not already grant the same owner for the same
+    /// container kind.
+    ///
+    /// `None` when the panel is not live or `generation` is not its binding key,
+    /// so a stale handle reads nothing instead of another generation's grants.
+    #[must_use]
+    pub fn panel_granted_capabilities(
+        &self,
+        panel_id: PanelId,
+        generation: Generation,
+    ) -> Option<&BTreeSet<String>> {
+        let key = self.resolved_grant_generation(panel_id, generation)?;
+        self.capabilities.get(&(panel_id, key))
     }
 
     /// Checks capability and returns error if not granted (deny-by-default).

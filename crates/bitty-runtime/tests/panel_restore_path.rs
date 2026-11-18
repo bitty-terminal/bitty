@@ -28,8 +28,10 @@
 //!   the replaced world's ids are released instead of surviving on a workspace
 //!   id no edge can reach;
 //! * the bounded remainder: a record whose ordinal names no restored slot is
-//!   dropped rather than re-homed, and a runtime with no panel host drops with
-//!   its own typed reason instead of panicking.
+//!   dropped rather than re-homed, and a runtime with no panel host defers the
+//!   step instead of dropping it (the deferred commit is read in
+//!   `tests/panel_restore_producers.rs`, and here from the restore that finds
+//!   no host).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -70,7 +72,18 @@ impl SessionFileBackend for CannedBackend {
         Ok(())
     }
 
-    fn load_session_bytes(&self, _path: &Path) -> Result<Vec<u8>, SessionError> {
+    fn load_session_bytes(&self, path: &Path) -> Result<Vec<u8>, SessionError> {
+        // The trait's contract is `NotFound` when no file exists. A path under
+        // the panel manifest suffix is a file this canned backend never wrote,
+        // so it answers the same way a real backend does for a missing sidecar
+        // (bitty#3243); answering `Ok(empty)` there would claim an empty
+        // document and clear the records a row configured.
+        if path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .ends_with(bitty_runtime::PANEL_MANIFEST_FILE_SUFFIX)
+        }) {
+            return Err(SessionError::NotFound);
+        }
         Ok(Vec::new())
     }
 
@@ -838,8 +851,16 @@ fn a_record_whose_workspace_is_gone_is_dropped_not_rehomed() {
     );
 }
 
+/// A restore that finds no panel host defers its panel step instead of
+/// bounding every record out; the host install that follows commits it
+/// (bitty#3243).
+///
+/// The shipped order restores the session before `bitty-terminal` has built the
+/// panel host, so a step that ran immediately would drop every record with
+/// `PanelRestoreDrop::NoPanelHost`. Nothing is decided — and nothing is lost —
+/// until a host exists.
 #[test]
-fn a_runtime_without_a_panel_host_drops_the_record_with_a_typed_reason() {
+fn a_runtime_without_a_panel_host_defers_the_record_until_one_is_installed() {
     let mut rt = Runtime::with_defaults().expect("defaults build");
     let backend = Arc::new(CannedBackend {
         snapshot: canned_snapshot(),
@@ -855,11 +876,37 @@ fn a_runtime_without_a_panel_host_drops_the_record_with_a_typed_reason() {
     rt.load_session_from_path(&session_path())
         .expect("the session still restores without a panel host");
 
+    assert!(
+        rt.panel_restore_pending(),
+        "no host yet: the step is deferred, not decided"
+    );
+    assert!(
+        rt.panel_restore_report().is_empty(),
+        "no record was dropped: {:#?}",
+        rt.panel_restore_report()
+    );
     assert_eq!(
-        rt.panel_restore_report().panels()[0].outcome,
-        PanelRestoreOutcome::Dropped {
-            reason: PanelRestoreDrop::NoPanelHost
-        },
-        "no registry means nothing to restore into, reported not panicked"
+        rt.panel_restore_records().len(),
+        1,
+        "the records stay configured for the host that arrives later"
+    );
+
+    // The composition root installs the host once it has one.
+    let host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds");
+    rt.install_scene_host(host);
+
+    let report = rt.panel_restore_report();
+    assert_eq!(report.len(), 1, "the deferred step ran: {report:?}");
+    let PanelRestoreOutcome::Placeholder { reason, .. } = report.panels()[0].outcome else {
+        panic!("a missing driver keeps the container: {report:?}");
+    };
+    assert_eq!(
+        reason,
+        PlaceholderReason::Unloaded,
+        "the deferred record restored as a placeholder instead of dropping"
+    );
+    assert!(
+        rt.panel_restore_records().is_empty(),
+        "the step consumed the records it applied"
     );
 }

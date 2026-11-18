@@ -150,6 +150,7 @@ pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod pane_cwd;
+pub mod panel_persist;
 pub mod panel_restore;
 pub mod panel_rules;
 pub mod panes;
@@ -1039,6 +1040,26 @@ pub struct Runtime {
     /// Configured by the composition root; empty by default, which makes the
     /// panel step a no-op and leaves every pre-existing restore path unchanged.
     panel_restore_inputs: Vec<panel_restore::PanelRestoreInput>,
+    /// Port that answers what drives a persisted record (bitty#3243).
+    ///
+    /// Installed at the panel-host install
+    /// ([`Runtime::install_shared_scene_host`](Runtime::install_shared_scene_host)),
+    /// which in the shipped order runs *after* the session restore — that is why
+    /// a restore defers its panel step instead of deciding it. The plugin host
+    /// owns which plugin is installed for a record, so Core asks rather than
+    /// deriving it. The shipped state of a runtime that installed a panel host
+    /// is `Some(HostProviderDriverSource)` over that host; an unset port (a
+    /// runtime with no host, or one whose composition root has not installed it
+    /// yet) answers every decoded record as a missing driver, and its container
+    /// comes back with the `unloaded` placeholder instead of the panel
+    /// disappearing.
+    panel_restore_driver_source: Option<std::rc::Rc<dyn panel_restore::PanelRestoreDriverSource>>,
+    /// Whether the last restore's panel records are waiting for a panel host.
+    ///
+    /// A restore that finds no host defers its panel step instead of dropping
+    /// every record; installing the host commits it. Read through
+    /// [`Runtime::panel_restore_pending`].
+    panel_restore_pending: bool,
     /// What the last successful restore did with those records (ids, keys,
     /// titles, and bounded outcomes only — never panel content).
     panel_restore_report: panel_restore::PanelRestoreReport,
@@ -2043,6 +2064,11 @@ impl std::fmt::Debug for Runtime {
             .field("has_session_backend", &self.session_backend.is_some())
             .field("panel_restore_policy", &self.panel_restore_policy.as_str())
             .field("panel_restore_inputs", &self.panel_restore_inputs.len())
+            .field(
+                "panel_restore_driver_source",
+                &self.panel_restore_driver_source.is_some(),
+            )
+            .field("panel_restore_pending", &self.panel_restore_pending)
             .field("panel_restore_report", &self.panel_restore_report.len())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("container", &self.container)
@@ -2587,6 +2613,8 @@ impl Runtime {
             session_backend: None,
             panel_restore_policy: bitty_ui::PersistencePolicy::Ephemeral,
             panel_restore_inputs: Vec::new(),
+            panel_restore_driver_source: None,
+            panel_restore_pending: false,
             panel_restore_report: panel_restore::PanelRestoreReport::default(),
             pending_ws_close: None,
             window_cells: container,
@@ -2925,6 +2953,8 @@ impl Runtime {
             session_backend: None,
             panel_restore_policy: bitty_ui::PersistencePolicy::Ephemeral,
             panel_restore_inputs: Vec::new(),
+            panel_restore_driver_source: None,
+            panel_restore_pending: false,
             panel_restore_report: panel_restore::PanelRestoreReport::default(),
             pending_ws_close: None,
             window_cells: container,

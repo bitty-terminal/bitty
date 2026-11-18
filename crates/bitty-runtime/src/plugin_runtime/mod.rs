@@ -351,7 +351,14 @@ pub struct PluginPackage {
 pub struct PluginRuntimeConfig {
     /// `bitty --safe`: never create a third-party VM.
     pub safe_mode: bool,
-    /// Root for plugin persistent state (`$XDG_DATA_HOME/bitty/plugins-state`).
+    /// Root for plugin persistent state (`$XDG_DATA_HOME/bitty/plugins-state`,
+    /// `%LOCALAPPDATA%\bitty\plugins-state`, or the `$HOME`/`%APPDATA%`
+    /// fallbacks).
+    ///
+    /// The caller resolves it, not this crate: startup resolves the tier
+    /// through the data-root resolver so an install upgraded across the
+    /// Windows precedence change (bitty#3226, bitty#3236) adopts the state its
+    /// plugins already wrote instead of starting them from an empty root.
     pub data_dir: Option<PathBuf>,
     /// Resolved plugin store root (`$XDG_DATA_HOME/bitty/plugins`).
     ///

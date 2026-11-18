@@ -150,6 +150,7 @@ pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod pane_cwd;
+pub mod panel_restore;
 pub mod panel_rules;
 pub mod panes;
 pub mod plaintext_url;
@@ -1028,6 +1029,19 @@ pub struct Runtime {
     /// `None` (tests, backend-absent runs) fails every durable path closed
     /// without touching the filesystem.
     session_backend: Option<std::sync::Arc<dyn session::SessionFileBackend>>,
+    /// Persistence policy the panel step of a session restore plans records
+    /// under (bitty#3239 row 14). Defaults to
+    /// [`bitty_ui::PersistencePolicy::Ephemeral`], the fail-safe outcome while
+    /// the persistence contract is open: restart re-mints identity.
+    panel_restore_policy: bitty_ui::PersistencePolicy,
+    /// Panel records the next session restore applies, in restore order.
+    ///
+    /// Configured by the composition root; empty by default, which makes the
+    /// panel step a no-op and leaves every pre-existing restore path unchanged.
+    panel_restore_inputs: Vec<panel_restore::PanelRestoreInput>,
+    /// What the last successful restore did with those records (ids, keys,
+    /// titles, and bounded outcomes only — never panel content).
+    panel_restore_report: panel_restore::PanelRestoreReport,
     /// Pending kill-confirm close arm, if any (never silent kill).
     pending_ws_close: Option<PendingWsClose>,
     /// CTX-0979: Core draws no workspace display (Hyprland-style). No
@@ -2027,6 +2041,9 @@ impl std::fmt::Debug for Runtime {
             .field("session_primary_cwd", &self.session_primary_cwd.is_some())
             .field("session_restored", &self.session_restored)
             .field("has_session_backend", &self.session_backend.is_some())
+            .field("panel_restore_policy", &self.panel_restore_policy.as_str())
+            .field("panel_restore_inputs", &self.panel_restore_inputs.len())
+            .field("panel_restore_report", &self.panel_restore_report.len())
             .field("has_pending_ws_close", &self.pending_ws_close.is_some())
             .field("container", &self.container)
             .field("window_cells", &self.window_cells)
@@ -2568,6 +2585,9 @@ impl Runtime {
             session_primary_cwd: None,
             session_restored: false,
             session_backend: None,
+            panel_restore_policy: bitty_ui::PersistencePolicy::Ephemeral,
+            panel_restore_inputs: Vec::new(),
+            panel_restore_report: panel_restore::PanelRestoreReport::default(),
             pending_ws_close: None,
             window_cells: container,
             last_presented_bands: Vec::new(),
@@ -2903,6 +2923,9 @@ impl Runtime {
             session_primary_cwd: None,
             session_restored: false,
             session_backend: None,
+            panel_restore_policy: bitty_ui::PersistencePolicy::Ephemeral,
+            panel_restore_inputs: Vec::new(),
+            panel_restore_report: panel_restore::PanelRestoreReport::default(),
             pending_ws_close: None,
             window_cells: container,
             last_presented_bands: Vec::new(),

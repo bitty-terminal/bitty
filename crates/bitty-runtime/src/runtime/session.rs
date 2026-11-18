@@ -301,6 +301,13 @@ pub enum SessionError {
     PinOnlyEmptyBase,
     /// Version mismatch (whole file rejected).
     UnsupportedVersion(u32),
+    /// The panel step of the restore refused before any mutation
+    /// (bitty#3239 row 14): the selected [`PersistencePolicy`] cannot key a
+    /// restore, or the record set broke a manifest bound. Layout, focus, pane
+    /// sessions, and panel containers are all unchanged.
+    ///
+    /// [`PersistencePolicy`]: bitty_ui::PersistencePolicy
+    PanelRestoreRefused(bitty_ui::ManifestError),
     /// Filesystem failure (message only, never file contents).
     Io(String),
 }
@@ -322,6 +329,7 @@ impl std::fmt::Display for SessionError {
                 write!(f, "pin-only empty tiled base has no session encoding yet")
             }
             Self::UnsupportedVersion(v) => write!(f, "unsupported session version ({v})"),
+            Self::PanelRestoreRefused(err) => write!(f, "panel restore refused ({err})"),
             Self::Io(msg) => write!(f, "session io error ({msg})"),
         }
     }
@@ -1231,11 +1239,34 @@ impl Runtime {
     /// Validation runs fully before any mutation: a rejected snapshot
     /// leaves the runtime untouched (fail-closed clean start). Counts only
     /// in the summary — never contents.
+    ///
+    /// The panel step (bitty#3239 row 14) rides the same transaction: the
+    /// configured panel records are planned through
+    /// [`bitty_ui::plan_restore`] before any mutation — a refused policy or
+    /// record set returns [`SessionError::PanelRestoreRefused`] with the runtime
+    /// untouched — and committed after the restored workspaces exist, each
+    /// record minting a fresh [`PanelId`](crate::registry::PanelId). A record
+    /// whose driver is missing, denied, or older keeps its container with the
+    /// Core-owned placeholder. The per-record outcomes are read back with
+    /// [`Runtime::panel_restore_report`].
     pub fn apply_session_snapshot(
         &mut self,
         snap: &SessionSnapshot,
     ) -> Result<SessionRestoreSummary, SessionError> {
         validate_snapshot(snap)?;
+        // bitty#3239 row 14: the panel step plans here, before any mutation.
+        // `plan_restore` runs the persistence policy over every configured
+        // record, so a refused policy (`StableIdentity`) or an over-cap record
+        // set refuses the whole restore while the layout, the focus, the pane
+        // sessions, and the panel registry are still untouched.
+        let planned_panels = self.plan_panel_restore(snap.workspaces.len());
+        let planned_panels = match planned_panels {
+            Ok(planned) => planned,
+            Err(error) => {
+                self.panel_restore_report = Default::default();
+                return Err(SessionError::PanelRestoreRefused(error));
+            }
+        };
         // CW-15 (F-2, WS-INV-26): a snapshot view colliding with a live
         // pane session fails closed before any mutation. Rehydration mints
         // fresh PTYs for restored leaves; merging snapshot history into a
@@ -1422,6 +1453,18 @@ impl Runtime {
                 }
             }
         }
+        // bitty#3239 row 14: the panel step commits inside the same restore
+        // transaction, once the restored workspaces carry their fresh
+        // `WorkspaceId`s and before the first painted frame. Every record mints
+        // a fresh `PanelId`; a record whose driver is absent keeps its container
+        // with the Core-owned placeholder. The step is bounded: it reports one
+        // outcome per record and never aborts a restore whose world is already
+        // installed.
+        self.panel_restore_report = self.commit_panel_restore(planned_panels);
+        // The records are consumed by the restore that applied them: a second
+        // restore without new records applies no panels instead of minting a
+        // duplicate container for a record that already has one.
+        self.panel_restore_inputs.clear();
         // CTX-0873: a restore can change the workspace count across one,
         // which reserves or releases the bar band.
         self.refresh_chrome_band();

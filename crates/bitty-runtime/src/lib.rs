@@ -287,6 +287,10 @@ pub use runtime::layout_focus::{
     HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
 };
 pub use runtime::pane_cwd::{PaneCwd, PaneCwdError};
+pub use runtime::panel_restore::{
+    PanelDriverAnswer, PanelRestoreDrop, PanelRestoreInput, PanelRestoreOutcome,
+    PanelRestoreReport, RestoredPanel,
+};
 pub use runtime::plaintext_url::{HoveredPlaintextUrl, PlaintextUrlSpan};
 pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{

@@ -467,6 +467,16 @@ pub fn decode_manifest(doc: &str) -> Result<RestartManifest, ManifestError> {
 /// order and carries the [`PanelRestoreKey`] and title across; the plan never
 /// mints ids itself (allocation stays with the runtime).
 ///
+/// # Callers
+///
+/// The production caller is the session-restore path in `bitty-runtime`: its
+/// panel restore step plans every configured record through this function
+/// before it mutates anything, then mints one fresh [`PanelId`] per returned
+/// record from the panel registry and either binds the record's driver or
+/// presents the bounded placeholder for a missing, denied, or older one
+/// (bitty#3239 row 14). A refusal therefore refuses the whole restore, which is
+/// why the call happens before the first write.
+///
 /// # Errors
 /// [`ManifestError::StableIdentityUnsupported`] for the refused policy.
 pub fn plan_restore(

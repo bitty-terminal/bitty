@@ -452,6 +452,8 @@ struct ConfigureRequest {
     /// True when this request came from a resize/DPI reflow, so the worker
     /// records the same `resize` telemetry as the synchronous path.
     record_resize: bool,
+    /// A same-extent incarnation repair, not a window resize.
+    unconfirmed_repair: bool,
 }
 
 #[derive(Default)]
@@ -491,6 +493,7 @@ struct WorkerShared {
     stuck: AtomicU64,
     coalesced: AtomicU64,
     alpha_supported: AtomicBool,
+    configurations: AtomicU64,
     /// Signalled once the worker loop (or its panic guard) has exited.
     exited: Mutex<bool>,
     exit_cv: Condvar,
@@ -514,6 +517,7 @@ impl WorkerShared {
             stuck: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
             alpha_supported: AtomicBool::new(true),
+            configurations: AtomicU64::new(0),
             exited: Mutex::new(false),
             exit_cv: Condvar::new(),
         }
@@ -717,9 +721,17 @@ fn worker_loop(shared: &Arc<WorkerShared>, backend: &mut Option<Box<dyn PresentB
 
         if let Some(request) = configure {
             let backend_ref = backend.as_mut().expect("worker backend present");
-            match backend_ref.configure(request.extent, request.opacity) {
+            if request.unconfirmed_repair {
+                telemetry::present_repair_attempt();
+            }
+            let configured = backend_ref.configure(request.extent, request.opacity);
+            if request.unconfirmed_repair {
+                telemetry::present_repair_result(configured.is_ok());
+            }
+            match configured {
                 Ok(alpha) => {
                     shared.alpha_supported.store(alpha, Ordering::Release);
+                    let _ = shared.configurations.fetch_add(1, Ordering::Release);
                     if request.record_resize {
                         telemetry::resize();
                     }
@@ -972,6 +984,13 @@ impl Presenter {
         self.last_opacity
     }
 
+    /// Successfully applied Configure requests in this worker's lifetime.
+    /// Queueing a request (which can be replaced or fail) does not count.
+    #[must_use]
+    pub fn configurations(&self) -> u64 {
+        self.shared.configurations.load(Ordering::Acquire)
+    }
+
     /// Whether the platform accepted premultiplied alpha at the last
     /// configure.
     #[must_use]
@@ -1074,22 +1093,35 @@ impl Presenter {
     /// Sends an opacity/configure request; the worker applies it before its
     /// next acquire. Only the newest request is kept.
     pub fn configure(&mut self, extent: PhysicalSize, opacity: f32) {
-        self.queue_configure(extent, opacity, false);
+        self.queue_configure(extent, opacity, false, false);
     }
 
     /// Sends a resize request; like [`Self::configure`] but records the
     /// `resize` telemetry the synchronous `Surface::resize` path emits.
     pub fn resize(&mut self, extent: PhysicalSize, opacity: f32) {
-        self.queue_configure(extent, opacity, true);
+        self.queue_configure(extent, opacity, true, false);
     }
 
-    fn queue_configure(&mut self, extent: PhysicalSize, opacity: f32, record_resize: bool) {
+    /// Queues a same-extent Configure after unconfirmed presents. The worker
+    /// records the actual backend attempt and outcome, not just the request.
+    pub fn repair_unconfirmed(&mut self) {
+        self.queue_configure(self.last_extent, self.last_opacity, false, true);
+    }
+
+    fn queue_configure(
+        &mut self,
+        extent: PhysicalSize,
+        opacity: f32,
+        record_resize: bool,
+        unconfirmed_repair: bool,
+    ) {
         self.last_extent = extent;
         self.last_opacity = opacity;
         self.shared.lock_slot().configure = Some(ConfigureRequest {
             extent,
             opacity,
             record_resize,
+            unconfirmed_repair,
         });
         self.shared.cv.notify_all();
     }

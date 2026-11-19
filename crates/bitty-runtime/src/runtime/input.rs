@@ -792,7 +792,10 @@ impl Runtime {
     /// only buffered headless (`false`); `terminal.submit` reports
     /// `Unavailable` (without charging the budget) for buffered frames. Bytes
     /// dropped because a presented content layer owns the input also report
-    /// `false` (bitty#3250 R2).
+    /// `false` (bitty#3250 R2), so a caller that reports an outcome to a user
+    /// reads [`Self::input_owner_content_frozen`] (or the
+    /// [`Self::content_input_dropped_bytes`] delta) to name the drop instead of
+    /// calling it buffered.
     pub fn push_input_bytes(&mut self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
             return false;

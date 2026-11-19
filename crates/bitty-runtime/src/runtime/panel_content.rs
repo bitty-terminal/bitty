@@ -35,7 +35,7 @@
 //! | Geometry frozen while hidden | `Runtime::sync_pane_geometry_to` (`runtime::panes`), `Runtime::sync_primary_geometry` (`runtime::layout_focus`), and `Runtime::reflow_content_to_chrome` (`runtime::resize`) skip the `LogicalRect -> PTY` step for a presented view and count the freeze; `Runtime::resize_primary_pty` skips the winsize ioctl itself, so a pixel-only change (font zoom, DPI) cannot deliver `SIGWINCH` either |
 //! | Exactly one restore resize, then a full repaint | [`Runtime::release_panel_content`] measures the current content rect (and the owner's own winsize, pixel axes included), issues the existing per-leaf resize path once when either no longer matches the frozen rect, and arms `pending_full_redraw` |
 //! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) swallow the key for a presented focused view and count it |
-//! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped |
+//! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
@@ -311,7 +311,14 @@ impl Runtime {
     /// [`Runtime::push_input_bytes`], so gating there keeps pasted or composed
     /// text out of a displaced shell while its panel presents a layer
     /// (bitty#3250 R2).
-    pub(super) fn input_owner_content_frozen(&self) -> bool {
+    ///
+    /// Public because `push_input_bytes` answers `false` for two different
+    /// outcomes — "only buffered headless" and "dropped by this gate" — and the
+    /// callers that report an outcome to a user (`terminal.submit`, the
+    /// `terminal send` control verb, the plugin submit drain) have to tell them
+    /// apart instead of calling a drop "buffered" (bitty#3250 review).
+    #[must_use]
+    pub fn input_owner_content_frozen(&self) -> bool {
         self.focus
             .focused()
             .or(self.primary_view)

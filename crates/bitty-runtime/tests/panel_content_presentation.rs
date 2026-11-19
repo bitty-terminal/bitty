@@ -26,10 +26,12 @@
 //! 4. **Input ownership.** While the layer is presented the focused panel's
 //!    keys are swallowed before the encoder on both keyboard entry points
 //!    (`handle_key_event` and `handle_key_event_ref`), and every non-key input
-//!    path (paste, IME commit, a programmatic write) is dropped at the single
-//!    `push_input_bytes` router: nothing is encoded, nothing is buffered, and
-//!    the transport buffer stays empty. Release returns input to the terminal
-//!    on the very next key, byte-identically.
+//!    path is dropped at one of the two byte routers — `push_input_bytes`
+//!    (paste, IME commit, a programmatic write, and the CTX-0243 snap that runs
+//!    ahead of it) and `route_input_bytes_to` (pointer reports, focus reports):
+//!    nothing is encoded, nothing is buffered, and the transport buffer stays
+//!    empty. Release returns input to the terminal on the very next key,
+//!    byte-identically.
 //! 5. **Typed refusals, fail-closed.** Duplicate present, present on a
 //!    non-terminal-backed panel, present with no panel mounted, release with no
 //!    layer, a stale or foreign layer handle, and a scene detach behind a live
@@ -44,14 +46,25 @@
 //!
 //! A row whose observable is a *live pane's* kernel winsize needs a real PTY:
 //! a pane-backed panel is a `PaneSession`, which owns a `Pty`, so no build
-//! without a PTY backend can construct one. Those rows (`present_swaps_…`,
-//! `geometry_stays_…`, `primary_owner_freezes_…`, `a_foreign_handle_…`) call
-//! `bitty_test_support::require_pty!()` and therefore do not run on such a
-//! build; that is the workspace-wide skip convention, not evidence. The
-//! PTY-independent halves of the same claims are proven here without it:
-//! `grid_geometry_freeze_holds_without_a_pty_backend` covers the grid half of
-//! the freeze, and the input rows need no PTY at all. The refusal row's second
-//! case deliberately keeps no live pane, so it cannot skip.
+//! without a PTY backend can construct one. Six rows read that observable and
+//! therefore call `bitty_test_support::require_pty!()` as their **first
+//! statement** — `present_swaps_…`, `geometry_stays_…`,
+//! `primary_owner_freezes_…`, `a_pixel_only_…`, `a_foreign_handle_…`, and
+//! `release_reconciles_…` — so the whole row skips on such a build (the
+//! workspace-wide skip convention, not evidence). The gate lives in the row
+//! and never in a helper: `require_pty!()` expands to a plain `return`, which
+//! inside a helper only leaves the helper and lets the rest of the row run
+//! against a pane that was never spawned. `BITTY_TEST_FORCE_NO_PTY=1 cargo test
+//! -p bitty-runtime --test panel_content_presentation` is the check: the six
+//! rows print `SKIP live-PTY test` (visible with `-- --nocapture`) and the run
+//! reports `17 passed; 0 failed` — libtest counts a skipped row as passed, so
+//! the SKIP notices are what tell the two apart.
+//!
+//! The PTY-independent halves of the same claims are proven here without the
+//! gate: `grid_geometry_freeze_holds_without_a_pty_backend` covers the grid
+//! half of the freeze, and the input rows — including the router-gate and
+//! submit-outcome rows — need no PTY at all. The refusal row's second case
+//! deliberately keeps no live pane, so it cannot skip.
 
 #![cfg(unix)]
 
@@ -59,13 +72,17 @@ use bitty_platform::{
     CursorPosition, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, PhysicalSize,
     PressState,
 };
+use bitty_rich::host::SubmitBudget;
 use bitty_rich::scene::{
     BlockAnchor, BlockId, RichBlock, Scene, SceneNode, ScrollBehavior, StyledSpan,
 };
 use bitty_runtime::registry::{
-    PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
+    LeaseHolder, PanelError, PanelLease, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
 };
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    LayoutNode, Runtime, SplitAxis, TerminalSubmitOutcome, TerminalSubmitUnavailable, UiRect, View,
+    ViewId,
+};
 use bitty_ui::panel::ViewContent;
 
 /// Primary leaf: paints the runtime-global primary grid (no pane session).
@@ -154,8 +171,11 @@ fn char_press(ch: char) -> KeyEvent {
     }
 }
 
+/// Spawns `PANE`'s shell. Callers must gate themselves with
+/// `bitty_test_support::require_pty!()` **first**: the macro expands to a plain
+/// `return`, so a gate inside this helper would leave the helper and let the
+/// caller continue against a pane that was never spawned (bitty#3250 review).
 fn spawn_pane(rt: &mut Runtime) {
-    bitty_test_support::require_pty!();
     rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], 40, 12)
         .expect("pane shell spawns");
 }
@@ -166,6 +186,7 @@ fn spawn_pane(rt: &mut Runtime) {
 
 #[test]
 fn present_swaps_content_kind_and_keeps_the_terminal_alive() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);
@@ -274,6 +295,7 @@ fn present_swaps_content_kind_and_keeps_the_terminal_alive() {
 
 #[test]
 fn geometry_stays_frozen_while_hidden_and_restores_with_one_resize() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);
@@ -639,6 +661,139 @@ fn paste_ime_and_programmatic_writes_cannot_reach_a_hidden_shell() {
 }
 
 #[test]
+fn a_dropped_write_never_snaps_a_scrolled_viewport_to_live() {
+    // bitty#3250 R2, second half: `push_input_bytes` carries a content gate of
+    // its own, and that hunk is load-bearing on an axis `route_input_bytes_to`
+    // cannot cover — the CTX-0243 snap-to-live runs *before* the router, so a
+    // paste or a programmatic write into a presented panel would yank a
+    // scrolled viewport to the bottom even though the byte assertion in
+    // `paste_ime_and_programmatic_writes_cannot_reach_a_hidden_shell` still
+    // passes on the router gate. This row pins that half.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    // Real scrollback, so paging up moves the viewport the snap would reset.
+    for i in 0..80 {
+        rt.handle_pty_bytes(format!("line-{i}\r\n").as_bytes());
+    }
+    rt.tick().expect("baseline frame");
+    assert!(rt.scroll_focused_page(true), "the focused leaf pages");
+    let scrolled = rt
+        .presented_scroll_offset(PRIMARY)
+        .expect("the primary owner is a live leaf");
+    assert!(
+        scrolled > 0,
+        "the scroll gesture must move the viewport, or the snap assert proves nothing"
+    );
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("scrolled"))
+        .expect("present is admitted on the primary owner");
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(scrolled),
+        "presenting a layer must not disturb the recorded viewport"
+    );
+
+    let dropped_before = rt.content_input_dropped_bytes();
+    assert!(
+        !rt.push_input_bytes(b"paste"),
+        "the router gate reports the bytes as not delivered"
+    );
+    assert_eq!(
+        rt.content_input_dropped_bytes(),
+        dropped_before + b"paste".len() as u64,
+        "the router gate counts what it dropped"
+    );
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(scrolled),
+        "a write the gate dropped must not snap the viewport to live (CTX-0243 snap)"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a dropped write is not buffered on the way out"
+    );
+
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores input ownership");
+    // Control: the same write is no longer dropped, so the CTX-0243 snap runs
+    // exactly as it did before the layer existed. (The bytes themselves buffer
+    // headless here: this fixture has no PTY writer, which is exactly why the
+    // drop has to be proven by its own counter and not by the return value.)
+    rt.push_input_bytes(b"live");
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(0),
+        "after release the same write reaches the snap-to-live path again"
+    );
+}
+
+#[test]
+fn a_content_gate_drop_reports_a_drop_not_a_headless_buffer() {
+    // bitty#3250 R2: `push_input_bytes` answers `false` both for a frame that
+    // only buffered headless and for one the content gate dropped. A caller
+    // that maps every `false` to "buffered" mislabels the drop, so
+    // `terminal.submit` reports the two apart and never charges the budget for
+    // a frame that was thrown away.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("composer"))
+        .expect("present is admitted on the primary owner");
+
+    let mut lease = PanelLease::idle();
+    let holder = LeaseHolder(7);
+    lease.acquire(holder, 100, 0).expect("lease acquires");
+    let mut budget = SubmitBudget::new("composer.test", 1024 * 1024);
+    let dropped_before = rt.content_input_dropped_bytes();
+    let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+
+    assert_eq!(
+        outcome,
+        TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::ContentLayerPresented),
+        "a content-gate drop is not a headless buffer"
+    );
+    assert_eq!(
+        budget.used(),
+        0,
+        "a dropped frame is never charged against the submit window"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a dropped frame is not buffered headless"
+    );
+    assert_eq!(
+        rt.content_input_dropped_bytes(),
+        dropped_before + b"\x1b[200~cargo test\x1b[201~\r".len() as u64,
+        "the dropped frame is counted byte for byte"
+    );
+
+    // Control: with no layer the same call still reports `Unavailable` on this
+    // headless fixture (no PTY writer), but now for the *other* reason — it
+    // buffered the frame instead of dropping it. That is the distinction the
+    // row is about: same `false` from the router, two different outcomes.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores input ownership");
+    let mut budget = SubmitBudget::new("composer.test", 1024 * 1024);
+    let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+    assert_eq!(
+        outcome,
+        TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly),
+        "with the layer gone the frame buffers headless, it is not dropped"
+    );
+    assert_eq!(
+        rt.pending_input(),
+        b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+        "the buffered frame is kept for a later delivery, which the dropped one was not"
+    );
+}
+
+#[test]
 fn grid_geometry_freeze_holds_without_a_pty_backend() {
     // The PTY-backed freeze rows skip on a build without a PTY. This row keeps
     // the same claim's grid half — the reflow gate, not the ioctl — observable
@@ -814,6 +969,7 @@ fn duplicate_present_release_without_layer_and_stale_handle_are_typed() {
 
 #[test]
 fn a_foreign_handle_cannot_release_another_panels_layer() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);

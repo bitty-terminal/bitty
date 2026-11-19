@@ -55,7 +55,10 @@
 
 #![cfg(unix)]
 
-use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, PhysicalSize, PressState};
+use bitty_platform::{
+    CursorPosition, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, PhysicalSize,
+    PressState,
+};
 use bitty_rich::scene::{
     BlockAnchor, BlockId, RichBlock, Scene, SceneNode, ScrollBehavior, StyledSpan,
 };
@@ -944,6 +947,102 @@ fn disposing_the_panel_drops_its_layer_record() {
     // The token is dead after the container is gone, and nothing restores.
     assert_eq!(rt.panel_content_layer(PRIMARY), None);
     assert!(rt.release_panel_content(PRIMARY, presented.token).is_err());
+}
+
+#[test]
+fn release_reconciles_a_pixel_only_winsize_after_a_dpi_change() {
+    bitty_test_support::require_pty!();
+    // A durable fixed-size leaf comes back to the same `cols`/`rows` after a
+    // font-zoom/DPI change, so a release that only compared the cell rect
+    // would leave the PTY advertising stale pixels — the exact ioctl the
+    // freeze deferred. The release has to reconcile the owner's own winsize.
+    let mut rt = runtime();
+    let mut view = View::new(PRIMARY, 80, 24);
+    view.set_fixed_size(Some(bitty_ui::Size::new(40, 12)));
+    install(&mut rt, LayoutNode::leaf(view));
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 30"])
+        .expect("primary shell spawns");
+    install_panel_at(&mut rt, PRIMARY);
+    // The spawn takes the container grid; one reflow puts the PTY on the fixed
+    // leaf's flag, which is the size the layer freezes.
+    rt.handle_resize(rt.surface_extent().expect("headless extent"))
+        .expect("window resize applies");
+    rt.tick().expect("baseline frame");
+    let extent = rt.surface_extent().expect("headless extent");
+    assert_eq!(
+        rt.pty_size(),
+        Some((40, 12)),
+        "the fixed-size leaf pins the primary grid, not the container"
+    );
+    let frozen = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("fixed"))
+        .expect("present is admitted");
+    rt.apply_dpi_scale(1.5, Some(extent));
+    assert_eq!(
+        rt.pty_pixel_size(),
+        Some(frozen),
+        "the freeze defers the pixel-only ioctl while the layer is up"
+    );
+    assert_eq!(rt.content_restore_resizes(), 0);
+
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the primary");
+    assert_eq!(
+        rt.pty_size(),
+        Some((40, 12)),
+        "the cell rect did not move, so this release owes no cell resize"
+    );
+    let restored = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    assert_ne!(
+        (restored.2, restored.3),
+        (frozen.2, frozen.3),
+        "release must reconcile the pixel axes the hidden gesture could not send"
+    );
+    assert_eq!(
+        rt.content_restore_resizes(),
+        1,
+        "the pixel-only reconciliation is counted as the one restore resize"
+    );
+}
+
+#[test]
+fn a_pointer_press_dropped_by_the_gate_does_not_arm_a_drag() {
+    // A press the content gate drops never reached the application, so it must
+    // not latch a drag either: a `?1002` app reports motion only while a
+    // button is held, which makes a phantom latch observable after the layer
+    // is gone.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    rt.handle_pty_bytes(b"\x1b[?1002h\x1b[?1006h");
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
+    rt.drain_pending_input();
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("pointer"))
+        .expect("present is admitted");
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Left, PressState::Pressed));
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a press report must not reach the hidden shell"
+    );
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the terminal content");
+    rt.drain_pending_input();
+
+    rt.handle_cursor_moved(CursorPosition {
+        x: 22.0 + 18.0,
+        y: 22.0,
+    });
+    assert_eq!(
+        rt.drain_pending_input(),
+        Vec::<u8>::new(),
+        "motion after the layer is gone must not report a drag the app never started"
+    );
 }
 
 #[test]

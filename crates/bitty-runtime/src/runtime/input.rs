@@ -1372,12 +1372,19 @@ impl Runtime {
                 // via `route_input_bytes` delivers to the focused pane without
                 // snapping a scrolled viewport to live when clicking or using
                 // external region-selection tools (`grim` + `slurp`).
+                // bitty#3250: read the content gate first, because a press the
+                // gate drops never reached the application.
+                let dropped = self.input_owner_content_frozen();
                 self.route_input_bytes(bytes.as_slice());
                 // bitty#2938: the app received this press, so it owns the
                 // pointer until the matching release; drag motion reports
                 // this button's identity. A press consumed by Core chrome
-                // above never sets the latch (the app saw no press).
-                if event.state == PressState::Pressed {
+                // above never sets the latch (the app saw no press), and a
+                // press dropped by the content gate must not either: the
+                // application never saw it, so a later release of the layer
+                // would otherwise inherit a drag from a press that was never
+                // delivered.
+                if event.state == PressState::Pressed && !dropped {
                     self.mouse_drag_button = Some(event.button);
                 }
             }

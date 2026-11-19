@@ -1100,11 +1100,19 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                     //
                     // What survives is the container and its leaf, not the
                     // placeholder: `PanelRegistry::rebind_panel` clears
-                    // `record.placeholder` in D.2 phase 2 step 2 and
-                    // `detach_panel_scene` above has already taken the render
-                    // scene, so the rebound container is bound, placeholder-free
-                    // and scene-less. Every other reason ends the generation
-                    // with no successor, so its leaf goes with it.
+                    // `record.placeholder` in D.2 phase 2 step 2 and the
+                    // detach above takes the render scene, so a rebound
+                    // container is bound and placeholder-free. It is
+                    // scene-less only when that detach succeeded: a container
+                    // that holds a presented content layer keeps its layer
+                    // scene and its record (bitty#3250 R5), and that record
+                    // dies with the container in `release_panel_mirrors`
+                    // rather than being released by the successor, which does
+                    // not hold the token. Ending a generation that holds a
+                    // presented layer needs its own lifecycle decision; it is
+                    // recorded in that PR's follow-ups, not decided here.
+                    // Every other reason ends the generation with no
+                    // successor, so its leaf goes with it.
                     if !matches!(edge.reason, PlaceholderReason::Reloaded) {
                         if let Some(queue) = self.layout_ops.as_ref() {
                             push_panel_layout_op(

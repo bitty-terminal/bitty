@@ -6972,6 +6972,26 @@ error("activation fails after mounting the terminal slot scene")
             .expect("the successor presents a fresh layer on the same container");
     }
 
+    /// `(program, argv)` of the keepalive child the generation-edge restore row
+    /// leaves under the panel leaf.
+    ///
+    /// The row is platform-neutral; only the child that keeps the leaf's
+    /// terminal alive is not. `cmd.exe` has neither `/bin/sh` nor `sleep`, so a
+    /// Unix literal here fails the spawn on Windows (`os error 2`) before the
+    /// restore is ever exercised. Each platform arm stays mutually exclusive so
+    /// no arm is dead code on the other platform.
+    fn generation_edge_keepalive() -> (&'static str, &'static [&'static str]) {
+        #[cfg(unix)]
+        let keepalive = ("/bin/sh", &["-c", "sleep 30"][..]);
+        #[cfg(windows)]
+        let keepalive = ("cmd.exe", &["/C", "ping -n 30 127.0.0.1 >nul"][..]);
+        // No PTY backend: `require_pty!` skips the row before it spawns, so the
+        // arm only has to keep the signature honest.
+        #[cfg(not(any(unix, windows)))]
+        let keepalive = ("/bin/sh", &["-c", "sleep 30"][..]);
+        keepalive
+    }
+
     /// One-block SCN-1 layer for the generation-edge restore row.
     fn generation_edge_layer() -> bitty_rich::scene::Scene {
         let mut scene = bitty_rich::scene::Scene::new();
@@ -7054,8 +7074,9 @@ error("activation fails after mounting the terminal slot scene")
 
         // A layer displaces live terminal content, so the panel's leaf gets a
         // shell of its own; present then freezes that terminal's geometry.
+        let (program, keepalive_args) = generation_edge_keepalive();
         app.runtime
-            .spawn_shell_for_view(view, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+            .spawn_shell_for_view(view, program, keepalive_args, 40, 12)
             .expect("the panel leaf owns a shell");
         app.drive_tick().expect("tick presents the pane");
         let presented = app

@@ -45,7 +45,7 @@ doctest = false
 
 [dependencies]
 bitty-config = { version = "0.0.45", path = "../bitty-config" }
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432" }
 # CTX-0939 (W-146): the composition root owns the extracted storage
 # mechanics. This is the ONLY crate in the workspace that may depend on
 # `bitty-storage`: Core library crates consume persistence exclusively
@@ -130,7 +130,7 @@ input-vm-test-support = ["bitty-platform/input-vm-test-support", "bitty-runtime/
 # feature; the shipped binary links none of the seam.
 bitty-runtime = { version = "0.0.45", path = "../bitty-runtime", features = ["hang-gauge-test-support"] }
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
+bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432", features = ["test-support"] }
 # `bitty#2869` acceptance: the safe-mode I/O-denied harness lives behind this
 # feature so a test can deny every configuration read and prove `--safe`
 # performs none. Test builds unify the feature; the shipped binary has none of

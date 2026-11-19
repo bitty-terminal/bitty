@@ -242,7 +242,7 @@ dependencies = [
 [[package]]
 name = "bitty-execution"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-execution?rev=36404ab#36404ab9302a3119b404d3bd1cca44fa7230c3bc"
+source = "git+https://github.com/bitty-terminal/bitty-execution?rev=fce5926#fce592637f4ee60b4f026849674164a741f89d77"
 dependencies = [
  "bitty-ipc",
  "bitty-plugin-host",
@@ -254,7 +254,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-auth",
@@ -266,12 +266,12 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-api"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 
 [[package]]
 name = "bitty-ipc-auth"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 dependencies = [
  "bitty-ipc-api",
  "bitty-ipc-winpipe",
@@ -283,7 +283,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-core"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 dependencies = [
  "bitty-ipc-api",
 ]
@@ -291,7 +291,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-devtools"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 dependencies = [
  "base16ct",
  "bitty-ipc-api",
@@ -307,7 +307,7 @@ dependencies = [
 [[package]]
 name = "bitty-ipc-winpipe"
 version = "0.0.1"
-source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=9493674#949367413b0640fbea4b99c6dda9acff48c623d1"
+source = "git+https://github.com/bitty-terminal/bitty-ipc?rev=18a1432#18a1432d6dbf276fd506b113b47ac4e29e1d0c71"
 dependencies = [
  "windows-sys 0.61.2",
 ]

@@ -97,7 +97,7 @@ bitty-sandbox = { version = "0.0.45", path = "../bitty-sandbox" }
 # `version` below is required for `cargo publish` (lockfile pins 0.0.1 for
 # each); the git rev stays the build source until each crate lands on
 # crates.io (see CTX-1172 publish order notes).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432" }
 # Issue #2249 (W-140 integration): tool/plugin spawns route through the
 # extracted execution supervisor's `JobRegistry`, so every mediated spawn has
 # a real job identity, lifecycle, cancellation, and bounded output instead of
@@ -108,14 +108,18 @@ bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-
 # `bitty-runtime::execution_jobs` and `bitty-runtime::execution_component`
 # are the only modules allowed to name the extension implementation (W-147
 # seam exception). Re-pin to the merged #2494 component commit before this
-# workspace merges it; until then the revision is the component PR tip.
-bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "36404ab" }
+# workspace merges it; until then the revision is the component PR tip. The
+# `fce5926` re-pin (bitty#3251) is the chain half: that execution release pins
+# `bitty-ipc` `18a1432` (exact devtools scope), so moving this workspace's own
+# ipc pin without it compiles two `bitty_ipc` instances and splits `EnvPolicy`
+# into two types (E0308 at the `with_env` call here).
+bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-execution", rev = "fce5926" }
 # CTX-1390 (bitty#2322): the pure provider-publication control-record contract
 # (header, bodies, canonical payload, named bounds). Optional and enabled only
 # by `publication-control`: the control driver reuses this codec instead of
 # defining a second wire format. Same git source and rev as the `bitty-ipc`
 # pin above, so Cargo resolves one `bitty-ipc-api` package.
-bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", optional = true }
+bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432", optional = true }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
 bitty-package = { version = "0.0.45", path = "../bitty-package" }
@@ -200,7 +204,7 @@ winapi-util = "0.1.11"
 # that live minute and not an epoch/zero formatting fallback.
 chrono.workspace = true
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
-bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
+bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }
 # CTX-1361: the production component-host slice drives the real
 # `bitty extension add` implementation through the composition-root library

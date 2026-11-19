@@ -12,8 +12,10 @@
 //! `generation`, `state`, `manifestHash`, `capabilities`); this module never
 //! reads a settings value, store body, terminal content, queue, budget, or VM
 //! handle, and registers no command, trace, or control method. Every call is
-//! still gated by the existing debug scope check, so the publication adds no
-//! authority.
+//! still gated by the exact `debug.inspect` scope the accepted table assigns
+//! these two methods, so the publication adds no authority: a session holding
+//! only `debug.trace` or only `debug.control` is refused (bitty#2921), because
+//! the debug scopes are independent grants.
 //!
 //! When no runtime is attached (`--safe` with no store, or a plugin-less run)
 //! the methods keep the pre-existing typed `PluginRuntimeUnavailable` verdict
@@ -163,14 +165,33 @@ pub(crate) fn register(dispatcher: &mut Dispatcher) -> Result<(), bitty_ipc::Ipc
     Ok(())
 }
 
-fn require_inspect_scope(context: &ServeContext, method: &str) -> Result<(), HandlerError> {
-    if context.has_any_scope(&[Scope::DebugInspect, Scope::DebugTrace, Scope::DebugControl]) {
+/// Gate one method on the **exact** debug scope the accepted table assigns it.
+///
+/// The three debug scopes are independent grants: `debug.trace` and
+/// `debug.control` imply neither `debug.inspect` nor each other
+/// (`bitty-terminal-docs` DevTools RFC, "Scopes": "no scope is implied by
+/// connection or by holding another scope"). An any-of check here admitted a
+/// `debug.trace`-only or `debug.control`-only caller through the
+/// `debug.inspect` gate, so a client that may not read lifecycle metadata
+/// could still enumerate plugin rows, and could tell an attached runtime from
+/// a detached one by whether the call returned rows or the typed
+/// `PluginRuntimeUnavailable` verdict (bitty#2921, P0-AC-025).
+///
+/// The refusal keeps the accepted fail-closed `scope`/`ScopeDenied` shape and
+/// names the scope this method actually requires, so the typed refusal a
+/// caller sees is unchanged apart from no longer being issued to a caller
+/// that does not hold the scope.
+fn require_scope(context: &ServeContext, scope: Scope, method: &str) -> Result<(), HandlerError> {
+    if context.has_scope(scope) {
         return Ok(());
     }
     Err(HandlerError::new(
         "scope",
         "ScopeDenied",
-        format!("permission denied: scope 'debug.inspect' denied for {method} (needs elevation)"),
+        format!(
+            "permission denied: scope '{}' denied for {method} (needs elevation)",
+            scope.as_str()
+        ),
     ))
 }
 
@@ -472,7 +493,11 @@ pub(crate) fn handle_list_plugins(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_inspect_scope(context, bitty_ipc::devtools::METHOD_LIST_PLUGINS)?;
+    require_scope(
+        context,
+        Scope::DebugInspect,
+        bitty_ipc::devtools::METHOD_LIST_PLUGINS,
+    )?;
     let params = request.params_raw.as_deref().unwrap_or("{}");
     let generation = list_generation(params)?;
     let rows = {
@@ -503,7 +528,11 @@ pub(crate) fn handle_get_plugin(
     context: &ServeContext,
     request: &DevtoolsRequest,
 ) -> Result<String, HandlerError> {
-    require_inspect_scope(context, bitty_ipc::devtools::METHOD_GET_PLUGIN)?;
+    require_scope(
+        context,
+        Scope::DebugInspect,
+        bitty_ipc::devtools::METHOD_GET_PLUGIN,
+    )?;
     let params = request.params_raw.as_deref().unwrap_or("{}");
     let plugin_id = top_string(params, "pluginId").ok_or_else(|| {
         HandlerError::new(
@@ -863,6 +892,190 @@ mod tests {
                 .code,
             "InvalidParams"
         );
+        publish(None);
+    }
+
+    /// Scope set for the gate-matrix tests: every listed scope, nothing else.
+    fn granted(scopes: &[Scope]) -> bitty_ipc::ScopeSet {
+        let mut set = bitty_ipc::ScopeSet::new();
+        for scope in scopes {
+            set.insert(*scope);
+        }
+        set
+    }
+
+    fn list_request() -> DevtoolsRequest {
+        bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0"}"#,
+        )
+        .expect("request")
+    }
+
+    fn get_plugin_request() -> DevtoolsRequest {
+        bitty_ipc::devtools::parse_request(
+            br#"{"id":2,"method":"bitty.debug/getPlugin","version":"1.0","params":{"pluginId":"xuepoo.one"}}"#,
+        )
+        .expect("request")
+    }
+
+    fn test_server() -> bitty_ipc::devtools::ServerInfo {
+        bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24)
+    }
+
+    /// bitty#2921 (P0-AC-025): `debug.inspect`, `debug.trace` and
+    /// `debug.control` are independent grants, so the plugin inspect gate must
+    /// admit exactly `debug.inspect`.
+    ///
+    /// Pre-fix, `require_inspect_scope` accepted any of the three: a
+    /// trace-only holder passed the inspect gate and reached the runtime,
+    /// whose detached-store answer is `PluginRuntimeUnavailable` rather than
+    /// `ScopeDenied`. That made the gate both an unauthorized metadata read
+    /// and a runtime-attachment oracle for a scope that does not own inspect.
+    #[test]
+    fn trace_only_holder_is_denied_on_the_plugin_inspect_methods_2921() {
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_rows(vec![row("xuepoo.one", 1, "active")]);
+        let trace_only = ServeContext::with_granted(&test_server(), granted(&[Scope::DebugTrace]));
+
+        let error = handle_list_plugins(&trace_only, &list_request())
+            .expect_err("debug.trace must not list plugins");
+        assert_eq!(error.category, "scope");
+        assert_eq!(error.code, "ScopeDenied");
+        assert!(
+            error.message.contains("'debug.inspect'"),
+            "the refusal must name the scope the method requires: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("'debug.trace'"),
+            "a trace holder must not be told trace is what it lacks: {}",
+            error.message
+        );
+
+        let error = handle_get_plugin(&trace_only, &get_plugin_request())
+            .expect_err("debug.trace must not read one plugin row");
+        assert_eq!(error.category, "scope");
+        assert_eq!(error.code, "ScopeDenied");
+
+        // The observed pre-fix symptom: with no runtime attached the
+        // trace-only holder got `PluginRuntimeUnavailable`, i.e. it could probe
+        // runtime attachment through a gate it does not own. The refusal must
+        // stay `ScopeDenied` whatever the publication state is.
+        publish(None);
+        let detached_list = handle_list_plugins(&trace_only, &list_request())
+            .expect_err("detached store, still denied");
+        assert_eq!(detached_list.code, "ScopeDenied");
+        let detached_get = handle_get_plugin(&trace_only, &get_plugin_request())
+            .expect_err("detached store, still denied");
+        assert_eq!(detached_get.code, "ScopeDenied");
+    }
+
+    /// bitty#2921: the control-only half of the same any-of defect.
+    #[test]
+    fn control_only_holder_is_denied_on_the_plugin_inspect_methods_2921() {
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_rows(vec![row("xuepoo.one", 1, "active")]);
+        let control_only =
+            ServeContext::with_granted(&test_server(), granted(&[Scope::DebugControl]));
+
+        let error = handle_list_plugins(&control_only, &list_request())
+            .expect_err("debug.control must not list plugins");
+        assert_eq!(error.category, "scope");
+        assert_eq!(error.code, "ScopeDenied");
+        assert!(
+            error.message.contains("'debug.inspect'"),
+            "the refusal must name the scope the method requires: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("'debug.control'"),
+            "a control holder must not be told control is what it lacks: {}",
+            error.message
+        );
+
+        let error = handle_get_plugin(&control_only, &get_plugin_request())
+            .expect_err("debug.control must not read one plugin row");
+        assert_eq!(error.category, "scope");
+        assert_eq!(error.code, "ScopeDenied");
+        publish(None);
+    }
+
+    /// bitty#2921: holding the required scope still serves both methods.
+    #[test]
+    fn inspect_only_holder_is_allowed_on_the_plugin_inspect_methods_2921() {
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_rows(vec![row("xuepoo.one", 1, "active")]);
+        let inspect_only =
+            ServeContext::with_granted(&test_server(), granted(&[Scope::DebugInspect]));
+
+        let list = handle_list_plugins(&inspect_only, &list_request()).expect("inspect may list");
+        assert!(list.contains("xuepoo.one"), "{list}");
+        let get = handle_get_plugin(&inspect_only, &get_plugin_request()).expect("inspect may get");
+        assert!(get.contains("\"id\":\"xuepoo.one\""), "{get}");
+        publish(None);
+    }
+
+    /// bitty#2921: a debug scope on top of `debug.inspect` neither adds nor
+    /// removes the requirement, so the accumulation stays allowed.
+    #[test]
+    fn inspect_plus_trace_or_control_holder_is_allowed_2921() {
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_rows(vec![row("xuepoo.one", 1, "active")]);
+        for scopes in [
+            [Scope::DebugInspect, Scope::DebugTrace].as_slice(),
+            [Scope::DebugInspect, Scope::DebugControl].as_slice(),
+            [Scope::DebugInspect, Scope::DebugTrace, Scope::DebugControl].as_slice(),
+        ] {
+            let holder = ServeContext::with_granted(&test_server(), granted(scopes));
+            let list =
+                handle_list_plugins(&holder, &list_request()).expect("inspect plus more may list");
+            assert!(list.contains("xuepoo.one"), "{scopes:?}: {list}");
+            let get = handle_get_plugin(&holder, &get_plugin_request())
+                .expect("inspect plus more may get");
+            assert!(get.contains("\"id\":\"xuepoo.one\""), "{scopes:?}: {get}");
+        }
+        publish(None);
+    }
+
+    /// bitty#2921: the refusal must hold on the registered dispatcher table,
+    /// not only on a direct handler call, so a served connection cannot reach
+    /// the runtime through the any-of gate.
+    #[cfg(unix)]
+    #[test]
+    fn trace_only_holder_is_refused_through_the_dispatcher_2921() {
+        use std::os::unix::net::UnixStream;
+
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_rows(vec![row("xuepoo.one", 1, "active")]);
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut trace_only =
+            ServeContext::with_granted(&test_server(), granted(&[Scope::DebugTrace]));
+        let proof = trace_only
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        trace_only.attest_local_peer(&proof.identity());
+
+        let mut dispatcher = Dispatcher::with_test_mode();
+        register(&mut dispatcher).expect("register");
+        assert!(
+            dispatcher.contains(bitty_ipc::devtools::METHOD_LIST_PLUGINS),
+            "the refusal must come from the gate, not from an unregistered method"
+        );
+        let error = dispatcher
+            .dispatch(&trace_only, &list_request())
+            .expect_err("trace-only must be refused on the wire path");
+        assert_eq!(error.category, "scope");
+        assert_eq!(error.code, "ScopeDenied");
         publish(None);
     }
 

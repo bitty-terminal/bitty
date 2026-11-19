@@ -150,6 +150,7 @@ pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod pane_cwd;
+pub mod panel_content;
 pub mod panel_declaration;
 pub mod panel_persist;
 pub mod panel_restore;
@@ -830,6 +831,27 @@ pub struct Runtime {
     last_scene_paint_refusal: Option<bitty_render::scene::ScenePaintError>,
     /// Cumulative accessibility refusals for scene text (CTX-1630).
     scene_a11y_refusals: u64,
+    /// Per-leaf geometry syncs skipped because the panel presented a GUI
+    /// content layer (bitty#2388 "geometry frozen while hidden").
+    ///
+    /// Monotonic and saturating. Counts the freeze gate firing, never a resize:
+    /// while a layer is presented the `LogicalRect -> PTY` step is not entered
+    /// at all, which is why the counter and the frozen `TIOCGWINSZ` are read
+    /// together as the absence proof.
+    content_geometry_freezes: u64,
+    /// Restore resizes issued by [`Runtime::release_panel_content`]
+    /// (bitty#2388 "exactly one resize on restore").
+    ///
+    /// At most one per release, and only when the leaf's current content rect
+    /// differs from the rect frozen at present time.
+    content_restore_resizes: u64,
+    /// Keys swallowed while the focused panel presented GUI content
+    /// (bitty#2388 "input ownership").
+    ///
+    /// A swallowed key is counted and dropped: it is never encoded and never
+    /// reaches the PTY. The owner-polled queue is a later slice, so no key is
+    /// retained anywhere.
+    content_input_swallowed: u64,
     /// Consecutive frames dropped because the overlay phase reset the glyph
     /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
     ///
@@ -2415,6 +2437,9 @@ impl Runtime {
             scene_paint_refusals: 0,
             last_scene_paint_refusal: None,
             scene_a11y_refusals: 0,
+            content_geometry_freezes: 0,
+            content_restore_resizes: 0,
+            content_input_swallowed: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,
@@ -2755,6 +2780,9 @@ impl Runtime {
             scene_paint_refusals: 0,
             last_scene_paint_refusal: None,
             scene_a11y_refusals: 0,
+            content_geometry_freezes: 0,
+            content_restore_resizes: 0,
+            content_input_swallowed: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,

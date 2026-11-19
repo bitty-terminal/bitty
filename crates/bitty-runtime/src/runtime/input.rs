@@ -579,6 +579,24 @@ impl Runtime {
         }
         // CTX-0159: retain a bounded input trace for screenshots-free probes.
         let pressed = Some(event.state == PressState::Pressed);
+        // bitty#2388: the focused panel's content kind decides input routing.
+        // While a GUI content layer is presented, no key is encoded and no byte
+        // reaches the PTY — the displaced shell must never receive typing it
+        // cannot show. The key is counted and dropped: the owner-polled queue
+        // (`bitty.ui.panel.poll`) is a later slice, so nothing is retained here.
+        // Every other state keeps the byte-identical encoder path below.
+        if self.focused_content_layer_presents() {
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+            }
+            self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            return None;
+        }
         if is_modifier {
             // Modifier-only keys produce no PTY input by default but still
             // update state. Under report-all-keys the kitty protocol reports

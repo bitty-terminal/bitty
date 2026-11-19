@@ -4455,6 +4455,13 @@ impl Runtime {
                     .focused_id
                     .map(|fid| fid == view_id)
                     .unwrap_or(true);
+                // bitty#2388: a presented GUI content layer replaces this
+                // leaf's terminal presentation. The displaced grid is not
+                // painted (no cells, no cursor, no image anchors); the layer
+                // composes into the same content rect from the panel's scene
+                // slot below. `false` on every leaf without a layer, so the
+                // grid path stays byte-identical.
+                let content_hidden = self.content_layer_presented(view_id);
 
                 // Each origin's damage comes from its own ring (CTX-0386).
                 // `last_presented_generation` is consumed per present: the
@@ -4509,7 +4516,7 @@ impl Runtime {
                 // (real resize or reflow) still forces a fresh render.
                 let live_atlas_epoch = self.renderer.atlas_epoch();
                 let live_color_atlas_epoch = self.renderer.color_atlas_epoch();
-                let reuse_delta = if full_frame || leaf_damaged {
+                let reuse_delta = if full_frame || content_hidden || leaf_damaged {
                     None
                 } else {
                     self.presented_leaf_frames.get(&view_id).and_then(|leaf| {
@@ -4850,14 +4857,19 @@ impl Runtime {
                 // decides: every other session-less leaf (spawn failures,
                 // recipe-less leaves) presents erased, so a session-less View
                 // never paints another View's grid.
-                let pane_snap: Option<std::borrow::Cow<'_, Snapshot>> =
+                let pane_snap: Option<std::borrow::Cow<'_, Snapshot>> = if content_hidden {
+                    // bitty#2388: the layer owns the content rect, so the
+                    // displaced grid contributes no cells at all.
+                    None
+                } else {
                     match self.pane_sessions.get(&view_id) {
                         Some(sess) => Some(std::borrow::Cow::Owned(sess.state.snapshot())),
                         None if Some(view_id) == self.primary_view => {
                             Some(std::borrow::Cow::Borrowed(snapshot))
                         }
                         None => None,
-                    };
+                    }
+                };
                 // Erased source for session-less leaves that do not own the
                 // primary; `viewport_snapshot` pads it to the allocation below.
                 let erased_snap: Option<Snapshot> = if pane_snap.is_none() {
@@ -4915,6 +4927,12 @@ impl Runtime {
                         cell.glyph = ' ';
                         cell.zerowidth = bitty_term_state::Zerowidth::new();
                     }
+                }
+                if content_hidden {
+                    // bitty#2388: the terminal cursor stays in Terminal Truth;
+                    // the presented layer owns the caret while it is up, so the
+                    // hidden leaf paints no cursor over it.
+                    view_snapshot.cursor.visible = false;
                 }
 
                 let owner_state = self
@@ -5213,7 +5231,12 @@ impl Runtime {
                 // combined frame drops glyphs under higher floats.
                 #[cfg(test)]
                 self.maybe_inject_test_empty_leaf(view_id, &mut fills, &mut glyphs);
-                if fills.is_empty() || (has_visible_text && glyphs.is_empty()) {
+                if content_hidden {
+                    // bitty#2388: an erased hidden leaf is neither retained nor
+                    // an empty render. The bitty#3032 retry budget exists for a
+                    // leaf that owes text, which a presented layer never does.
+                    self.presented_leaf_frames.remove(&view_id);
+                } else if fills.is_empty() || (has_visible_text && glyphs.is_empty()) {
                     // bitty#3032: an empty render must never become the
                     // retained list a later clean frame reuses. Drop the entry;
                     // only arm the cross-frame retry when `fills.is_empty()`

@@ -1074,6 +1074,16 @@ impl Runtime {
         // CTX-0294: decorated content frames (Core px decoration + CTX-0177
         // cell gaps) so pane grids/PTYs match the painted viewport.
         for frame in frames {
+            // bitty#2388: a presented GUI content layer freezes the displaced
+            // terminal's geometry. The leaf still reflows with the layout; the
+            // grid and the kernel winsize are simply not touched, so the hidden
+            // child keeps the size it had at transition time and receives no
+            // `SIGWINCH`. The freeze is counted, so a test can show the sync
+            // ran and was skipped (not that it never ran).
+            if self.content_layer_presented(frame.view) {
+                self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+                continue;
+            }
             let (cols, rows) = match self.fixed_size_for_view(frame.view) {
                 Some(size) => (size.width.max(1), size.height.max(1)),
                 None => (frame.cols.max(1), frame.rows.max(1)),

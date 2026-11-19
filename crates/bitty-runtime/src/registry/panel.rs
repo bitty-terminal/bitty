@@ -236,6 +236,39 @@ pub enum PanelError {
     ResourceExhausted {
         reason: String,
     },
+    /// A content-layer presentation named a panel that already presents one
+    /// (bitty#2388, `E_UI_PANEL_BUSY`). The presented layer, its displaced
+    /// terminal record, the attachment, and the input route are unchanged: a
+    /// second presentation is refused before any state moves, so a panel never
+    /// hosts two content layers.
+    ContentBusy {
+        panel_id: PanelId,
+    },
+    /// A content-layer verb named a target that cannot host one
+    /// (bitty#2388, `E_UI_PANEL_UNAVAILABLE`): no panel is mounted at the
+    /// view, or the panel's content is not terminal-backed, or no panel host
+    /// is installed. Nothing was presented and no record was written.
+    ContentUnavailable {
+        view_id: ViewId,
+        /// Stable cause name, bounded to a `'static` literal so a denial can
+        /// never echo caller payload.
+        reason: &'static str,
+    },
+    /// A release named a panel that presents no content layer (bitty#2388):
+    /// the layer was already released, or one was never presented. The panel,
+    /// its terminal content, and its input route are untouched.
+    ContentNotPresented {
+        panel_id: PanelId,
+    },
+    /// A release named a content-layer handle that is not the live layer of
+    /// this panel (bitty#2388, stale or foreign handle). The live layer is
+    /// left exactly as it was, so a stale token can never release another
+    /// panel's content or restore the wrong terminal.
+    ContentTokenMismatch {
+        panel_id: PanelId,
+        /// The refused token value; an opaque generation-owned ordinal.
+        token: u64,
+    },
 }
 
 impl std::fmt::Display for PanelError {
@@ -353,6 +386,19 @@ impl std::fmt::Display for PanelError {
                 "panel {panel_id} placeholder scene failed the scene bounds: {detail}"
             ),
             Self::ResourceExhausted { reason } => write!(f, "resource exhausted: {reason}"),
+            Self::ContentBusy { panel_id } => {
+                write!(f, "panel {panel_id} already presents a content layer")
+            }
+            Self::ContentUnavailable { view_id, reason } => {
+                write!(f, "view {view_id} cannot present panel content: {reason}")
+            }
+            Self::ContentNotPresented { panel_id } => {
+                write!(f, "panel {panel_id} presents no content layer")
+            }
+            Self::ContentTokenMismatch { panel_id, token } => write!(
+                f,
+                "panel {panel_id} content-layer handle {token} is stale or foreign"
+            ),
         }
     }
 }
@@ -1801,7 +1847,13 @@ impl PanelRegistry {
         Ok(())
     }
 
-    fn bump_error(&mut self, variant: &str) {
+    /// Advances the bounded per-variant error counter.
+    ///
+    /// `pub(crate)` because the [`PanelRuntime`](super::host::PanelRuntime)
+    /// facade attributes its own refusals through the same table (bitty#2388
+    /// content-layer refusals), keeping one counter surface for every panel
+    /// verb.
+    pub(crate) fn bump_error(&mut self, variant: &str) {
         *self.errors.entry(variant.to_owned()).or_insert(0) += 1;
     }
 

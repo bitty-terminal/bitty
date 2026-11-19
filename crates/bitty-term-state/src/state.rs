@@ -3924,6 +3924,11 @@ impl State {
     /// [`State::scroll_region_top`]): this writes only the live pair, so a
     /// region set inside the alternate screen never reaches the primary
     /// screen and vice versa.
+    ///
+    /// The top margin must sit strictly above the bottom margin. xterm and
+    /// ghostty reject any other pair, `top == bottom` included (bitty#3261):
+    /// a one-row region is not a state either of them will ever enter, and it
+    /// turns a leaked margin into a pane collapsed to a single scrolling row.
     fn set_scroll_region(&mut self, top: Row, bottom: Row) {
         let last = self.height as u16 - 1;
         let t = top.0.saturating_sub(1);
@@ -3933,8 +3938,10 @@ impl State {
             bottom.0.saturating_sub(1)
         }
         .min(last);
-        // Invalid requests are ignored wholesale (xterm-compatible).
-        if t > b {
+        // Invalid requests are ignored wholesale, cursor home included
+        // (xterm/ghostty-compatible): an inverted or degenerate pair leaves
+        // the margins untouched.
+        if t >= b {
             return;
         }
         self.scroll_region_top = t;

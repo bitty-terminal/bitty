@@ -62,6 +62,7 @@
 //! | PGO-15, refusal half (bitty#2476 residual 9) | here — `pgo_15_a_verb_from_a_displaced_generation_is_refused_and_moves_nothing`; the read half is **not** homed, see the blocking note below |
 //! | PGO-1, container-fact half through the reload edge (bitty#2476 residual 9) | here — `pgo_1_container_facts_survive_the_rebind_edge` (attachment, lifecycle state, title across the plugin-runtime edge); the controller half is `tests/panel_rebind.rs`. The `PresentationMode` clause is **homed as a report** where the layout lives (`crates/bitty-terminal/src/plugin_runtime.rs`, `a_reload_keeps_the_leaf_and_reports_the_presentation_mode_it_retained`): no production caller reads the report, and the two end states the retention change creates are listed as **not measured** in the note below |
 //! | `N -> N+1 -> N` retired generation | here — `a_retired_generation_cannot_be_rebound_over_its_successor` |
+//! | Residual 3, controller `Suspended` (bitty#2476, OQ-084 C.1) | here — `the_suspend_edge_presents_suspended_and_the_resume_restores_the_content` (park keeps the binding and the grants, presents `suspended`, and the resume restores the container's own scene; the same test fails if either direction stops reaching the port) |
 //!
 //! Still without a row in this crate: PGO-5, the disable arm of PGO-20
 //! (`disabled` on a live generation, then a re-enable that rebinds), PGO-11
@@ -76,8 +77,9 @@
 //!   — and that pass only selects a generation that is `Failed` with
 //!   `FailureClass::WallSliceTimeout`. Nothing else turns a *live* generation
 //!   into a `disabled` one: `PluginRuntime` has no disable entry (`suspend`
-//!   parks a generation and asks the port for nothing, and `dispose` names
-//!   `unloaded`), `package::set_enabled` (`src/plugin_runtime/package.rs:1441`) only writes
+//!   parks a generation and presents `suspended`, which is residual 3's row
+//!   below, and `dispose` names `unloaded`), `package::set_enabled`
+//!   (`src/plugin_runtime/package.rs:1441`) only writes
 //!   the store index, `discover_inner` skips a disabled record without touching
 //!   a live entry (`mod.rs:2852`), and the application classes a plugin-set
 //!   change as `restart-required` because "the plugin set is not part of the
@@ -173,14 +175,16 @@ use std::time::{Duration, Instant};
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort,
-    PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource, controller_generation,
+    LifecycleState, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume,
+    PanelEdgeSuspend, PanelGenerationPort, PluginRuntime, PluginRuntimeConfig, SettingsSource,
+    SnapshotSource, controller_generation,
 };
 use bitty_runtime::{
     Generation, UiRect, ViewId,
     registry::{
-        BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelId, PanelRegistry,
-        PanelRegistryConfig, PanelRuntime, PanelType, PlaceholderReason, WorkspaceId,
+        BoundedPayload, LeaseHolder, LeaseState, OverlayKind, PanelError, PanelHandle, PanelId,
+        PanelRegistry, PanelRegistryConfig, PanelRuntime, PanelState, PanelType, PlaceholderReason,
+        WorkspaceId,
     },
 };
 
@@ -843,6 +847,48 @@ impl PanelGenerationPort for EdgePort {
         }
         report
     }
+
+    fn suspend_generation(&self, edge: PanelEdgeSuspend<'_>) -> PanelEdgeReport {
+        let suspended = controller_generation(edge.suspended);
+        let bound = {
+            let host = self.panels.borrow();
+            host.registry().panels_bound_to(edge.owner, suspended)
+        };
+        let mut report = PanelEdgeReport::default();
+        for panel in bound {
+            report.attempted += 1;
+            match self
+                .panels
+                .borrow_mut()
+                .present_suspended_placeholder(panel, suspended)
+            {
+                Ok(_) => report.committed.push(panel),
+                Err(error) => report.refused.push((panel, error)),
+            }
+        }
+        report
+    }
+
+    fn resume_generation(&self, edge: PanelEdgeResume<'_>) -> PanelEdgeReport {
+        let resumed = controller_generation(edge.resumed);
+        let bound = {
+            let host = self.panels.borrow();
+            host.registry().panels_bound_to(edge.owner, resumed)
+        };
+        let mut report = PanelEdgeReport::default();
+        for panel in bound {
+            report.attempted += 1;
+            match self
+                .panels
+                .borrow_mut()
+                .clear_suspended_placeholder(panel, resumed)
+            {
+                Ok(_) => report.committed.push(panel),
+                Err(error) => report.refused.push((panel, error)),
+            }
+        }
+        report
+    }
 }
 
 /// The closed `panel` family, in vocabulary order (OQ-084 A.3).
@@ -1077,6 +1123,193 @@ fn a_generation_edge_with_no_successor_presents_the_placeholder_after_the_releas
     let edge = runtime.last_panel_edge().expect("the edge ran");
     assert_eq!((edge.attempted, edge.refused_count()), (1, 0), "{edge:?}");
     assert_eq!(edge.committed, vec![panel]);
+}
+
+/// Residual 3 on the production edge: a parked controller keeps its bound
+/// container and presents `suspended`, and the resume brings the content back.
+///
+/// OQ-084 C.1 is a mapping, not a merge of two enums: a controller `Suspended`
+/// does **not** suspend the panel. So the park is the one presentation the tree
+/// performs while the binding stays in force. Everything container-side is
+/// asserted unchanged across the park — `PanelId`, allocation epoch, lifecycle
+/// state, view attachment, workspace membership, title, the grant row, and the
+/// scene slot the container presents — together with the one thing that moved:
+/// the placeholder now names `suspended`, and it names the parked generation.
+/// The reserve assertions are what makes this a park rather than a release: no
+/// retired-ceiling tombstone and no unbind release record exist, so no
+/// generation-owned family was drained. The resume then takes the placeholder
+/// away and the container presents its own scene again, without a mount, a bind,
+/// or a lease reset.
+///
+/// Fails for a suspend path that never reaches the panel port (no placeholder
+/// ever appears — the state this row was written for), for one that reaches it
+/// through `present_placeholder` (the binding is cleared, the grants are
+/// released, and the resume comes back to an unbound container), for one that
+/// presents the park under another reason, and for a resume that leaves the
+/// placeholder standing or restores the container by disposing and re-creating
+/// it (`PanelId` and epoch would move).
+#[test]
+fn the_suspend_edge_presents_suspended_and_the_resume_restores_the_content() {
+    let (mut runtime, plugin, panels) = edge_fixture("suspend", "acme.edgesuspend");
+    let (panel, epoch) = bound_container(&panels, &plugin, 8, 14);
+    let controller = controller_generation(1);
+
+    // The panel's own presented content, in the slot `bitty.panel.mount` writes
+    // (`AppPanelSceneBackend::mount_panel_scene` → `attach_panel_scene`). It is
+    // app-owned and generation-independent, so it is exactly what a park must
+    // leave standing and a resume must find again.
+    panels
+        .borrow_mut()
+        .attach_panel_scene(
+            PanelHandle {
+                id: panel,
+                generation: epoch,
+            },
+            bitty_rich::scene::Scene::new(),
+        )
+        .expect("attach the panel scene");
+
+    runtime.suspend(&plugin).expect("suspend");
+
+    assert_eq!(
+        runtime.state(&plugin),
+        Some(&LifecycleState::Suspended),
+        "the park ran from the real lifecycle path"
+    );
+    {
+        let host_ref = panels.borrow();
+        let registry = host_ref.registry();
+        // The one thing a park moves: the presentation.
+        let placeholder = registry
+            .placeholder(panel)
+            .expect("a parked controller presents the placeholder, never a silent live panel");
+        assert_eq!(placeholder.reason(), PlaceholderReason::Suspended);
+        assert_eq!(
+            placeholder.unbound_generation(),
+            Some(controller),
+            "the placeholder names the generation that is parked"
+        );
+        assert!(
+            registry
+                .placeholder_block(panel)
+                .expect("the Core-owned block is admitted")
+                .is_some(),
+            "the container presents the placeholder surface"
+        );
+        // Everything a park must not move.
+        assert_eq!(
+            registry.controller_generation(panel),
+            Some(controller),
+            "a park is not an unbind: the generation keeps the binding"
+        );
+        assert_eq!(
+            registry.panel_state(panel, epoch).expect("live container"),
+            PanelState::Mounted,
+            "controller `Suspended` does not suspend the panel (C.1)"
+        );
+        assert_eq!(
+            registry.panel_allocation_generation(panel),
+            Some(epoch),
+            "no `StaleHandle`: the container was never re-minted"
+        );
+        assert_eq!(
+            host_ref.placement_view_of(panel),
+            Some(ViewId::new(14)),
+            "the attachment is a container fact and survives the park"
+        );
+        assert_eq!(
+            registry.panels_for_workspace(WorkspaceId::new(8)),
+            vec![panel],
+            "workspace membership survives the park"
+        );
+        assert_eq!(
+            host_ref
+                .panel_description(panel, epoch)
+                .expect("live container"),
+            (Some("Notes".to_string()), Some("acme notes".to_string())),
+            "the title survives the park"
+        );
+        assert_eq!(
+            granted_set(registry, panel, controller),
+            set(&[CREATE, FOCUS]),
+            "the parked generation retains its panel grants"
+        );
+        // No release ran: a park that reached the unbind edge would leave these.
+        assert_eq!(
+            registry.unbind_release_record(panel),
+            None,
+            "a park releases no generation-owned family"
+        );
+        assert_eq!(
+            registry.retained_grant_ceiling(panel),
+            None,
+            "a park writes no retired-ceiling tombstone"
+        );
+        assert_eq!(
+            host_ref.panel_scene_len(),
+            1,
+            "the container keeps the content it presented"
+        );
+    }
+    let park = runtime
+        .last_panel_edge()
+        .expect("the park ran through the installed port");
+    assert_eq!(
+        (park.attempted, park.refused_count()),
+        (1, 0),
+        "the park reached the one container the generation binds: {park:?}"
+    );
+    assert_eq!(park.committed, vec![panel]);
+
+    runtime.resume(&plugin).expect("resume");
+
+    assert_eq!(runtime.state(&plugin), Some(&LifecycleState::Active));
+    {
+        let host_ref = panels.borrow();
+        let registry = host_ref.registry();
+        assert_eq!(
+            registry.placeholder(panel),
+            None,
+            "the resume takes the park's presentation away"
+        );
+        assert!(
+            registry
+                .placeholder_block(panel)
+                .expect("no refusal")
+                .is_none(),
+            "a bound, unparked container presents no placeholder"
+        );
+        assert_eq!(registry.controller_generation(panel), Some(controller));
+        assert_eq!(
+            registry.panel_state(panel, epoch).expect("live container"),
+            PanelState::Mounted,
+            "the state never left `Mounted`, so the resume had nothing to restore"
+        );
+        assert_eq!(
+            host_ref.placement_view_of(panel),
+            Some(ViewId::new(14)),
+            "no mount: the attachment is the one the park kept"
+        );
+        assert_eq!(
+            granted_set(registry, panel, controller),
+            set(&[CREATE, FOCUS]),
+            "the grant row is the same row, not a re-derived one"
+        );
+        assert_eq!(
+            host_ref.panel_scene_len(),
+            1,
+            "the content the container presented before the park is back"
+        );
+    }
+    let resume = runtime
+        .last_panel_edge()
+        .expect("the resume ran through the installed port");
+    assert_eq!(
+        (resume.attempted, resume.refused_count()),
+        (1, 0),
+        "{resume:?}"
+    );
+    assert_eq!(resume.committed, vec![panel]);
 }
 
 /// A refused successor bind leaves the container unbound and widens nothing.

@@ -25,10 +25,10 @@ use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LegacyStoreAdoption,
     LifecycleState, LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
-    PanelEdgeRelease, PanelEdgeReport, PanelGenerationPort, PanelPinHandler, PanelPinQueue,
-    PanelSceneBackend, PluginRuntime, PluginRuntimeConfig, QueuedPinRequest, SnapshotSource,
-    TargetSource, TranscriptHistory, WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
-    adopt_legacy_store, controller_generation,
+    PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume, PanelEdgeSuspend, PanelGenerationPort,
+    PanelPinHandler, PanelPinQueue, PanelSceneBackend, PluginRuntime, PluginRuntimeConfig,
+    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
+    WorkspaceInfo, WorkspaceSource, adopt_legacy_store, controller_generation,
 };
 use bitty_runtime::registry::{
     Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
@@ -976,7 +976,7 @@ impl PanelSceneBackend for AppPanelSceneBackend {
     }
 }
 
-/// Production panel generation port (bitty#2476 residuals 2 and 4).
+/// Production panel generation port (bitty#2476 residuals 2, 3 and 4).
 ///
 /// The generation edge runs in the plugin runtime, which cannot name a
 /// `PanelRuntime`: the panel host is this crate's, built once at the
@@ -984,7 +984,7 @@ impl PanelSceneBackend for AppPanelSceneBackend {
 /// the present loop. This is the adapter the runtime asks instead, installed
 /// with `PluginRuntime::set_panel_generation_port` beside the scene host.
 ///
-/// It exposes exactly the two questions the edge has and answers them by
+/// It exposes exactly the four questions the edge has and answers them by
 /// delegating to the same public panel API every other surface uses:
 ///
 /// - **release** — the containers the ended generation still binds are released
@@ -1003,15 +1003,22 @@ impl PanelSceneBackend for AppPanelSceneBackend {
 /// - **bind** — the containers the predecessor drove are bound to the successor
 ///   through `PanelRuntime::rebind_panel`, which is D.2 phase 2 step 3's
 ///   required caller: it resets the lease and only then drops the tombstone.
+/// - **park** — the containers the *suspended* generation still binds get the
+///   `suspended` placeholder and nothing else (OQ-084 C.1): the record, its
+///   identity, its state, its attachment, its grants, its scene slot, its content
+///   layer, and its binding all stay, and the layout is untouched, because the
+///   container was never unmounted and must come back to the same leaf when the
+///   plugin resumes.
+/// - **resume** — that placeholder comes off again, and nothing else is written.
 ///
 /// Enumeration is one bounded `PanelId` walk per edge — the containers the
 /// generation *holds*, either because its binding is still in force (a
-/// displacement) or because its edge already ended it and the record retained
-/// the pair (the reload case, where the release ran first). A container that
-/// never bound a controller is not this port's to move: `bitty.panel.create`
-/// writes that first binding itself from the creating generation (OQ-084
-/// follow-up (e)), and a create that cannot is refused and its record retired,
-/// so nothing reaches an edge both unbound and unnamed.
+/// displacement, and the only case a park sees) or because its edge already
+/// ended it and the record retained the pair (the reload case, where the release
+/// ran first). A container that never bound a controller is not this port's to
+/// move: `bitty.panel.create` writes that first binding itself from the creating
+/// generation (OQ-084 follow-up (e)), and a create that cannot is refused and
+/// its record retired, so nothing reaches an edge both unbound and unnamed.
 ///
 /// Nothing here grants authority. The capability set a bind installs is the
 /// successor's own activation resolution intersected with the predecessor's
@@ -1038,6 +1045,62 @@ impl AppPanelGenerationPort {
         let mut held = host.registry().panels_bound_to(owner, generation);
         held.extend(host.registry().panels_ended_at(owner, generation));
         held
+    }
+
+    /// One walk of the containers `generation` still binds, presenting or
+    /// clearing the park's `suspended` placeholder on each (OQ-084 C.1,
+    /// bitty#2476 residual 3).
+    ///
+    /// The two directions share this because they share every fact that
+    /// matters: the same enumeration (a park only ever names a container whose
+    /// binding is still in force — nothing has ended), the same refusal report,
+    /// and the same deliberate absence of any other write. No layout op is
+    /// queued in either direction: a parked controller keeps its leaf and its
+    /// scene slot, so the resume has nothing to recreate, and a `Close` here
+    /// would be the container disposal C.1 forbids.
+    fn park_edge(
+        &self,
+        owner: &bitty_plugin_host::PluginId,
+        generation: u32,
+        present: bool,
+    ) -> PanelEdgeReport {
+        let controller = controller_generation(generation);
+        let bound = {
+            let host = self.panels.borrow();
+            host.registry().panels_bound_to(owner, controller)
+        };
+        let mut report = PanelEdgeReport::default();
+        for panel in bound {
+            report.attempted += 1;
+            let result = if present {
+                self.panels
+                    .borrow_mut()
+                    .present_suspended_placeholder(panel, controller)
+                    .map(|_| ())
+            } else {
+                self.panels
+                    .borrow_mut()
+                    .clear_suspended_placeholder(panel, controller)
+                    .map(|_| ())
+            };
+            match result {
+                Ok(()) => report.committed.push(panel),
+                Err(error) => {
+                    // A refusal moves nothing, so the container keeps whatever
+                    // presentation it had. It is reported rather than retried:
+                    // the edge never loops, and the direction names what failed.
+                    let direction = if present { "park" } else { "resume" };
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: panel {} {direction} presentation not written: {error}",
+                            panel.0
+                        )
+                    });
+                    report.refused.push((panel, error));
+                }
+            }
+        }
+        report
     }
 }
 
@@ -1226,6 +1289,14 @@ impl PanelGenerationPort for AppPanelGenerationPort {
             }
         }
         report
+    }
+
+    fn suspend_generation(&self, edge: PanelEdgeSuspend<'_>) -> PanelEdgeReport {
+        self.park_edge(edge.owner, edge.suspended, true)
+    }
+
+    fn resume_generation(&self, edge: PanelEdgeResume<'_>) -> PanelEdgeReport {
+        self.park_edge(edge.owner, edge.resumed, false)
     }
 }
 
@@ -4710,6 +4781,115 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             runtime.last_panel_edge().map(|report| report.attempted),
             Some(1),
             "the reload issued exactly one bind through the app-installed port"
+        );
+    }
+
+    /// bitty#2476 residual 3: the composition root's port parks a bound
+    /// container on `suspend` and restores it on `resume`.
+    ///
+    /// This drives the real `AppPanelGenerationPort` the startup path installs,
+    /// not a test double, so what it pins is the wiring the audit found missing:
+    /// `PluginRuntime::suspend_inner` asks the port, the port enumerates the
+    /// containers the parked generation still binds, and the registry presents
+    /// `suspended` on the one container without unbinding it. The resume is the
+    /// same port in the other direction.
+    ///
+    /// Fails for a suspend path that asks the port for nothing (no placeholder),
+    /// for a port that reaches `present_placeholder` instead of the park entry
+    /// (the binding and the grant row are gone, so re-arming the plugin leaves an
+    /// unbound container), and for a resume that leaves the placeholder standing.
+    #[test]
+    fn the_installed_port_parks_a_bound_container_and_restores_it_on_resume() {
+        let root = pin_test_dir("edge-park");
+        write_panel_probe(&root, "xuepoo.edgepark", &["panel.create", "panel.focus"]);
+        let live = Runtime::with_defaults().expect("defaults must build");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: None,
+            focused_workspace: live.focused_workspace_id(),
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let panels = session
+            .panels
+            .clone()
+            .expect("the composition root installs the panel host");
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgepark").expect("id");
+        let mut runtime = session.runtime;
+
+        let first = installed_generation(&runtime, id.as_str());
+        let handle = panels
+            .borrow_mut()
+            .create_panel(PanelType::Rich, Some(WorkspaceId::new(4)))
+            .expect("create panel");
+        panels
+            .borrow_mut()
+            .mount_panel(handle.id, handle.generation, ViewId::new(42))
+            .expect("mount panel");
+        let requested = ["panel.create", "panel.focus"]
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect();
+        panels
+            .borrow_mut()
+            .rebind_panel(
+                handle.id,
+                controller_generation(first),
+                &id,
+                &requested,
+                &std::collections::BTreeSet::new(),
+            )
+            .expect("first bind");
+
+        runtime.suspend(&id).expect("suspend");
+
+        assert_eq!(
+            panels
+                .borrow()
+                .registry()
+                .placeholder_reason(handle.id)
+                .map(|reason| reason.as_str().to_string()),
+            Some("suspended".to_string()),
+            "the installed port presented the park on the container it binds"
+        );
+        assert_eq!(
+            panels.borrow().registry().controller_generation(handle.id),
+            Some(controller_generation(first)),
+            "a park keeps the binding: the container was never unbound"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(handle.id),
+            Some(ViewId::new(42)),
+            "a park keeps the attachment"
+        );
+        assert_eq!(
+            runtime.last_panel_edge().map(|report| report.attempted),
+            Some(1),
+            "the park issued exactly one edge through the app-installed port"
+        );
+
+        runtime.resume(&id).expect("resume");
+
+        assert!(
+            panels.borrow().registry().placeholder(handle.id).is_none(),
+            "the resume took the park's presentation away"
+        );
+        assert_eq!(
+            panels.borrow().registry().controller_generation(handle.id),
+            Some(controller_generation(first)),
+            "the resume never rebound: it is the same generation"
         );
     }
 

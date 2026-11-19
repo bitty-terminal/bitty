@@ -140,8 +140,8 @@ pub use overlay::{
     is_release_reason,
 };
 pub use panel_generation::{
-    CONTROLLER_GENERATION_BASE, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport,
-    PanelGenerationPort, PluginGeneration, controller_generation,
+    CONTROLLER_GENERATION_BASE, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume,
+    PanelEdgeSuspend, PanelGenerationPort, PluginGeneration, controller_generation,
 };
 pub use presentation_overlay::{
     DismissedEvent, ESCAPE_DISMISS_REASON, PENDING_DISMISSED_MAX, PRESENTATION_OVERLAY_KIND,
@@ -1942,6 +1942,48 @@ impl PluginRuntime {
             requested,
             consented: &consented,
         });
+        self.last_panel_edge = Some(report);
+    }
+
+    /// Runs the park edge through the installed port, if any (bitty#2476
+    /// residual 3).
+    ///
+    /// Called from `suspend_inner` after the generation's own surface and
+    /// capture were revoked and its commands, services, and suggestions parked,
+    /// and while the binding is still in force — a park is not an edge, so the
+    /// containers this generation binds are still the ones it binds. The port
+    /// presents the `suspended` placeholder on each and moves nothing else
+    /// (OQ-084 C.1). A port the app did not install leaves this a no-op.
+    fn suspend_panel_generation(
+        &mut self,
+        owner: &PluginId,
+        suspended: panel_generation::PluginGeneration,
+    ) {
+        let Some(port) = self.panel_generation_port.clone() else {
+            return;
+        };
+        let report =
+            port.suspend_generation(panel_generation::PanelEdgeSuspend { owner, suspended });
+        self.last_panel_edge = Some(report);
+    }
+
+    /// Runs the resume edge through the installed port, if any (bitty#2476
+    /// residual 3).
+    ///
+    /// Called from `resume_inner` once the generation is `Active` again. It is
+    /// the inverse of [`Self::suspend_panel_generation`]: the park's
+    /// presentation comes off, and because nothing about the container moved in
+    /// between, the container presents its prior content again without a mount
+    /// and without a bind (OQ-084 C.1).
+    fn resume_panel_generation(
+        &mut self,
+        owner: &PluginId,
+        resumed: panel_generation::PluginGeneration,
+    ) {
+        let Some(port) = self.panel_generation_port.clone() else {
+            return;
+        };
+        let report = port.resume_generation(panel_generation::PanelEdgeResume { owner, resumed });
         self.last_panel_edge = Some(report);
     }
 
@@ -3760,6 +3802,13 @@ impl PluginRuntime {
     /// fails closed with `false` after the suspend and after a resume, until
     /// the plugin mounts again.
     ///
+    /// bitty#2476 residual 3 (OQ-084 C.1): a controller `Suspended` does not
+    /// suspend the panel. Every container this generation binds keeps its
+    /// identity, its state, its attachment, and its grants, and presents the
+    /// `suspended` placeholder until [`PluginRuntime::resume`] takes it away
+    /// again — so the panel comes back to the content it presented before the
+    /// park, not to an unbound container.
+    ///
     /// # Errors
     ///
     /// [`PluginRuntimeError::Lifecycle`] when the transition is invalid.
@@ -3791,6 +3840,7 @@ impl PluginRuntime {
             // its lenses; outstanding handles go stale by construction.
             services.revoke_targeting_lenses();
         }
+        let generation = entry.generation;
         // CTX-0941: suspend is a release; a suspended generation must never
         // keep the transient input capture (honored even when the VM is
         // parked rather than disposed).
@@ -3826,6 +3876,15 @@ impl PluginRuntime {
             .borrow_mut()
             .drop_plugin(id.as_str());
         let _ = self.host.suspend(id);
+        // bitty#2476 residual 3 (OQ-084 C.1): the containers this generation
+        // binds keep their identity, their state, their attachment, and their
+        // grants, and the generation keeps the binding — but the panel now
+        // presents the Core-owned `suspended` placeholder, because a parked
+        // controller has no verbs left to drive it. The park runs last, after
+        // the generation's own content and capture release above and after every
+        // verb surface was parked, so the placeholder never goes up over a
+        // generation that can still act.
+        self.suspend_panel_generation(id, generation);
         Ok(())
     }
 
@@ -3852,6 +3911,7 @@ impl PluginRuntime {
             ));
         }
         entry.state = LifecycleState::Active;
+        let generation = entry.generation;
         // LUA-OQ-8: restore the parked publications (same generation, so
         // pre-suspend consumer handles serve again).
         self.service_directory
@@ -3868,6 +3928,12 @@ impl PluginRuntime {
             .borrow_mut()
             .resume_owner(id.as_str());
         let _ = self.host.resume(id);
+        // bitty#2476 residual 3 (OQ-084 C.1): the controller drives its panels
+        // again, so the `suspended` presentation the park wrote comes off. It is
+        // the same generation and the container never moved, so what it presents
+        // now is the content it presented before the park: no mount, no bind, no
+        // lease reset.
+        self.resume_panel_generation(id, generation);
         Ok(())
     }
 
@@ -6298,6 +6364,14 @@ mod tests {
             }
 
             fn bind_successor(&self, _edge: PanelEdgeBind<'_>) -> PanelEdgeReport {
+                PanelEdgeReport::default()
+            }
+
+            fn suspend_generation(&self, _edge: PanelEdgeSuspend<'_>) -> PanelEdgeReport {
+                PanelEdgeReport::default()
+            }
+
+            fn resume_generation(&self, _edge: PanelEdgeResume<'_>) -> PanelEdgeReport {
                 PanelEdgeReport::default()
             }
         }

@@ -1,5 +1,5 @@
 //! The panel generation edge: the narrow port through which the plugin
-//! generation boundary reaches the panel host (bitty#2476 residuals 2 and 4).
+//! generation boundary reaches the panel host (bitty#2476 residuals 2, 3 and 4).
 //!
 //! # Why a port and not a handle
 //!
@@ -11,20 +11,37 @@
 //! `present_placeholder` had no caller — the state residual 2 and residual 4
 //! were merged in.
 //!
-//! This module is the seam that closes that: a two-method trait the app
+//! This module is the seam that closes that: a four-method trait the app
 //! implements over its own panel host and installs with
 //! [`PluginRuntime::set_panel_generation_port`](super::PluginRuntime::set_panel_generation_port),
 //! following the `SceneHost` precedent (also an app-owned installer passed into
 //! the plugin runtime at the composition root).
 //!
-//! The port deliberately exposes **two questions and nothing else**: *bind this
-//! successor onto the containers my predecessor still owns*, and *release this
-//! ended generation and present the placeholder on the containers it left
-//! unbound*. It hands over no registry, no renderer, no scene, no capability
-//! token from presentation data, and no panel identifier the plugin can choose.
-//! The plugin runtime decides *when* an edge runs and *which* owner and
-//! generation it is; the app decides *which containers that names*, because
-//! only it holds the panel records.
+//! The port deliberately exposes **four questions and nothing else**: *bind this
+//! successor onto the containers my predecessor still owns*, *release this ended
+//! generation and present the placeholder on the containers it left unbound*,
+//! and — for the parked controller of OQ-084 C.1 — *present the `suspended`
+//! placeholder on the containers this still-bound generation holds, keeping
+//! them bound*, with its inverse *take that placeholder away again*. It hands
+//! over no registry, no renderer, no scene, no capability token from
+//! presentation data, and no panel identifier the plugin can choose. The plugin
+//! runtime decides *when* an edge runs and *which* owner and generation it is;
+//! the app decides *which containers that names*, because only it holds the
+//! panel records.
+//!
+//! # Park is not release
+//!
+//! A controller `Suspended` does not suspend the panel (OQ-084 C.1): the
+//! container keeps its identity, its state, its attachment, and its grants, and
+//! its generation keeps the binding. Only the preference and command surface
+//! moves, and that is the plugin runtime's own. So the park pair is not the
+//! release edge with another reason token — a release presents the placeholder
+//! *after* removing the generation's panel-scoped families and clearing the
+//! binding, which would leave the resume with nothing to come back to, and would
+//! contradict the same rule that has the parked generation retain its grants.
+//! [`PanelGenerationPort::suspend_generation`] therefore writes the `suspended`
+//! presentation and moves nothing else, and
+//! [`PanelGenerationPort::resume_generation`] removes exactly that presentation.
 //!
 //! # Fail-closed contract
 //!
@@ -62,12 +79,21 @@
 //!    reference implementation reaches it through the registry's
 //!    `present_placeholder`, which runs the unbind release and only then writes
 //!    the placeholder (OQ-084 A.2).
+//! 4. [`PanelGenerationPort::suspend_generation`] is called after the plugin
+//!    runtime parked the generation's commands, services, suggested bindings,
+//!    capture session, and presentation surface, and while the binding is still
+//!    in force — a park clears nothing, so the container it names is one the
+//!    generation still binds.
+//! 5. [`PanelGenerationPort::resume_generation`] is called after the generation
+//!    is `Active` again and only takes the park's presentation away. Nothing
+//!    else about the container moved in between, so the content the container
+//!    presented before the park is the content it presents after the resume.
 //!
 //! # Optional by construction
 //!
 //! The port is `None` until the app installs one, so runtime tests and headless
-//! builds behave exactly as before: the edge releases nothing and presents
-//! nothing, and only the generation's own content release runs.
+//! builds behave exactly as before: no edge releases anything, no park presents
+//! anything, and only the generation's own content release runs.
 
 use std::collections::BTreeSet;
 
@@ -175,6 +201,33 @@ pub struct PanelEdgeBind<'a> {
     pub consented: &'a BTreeSet<String>,
 }
 
+/// The park edge of one plugin generation (bitty#2476 residual 3).
+///
+/// The generation is `Suspended`, not ended: its VM is parked, its grants are
+/// retained, and it still binds every container it drove. The port presents the
+/// [`PlaceholderReason::Suspended`] placeholder on those containers and moves
+/// nothing else (OQ-084 C.1).
+#[derive(Clone, Copy, Debug)]
+pub struct PanelEdgeSuspend<'a> {
+    /// The plugin whose generation was parked.
+    pub owner: &'a PluginId,
+    /// The activation generation that was parked.
+    pub suspended: PluginGeneration,
+}
+
+/// The inverse of [`PanelEdgeSuspend`]: the generation is `Active` again, so the
+/// presentation its park wrote comes off (OQ-084 C.1). While the controller was
+/// parked the panel "keeps its container and its state" and "loses its
+/// controller verbs"; both of those end with the resume.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelEdgeResume<'a> {
+    /// The plugin whose generation was resumed.
+    pub owner: &'a PluginId,
+    /// The activation generation that resumed. It is the same generation the
+    /// park named: a resume never advances the counter.
+    pub resumed: PluginGeneration,
+}
+
 /// What one edge call did.
 ///
 /// One report per edge, replaced at the next edge: the edge never accumulates a
@@ -186,8 +239,9 @@ pub struct PanelEdgeReport {
     /// Containers the edge attempted. Bounded by the panel registry's live
     /// panel count, which is itself bounded by `max_panels_per_window`.
     pub attempted: usize,
-    /// Containers the edge moved: bound to the successor, or left unbound with
-    /// the placeholder presented.
+    /// Containers the edge moved: bound to the successor, left unbound with the
+    /// placeholder presented, or — on the park pair — presented with the
+    /// `suspended` placeholder while staying bound, and restored on the resume.
     pub committed: Vec<PanelId>,
     /// Containers the edge refused, with the typed refusal and nothing moved.
     pub refused: Vec<(PanelId, PanelError)>,
@@ -213,8 +267,8 @@ impl PanelEdgeReport {
 
 /// The panel host, as the plugin generation edge can reach it.
 ///
-/// Two methods, one per edge, and no state: the implementation owns the panel
-/// host and answers for the containers a generation drives. See the
+/// Four methods, one pair per edge, and no state: the implementation owns the
+/// panel host and answers for the containers a generation drives. See the
 /// [module documentation](self) for the ordering the caller guarantees and the
 /// fail-closed contract an implementation must honour.
 ///
@@ -253,6 +307,36 @@ pub trait PanelGenerationPort {
     /// reset, and the tombstone drop then happen in D.2 phase 2's order. A
     /// refusal moves nothing.
     fn bind_successor(&self, edge: PanelEdgeBind<'_>) -> PanelEdgeReport;
+
+    /// Presents the `suspended` placeholder on every container `edge.suspended`
+    /// still binds, keeping each one bound (OQ-084 C.1, bitty#2476 residual 3).
+    ///
+    /// Nothing about the container moves except its presentation: the record,
+    /// its `PanelId`, its allocation epoch, its attachment, its title, its
+    /// geometry, its workspace membership, its state, and its panel-scoped
+    /// grant row all stay as they are, and the generation keeps the binding and
+    /// the lease tenure it holds. The implementation must not reach
+    /// `present_placeholder`, `dispose_panel`, or `release_generation_scope`:
+    /// those are the end edges, and a park that took one of them would release
+    /// a generation the resume is supposed to bring back.
+    ///
+    /// A refusal moves nothing and is reported in
+    /// [`PanelEdgeReport::refused`]; the container keeps whatever presentation
+    /// it had, which after `clear_ui_blocks` is its own retained content and
+    /// never a dead generation's.
+    fn suspend_generation(&self, edge: PanelEdgeSuspend<'_>) -> PanelEdgeReport;
+
+    /// Takes the park's `suspended` presentation away from every container
+    /// `edge.resumed` still binds (OQ-084 C.1).
+    ///
+    /// This is the inverse of [`PanelGenerationPort::suspend_generation`] and
+    /// nothing else: it writes no binding, installs no grant, resets no lease,
+    /// and does not mount. A container that presents another reason, binds
+    /// another generation, or is gone is left exactly as it is, so a panel the
+    /// user closed while its plugin was parked is an ordinary no-op rather than
+    /// an error. After this call the container presents the content it presented
+    /// before the park, because nothing in between moved it.
+    fn resume_generation(&self, edge: PanelEdgeResume<'_>) -> PanelEdgeReport;
 }
 
 #[cfg(test)]

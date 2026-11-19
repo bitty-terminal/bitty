@@ -2381,9 +2381,12 @@ impl Runtime {
     /// for a column band any row inside the band's granted column range hits.
     /// Press consumption uses this so a band press can never fall through to
     /// selection or capture. Both axes resolve through the host's granted band
-    /// rect (`band_paint_rect`), the same geometry the paint path uses (no
-    /// second source). Returns `None` outside every painted band rect, past the
-    /// window, or under any geometry violation (fail-closed).
+    /// rect (`band_paint_rect`) and then through the one physical band mapping
+    /// (`band_geometry`), the same mapping the paint path emits its fills at
+    /// (CTX-1906/bitty#3263) — so a bottom band's hit region is exactly the
+    /// pixels it paints, whatever sub-cell remainder the window leaves.
+    /// Returns `None` outside every painted band rect, past the window, or
+    /// under any geometry violation (fail-closed).
     #[must_use]
     pub fn plugin_band_cell_hit(&self, pos: CursorPosition) -> Option<BandCellHit> {
         if !pos.x.is_finite() || !pos.y.is_finite() {
@@ -2400,21 +2403,22 @@ impl Runtime {
         if window.width == 0 || window.height == 0 {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
+        let pad_px = self.window_padding_physical();
+        let pad = f64::from(pad_px);
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
         let origin_x = pad + f64::from(window.x) * cell_w;
         // The window cell the pointer is on, in the same window-relative frame
         // [`Self::band_paint_rect`] reports.
         let cell_col = (pos.x - origin_x) / cell_w;
-        let cell_row = (pos.y - pad) / cell_h;
-        if !(0.0..f64::from(window.width)).contains(&cell_col)
-            || !(0.0..f64::from(window.height)).contains(&cell_row)
-        {
+        if !(0.0..f64::from(window.width)).contains(&cell_col) {
             return None;
         }
         let column = u16::try_from(cell_col.floor() as u64).ok()?;
-        let row = u16::try_from(cell_row.floor() as u64).ok()?;
+        // CTX-1906: the pointer's physical rect test and the paint rect are the
+        // same rect, so a band that is anchored to the physical window inset is
+        // hit where it is painted instead of where its cell row would fall.
+        let geometry = self.band_pixel_geometry(pad_px);
         for edge in BAND_EDGES {
             let count = match edge.axis() {
                 BandAxis::Row => self.visible_band_count(edge),
@@ -2429,9 +2433,25 @@ impl Runtime {
                 if column < band_column || column >= band_column.saturating_add(width) {
                     continue;
                 }
-                if row < band_row || row >= band_row.saturating_add(height) {
+                let rect = match edge.axis() {
+                    BandAxis::Row => geometry.row_band(edge, band_row, band_column, width),
+                    BandAxis::Column => geometry.area_band(band_row, band_column, width, height),
+                };
+                if !rect.contains(pos.x, pos.y) {
                     continue;
                 }
+                // Row bands own exactly one cell row; a column band's row is the
+                // pointer's offset inside its granted rows.
+                let row = match edge.axis() {
+                    BandAxis::Row => band_row,
+                    BandAxis::Column => {
+                        let offset = ((pos.y - f64::from(rect.y)) / cell_h).floor();
+                        if !(0.0..f64::from(height)).contains(&offset) {
+                            continue;
+                        }
+                        band_row.saturating_add(u16::try_from(offset as u64).ok()?)
+                    }
+                };
                 return Some(BandCellHit {
                     edge,
                     visible_index: index,

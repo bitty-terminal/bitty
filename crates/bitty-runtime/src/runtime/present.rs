@@ -6442,6 +6442,15 @@ impl Runtime {
     /// the layout container) skips the whole band, never a partial paint,
     /// and counts a diagnostic.
     ///
+    /// bitty#3263 (CTX-1906): the granted rectangle is converted to pixels by
+    /// the one shared band mapping
+    /// ([`BandPixelGeometry`](super::band_geometry::BandPixelGeometry)), which
+    /// anchors bottom bands to the window's *physical* bottom inset instead of
+    /// the floored cell grid, so the sub-cell row remainder
+    /// `(surface_height - 2 * padding) % cell_height` no longer opens a blank
+    /// strip under the bottom chrome. The granted cell rows, the layout
+    /// container, the grid, and every PTY winsize are unchanged.
+    ///
     /// Issue #3165: column bands (`left`/`right`) paint after the row bands
     /// through the same span renderer — one row per root child, clipped to the
     /// band's granted width, top-down from the row-carved container's first
@@ -6616,10 +6625,13 @@ impl Runtime {
     ) {
         use super::band_host::resolve_band_token;
 
-        let live = self.live_cell_metrics();
-        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
-        let cell_w = live.width;
-        let origin_y = px_add(pad_px, i32::from(row).saturating_mul(cell_h));
+        // CTX-1906 (bitty#3263): the band's physical rect comes from the one
+        // shared band mapping, not from the cell row alone. The fill, the glyph
+        // origin, and the chrome rule all read it, and the hit-test asks the
+        // same mapping whether the pointer is inside — so a bottom band lands
+        // on the window's physical inset instead of stopping at the floored
+        // cell grid, and paint and routing can never disagree.
+        let geometry = self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0));
         let chars: Vec<char> = text.chars().collect();
         let mut painted_any = false;
         for run in runs {
@@ -6666,21 +6678,19 @@ impl Runtime {
             // geometry even for a non-zero window origin.
             let col_offset =
                 u32::from(band_x).saturating_add(u32::try_from(start).unwrap_or(u32::MAX));
-            let origin_x = pad_px.saturating_add(
-                i32::try_from(col_offset.saturating_mul(cell_w)).unwrap_or(i32::MAX),
+            let rect = geometry.row_band(
+                edge,
+                row,
+                u16::try_from(col_offset).unwrap_or(u16::MAX),
+                u16::try_from(cells).unwrap_or(u16::MAX),
             );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
-                rect: bitty_render::geometry::RectPx::new(
-                    origin_x,
-                    origin_y,
-                    px_span_usize(cells, cell_w),
-                    live.height,
-                ),
+                rect: bitty_render::geometry::RectPx::new(rect.x, rect.y, rect.width, rect.height),
                 color: bg,
             });
-            let mut glyphs =
-                self.renderer
-                    .overlay_text_glyphs(&span, (origin_x, origin_y), cells, fg);
+            let mut glyphs = self
+                .renderer
+                .overlay_text_glyphs(&span, (rect.x, rect.y), cells, fg);
             if run.bold {
                 // Synthetic double-strike: the overlay face is single-weight,
                 // so bold repaints the same instances one pixel right. Glyph
@@ -6705,11 +6715,21 @@ impl Runtime {
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule_h = chrome.border_px.max(1);
+        let rule_rect = geometry.row_band(
+            edge,
+            row,
+            band_x,
+            u16::try_from(band_cells).unwrap_or(u16::MAX),
+        );
         let rule_y = match edge {
-            BandEdge::Top => origin_y
-                .saturating_add(cell_h)
+            BandEdge::Top => rule_rect
+                .y
+                .saturating_add(i32::try_from(rule_rect.height).unwrap_or(i32::MAX))
                 .saturating_sub(i32::from(rule_h)),
-            BandEdge::Bottom => origin_y,
+            // The rule sits on the band's own (physical) top edge, so it stays
+            // on the content-facing side of a bottom band that is anchored to
+            // the window inset.
+            BandEdge::Bottom => rule_rect.y,
             // Issue #3171: a column band draws *one* vertical rule for the
             // whole band, not one horizontal strip per content row. Drawing it
             // here would fence every content line, so the column paint loop
@@ -6717,14 +6737,11 @@ impl Runtime {
             // band's rows (same muted token, same content-facing edge).
             BandEdge::Left | BandEdge::Right => return,
         };
-        let rule_x = pad_px.saturating_add(
-            i32::try_from(u32::from(band_x).saturating_mul(cell_w)).unwrap_or(i32::MAX),
-        );
-        let rule_w = px_span_usize(band_cells, cell_w);
+        let rule_w = rule_rect.width;
         if rule_w > 0 {
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(
-                    rule_x,
+                    rule_rect.x,
                     rule_y,
                     rule_w,
                     u32::from(rule_h),
@@ -6974,6 +6991,18 @@ impl Runtime {
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let surface_color = chrome.surface_for(bitty_render::chrome::ChromeElevation::Overlay);
+        // CTX-1906 (bitty#3263): a bottom-anchored card clips at the band's
+        // *physical* top edge through the shared band mapping, not at the cell
+        // grid boundary, so the card tracks the band it is anchored to and the
+        // sub-cell remainder above the band is not left blank.
+        let band_limit_px = match (anchored.and_then(|stack| stack.limit_row), anchor) {
+            (Some(limit), Some(anchor)) => Some(
+                self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
+                    .row_band(anchor.edge, limit, 0, 0)
+                    .y,
+            ),
+            _ => None,
+        };
         let mut painted_rows: Vec<(usize, OverlayPill)> = Vec::new();
         let mut bottom_limit: Option<i32> = None;
         for (index, overlay_row) in rows.iter().enumerate() {
@@ -7006,8 +7035,8 @@ impl Runtime {
             if out_of_bounds {
                 continue;
             }
-            if let Some(limit) = limit_row {
-                bottom_limit = Some(px_add(pad_px, px_offset_cells(0, limit, live.height)));
+            if limit_row.is_some() {
+                bottom_limit = band_limit_px;
             }
             let Some(pill) =
                 self.overlay_pill_geometry(frame, row, overlay_row, full_w, placement, pad_px)

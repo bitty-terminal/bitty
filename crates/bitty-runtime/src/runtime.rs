@@ -130,6 +130,7 @@ use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
 pub mod background_images;
+mod band_geometry;
 pub mod band_host;
 pub mod band_slots;
 pub mod bell;

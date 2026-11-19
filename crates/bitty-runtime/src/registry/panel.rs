@@ -2777,8 +2777,8 @@ impl PanelRegistry {
     ///
     /// A placeholder is presented on a container whose controller ended (the
     /// unbind case) and, since bitty#2476 residual 3, on a container whose
-    /// controller is parked while the binding stays in force (C.1). Read
-    /// [`PanelRecord`]'s binding, not this accessor, to tell the two apart.
+    /// controller is parked while the binding stays in force (C.1). Read the
+    /// record's binding, not this accessor, to tell the two apart.
     #[must_use]
     pub fn placeholder(&self, panel_id: PanelId) -> Option<PanelPlaceholder> {
         self.panels

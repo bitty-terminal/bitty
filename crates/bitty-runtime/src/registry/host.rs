@@ -166,10 +166,12 @@ pub struct PanelRuntime {
     /// [`PresentedPanelContent`] per live panel, holding the displaced
     /// terminal record that is the only restore authority.
     ///
-    /// Entries are written only by [`PanelRuntime::present_panel_content`],
-    /// consumed by [`PanelRuntime::release_panel_content`], and dropped with
-    /// the panel at [`PanelRuntime::dispose_panel`] (through
-    /// `release_panel_mirrors`) so a record can never outlive its container.
+    /// Entries are written only by [`PanelRuntime::present_panel_content`] and
+    /// consumed by [`PanelRuntime::release_panel_content`] (the owner's token)
+    /// or by [`PanelRuntime::release_content_layer_at_generation_end`] (the
+    /// presenting generation's edge, bitty#3253), and dropped with the panel at
+    /// [`PanelRuntime::dispose_panel`] (through `release_panel_mirrors`) so a
+    /// record can never outlive its container.
     /// The slot count inherits the registry window panel budget: one layer per
     /// panel, never two.
     content_layers: HashMap<super::panel::PanelId, PresentedPanelContent>,
@@ -275,6 +277,11 @@ fn map_lease_error(panel: super::panel::PanelId, error: LeaseError) -> PanelErro
 /// panel's) presentation is refused instead of restoring the wrong terminal.
 /// The caller cannot supply one: a plugin-facing `handle` is host-derived
 /// (bitty#2388 "No surface handle").
+///
+/// A token dies with its generation. When the presenting generation ends while
+/// its layer is up, the record is released through the binding
+/// ([`PanelRuntime::release_content_layer_at_generation_end`], bitty#3253) and
+/// the token names nothing afterwards — it is never handed to a successor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PanelContentToken(u64);
 
@@ -1567,14 +1574,18 @@ impl PanelRuntime {
     /// displaced terminal are one presentation, so detaching the scene behind
     /// the record's back would strand it: nothing could later restore the
     /// terminal it displaced, and the panel would keep reporting a `Rich`
-    /// content kind it no longer paints. The owner releases the layer first
-    /// (which detaches its own scene), so the refusal is the fail-closed
-    /// ordering, not a new lock. Nothing is removed on refusal — the scene,
-    /// its paint cache, and the record stay intact.
+    /// content kind it no longer paints. The layer leaves first and detaches
+    /// its own scene, through the owner's token
+    /// ([`PanelRuntime::release_panel_content`]) or, when the owner's
+    /// generation has ended, through the generation edge
+    /// ([`PanelRuntime::release_content_layer_at_generation_end`]), so the
+    /// refusal is the fail-closed ordering, not a new lock. Nothing is removed
+    /// on refusal — the scene, its paint cache, and the record stay intact.
     ///
     /// Panels without a layer — every panel before bitty#2388 — detach exactly
-    /// as before, including the crash, disable, reload, and dispose paths that
-    /// drop the layer record together with the container.
+    /// as before, including the crash, disable, reload, and dispose paths,
+    /// whose generation edge now releases the layer before it detaches and
+    /// disposes.
     pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> Result<bool, PanelError> {
         if self.content_layers.contains_key(&id) {
             self.registry.bump_error("ContentBusy");
@@ -1848,6 +1859,80 @@ impl PanelRuntime {
             scroll_offset: record.scroll_offset,
             token: record.token,
         })
+    }
+
+    /// Releases the content layer presented on `id` because the generation that
+    /// presented it has ended (bitty#3253).
+    ///
+    /// A presented layer is generation-owned: the [`PanelContentToken`] that
+    /// [`PanelRuntime::release_panel_content`] requires belongs to the caller
+    /// that presented the layer, and at a generation edge (reload, disable,
+    /// crash, unload) that caller is gone. Leaving the record to die with the
+    /// container is not neutral — [`PanelRuntime::detach_panel_scene`] refuses
+    /// with [`PanelError::ContentBusy`] for exactly as long as a layer is
+    /// presented, so the container keeps a dead generation's scene painted and
+    /// every later present on it is refused with `ContentBusy` until the
+    /// container is retired. The edge therefore releases the layer itself, in
+    /// the same step that ends the generation, so the container is
+    /// terminal-backed again before the placeholder becomes visible.
+    ///
+    /// Authority is the binding, not the token: the presenting caller *is* the
+    /// generation whose binding this call names, so only the
+    /// `(owner, controller generation)` pair the record currently binds may
+    /// release the layer. A successor that already rebound the container is
+    /// refused and inherits nothing, and a generation whose binding is gone
+    /// cannot reach the record at all. The token path is unchanged: a live
+    /// caller still releases with the token it holds, and
+    /// `ContentNotPresented` / `ContentTokenMismatch` keep their meaning.
+    ///
+    /// The release is all-or-nothing, like the token release: the record is
+    /// removed and the layer's scene slot is detached in the same step (so the
+    /// leaf returns to the grid path), and the displaced terminal content is
+    /// reported. No geometry step is issued here — this side owns no present
+    /// frame, and the freeze is a predicate over the record
+    /// (`Runtime::content_layer_presented`), so with the record gone the
+    /// ordinary per-leaf sync resumes the resize on its own; the edge either
+    /// closes that leaf or rebinds it to a successor.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ControllerConflict`] when the record does not bind
+    /// `(owner, generation)`. Nothing is released: the layer, its scene, and
+    /// its displaced record stay exactly as they were.
+    ///
+    /// Returns `Ok(None)` when the panel presents no layer — every panel before
+    /// bitty#2388, and a panel whose layer this edge already released.
+    pub fn release_content_layer_at_generation_end(
+        &mut self,
+        id: super::panel::PanelId,
+        owner: &bitty_plugin_host::PluginId,
+        generation: Generation,
+    ) -> Result<Option<RestoredPanelContent>, PanelError> {
+        if !self.content_layers.contains_key(&id) {
+            return Ok(None);
+        }
+        if !self.registry.panel_bound_to(id, owner, generation) {
+            self.registry.bump_error("ControllerConflict");
+            return Err(PanelError::ControllerConflict {
+                panel_id: id,
+                bound_generation: self.registry.controller_generation(id),
+                presented_generation: generation,
+            });
+        }
+        let Some(record) = self.content_layers.remove(&id) else {
+            return Ok(None);
+        };
+        // The record is gone before the scene detaches, so this cannot refuse
+        // (a presented layer is exactly what `detach_panel_scene` guards).
+        self.detach_panel_scene(id)?;
+        Ok(Some(RestoredPanelContent {
+            panel: record.panel,
+            view: record.view,
+            content: record.displaced,
+            frozen: record.frozen,
+            scroll_offset: record.scroll_offset,
+            token: record.token,
+        }))
     }
 
     /// The content layer presented on `panel`, if any.

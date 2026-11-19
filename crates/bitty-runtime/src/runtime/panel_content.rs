@@ -36,11 +36,41 @@
 //! | Exactly one restore resize, then a full repaint | [`Runtime::release_panel_content`] measures the current content rect (and the owner's own winsize, pixel axes included), issues the existing per-leaf resize path once when either no longer matches the frozen rect, and arms `pending_full_redraw` |
 //! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) swallow the key for a presented focused view and count it |
 //! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
+//! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
 //! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
 //! content layer?", which is false on every runtime without one. The
 //! no-layer path is therefore byte-identical to before this module existed.
+//!
+//! # Generation edges
+//!
+//! A presented layer cannot outlive the generation that presented it
+//! (bitty#3253). The [`PanelContentToken`] that
+//! [`Runtime::release_panel_content`] requires belongs to the presenting
+//! caller, and a generation edge — reload, disable, crash, unload — removes
+//! that caller. Handing the release to somebody else was rejected: the
+//! successor has no token, would have to be given one (which is the same
+//! authority under another name), and would still be painting a dead
+//! generation's scene until it decided to act.
+//!
+//! So the edge releases the layer itself, through the panel host's binding
+//! rather than a token: `PanelRuntime::release_content_layer_at_generation_end`
+//! is fenced on the `(owner, controller generation)` pair the container
+//! currently binds, and the generation port calls it *before*
+//! `present_placeholder`, because that call is the unbind edge and clears the
+//! binding the fence reads. The container comes back terminal-backed with no
+//! record and no scene, the placeholder is then presented over a layer-free
+//! container, and a successor can present a fresh layer on the same panel
+//! instead of being refused with `PanelError::ContentBusy` until the container
+//! is retired. A successor that already rebound the container is refused
+//! (`PanelError::ControllerConflict`) and inherits nothing, and the three token
+//! refusals keep their meaning for live callers.
+//!
+//! Nothing here issues a restore resize for that path: this module's freeze is
+//! a predicate over the record, so with the record gone the ordinary per-leaf
+//! sync resumes on the next layout pass, and the edge either closes the leaf or
+//! rebinds it to a successor.
 //!
 //! # Not in this slice
 //!
@@ -51,15 +81,6 @@
 //! suppressing the displaced leaf's grid paint pass are follow-ups recorded in
 //! the pull request body. Nothing here stubs them: there is no queue to drain,
 //! no capability to grant, and no owner identity to nest against yet.
-//!
-//! One lifecycle question is also deliberately undecided: a generation edge
-//! (reload, disable, crash) that ends while its panel presents a layer. The
-//! layer's token belongs to the presenting caller, so neither the successor nor
-//! the edge can release it; the detach refuses (bitty#3250 R5), the record dies
-//! with the container, and a successor cannot present again on that panel until
-//! it is retired. That needs its own decision — release on the edge, move the
-//! release authority to the successor, or refuse before the edge changes state
-//! — and it must be settled before the Lua verb exposes the path.
 
 use bitty_rich::scene::Scene;
 use bitty_ui::Point;
@@ -164,6 +185,11 @@ impl Runtime {
     /// panel presents no layer; [`PanelError::ContentTokenMismatch`] when
     /// `token` is not that panel's live layer. A refusal restores nothing and
     /// leaves the live layer presented.
+    ///
+    /// A layer whose generation ended is released by the generation edge
+    /// instead (bitty#3253), so its token then lands in `ContentNotPresented`
+    /// like any other already-released layer — never in a restore of a
+    /// terminal another generation now owns.
     pub fn release_panel_content(
         &mut self,
         view: ViewId,

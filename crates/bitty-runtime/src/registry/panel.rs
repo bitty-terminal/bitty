@@ -3793,6 +3793,23 @@ impl PanelRegistry {
         })
     }
 
+    /// Whether one record's controller binding names `(owner, generation)` and
+    /// the record is still live.
+    ///
+    /// The single predicate [`Self::panels_bound_to`] and
+    /// [`Self::panel_bound_to`] both read, so the enumeration and the
+    /// single-panel question can never answer differently about one record.
+    fn binding_names(
+        record: &PanelRecord,
+        owner: &bitty_plugin_host::PluginId,
+        generation: Generation,
+    ) -> bool {
+        record.state != UiPanelState::Disposed
+            && record.binding.as_ref().is_some_and(|binding| {
+                &binding.plugin_id == owner && binding.controller_generation == generation
+            })
+    }
+
     /// The panels whose binding names `owner` at `generation` (OQ-084 A.2/A.3,
     /// bitty#2476 residual 2).
     ///
@@ -3818,16 +3835,32 @@ impl PanelRegistry {
         let mut bound: Vec<PanelId> = self
             .panels
             .values()
-            .filter(|record| record.state != UiPanelState::Disposed)
-            .filter(|record| {
-                record.binding.as_ref().is_some_and(|binding| {
-                    &binding.plugin_id == owner && binding.controller_generation == generation
-                })
-            })
+            .filter(|record| Self::binding_names(record, owner, generation))
             .map(|record| record.id)
             .collect();
         bound.sort_unstable();
         bound
+    }
+
+    /// Whether `panel_id` is bound to `(owner, generation)` right now — the
+    /// single-panel form of [`Self::panels_bound_to`].
+    ///
+    /// Read-only, and the same predicate the enumeration uses: a disposed
+    /// record binds nothing, and a binding names exactly one pair. It answers
+    /// about the binding in force only, so a caller that presents the record's
+    /// allocation epoch, its retained predecessor generation, or another
+    /// owner's generation gets `false` (bitty#3253 uses this as the fence for
+    /// releasing a dead generation's presented content layer).
+    #[must_use]
+    pub fn panel_bound_to(
+        &self,
+        panel_id: PanelId,
+        owner: &bitty_plugin_host::PluginId,
+        generation: Generation,
+    ) -> bool {
+        self.panels
+            .get(&panel_id.0)
+            .is_some_and(|record| Self::binding_names(record, owner, generation))
     }
 
     /// The panels whose controller binding ended at `owner` and `generation`

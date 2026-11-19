@@ -993,7 +993,13 @@ impl PanelSceneBackend for AppPanelSceneBackend {
 ///   retired-ceiling tombstone, removes the grant row, drains the panel queue,
 ///   unregisters the panel commands, and dismisses the attributed overlays
 ///   *before* the placeholder becomes visible (OQ-084 A.2), so the ordering is
-///   the registry's rather than a second implementation here.
+///   the registry's rather than a second implementation here. A container that
+///   presents a GUI content layer is freed first, through
+///   `PanelRuntime::release_content_layer_at_generation_end` (bitty#3253): the
+///   layer is generation-owned, its token dies with the generation, and the
+///   binding is cleared by the placeholder call itself — so the edge releases it
+///   while the binding still authorizes the call, and the container is
+///   terminal-backed again for whoever comes next.
 /// - **bind** — the containers the predecessor drove are bound to the successor
 ///   through `PanelRuntime::rebind_panel`, which is D.2 phase 2 step 3's
 ///   required caller: it resets the lease and only then drops the tombstone.
@@ -1067,18 +1073,44 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                 }
             }
             let view_id = self.panels.borrow().placement_view_of(panel);
+            // bitty#3253: a presented content layer is generation-owned. Its
+            // release token belongs to the caller that presented it, and that
+            // caller is the generation this edge is ending, so the edge takes
+            // the layer down through the binding before the placeholder
+            // becomes visible. It has to run *before* `present_placeholder`:
+            // that call is the unbind edge and clears the binding, which is the
+            // fence this release is authorized by. Releasing here leaves the
+            // container terminal-backed, so the detach below has nothing to
+            // refuse and a successor can present a fresh layer on the same
+            // panel instead of being refused with `ContentBusy` until the
+            // container is retired.
+            if let Err(error) = self
+                .panels
+                .borrow_mut()
+                .release_content_layer_at_generation_end(panel, edge.owner, ended)
+            {
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: panel {} content layer not released at the {reason} edge: {error}",
+                        panel.0,
+                        reason = edge.reason.as_str()
+                    )
+                });
+            }
             let res =
                 self.panels
                     .borrow_mut()
                     .present_placeholder(panel, ended, edge.reason.as_str());
             match res {
                 Ok(_) => {
-                    // bitty#3250 R5: a presented content layer owns the scene
-                    // slot, so the detach refuses rather than stripping the
-                    // paint half of a live record. Nothing was lost (the
-                    // placeholder is a registry record, not a scene) and the
-                    // layer still has to be released by its owner, which is
-                    // the diagnosable ordering this warning reports.
+                    // The layer is gone (released above), so the detach takes
+                    // the panel's own declarative scene — a `ui.rich` mount —
+                    // and never a live layer's paint half. A refusal here is
+                    // therefore a defect that has to be reported rather than
+                    // swallowed: `detach_panel_scene` refuses exactly while a
+                    // presented layer is still up, which can now only happen if
+                    // the release above was refused for a panel this edge does
+                    // not bind.
                     if let Err(error) = self.panels.borrow_mut().detach_panel_scene(panel) {
                         crate::logging::warn(|| {
                             format!(
@@ -1102,15 +1134,14 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                     // placeholder: `PanelRegistry::rebind_panel` clears
                     // `record.placeholder` in D.2 phase 2 step 2 and the
                     // detach above takes the render scene, so a rebound
-                    // container is bound and placeholder-free. It is
-                    // scene-less only when that detach succeeded: a container
-                    // that holds a presented content layer keeps its layer
-                    // scene and its record (bitty#3250 R5), and that record
-                    // dies with the container in `release_panel_mirrors`
-                    // rather than being released by the successor, which does
-                    // not hold the token. Ending a generation that holds a
-                    // presented layer needs its own lifecycle decision; it is
-                    // recorded in that PR's follow-ups, not decided here.
+                    // container is bound and placeholder-free. A container that
+                    // presented a content layer is placeholder-free *and*
+                    // layer-free, because this edge released the layer above
+                    // (bitty#3253): the successor never inherits the record and
+                    // never needs the token, and the panel comes back
+                    // terminal-backed, so the successor's own present is
+                    // admitted instead of being refused with `ContentBusy`
+                    // until the container is retired.
                     // Every other reason ends the generation with no
                     // successor, so its leaf goes with it.
                     if !matches!(edge.reason, PlaceholderReason::Reloaded) {
@@ -6603,6 +6634,122 @@ error("activation fails after mounting the terminal slot scene")
             release.capture_sessions, 0,
             "an edge that revoked nothing must record nothing"
         );
+    }
+
+    /// bitty#3253: the edge releases the content layer its generation
+    /// presented, before the placeholder and before any successor bind.
+    ///
+    /// On the pre-fix tree this row fails twice over: the record and its scene
+    /// survive the edge (`presented_content_count` stays `1`), and the
+    /// successor's present on the same container is refused with `ContentBusy`
+    /// until the container is retired. It also pins the order inside the edge:
+    /// `present_placeholder` is the unbind call that clears the binding, so a
+    /// release after it has nothing to be authorized by and the layer survives.
+    #[test]
+    fn the_panel_edge_port_releases_a_presented_layer_before_the_placeholder() {
+        use bitty_runtime::registry::PlaceholderReason;
+        use bitty_ui::panel::ViewContent;
+
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host builds"),
+        ));
+        let port = AppPanelGenerationPort::with_layout_ops(Rc::clone(&panels), None);
+        let owner = bitty_plugin_host::manifest::PluginId::new("acme.dashboard").expect("valid id");
+        let view = ViewId::new(41);
+        let panel = {
+            let mut host = panels.borrow_mut();
+            let handle = host
+                .create_panel(PanelType::Helper, None)
+                .expect("create panel");
+            host.mount_panel(handle.id, handle.generation, view)
+                .expect("panel mounts at the leaf");
+            handle.id
+        };
+        let ended = controller_generation(1);
+        let content_rect = bitty_ui::geometry::Rect::new(0, 0, 40, 12);
+        let scene = || {
+            let mut scene = bitty_rich::scene::Scene::new();
+            scene
+                .insert(
+                    bitty_rich::scene::RichBlock::new(
+                        bitty_rich::scene::BlockId(1),
+                        bitty_rich::scene::BlockAnchor::Zone(1),
+                        bitty_rich::scene::SceneNode::Text(bitty_rich::scene::StyledSpan {
+                            text: "generation-owned".to_string(),
+                            bold: false,
+                            italic: false,
+                        }),
+                        bitty_rich::scene::ScrollBehavior::Inline,
+                        1,
+                        1,
+                        1,
+                    )
+                    .expect("block fits SCN-1..3"),
+                )
+                .expect("scene admits the block");
+            scene
+        };
+        {
+            let mut host = panels.borrow_mut();
+            host.rebind_panel(panel, ended, &owner, &BTreeSet::new(), &BTreeSet::new())
+                .expect("first bind");
+            host.present_panel_content(
+                view,
+                ViewContent::Terminal(view.0),
+                content_rect,
+                0,
+                scene(),
+            )
+            .expect("present is admitted on the terminal-backed panel");
+            assert_eq!(host.presented_content_count(), 1);
+        }
+
+        let report = port.release_generation(PanelEdgeRelease {
+            owner: &owner,
+            ended: 1,
+            reason: PlaceholderReason::Reloaded,
+            capture_revoked: false,
+        });
+        assert_eq!(report.committed, vec![panel], "{report:?}");
+        assert!(report.refused.is_empty(), "{report:?}");
+        {
+            let host = panels.borrow();
+            assert_eq!(
+                host.presented_content_count(),
+                0,
+                "the ended generation's layer does not outlive its edge"
+            );
+            assert!(
+                host.panel_scene(panel).is_none(),
+                "the layer's scene leaves with the record, so the detach cannot refuse"
+            );
+            assert!(
+                host.registry().placeholder(panel).is_some(),
+                "the placeholder is presented over a layer-free container"
+            );
+        }
+
+        // The payoff: the successor binds the same container and presents on
+        // it. The pre-fix tree refuses this with `ContentBusy` until the panel
+        // is retired, because the dead generation's record is still there.
+        let bind = port.bind_successor(PanelEdgeBind {
+            owner: &owner,
+            predecessor: 1,
+            successor: 2,
+            requested: &BTreeSet::new(),
+            consented: &BTreeSet::new(),
+        });
+        assert_eq!(bind.committed, vec![panel], "{bind:?}");
+        panels
+            .borrow_mut()
+            .present_panel_content(
+                view,
+                ViewContent::Terminal(view.0),
+                content_rect,
+                0,
+                scene(),
+            )
+            .expect("the successor presents a fresh layer on the same container");
     }
 
     #[test]

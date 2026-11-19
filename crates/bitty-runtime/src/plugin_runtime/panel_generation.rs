@@ -232,6 +232,16 @@ pub trait PanelGenerationPort {
     /// becomes visible only after that release completed. A container whose
     /// presentation then fails is reported in
     /// [`PanelEdgeReport::refused`] and is left unbound.
+    ///
+    /// A container that presents a GUI content layer is freed **first**
+    /// (bitty#3253): the layer and its scene slot are generation-owned, and the
+    /// token that a token release would need dies with the generation, so an
+    /// implementation releases the record while the binding still authorizes
+    /// the call — before the placeholder, which clears that binding — and
+    /// leaves the container terminal-backed for a successor. Releasing it later
+    /// is not an option: a presented layer makes a scene detach refuse
+    /// (`ContentBusy`), so the container would keep a dead generation's scene
+    /// painted and refuse every later present until it was retired.
     fn release_generation(&self, edge: PanelEdgeRelease<'_>) -> PanelEdgeReport;
 
     /// Binds `edge.successor` onto every container `edge.predecessor` still

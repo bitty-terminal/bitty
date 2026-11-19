@@ -35,8 +35,14 @@
 //! 5. **Typed refusals, fail-closed.** Duplicate present, present on a
 //!    non-terminal-backed panel, present with no panel mounted, release with no
 //!    layer, a stale or foreign layer handle, and a scene detach behind a live
-//!    layer all fail typed and change nothing. A presented record can only
-//!    leave by release or by the container dying with it.
+//!    layer all fail typed and change nothing. A presented record leaves by its
+//!    owner's token release, by its generation's edge, or with the container.
+//! 6. **A layer never outlives its generation.** The generation edge releases
+//!    the record through the panel host's binding (no token: the presenting
+//!    generation is the one ending), so the container comes back
+//!    terminal-backed, the freeze and the input gate lift, and a later
+//!    generation presents on the same panel. The release is fenced on that
+//!    binding, so a displaced generation cannot reach the record.
 //!
 //! Every assertion reads observable state — the PTY's own winsize, the pane's
 //! grid, the transport buffer, the presented frame report — never a value the
@@ -1245,4 +1251,174 @@ fn detaching_a_scene_cannot_strand_a_presented_layer() {
         "release already detached the layer's scene"
     );
     assert_eq!(host.presented_content_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Row 6: a presented layer cannot outlive the generation that presented it
+// ---------------------------------------------------------------------------
+
+/// The presenting generation's edge releases the layer through the panel host's
+/// binding (bitty#3253).
+///
+/// Fails for the pre-fix tree four ways at once: the record survives the edge,
+/// the layer's scene stays attached to a dead generation, [`Runtime`] keeps
+/// reporting a `Rich` content kind and a frozen content owner, and a fresh
+/// present on the same panel is refused with `ContentBusy` until the container
+/// is retired. The assertions are the four observables that matter — the record
+/// count, the scene slot, the content kind the input and geometry gates read,
+/// and the token a second present mints.
+#[test]
+fn panel_content_layer_is_released_by_the_generation_edge() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("generation-owned"))
+        .expect("present is admitted on the primary owner");
+    // The presenting generation, in the controller domain the generation port
+    // uses, bound to the container the layer lives on.
+    let owner = bitty_plugin_host::PluginId::new("acme.dashboard").expect("valid plugin id");
+    let ended = bitty_runtime::plugin_runtime::controller_generation(1);
+
+    let host = rt.scene_host().expect("host installed");
+    let restored = {
+        let mut host = host.try_borrow_mut().expect("host is free");
+        host.rebind_panel(
+            presented.panel,
+            ended,
+            &owner,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the generation binds the container");
+        let restored = host
+            .release_content_layer_at_generation_end(presented.panel, &owner, ended)
+            .expect("the ending generation releases its own layer")
+            .expect("a layer was presented");
+        assert_eq!(
+            restored.content,
+            ViewContent::Terminal(PRIMARY.0),
+            "the record still names the terminal content it displaced"
+        );
+        assert_eq!(restored.token, presented.token);
+        assert_eq!(
+            host.presented_content_count(),
+            0,
+            "the record does not survive the generation that presented it"
+        );
+        assert!(
+            host.panel_scene(presented.panel).is_none(),
+            "the layer's scene goes with the record, so the detach above cannot refuse"
+        );
+        restored
+    };
+    assert_eq!(restored.view, PRIMARY);
+
+    // The gates are predicates over the record, so the container is
+    // terminal-backed again the moment the record is gone: no freeze, no input
+    // ownership, and the ordinary paths resume without a release token.
+    assert_eq!(
+        rt.panel_content_kind(PRIMARY),
+        Some(ViewContent::Terminal(PRIMARY.0))
+    );
+    assert!(!rt.content_layer_presented(PRIMARY));
+    assert!(!rt.input_owner_content_frozen());
+    let swallowed_before = rt.content_input_swallowed();
+    assert_eq!(
+        rt.handle_key_event(char_press('g')),
+        Some(vec![b'g']),
+        "the terminal takes its keys back once the layer's generation is gone"
+    );
+    assert_eq!(rt.drain_pending_input(), vec![b'g']);
+    assert_eq!(
+        rt.content_input_swallowed(),
+        swallowed_before,
+        "no key is swallowed for a layer that is no longer presented"
+    );
+
+    // The payoff: a later generation presents on the same container, which the
+    // pre-fix tree refuses with `ContentBusy` until the panel is retired.
+    let again = rt
+        .present_panel_content(PRIMARY, text_layer("successor"))
+        .expect("the panel presents again once the dead layer is released");
+    assert!(
+        again.token > presented.token,
+        "a released token is never reused: {:?} then {:?}",
+        presented.token,
+        again.token
+    );
+}
+
+/// The edge release is fenced on the binding, not on a token (bitty#3253).
+///
+/// A generation that does not bind the container cannot reach the record: the
+/// successor inherits nothing merely by inheriting the container, and the
+/// displaced generation loses its reach the moment the bind replaces it. The
+/// live token path is untouched by the fence, which is what keeps the three
+/// content refusals meaning what they meant before the edge existed.
+#[test]
+fn panel_content_layer_release_is_fenced_on_the_ending_generation() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("fenced"))
+        .expect("present is admitted on the primary owner");
+    let owner = bitty_plugin_host::PluginId::new("acme.dashboard").expect("valid plugin id");
+    let ended = bitty_runtime::plugin_runtime::controller_generation(1);
+    let successor = bitty_runtime::plugin_runtime::controller_generation(2);
+
+    let host = rt.scene_host().expect("host installed");
+    {
+        let mut host = host.try_borrow_mut().expect("host is free");
+        host.rebind_panel(
+            presented.panel,
+            ended,
+            &owner,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("the ending generation binds the container");
+        host.rebind_panel(
+            presented.panel,
+            successor,
+            &owner,
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("a successor binds the same container");
+        match host.release_content_layer_at_generation_end(presented.panel, &owner, ended) {
+            Err(PanelError::ControllerConflict {
+                panel_id,
+                bound_generation,
+                presented_generation,
+            }) => {
+                assert_eq!(panel_id, presented.panel);
+                assert_eq!(bound_generation, Some(successor));
+                assert_eq!(presented_generation, ended);
+            }
+            other => panic!("a displaced generation must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            host.presented_content_count(),
+            1,
+            "a refused edge release leaves the record presented"
+        );
+        assert!(
+            host.panel_scene(presented.panel).is_some(),
+            "a refused edge release leaves the layer's scene attached"
+        );
+    }
+
+    // The token path still releases it, exactly once, with the meaning it had:
+    // a live caller releases with the token it holds.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("the owner still releases through its own token");
+    assert_eq!(rt.panel_content_layer(PRIMARY), None);
+    match rt.release_panel_content(PRIMARY, presented.token) {
+        Err(PanelError::ContentNotPresented { panel_id }) => assert_eq!(panel_id, presented.panel),
+        other => panic!("a spent token must report ContentNotPresented, got {other:?}"),
+    }
 }

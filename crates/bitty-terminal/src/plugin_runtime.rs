@@ -32,7 +32,7 @@ use bitty_runtime::plugin_runtime::{
 };
 use bitty_runtime::registry::{
     Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
-    PanelType, PlaceholderReason, WorkspaceId,
+    PanelType, PlaceholderReason, RestoredPanelContent, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
@@ -573,7 +573,7 @@ pub(crate) struct PluginSession {
 const PLUGIN_PANEL_LAYOUT_QUEUE_CAP: usize = 64;
 
 /// A pending Dwindle layout operation for a plugin-created panel (CTX-1859).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PluginPanelLayoutOp {
     /// Materialize a `View` leaf for `(panel_id, generation)` in the focused
     /// workspace's Dwindle layout.
@@ -598,6 +598,24 @@ pub(crate) enum PluginPanelLayoutOp {
     /// `presentation_observation_of` answers what the leaf presented at the
     /// edge. No layout decision, paint, or grant ever consults the row.
     ObservePresentation { panel_id: PanelId, view_id: ViewId },
+    /// Return the leaf to the presentation mode a released content layer
+    /// displaced (bitty#2388, CTX-1902).
+    ///
+    /// Queued by the release edge: an ended generation's layer is
+    /// generation-owned, so `AppPanelGenerationPort::release_generation` takes it
+    /// down through the host
+    /// (`PanelRuntime::release_content_layer_at_generation_end`) and gets back
+    /// the typed [`RestoredPanelContent`] naming the mode the layer moved the
+    /// panel out of. The host owns no layout and neither does the port, so
+    /// dropping that value is what leaves a floated panel floating after its
+    /// generation died; the edge carries it here instead, and the drain applies
+    /// `Runtime::restore_released_panel_presentation` before the frame is
+    /// presented. Same seam, same reason as [`Self::ObservePresentation`]: only
+    /// the app holds the layout.
+    RestorePresentation {
+        panel_id: PanelId,
+        restored: RestoredPanelContent,
+    },
 }
 
 /// Shared queue of pending [`PluginPanelLayoutOp`] items.
@@ -1147,18 +1165,38 @@ impl PanelGenerationPort for AppPanelGenerationPort {
             // refuse and a successor can present a fresh layer on the same
             // panel instead of being refused with `ContentBusy` until the
             // container is retired.
-            if let Err(error) = self
+            match self
                 .panels
                 .borrow_mut()
                 .release_content_layer_at_generation_end(panel, edge.owner, ended)
             {
-                crate::logging::warn(|| {
-                    format!(
-                        "bitty: panel {} content layer not released at the {reason} edge: {error}",
-                        panel.0,
-                        reason = edge.reason.as_str()
-                    )
-                });
+                Ok(released) => {
+                    // bitty#2388 (CTX-1902): the release consumed the record, so
+                    // the mode the layer moved this panel out of comes back only
+                    // if it is carried out of here. This side owns no layout, so
+                    // the typed record goes to the app's queue — the drain stamps
+                    // the leaf back before the frame is presented. Dropping it
+                    // would leave a floated panel floating over a placeholder
+                    // with nothing left to restore it from.
+                    if let (Some(restored), Some(queue)) = (released, self.layout_ops.as_ref()) {
+                        push_panel_layout_op(
+                            queue,
+                            PluginPanelLayoutOp::RestorePresentation {
+                                panel_id: panel,
+                                restored,
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: panel {} content layer not released at the {reason} edge: {error}",
+                            panel.0,
+                            reason = edge.reason.as_str()
+                        )
+                    });
+                }
             }
             let res =
                 self.panels
@@ -6932,6 +6970,153 @@ error("activation fails after mounting the terminal slot scene")
                 scene(),
             )
             .expect("the successor presents a fresh layer on the same container");
+    }
+
+    /// One-block SCN-1 layer for the generation-edge restore row.
+    fn generation_edge_layer() -> bitty_rich::scene::Scene {
+        let mut scene = bitty_rich::scene::Scene::new();
+        scene
+            .insert(
+                bitty_rich::scene::RichBlock::new(
+                    bitty_rich::scene::BlockId(1),
+                    bitty_rich::scene::BlockAnchor::Zone(1),
+                    bitty_rich::scene::SceneNode::Text(bitty_rich::scene::StyledSpan {
+                        text: "floated layer".to_string(),
+                        bold: false,
+                        italic: false,
+                    }),
+                    bitty_rich::scene::ScrollBehavior::Inline,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("block fits SCN-1..3"),
+            )
+            .expect("scene admits the block");
+        scene
+    }
+
+    /// bitty#2388 (CTX-1902) on the **other** production release path: a panel
+    /// floated through the presentation verb goes back to the mode its layer
+    /// displaced when the generation that presented it ends.
+    ///
+    /// `Runtime::release_panel_content` is not this path.
+    /// `AppPanelGenerationPort::release_generation` releases the layer through
+    /// `PanelRuntime::release_content_layer_at_generation_end` while the binding
+    /// still authorizes it; that call consumes the record and the host owns no
+    /// layout, so the presentation half of "exact restore" only happens if the
+    /// returned `RestoredPanelContent` is carried out of the edge and applied by
+    /// the app that owns the leaf.
+    ///
+    /// The row is the production chain end to end: the composition root's own
+    /// port (`build_dwindle_app` installs it), its queue, the app's
+    /// `apply_plugin_panel_requests` drain, and
+    /// `Runtime::restore_released_panel_presentation`. It fails if the edge
+    /// discards the returned record — the leaf stays `Floating` with nothing left
+    /// to restore it from — and if the drain does not stamp the leaf back.
+    #[test]
+    fn a_generation_edge_returns_a_floated_panel_to_the_mode_its_layer_displaced() {
+        bitty_test_support::require_pty!();
+        use bitty_ui::PresentationMode;
+        use bitty_ui::panel::ViewContent;
+
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("generation-edge-restore");
+        let lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "helper" })
+                    return p.id
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.edgefloat",
+            &["panel.create", "panel.focus"],
+            &[],
+            &["open"],
+            lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let raw = match dispatch_app_cmd(&mut app, "xuepoo.edgefloat", "open", &[]) {
+            Ok(LuaValue::Integer(id)) => id,
+            other => panic!("expected integer panel id, got {other:?}"),
+        };
+        app.drive_tick().expect("tick materializes the leaf");
+        let panel = PanelId(raw as u64);
+        let view = panels
+            .borrow()
+            .placement_view_of(panel)
+            .expect("the created panel is attached to a leaf");
+
+        // A layer displaces live terminal content, so the panel's leaf gets a
+        // shell of its own; present then freezes that terminal's geometry.
+        app.runtime
+            .spawn_shell_for_view(view, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+            .expect("the panel leaf owns a shell");
+        app.drive_tick().expect("tick presents the pane");
+        let presented = app
+            .runtime
+            .present_panel_content(view, generation_edge_layer())
+            .expect("the panel presents a layer over its own terminal");
+        assert_eq!(presented.presentation, PresentationMode::Tiled);
+        assert_eq!(
+            presented.prior_presentation,
+            PresentationMode::Tiled,
+            "the layer records the mode it displaced"
+        );
+
+        app.runtime
+            .set_panel_content_presentation(view, presented.token, PresentationMode::Floating)
+            .expect("a presented panel may float");
+        assert_eq!(
+            app.runtime.view_presentation(view),
+            Some(PresentationMode::Floating),
+            "the leaf itself carries the mode the layer moved it to"
+        );
+        assert!(app.runtime.content_layer_presented(view));
+
+        // The generation that presented the layer ends, through the production
+        // edge: `reload` disposes the predecessor generation, which releases its
+        // generation-owned layer before the placeholder and retains the leaf for
+        // its successor.
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgefloat").expect("id");
+        app.plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .reload(&id)
+            .expect("reload");
+        app.drive_tick().expect("tick drains the edge's restore");
+
+        // The record went with the generation, and the mode came back with it.
+        assert_eq!(
+            panels.borrow().presented_content_count(),
+            0,
+            "the ended generation's layer does not outlive its edge"
+        );
+        assert!(
+            panels.borrow().panel_scene(panel).is_none(),
+            "the layer's scene leaves with the record"
+        );
+        assert!(!app.runtime.content_layer_presented(view));
+        assert_eq!(
+            app.runtime.view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the generation edge returns the panel to the mode its layer displaced"
+        );
+        assert_eq!(
+            app.runtime.panel_content_kind(view),
+            Some(ViewContent::Terminal(view.0)),
+            "the container is terminal-backed again"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(panel),
+            Some(view),
+            "the reload retained the container on the same leaf"
+        );
     }
 
     #[test]

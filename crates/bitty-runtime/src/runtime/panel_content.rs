@@ -44,6 +44,7 @@
 //! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
 //! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
 //! | Mode given back on release | [`Runtime::release_panel_content`] restores the mode recorded at present time when the leaf still carries the mode the layer last requested, and leaves the leaf alone when somebody else moved it |
+//! | Mode given back at a generation edge | the edge's release cannot stamp (the plugin runtime owns no layout), so it carries the typed [`RestoredPanelContent`] to [`Runtime::restore_released_panel_presentation`], which applies the same two guards before the next frame |
 //! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch, ContentPresentationUnsupported}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
@@ -78,6 +79,16 @@
 //! a predicate over the record, so with the record gone the ordinary per-leaf
 //! sync resumes on the next layout pass, and the edge either closes the leaf or
 //! rebinds it to a successor.
+//!
+//! The **presentation** half of the restore does not fall out of that predicate,
+//! so the edge carries it: the port hands the typed
+//! [`RestoredPanelContent`] to the app-owned queue it already uses for the leaves
+//! it cannot reach (the same seam as its bind-edge observation), and the drain
+//! calls [`Runtime::restore_released_panel_presentation`] before the frame is
+//! presented. A floated layer therefore comes back to the mode it displaced
+//! instead of leaving a placeholder in a float nobody asked for. A refused
+//! release (`PanelError::ControllerConflict`) still tears nothing down and
+//! queues nothing.
 //!
 //! # Not in this slice
 //!
@@ -250,6 +261,42 @@ impl Runtime {
         self.restore_panel_presentation(&restored);
         self.restore_panel_content_geometry(&restored);
         Ok(restored)
+    }
+
+    /// Returns the panel to the mode a released layer displaced, on a release
+    /// path that owns no present frame (bitty#2388, CTX-1902).
+    ///
+    /// [`Runtime::release_panel_content`] restores the mode itself, because it
+    /// owns the layout it stamps. The other production release path does not:
+    /// the generation edge releases the layer inside the plugin runtime
+    /// (`PanelRuntime::release_content_layer_at_generation_end`), which owns the
+    /// panel host but no layout, so it **carries** the typed
+    /// [`RestoredPanelContent`] to this side instead of discarding it. This is
+    /// where that record is applied, through the same two guards the token
+    /// release applies: a layer that never moved the mode restores nothing, and
+    /// a leaf somebody else moved since is left where it is.
+    ///
+    /// Geometry is deliberately not touched: the caller owns no present frame,
+    /// the freeze is a predicate over the record (already gone), and the edge
+    /// either closes the leaf or rebinds it to a successor — the ordinary
+    /// per-leaf sync resumes on its own.
+    ///
+    /// Returns `true` when the leaf was moved back to
+    /// [`RestoredPanelContent::prior_presentation`] and `false` for every no-op,
+    /// which includes the ordinary disposal case where the edge closed the leaf
+    /// before this ran.
+    #[must_use]
+    pub fn restore_released_panel_presentation(&mut self, restored: &RestoredPanelContent) -> bool {
+        let before = self.view_presentation(restored.view);
+        self.restore_panel_presentation(restored);
+        if self.view_presentation(restored.view) == before {
+            return false;
+        }
+        // The leaf moved, so the retained primitives describe a frame that no
+        // longer exists: the first frame in the returned mode is a full paint.
+        self.presented_leaf_frames.remove(&restored.view);
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Presents the layer of the panel at `view` in `mode` (bitty#2388,
@@ -605,11 +652,29 @@ impl Runtime {
     ///
     /// - A layer that never moved the mode restores nothing (`presentation ==
     ///   prior_presentation`), so an ordinary present/release of a tiled panel
-    ///   is byte-identical to the slice that had no modes.
+    ///   is byte-identical to the slice that had no modes: not one stamp
+    ///   reaches the transition gate.
     /// - A leaf whose mode no longer equals the mode this layer last requested
     ///   was moved by somebody else (a detach, a keybinding, a restored
     ///   snapshot). That intent outranks the layer's, so the leaf is left where
     ///   it is and only the content is restored.
+    ///
+    /// Both guards share one leaf state, so only the second one is
+    /// *behaviourally* discriminating, and it is discriminated alone:
+    /// `release_leaves_a_third_party_mode_alone_after_the_layer_floated`
+    /// (`tests/panel_content_presentation_modes.rs`, row 8) presents `Tiled`,
+    /// floats through the verb so the record's mode differs from the prior mode,
+    /// stamps `Fullscreen` out of band, and releases — with this guard deleted
+    /// the prior `Tiled` is stamped over that `Fullscreen`. Guard 1 is kept
+    /// because it is the only thing that keeps the ordinary case stamp-free;
+    /// no row can see its removal, since guard 2 refuses the same leaves for the
+    /// same reason.
+    ///
+    /// This runs on both production release paths: the token release
+    /// ([`Runtime::release_panel_content`]) and the generation edge, which
+    /// carries its [`RestoredPanelContent`] to
+    /// [`Runtime::restore_released_panel_presentation`] because the plugin
+    /// runtime owns no layout.
     ///
     /// The stamp cannot refuse for a supported mode on a live leaf; a layer
     /// whose leaf left the layout (closed, discarded, moved to another store)

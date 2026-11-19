@@ -39,6 +39,12 @@
 //!    release only returns the mode the layer itself moved.
 //! 7. **The prior mode is the one the layer displaced.** A layer presented on an
 //!    already-floating panel records `Floating` as prior and gives it back.
+//! 8. **Release never overwrites a mode a third party stamped after the layer
+//!    moved the panel.** Present `Tiled`, float through the verb (so the record's
+//!    mode and the prior mode differ), stamp `Fullscreen` out of band, release:
+//!    the leaf stays `Fullscreen` and only the content comes back. This is the
+//!    second restore guard on its own — row 6 cannot reach it, because a layer
+//!    that never moved the mode is answered by the first guard.
 //!
 //! Every assertion reads observable state — the presented frame report, the
 //! leaf's mode through `Runtime::view_presentation`, the PTY's own winsize — and
@@ -572,5 +578,71 @@ fn a_layer_presented_on_a_floating_panel_gives_floating_back() {
         frame_of(&rt, PRIMARY).frame,
         floated.frame,
         "and to the exact frame that mode gives it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 8: the second restore guard, on its own — a third party moves the leaf
+//        after the layer did, and release leaves that intent alone
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_leaves_a_third_party_mode_alone_after_the_layer_floated() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panels_at(&mut rt, &[PRIMARY]);
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("layer"))
+        .expect("primary presents");
+    assert_eq!(presented.presentation, PresentationMode::Tiled);
+
+    // The layer moves the panel itself, so the record's mode (`Floating`) and
+    // the mode release would give back (`Tiled`) differ. Row 6 cannot reach the
+    // second restore guard because the first one answers it: here the first one
+    // no longer answers, and only the second can refuse the restore.
+    let floated = rt
+        .set_panel_content_presentation(PRIMARY, presented.token, PresentationMode::Floating)
+        .expect("a presented panel may float");
+    assert_eq!(floated.presentation, PresentationMode::Floating);
+    assert_eq!(floated.prior_presentation, PresentationMode::Tiled);
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Floating)
+    );
+
+    // Third party, out of band, after the layer's own move: the leaf carries
+    // somebody else's intent now, and that outranks the layer's.
+    stamp_out_of_band(&mut rt, PRIMARY, PresentationMode::Fullscreen);
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Fullscreen)
+    );
+
+    let restored = rt
+        .release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the terminal content");
+    assert_eq!(
+        restored.presentation,
+        PresentationMode::Floating,
+        "the record still names the mode the layer last requested"
+    );
+    assert_eq!(
+        restored.prior_presentation,
+        PresentationMode::Tiled,
+        "and the mode the layer displaced"
+    );
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Fullscreen),
+        "release restores content, never the mode a third party stamped after the layer moved the panel"
+    );
+    assert_eq!(
+        rt.panel_content_kind(PRIMARY),
+        Some(ViewContent::Terminal(PRIMARY.0)),
+        "the content is restored either way"
+    );
+    assert!(
+        !rt.content_layer_presented(PRIMARY),
+        "and the layer is gone"
     );
 }

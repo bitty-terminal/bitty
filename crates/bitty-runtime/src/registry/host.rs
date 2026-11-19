@@ -1977,6 +1977,13 @@ impl PanelRuntime {
     ///
     /// Returns `Ok(None)` when the panel presents no layer — every panel before
     /// bitty#2388, and a panel whose layer this edge already released.
+    ///
+    /// A `Some` record must not be dropped (bitty#2388, CTX-1902): it carries
+    /// the presentation half of the same restore — the mode the layer moved the
+    /// panel out of and the mode it last presented in. The host owns no layout,
+    /// so it cannot stamp the leaf back; whoever does own one applies the record
+    /// through `Runtime::restore_released_panel_presentation`, or the panel stays
+    /// in a mode a dead generation asked for.
     pub fn release_content_layer_at_generation_end(
         &mut self,
         id: super::panel::PanelId,

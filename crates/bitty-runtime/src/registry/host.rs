@@ -658,6 +658,47 @@ impl PanelRuntime {
         self.registry.present_placeholder(id, presented, reason)
     }
 
+    /// Presents the `suspended` placeholder on a panel whose controller
+    /// generation is parked, keeping the panel bound (OQ-084 C.1, bitty#2476
+    /// residual 3).
+    ///
+    /// The registry owns the transition and the facade adds nothing, because
+    /// nothing of a park is facade-owned: the view attachment, the title, the
+    /// render scene slot, the content layer, and the lease tenure all stay
+    /// exactly as they were — a park is not an unbind, so no mirror has to follow
+    /// it and the panel keeps presenting its own content under the placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`PanelRegistry::present_suspended_placeholder`] refuses with —
+    /// `NotFound`, `RegistryDisposed`, `StaleHandle`, `ControllerConflict`, or
+    /// `ControllerReleased`. A refusal presents nothing and moves nothing.
+    pub fn present_suspended_placeholder(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+    ) -> Result<super::panel::PanelPlaceholder, PanelError> {
+        self.registry.present_suspended_placeholder(id, generation)
+    }
+
+    /// Takes the park's `suspended` placeholder away again (OQ-084 C.1,
+    /// bitty#2476 residual 3).
+    ///
+    /// Answers whether a placeholder was removed; see
+    /// [`PanelRegistry::clear_suspended_placeholder`] for why a container the
+    /// call does not mark is a no-op rather than a refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::RegistryDisposed`] when the registry is terminal.
+    pub fn clear_suspended_placeholder(
+        &mut self,
+        id: super::panel::PanelId,
+        generation: Generation,
+    ) -> Result<bool, PanelError> {
+        self.registry.clear_suspended_placeholder(id, generation)
+    }
+
     /// The placeholder and recovery record set a container presents while
     /// unbound (`bitty#2476` AC-4).
     ///

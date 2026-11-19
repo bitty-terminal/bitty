@@ -590,18 +590,29 @@ impl PanelRebind {
 }
 
 /// The unbound container's placeholder (OQ-084 Decision E, bitty#2476
-/// residual 4).
+/// residuals 3 and 4).
 ///
 /// The container is retained (the record, its state, its workspace, and its
-/// attachment are untouched), the controller binding is absent (the unbind edge
-/// cleared it, or none was ever written), and the content is absent. The
-/// reason is the one Decision E rule 2 spelling the last transition carried, so
-/// a panel has exactly one findable reason at a time.
+/// attachment are untouched) and the content is absent. The reason is the one
+/// Decision E rule 2 spelling the last transition carried, so a panel has
+/// exactly one findable reason at a time.
+///
+/// The binding is absent in the ordinary case: the unbind edge cleared it, or
+/// none was ever written. The one exception is the parked controller
+/// ([`PanelRegistry::present_suspended_placeholder`], C.1): a suspension is not
+/// an edge, so the record keeps its binding and its grant row while the
+/// `suspended` placeholder is presented, and the resume
+/// ([`PanelRegistry::clear_suspended_placeholder`]) takes the placeholder away
+/// again without a rebind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PanelPlaceholder {
     reason: PlaceholderReason,
-    /// The controller generation that ended when the placeholder appeared
+    /// The controller generation the placeholder is about.
+    ///
+    /// For a placeholder presented at an end it is the generation that ended
     /// (`None` for a container that never had a controller: the unloaded case).
+    /// For the parked case it is the generation that is still bound — the
+    /// generation the park names, not one that ended.
     unbound_generation: Option<Generation>,
 }
 
@@ -653,8 +664,11 @@ pub struct PlaceholderPresentation {
 ///
 /// The snapshot is derived on every call and never stored: it carries no
 /// authority, and a plugin cannot hold or mutate it. `bound` reports whether the
-/// container currently has a controller generation, so a bound container reads as
-/// an empty set instead of as "no container".
+/// container currently has a controller generation, so a container with no
+/// controller and no record reads as an empty set instead of as "no container".
+/// A container that is bound *and* presents a reason is the parked one
+/// ([`PanelRegistry::present_suspended_placeholder`]): since bitty#2476
+/// residual 3, `bound.is_some()` no longer implies `placeholder.is_none()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnboundContainerRecords {
     panel: PanelId,
@@ -2641,7 +2655,130 @@ impl PanelRegistry {
         })
     }
 
-    /// The placeholder on a panel, if it is unbound (OQ-084 E).
+    /// Presents the `suspended` placeholder on a container whose controller
+    /// generation is parked, keeping the binding (OQ-084 C.1, bitty#2476
+    /// residual 3).
+    ///
+    /// A controller `Suspended` does not suspend the panel (C.1). The container,
+    /// its state, its attachment, its workspace membership, its title, its
+    /// presentation slot, and its panel-scoped grant row all stay exactly as
+    /// they were, and the generation keeps the binding — a park is a lifecycle
+    /// transition of the *controller*, not an edge of the panel. What the
+    /// generation loses is its verbs, which the plugin runtime parks in its own
+    /// directories, and what the user gets is the Core-owned placeholder naming
+    /// [`PlaceholderReason::Suspended`].
+    ///
+    /// This is deliberately **not** [`Self::present_placeholder`]: that call is
+    /// the unbind edge (it runs [`Self::release_generation_scope`] and clears the
+    /// binding), which is the `Disposed` mapping of C.2, not the `Suspended` one.
+    /// A park that released the generation would leave the resume with nothing
+    /// to come back to, and the record's own wording — a parked controller
+    /// "retains grants" and the panel "keeps its state" — is only representable
+    /// while the binding that keys those grants is still in force.
+    ///
+    /// No recovery record and no counter key is written. The bounded recovery
+    /// budget counts transitions that *recover or end* a container's controller
+    /// (E.1); a park reverts at the next resume, is repeated by every
+    /// suspend/resume cycle the user performs, and counting it would spend the
+    /// eight-attempt budget of a container on a reversible user action and grow
+    /// one diagnostic per cycle, which E.1's own bound forbids. Presenting the
+    /// same park twice is therefore idempotent rather than a second attempt.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `RegistryDisposed`, `StaleHandle`, `ControllerConflict`, and
+    /// `ControllerReleased` from the controller fence: a park names the
+    /// generation the record **binds**, so a container that never bound one and
+    /// a generation whose edge already ran are both refused, and nothing is
+    /// presented.
+    pub fn present_suspended_placeholder(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+    ) -> Result<PanelPlaceholder, PanelError> {
+        self.ensure_not_disposed()?;
+        self.panel_state_at_controller_fence(panel_id, generation)?;
+        let Some(bound) = self
+            .panels
+            .get(&panel_id.0)
+            .and_then(|record| record.controller_generation())
+        else {
+            self.bump_error("ControllerConflict");
+            return Err(PanelError::ControllerConflict {
+                panel_id,
+                bound_generation: None,
+                presented_generation: generation,
+            });
+        };
+        if bound != generation {
+            self.bump_error("ControllerConflict");
+            return Err(PanelError::ControllerConflict {
+                panel_id,
+                bound_generation: Some(bound),
+                presented_generation: generation,
+            });
+        }
+        let placeholder = PanelPlaceholder {
+            reason: PlaceholderReason::Suspended,
+            unbound_generation: Some(generation),
+        };
+        if let Some(record) = self.panels.get_mut(&panel_id.0) {
+            record.placeholder = Some(placeholder);
+        }
+        Ok(placeholder)
+    }
+
+    /// Clears the `suspended` placeholder a park presented, leaving everything
+    /// else untouched (OQ-084 C.1: the resume restores the prior presented
+    /// content).
+    ///
+    /// Idempotent and total over the containers a park could have marked: a
+    /// container that is gone, that another generation binds, or that presents
+    /// any other reason is left exactly as it is and the call answers `false`.
+    /// Clearing a presentation marker moves no authority — it grants nothing,
+    /// releases nothing, and rewrites no binding — so a no-op is the correct
+    /// answer where a refusal would only turn an ordinary race (a panel the user
+    /// closed while its plugin was parked) into an error.
+    ///
+    /// Every other placeholder clear in the tree is a byproduct of a commit
+    /// that owns the container again ([`Self::mount_panel`],
+    /// [`Self::rebind_panel`]); this one exists because a park is the only
+    /// placeholder a *live* binding can carry, and the resume that ends it
+    /// performs no other registry write.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::RegistryDisposed`] when the registry is terminal. Nothing
+    /// else: the call has no refusal for a panel it does not mark.
+    pub fn clear_suspended_placeholder(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+    ) -> Result<bool, PanelError> {
+        self.ensure_not_disposed()?;
+        let Some(record) = self.panels.get_mut(&panel_id.0) else {
+            return Ok(false);
+        };
+        if record.state == UiPanelState::Disposed
+            || record.controller_generation() != Some(generation)
+        {
+            return Ok(false);
+        }
+        let parked = record
+            .placeholder
+            .is_some_and(|placeholder| placeholder.reason() == PlaceholderReason::Suspended);
+        if parked {
+            record.placeholder = None;
+        }
+        Ok(parked)
+    }
+
+    /// The placeholder on a panel, if it presents one (OQ-084 E).
+    ///
+    /// A placeholder is presented on a container whose controller ended (the
+    /// unbind case) and, since bitty#2476 residual 3, on a container whose
+    /// controller is parked while the binding stays in force (C.1). Read
+    /// [`PanelRecord`]'s binding, not this accessor, to tell the two apart.
     #[must_use]
     pub fn placeholder(&self, panel_id: PanelId) -> Option<PanelPlaceholder> {
         self.panels
@@ -2698,8 +2835,11 @@ impl PanelRegistry {
     /// One read-only value for the AC "accepts no verb, keeps one record": a
     /// caller compares it across ticks and sees it unchanged while no transition
     /// runs. `None` when the panel does not exist or the registry is disposed;
-    /// a bound container reads as a snapshot with
-    /// [`UnboundContainerRecords::bound_generation`] set and no placeholder.
+    /// a container whose controller ended reads as a snapshot with
+    /// [`UnboundContainerRecords::bound_generation`] `None` and the reason its
+    /// placeholder names. A **bound** container reads as
+    /// [`UnboundContainerRecords::bound_generation`] set and, except while its
+    /// controller is parked (bitty#2476 residual 3), no placeholder.
     ///
     /// The snapshot is derived, never stored: it grants nothing and a plugin
     /// cannot hold it. The record count is the retained ring's length (at most
@@ -2728,8 +2868,9 @@ impl PanelRegistry {
     /// The Core-owned placeholder block a panel currently presents, rebuilt
     /// from its reason and admitted against `SCN-1..3`.
     ///
-    /// `Ok(None)` when the panel is bound (it has no placeholder). The block is
-    /// never stored, so no caller and no plugin can hold or mutate it.
+    /// `Ok(None)` when the panel presents no placeholder — a bound container,
+    /// except while its controller is parked (bitty#2476 residual 3). The block
+    /// is never stored, so no caller and no plugin can hold or mutate it.
     ///
     /// # Errors
     /// [`PanelError::PlaceholderSceneRejected`] if the fixed table ever stops

@@ -12,11 +12,16 @@
 //! changes is the panel's **content kind**: a terminal-backed panel
 //! (`ViewContent::Terminal`) presents a bounded GUI content layer
 //! (`ViewContent::Rich`) instead, and release restores the recorded terminal
-//! content byte-for-byte.
+//! content byte-for-byte. The panel's **presentation mode** is the other half
+//! of the same statement (CTX-1902): the layer may sit in the panel's own slot
+//! or float over the workspace, and release returns it to the mode it
+//! displaced.
 //!
 //! ```text
 //! Terminal(tid) --present--> Gui(surface)     displaced = Terminal(tid)
 //! Gui(surface)  --release--> Terminal(tid)    displaced record consumed
+//! tiled         --set mode-> floating         record.presentation = floating
+//! floating      --release--> tiled            prior_presentation restored
 //! ```
 //!
 //! # What the swap does not touch
@@ -37,7 +42,9 @@
 //! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) swallow the key for a presented focused view and count it |
 //! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
-//! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch}` |
+//! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
+//! | Mode given back on release | [`Runtime::release_panel_content`] restores the mode recorded at present time when the leaf still carries the mode the layer last requested, and leaves the leaf alone when somebody else moved it |
+//! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch, ContentPresentationUnsupported}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
 //! content layer?", which is false on every runtime without one. The
@@ -81,9 +88,21 @@
 //! suppressing the displaced leaf's grid paint pass are follow-ups recorded in
 //! the pull request body. Nothing here stubs them: there is no queue to drain,
 //! no capability to grant, and no owner identity to nest against yet.
+//!
+//! The mode verb (CTX-1902) is Core-owned and token-fenced, and it is the mode
+//! *change* half only. A plugin-facing path is not part of it: `bitty.panel.
+//! set_presentation` stays `E_NOT_IMPLEMENTED` because no plugin-facing
+//! present hands a plugin a [`PanelContentToken`] to fence a change with, and a
+//! verb that can only ever answer "no layer" would be a stub wearing the
+//! feature's name. Two of the four modes are answerable (`Tiled`, `Floating`);
+//! `Fullscreen` (app-level zoom) and `Scratchpad` (the scratchpad store) are
+//! refused with [`PanelError::ContentPresentationUnsupported`] until the
+//! mechanism that can honor them owns the change, and a bottom band has no
+//! placement at all yet.
 
 use bitty_rich::scene::Scene;
 use bitty_ui::Point;
+use bitty_ui::PresentationMode;
 use bitty_ui::ViewId;
 use bitty_ui::geometry::Rect;
 
@@ -142,10 +161,25 @@ impl Runtime {
             .layout
             .find_leaf(view)
             .map_or(0, bitty_ui::View::scroll_offset);
+        // The mode the panel presents in is part of what a layer records: it is
+        // the mode release gives back, and the mode a plugin-facing change
+        // moves (bitty#2388, CTX-1902). Read from the leaf so the record starts
+        // in agreement with the tree.
+        let Some(presentation) = self.view_presentation(view) else {
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "view holds no presentation mode",
+            });
+        };
         let presented = match host.try_borrow_mut() {
-            Ok(mut host) => {
-                host.present_panel_content(view, displaced, frozen, scroll_offset, scene)
-            }
+            Ok(mut host) => host.present_panel_content(
+                view,
+                displaced,
+                frozen,
+                scroll_offset,
+                presentation,
+                scene,
+            ),
             // The host is shared with the plugin services. A reentrant plugin
             // call holds the borrow; refuse rather than panic, and change
             // nothing (the same fail-closed rule the present loop uses).
@@ -209,8 +243,166 @@ impl Runtime {
             }),
         };
         let restored = restored?;
+        // The presentation half of "exact restore" runs before the geometry
+        // half: the mode decides the content rect the restore resize measures,
+        // so the panel must already be back in its own mode when the rect is
+        // read.
+        self.restore_panel_presentation(&restored);
         self.restore_panel_content_geometry(&restored);
         Ok(restored)
+    }
+
+    /// Presents the layer of the panel at `view` in `mode` (bitty#2388,
+    /// CTX-1902).
+    ///
+    /// This is the presentation-mode half of "a GUI plugin presents in place of
+    /// its panel": the panel that presents a content layer may choose where the
+    /// surface sits — in its own slot ([`PresentationMode::Tiled`], the mode
+    /// present used) or as a bounded float over the workspace
+    /// ([`PresentationMode::Floating`]) — without giving up its `PanelId`, its
+    /// attachment, its content layer, or its displaced terminal.
+    ///
+    /// The change is one atomic step with one authority:
+    ///
+    /// 1. **Validate.** The layer must exist for `view`'s panel
+    ///    ([`PanelError::ContentNotPresented`]), `token` must be that layer
+    ///    ([`PanelError::ContentTokenMismatch`]), and `mode` must be a mode a
+    ///    presented panel can take ([`PanelError::ContentPresentationUnsupported`]).
+    ///    Every one of those refusals happens before anything moves.
+    /// 2. **Stamp.** The leaf is stamped through the workspace command registry
+    ///    ([`bitty_ui::apply_presentation_command`]) — the same single
+    ///    transition gate every other mode change uses, never a direct write to
+    ///    the layout node.
+    /// 3. **Record.** Only then does the layer record the new mode
+    ///    ([`crate::registry::PanelRuntime::commit_presented_content_presentation`]),
+    ///    so a refused stamp leaves the record untouched and no state is ever
+    ///    reported as changed when it did not change.
+    ///
+    /// Re-presenting the mode the leaf already has is a true no-op: no stamp,
+    /// no record write, no repaint armed. That is what keeps a mode the user
+    /// moved out of band from being rewritten by a redundant request, and it is
+    /// why release can tell "the layer moved this leaf" from "somebody else
+    /// did".
+    ///
+    /// # What does not move
+    ///
+    /// The displaced terminal keeps its frozen geometry: the mode change is a
+    /// layout fact, and the freeze (`Runtime::content_layer_presented`) is a
+    /// predicate over the layer record, so no `LogicalRect -> PTY` step runs
+    /// and no `SIGWINCH` is delivered for the new frame. The content kind stays
+    /// `Rich(token)`, the token stays valid, the scene slot stays attached, and
+    /// focus is untouched: this verb moves *where* the panel paints, never
+    /// *what* it presents or who owns input.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel host is installed, no
+    /// panel is mounted at `view`, the host is borrowed, or `view` is not a
+    /// leaf of the workspace layout (a detached float's placement belongs to
+    /// the detach-restore path, not to the layer); [`PanelError::ContentNotPresented`]
+    /// when the panel presents no layer; [`PanelError::ContentTokenMismatch`]
+    /// when `token` is not that layer; [`PanelError::ContentPresentationUnsupported`]
+    /// for a mode this runtime cannot give an in-tree panel. A refusal changes
+    /// nothing: no stamp, no record write, no focus, no resize.
+    pub fn set_panel_content_presentation(
+        &mut self,
+        view: ViewId,
+        token: PanelContentToken,
+        mode: bitty_ui::PresentationMode,
+    ) -> Result<PresentedPanelContent, PanelError> {
+        let Some(host) = self.scene_host.clone() else {
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel host installed",
+            });
+        };
+        // Step 1 — validate. Every refusal below leaves the leaf, the record,
+        // the focus, and the PTY exactly as they were.
+        let (panel, layer) = match host.try_borrow() {
+            Ok(host) => {
+                let panel = host.content_panel_for_view(view)?;
+                let Some(layer) = host.presented_content(panel).cloned() else {
+                    return Err(PanelError::ContentNotPresented { panel_id: panel });
+                };
+                (panel, layer)
+            }
+            Err(_) => {
+                return Err(PanelError::ContentUnavailable {
+                    view_id: view,
+                    reason: "panel host is borrowed",
+                });
+            }
+        };
+        if layer.token != token {
+            return Err(PanelError::ContentTokenMismatch {
+                panel_id: panel,
+                token: token.get(),
+            });
+        }
+        if !presented_panel_mode_supported(mode) {
+            return Err(PanelError::ContentPresentationUnsupported {
+                view_id: view,
+                mode: mode.as_str(),
+            });
+        }
+        let Some(current) = self.view_presentation(view) else {
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "view holds no presentation mode",
+            });
+        };
+        if current == mode {
+            // Nothing to stamp and nothing to record: a redundant request must
+            // not claim the leaf's mode as the layer's own.
+            return Ok(layer);
+        }
+        // Step 2 — stamp through the one transition gate.
+        bitty_ui::apply_presentation_command(
+            &mut self.layout,
+            bitty_ui::presentation_command_for_mode(mode),
+            view,
+        )
+        .map_err(|error| match error {
+            bitty_ui::PresentationCommandError::LeafNotFound(_) => PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "view is not a workspace layout leaf",
+            },
+            bitty_ui::PresentationCommandError::Rejected { .. } => {
+                PanelError::ContentPresentationUnsupported {
+                    view_id: view,
+                    mode: mode.as_str(),
+                }
+            }
+            bitty_ui::PresentationCommandError::UnknownCommand(_) => {
+                PanelError::ContentUnavailable {
+                    view_id: view,
+                    reason: "presentation command is not a workspace command",
+                }
+            }
+        })?;
+        // Step 3 — record. The stamp above is the only fallible half, so this
+        // cannot refuse on any path that reached it.
+        let committed = match host.try_borrow_mut() {
+            Ok(mut host) => host.commit_presented_content_presentation(view, mode),
+            Err(_) => None,
+        };
+        let Some(record) = committed else {
+            // Unreachable: the record was validated a few statements ago and
+            // nothing re-entered. Report the refusal honestly and put the leaf
+            // back where the caller found it rather than leave a half state.
+            let _ = bitty_ui::apply_presentation_command(
+                &mut self.layout,
+                bitty_ui::presentation_command_for_mode(current),
+                view,
+            );
+            return Err(PanelError::ContentNotPresented { panel_id: panel });
+        };
+        // The layer's content rect may have moved: drop the retained leaf
+        // primitives so the first frame in the new mode is a full paint rather
+        // than a diff against a frame that no longer exists.
+        self.presented_leaf_frames.remove(&view);
+        self.pending_full_redraw = true;
+        Ok(record)
     }
 
     /// The content layer presented on the panel mounted at `view`, if any.
@@ -404,6 +596,39 @@ impl Runtime {
         Some(Rect::new(origin.x, origin.y, cols, rows))
     }
 
+    /// Returns the panel to the presentation mode the layer moved it out of.
+    ///
+    /// The layer is a *presentation* of the panel, so the mode it moved is the
+    /// mode it gives back — through the same workspace command registry the
+    /// change went through (`bitty_ui::apply_presentation_command`), never by
+    /// writing the leaf. Two guards keep the restore from overreaching:
+    ///
+    /// - A layer that never moved the mode restores nothing (`presentation ==
+    ///   prior_presentation`), so an ordinary present/release of a tiled panel
+    ///   is byte-identical to the slice that had no modes.
+    /// - A leaf whose mode no longer equals the mode this layer last requested
+    ///   was moved by somebody else (a detach, a keybinding, a restored
+    ///   snapshot). That intent outranks the layer's, so the leaf is left where
+    ///   it is and only the content is restored.
+    ///
+    /// The stamp cannot refuse for a supported mode on a live leaf; a layer
+    /// whose leaf left the layout (closed, discarded, moved to another store)
+    /// has no mode to return to and release must not fail over presentation
+    /// after the content is already back.
+    fn restore_panel_presentation(&mut self, restored: &RestoredPanelContent) {
+        if restored.presentation == restored.prior_presentation {
+            return;
+        }
+        if self.view_presentation(restored.view) != Some(restored.presentation) {
+            return;
+        }
+        let _ = bitty_ui::apply_presentation_command(
+            &mut self.layout,
+            bitty_ui::presentation_command_for_mode(restored.prior_presentation),
+            restored.view,
+        );
+    }
+
     /// Applies the release-side geometry contract: one resize when the
     /// current content rect differs from the frozen one, then one full
     /// repaint.
@@ -458,4 +683,25 @@ impl Runtime {
         self.presented_leaf_frames.remove(&restored.view);
         self.pending_full_redraw = true;
     }
+}
+
+/// Modes a presented panel can actually take on this tree (bitty#2388,
+/// CTX-1902).
+///
+/// `Tiled` and `Floating` are the two placements the present loop can give an
+/// in-tree leaf today: `Tiled` fills the solver slot, and `Floating` re-places
+/// the leaf at the configured float frame with the elevated `Float` tier
+/// (`PresentationMode::overlay_tier`, `float_frame`). Both are real placements,
+/// so both are answerable.
+///
+/// The other two are refused rather than accepted and ignored, because a mode
+/// that stamps and then paints exactly like the mode it replaced is a lie about
+/// layout. `Fullscreen` is the app-level zoom (`zoom_backup` backup/restore in
+/// the host application), not a leaf stamp: stamping it changes no frame. And
+/// `Scratchpad` is the scratchpad store's hide/slot behavior plus the float
+/// frame, so a bare stamp would produce a float that never hides — also not
+/// what the caller asked for. Both stay refusals until the mechanism that can
+/// honor them owns the mode change.
+fn presented_panel_mode_supported(mode: PresentationMode) -> bool {
+    matches!(mode, PresentationMode::Tiled | PresentationMode::Floating)
 }

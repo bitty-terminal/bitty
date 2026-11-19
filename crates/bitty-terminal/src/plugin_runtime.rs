@@ -6878,6 +6878,7 @@ error("activation fails after mounting the terminal slot scene")
                 ViewContent::Terminal(view.0),
                 content_rect,
                 0,
+                bitty_ui::PresentationMode::Tiled,
                 scene(),
             )
             .expect("present is admitted on the terminal-backed panel");
@@ -6927,6 +6928,7 @@ error("activation fails after mounting the terminal slot scene")
                 ViewContent::Terminal(view.0),
                 content_rect,
                 0,
+                bitty_ui::PresentationMode::Tiled,
                 scene(),
             )
             .expect("the successor presents a fresh layer on the same container");

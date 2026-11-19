@@ -27,6 +27,21 @@ pub enum InvariantViolation {
         /// Grid height.
         height: u16,
     },
+    /// Invariant 1: the inactive screen's stored scroll region (the primary's
+    /// margins while the alternate screen is active) violates
+    /// `top <= bottom < height`.
+    ///
+    /// Margins are per screen, so the stored pair is checked exactly like the
+    /// live one: a resize must clamp it before it can be restored on
+    /// `?1049l`/`?47l`.
+    SavedScrollRegionInvalid {
+        /// Stored region top row.
+        top: u16,
+        /// Stored region bottom row.
+        bottom: u16,
+        /// Grid height.
+        height: u16,
+    },
     /// Invariant 1: cursor outside screen bounds.
     CursorOutOfBounds {
         /// Cursor row.
@@ -199,6 +214,20 @@ impl State {
             return Err(InvariantViolation::ScrollRegionInvalid {
                 top: self.scroll_region_top,
                 bottom: self.scroll_region_bottom,
+                height: self.height as u16,
+            });
+        }
+        // Margins are per screen: the inactive screen's stored pair (the
+        // primary's, while the alternate screen is active) has to satisfy the
+        // same `top <= bottom < height` bound, because a `?1049l`/`?47l` exit
+        // restores it as the live region.
+        if let Some(save) = &self.primary_save
+            && !(save.scroll_region_top <= save.scroll_region_bottom
+                && (save.scroll_region_bottom as usize) < self.height)
+        {
+            return Err(InvariantViolation::SavedScrollRegionInvalid {
+                top: save.scroll_region_top,
+                bottom: save.scroll_region_bottom,
                 height: self.height as u16,
             });
         }

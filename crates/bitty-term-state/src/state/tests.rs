@@ -3154,3 +3154,74 @@ fn snapshot_into_reuses_buffer_at_equal_dims_and_reallocates_on_resize() {
     assert_eq!(snap.height, 12);
     assert_eq!(snap, s.snapshot());
 }
+
+/// CTX-1903 (issue #3259): the primary screen's margins are stashed across an
+/// alternate-screen session and decide the next primary-screen scroll, so two
+/// states differing only in the stash are not behaviorally identical.
+#[test]
+fn ctx_1903_stashed_primary_margins_are_truth_bearing() {
+    let with_region = || {
+        let mut s = State::new();
+        s.apply(&TerminalAction::SetScrollRegion {
+            top: Row(3),
+            bottom: Row(6),
+        });
+        s.apply(&TerminalAction::SetMode {
+            mode: Mode::AlternateScreenClearAndRestore,
+            enabled: true,
+        });
+        s
+    };
+    let mut without_region = State::new();
+    without_region.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+
+    assert_ne!(
+        with_region().state_hash(),
+        without_region.state_hash(),
+        "the stashed primary margins must participate in the state hash"
+    );
+    // Both are valid states: the stash is within the live height.
+    assert!(with_region().check_invariants().is_ok());
+    assert!(without_region.check_invariants().is_ok());
+}
+
+/// CTX-1903 review M4: the stashed-margins invariant is enforced, not
+/// decorative. Directly corrupting the snapshot (white box) must be reported
+/// for both failure shapes: a bottom margin past the grid and `top > bottom`.
+#[test]
+fn ctx_1903_saved_scroll_region_invariant_reports_a_broken_stash() {
+    let mut s = State::new();
+    s.apply(&TerminalAction::SetMode {
+        mode: Mode::AlternateScreenClearAndRestore,
+        enabled: true,
+    });
+    let height = s.height() as u16;
+
+    let save = s
+        .primary_save
+        .as_mut()
+        .expect("alternate-screen entry saves the primary set");
+    save.scroll_region_bottom = height; // one past the last row
+    assert_eq!(
+        s.check_invariants(),
+        Err(InvariantViolation::SavedScrollRegionInvalid {
+            top: 0,
+            bottom: height,
+            height,
+        })
+    );
+
+    let save = s
+        .primary_save
+        .as_mut()
+        .expect("the alternate screen is still active");
+    save.scroll_region_top = 9;
+    save.scroll_region_bottom = 8; // top > bottom
+    assert!(matches!(
+        s.check_invariants(),
+        Err(InvariantViolation::SavedScrollRegionInvalid { .. })
+    ));
+}

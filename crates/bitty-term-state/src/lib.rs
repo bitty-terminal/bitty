@@ -49,7 +49,46 @@
 //! | [`MAX_CLUSTER_SCALARS`] | 6 | Per-cell cluster-tail cap (threat T-01; CTX-1609; the historical `MAX_ZEROWIDTH_CHARS` name aliases the same bound) |
 //! | [`MAX_BIDI_PARAGRAPH_CELLS`] | 4096 | BiDi paragraph bound: longer logical lines split at cell boundaries (CTX-1612; the S0 caller resolves one logical line, `OQ-091` paragraph extent stays open) |
 //! | [`ZONE_RECORDS_MAX`] | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 14 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker, v13 East Asian ambiguous-width policy, v14 xterm modifyOtherKeys level) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 15 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker, v13 East Asian ambiguous-width policy, v14 xterm modifyOtherKeys level, v15 stashed primary-screen scroll margins) |
+//!
+//! # Scroll margins are primary-screen state (divergence D-1)
+//!
+//! Vertical `DECSTBM` margins are tracked per screen: the live
+//! `State::scroll_region_top`/`_bottom` pair is always the active screen's
+//! region, the primary screen's pair is stashed across an alternate-screen
+//! session and restored (clamped) on `?1049l`/`?47l`, and every
+//! alternate-screen entry starts from full margins. A status-line region
+//! installed inside a full-screen TUI therefore cannot clip the shell that
+//! resumes after `?1049l` (issue #3259: the pane never scrolled again), and a
+//! primary-screen region cannot clip the TUI that follows.
+//!
+//! This is a **recorded divergence (D-1)**, not reference parity: xterm keeps a
+//! single pair (`TScreen.top_marg`/`bot_marg`) and `ToAlternate`/`FromAlternate`
+//! never touch it; ghostty keeps `Terminal.scrolling_region` and
+//! `switchScreenMode` never touches it. Both therefore leave the shell clipped
+//! when a TUI's region survives `?1049l`. The recorded rationale is that the
+//! margins restored are the primary screen's own state, so the divergence
+//! cannot invent or lose information, and a pane must recover after any TUI
+//! exits. The cost is bounded: an application that set a primary-screen region,
+//! entered the alternate screen and expected that region to bound its scrolling
+//! now scrolls the full screen there — nothing is clipped or dropped.
+//!
+//! Index/reverse index do **not** diverge: a linefeed or reverse index on a
+//! screen edge *outside* a shorter region is discarded, exactly like xterm
+//! (`xtermIndex`/`RevIndex` clamp), ghostty (`index`/`reverseIndex`) and kitty
+//! (`screen_index`). The index is what is discarded, never a row.
+//!
+//! Resize is asymmetric by design: the active screen's margins reset to full
+//! (TERM-ENG-005, the resized application re-sets them from its `SIGWINCH`
+//! handler), while the stashed pair is only clamped to the new height, because
+//! the inactive screen's application gets no `SIGWINCH` and cannot react.
+//!
+//! Single-register state stays single-register on purpose: tab stops,
+//! scrollback (primary-only by invariant 4), and terminal-global registers
+//! (title, replies, hyperlink table) do not switch with the screen, matching
+//! the reference. The alternate-screen save set (cursor, modes, charsets,
+//! margins), the `DECSC` slots, the Kitty keyboard register, kitty graphic
+//! placements, and the inline-viewport bookkeeping are already per screen.
 //!
 //! # Determinism
 //!

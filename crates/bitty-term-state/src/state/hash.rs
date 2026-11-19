@@ -277,6 +277,12 @@ fn out_save_cursor_fields(out: &mut CanonicalHasher, save: &ScreenSave) {
     out.boolean(save.origin_mode);
     out.boolean(save.auto_wrap);
     write_charsets(out, &save.charsets);
+    // v15: the primary screen's own DECSTBM margins, stashed for the
+    // `?1049l`/`?47l` restore. They decide where the next primary-screen
+    // scroll moves content, so two states differing only here are not
+    // behaviorally identical.
+    out.u16(save.scroll_region_top);
+    out.u16(save.scroll_region_bottom);
 }
 
 fn write_charsets(out: &mut CanonicalHasher, charsets: &Charsets) {

@@ -71,26 +71,32 @@
 //! that blocks it rather than implied covered:
 //!
 //! - **PGO-5, PGO-20 disable arm** (`disabled` placeholder, then a re-enable
-//!   that rebinds): the reason token has exactly one production producer —
-//!   `dispose_inner` called from `recover_wall_failed_plugins`
-//!   (`src/plugin_runtime/mod.rs:3934`, branch at `:3970`, dispose at `:3974`)
-//!   — and that pass only selects a generation that is `Failed` with
-//!   `FailureClass::WallSliceTimeout`. Nothing else turns a *live* generation
-//!   into a `disabled` one: `PluginRuntime` has no disable entry (`suspend`
-//!   parks a generation and presents `suspended`, which is residual 3's row
-//!   below, and `dispose` names `unloaded`), `package::set_enabled`
-//!   (`src/plugin_runtime/package.rs:1441`) only writes
-//!   the store index, `discover_inner` skips a disabled record without touching
-//!   a live entry (`mod.rs:2852`), and the application classes a plugin-set
+//!   that rebinds): the row stays without a home here and the arm is a
+//!   **decided** one, recorded on `PlaceholderReason::Disabled`
+//!   (`bitty-ui/src/panel_recovery.rs`) and on
+//!   `PluginRuntime::recover_wall_failed_plugins`, and gated against drift by
+//!   `tests/panel_disabled_arm.rs`. The reason token has exactly one production
+//!   producer — `dispose_inner` called from `recover_wall_failed_plugins`, the
+//!   same teardown `dispose` and `reload` reach — and that pass only selects a
+//!   generation that is `Failed` with `FailureClass::WallSliceTimeout`. Nothing
+//!   else turns a *live* generation into a `disabled` one: `PluginRuntime` has
+//!   no disable entry (`suspend` parks a generation and presents `suspended`,
+//!   which is residual 3's row above, and `dispose` names `unloaded`),
+//!   `package::set_enabled` only writes the store index, `op_disable` and the
+//!   plugin-facing `config.set_enabled` writer only rewrite the managed ledger
+//!   (`apply_plugin_enabled` answers `pending_restart` and notes that the ledger
+//!   is read at activation only), `discover_inner` skips a disabled record
+//!   without touching a live entry, and the application classes a plugin-set
 //!   change as `restart-required` because "the plugin set is not part of the
 //!   config plan and has no live apply path"
-//!   (`crates/bitty-terminal/src/config_reload.rs:128`). A test that produced
-//!   `disabled` therefore has to invent the disable, and the only route that
-//!   exists (crash first, then disable the index) reaches the release with the
-//!   containers already unbound by the crash edge, so `disabled` cannot be
-//!   presented on a container this generation still holds. Homing the row needs
-//!   a live disable entry and a live enable/rebind path in the plugin host, not
-//!   a test-side reason token; `PGO-4`/`PGO-20`'s crash arm cover the fault
+//!   (`crates/bitty-terminal/src/config_reload.rs`, `plugins_restart_required`).
+//!   A test that produced `disabled` therefore has to invent the disable, and
+//!   the only route that exists (crash first, then disable the index) reaches
+//!   the release with the containers already unbound by the crash edge
+//!   (`rollback` released them as `crashed`), so `disabled` cannot be presented
+//!   on a container this generation still holds. Homing the row needs a live
+//!   disable entry and a live enable/rebind path in the plugin host, not a
+//!   test-side reason token; `PGO-4`/`PGO-20`'s crash arm cover the fault
 //!   direction that *is* reachable.
 //! - **PGO-11** (provider version records): implemented on the restore edge but
 //!   **not reachable in a shipped binary**, so this row remains open. The rule

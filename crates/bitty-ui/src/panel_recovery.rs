@@ -239,6 +239,51 @@ pub enum PlaceholderReason {
     Reloaded,
     /// The plugin is disabled by the user or by policy; re-enabling permits a
     /// rebind (C.4).
+    ///
+    /// # Producer: a bounded decision (bitty#2476 residual 4)
+    ///
+    /// `disabled` has exactly one production producer: a wall-recovery
+    /// reconcile pass. `recover_wall_failed_plugins` selects a generation that
+    /// is `Failed` with `FailureClass::WallSliceTimeout` and whose store index
+    /// record says `enabled == false`, and ends it through `dispose_inner`,
+    /// which spells this reason on the panel port's release edge instead of
+    /// reloading the generation. That teardown is a release, so the reason is
+    /// the mapping ADR-0020 §3 rule 4 asks for — "disable behaves as crash with
+    /// the disable named rather than a fault": the container is unbound, its
+    /// panel-scoped families are released, it stays until the user closes it,
+    /// and a re-enable permits a rebind rather than reviving this binding.
+    ///
+    /// # Why a user disable does not present it, and why no call was added
+    ///
+    /// Every user-facing disable is next-start. None of the three paths holds a
+    /// live generation, so none has a live container to present on:
+    ///
+    /// - `bitty plugin disable` for an installed package rewrites the store
+    ///   index (`package::set_enabled`) and answers with a restart hint. It runs
+    ///   in the CLI process, which owns no `PluginRuntime`; the subcommand exits
+    ///   the process the index write returns to.
+    /// - `bitty plugin disable` for a bundled id rewrites the managed ledger and
+    ///   answers with its own restart hint. The ledger is read at activation
+    ///   only.
+    /// - The in-process, plugin-facing `config.set_enabled` writer
+    ///   (`apply_plugin_enabled` in the application) rewrites the same ledger and
+    ///   answers `pending_restart: true`; its own note says the toggle is never
+    ///   live. A `reload` reports a plugin-set change as `restart-required`
+    ///   because the plugin set has no live apply path.
+    ///
+    /// Discovery skips a disabled index record without touching a live entry,
+    /// so nothing about a running generation changes when the user disables its
+    /// plugin. Presenting `disabled` on that action would need a new lifecycle
+    /// verb in the plugin host — a live disable that ends a live generation —
+    /// and the residual does not add one. The arm is therefore **decided, not
+    /// implemented**: the wall-recovery reconcile is the whole of it, and the
+    /// reason keeps the exact spelling and detail line rule 2 gave it.
+    ///
+    /// This is recorded rather than left implicit because a reader who sees a
+    /// `disabled` container is looking at a plugin that faulted and was
+    /// disabled, not at one the user just disabled. A second producer appearing
+    /// is a decision change; `tests/panel_disabled_arm.rs` in `bitty-runtime`
+    /// fails when one does, so the change cannot land silently.
     Disabled,
     /// The generation faulted and ended `Disabled` through the FS-2 ladder
     /// (C.3).

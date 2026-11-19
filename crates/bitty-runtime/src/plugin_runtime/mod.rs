@@ -4122,6 +4122,26 @@ impl PluginRuntime {
     /// deterministic `init.lua` or `RC-2 memory` / `RC-1 instructions` failures.
     /// Consecutive recovery attempts are bounded by [`MAX_WALL_RECOVERY_ATTEMPTS`]
     /// so a deterministically failing timer stays stopped.
+    ///
+    /// # The `disabled` arm (bitty#2476 residual 4)
+    ///
+    /// This pass holds the only production write of
+    /// [`PlaceholderReason::Disabled`]: a candidate whose store index record
+    /// says `enabled == false` is ended through
+    /// `dispose_inner` with that reason instead of being reloaded, so
+    /// its containers present `disabled` and nothing drives them again.
+    ///
+    /// It is deliberately the whole of the arm. Every user-facing disable
+    /// (`bitty plugin disable` for a package or a bundled id, and the
+    /// plugin-facing `config.set_enabled` writer) is next-start: it mutates the
+    /// store index or the managed ledger in a different process, or answers
+    /// `pending_restart`, and never reaches a live generation. Presenting
+    /// `disabled` on the user's own disable would need a live disable verb the
+    /// plugin host does not have. The reason's own documentation carries the
+    /// decision; this entry point carries the ordering it depends on — the
+    /// fault released the container as [`PlaceholderReason::Crashed`] first, so
+    /// this pass re-spells the reason on an already-unbound container rather
+    /// than taking a binding away.
     pub fn recover_wall_failed_plugins(&mut self) -> usize {
         self.recover_wall_failed_plugins_inner(None)
     }
@@ -4186,6 +4206,16 @@ impl PluginRuntime {
                                 // bitty#2476 residual 4: the index says the
                                 // plugin is disabled, so its containers present
                                 // `disabled` until a re-enable rebinds them.
+                                //
+                                // This is the whole of the `disabled` arm: the
+                                // reason's own doc records why every user
+                                // disable path (the package CLI, the bundled
+                                // ledger CLI, and the plugin-facing
+                                // `config.set_enabled` writer) is next-start and
+                                // never reaches a live generation. Do not add a
+                                // second producer here without changing that
+                                // decision — `tests/panel_disabled_arm.rs` fails
+                                // if one appears.
                                 let _ = self.dispose_inner(&id, PlaceholderReason::Disabled);
                                 continue;
                             }

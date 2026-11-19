@@ -254,6 +254,10 @@ impl Runtime {
             }),
         };
         let restored = restored?;
+        // A plugin-presented layer's handle dies with the record it names
+        // (bitty#2388, CTX-1909): one prune point for every release path, so no
+        // `bitty.ui.panel` handle can survive into a panel somebody else owns.
+        self.forget_ui_panel_layer(restored.token);
         // The presentation half of "exact restore" runs before the geometry
         // half: the mode decides the content rect the restore resize measures,
         // so the panel must already be back in its own mode when the rect is
@@ -287,6 +291,10 @@ impl Runtime {
     /// before this ran.
     #[must_use]
     pub fn restore_released_panel_presentation(&mut self, restored: &RestoredPanelContent) -> bool {
+        // The generation edge released this layer, so any `bitty.ui.panel`
+        // handle that named it is dead here — before the caller can present
+        // anything over the returned terminal (bitty#2388, CTX-1909).
+        self.forget_ui_panel_layer(restored.token);
         let before = self.view_presentation(restored.view);
         self.restore_panel_presentation(restored);
         if self.view_presentation(restored.view) == before {

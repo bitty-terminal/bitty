@@ -2099,6 +2099,69 @@ impl PanelRuntime {
     pub fn presented_content_count(&self) -> usize {
         self.content_layers.len()
     }
+
+    /// Replaces the scene of the content layer presented on the panel mounted
+    /// at `view` (bitty#2388, CTX-1909).
+    ///
+    /// This is the content half of an owner-refresh: the layer keeps its
+    /// identity (panel, attachment, token, frozen rectangle, displaced
+    /// terminal, presentation mode) and only what the panel paints changes.
+    /// The replacement is fenced on `token`, so a caller holding a stale or
+    /// foreign handle cannot repaint another owner's presented content; the
+    /// record stays attached and the displaced terminal keeps parsing while
+    /// the new scene is admitted.
+    ///
+    /// The scene arrives already admitted by its producer (the same boundary
+    /// [`PanelRuntime::present_panel_content`] takes), so this is one slot
+    /// write plus the one revision bump the present loop reads — no second
+    /// paint path, no second admission path.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel is mounted at `view` or
+    /// its record is disposed; [`PanelError::ContentNotPresented`] when the
+    /// panel presents no layer; [`PanelError::ContentTokenMismatch`] when
+    /// `token` is not that panel's live layer. Every refusal leaves the live
+    /// scene and the record untouched.
+    pub fn replace_presented_content_scene(
+        &mut self,
+        view: ViewId,
+        token: PanelContentToken,
+        scene: Scene,
+    ) -> Result<(), PanelError> {
+        let Some(panel) = self.placement.panel_of(view) else {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel is mounted at this view",
+            });
+        };
+        let Some(record) = self.content_layers.get(&panel) else {
+            self.registry.bump_error("ContentNotPresented");
+            return Err(PanelError::ContentNotPresented { panel_id: panel });
+        };
+        if record.token != token {
+            self.registry.bump_error("ContentTokenMismatch");
+            return Err(PanelError::ContentTokenMismatch {
+                panel_id: panel,
+                token: token.get(),
+            });
+        }
+        let Some(generation) = self.registry.panel_allocation_generation(panel) else {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "panel record is disposed",
+            });
+        };
+        self.attach_panel_scene(
+            super::panel::PanelHandle {
+                id: panel,
+                generation,
+            },
+            scene,
+        )
+    }
 }
 
 /// Maps a [`PlacementError`] bind failure onto the host [`PanelError`]

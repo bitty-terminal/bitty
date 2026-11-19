@@ -368,6 +368,11 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     // focused view. Separate from the `overlay`-slot mount head and from the
     // capture head, so draw authority never becomes input authority.
     "ui.present",
+    // bitty#2388 (CTX-1909): present plugin content in place of the focused
+    // panel's terminal and own the input it displaces. One head: presentation
+    // and input ownership are the same authority, so a manifest cannot hold
+    // the content without holding the keys that reach the panel it covers.
+    "ui.panel",
     "ui.protocol-register",
     "clipboard.read",
     "clipboard.write",

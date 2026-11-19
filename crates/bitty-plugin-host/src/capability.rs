@@ -158,6 +158,14 @@ impl CapabilityFamily {
                 // `ui.overlay.focus` (exclusive input capture), so a manifest
                 // cannot gain input authority by asking to draw.
                 "ui.present",
+                // bitty#2388 (CTX-1909): present plugin content in place of the
+                // focused panel's terminal content and own the input it displaces.
+                // One head on purpose: a grant that could present without owning
+                // input would create a focused panel whose keys go nowhere. It
+                // implies nothing and is not implied by any other head — scene
+                // rendering stays separately granted through `ui.rich`, so a
+                // present-only grant cannot draw arbitrary trees.
+                "ui.panel",
                 "ui.protocol-register",
             ],
             Self::Clipboard => &["clipboard.read", "clipboard.write"],
@@ -497,6 +505,10 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "ui.overlay.focus" => "Acquire a focusable overlay and hold transient input capture",
         "ui.present" => {
             "Draw a non-focusable presentation panel above the focused view (no input capture)"
+        }
+        "ui.panel" => {
+            "Present plugin content in place of the focused panel's terminal until \
+             released, and own the input it displaces"
         }
         "ui.protocol-register" => "Register custom URL protocols (high-risk)",
         "clipboard.read" => "Read clipboard contents",

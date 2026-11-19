@@ -60,12 +60,17 @@ use crate::cell::{Attributes, Cell, Style};
 /// v14 adds the xterm `modifyOtherKeys` level (Pp = 4): it selects between
 /// the legacy, xterm and Kitty key encodings for the same key event, so two
 /// states differing only in it emit different bytes.
+/// v15 adds the primary screen's stashed `DECSTBM` margins (issue #3259,
+/// `CTX-1903`, divergence D-1): the primary region saved across an
+/// alternate-screen session is restored on `?1049l`/`?47l` and decides where
+/// the next primary-screen scroll moves content, so two states differing only
+/// in the saved margins are not behaviorally identical.
 ///
 /// Paint-time BiDi (CTX-1612) adds **no** hash field and keeps the version:
 /// paragraph levels and visual columns are derived from the same logical
 /// cells at paint time, never stored, so replay and the canonical bytes of
 /// a given action stream are unchanged by `terminal.bidi`.
-pub const CANONICAL_HASH_VERSION: u32 = 14;
+pub const CANONICAL_HASH_VERSION: u32 = 15;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -230,6 +235,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 14);
+        assert_eq!(CANONICAL_HASH_VERSION, 15);
     }
 }

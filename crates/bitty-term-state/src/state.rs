@@ -263,6 +263,20 @@ struct ScreenSave {
     auto_wrap: bool,
     charsets: Charsets,
     modes: Modes,
+    /// `DECSTBM` margins of the primary screen at alternate-screen entry.
+    ///
+    /// Bitty tracks vertical margins per screen (recorded divergence **D-1**,
+    /// see the crate docs): this snapshot carries the primary screen's own pair
+    /// across the switch, so the exit restores it instead of the alternate
+    /// screen's region. xterm (`TScreen.top_marg`/`bot_marg`) and ghostty
+    /// (`Terminal.scrolling_region`) keep one register for the whole terminal
+    /// and never touch it on an alternate-screen switch, which is why a TUI's
+    /// status-line region leaves the shell clipped after `?1049l` (issue
+    /// #3259).
+    scroll_region_top: u16,
+    /// `DECSTBM` bottom margin of the primary screen at entry (see
+    /// `ScreenSave::scroll_region_top`).
+    scroll_region_bottom: u16,
 }
 
 /// The terminal state machine: grid, cursor, modes, scrollback, damage,
@@ -297,7 +311,37 @@ pub struct State {
     /// re-interpret already committed cell widths and invalidate the grid.
     ambiguous_width: AmbiguousWidth,
     modes: Modes,
+    /// `DECSTBM` top margin of the **active** screen (inclusive).
+    ///
+    /// Margins are primary-screen state tracked per screen, not one terminal
+    /// register: a TUI that installs a status-line region inside the alternate
+    /// screen must not clip the primary screen after `?1049l`, and a
+    /// primary-screen region must not clip a TUI that later takes the alternate
+    /// screen. The live pair is always the active screen's region; the
+    /// primary's rides in [`State::primary_save`] while the alternate screen is
+    /// active, every alternate-screen entry starts from full margins
+    /// (`0 .. height - 1`), and the exit restores the saved primary pair. See
+    /// [`State::switch_alt_screen`].
+    ///
+    /// Recorded divergence **D-1** from xterm and ghostty, which keep one
+    /// margin register for the whole terminal (xterm `TScreen.top_marg`/
+    /// `bot_marg`; ghostty `Terminal.scrolling_region`) and never touch it on
+    /// an alternate-screen switch. That is why the shell stays clipped after a
+    /// TUI's status-line region (issue #3259: the pane never scrolls again).
+    /// Bitty restores only what the primary screen itself set, so the
+    /// divergence cannot lose information; the cost is that an application
+    /// that set a primary region, entered the alternate screen and expected
+    /// that region to bound its scrolling now scrolls full-screen instead
+    /// (benign: nothing is clipped, nothing is dropped).
+    ///
+    /// Resize is asymmetric by design: the active screen's margins reset to
+    /// full (TERM-ENG-005), while the stashed primary pair is only clamped to
+    /// the new height, never reset or grown. The inactive screen's application
+    /// receives no `SIGWINCH` and cannot react, so it gets its own region back —
+    /// absolute rows, trimmed only when they no longer fit.
     scroll_region_top: u16,
+    /// `DECSTBM` bottom margin of the active screen (inclusive); see
+    /// [`State::scroll_region_top`].
     scroll_region_bottom: u16,
     tabs: TabStops,
     charsets: Charsets,
@@ -711,8 +755,22 @@ impl State {
         self.tabs = new_tabs;
         self.width = cols;
         self.height = rows;
-        // Reset scroll region to the full screen (clamps invariants 1) and
-        // place the cursor: logical mapping after a width reflow, else clamp.
+        // Reset the active screen's scroll region to the full screen (clamps
+        // invariant 1) and place the cursor: logical mapping after a width
+        // reflow, else clamp.
+        //
+        // Only the active screen's margins are reset. The inactive screen's
+        // margins (the primary's, while the alternate screen is active) are
+        // **clamped, never reset or grown**: DECSTBM rows are absolute, so a
+        // taller grid leaves a stored region where it was, while a shorter
+        // grid trims its bottom margin to the new last row and its top margin
+        // to that bottom (keeping `top <= bottom`). The stored region is
+        // restored on the `?1049l`/`?47l` exit.
+        //
+        // The asymmetry is deliberate: TERM-ENG-005 resets the *active*
+        // screen's region because that screen's application sees the resize
+        // (SIGWINCH) and redraws; the inactive screen's application sees
+        // nothing and cannot re-set its margins, so it gets them back.
         self.scroll_region_top = 0;
         self.scroll_region_bottom = (rows - 1) as u16;
         if let Some((li, cells, seg)) = &inline_split_cells {
@@ -780,6 +838,11 @@ impl State {
         if let Some(save) = &mut self.primary_save {
             save.cursor_position.row = save.cursor_position.row.min((rows - 1) as u16);
             save.cursor_position.col = save.cursor_position.col.min((cols - 1) as u16);
+            // Stored primary margins follow the height the same way the live
+            // ones do: clamp into the new grid, never grow (see the region
+            // reset above).
+            save.scroll_region_bottom = save.scroll_region_bottom.min((rows - 1) as u16);
+            save.scroll_region_top = save.scroll_region_top.min(save.scroll_region_bottom);
         }
         // Damage for resize: full grid plus scrollback reflow range when
         // scrollback non-empty (RFC damage model). Coalesce ordering is grid
@@ -3546,8 +3609,15 @@ impl State {
         self.cursor.pending_wrap = false;
     }
 
-    /// Linefeed/index: scrolls the region at its bottom margin, otherwise
-    /// moves down until the screen bottom.
+    /// Linefeed/index (`LF`, `VT`, `FF`, `IND`, `NEL`).
+    ///
+    /// A cursor on the region's bottom margin scrolls the region; any other
+    /// position moves down one row, and a linefeed on the last screen row with
+    /// the cursor *below* a shorter region is discarded. That is the reference
+    /// rule: xterm's `xtermIndex` falls through to `CursorDown` (which clamps
+    /// at `max_row`), ghostty's `index()` only advances while `cursor.y <
+    /// rows - 1`, and kitty's `screen_index` stops the same way. The discarded
+    /// thing is the index, never a row.
     fn index_linefeed(&mut self) {
         let row = self.cursor.position.row;
         if row == self.scroll_region_bottom {
@@ -3558,7 +3628,12 @@ impl State {
         self.cursor.pending_wrap = false;
     }
 
-    /// Reverse index: reverse-scrolls the region at its top margin.
+    /// Reverse index (`RI`): the mirror of [`State::index_linefeed`].
+    ///
+    /// Reverse-scrolls the region at its top margin; otherwise moves up one
+    /// row, and a reverse index on the first screen row with the cursor
+    /// *above* a shorter region does not move (the reference `RevIndex` /
+    /// `reverseIndex` clamp at row 0).
     fn reverse_index(&mut self) {
         let row = self.cursor.position.row;
         if row == self.scroll_region_top {
@@ -3776,6 +3851,7 @@ impl State {
         self.damage_scroll_move(row, self.scroll_region_bottom, n as i32);
     }
 
+    /// Scrolls the active screen's scroll region up by `n` rows.
     fn scroll_up_region(&mut self, n: u16) {
         let top = self.scroll_region_top as usize;
         let bottom = self.scroll_region_bottom as usize;
@@ -3814,6 +3890,7 @@ impl State {
         self.damage_scroll_move(self.scroll_region_top, self.scroll_region_bottom, n as i32);
     }
 
+    /// Scrolls the active screen's scroll region down by `n` rows.
     fn scroll_down_region(&mut self, n: u16) {
         // Scroll-down displaces region rows downward with blanks entering
         // at the top; displaced rows are discarded (never captured into
@@ -3841,6 +3918,12 @@ impl State {
         );
     }
 
+    /// `DECSTBM`: sets the vertical margins of the **active screen**.
+    ///
+    /// The margins stay with the screen they belong to (see
+    /// [`State::scroll_region_top`]): this writes only the live pair, so a
+    /// region set inside the alternate screen never reaches the primary
+    /// screen and vice versa.
     fn set_scroll_region(&mut self, top: Row, bottom: Row) {
         let last = self.height as u16 - 1;
         let t = top.0.saturating_sub(1);
@@ -3927,6 +4010,8 @@ impl State {
                 self.screens_active_mut()
                     .fill_rect(0, 0, last_row, last_col, &erase);
                 self.damage_grid_rect(0, 0, last_row, last_col);
+                // Declaration-scope reset on the active screen only: margins
+                // are per screen, so the inactive screen keeps its own pair.
                 self.scroll_region_top = 0;
                 self.scroll_region_bottom = self.height as u16 - 1;
                 self.home_cursor();
@@ -4019,6 +4104,8 @@ impl State {
                 auto_wrap: self.modes.auto_wrap,
                 charsets: self.charsets.clone(),
                 modes: self.modes.clone(),
+                scroll_region_top: self.scroll_region_top,
+                scroll_region_bottom: self.scroll_region_bottom,
             });
             // Kitty keeps a separate flag register per screen: swap the live
             // (main) register with the inactive-screen stash so the alt screen
@@ -4028,6 +4115,16 @@ impl State {
                 &mut self.enhanced_keyboard_stash,
             );
             self.alt_screen = variant;
+            // Margins are per screen, so the alternate screen starts from full
+            // margins on every entry: a status-line region a TUI installed on
+            // the primary screen (or in a previous alternate-screen session)
+            // must not clip this one. The primary margins were snapshotted
+            // above and are restored on exit. A `?47` re-entry into a retained
+            // alt grid therefore also starts full: the grid survives, the
+            // previous session's margins do not (they were that session's
+            // policy, not the screen's content).
+            self.scroll_region_top = 0;
+            self.scroll_region_bottom = self.height as u16 - 1;
             // Inline-viewport bookkeeping is primary-screen state: an
             // alternate-screen session must not inherit (or leak back) a
             // widget top recorded on the other screen (#3103 review item 4).
@@ -4080,6 +4177,17 @@ impl State {
                 }
                 self.charsets = save.charsets;
                 self.modes = save.modes;
+                // Margins belong to the screen, not to the save/restore pair:
+                // the primary screen gets its own region back on every exit
+                // variant, including a mixed `?47h`/`?1049l` pair. Unlike the
+                // cursor, DECSTBM was never the alternate screen's to hand
+                // back, so the restore is not gated on the `?1049` pair.
+                // Clamped defensively: a resize clamps the stored pair, and
+                // this keeps the invariant even if a height change ever lands
+                // through another path.
+                let last_row = self.height as u16 - 1;
+                self.scroll_region_bottom = save.scroll_region_bottom.min(last_row);
+                self.scroll_region_top = save.scroll_region_top.min(self.scroll_region_bottom);
             }
             // bitty#2938: the primary snapshot restores whatever tracking mode
             // was live at alt-screen entry. A TUI that enabled tracking and
@@ -4282,8 +4390,12 @@ impl State {
 
     fn soft_reset(&mut self) {
         // DECSTR subset (VT510 manual): cursor shown, replace mode,
-        // absolute origin, autowrap reset, margins cleared, SGR and
-        // charsets defaulted. Alternate-screen state is untouched.
+        // absolute origin, autowrap reset, margins cleared, SGR and charsets
+        // defaulted. The scrolling-region reset is a device-scope reset (DEC
+        // STD 070), not an active-screen one: a DECSTR issued inside an
+        // alternate-screen session also clears the primary margins stashed for
+        // the `?1049l`/`?47l` restore, so the soft reset cannot leave a region
+        // the reset claims to have cleared.
         self.cursor.visible = true;
         self.cursor.pending_wrap = false;
         self.cursor.style = Style::default();
@@ -4292,6 +4404,10 @@ impl State {
         self.modes.auto_wrap = false;
         self.scroll_region_top = 0;
         self.scroll_region_bottom = self.height as u16 - 1;
+        if let Some(save) = &mut self.primary_save {
+            save.scroll_region_top = 0;
+            save.scroll_region_bottom = self.height as u16 - 1;
+        }
         self.charsets = Charsets::default();
     }
 

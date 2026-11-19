@@ -525,17 +525,10 @@ impl Runtime {
                 let palette = self.surface.theme_palette();
                 presenter.resize(surface_extent, opacity);
                 self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
-                // bitty#2989: the confirmation described the pre-resize frame. Its
-                // repair budget goes with it, so the new surface incarnation starts
-                // with the full one. The *speculation* is deliberately kept
-                // (review R8): a resize answers nothing about whether the surface
-                // is on screen, so clearing the flag here would leave the gate open
-                // with no mechanism left to close it. It stays until a commit or a
-                // confirmation settles it, and the first present of the resized
-                // surface either settles it that way or fails, which closes the
-                // gate through `restore_hidden_after_blind_repair`.
+                // Discard only the pre-resize deadline. The worker must apply
+                // Configure before the runtime resets the fast repair budget.
+                // Neither requesting nor applying it proves visibility.
                 self.present_confirm_at = None;
-                self.present_confirm_misses = 0;
             }
             if (extent_changed || grid_changed) && self.pending_present.take().is_some() {
                 self.pending_full_redraw = true;
@@ -545,6 +538,8 @@ impl Runtime {
                 self.surface
                     .resize(gpu, surface_extent)
                     .map_err(RuntimeError::from)?;
+                self.present_confirm_at = None;
+                self.present_confirm_misses = 0;
             }
         } else if extent_changed {
             self.surface

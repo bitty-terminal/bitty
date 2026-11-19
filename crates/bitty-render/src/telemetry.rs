@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Number of tracked counters; must match the field order in
 /// [`SurfaceTelemetrySnapshot`].
-const COUNTER_SLOTS: usize = 17;
+const COUNTER_SLOTS: usize = 20;
 
 const CONFIGURE_OK: usize = 0;
 const CONFIGURE_ERR: usize = 1;
@@ -46,6 +46,9 @@ const RETRY_ATTEMPTS: usize = 13;
 const RETRY_RECOVERIES: usize = 14;
 const RETRY_LAST_DELAY_MS: usize = 15;
 const PRESENT_UNCONFIRMED: usize = 16;
+const PRESENT_REPAIR_ATTEMPTS: usize = 17;
+const PRESENT_REPAIR_CONFIGURED: usize = 18;
+const PRESENT_REPAIR_FAILED: usize = 19;
 
 /// Last surface event recorded, stored as one byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,9 +182,15 @@ pub struct SurfaceTelemetrySnapshot {
     /// the verification bound (bitty#2989).
     ///
     /// A present can report success and still never reach the screen (a lost
-    /// frame callback, a dropped buffer). Each miss forces one corrective
-    /// repaint, so this counts bounded recovery episodes, not frames.
+    /// frame callback, a dropped buffer). This counts expired verification
+    /// deadlines, including the one that spent the fast repair budget.
     pub present_unconfirmed: u64,
+    /// Same-extent Configure attempts after fast repaint exhaustion.
+    pub present_repair_attempts: u64,
+    /// Repair Configure calls that succeeded; not compositor confirmations.
+    pub present_repair_configured: u64,
+    /// Repair Configure calls that returned an error.
+    pub present_repair_failed: u64,
     /// Last recorded event name, stable for reports.
     pub last_event: &'static str,
 }
@@ -213,6 +222,9 @@ impl Default for SurfaceTelemetrySnapshot {
             presenter_coalesced: 0,
             presenter_acks_dropped: 0,
             present_unconfirmed: 0,
+            present_repair_attempts: 0,
+            present_repair_configured: 0,
+            present_repair_failed: 0,
             last_event: "none",
         }
     }
@@ -388,10 +400,30 @@ pub fn retry_recovered() {
     record(LastEvent::RetryRecovered, Some(RETRY_RECOVERIES));
 }
 
-/// A committed present was not confirmed by the compositor within the bound
-/// and one corrective repaint is being forced (bitty#2989).
+fn bump_present_counter(slot: usize) {
+    let _ = COUNTERS[slot].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+        total.checked_add(1)
+    });
+}
+
+/// A committed present was not confirmed by the compositor within the bound.
 pub fn present_unconfirmed() {
-    record(LastEvent::PresentUnconfirmed, Some(PRESENT_UNCONFIRMED));
+    bump_present_counter(PRESENT_UNCONFIRMED);
+    record(LastEvent::PresentUnconfirmed, None);
+}
+
+/// A same-extent incarnation repair reached the backend.
+pub fn present_repair_attempt() {
+    bump_present_counter(PRESENT_REPAIR_ATTEMPTS);
+}
+
+/// Records the Configure outcome, without asserting compositor sampling.
+pub fn present_repair_result(configured: bool) {
+    bump_present_counter(if configured {
+        PRESENT_REPAIR_CONFIGURED
+    } else {
+        PRESENT_REPAIR_FAILED
+    });
 }
 
 /// Copy the process-wide surface telemetry slot.
@@ -432,6 +464,9 @@ pub fn snapshot() -> SurfaceTelemetrySnapshot {
         presenter_coalesced: PRESENT_COALESCED.load(Ordering::Relaxed),
         presenter_acks_dropped: PRESENT_ACKS_DROPPED.load(Ordering::Relaxed),
         present_unconfirmed: COUNTERS[PRESENT_UNCONFIRMED].load(Ordering::Relaxed),
+        present_repair_attempts: COUNTERS[PRESENT_REPAIR_ATTEMPTS].load(Ordering::Relaxed),
+        present_repair_configured: COUNTERS[PRESENT_REPAIR_CONFIGURED].load(Ordering::Relaxed),
+        present_repair_failed: COUNTERS[PRESENT_REPAIR_FAILED].load(Ordering::Relaxed),
         last_event: LastEvent::from_u8(LAST_EVENT.load(Ordering::Relaxed)).as_str(),
     }
 }

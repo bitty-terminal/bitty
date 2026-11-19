@@ -44,6 +44,47 @@ fn handle_pty_bytes_flow_reaches_render() {
 }
 
 #[test]
+fn damage_only_present_matches_full_redraw() {
+    // App-agnostic streams from the stale-present audit: a row update,
+    // alternate-screen exit inside a sync burst, and a live scroll.
+    let cases: &[(&str, &[u8], &[u8])] = &[
+        ("one row", b"first\r\nsecond\r\nthird", b"\x1b[2;1HSECOND"),
+        (
+            "alternate-screen exit",
+            b"primary\r\n\x1b[?1049h\x1b[Halt\r\nscreen",
+            b"\x1b[?2026h\x1b[?1049l\x1b[2;1Hnew row\x1b[?2026l",
+        ),
+        ("scroll", b"first\x1b[24;1Hbottom", b"\r\nnext"),
+    ];
+    for &(case, initial, update) in cases {
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime");
+        let start = Instant::now();
+        rt.handle_pty_bytes(initial);
+        rt.tick_at(start).expect("initial present");
+        let prior = rt.headless_rgba().expect("initial pixels");
+        let now = start + Duration::from_millis(10);
+        rt.handle_pty_bytes(update);
+        let incremental = rt.tick_at(now).expect("incremental present");
+        let pixels = rt.headless_rgba().expect("incremental pixels");
+        assert!(pixels != prior, "{case}: update must change pixels");
+
+        rt.set_surface_visibility_at(now, false);
+        assert!(rt.tick_at(now).is_none());
+        rt.set_surface_visibility_at(now, true);
+        let full = rt.tick_at(now).expect("forced full redraw");
+        assert_eq!(
+            incremental.generation, full.generation,
+            "{case}: same truth"
+        );
+        assert!(
+            pixels == rt.headless_rgba().expect("full redraw pixels"),
+            "{case}: pixel mismatch"
+        );
+    }
+}
+
+#[test]
 fn tick_cursor_overlay_uses_theme_cursor_hue() {
     // CTX-0219: the live cursor overlay paints the designed theme
     // cursor hue (rosewater) at the existing translucent alpha instead

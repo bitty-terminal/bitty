@@ -98,9 +98,9 @@ const PRESENT_CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_mil
 
 /// Corrective repaints allowed for consecutive unconfirmed presents.
 ///
-/// Invariant: a compositor that never confirms again must not be repainted
-/// every bound forever. Three attempts cover a transient stall without turning
-/// a permanently broken surface into a periodic frame source.
+/// Three fast repaints cover a transient stall. After that, a gate that is
+/// still open permits only the slow incarnation repair below; a hidden
+/// surface parks instead. Neither an open gate nor a commit proves sampling.
 ///
 /// This budget counts frames *this runtime submits*; it is not the lifetime
 /// bound of a hidden surface. A repair that cannot commit re-closes the gate
@@ -116,6 +116,12 @@ const PRESENT_CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_mil
 /// recovery slot per occlusion epoch, so the 5 s reattach cooldown only shows
 /// up after three such epochs.
 const PRESENT_CONFIRM_REPAIR_LIMIT: u32 = 3;
+
+/// Minimum interval between automatic same-extent Configure attempts after
+/// the fast budget is spent (bitty#3262). A Configure may itself block in the
+/// driver, so keep it on the present worker when one owns the surface.
+/// Allow one rebuild per interval, not three more fast repaints per Configure.
+const PRESENT_INCARNATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Commit data for the newest frame submitted to the off-thread presenter.
 ///
@@ -1309,7 +1315,11 @@ fn erased_snapshot(base: &Snapshot) -> Snapshot {
 /// scroll-shift guards so a pane whose grid holds text can never reuse or
 /// shift into a glyph-less draw list (bitty#3032).
 fn snapshot_has_visible_text(snapshot: &Snapshot) -> bool {
-    snapshot.cells.iter().any(|cell| {
+    cells_have_visible_text(&snapshot.cells)
+}
+
+fn cells_have_visible_text(cells: &[bitty_term_state::Cell]) -> bool {
+    cells.iter().any(|cell| {
         !cell.glyph.is_whitespace()
             && !cell.glyph.is_control()
             && !cell.spacer
@@ -2125,6 +2135,48 @@ impl Runtime {
             .unwrap_or(self.presented_scene_revision);
     }
 
+    /// An empty composite can settle a blank frame but cannot consume text
+    /// damage. Check live grids even if geometry collapsed to zero, and also
+    /// scrolled viewports (which can hold text when the live grid is blank).
+    fn finish_without_draw(
+        &mut self,
+        primary_gen: u64,
+        allocations: Vec<layout_focus::PresentFrame>,
+        focused: Option<ViewId>,
+    ) {
+        self.pending_paint_redraw = false;
+        let has_text = |state: &State, view: Option<ViewId>| {
+            // A presented GUI content layer deliberately displaces the grid.
+            // Its release invalidates the frame; do not retry hidden text.
+            if view.is_some_and(|id| self.content_layer_presented(id)) {
+                return false;
+            }
+            (0..state.height()).any(|row| {
+                state
+                    .live_grid_row(row)
+                    .is_some_and(cells_have_visible_text)
+            }) || (!state.alt_screen_active()
+                && view.and_then(|id| self.find_view(id)).is_some_and(|view| {
+                    view.scroll_offset() != 0 && cells_have_visible_text(&view.visible_cells(state))
+                }))
+        };
+        if has_text(&self.state, self.primary_view)
+            || self
+                .pane_sessions
+                .iter()
+                .any(|(view, session)| has_text(&session.state, Some(*view)))
+        {
+            self.pending_full_redraw = true;
+            // Don't keep a used coalescing wake in the past. The embedder's
+            // bounded present nudge owns this retained redraw debt.
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
+            return;
+        }
+        self.mark_frame_presented(primary_gen);
+        self.publish_presented_allocations(allocations, focused);
+    }
+
     /// Publishes `allocations` as the frame now on screen.
     ///
     /// Issue #2789: the first present after a content-geometry gesture
@@ -2377,8 +2429,8 @@ impl Runtime {
         }
     }
 
-    /// Deadline by which the compositor must confirm the last committed frame
-    /// (bitty#2989).
+    /// Next compositor-confirmation or slow incarnation-repair wake
+    /// (bitty#2989, bitty#3262).
     ///
     /// Armed when a real frame commits, cleared by
     /// [`Self::note_present_confirmed`] when the embedder observes the
@@ -2386,32 +2438,39 @@ impl Runtime {
     /// confirmation check when it fires. `None` in the healthy steady state, so
     /// an idle window arms nothing.
     ///
-    /// It is *not* gated on visibility: a hide keeps the bound whether or not
-    /// it retained damage (see [`Self::set_surface_visibility_at`]), and only a
-    /// settlement - a reveal, a served frame callback, or a frame the
-    /// failed-present retry owns - clears it, so the embedder must arm this wake
-    /// whether or not the surface is visible. That expiry is what gives a
-    /// false-positive occlusion during a streaming burst its single bounded
-    /// speculative reopen at `PRESENT_CONFIRM_BOUND`.
+    /// A hide keeps the fast bound so a false-positive occlusion can get its
+    /// one bounded speculative reopen. The slow wake is independent of new
+    /// commits and only applies with the non-speculative gate open.
     #[must_use]
     pub fn present_confirm_deadline(&self) -> Option<std::time::Instant> {
-        // A hide does not clear the bound: the deadline has to outlive the
-        // synthetic occlusion edge a streaming burst produces, so a later
-        // expiry can still spend the one bounded speculative reopen. Only a
-        // reveal (`queue_reveal_repaint`), a served frame callback, or a frame
-        // the retry path owns settles it.
-        self.present_confirm_at
+        if self.surface_visible && !self.speculative_present_reopen {
+            if self.present_incarnation_repair_after.is_some() && self.pending_present.is_some() {
+                // The ack/recovery owns the next wake while a frame is in
+                // flight. The slow retry is still owed once the worker frees.
+                return None;
+            }
+            match (
+                self.present_confirm_at,
+                self.present_incarnation_repair_after,
+            ) {
+                (Some(confirmation), Some(repair)) => Some(confirmation.min(repair)),
+                (confirmation, repair) => confirmation.or(repair),
+            }
+        } else {
+            self.present_confirm_at
+        }
     }
 
     /// Records that the compositor served a frame callback (bitty#2989).
     ///
     /// The embedder calls this when a redraw request issued after a present is
-    /// answered: a served callback proves the compositor sampled the surface,
-    /// so the frame just committed is on screen. Clears the verification bound
-    /// and the corrective-repaint budget; a no-op when nothing is pending.
+    /// answered. It is evidence that the compositor is servicing the surface,
+    /// not a per-buffer presentation receipt. Clears the verification bound,
+    /// the fast repaint budget, and the slow incarnation repair wake.
     pub fn note_present_confirmed(&mut self) {
         self.present_confirm_at = None;
         self.present_confirm_misses = 0;
+        self.present_incarnation_repair_after = None;
         // A served callback proves the surface is on screen, which settles any
         // reopen this runtime made speculatively.
         self.speculative_present_reopen = false;
@@ -2422,7 +2481,13 @@ impl Runtime {
     /// Headless presents have no compositor to confirm them and never arm
     /// this.
     fn arm_present_confirmation(&mut self, now: std::time::Instant) {
-        self.present_confirm_at = now.checked_add(PRESENT_CONFIRM_BOUND);
+        let bound = now.checked_add(PRESENT_CONFIRM_BOUND);
+        // On the slow cadence there is no extra short wake just to count
+        // another unconfirmed frame. New commits leave the repair timer alone.
+        self.present_confirm_at = bound.map(|at| {
+            self.present_incarnation_repair_after
+                .map_or(at, |repair| at.max(repair))
+        });
     }
 
     /// Test seam: arms the confirmation bound without a GPU frame.
@@ -2459,13 +2524,14 @@ impl Runtime {
     /// platform's starvation probe, which reads the same unanswered redraw a
     /// dropped frame leaves behind, so the expiry is the counter-evidence and
     /// reopens the gate **speculatively**
-    /// ([`Self::speculative_present_reopen`]). A repair that commits or is
-    /// confirmed proves the surface visible and settles it; one that cannot
-    /// commit closes the gate again
+    /// ([`Self::speculative_present_reopen`]). Only confirmation or an explicit
+    /// reveal settles it; a repair that cannot commit or is not confirmed
+    /// closes the gate again
     /// ([`Self::restore_hidden_after_blind_repair`]), so a genuinely occluded
     /// surface pays exactly one blind attempt per occlusion epoch and keeps its
     /// damage for the bounded hidden repair. [`PRESENT_CONFIRM_REPAIR_LIMIT`]
-    /// only bounds how many frames this runtime submits on that evidence.
+    /// bounds fast repaints. Further same-extent Configure attempts are
+    /// rate-limited and only allowed while the non-speculative gate is open.
     fn check_present_confirmation(&mut self, now: std::time::Instant) {
         let Some(deadline) = self.present_confirm_at else {
             return;
@@ -2473,33 +2539,33 @@ impl Runtime {
         if now < deadline {
             return;
         }
-        self.present_confirm_at = None;
         if self.pending_present.is_some() {
             // The newest frame is with the presenter: its commit re-arms this
             // bound, and the stuck-present bound owns a worker that never acks.
             // Counting a miss here would force a duplicate repaint once the
             // in-flight frame lands.
+            self.present_confirm_at = None;
             return;
         }
+        self.present_confirm_at = None;
+        bitty_render::telemetry::present_unconfirmed();
         if self.speculative_present_reopen {
             // bitty#3116: the speculative reopen submitted one blind repair
             // frame, and the driver accepted it into a free swapchain image,
             // but the compositor still has not served a frame callback within
-            // `PRESENT_CONFIRM_BOUND`. The surface is genuinely hidden on
-            // another workspace — close the gate back before subsequent frames
+            // `PRESENT_CONFIRM_BOUND`. Assume it is still hidden and close
+            // the gate before subsequent frames
             // fill the swapchain and stall `vkAcquireNextImageKHR`.
             self.restore_hidden_after_blind_repair(now);
             return;
         }
-        if self.present_confirm_misses >= PRESENT_CONFIRM_REPAIR_LIMIT {
-            // A surface that never confirms again must not become a periodic
-            // frame source. The budget is the only stop that applies here:
-            // neither the stuck-present bound nor the hidden repair engages on
-            // this evidence, because a committed frame consumed the pending
-            // frame and the retained damage. Nothing has proven the surface
-            // visible, so the gate is left exactly as it is (a hidden surface
-            // stays hidden) until an unrelated event; `present_unconfirmed`
-            // records that it happened.
+        if self.present_confirm_misses >= PRESENT_CONFIRM_REPAIR_LIMIT
+            || self.present_incarnation_repair_after.is_some()
+        {
+            if self.surface_visible && self.present_incarnation_repair_after.is_none() {
+                self.present_incarnation_repair_after =
+                    now.checked_add(PRESENT_INCARNATION_REPAIR_INTERVAL);
+            }
             return;
         }
         if !self.surface_visible {
@@ -2509,9 +2575,9 @@ impl Runtime {
             // whose redraw starvation the 300 ms probe read as synthetic
             // occlusion. `request_redraw()` alone cannot unstick a Wayland
             // surface whose frame callback is waiting on a commit, so treat
-            // the expiry as proof of life: reopen the gate and queue the repair
+            // the expiry as reason to probe: reopen the gate and queue the repair
             // below, which spends the one bounded speculative reopen. The
-            // reopen is speculative - if the repair does not commit, the gate
+            // reopen is speculative - if the repair is not confirmed, the gate
             // closes again and the bounded hidden repair takes over, so a
             // genuinely hidden surface costs one blind attempt per epoch
             // instead of a retry loop.
@@ -2519,18 +2585,63 @@ impl Runtime {
             self.speculative_present_reopen = true;
         }
         self.present_confirm_misses = self.present_confirm_misses.saturating_add(1);
+        self.queue_confirm_repaint();
+        eprintln!(
+            "bitty: present unconfirmed by the compositor (misses={}, bound={} ms); forcing a corrective repaint",
+            self.present_confirm_misses,
+            PRESENT_CONFIRM_BOUND.as_millis(),
+        );
+    }
+
+    fn queue_confirm_repaint(&mut self) {
         self.pending_full_redraw = true;
         self.forced_repaint_requests = self.forced_repaint_requests.saturating_add(1);
         if self.presenter.is_some() {
             // Consumed by the next submission, which marks it corrective.
             self.forced_repaint_owed = true;
         }
-        bitty_render::telemetry::present_unconfirmed();
-        eprintln!(
-            "bitty: present unconfirmed by the compositor (misses={}, bound={} ms); forcing a corrective repaint",
-            self.present_confirm_misses,
-            PRESENT_CONFIRM_BOUND.as_millis(),
-        );
+    }
+
+    /// An open gate permits a low-rate attempt; it is not evidence that the
+    /// compositor sampled anything. Use the worker's current extent/opacity
+    /// without reflowing Terminal Truth or taking the resize deduplication path.
+    /// Configure replaces the swapchain configuration, not winit's callback
+    /// state; only a served callback settles this repair episode.
+    fn check_unconfirmed_incarnation_repair(&mut self, now: std::time::Instant) {
+        let Some(after) = self.present_incarnation_repair_after else {
+            return;
+        };
+        if now < after
+            || !self.surface_visible
+            || self.speculative_present_reopen
+            || self.pending_present.is_some()
+        {
+            return;
+        }
+        self.present_incarnation_repair_after =
+            now.checked_add(PRESENT_INCARNATION_REPAIR_INTERVAL);
+        if let Some(presenter) = self.presenter.as_mut() {
+            if !presenter.is_active() {
+                // The worker recovery/reattach path owns an inactive surface.
+                return;
+            }
+            // Configure is applied before the next acquire, even at the same
+            // extent. The worker counts successful configurations separately.
+            presenter.repair_unconfirmed();
+        } else if let (Some(gpu), Some(extent)) = (self.gpu.as_ref(), self.surface.extent()) {
+            bitty_render::telemetry::present_repair_attempt();
+            let configured = self.surface.configure(gpu, extent).is_ok();
+            bitty_render::telemetry::present_repair_result(configured);
+            if !configured {
+                return;
+            }
+            self.present_confirm_misses = 0;
+        } else {
+            // A test seam can arm confirmation without a real surface.
+            self.present_incarnation_repair_after = None;
+            return;
+        }
+        self.queue_confirm_repaint();
     }
 
     /// Restores the hidden state when a speculative repair could not commit.
@@ -2709,6 +2820,11 @@ impl Runtime {
             // confirmation bound's single speculative reopen submits one real
             // frame commit at `PRESENT_CONFIRM_BOUND` (and closes the gate back
             // if the compositor still does not confirm it, per bitty#3116).
+            // After the fast budget is spent, a hide cancels any confirmation
+            // wait; a slow Configure must never reopen the hidden gate.
+            if self.present_incarnation_repair_after.is_some() {
+                self.clear_present_confirmation();
+            }
             // Retain the cancelled presentation as damage, exactly as before,
             // and arm the bounded self-heal only when something real was
             // retained (bitty#2830 hypothesis 2). A clean hide arms nothing.
@@ -3452,6 +3568,7 @@ impl Runtime {
         // one case that leaves nothing owed and no retry armed. Consume the
         // bound before the gates so the corrective frame is built this tick.
         self.check_present_confirmation(now);
+        self.check_unconfirmed_incarnation_repair(now);
         let mut stats = self.tick_at_inner(now).or(committed);
         // CTX-1788 (PR #3109 round-2 F3): an ack drained off-tick (input hot
         // path, or the embedder's pre-tick band hit-test) committed a frame
@@ -4081,10 +4198,8 @@ impl Runtime {
 
         // Empty layout -> idle (no leaf to present).
         if allocations.is_empty() {
-            self.mark_frame_presented(primary_generation);
-            self.publish_presented_allocations(allocations, focused);
             self.pending_full_redraw = false;
-            self.pending_paint_redraw = false;
+            self.finish_without_draw(primary_generation, allocations, focused);
             return None;
         }
 
@@ -4525,6 +4640,7 @@ impl Runtime {
                             || leaf.fills.is_empty()
                             || leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
                             || leaf.fade_factor != fade
+                            || leaf.content_size != (frame.content.width, frame.content.height)
                         {
                             return None;
                         }
@@ -4535,11 +4651,7 @@ impl Runtime {
                         }
                         let dx = frame.content.x.saturating_sub(leaf.origin.0);
                         let dy = frame.content.y.saturating_sub(leaf.origin.1);
-                        if dx == 0 && dy == 0 {
-                            return Some((0, 0));
-                        }
-                        (leaf.content_size == (frame.content.width, frame.content.height))
-                            .then_some((dx, dy))
+                        Some((dx, dy))
                     })
                 };
 
@@ -8113,16 +8225,19 @@ impl Runtime {
     /// so the embedder reports a real present on the tick that learned about
     /// it. The event-loop thread never performs the acquire/present itself.
     pub(super) fn poll_presenter(&mut self, now: std::time::Instant) -> Option<PresentStats> {
-        self.presenter.as_ref()?;
+        let presenter = self.presenter.as_mut()?;
         // bitty#2830: apply acknowledgements *before* any stuck decision.
         // A worker that finished just before this tick already cleared its
         // in-flight gauge and queued `Presented`; recovering it first would
         // abandon a healthy worker, spend a recovery slot, and drop the ack.
-        let acks = self
-            .presenter
-            .as_mut()
-            .map(|presenter| presenter.drain_acks(PRESENT_ACKS_PER_TICK))
-            .unwrap_or_default();
+        let acks = presenter.drain_acks(PRESENT_ACKS_PER_TICK);
+        // Read after draining: a Configure applied before a frame ack must
+        // already be visible here, even when the ack arrived during this tick.
+        let configurations = presenter.configurations();
+        if self.presenter_configurations != configurations {
+            self.presenter_configurations = configurations;
+            self.present_confirm_misses = 0;
+        }
         let mut committed = None;
         for ack in acks {
             self.apply_present_ack(now, ack, &mut committed);
@@ -8220,6 +8335,8 @@ impl Runtime {
             if recovered.is_ok() {
                 self.pending_full_redraw = true;
                 self.presenter_retry_at = None;
+                self.presenter_configurations = 0;
+                self.present_confirm_misses = 0;
                 // The recovery just abandoned the old worker; publish its
                 // liveness immediately so the forced-repaint transition is
                 // observed even if no tick happens before it exits.
@@ -8260,6 +8377,8 @@ impl Runtime {
                 self.pending_present = None;
                 self.pending_full_redraw = true;
                 self.presenter_retry_at = None;
+                self.presenter_configurations = 0;
+                self.present_confirm_misses = 0;
                 // bitty#2989: the stuck-present gauge owns this failure; the
                 // abandoned frame never committed, so no confirmation is owed.
                 self.clear_present_confirmation();
@@ -8554,15 +8673,16 @@ impl Runtime {
         if !layers.any_needs_draw
             && layers.combined_fills.is_empty()
             && layers.combined_rounded.is_empty()
+            && layers.combined_float_layers.is_empty()
             && layers.combined_backgrounds.is_empty()
             && layers.combined_overlay.is_empty()
+            && layers.combined_overlay_card_rounded.is_empty()
+            && layers.combined_overlay_content.is_empty()
+            && layers.combined_overlay_rounded.is_empty()
             && layers.combined_glyphs.is_empty()
             && layers.combined_images.is_empty()
         {
-            // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
-            // But ensure generation advances for idle detection.
-            self.mark_frame_presented(snapshot.generation);
-            self.publish_presented_allocations(allocations, focused);
+            self.finish_without_draw(snapshot.generation, allocations, focused);
             // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
             // executable origin and does not advance the presented-band
             // identity (the next tick keeps trying to commit a real frame).
@@ -8733,8 +8853,7 @@ impl Runtime {
         }
 
         if !combined_list.needs_draw() {
-            self.mark_frame_presented(snapshot.generation);
-            self.publish_presented_allocations(allocations, focused);
+            self.finish_without_draw(snapshot.generation, allocations, focused);
             // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
             // executable origin and does not advance the presented-band
             // identity (the next tick keeps trying to commit a real frame).
@@ -9311,8 +9430,9 @@ mod coalesced_deferral_tests {
 
 #[cfg(test)]
 mod empty_leaf_guard_tests {
-    use super::EMPTY_LEAF_RETRY_LIMIT;
+    use super::{EMPTY_LEAF_RETRY_LIMIT, FrameLayers};
     use crate::runtime::{Runtime, RuntimeConfig, ViewId};
+    use std::time::Instant;
 
     fn runtime() -> Runtime {
         Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
@@ -9326,6 +9446,141 @@ mod empty_leaf_guard_tests {
         rgba.chunks_exact(4)
             .filter(|px| *px != [30, 30, 46, 255])
             .count()
+    }
+
+    #[test]
+    fn retained_reuse_requires_content_size_at_the_same_origin() {
+        let mut rt = runtime();
+        let now = Instant::now();
+        rt.handle_pty_bytes(b"text");
+        rt.tick_at(now).expect("seed the retained leaf");
+        rt.pending_paint_redraw = true;
+        let mut basis = rt.collect_tick_basis(now).expect("paint-only frame");
+        assert!(!basis.full_frame);
+        let mut painted = basis.allocations.clone();
+        let frame = &mut painted[0];
+        // Model an interpolated extent with unchanged origin and grid.
+        frame.content.width -= 1;
+        let view = frame.view;
+        let expected = (frame.content.width, frame.content.height);
+        assert_ne!(rt.presented_leaf_frames[&view].content_size, expected);
+        basis.paint_allocations = Some(painted);
+        rt.build_leaf_primitives(&basis, now);
+        assert_eq!(rt.presented_leaf_frames[&view].content_size, expected);
+    }
+
+    #[test]
+    fn no_draw_does_not_consume_primary_text() {
+        let mut rt = runtime();
+        let now = Instant::now();
+        rt.tick_at(now).expect("initial frame");
+        let painted = rt.last_presented_generation;
+        rt.handle_pty_bytes(b"primary text");
+        let basis = rt.collect_tick_basis(now).expect("new primary truth");
+        assert_ne!(basis.snapshot.generation, painted);
+        assert!(
+            rt.present_assembled_frame(basis, FrameLayers::default(), now)
+                .is_none()
+        );
+        assert_eq!(rt.last_presented_generation, painted, "no text was painted");
+        assert!(rt.present_owed());
+        assert!(rt.tick_at(now).expect("truthful retry").glyphs > 0);
+        assert_ne!(rt.last_presented_generation, painted);
+    }
+
+    #[test]
+    fn blank_no_draw_settles_to_idle() {
+        let mut rt = runtime();
+        let now = Instant::now();
+        let basis = rt.collect_tick_basis(now).expect("initial blank frame");
+        let blank_generation = basis.snapshot.generation;
+        assert!(
+            rt.present_assembled_frame(basis, FrameLayers::default(), now)
+                .is_none()
+        );
+        assert_eq!(rt.last_presented_generation, blank_generation);
+        assert!(!rt.present_owed());
+        assert!(rt.tick_at(now).is_none());
+    }
+
+    #[test]
+    fn no_draw_does_not_retry_text_displaced_by_panel_content() {
+        use crate::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
+        use bitty_rich::scene::Scene;
+        let mut rt = runtime();
+        let now = Instant::now();
+        rt.handle_pty_bytes(b"text behind a presented content layer");
+        rt.tick_at(now).expect("initial terminal frame");
+        let view = rt.primary_view.expect("primary owner");
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let panel = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(panel.id, panel.generation, view)
+            .expect("mount panel");
+        rt.install_scene_host(host);
+        rt.present_panel_content(view, Scene::new())
+            .expect("present empty GUI content");
+        assert!(rt.content_layer_presented(view));
+        let basis = rt.collect_tick_basis(now).expect("new scene frame");
+        assert!(
+            rt.present_assembled_frame(basis, FrameLayers::default(), now)
+                .is_none()
+        );
+        assert!(
+            !rt.pending_full_redraw,
+            "the replaced grid does not owe paint"
+        );
+    }
+
+    #[test]
+    fn empty_layout_does_not_consume_primary_text() {
+        let mut rt = runtime();
+        let now = Instant::now();
+        rt.tick_at(now).expect("initial frame");
+        let painted = rt.last_presented_generation;
+        rt.handle_pty_bytes(b"primary text");
+        rt.set_layout(crate::runtime::LayoutNode::stack(Vec::new()));
+        assert!(rt.tick_at(now).is_none());
+        assert_eq!(rt.last_presented_generation, painted, "no leaf painted");
+        assert!(rt.present_owed());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_draw_does_not_consume_pane_text() {
+        use crate::runtime::{LayoutNode, View};
+        bitty_test_support::require_pty!();
+        let mut rt = runtime();
+        let pane = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            bitty_ui::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 12)),
+            LayoutNode::leaf(View::new(pane, 40, 12)),
+        ));
+        rt.spawn_shell_for_view(pane, "/bin/cat", &[], 40, 12)
+            .expect("pane spawns");
+        let now = Instant::now();
+        rt.tick_at(now).expect("initial frame");
+        let painted = rt.pane_sessions[&pane].last_presented_generation;
+        rt.handle_pane_bytes(pane, b"pane text");
+        let basis = rt.collect_tick_basis(now).expect("new pane truth");
+        assert_ne!(rt.pane_sessions[&pane].state.generation(), painted);
+        // The leaf pass can report work that produces no final primitives.
+        // Explicitly reach the final DrawList guard, not the early shortcut.
+        let layers = FrameLayers {
+            any_needs_draw: true,
+            ..FrameLayers::default()
+        };
+        assert!(rt.present_assembled_frame(basis, layers, now).is_none());
+        assert_eq!(
+            rt.pane_sessions[&pane].last_presented_generation, painted,
+            "no pane text was painted"
+        );
+        assert!(rt.present_owed());
+        assert!(rt.tick_at(now).expect("truthful retry").glyphs > 0);
+        assert_ne!(rt.pane_sessions[&pane].last_presented_generation, painted);
     }
 
     /// bitty#3032: an empty render of a text-bearing leaf must never become the
@@ -15329,10 +15584,9 @@ mod async_present_tests {
         assert!(runtime.shutdown());
     }
 
-    /// A surface that never confirms again must not be repainted every bound
-    /// forever: the repair budget bounds the corrective presents.
+    /// At exhaustion a hidden surface parks rather than reconfiguring.
     #[test]
-    fn an_unconfirming_surface_stops_after_the_repair_budget() {
+    fn an_occluded_surface_still_parks_after_the_repair_budget() {
         let _guard = unconfirmed_guard();
         let control = Control::new(false);
         let mut runtime = runtime_with(
@@ -15345,28 +15599,101 @@ mod async_present_tests {
         runtime.handle_pty_bytes(b"never confirms");
         tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
 
-        let mut repairs = 0u32;
-        for _ in 0..(PRESENT_CONFIRM_REPAIR_LIMIT + 2) {
-            let Some(deadline) = runtime.present_confirm_deadline() else {
-                break;
-            };
+        for _ in 0..PRESENT_CONFIRM_REPAIR_LIMIT {
+            let deadline = runtime.present_confirm_deadline().expect("repair bound");
             assert!(runtime.tick_at(deadline).is_none());
-            if runtime.pending_present.is_none() {
-                // Budget spent: no corrective frame was rebuilt.
-                break;
-            }
-            repairs = repairs.saturating_add(1);
             tick_until_committed(&mut runtime, TEST_WAIT).expect("the corrective frame commits");
         }
-        assert_eq!(
-            repairs, PRESENT_CONFIRM_REPAIR_LIMIT,
-            "the corrective present is bounded, not periodic"
-        );
+        let deadline = runtime.present_confirm_deadline().expect("repair bound");
+        runtime.set_surface_visibility_at(deadline, false);
+        assert!(runtime.tick_at(deadline).is_none());
+        assert!(!runtime.is_surface_visible());
+        assert!(!runtime.present_owed());
+        assert!(!runtime.probe_full_redraw_armed());
+        assert!(control.configured.lock().expect("configured").is_empty());
         assert_eq!(
             runtime.present_confirm_deadline(),
             None,
             "a spent budget arms no further wake"
         );
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn present_confirm_park_reconfigures_a_visible_surface() {
+        let _guard = unconfirmed_guard();
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"never confirms");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("first commit");
+        for _ in 0..PRESENT_CONFIRM_REPAIR_LIMIT {
+            let deadline = runtime.present_confirm_deadline().expect("repair bound");
+            assert!(runtime.tick_at(deadline).is_none());
+            tick_until_committed(&mut runtime, TEST_WAIT).expect("corrective commit");
+        }
+        let extent = runtime.presenter.as_ref().expect("presenter").extent();
+        let dead = runtime.present_confirm_deadline().expect("repair bound");
+        assert!(runtime.is_surface_visible());
+        // An applied Configure is required; a worker commit alone must not
+        // reset the budget or the last fast miss would never be reached.
+        assert_eq!(runtime.present_confirm_misses, PRESENT_CONFIRM_REPAIR_LIMIT);
+        assert!(runtime.tick_at(dead).is_none());
+        assert!(
+            runtime.pending_present.is_some() || runtime.present_confirm_deadline().is_some(),
+            "visible surface parked with neither an in-flight repair nor a deadline"
+        );
+        let interval = std::time::Duration::from_secs(5);
+        let mut repair_at = dead + interval;
+        let fast_commits = u64::from(PRESENT_CONFIRM_REPAIR_LIMIT) + 1;
+        let telemetry = bitty_render::telemetry::snapshot();
+        for repairs in 1..=2 {
+            assert_eq!(runtime.present_confirm_deadline(), Some(repair_at));
+            assert!(runtime.tick_at(repair_at - PRESENT_MIN_WAKE).is_none());
+            assert_eq!(control.presented(), fast_commits + repairs - 1);
+            assert_eq!(
+                control.configured.lock().expect("configured").len() as u64,
+                repairs - 1
+            );
+            assert!(runtime.tick_at(repair_at).is_none());
+            let repair =
+                tick_until_committed(&mut runtime, TEST_WAIT).expect("incarnation repair commits");
+            assert_eq!(control.presented(), fast_commits + repairs);
+            assert_eq!(
+                control.configured.lock().expect("configured").as_slice(),
+                vec![(extent.width(), extent.height()); repairs as usize]
+            );
+            assert!(
+                repair.cells_examined > 0,
+                "rebuild from truth after Configure"
+            );
+            assert!(repair.glyphs_emitted > 0, "repair frame carries the text");
+            assert_eq!(
+                runtime.present_confirm_misses, 0,
+                "applied Configure starts a new incarnation"
+            );
+            repair_at += interval;
+        }
+        let after = bitty_render::telemetry::snapshot();
+        assert_eq!(
+            after.present_repair_attempts - telemetry.present_repair_attempts,
+            2
+        );
+        assert_eq!(
+            after.present_repair_configured - telemetry.present_repair_configured,
+            2
+        );
+        assert_eq!(after.present_repair_failed, telemetry.present_repair_failed);
+        runtime.note_present_confirmed();
+        assert_eq!(runtime.present_confirm_deadline(), None);
+        assert!(!runtime.present_owed());
+        assert!(runtime.tick_at(repair_at).is_none());
+        assert_eq!(control.presented(), fast_commits + 2);
         assert!(runtime.shutdown());
     }
 

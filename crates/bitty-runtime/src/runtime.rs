@@ -1620,22 +1620,24 @@ pub struct Runtime {
     ///
     /// A present can report success and still never reach the screen: the
     /// commit is dropped, or the compositor never samples the surface again.
-    /// Damage is already consumed at that point, so nothing is owed and no
-    /// retry is armed - the window keeps the older frame while the loop parks
-    /// in `ControlFlow::Wait`. After a commit the runtime arms this bound; the
-    /// embedder clears it when the compositor serves a frame callback
-    /// (`note_present_confirmed`), and a deadline that fires first forces one
-    /// corrective repaint. `None` while no confirmation is outstanding, so a
-    /// healthy idle window arms nothing.
+    /// Damage is already consumed at that point, so there is no ordinary
+    /// frame debt to wake a parked loop. A commit arms this bound; a served
+    /// callback clears it. An expiry can spend one fast repaint slot, or
+    /// escalate to the slow repair cadence once those slots are spent.
+    /// Neither timer is armed on a healthy idle window.
     present_confirm_at: Option<std::time::Instant>,
     /// Consecutive unconfirmed presents since the last confirmation, bounded
-    /// by the presenter's repair limit.
+    /// by the fast repaint limit.
     ///
-    /// A surface that never confirms again (a wedged compositor, a lost
-    /// callback path) must not be repainted every bound forever; the budget
-    /// stops the corrective presents. Reset with the surface incarnation
-    /// (a fresh presenter, a resize) so a new one starts with the full budget.
+    /// Reset by a compositor callback or an applied surface configuration,
+    /// never by a driver commit alone.
     present_confirm_misses: u32,
+    /// Once the fast budget is spent with the visibility gate open, only
+    /// slow incarnation repairs are allowed up to the next confirmation.
+    /// Holds the earliest time another Configure may be queued.
+    present_incarnation_repair_after: Option<std::time::Instant>,
+    /// Last observed count of successful Configure requests on this worker.
+    presenter_configurations: u64,
     /// Whether [`Runtime::check_present_confirmation`] reopened a closed
     /// visibility gate speculatively (bitty#2989).
     ///
@@ -1643,12 +1645,12 @@ pub struct Runtime {
     /// redraw, which is the same evidence a dropped frame leaves behind, so
     /// an expiry can be the counter-evidence that the surface is still
     /// mapped. That reopen is an *experiment*: nothing has yet proven the
-    /// surface visible. While this is `true`, a repair attempt that does not
-    /// commit (a failed acquire, a stuck worker) closes the gate again and
+    /// surface visible. While this is `true`, a repair attempt that fails or
+    /// does not get a compositor confirmation closes the gate again and
     /// leaves a genuinely occluded surface its retained damage plus the
     /// bounded hidden repair - one blind attempt per occlusion epoch. A
-    /// committed frame, a served confirmation, or a real visibility edge
-    /// resolves the speculation and clears this.
+    /// served confirmation or a real visibility edge resolves the speculation;
+    /// a driver commit alone does not.
     speculative_present_reopen: bool,
     /// Test-only present-failure seam (issue #2570 B1).
     ///
@@ -2549,6 +2551,8 @@ impl Runtime {
             hidden_repair_at: None,
             present_confirm_at: None,
             present_confirm_misses: 0,
+            present_incarnation_repair_after: None,
+            presenter_configurations: 0,
             speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
@@ -2893,6 +2897,8 @@ impl Runtime {
             hidden_repair_at: None,
             present_confirm_at: None,
             present_confirm_misses: 0,
+            present_incarnation_repair_after: None,
+            presenter_configurations: 0,
             speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
@@ -3490,6 +3496,8 @@ impl Runtime {
         // a failed present of the new incarnation closes the gate.
         self.present_confirm_at = None;
         self.present_confirm_misses = 0;
+        self.present_incarnation_repair_after = None;
+        self.presenter_configurations = 0;
     }
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.

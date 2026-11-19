@@ -963,7 +963,16 @@ impl PanelSceneBackend for AppPanelSceneBackend {
             };
             handle
         };
-        Ok(self.panels.borrow_mut().detach_panel_scene(handle.id))
+        self.panels
+            .borrow_mut()
+            .detach_panel_scene(handle.id)
+            .map_err(|err| {
+                BridgeError::new(
+                    "runtime",
+                    E_UI_UNAVAILABLE,
+                    format!("panel.unmount failed: {err}"),
+                )
+            })
     }
 }
 
@@ -1064,7 +1073,20 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                     .present_placeholder(panel, ended, edge.reason.as_str());
             match res {
                 Ok(_) => {
-                    self.panels.borrow_mut().detach_panel_scene(panel);
+                    // bitty#3250 R5: a presented content layer owns the scene
+                    // slot, so the detach refuses rather than stripping the
+                    // paint half of a live record. Nothing was lost (the
+                    // placeholder is a registry record, not a scene) and the
+                    // layer still has to be released by its owner, which is
+                    // the diagnosable ordering this warning reports.
+                    if let Err(error) = self.panels.borrow_mut().detach_panel_scene(panel) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: panel {} placeholder release left a content layer presented: {error}",
+                                panel.0
+                            )
+                        });
+                    }
                     // A reload's release is not terminal for the container: the
                     // successor bind on the same edge rebinds it (OQ-084 D.3), so
                     // the leaf has to outlive the release. This `Close` is

@@ -323,6 +323,23 @@ pub struct PresentedPanelContent {
     pub scroll_offset: usize,
     /// The layer's opaque handle.
     pub token: PanelContentToken,
+    /// The presentation mode the panel presents its layer in right now
+    /// (bitty#2388, CTX-1902).
+    ///
+    /// A presented panel carries its mode exactly like any other panel: the
+    /// mode is stamped on the leaf [`View`](bitty_ui::View) and this field only
+    /// records what the host was told at the transition. A mode change through
+    /// the Core-owned verb rewrites it in the same step that stamps the leaf
+    /// (`Runtime::set_panel_content_presentation`), so the two never disagree
+    /// for a change made through that path.
+    pub presentation: PresentationMode,
+    /// The mode the panel presented **before** the layer was presented.
+    ///
+    /// Release returns the panel to this mode when nothing else moved the leaf
+    /// in between, which is the presentation half of "exact restore": the layer
+    /// is a presentation of the panel, so dismissing it must not leave the
+    /// panel where the layer put it.
+    pub prior_presentation: PresentationMode,
 }
 
 /// What [`PanelRuntime::release_panel_content`] restored.
@@ -346,6 +363,15 @@ pub struct RestoredPanelContent {
     pub scroll_offset: usize,
     /// The released layer's handle.
     pub token: PanelContentToken,
+    /// The mode the panel last presented its layer in.
+    ///
+    /// The caller compares it with the leaf's live mode to decide whether the
+    /// layer's mode is still the panel's own: a leaf moved outside the
+    /// presented-content path in between carries somebody else's intent and is
+    /// left where it is.
+    pub presentation: PresentationMode,
+    /// The mode to return the panel to (the mode recorded at present time).
+    pub prior_presentation: PresentationMode,
 }
 
 impl PanelRuntime {
@@ -1761,6 +1787,9 @@ impl PanelRuntime {
     /// transition; it is the geometry the displaced terminal keeps while
     /// hidden, and the value release reports back so the caller can decide the
     /// single restore resize. `scroll_offset` is recorded for the same reason.
+    /// `presentation` is the mode the leaf holds at this transition: it is both
+    /// the mode the layer is presented in and the mode release returns the
+    /// panel to.
     ///
     /// # Errors
     ///
@@ -1775,6 +1804,7 @@ impl PanelRuntime {
         displaced: ViewContent,
         frozen: Rect,
         scroll_offset: usize,
+        presentation: PresentationMode,
         scene: Scene,
     ) -> Result<PresentedPanelContent, PanelError> {
         if !matches!(displaced, ViewContent::Terminal(_)) {
@@ -1832,6 +1862,8 @@ impl PanelRuntime {
             frozen,
             scroll_offset,
             token,
+            presentation,
+            prior_presentation: presentation,
         };
         self.content_layers.insert(panel, record.clone());
         Ok(record)
@@ -1899,6 +1931,8 @@ impl PanelRuntime {
             frozen: record.frozen,
             scroll_offset: record.scroll_offset,
             token: record.token,
+            presentation: record.presentation,
+            prior_presentation: record.prior_presentation,
         })
     }
 
@@ -1943,6 +1977,13 @@ impl PanelRuntime {
     ///
     /// Returns `Ok(None)` when the panel presents no layer — every panel before
     /// bitty#2388, and a panel whose layer this edge already released.
+    ///
+    /// A `Some` record must not be dropped (bitty#2388, CTX-1902): it carries
+    /// the presentation half of the same restore — the mode the layer moved the
+    /// panel out of and the mode it last presented in. The host owns no layout,
+    /// so it cannot stamp the leaf back; whoever does own one applies the record
+    /// through `Runtime::restore_released_panel_presentation`, or the panel stays
+    /// in a mode a dead generation asked for.
     pub fn release_content_layer_at_generation_end(
         &mut self,
         id: super::panel::PanelId,
@@ -1973,6 +2014,8 @@ impl PanelRuntime {
             frozen: record.frozen,
             scroll_offset: record.scroll_offset,
             token: record.token,
+            presentation: record.presentation,
+            prior_presentation: record.prior_presentation,
         }))
     }
 
@@ -1994,6 +2037,61 @@ impl PanelRuntime {
     pub fn presented_content_for_view(&self, view: ViewId) -> Option<&PresentedPanelContent> {
         let panel = self.placement.panel_of(view)?;
         self.content_layers.get(&panel)
+    }
+
+    /// The panel mounted at `view`, or the typed refusal that says why no panel
+    /// answers.
+    ///
+    /// The present/release pair resolves the panel the same way; this reports
+    /// the resolution so a verb that needs the panel identity *before* it can
+    /// name a refusal (a content-layer verb refusing on the panel it found, not
+    /// on the view it was given) does not have to guess it. Read-only: it
+    /// touches no registry counter and no record, so a caller that refuses on
+    /// its result reports the refusal once, at the verb that refused.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel is mounted at `view`.
+    pub fn content_panel_for_view(
+        &self,
+        view: ViewId,
+    ) -> Result<super::panel::PanelId, PanelError> {
+        match self.placement.panel_of(view) {
+            Some(panel) => Ok(panel),
+            None => Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel is mounted at this view",
+            }),
+        }
+    }
+
+    /// Records `mode` as the presentation mode the panel mounted at `view` is
+    /// presenting its content layer in (bitty#2388, CTX-1902).
+    ///
+    /// This is the record half of a mode change: the layout half is
+    /// [`bitty_ui::apply_presentation_command`], which stamps the leaf through
+    /// the single transition gate. The caller runs the fallible half first and
+    /// calls this only after it succeeded, so the pair never splits across a
+    /// refusal — see
+    /// [`Runtime::set_panel_content_presentation`](crate::runtime::Runtime::set_panel_content_presentation).
+    ///
+    /// Nothing else is touched: the layer, its scene slot, the displaced
+    /// terminal record, the frozen rectangle, and the token keep their values.
+    /// `prior_presentation` is deliberately **not** rewritten: it is the mode
+    /// the panel is restored to long after this call.
+    ///
+    /// Returns `None` when the panel presents no layer, which the caller's
+    /// prior validation rules out; a `None` therefore means the record left
+    /// between the two steps and the caller must not report a change.
+    pub fn commit_presented_content_presentation(
+        &mut self,
+        view: ViewId,
+        mode: PresentationMode,
+    ) -> Option<PresentedPanelContent> {
+        let panel = self.placement.panel_of(view)?;
+        let record = self.content_layers.get_mut(&panel)?;
+        record.presentation = mode;
+        Some(record.clone())
     }
 
     /// Number of panels presenting a content layer.

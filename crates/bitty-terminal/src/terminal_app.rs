@@ -4400,8 +4400,47 @@ impl TerminalApp {
                 } => {
                     self.record_plugin_panel_presentation(panel_id, view_id);
                 }
+                crate::plugin_runtime::PluginPanelLayoutOp::RestorePresentation {
+                    panel_id,
+                    restored,
+                } => {
+                    self.restore_released_panel_presentation(panel_id, &restored);
+                }
             }
         }
+    }
+
+    /// Returns a leaf to the presentation mode a released content layer
+    /// displaced (bitty#2388, CTX-1902).
+    ///
+    /// The release itself ran at the generation edge, inside the plugin runtime,
+    /// which owns the panel host but no layout — so it carried the typed
+    /// `RestoredPanelContent` here rather than dropping it. This is the layer
+    /// that owns the leaf, so it applies the record through
+    /// `Runtime::restore_released_panel_presentation`, the same restore the token
+    /// release runs, guards included: a leaf somebody else moved is left where
+    /// it is, and a leaf the edge already closed restores nothing. Runs in the
+    /// pre-present drain, so the first frame after the edge already shows the
+    /// returned placement.
+    fn restore_released_panel_presentation(
+        &mut self,
+        panel_id: bitty_runtime::registry::PanelId,
+        restored: &bitty_runtime::registry::RestoredPanelContent,
+    ) {
+        if self.runtime.restore_released_panel_presentation(restored) {
+            return;
+        }
+        // A no-op is ordinary: the edge closed the leaf (a disposal), the layer
+        // never moved the mode, or somebody else owns the placement now. Only a
+        // leaf that still exists and still carries the dead layer's mode would
+        // mean the restore was refused, which cannot happen for a supported
+        // mode — so this is a note, not a warning.
+        crate::logging::info(|| {
+            format!(
+                "bitty: panel {} presentation not restored at the generation edge (leaf {:?} left as it was)",
+                panel_id.0, restored.view
+            )
+        });
     }
 
     /// Records the presentation mode a retained panel leaf still presents,

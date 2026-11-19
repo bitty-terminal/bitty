@@ -269,6 +269,21 @@ pub enum PanelError {
         /// The refused token value; an opaque generation-owned ordinal.
         token: u64,
     },
+    /// A presented-content verb named a presentation mode a presented panel
+    /// cannot take (bitty#2388, CTX-1902): the mode has no placement this
+    /// runtime gives an in-tree panel, so stamping it would report a change
+    /// that paints exactly like the mode it replaced.
+    ///
+    /// Nothing was stamped, recorded, focused, or resized: the leaf keeps its
+    /// mode, its frame, its focus, and its frozen geometry, and the layer keeps
+    /// its record.
+    ContentPresentationUnsupported {
+        view_id: ViewId,
+        /// Canonical mode name
+        /// ([`PresentationMode::as_str`](bitty_ui::presentation::PresentationMode::as_str)):
+        /// a `'static` vocabulary word, never caller payload.
+        mode: &'static str,
+    },
 }
 
 impl std::fmt::Display for PanelError {
@@ -398,6 +413,10 @@ impl std::fmt::Display for PanelError {
             Self::ContentTokenMismatch { panel_id, token } => write!(
                 f,
                 "panel {panel_id} content-layer handle {token} is stale or foreign"
+            ),
+            Self::ContentPresentationUnsupported { view_id, mode } => write!(
+                f,
+                "view {view_id} cannot present panel content in mode '{mode}'"
             ),
         }
     }

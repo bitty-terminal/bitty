@@ -207,6 +207,36 @@ fn the_disabled_reason_has_one_producer_and_it_is_the_wall_recovery_reconcile() 
              false"
         );
     }
+
+    // Presence is not nesting: a compile-valid move of the producer out of the
+    // index-gate block would dispose *enabled* records while the two checks
+    // above stayed green, so pin the producer inside that block's brace span.
+    let lines: Vec<&str> = body.lines().collect();
+    let gate = lines
+        .iter()
+        .position(|line| line.contains("if !record.enabled {"))
+        .expect("the index-gate line is in the reconcile body (asserted above)");
+    let mut depth = 0i32;
+    let mut gate_end = None;
+    for (offset, line) in lines.iter().enumerate().skip(gate) {
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if offset > gate && depth <= 0 {
+            gate_end = Some(offset);
+            break;
+        }
+    }
+    let gate_end =
+        gate_end.expect("the `if !record.enabled` block is closed in the reconcile body");
+    let producer_offset = producer_line - start;
+    assert!(
+        gate < producer_offset && producer_offset < gate_end,
+        "{RUNTIME}:{}: the `disabled` producer is not inside the `if !record.enabled` block \
+         ({}-{} of the reconcile body), so the recorded decision (\"disable behaves as crash with \
+         the disable named\") would fire on enabled records",
+        producer_line + 1,
+        gate + start + 2,
+        gate_end + start + 1,
+    );
 }
 
 /// The plugin runtime exposes no live disable verb, which is why the arm is a

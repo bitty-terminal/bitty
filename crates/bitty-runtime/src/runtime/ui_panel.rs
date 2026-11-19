@@ -35,7 +35,7 @@
 //! | this generation already presents | [`E_UI_PANEL_NESTED`] |
 //! | no focused panel, no panel there, or not terminal-backed | [`E_UI_PANEL_UNAVAILABLE`] |
 //! | no panel host installed (headless/no-surface host) | [`E_UI_UNAVAILABLE`] |
-//! | a stale, foreign, or already-released handle | [`E_UI_NOT_OWNER`] |
+//! | a stale, foreign, previous-generation, or already-released handle | [`E_UI_NOT_OWNER`] |
 //! | an unusable scene | `E_UI_COMPONENT_INVALID` |
 //!
 //! # Handle lifetime
@@ -48,6 +48,15 @@
 //! outlive what it names. A handle whose Core record is gone answers
 //! [`E_UI_NOT_OWNER`] (and drops its entry) instead of restoring a terminal
 //! somebody else now owns.
+//!
+//! The fence compares the owner **and** the generation, because one edge can
+//! leave a row behind: `RuntimePanelContentBackend::release_owner`
+//! ([`crate::plugin_runtime::RuntimePanelContentBackend`]) reports zero instead
+//! of releasing when the shared runtime is borrowed by an in-flight call, so a
+//! dying generation's row can survive its teardown. The next generation must
+//! adopt nothing from it: a handle the row names is not the successor's, and
+//! neither the row's own generation nor the successor may release a layer the
+//! other owns.
 
 use bitty_lua::{
     BridgeError, E_UI_NOT_OWNER, E_UI_PANEL_BUSY, E_UI_PANEL_NESTED, E_UI_PANEL_UNAVAILABLE,
@@ -195,10 +204,10 @@ impl Runtime {
     /// # Errors
     ///
     /// [`E_UI_NOT_OWNER`] for a handle this generation does not hold (stale,
-    /// foreign, already released, or whose Core record is gone — the entry is
-    /// dropped, so a repeat answers the same way); `E_UI_COMPONENT_INVALID` for
-    /// a refused scene; [`E_UI_UNAVAILABLE`] when no panel host is installed.
-    /// A refusal keeps the last good content.
+    /// foreign, presented by another generation, already released, or whose
+    /// Core record is gone — the entry is dropped, so a repeat answers the same
+    /// way); `E_UI_COMPONENT_INVALID` for a refused scene; [`E_UI_UNAVAILABLE`]
+    /// when no panel host is installed. A refusal keeps the last good content.
     pub fn ui_panel_update(
         &mut self,
         owner: &PluginId,
@@ -276,8 +285,9 @@ impl Runtime {
     /// # Errors
     ///
     /// [`E_UI_NOT_OWNER`] for a handle this generation does not hold, including
-    /// a second release of the same handle (the record is gone and the entry is
-    /// dropped); [`E_UI_PANEL_UNAVAILABLE`] when the panel is no longer mounted;
+    /// one a previous generation presented, and a second release of the same
+    /// handle (the record is gone and the entry is dropped);
+    /// [`E_UI_PANEL_UNAVAILABLE`] when the panel is no longer mounted;
     /// [`E_UI_UNAVAILABLE`] when no panel host is installed. A refusal restores
     /// nothing and leaves a live layer presented.
     pub fn ui_panel_release(
@@ -412,9 +422,10 @@ impl Runtime {
     ///
     /// The block id is the panel's: a layer replaces that panel's content, so a
     /// stable id per container keeps the paint slot addressable across updates.
-    /// Admission refusals are `E_UI_COMPONENT_INVALID` — the record's code for
+    /// An admission refusal already carries `E_UI_COMPONENT_INVALID` — that is
+    /// the value of [`crate::scene_host::E_SCENE_REFUSED`], the record's code for
     /// a scene the host will not paint — while a missing admission path stays
-    /// [`E_UI_UNAVAILABLE`].
+    /// [`E_UI_UNAVAILABLE`]. Nothing is re-spelled here.
     fn ui_panel_scene(
         &self,
         panel: PanelId,
@@ -423,13 +434,6 @@ impl Runtime {
         node: &bitty_lua::UiRichNode,
     ) -> Result<Scene, BridgeError> {
         crate::scene_host::build_panel_scene(BlockId(panel.get()), owner.as_str(), generation, node)
-            .map_err(|error| {
-                if error.code == "E_SCENE_REFUSED" {
-                    bitty_lua::ui::component_invalid(error.message)
-                } else {
-                    error
-                }
-            })
     }
 }
 

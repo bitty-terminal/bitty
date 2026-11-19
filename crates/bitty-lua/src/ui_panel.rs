@@ -84,17 +84,6 @@ pub enum UiPanelPlacement {
 }
 
 impl UiPanelPlacement {
-    /// Canonical spelling, identical to the accepted `spec` value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tiled => "tiled",
-            Self::Floating => "floating",
-            Self::Fullscreen => "fullscreen",
-            Self::Scratchpad => "scratchpad",
-        }
-    }
-
     /// Parse one accepted spelling; `None` for anything else (including the
     /// record's explicit `band` refusal).
     #[must_use]
@@ -115,16 +104,6 @@ pub enum UiPanelRestore {
     /// Put the displaced terminal back (the only accepted behaviour).
     #[default]
     Previous,
-}
-
-impl UiPanelRestore {
-    /// Canonical spelling, identical to the accepted `spec` value.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Previous => UI_PANEL_RESTORE_PREVIOUS,
-        }
-    }
 }
 
 /// The validated, closed `spec` table of `bitty.ui.panel.present`.

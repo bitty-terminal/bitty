@@ -8127,7 +8127,10 @@ impl HostServices for PluginServices {
     /// CTX-1909 — `bitty.ui.panel.update`).
     ///
     /// Same two grants as the present: an update rewrites what a granted
-    /// presentation paints, so it is never cheaper than presenting.
+    /// presentation paints, so it is never cheaper than presenting. Safe mode
+    /// refuses with [`E_UI_UNAVAILABLE`] before the backend is consulted, the
+    /// same gate `present` applies: a generation running under safe policy must
+    /// not repaint a layer, including one it could never have created itself.
     fn ui_panel_update(
         &self,
         handle: i64,
@@ -8142,6 +8145,13 @@ impl HostServices for PluginServices {
         }
         if !panel {
             return Err(BridgeError::capability_denied("ui.panel"));
+        }
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "safe mode updates no panel content",
+            ));
         }
         let backend = self.panel_content_backend.borrow().clone().ok_or_else(|| {
             BridgeError::new(
@@ -9988,6 +9998,53 @@ mod tests {
         );
     }
 
+    /// Panel-content backend that only counts the updates that reached it.
+    ///
+    /// Used to prove the safe-mode gate in `ui_panel_update`: the refusal must
+    /// happen before this type, and clearing safe mode must be what lets the
+    /// call through (so a backend that always fails could not fake it).
+    #[derive(Default)]
+    struct CountingPanelContent {
+        updates: Cell<u32>,
+    }
+
+    impl PanelContentBackend for CountingPanelContent {
+        fn present(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _spec: &bitty_lua::UiPanelSpec,
+            _node: &bitty_lua::UiRichNode,
+        ) -> Result<i64, BridgeError> {
+            Ok(1)
+        }
+
+        fn update(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _handle: i64,
+            _node: &bitty_lua::UiRichNode,
+        ) -> Result<bool, BridgeError> {
+            self.updates.set(self.updates.get() + 1);
+            Ok(true)
+        }
+
+        fn release(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _handle: i64,
+            _reason: &str,
+        ) -> Result<bool, BridgeError> {
+            Ok(true)
+        }
+
+        fn release_owner(&self, _owner: &PluginId, _generation: u32) -> usize {
+            0
+        }
+    }
+
     fn ui_services(access: UiAccess) -> PluginServices {
         let services = services();
         services.set_ui_access(access);
@@ -10239,6 +10296,57 @@ mod tests {
                 .ui_overlay_release_with_reason(handle, None)
                 .expect("idempotent release"),
             "an already-ended session releases nothing"
+        );
+    }
+
+    /// bitty#2388 (CTX-1909): `update` is gated by safe mode exactly like
+    /// `present`, and the refusal happens before the backend is consulted.
+    ///
+    /// The asymmetry was invisible from the plugin surface — a safe-mode
+    /// generation cannot *create* a layer — but `update` is the verb that
+    /// rewrites whatever the panel currently presents, so it carries the same
+    /// policy gate as the verb that creates it rather than relying on the
+    /// create-side gate alone.
+    #[test]
+    fn ui_panel_update_refuses_in_safe_mode_before_the_backend() {
+        let backend = Rc::new(CountingPanelContent::default());
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: false,
+            overlay_focus: false,
+            present: false,
+            panel: true,
+            claims: Vec::new(),
+        });
+        services
+            .set_panel_content_backend(Some(Rc::clone(&backend) as Rc<dyn PanelContentBackend>));
+        let node = bitty_lua::UiRichNode::Text {
+            text: "layer".to_string(),
+            bold: false,
+        };
+
+        services.set_safe_mode(true);
+        let error = services
+            .ui_panel_update(1, &node)
+            .expect_err("safe mode denies a panel content update");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert_eq!(
+            backend.updates.get(),
+            0,
+            "the refusal happens before the backend"
+        );
+
+        services.set_safe_mode(false);
+        assert!(
+            services
+                .ui_panel_update(1, &node)
+                .expect("cleared safe mode"),
+            "the same call is forwarded once safe mode is cleared"
+        );
+        assert_eq!(
+            backend.updates.get(),
+            1,
+            "the gate, not a stale failure, is what refused"
         );
     }
 

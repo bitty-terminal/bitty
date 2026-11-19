@@ -29,14 +29,35 @@
 //! 8. **Update replaces content only.** `bitty.ui.panel.update` repaints the
 //!    layer and leaves the displaced terminal, its winsize, and the record as
 //!    they were.
+//! 9. **A handle from another generation fences.** The same owner at a later
+//!    generation is refused `E_UI_NOT_OWNER` on both content verbs, and the
+//!    refusal leaves the row, the painted kind, the child, and the restore
+//!    count untouched (fail-closed, not just an error string).
+//! 10. **Suspend releases the layer.** Driving the real `PluginRuntime::suspend`
+//!     edge restores the recorded terminal kind, drops the plugin row, and
+//!     leaves the pre-suspend handle dead once the plugin resumes.
+//! 11. **Reload releases the layer and advances the generation.** The real
+//!     `PluginRuntime::reload` edge restores the terminal, advances the
+//!     generation by exactly one, and neither generation can address the
+//!     other's layer afterwards.
 //!
 //! # Verification limits
 //!
-//! Rows 1, 2, 4, 5, and 8 read a live pane's kernel winsize or grid, so they
-//! call `bitty_test_support::require_pty!()` as their **first statement** and
-//! skip on a build without a PTY backend (the workspace skip convention, not
-//! evidence). Rows 3, 6, and 7 need no PTY: they assert a typed code produced
-//! before any terminal is touched.
+//! Rows 1, 2, 4, 5, 8, 9, 10, and 11 read a live pane's kernel winsize or grid,
+//! so they call `bitty_test_support::require_pty!()` as their **first
+//! statement** and skip on a build without a PTY backend (the workspace skip
+//! convention, not evidence). Rows 3, 6, and 7 need no PTY: they assert a typed
+//! code produced before any terminal is touched.
+//!
+//! Row 9 addresses the fence through `Runtime::ui_panel_update` /
+//! `Runtime::ui_panel_release` rather than through a Lua verb, because no
+//! lifecycle edge leaves a row behind: `suspend`, `dispose`, `reload`, and the
+//! failure rollback all release the dying generation's layers (rows 10 and 11
+//! drive two of them). The only shape that leaves a row is the teardown whose
+//! `release_owner` reported zero on a borrow conflict, and the fence's
+//! generation arm exists for exactly that shape. Those two `Runtime` entries are
+//! the ones `RuntimePanelContentBackend` calls, so the row exercises the real
+//! fence, not a test-only path through it.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -139,6 +160,7 @@ const COMMANDS: &[&str] = &[
     "present_extra_key",
     "present_band",
     "present_bad_scene",
+    "present_nested_spec",
     "present_message",
     "present_twice",
     "update",
@@ -192,6 +214,10 @@ end })
 
 bitty.commands.register({ id = "present_bad_scene", title = "Present bad scene", run = function()
   return present({ kind = "Nope" }, {})
+end })
+
+bitty.commands.register({ id = "present_nested_spec", title = "Present nested spec", run = function()
+  return present(SCENE, { placement = { mode = "floating" } })
 end })
 
 bitty.commands.register({ id = "present_message", title = "Present message", run = function()
@@ -727,6 +753,11 @@ fn an_invalid_scene_or_spec_is_component_invalid() {
         "a tree admission rejects is the component code"
     );
     assert_eq!(
+        fixture.run_err("present_nested_spec"),
+        "E_UI_COMPONENT_INVALID",
+        "a nested table where the flat spec carries a string is a refusal"
+    );
+    assert_eq!(
         fixture.run_err("release_bad_reason"),
         "E_UI_COMPONENT_INVALID",
         "the release disposition set is closed, refused before the host call"
@@ -835,4 +866,328 @@ fn update_repaints_the_layer_and_leaves_the_terminal_alone() {
         );
     }
     assert_eq!(fixture.run_ok("release"), "true");
+}
+
+// ---------------------------------------------------------------------------
+// Row 9: a previous generation's handle cannot touch a live layer
+// ---------------------------------------------------------------------------
+
+/// The generation half of the handle fence (`ui_panel_update` and
+/// `ui_panel_release`).
+///
+/// No lifecycle edge leaves a row behind: suspend, dispose, reload, and the
+/// failure rollback all reach `clear_ui_blocks`, which releases the dying
+/// generation's layers (rows 10 and 11). The generation arm therefore defends
+/// the one shape that can leave a row — a teardown whose release reported zero
+/// because the shared runtime was borrowed
+/// (`RuntimePanelContentBackend::release_owner`). This row builds that shape on
+/// the public `Runtime` entries the backend calls: a live row, addressed by the
+/// same owner at a later generation.
+#[test]
+fn a_previous_generations_handle_cannot_update_or_release_a_live_layer() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("generation-fence", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let (generation, token, pid) = {
+        let live = fixture.live.borrow();
+        let layer = live
+            .ui_panel_layer(handle)
+            .expect("the handle names a layer");
+        assert_eq!(
+            live.panel_content_kind(PANE),
+            Some(ViewContent::Rich(layer.token.get())),
+            "the fixture must present a live layer"
+        );
+        (
+            layer.generation,
+            layer.token,
+            live.pane_pid(&PANE).expect("pane child"),
+        )
+    };
+    let successor = generation + 1;
+    let owner = PluginId::new(PLUGIN).expect("valid id");
+    let node = bitty_lua::UiRichNode::Text {
+        text: "successor-generation".to_string(),
+        bold: false,
+    };
+    // Move the leaf's content rect while the layer is up, so a restore would
+    // issue exactly one resize: the refusal assertions below then prove *no*
+    // restore ran, rather than leaning on a counter that is zero by default.
+    fixture
+        .live
+        .borrow_mut()
+        .handle_resize(PhysicalSize::new(1200, 700))
+        .expect("window resize applies");
+
+    // The same owner at a later generation is a stranger to this layer.
+    let updated = fixture
+        .live
+        .borrow_mut()
+        .ui_panel_update(&owner, successor, handle, &node)
+        .map_err(|error| error.code);
+    assert_eq!(
+        updated,
+        Err("E_UI_NOT_OWNER"),
+        "a later generation must not repaint an earlier generation's layer"
+    );
+    let released = fixture
+        .live
+        .borrow_mut()
+        .ui_panel_release(&owner, successor, handle, "released")
+        .map_err(|error| error.code);
+    assert_eq!(
+        released,
+        Err("E_UI_NOT_OWNER"),
+        "a later generation must not release an earlier generation's layer"
+    );
+
+    // Fail-closed is *unchanged*, not merely an error code: the refusal must
+    // leave the row, the painted kind, and the displaced child exactly as they
+    // were.
+    {
+        let live = fixture.live.borrow();
+        assert_eq!(
+            live.ui_panel_layer_count(),
+            1,
+            "a refused call drops no row and adds none"
+        );
+        assert_eq!(
+            live.ui_panel_layer(handle)
+                .map(|layer| (layer.generation, layer.token)),
+            Some((generation, token)),
+            "the row still names the generation that presented it"
+        );
+        assert_eq!(
+            live.panel_content_kind(PANE),
+            Some(ViewContent::Rich(token.get())),
+            "the panel still presents the layer it presented before"
+        );
+        assert!(live.content_layer_presented(PANE), "the layer is still up");
+        assert_eq!(
+            live.pane_pid(&PANE),
+            Some(pid),
+            "a refused release restored nothing (and respawned nothing)"
+        );
+        assert_eq!(
+            live.content_restore_resizes(),
+            0,
+            "a refused release issued no restore resize"
+        );
+    }
+
+    // The generation that presented it still holds it: the fence refuses the
+    // stranger, not the owner.
+    assert_eq!(fixture.run_ok("release"), "true");
+    assert_eq!(
+        fixture.live.borrow().content_restore_resizes(),
+        1,
+        "the owner's release is the one restore"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 10: suspend releases the layer before the plugin parks
+// ---------------------------------------------------------------------------
+
+/// `PluginRuntime::suspend` reaches `PluginServices::clear_ui_blocks`, which is
+/// the generation edge that must hand the panel back before the placeholder is
+/// presented. A deleted `PanelContentBackend::release_owner` call there leaves
+/// the layer painting over a terminal nobody owns, and this row is what sees it.
+#[test]
+fn suspend_releases_the_layer_and_the_stale_handle_cannot_restore() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("teardown-suspend", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let pid = fixture.live.borrow().pane_pid(&PANE).expect("pane child");
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let token = fixture
+        .live
+        .borrow()
+        .ui_panel_layer(handle)
+        .expect("the handle names a layer")
+        .token;
+
+    // Move the content rect while the layer is up so the teardown restore is
+    // observable: a teardown that did *not* release the layer issues no resize.
+    fixture
+        .live
+        .borrow_mut()
+        .handle_resize(PhysicalSize::new(1200, 700))
+        .expect("window resize applies");
+
+    let id = PluginId::new(PLUGIN).expect("valid id");
+    fixture
+        .plugins
+        .suspend(&id)
+        .expect("an active plugin suspends");
+
+    // The teardown release ran before the plugin parked: the recorded terminal
+    // is back, and the row died with the generation.
+    {
+        let live = fixture.live.borrow();
+        assert_eq!(
+            live.panel_content_kind(PANE),
+            Some(ViewContent::Terminal(PANE.0)),
+            "a suspended generation's layer must not stay on screen"
+        );
+        assert_eq!(
+            live.ui_panel_layer_count(),
+            0,
+            "the dead generation's row must not survive the teardown"
+        );
+        assert!(!live.content_layer_presented(PANE), "no layer is presented");
+        assert_eq!(
+            live.content_restore_resizes(),
+            1,
+            "the teardown restore is the only resize the hidden PTY sees"
+        );
+        assert_eq!(live.pane_pid(&PANE), Some(pid), "the same child came back");
+        assert!(
+            live.panel_content_layer(PANE).map(|layer| layer.token) != Some(token),
+            "the Core record no longer carries the released token"
+        );
+    }
+
+    // After resume the plugin is live again, and the pre-suspend handle is a
+    // dead value: refusing it must restore nothing a second time.
+    fixture.plugins.resume(&id).expect("resume");
+    let stale = fixture.run_on_args(PLUGIN, "release_handle", &[LuaValue::Integer(handle)]);
+    assert_eq!(
+        stale, "ERR:E_UI_NOT_OWNER",
+        "a handle from before the teardown names nothing"
+    );
+    let live = fixture.live.borrow();
+    assert_eq!(
+        live.panel_content_kind(PANE),
+        Some(ViewContent::Terminal(PANE.0)),
+        "the stale release did not put the layer back"
+    );
+    assert_eq!(
+        live.content_restore_resizes(),
+        1,
+        "the refused release restored nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 11: a reloaded generation starts released, and owns nothing from before
+// ---------------------------------------------------------------------------
+
+/// The reload edge runs the same teardown and then rebuilds the generation.
+/// This row proves three things the suite previously could not see: the layer
+/// is released at the teardown, the real reload path advances the generation by
+/// one, and neither direction of the fence crosses generations afterwards (the
+/// dead generation cannot release the live layer, and the live generation does
+/// not adopt the dead handle).
+#[test]
+fn a_reloaded_generation_releases_the_layer_and_the_predecessor_owns_nothing() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("teardown-reload", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let (generation, pid) = {
+        let live = fixture.live.borrow();
+        let layer = live
+            .ui_panel_layer(handle)
+            .expect("the handle names a layer");
+        (layer.generation, live.pane_pid(&PANE).expect("pane child"))
+    };
+
+    // Move the content rect while the layer is up so the reload teardown's
+    // restore is observable.
+    fixture
+        .live
+        .borrow_mut()
+        .handle_resize(PhysicalSize::new(1200, 700))
+        .expect("window resize applies");
+
+    let id = PluginId::new(PLUGIN).expect("valid id");
+    let report = fixture.plugins.reload(&id).expect("reload");
+    assert_eq!(
+        report.state,
+        LifecycleState::Active,
+        "the rebuilt generation is live"
+    );
+
+    {
+        let live = fixture.live.borrow();
+        assert_eq!(
+            live.panel_content_kind(PANE),
+            Some(ViewContent::Terminal(PANE.0)),
+            "a reloaded generation's layer must not stay on screen"
+        );
+        assert_eq!(
+            live.ui_panel_layer_count(),
+            0,
+            "the predecessor's row must not survive the reload"
+        );
+        assert_eq!(
+            live.content_restore_resizes(),
+            1,
+            "the reload teardown is the only restore"
+        );
+        assert_eq!(live.pane_pid(&PANE), Some(pid), "the same child came back");
+    }
+
+    // The rebuilt generation holds the panel: it presents its own layer, from a
+    // real advanced generation, and the old handle value is not it.
+    let fresh: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    assert_ne!(fresh, handle, "a reload never reuses a handle");
+    let fresh_generation = fixture
+        .live
+        .borrow()
+        .ui_panel_layer(fresh)
+        .expect("the new layer")
+        .generation;
+    assert_eq!(
+        fresh_generation,
+        generation + 1,
+        "the reload path advanced the plugin generation by exactly one"
+    );
+    // Move the rect again while the successor's layer is up: a refusal that
+    // restored the terminal would show up as a second restore resize.
+    fixture
+        .live
+        .borrow_mut()
+        .handle_resize(PhysicalSize::new(1000, 640))
+        .expect("second window resize applies");
+
+    // The predecessor generation cannot reach the successor's layer.
+    let owner = PluginId::new(PLUGIN).expect("valid id");
+    let stolen = fixture
+        .live
+        .borrow_mut()
+        .ui_panel_release(&owner, generation, fresh, "released")
+        .map_err(|error| error.code);
+    assert_eq!(
+        stolen,
+        Err("E_UI_NOT_OWNER"),
+        "a dead generation must not release the live layer"
+    );
+
+    // And the successor does not adopt the predecessor's handle.
+    let stale = fixture.run_on_args(PLUGIN, "release_handle", &[LuaValue::Integer(handle)]);
+    assert_eq!(
+        stale, "ERR:E_UI_NOT_OWNER",
+        "a handle from the displaced generation names nothing"
+    );
+    let live = fixture.live.borrow();
+    assert_eq!(
+        live.ui_panel_layer_count(),
+        1,
+        "neither stale call touched the live row"
+    );
+    assert_eq!(
+        live.panel_content_kind(PANE),
+        Some(ViewContent::Rich(
+            live.ui_panel_layer(fresh).expect("live layer").token.get()
+        )),
+        "the successor's layer is still presented after both refusals"
+    );
+    assert_eq!(
+        live.content_restore_resizes(),
+        1,
+        "neither refused call restored the terminal"
+    );
 }

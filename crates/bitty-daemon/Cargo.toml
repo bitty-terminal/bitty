@@ -32,13 +32,13 @@ path = "src/main.rs"
 # bitty#2607: the service scope registry reuses the `bitty-ipc` v1 method
 # grammar and v1 vocabulary instead of defining a second one (bitty#2664
 # freeze: one spelling, one registry). The crate is the same git source and
-# `rev = "9493674"` pin the workspace already resolves through
+# `rev = "18a1432"` pin the workspace already resolves through
 # `bitty-runtime`, so this adds no package version and no second wire format.
-bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432" }
 # bitty#2607: the admission loop uses the accepted RC-9 token-bucket limiter
 # (`100`/s sustained, `200` burst at the compiled defaults) instead of a second
 # rate-limit implementation. Same git source and rev as the API crate above.
-bitty-ipc-core = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+bitty-ipc-core = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "18a1432" }
 # bitty#2607: the v1 envelope is JSON, so the service loop needs one bounded
 # parser/renderer. `serde_json` 1.0 is already resolved and in the lockfile
 # through the existing workspace graph; this moves it from the dev graph to

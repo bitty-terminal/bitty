@@ -308,6 +308,84 @@ fn invalid_scroll_region_is_ignored() {
     assert_eq!(s.scroll_region_bottom, GRID_ROWS as u16 - 1);
 }
 
+/// bitty#3261: `DECSTBM` with `top == bottom` asks for a one-row region, which
+/// xterm and ghostty both reject — the top margin must sit strictly above the
+/// bottom one. The pair is ignored wholesale: the live margins survive and the
+/// cursor is not homed, exactly as for an inverted pair.
+#[test]
+fn decstbm_rejects_a_one_row_region() {
+    let mut s = State::new();
+    feed_bytes(&mut s, b"\x1b[5;10r");
+    assert_eq!((s.scroll_region_top, s.scroll_region_bottom), (4, 9));
+    feed_bytes(&mut s, b"\x1b[7;3H");
+    feed_bytes(&mut s, b"\x1b[6;6r");
+    assert_eq!(
+        (s.scroll_region_top, s.scroll_region_bottom),
+        (4, 9),
+        "a one-row region must not replace the live margins"
+    );
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (6, 2),
+        "the rejected sequence must not home the cursor"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+/// The inverted shape (`top > bottom`) stays rejected after bitty#3261: same
+/// wholesale-ignore behaviour, no margin write, no cursor home.
+#[test]
+fn decstbm_rejects_an_inverted_region() {
+    let mut s = State::new();
+    feed_bytes(&mut s, b"\x1b[4;20r");
+    assert_eq!((s.scroll_region_top, s.scroll_region_bottom), (3, 19));
+    feed_bytes(&mut s, b"\x1b[12;1H");
+    feed_bytes(&mut s, b"\x1b[15;6r");
+    assert_eq!(
+        (s.scroll_region_top, s.scroll_region_bottom),
+        (3, 19),
+        "an inverted region must not replace the live margins"
+    );
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (11, 0),
+        "the rejected sequence must not home the cursor"
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+/// The accepted boundary: adjacent margins (`top + 1 == bottom`) are the
+/// narrowest region xterm and ghostty accept, so bitty keeps honouring them —
+/// and the two rows scroll as a unit with their neighbours untouched.
+#[test]
+fn decstbm_accepts_a_two_row_region() {
+    let mut s = State::new();
+    for row in 1..=9 {
+        feed_bytes(&mut s, format!("\x1b[{row};1Hrow{row}").as_bytes());
+    }
+    feed_bytes(&mut s, b"\x1b[6;7r");
+    assert_eq!((s.scroll_region_top, s.scroll_region_bottom), (5, 6));
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (0, 0),
+        "a valid pair homes the cursor"
+    );
+
+    feed_bytes(&mut s, b"\x1b[S");
+    assert_eq!(live_line_text(&s, 5), "row7");
+    assert_eq!(live_line_text(&s, 6), "");
+    assert_eq!(live_line_text(&s, 4), "row5");
+    assert_eq!(live_line_text(&s, 7), "row8");
+    assert!(s.check_invariants().is_ok());
+
+    // The default pair (`CSI r`) still restores the full-screen region.
+    feed_bytes(&mut s, b"\x1b[r");
+    assert_eq!(
+        (s.scroll_region_top, s.scroll_region_bottom),
+        (0, GRID_ROWS as u16 - 1)
+    );
+}
+
 #[test]
 fn alt_screen_roundtrip_restores_primary_set() {
     let mut s = State::new();

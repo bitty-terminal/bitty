@@ -65,6 +65,7 @@
 
 use bitty_rich::scene::Scene;
 use bitty_ui::ViewId;
+use bitty_ui::geometry::Rect;
 use bitty_ui::placement::{Placement, PlacementError};
 use bitty_ui::presentation::PresentationMode;
 use bitty_ui::uitree::UiNodeId;
@@ -161,6 +162,20 @@ pub struct PanelRuntime {
     /// last presented, so a scene mounted by a plugin on a quiet grid still
     /// owes one frame without a separate wake channel.
     scene_revision: u64,
+    /// Presented panel content layers (bitty#2388): at most one
+    /// [`PresentedPanelContent`] per live panel, holding the displaced
+    /// terminal record that is the only restore authority.
+    ///
+    /// Entries are written only by [`PanelRuntime::present_panel_content`],
+    /// consumed by [`PanelRuntime::release_panel_content`], and dropped with
+    /// the panel at [`PanelRuntime::dispose_panel`] (through
+    /// `release_panel_mirrors`) so a record can never outlive its container.
+    /// The slot count inherits the registry window panel budget: one layer per
+    /// panel, never two.
+    content_layers: HashMap<super::panel::PanelId, PresentedPanelContent>,
+    /// Next opaque [`PanelContentToken`] ordinal. Monotonic and never reused,
+    /// so a released token can never address a later layer.
+    next_content_token: u64,
 }
 
 /// Per-panel lease binding: the transition kernel plus the validated
@@ -252,6 +267,80 @@ fn map_lease_error(panel: super::panel::PanelId, error: LeaseError) -> PanelErro
     }
 }
 
+/// Opaque, generation-owned handle for one presented panel content layer.
+///
+/// Minted by [`PanelRuntime::present_panel_content`] and consumed by
+/// [`PanelRuntime::release_panel_content`]. The value is an ordinal the host
+/// never reuses for a second layer, so a token from an earlier (or another
+/// panel's) presentation is refused instead of restoring the wrong terminal.
+/// The caller cannot supply one: a plugin-facing `handle` is host-derived
+/// (bitty#2388 "No surface handle").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PanelContentToken(u64);
+
+impl PanelContentToken {
+    /// The opaque ordinal, for audit rows and bounded diagnostics.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Core-owned record of a panel's presented GUI content layer and the
+/// terminal content it displaced (bitty#2388, `Terminal -> Gui` transition).
+///
+/// The record is the only restore authority: it names the panel, the
+/// attachment view, the content kind that was displaced, the **frozen**
+/// content rectangle taken at transition time, and the scroll offset. Nothing
+/// here is plugin-writable; a plugin never reads or writes the record, and it
+/// carries no PTY, process, signal, path, or terminal-content payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresentedPanelContent {
+    /// Panel container that presents the layer. Its identity, placement, and
+    /// decoration are unchanged by the swap.
+    pub panel: super::panel::PanelId,
+    /// Attachment view the panel is mounted at; the leaf keeps its geometry
+    /// ownership while the layer is presented.
+    pub view: ViewId,
+    /// The content kind that was presented before the swap
+    /// (`ViewContent::Terminal(_)`). Release restores exactly this value.
+    pub displaced: ViewContent,
+    /// The content kind the panel now presents, in the existing
+    /// [`ViewContent`] vocabulary: `Rich(raw)` for a scene layer.
+    pub presented: ViewContent,
+    /// Frozen content rectangle in **cells**, captured at transition time.
+    /// The displaced terminal keeps this geometry while hidden: no resize
+    /// enters the `LogicalRect -> PTY` path and no `SIGWINCH` is delivered.
+    pub frozen: Rect,
+    /// Scroll offset of the displaced terminal's view at transition time.
+    pub scroll_offset: usize,
+    /// The layer's opaque handle.
+    pub token: PanelContentToken,
+}
+
+/// What [`PanelRuntime::release_panel_content`] restored.
+///
+/// `content` is byte-identical to the [`PresentedPanelContent::displaced`]
+/// value it came from, which is the restore contract: the same content kind,
+/// the same panel, the same attachment, and the same placement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredPanelContent {
+    /// Panel container that presents the terminal content again.
+    pub panel: super::panel::PanelId,
+    /// Attachment view the panel is mounted at.
+    pub view: ViewId,
+    /// The restored content kind (the displaced record's value).
+    pub content: ViewContent,
+    /// The rectangle that was frozen for the displacement, in cells. The
+    /// caller compares it with the current content rect to decide whether the
+    /// single restore resize is owed.
+    pub frozen: Rect,
+    /// The scroll offset recorded at transition time.
+    pub scroll_offset: usize,
+    /// The released layer's handle.
+    pub token: PanelContentToken,
+}
+
 impl PanelRuntime {
     /// Creates a host over a validated registry config.
     ///
@@ -270,6 +359,8 @@ impl PanelRuntime {
             scenes: HashMap::new(),
             scene_paints: HashMap::new(),
             scene_revision: 0,
+            content_layers: HashMap::new(),
+            next_content_token: 1,
         })
     }
 
@@ -642,6 +733,11 @@ impl PanelRuntime {
             self.scene_revision = self.scene_revision.saturating_add(1);
         }
         self.scene_paints.remove(&id);
+        // bitty#2388: a presented content layer is presentation state of this
+        // container, so it dies with the panel. A later panel reusing the id
+        // starts with no layer, and no dispatched token can address the old
+        // one (tokens are never reused).
+        self.content_layers.remove(&id);
     }
 
     /// Acquires an idle panel's lease for `holder` for `term_ticks` host
@@ -1566,6 +1662,196 @@ impl PanelRuntime {
         items: usize,
     ) -> Option<NonTerminalPresent> {
         nonterminal_for_content(content, node, items)
+    }
+
+    // ---------------------------------------------------------------------
+    // Panel content layers (bitty#2388)
+    // ---------------------------------------------------------------------
+
+    /// Presents one GUI content layer on the panel mounted at `view`,
+    /// displacing the terminal content it presented (bitty#2388
+    /// `Terminal(tid) -> Gui(surface)`).
+    ///
+    /// This is the Core-owned content-kind transition the candidate contract
+    /// requires (`specifications/panel-gui-content-presentation-candidate.md`,
+    /// "Content is a Core-owned kind transition"): the host resolves the
+    /// panel from the live [`Placement`] mirror, checks that the target is a
+    /// terminal-backed panel, writes the displaced-terminal record, attaches
+    /// the scene to the panel's existing scene slot (so the shipped present
+    /// loop paints it clipped to the leaf content rect), and mints the opaque
+    /// layer handle. No identity is allocated: the `PanelId`, the `ViewId`,
+    /// the layout attachment, and the placement are untouched.
+    ///
+    /// `displaced` is the content kind the caller observed on the leaf and
+    /// must be `ViewContent::Terminal(_)`: a panel whose content is not
+    /// terminal-backed cannot present a layer, and the refusal changes
+    /// nothing. `frozen` is the content rectangle (cells) captured at this
+    /// transition; it is the geometry the displaced terminal keeps while
+    /// hidden, and the value release reports back so the caller can decide the
+    /// single restore resize. `scroll_offset` is recorded for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel is mounted at `view`,
+    /// the panel is disposed, or `displaced` is not terminal content;
+    /// [`PanelError::ContentBusy`] when the panel already presents a layer
+    /// (`E_UI_PANEL_BUSY`). On every refusal the panel, its scene slot, the
+    /// placement, and the terminal are left exactly as they were.
+    pub fn present_panel_content(
+        &mut self,
+        view: ViewId,
+        displaced: ViewContent,
+        frozen: Rect,
+        scroll_offset: usize,
+        scene: Scene,
+    ) -> Result<PresentedPanelContent, PanelError> {
+        if !matches!(displaced, ViewContent::Terminal(_)) {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "panel content is not terminal-backed",
+            });
+        }
+        let Some(panel) = self.placement.panel_of(view) else {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel is mounted at this view",
+            });
+        };
+        if self.content_layers.contains_key(&panel) {
+            self.registry.bump_error("ContentBusy");
+            return Err(PanelError::ContentBusy { panel_id: panel });
+        }
+        // A panel that already carries content in its scene slot belongs to
+        // another owner (a `ui.rich` mount, a Core recovery presentation). The
+        // layer would overwrite that content and the release would then detach
+        // it, silently losing the other owner's presentation; refuse instead,
+        // so the slot is never shared.
+        if self.scenes.contains_key(&panel) {
+            self.registry.bump_error("ContentBusy");
+            return Err(PanelError::ContentBusy { panel_id: panel });
+        }
+        let Some(generation) = self.registry.panel_allocation_generation(panel) else {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "panel record is disposed",
+            });
+        };
+        // The scene slot is the paint half of the swap: attaching it here (one
+        // path, `attach_panel_scene`) is what makes the shipped present loop
+        // compose the layer for this leaf. A refused attach leaves the record
+        // unwritten, so present is all-or-nothing.
+        self.attach_panel_scene(
+            super::panel::PanelHandle {
+                id: panel,
+                generation,
+            },
+            scene,
+        )?;
+        let token = PanelContentToken(self.next_content_token);
+        self.next_content_token = self.next_content_token.saturating_add(1);
+        let record = PresentedPanelContent {
+            panel,
+            view,
+            displaced,
+            presented: ViewContent::Rich(token.get()),
+            frozen,
+            scroll_offset,
+            token,
+        };
+        self.content_layers.insert(panel, record.clone());
+        Ok(record)
+    }
+
+    /// Releases the content layer presented on the panel mounted at `view`
+    /// and reports the terminal content it restored (bitty#2388
+    /// `Gui(surface) -> Terminal(tid)`).
+    ///
+    /// The displaced record is the only restore authority: the returned
+    /// [`RestoredPanelContent::content`] is the exact `displaced` value the
+    /// present wrote, so the panel keeps the same terminal content, the same
+    /// `PanelId`, the same attachment, and the same placement. The layer's
+    /// scene slot is detached in the same step, so the leaf returns to the
+    /// grid path for the next frame.
+    ///
+    /// The host issues no resize and no signal here: geometry restore is the
+    /// caller's step, because only the caller owns the leaf's current content
+    /// rectangle.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel is mounted at `view`;
+    /// [`PanelError::ContentNotPresented`] when the panel presents no layer
+    /// (already released, or never presented); [`PanelError::ContentTokenMismatch`]
+    /// when `token` is not the panel's live layer. A refusal consumes nothing:
+    /// the live layer, its scene, and its displaced record are unchanged.
+    pub fn release_panel_content(
+        &mut self,
+        view: ViewId,
+        token: PanelContentToken,
+    ) -> Result<RestoredPanelContent, PanelError> {
+        let Some(panel) = self.placement.panel_of(view) else {
+            self.registry.bump_error("ContentUnavailable");
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel is mounted at this view",
+            });
+        };
+        let Some(record) = self.content_layers.get(&panel) else {
+            self.registry.bump_error("ContentNotPresented");
+            return Err(PanelError::ContentNotPresented { panel_id: panel });
+        };
+        if record.token != token {
+            self.registry.bump_error("ContentTokenMismatch");
+            return Err(PanelError::ContentTokenMismatch {
+                panel_id: panel,
+                token: token.get(),
+            });
+        }
+        let record = match self.content_layers.remove(&panel) {
+            Some(record) => record,
+            None => {
+                self.registry.bump_error("ContentNotPresented");
+                return Err(PanelError::ContentNotPresented { panel_id: panel });
+            }
+        };
+        self.detach_panel_scene(panel);
+        Ok(RestoredPanelContent {
+            panel,
+            view: record.view,
+            content: record.displaced,
+            frozen: record.frozen,
+            scroll_offset: record.scroll_offset,
+            token: record.token,
+        })
+    }
+
+    /// The content layer presented on `panel`, if any.
+    #[must_use]
+    pub fn presented_content(
+        &self,
+        panel: super::panel::PanelId,
+    ) -> Option<&PresentedPanelContent> {
+        self.content_layers.get(&panel)
+    }
+
+    /// The content layer presented on the panel mounted at `view`, if any.
+    ///
+    /// Resolves the panel through the live [`Placement`] mirror, like the
+    /// present/release pair, so callers never pass a panel identity the host
+    /// did not bind to the view they are painting.
+    #[must_use]
+    pub fn presented_content_for_view(&self, view: ViewId) -> Option<&PresentedPanelContent> {
+        let panel = self.placement.panel_of(view)?;
+        self.content_layers.get(&panel)
+    }
+
+    /// Number of panels presenting a content layer.
+    #[must_use]
+    pub fn presented_content_count(&self) -> usize {
+        self.content_layers.len()
     }
 }
 

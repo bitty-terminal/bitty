@@ -259,6 +259,14 @@ impl Runtime {
         let Some(primary) = self.primary_view else {
             return;
         };
+        // bitty#2388: a presented GUI content layer freezes the displaced
+        // terminal's geometry, so the acceptance path from the layout install to
+        // the kernel winsize is not entered while the layer is up. No resize
+        // call, no `SIGWINCH`. The freeze is counted so the skip is observable.
+        if self.content_layer_presented(primary) {
+            self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            return;
+        }
         let frames = self.present_frames();
         let Some(frame) = frames.iter().find(|frame| frame.view == primary) else {
             return;

@@ -618,9 +618,22 @@ impl Runtime {
                 ),
             }
         };
-        let (_damage, primary_resize) = self.state.resize_with_report(cols, rows);
-        self.cols = cols;
-        self.rows = rows;
+        // bitty#2388: a presented GUI content layer freezes the displaced
+        // terminal's geometry. The window and the layout still reflow; only the
+        // primary grid/PTY step is skipped, so the hidden child keeps the
+        // winsize it had at transition time and receives no `SIGWINCH` from a
+        // window resize. `release_panel_content` lifts the freeze and issues the
+        // single restore resize through `sync_primary_geometry`.
+        let primary_frozen = self.primary_content_frozen();
+        let primary_resize = if primary_frozen {
+            self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            None
+        } else {
+            let (_damage, report) = self.state.resize_with_report(cols, rows);
+            self.cols = cols;
+            self.rows = rows;
+            Some(report)
+        };
 
         // Reflow every presented View before restoring its anchor. In
         // particular, detached floats and pinned Views are not layout leaves,
@@ -652,9 +665,10 @@ impl Runtime {
         }
         // #2543: move a held grid-coordinate selection with the primary
         // content before clamping it to the new bounds. Pane owners were
-        // already remapped by `sync_pane_geometry_to`.
-        if let Some(owner) = self.primary_view {
-            self.remap_selection_for_resize(owner, true, primary_resize);
+        // already remapped by `sync_pane_geometry_to`. A frozen primary did not
+        // resize its grid, so there is no shift to apply (bitty#2388).
+        if let (Some(report), Some(owner)) = (primary_resize, self.primary_view) {
+            self.remap_selection_for_resize(owner, true, report);
         }
         self.clamp_view_bindings_to_geometry();
     }

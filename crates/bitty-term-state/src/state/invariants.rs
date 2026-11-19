@@ -221,15 +221,16 @@ impl State {
         // primary's, while the alternate screen is active) has to satisfy the
         // same `top <= bottom < height` bound, because a `?1049l`/`?47l` exit
         // restores it as the live region.
-        if let Some(save) = &self.primary_save
-            && !(save.scroll_region_top <= save.scroll_region_bottom
+        if let Some(save) = &self.primary_save {
+            if !(save.scroll_region_top <= save.scroll_region_bottom
                 && (save.scroll_region_bottom as usize) < self.height)
-        {
-            return Err(InvariantViolation::SavedScrollRegionInvalid {
-                top: save.scroll_region_top,
-                bottom: save.scroll_region_bottom,
-                height: self.height as u16,
-            });
+            {
+                return Err(InvariantViolation::SavedScrollRegionInvalid {
+                    top: save.scroll_region_top,
+                    bottom: save.scroll_region_bottom,
+                    height: self.height as u16,
+                });
+            }
         }
         let (crow, ccol) = (self.cursor.position.row, self.cursor.position.col);
         if (crow as usize) >= self.height || (ccol as usize) >= self.width {

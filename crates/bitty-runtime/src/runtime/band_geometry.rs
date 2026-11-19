@@ -194,6 +194,24 @@ impl BandPixelGeometry {
         self.rect(y, height, column, width_cells)
     }
 
+    /// Physical y displacement of row band row `row` on `edge` from its own cell
+    /// origin — the sub-cell distance a bottom band was moved down to meet the
+    /// window's physical inset (bitty#3263).
+    ///
+    /// `0` for a top band (or a column band's content row), for an exact
+    /// multiple, and for the innermost bottom band, which keeps its cell top.
+    /// Content anchored to a band (a hover tooltip row stack) shifts by this so
+    /// it stays attached to the pixels the band actually paints.
+    #[must_use]
+    pub(super) fn vertical_offset(&self, edge: BandEdge, row: u16) -> i32 {
+        if edge != BandEdge::Bottom {
+            return 0;
+        }
+        let (y, _) = self.bottom_row(row);
+        let cell_y = i64::from(self.pad_px) + i64::from(row) * i64::from(self.cell_h);
+        i32::try_from(y - cell_y).unwrap_or(0)
+    }
+
     /// The physical strip between the cell grid's bottom edge and the bottom
     /// inset: `(surface_height - 2 * padding) - window_rows * cell_height`.
     ///
@@ -345,6 +363,19 @@ impl Runtime {
             self.visible_band_count(BandEdge::Bottom),
             self.surface_extent().map(|extent| extent.height()),
         )
+    }
+
+    /// Physical y displacement of row band row `row` on `edge` from its cell
+    /// origin (CTX-1906, bitty#3263): how far the shared band mapping moved the
+    /// band down to meet the window's physical inset.
+    ///
+    /// `0` for a top band, an exact-multiple window, or the innermost bottom
+    /// band. Content anchored to the band (a hover tooltip stack) shifts by this
+    /// so it stays attached to the painted band.
+    #[must_use]
+    pub(super) fn band_vertical_offset(&self, edge: BandEdge, row: u16, pad_px: i32) -> i32 {
+        self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
+            .vertical_offset(edge, row)
     }
 }
 
@@ -517,6 +548,23 @@ mod tests {
             "starts at the content top"
         );
         assert_eq!(band.height, CELL_H, "the cell mapping stands, as before");
+    }
+
+    #[test]
+    fn vertical_offset_tracks_only_displaced_bands() {
+        // bitty#3263: anchored content shifts by exactly the sub-cell distance
+        // the band was moved. The innermost band keeps its cell top, outer
+        // bands move by the remainder, and nothing else moves at all.
+        let geo = geometry(Some(surface_for(7)), 2);
+        let inner = ROWS - 2;
+        let outer = ROWS - 1;
+        assert_eq!(geo.vertical_offset(BandEdge::Bottom, inner), 0);
+        assert_eq!(geo.vertical_offset(BandEdge::Bottom, outer), 7);
+        assert_eq!(geo.vertical_offset(BandEdge::Top, 0), 0);
+        assert_eq!(geo.vertical_offset(BandEdge::Left, 0), 0);
+        // An exact multiple moves nothing.
+        let exact = geometry(Some(surface_for(0)), 2);
+        assert_eq!(exact.vertical_offset(BandEdge::Bottom, outer), 0);
     }
 
     #[test]

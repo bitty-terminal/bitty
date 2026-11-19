@@ -626,11 +626,15 @@ fn top_band_origin_is_unchanged_on_a_remainder_surface() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Everything else keeps its geometry
+// ---------------------------------------------------------------------------
+
 #[test]
-fn bottom_anchor_leaves_the_container_grid_and_pty_size_unchanged() {
+fn bottom_anchor_leaves_the_container_and_grid_unchanged() {
     // The fix is paint-and-routing only: the reserved rows, the layout
-    // container, the leaf grid, and the PTY winsize must stay the numbers a
-    // pre-#3263 tree produced (one window row per band, no more, no less).
+    // container, and the leaf grid must stay the numbers a pre-#3263 tree
+    // produced (one window row per band, no more, no less).
     let mut rt = fixture(ROWS, 7);
     let mut control = fixture(ROWS, 7);
     control.tick().expect("the band-free control presents");
@@ -665,8 +669,6 @@ fn bottom_anchor_leaves_the_container_grid_and_pty_size_unchanged() {
         window.height.saturating_sub(1),
         "the row carve is one band row"
     );
-    // Grid: the primary leaf is one row shorter than the band-free control, and
-    // the PTY winsize follows the grid, so the fix changed neither.
     let rows_with_band = primary_rows(&rt);
     let rows_without_band = primary_rows(&control);
     assert_eq!(
@@ -674,20 +676,56 @@ fn bottom_anchor_leaves_the_container_grid_and_pty_size_unchanged() {
         rows_without_band,
         "the band still costs exactly one leaf row"
     );
-    let snapshot = rt.snapshot();
     assert_eq!(
         usize::from(rows_with_band),
-        snapshot.height,
+        rt.snapshot().height,
         "the primary grid follows the reduced leaf"
     );
-    if let Some((cols, rows)) = rt.pty_size() {
-        assert_eq!(
-            (cols, rows),
-            (
-                u16::try_from(snapshot.width).expect("columns"),
-                u16::try_from(snapshot.height).expect("rows")
-            ),
-            "the winsize still equals the band-reduced primary grid"
-        );
-    }
+}
+
+// The winsize is only observable with a real child, so this leg is POSIX-only
+// (same gate as `host_chrome_gaps.rs`): spawning `/bin/sh` is the fixture.
+#[cfg(unix)]
+#[test]
+fn bottom_anchor_leaves_the_pty_winsize_unchanged() {
+    let banded = |rt: &mut Runtime| {
+        rt.set_chrome_bands(ChromeBands {
+            bottom: vec![bottom_band("bar", "status bar", "bright_red")],
+            ..Default::default()
+        });
+    };
+    let mut rt = fixture(ROWS, 7);
+    let _ = rt.tick();
+    rt.spawn_shell("/bin/sh").expect("primary shell must spawn");
+    let _ = rt.tick();
+    let bare_winsize = rt.pty_size().expect("the shell owns a winsize");
+
+    // Reserving a bottom band costs exactly one row on the non-multiple
+    // surface; the remainder the fix absorbs is *not* part of the grid.
+    banded(&mut rt);
+    rt.tick().expect("band tick reflows");
+    let winsize = rt.pty_size().expect("the shell still owns a winsize");
+    assert_eq!(
+        winsize.0, bare_winsize.0,
+        "the band reserves rows, never columns"
+    );
+    assert_eq!(
+        winsize.1,
+        bare_winsize.1 - 1,
+        "the band costs exactly one PTY row, as before"
+    );
+    let snapshot = rt.snapshot();
+    assert_eq!(
+        winsize,
+        (
+            u16::try_from(snapshot.width).expect("columns"),
+            u16::try_from(snapshot.height).expect("rows")
+        ),
+        "the kernel winsize equals the band-reduced primary grid"
+    );
+    assert_eq!(
+        rt.band_row_container().height,
+        rt.window_cells().height.saturating_sub(1),
+        "the container keeps the band row outside the leaf"
+    );
 }

@@ -6969,11 +6969,19 @@ impl Runtime {
                 BandEdge::Bottom => (band_row.saturating_sub(count), Some(band_row)),
                 BandEdge::Left | BandEdge::Right => return None,
             };
+            // CTX-1906 (bitty#3263): a bottom band that was displaced to the
+            // window's physical inset takes its anchored rows with it, so the
+            // last tooltip row still ends on the band's painted edge instead of
+            // `remainder` pixels above it. Zero for the exact-multiple case,
+            // for a top band, and for the innermost band (which keeps its cell
+            // top).
+            let y_offset = self.band_vertical_offset(anchor.edge, band_row, pad_px);
             let x = centered_tooltip_x(anchor.start_col, anchor.end_col, stack_cells, window.width);
             Some(AnchoredOverlayStack {
                 start_row,
                 x,
                 limit_row,
+                y_offset,
             })
         });
         let mid_row = frame.rows.saturating_sub(1) / 2;
@@ -7017,6 +7025,7 @@ impl Runtime {
                             cols: window.width.saturating_sub(stack.x),
                             row,
                             window_x: window.x,
+                            y_offset: stack.y_offset,
                         }),
                         stack.limit_row,
                     )
@@ -7163,7 +7172,13 @@ impl Runtime {
                     pad_px,
                     px_offset_cells(i32::from(anchor.window_x), anchor.x, cell_w),
                 ),
-                px_add(pad_px, px_offset_cells(0, anchor.row, cell_h)),
+                // CTX-1906: an anchored stack follows the band's own physical
+                // edge, so a bottom band displaced to the window inset keeps
+                // its tooltip attached (offset is `0` otherwise).
+                px_add(
+                    px_add(pad_px, px_offset_cells(0, anchor.row, cell_h)),
+                    anchor.y_offset,
+                ),
             ),
             None => (
                 px_add(
@@ -9222,6 +9237,10 @@ struct AnchoredOverlayStack {
     x: u16,
     /// Exclusive window row the stack must not reach.
     limit_row: Option<u16>,
+    /// Extra physical y applied to every anchored row (CTX-1906/bitty#3263):
+    /// the sub-cell distance between the band's cell row and the physical edge
+    /// it was actually painted at, so the last row still ends on the band.
+    y_offset: i32,
 }
 
 /// One overlay row placed against a live band item (issue #2411).
@@ -9238,6 +9257,10 @@ struct AnchoredOverlayRow {
     row: u16,
     /// Window column origin the cells are measured from.
     window_x: u16,
+    /// Physical y shift applied on top of the row's cell origin, so an anchored
+    /// row stack follows a bottom band that was displaced to the window's
+    /// physical inset (CTX-1906/bitty#3263). `0` for every other placement.
+    y_offset: i32,
 }
 
 /// Clipped geometry of one overlay pill row (CTX-1170).
@@ -10443,6 +10466,89 @@ mod plugin_overlay_paint_tests {
                 "row {row} must stay above the band row {band_row}"
             );
         }
+    }
+
+    #[test]
+    fn bottom_band_tooltip_rows_follow_a_displaced_band() {
+        // CodeRabbit (PR #3266): a tooltip anchored to a bottom band that was
+        // moved down to the window's physical inset must move with it, so the
+        // last row ends on the band's painted top edge instead of `remainder`
+        // pixels above it (CTX-1906/bitty#3263).
+        let mut rt = runtime();
+        let (cell_w, cell_h) = rt.live_cell_size();
+        let pad = rt.window_padding_physical();
+        let remainder = 7;
+        let rows: u32 = 6;
+        rt.handle_resize(PhysicalSize::new(
+            cell_w
+                .saturating_mul(40)
+                .saturating_add(pad.saturating_mul(2)),
+            cell_h
+                .saturating_mul(rows)
+                .saturating_add(pad.saturating_mul(2))
+                .saturating_add(remainder),
+        ))
+        .expect("resize onto a remainder surface");
+        rt.set_chrome_bands(ChromeBands {
+            bottom: vec![
+                surface_with_rows(&["bar"]),
+                surface_with_rows(&["devtools"]),
+            ],
+            ..Default::default()
+        });
+        rt.tick().expect("present the stacked bands");
+        let outer_row = rt
+            .visible_band_row(BandEdge::Bottom, 0)
+            .expect("outer band row");
+        let band_top = rt
+            .band_pixel_geometry(pad)
+            .row_band(BandEdge::Bottom, outer_row, 0, 0)
+            .y;
+        assert_eq!(
+            band_top
+                - (i32::try_from(pad).unwrap()
+                    + i32::from(outer_row) * i32::try_from(cell_h).unwrap()),
+            i32::try_from(remainder).unwrap(),
+            "fixture precondition: the outer band is displaced by the remainder"
+        );
+
+        rt.set_plugin_overlay(Some(surface_with_rows(&["detail", "more"])));
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Bottom,
+            visible_index: 0,
+            start_col: 4,
+            end_col: 10,
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(
+            &[one_frame()],
+            i32::try_from(pad).expect("padding fits i32"),
+            &mut layers,
+        );
+        assert_eq!(layers.combined_overlay_content.len(), 2, "two tooltip rows");
+        let last = layers
+            .combined_overlay_content
+            .last()
+            .expect("the anchored stack paints");
+        assert_eq!(
+            last.rect.y + i32::try_from(last.rect.height).expect("row height"),
+            band_top,
+            "the last tooltip row ends on the band's painted top edge"
+        );
+        // The first row keeps its own one-cell height, just shifted.
+        let first = &layers.combined_overlay_content[0];
+        assert_eq!(
+            last.rect.y - first.rect.y,
+            i32::try_from(cell_h).expect("cell height"),
+            "rows still stack one cell apart"
+        );
+        assert_eq!(
+            first.rect.y,
+            i32::try_from(pad).unwrap()
+                + (i32::from(outer_row) - 2) * i32::try_from(cell_h).unwrap()
+                + i32::try_from(remainder).unwrap(),
+            "the whole stack moved down with the band"
+        );
     }
 
     #[test]

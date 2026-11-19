@@ -4672,19 +4672,32 @@ impl TerminalApp {
     ///   Lua call already reported `accepted` for the validated frame, so
     ///   the composer already closed its modal. Headed with a live shell
     ///   the write lands synchronously.
+    /// - a frame the router's content gate drops because the focused panel
+    ///   presents a GUI content layer is *not* buffered and is not reported
+    ///   as buffered: the warning names the drop (bitty#3250 review).
     pub(crate) fn apply_plugin_submit_requests(&mut self) {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return;
         };
         let requests = plugin_runtime.drain_submit_requests();
         for queued in requests {
+            let dropped_by_content = self.runtime.input_owner_content_frozen();
             if !self.runtime.push_input_bytes(&queued.frame) {
-                crate::logging::warn(|| {
-                    format!(
-                        "bitty: plugin submit buffered (no live PTY accepted {} bytes)",
-                        queued.frame.len()
-                    )
-                });
+                if dropped_by_content {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: plugin submit dropped by the focused panel's content layer ({} bytes, not buffered)",
+                            queued.frame.len()
+                        )
+                    });
+                } else {
+                    crate::logging::warn(|| {
+                        format!(
+                            "bitty: plugin submit buffered (no live PTY accepted {} bytes)",
+                            queued.frame.len()
+                        )
+                    });
+                }
             }
         }
     }

@@ -40,6 +40,13 @@ pub enum TerminalSubmitUnavailable {
     /// writer live at all): it was only buffered headless, so the budget
     /// is untouched.
     BufferedOnly,
+    /// The focused panel presents a GUI content layer, so the frame was
+    /// dropped at the input router's content gate — counted in
+    /// [`Runtime::content_input_dropped_bytes`], never buffered and never
+    /// written to a shell. Reported apart from
+    /// [`Self::BufferedOnly`] because the two are different outcomes for the
+    /// caller: nothing was kept for a later delivery here.
+    ContentLayerPresented,
 }
 
 impl std::fmt::Display for TerminalSubmitUnavailable {
@@ -47,6 +54,9 @@ impl std::fmt::Display for TerminalSubmitUnavailable {
         match self {
             Self::NoFocusedView => f.write_str("submit unavailable: no focused panel"),
             Self::BufferedOnly => f.write_str("submit unavailable: no live PTY accepted the frame"),
+            Self::ContentLayerPresented => f.write_str(
+                "submit unavailable: the focused panel presents a content layer (frame dropped)",
+            ),
         }
     }
 }
@@ -85,9 +95,12 @@ impl Runtime {
     /// here, fail-closed. `budget` is the submitting plugin's submit window,
     /// charged only on PTY delivery. The frame is byte-exact
     /// (`ESC[200~` content `ESC[201~` `CR`) and written in a single router
-    /// call; any refusal emits nothing, and a frame that only buffers
-    /// headless (session-less non-primary leaf, no live writer) reports
-    /// [`TerminalSubmitUnavailable::BufferedOnly`] without charging.
+    /// call; any refusal emits nothing. A frame that only buffers headless
+    /// (session-less non-primary leaf, no live writer) reports
+    /// [`TerminalSubmitUnavailable::BufferedOnly`], and one the input router's
+    /// content gate drops because the focused panel presents a GUI content
+    /// layer reports [`TerminalSubmitUnavailable::ContentLayerPresented`] —
+    /// dropped, not buffered — again without charging.
     #[must_use]
     pub fn terminal_submit(
         &mut self,
@@ -114,7 +127,15 @@ impl Runtime {
         };
         let bytes = frame.len();
         if !self.push_input_bytes(&frame) {
-            return TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly);
+            // `push_input_bytes` answers `false` for both no-live-PTY and the
+            // content gate; name the one that happened instead of calling a
+            // drop "buffered" (bitty#3250 review).
+            let reason = if self.input_owner_content_frozen() {
+                TerminalSubmitUnavailable::ContentLayerPresented
+            } else {
+                TerminalSubmitUnavailable::BufferedOnly
+            };
+            return TerminalSubmitOutcome::Unavailable(reason);
         }
         *budget = probe;
         TerminalSubmitOutcome::Accepted { bytes }

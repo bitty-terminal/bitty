@@ -369,7 +369,18 @@ pub fn apply_control(
                 ),
             ));
         }
-        runtime.push_input_bytes(text.as_bytes());
+        // A panel that presents a GUI content layer owns its input: the write is
+        // dropped (and counted) at the router's content gate, so report the drop
+        // as a drop instead of answering `sent_to`/`bytes` for bytes no shell
+        // received (bitty#3250 review). The router stays the only place that
+        // drops and counts, so this verb cannot disagree with it.
+        let dropped_by_content = runtime.content_layer_presented(target_view);
+        let delivered = runtime.push_input_bytes(text.as_bytes());
+        if !delivered && dropped_by_content {
+            return Ok(format!(
+                "{{\"sent_to\":\"{terminal_id}\",\"bytes\":0,\"dropped\":\"content-layer\"}}"
+            ));
+        }
         return Ok(format!(
             "{{\"sent_to\":\"{terminal_id}\",\"bytes\":{}}}",
             text.len()
@@ -1104,7 +1115,71 @@ fn append_json_escaped(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
+    use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
+    use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+
+    /// bitty#3250 review: `terminal send` must not answer `sent_to`/`bytes` for
+    /// a write the router's content gate drops. The panel in front of the
+    /// target leaf presents a GUI content layer, so the verb reports the drop
+    /// and no byte reaches the headless buffer.
+    #[test]
+    fn ctl_send_reports_a_content_layer_drop_instead_of_a_send() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        assert!(rt.set_focus(view), "the single leaf holds focus");
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let handle = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("panel mounts at the leaf");
+        rt.install_scene_host(host);
+        let mut scene = bitty_rich::scene::Scene::new();
+        scene
+            .insert(
+                bitty_rich::scene::RichBlock::new(
+                    bitty_rich::scene::BlockId(1),
+                    bitty_rich::scene::BlockAnchor::Zone(1),
+                    bitty_rich::scene::SceneNode::Text(bitty_rich::scene::StyledSpan {
+                        text: "dashboard".to_string(),
+                        bold: false,
+                        italic: false,
+                    }),
+                    bitty_rich::scene::ScrollBehavior::Inline,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("block fits"),
+            )
+            .expect("scene admits the block");
+        rt.present_panel_content(view, scene)
+            .expect("the primary owner is a terminal-backed panel");
+
+        let params = ipc_ctl::params_send_input("t:1", "hello\n");
+        let body = apply_control(&mut rt, ipc_ctl::METHOD_SEND_INPUT, Some(&params))
+            .expect("terminal send applies");
+        assert!(
+            body.contains("\"dropped\":\"content-layer\""),
+            "the drop is named, not reported as a send: {body}"
+        );
+        assert!(
+            body.contains("\"bytes\":0"),
+            "a dropped write reports zero delivered bytes: {body}"
+        );
+        assert_eq!(
+            rt.pending_input_len(),
+            0,
+            "a dropped write is not buffered headless"
+        );
+        assert_eq!(
+            rt.content_input_dropped_bytes(),
+            b"hello\n".len() as u64,
+            "the dropped write is counted at the content gate"
+        );
+    }
 
     #[test]
     fn ctl_send_text_close_and_split_support_detached_float_and_pinned_views() {

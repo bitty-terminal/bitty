@@ -963,7 +963,16 @@ impl PanelSceneBackend for AppPanelSceneBackend {
             };
             handle
         };
-        Ok(self.panels.borrow_mut().detach_panel_scene(handle.id))
+        self.panels
+            .borrow_mut()
+            .detach_panel_scene(handle.id)
+            .map_err(|err| {
+                BridgeError::new(
+                    "runtime",
+                    E_UI_UNAVAILABLE,
+                    format!("panel.unmount failed: {err}"),
+                )
+            })
     }
 }
 
@@ -1064,7 +1073,20 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                     .present_placeholder(panel, ended, edge.reason.as_str());
             match res {
                 Ok(_) => {
-                    self.panels.borrow_mut().detach_panel_scene(panel);
+                    // bitty#3250 R5: a presented content layer owns the scene
+                    // slot, so the detach refuses rather than stripping the
+                    // paint half of a live record. Nothing was lost (the
+                    // placeholder is a registry record, not a scene) and the
+                    // layer still has to be released by its owner, which is
+                    // the diagnosable ordering this warning reports.
+                    if let Err(error) = self.panels.borrow_mut().detach_panel_scene(panel) {
+                        crate::logging::warn(|| {
+                            format!(
+                                "bitty: panel {} placeholder release left a content layer presented: {error}",
+                                panel.0
+                            )
+                        });
+                    }
                     // A reload's release is not terminal for the container: the
                     // successor bind on the same edge rebinds it (OQ-084 D.3), so
                     // the leaf has to outlive the release. This `Close` is
@@ -1078,11 +1100,19 @@ impl PanelGenerationPort for AppPanelGenerationPort {
                     //
                     // What survives is the container and its leaf, not the
                     // placeholder: `PanelRegistry::rebind_panel` clears
-                    // `record.placeholder` in D.2 phase 2 step 2 and
-                    // `detach_panel_scene` above has already taken the render
-                    // scene, so the rebound container is bound, placeholder-free
-                    // and scene-less. Every other reason ends the generation
-                    // with no successor, so its leaf goes with it.
+                    // `record.placeholder` in D.2 phase 2 step 2 and the
+                    // detach above takes the render scene, so a rebound
+                    // container is bound and placeholder-free. It is
+                    // scene-less only when that detach succeeded: a container
+                    // that holds a presented content layer keeps its layer
+                    // scene and its record (bitty#3250 R5), and that record
+                    // dies with the container in `release_panel_mirrors`
+                    // rather than being released by the successor, which does
+                    // not hold the token. Ending a generation that holds a
+                    // presented layer needs its own lifecycle decision; it is
+                    // recorded in that PR's follow-ups, not decided here.
+                    // Every other reason ends the generation with no
+                    // successor, so its leaf goes with it.
                     if !matches!(edge.reason, PlaceholderReason::Reloaded) {
                         if let Some(queue) = self.layout_ops.as_ref() {
                             push_panel_layout_op(

@@ -714,6 +714,23 @@ impl Runtime {
         if self.confirm_pending_paste_on_enter(event) {
             return None;
         }
+        // bitty#3250 R1: this borrowed entry point reads the same input gate as
+        // `handle_key_event_at`. It re-implements the encoder preamble, so
+        // without the gate here a key pressed while the focused panel presents
+        // a content layer was encoded straight into the displaced shell. The
+        // swallow is counted exactly like the owned path's.
+        if self.focused_content_layer_presents() {
+            if is_modifier {
+                self.inspect_ring.push_modifiers(
+                    self.shift_pressed,
+                    self.control_pressed,
+                    self.alt_pressed,
+                );
+                self.publish_inspect_snapshot();
+            }
+            self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            return None;
+        }
         let pressed = Some(event.state == PressState::Pressed);
         if is_modifier {
             self.inspect_ring.push_modifiers(
@@ -773,9 +790,26 @@ impl Runtime {
     ///
     /// Returns whether the bytes reached a live PTY writer (`true`) or were
     /// only buffered headless (`false`); `terminal.submit` reports
-    /// `Unavailable` (without charging the budget) for buffered frames.
+    /// `Unavailable` (without charging the budget) for buffered frames. Bytes
+    /// dropped because a presented content layer owns the input also report
+    /// `false` (bitty#3250 R2), so a caller that reports an outcome to a user
+    /// reads [`Self::input_owner_content_frozen`] (or the
+    /// [`Self::content_input_dropped_bytes`] delta) to name the drop instead of
+    /// calling it buffered.
     pub fn push_input_bytes(&mut self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
+            return false;
+        }
+        // bitty#3250 R2: every non-key input path (paste, IME commit, and a
+        // programmatic submit) funnels through this router, so this is the one
+        // choke point that keeps pasted or composed text out of a displaced
+        // shell while its panel presents a content layer. The bytes are
+        // dropped and counted, never buffered: `false` reports "not
+        // delivered", exactly like the headless no-writer case.
+        if self.input_owner_content_frozen() {
+            self.content_input_dropped_bytes = self
+                .content_input_dropped_bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
             return false;
         }
         // CTX-0243: any input bytes snap the focused viewport to live so
@@ -898,6 +932,17 @@ impl Runtime {
     ///
     /// Returns whether the bytes reached a live PTY writer.
     fn route_input_bytes_to(&mut self, view: ViewId, bytes: &[u8]) -> bool {
+        // bitty#3250 R2: the pointer-owned reports (motion, issue #2939) and
+        // the focus-report pair reach a shell through this explicit-target
+        // router rather than `push_input_bytes`, so the content gate is
+        // repeated here. One rule, one counter: while `view`'s panel presents a
+        // content layer it receives no byte of input at all, from any path.
+        if self.content_layer_presented(view) {
+            self.content_input_dropped_bytes = self
+                .content_input_dropped_bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            return false;
+        }
         if let Some(sess) = self.pane_sessions.get_mut(&view) {
             let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);
             self.record_input_write_loss(dropped, flush_failed);
@@ -998,6 +1043,11 @@ impl Runtime {
 
     /// Writes raw bytes as terminal input, same routing as keyboard (writer
     /// when live, bounded pending otherwise).
+    ///
+    /// While the focused panel presents a GUI content layer nothing is written
+    /// and nothing is buffered: the bytes are dropped and counted
+    /// ([`Self::content_input_dropped_bytes`]), so a paste or a programmatic
+    /// submit cannot reach the displaced shell (bitty#3250 R2).
     pub fn write_input(&mut self, bytes: &[u8]) {
         self.push_input_bytes(bytes);
     }
@@ -1325,12 +1375,19 @@ impl Runtime {
                 // via `route_input_bytes` delivers to the focused pane without
                 // snapping a scrolled viewport to live when clicking or using
                 // external region-selection tools (`grim` + `slurp`).
+                // bitty#3250: read the content gate first, because a press the
+                // gate drops never reached the application.
+                let dropped = self.input_owner_content_frozen();
                 self.route_input_bytes(bytes.as_slice());
                 // bitty#2938: the app received this press, so it owns the
                 // pointer until the matching release; drag motion reports
                 // this button's identity. A press consumed by Core chrome
-                // above never sets the latch (the app saw no press).
-                if event.state == PressState::Pressed {
+                // above never sets the latch (the app saw no press), and a
+                // press dropped by the content gate must not either: the
+                // application never saw it, so a later release of the layer
+                // would otherwise inherit a drag from a press that was never
+                // delivered.
+                if event.state == PressState::Pressed && !dropped {
                     self.mouse_drag_button = Some(event.button);
                 }
             }

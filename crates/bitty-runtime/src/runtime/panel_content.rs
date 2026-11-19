@@ -32,9 +32,10 @@
 //! | Effect | Seam |
 //! |---|---|
 //! | Content kind flips, layer paints in the content rect | [`PanelRuntime::present_panel_content`](crate::registry::PanelRuntime::present_panel_content) attaches the scene to the panel's existing scene slot, which the shipped present loop already composes (`runtime::scene_present`) |
-//! | Geometry frozen while hidden | `Runtime::sync_pane_geometry_to` (`runtime::panes`), `Runtime::sync_primary_geometry` (`runtime::layout_focus`), and `Runtime::reflow_content_to_chrome` (`runtime::resize`) skip the `LogicalRect -> PTY` step for a presented view and count the freeze |
-//! | Exactly one restore resize, then a full repaint | [`Runtime::release_panel_content`] measures the current content rect, issues the existing per-leaf resize path once when it differs from the frozen rect, and arms `pending_full_redraw` |
-//! | No key reaches the PTY while presented | `Runtime::handle_key_event_at` (`runtime::input`) swallows the key for a presented focused view and counts it |
+//! | Geometry frozen while hidden | `Runtime::sync_pane_geometry_to` (`runtime::panes`), `Runtime::sync_primary_geometry` (`runtime::layout_focus`), and `Runtime::reflow_content_to_chrome` (`runtime::resize`) skip the `LogicalRect -> PTY` step for a presented view and count the freeze; `Runtime::resize_primary_pty` skips the winsize ioctl itself, so a pixel-only change (font zoom, DPI) cannot deliver `SIGWINCH` either |
+//! | Exactly one restore resize, then a full repaint | [`Runtime::release_panel_content`] measures the current content rect (and the owner's own winsize, pixel axes included), issues the existing per-leaf resize path once when either no longer matches the frozen rect, and arms `pending_full_redraw` |
+//! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) swallow the key for a presented focused view and count it |
+//! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
@@ -50,6 +51,15 @@
 //! suppressing the displaced leaf's grid paint pass are follow-ups recorded in
 //! the pull request body. Nothing here stubs them: there is no queue to drain,
 //! no capability to grant, and no owner identity to nest against yet.
+//!
+//! One lifecycle question is also deliberately undecided: a generation edge
+//! (reload, disable, crash) that ends while its panel presents a layer. The
+//! layer's token belongs to the presenting caller, so neither the successor nor
+//! the edge can release it; the detach refuses (bitty#3250 R5), the record dies
+//! with the container, and a successor cannot present again on that panel until
+//! it is retired. That needs its own decision — release on the edge, move the
+//! release authority to the successor, or refuse before the edge changes state
+//! — and it must be settled before the Lua verb exposes the path.
 
 use bitty_rich::scene::Scene;
 use bitty_ui::Point;
@@ -138,10 +148,14 @@ impl Runtime {
     /// The restore is exact: the panel keeps its `PanelId`, its attachment, its
     /// placement, and the same terminal content kind and content id the
     /// present recorded. Geometry is restored through the existing per-leaf
-    /// resize path and only when the leaf's current content rect differs from
-    /// the frozen one, so a release issues **exactly one** resize in that case
-    /// and none otherwise. Either way the next frame is a full repaint, so no
-    /// partial grid or stale layer pixels survive.
+    /// resize path when the leaf's current content rect differs from the
+    /// frozen one, and also when the owner's own `TIOCGWINSZ` (pixel axes
+    /// included) no longer matches that rect — a fixed-size leaf can come back
+    /// to the same `cols`/`rows` with stale pixels after a font-zoom/DPI change.
+    /// The sync skips a winsize that already matches, so a release issues
+    /// **exactly one** resize when one is owed and none otherwise. Either way
+    /// the next frame is a full repaint, so no partial grid or stale layer
+    /// pixels survive.
     ///
     /// # Errors
     ///
@@ -218,21 +232,29 @@ impl Runtime {
         }
     }
 
-    /// Number of per-leaf geometry syncs skipped because the panel presented a
-    /// content layer (bitty#2388 "no resize while hidden").
+    /// Number of geometry steps skipped because a panel presented a content
+    /// layer (bitty#2388 "no resize while hidden").
     ///
-    /// Counts the gate firing, which is the observable half of "the resize
-    /// never entered the `LogicalRect -> PTY` path"; the frozen `TIOCGWINSZ`
-    /// in the same test is the other half.
+    /// Counts the gate firing — the per-leaf sync, the layout install, the
+    /// window reflow, and the primary winsize ioctl are each a step — which is
+    /// the observable half of "the resize never entered the
+    /// `LogicalRect -> PTY` path"; the frozen `TIOCGWINSZ` in the same test is
+    /// the other half.
     #[must_use]
     pub const fn content_geometry_freezes(&self) -> u64 {
         self.content_geometry_freezes
     }
 
-    /// Number of restore resizes issued by [`Runtime::release_panel_content`].
+    /// Number of restore resizes the PTY's own `TIOCGWINSZ` actually
+    /// reflected, as issued by [`Runtime::release_panel_content`].
     ///
     /// At most one per release, and only when the leaf's current content rect
-    /// differs from the rect frozen at present time.
+    /// differs from the rect frozen at present time **and** the winning
+    /// winsize moved. The counter is measured on the kernel side of the
+    /// restore (read the winsize before and after the sync, count only a real
+    /// change), so it agrees with the assertion that bites: the restored
+    /// `TIOCGWINSZ` equals the current content rect. A release that measured a
+    /// changed rect but left the winsize where it was counts zero.
     #[must_use]
     pub const fn content_restore_resizes(&self) -> u64 {
         self.content_restore_resizes
@@ -246,6 +268,17 @@ impl Runtime {
     #[must_use]
     pub const fn content_input_swallowed(&self) -> u64 {
         self.content_input_swallowed
+    }
+
+    /// Bytes dropped because the focused panel presented content.
+    ///
+    /// Covers every non-key input path that shares the one
+    /// [`Runtime::push_input_bytes`] router: paste, IME commit, and a
+    /// programmatic submit. Dropped bytes are counted, never buffered, so the
+    /// transport stays empty and the hidden shell receives nothing.
+    #[must_use]
+    pub const fn content_input_dropped_bytes(&self) -> u64 {
+        self.content_input_dropped_bytes
     }
 
     /// Whether the primary owner's content layer freezes its geometry.
@@ -267,6 +300,44 @@ impl Runtime {
     pub(super) fn focused_content_layer_presents(&self) -> bool {
         self.focused_view()
             .is_some_and(|view| self.content_layer_presented(view))
+    }
+
+    /// Whether the view that owns routed input bytes presents a content layer.
+    ///
+    /// The target is resolved exactly like `Runtime::route_input_bytes`: the
+    /// focused leaf, else the primary owner. This is the gate for every input
+    /// path that does not go through the keyboard encoder — paste, IME commit,
+    /// and a programmatic write all reach the PTY through
+    /// [`Runtime::push_input_bytes`], so gating there keeps pasted or composed
+    /// text out of a displaced shell while its panel presents a layer
+    /// (bitty#3250 R2).
+    ///
+    /// Public because `push_input_bytes` answers `false` for two different
+    /// outcomes — "only buffered headless" and "dropped by this gate" — and the
+    /// callers that report an outcome to a user (`terminal.submit`, the
+    /// `terminal send` control verb, the plugin submit drain) have to tell them
+    /// apart instead of calling a drop "buffered" (bitty#3250 review).
+    #[must_use]
+    pub fn input_owner_content_frozen(&self) -> bool {
+        self.focus
+            .focused()
+            .or(self.primary_view)
+            .is_some_and(|view| self.content_layer_presented(view))
+    }
+
+    /// The `TIOCGWINSZ` winsize of `view`'s terminal content owner, if any.
+    ///
+    /// Read on both sides of a restore sync so "one restore resize" is
+    /// measured on the kernel side of the call instead of being inferred from
+    /// the intent to resize. The pixel axes are part of the tuple: a
+    /// font-zoom/DPI change at a fixed cell rect moves only those, and that is
+    /// exactly the restore the freeze deferred (bitty#3250 R3).
+    fn content_owner_winsize(&self, view: ViewId) -> Option<(u16, u16, u16, u16)> {
+        if self.pane_sessions.contains_key(&view) {
+            self.pane_pty_pixel_size(&view)
+        } else {
+            self.pty_pixel_size()
+        }
     }
 
     /// The terminal content owner of `view`, as a content kind.
@@ -318,15 +389,41 @@ impl Runtime {
     /// release whose rect did not change issues nothing and only repaints.
     fn restore_panel_content_geometry(&mut self, restored: &RestoredPanelContent) {
         let target = self.content_rect_for(restored.view);
-        let owes_resize = target.is_some_and(|rect| {
+        let owes_cell_resize = target.is_some_and(|rect| {
             rect.width != restored.frozen.width || rect.height != restored.frozen.height
         });
-        if owes_resize {
-            self.content_restore_resizes = self.content_restore_resizes.saturating_add(1);
+        // The cell rect is not the whole contract: a durable fixed-size leaf can
+        // come back to the same `cols`/`rows` while a font-zoom/DPI change moved
+        // the pixel axes, and the frame with the layer up deferred exactly that
+        // ioctl. The existing sync already skips a winsize that matches, so ask
+        // it whenever the owner's pixel axes are stale at the target cell size.
+        let owes_winsize_sync = match (target, self.content_owner_winsize(restored.view)) {
+            // Only the deferred pixel-only resize belongs here: the owner must
+            // already agree with the target on the cell axes. A winsize that
+            // disagrees on `cols`/`rows` is the ordinary case (a leaf whose
+            // spawn size never matched its frame), and release deliberately
+            // leaves it to the next reflow instead of forcing a grid reflow
+            // nobody asked for.
+            (Some(rect), Some((cols, rows, width, height))) => {
+                let (target_width, target_height) = self.pty_pixel_span(rect.width, rect.height);
+                cols == rect.width
+                    && rows == rect.height
+                    && (width, height) != (target_width, target_height)
+            }
+            _ => false,
+        };
+        if owes_cell_resize || owes_winsize_sync {
+            // Measured on the kernel side of the sync: the counter reports the
+            // `TIOCGWINSZ` movement the restore actually produced (cells or
+            // pixels), not the intent to produce one (bitty#3250 R10).
+            let before = self.content_owner_winsize(restored.view);
             if self.pane_sessions.contains_key(&restored.view) {
                 self.sync_pane_geometry();
             } else if self.paints_primary_grid(&restored.view) {
                 self.sync_primary_geometry();
+            }
+            if self.content_owner_winsize(restored.view) != before {
+                self.content_restore_resizes = self.content_restore_resizes.saturating_add(1);
             }
         }
         // The restored grid and the dropped layer share the content rect: one

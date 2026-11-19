@@ -888,7 +888,23 @@ impl Runtime {
     /// bottom and drop the scroll position the user was reading. The reflow
     /// and repaint still run — only the redundant ioctl is skipped. A failed
     /// size query fails open to the resize.
+    ///
+    /// bitty#2388: a presented content layer freezes this call outright (see
+    /// the gate below), so the hidden child receives no `SIGWINCH` even from a
+    /// pixel-only change such as font zoom or a DPI switch (bitty#3250 R3).
     pub(super) fn resize_primary_pty(&mut self) -> Result<(), RuntimeError> {
+        // bitty#2388/#3250 R3: a presented content layer freezes the displaced
+        // primary, and the freeze is literal on the ioctl, not just on the cell
+        // axes. The comparison below includes pixel geometry, so a font-zoom or
+        // DPI change at a fixed grid re-sends the same `cols`/`rows` with new
+        // pixels — and `TIOCSWINSZ` delivers `SIGWINCH` for that write exactly
+        // as it does for a cell change. Skipping the call is the only way the
+        // child really sees no `SIGWINCH`; release lifts the freeze first, so
+        // the single restore resize still reaches the kernel.
+        if self.primary_content_frozen() {
+            self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            return Ok(());
+        }
         let pty_cols = self.cols.min(u16::MAX as usize) as u16;
         let pty_rows = self.rows.min(u16::MAX as usize) as u16;
         let (pixel_width, pixel_height) = self.pty_pixel_span(pty_cols, pty_rows);

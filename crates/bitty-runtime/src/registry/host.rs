@@ -1557,15 +1557,35 @@ impl PanelRuntime {
 
     /// Detaches the render scene from `id`, if one is attached.
     ///
-    /// Returns `true` when a scene was removed. Detach is always safe and
-    /// idempotent: the panel keeps the grid path afterwards.
-    pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> bool {
+    /// Returns `true` when a scene was removed. Detach is idempotent: a panel
+    /// with no scene keeps the grid path.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentBusy`] when the panel presents a GUI content layer
+    /// (bitty#2388). The layer's record, its scene slot, and the record's
+    /// displaced terminal are one presentation, so detaching the scene behind
+    /// the record's back would strand it: nothing could later restore the
+    /// terminal it displaced, and the panel would keep reporting a `Rich`
+    /// content kind it no longer paints. The owner releases the layer first
+    /// (which detaches its own scene), so the refusal is the fail-closed
+    /// ordering, not a new lock. Nothing is removed on refusal — the scene,
+    /// its paint cache, and the record stay intact.
+    ///
+    /// Panels without a layer — every panel before bitty#2388 — detach exactly
+    /// as before, including the crash, disable, reload, and dispose paths that
+    /// drop the layer record together with the container.
+    pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> Result<bool, PanelError> {
+        if self.content_layers.contains_key(&id) {
+            self.registry.bump_error("ContentBusy");
+            return Err(PanelError::ContentBusy { panel_id: id });
+        }
         self.scene_paints.remove(&id);
         let removed = self.scenes.remove(&id).is_some();
         if removed {
             self.scene_revision = self.scene_revision.saturating_add(1);
         }
-        removed
+        Ok(removed)
     }
 
     /// Number of panels with an attached render scene.
@@ -1817,7 +1837,9 @@ impl PanelRuntime {
                 return Err(PanelError::ContentNotPresented { panel_id: panel });
             }
         };
-        self.detach_panel_scene(panel);
+        // The record is gone before the scene detaches, so this cannot refuse
+        // (a presented layer is exactly what `detach_panel_scene` guards).
+        self.detach_panel_scene(panel)?;
         Ok(RestoredPanelContent {
             panel,
             view: record.view,
@@ -2083,18 +2105,18 @@ mod tests {
         // No scene yet: grid path, not an error.
         assert!(host.panel_scene(handle.id).is_none());
         assert_eq!(host.panel_scene_len(), 0);
-        assert!(!host.detach_panel_scene(handle.id));
+        assert!(!host.detach_panel_scene(handle.id).unwrap());
 
         host.attach_panel_scene(handle, scene_with_blocks(2))
             .unwrap();
         assert_eq!(host.panel_scene_len(), 1);
         assert_eq!(host.panel_scene(handle.id).expect("attached").len(), 2);
 
-        assert!(host.detach_panel_scene(handle.id));
+        assert!(host.detach_panel_scene(handle.id).unwrap());
         assert!(host.panel_scene(handle.id).is_none());
         assert_eq!(host.panel_scene_len(), 0);
         // Detach stays idempotent: the panel keeps the grid path.
-        assert!(!host.detach_panel_scene(handle.id));
+        assert!(!host.detach_panel_scene(handle.id).unwrap());
     }
 
     #[test]
@@ -2263,7 +2285,7 @@ mod tests {
         let replaced = host.scene_paint_for(content, Some(SURFACE), 64);
         assert_eq!(replaced.paint.plain_text(), "block 1\nblock 2");
 
-        host.detach_panel_scene(handle.id);
+        let _ = host.detach_panel_scene(handle.id);
         assert!(host.scene_paints.is_empty());
         assert_eq!(
             host.scene_paint_for(content, Some(SURFACE), 64),

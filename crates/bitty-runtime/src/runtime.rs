@@ -852,6 +852,14 @@ pub struct Runtime {
     /// reaches the PTY. The owner-polled queue is a later slice, so no key is
     /// retained anywhere.
     content_input_swallowed: u64,
+    /// Bytes dropped because the focused panel presented GUI content
+    /// (bitty#2388 "input ownership", bitty#3250 R2).
+    ///
+    /// Paste, IME commit, and every programmatic write share the one
+    /// `push_input_bytes` router, so this counter is the observable half of
+    /// "no byte reaches the displaced terminal while its panel presents a
+    /// layer": the counter moves and the transport buffer stays empty.
+    content_input_dropped_bytes: u64,
     /// Consecutive frames dropped because the overlay phase reset the glyph
     /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
     ///
@@ -2440,6 +2448,7 @@ impl Runtime {
             content_geometry_freezes: 0,
             content_restore_resizes: 0,
             content_input_swallowed: 0,
+            content_input_dropped_bytes: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,
@@ -2783,6 +2792,7 @@ impl Runtime {
             content_geometry_freezes: 0,
             content_restore_resizes: 0,
             content_input_swallowed: 0,
+            content_input_dropped_bytes: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,

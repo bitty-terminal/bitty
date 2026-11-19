@@ -14,32 +14,75 @@
 //!    presented leaf: `TIOCGWINSZ` keeps returning the frozen size and no
 //!    `SIGWINCH` is generated. The unpresented primary is the control: it does
 //!    reflow, which proves the resize reached the runtime and only the
-//!    presented leaf was skipped.
+//!    presented leaf was skipped. The freeze covers the pixel axes too, so a
+//!    font-zoom/DPI change (a pixel-only `TIOCSWINSZ`, which the kernel also
+//!    answers with `SIGWINCH`) can no longer reach the hidden child.
 //! 3. **One restore resize, then a full repaint.** Release measures the
 //!    current content rect, issues the existing per-leaf resize path once when
-//!    it differs from the frozen rect, and arms a full repaint.
+//!    it differs from the frozen rect, and arms a full repaint. The
+//!    `content_restore_resizes` counter is read on the kernel side (the
+//!    `TIOCGWINSZ` movement), so the counter and the winsize assertion say the
+//!    same thing.
 //! 4. **Input ownership.** While the layer is presented the focused panel's
-//!    keys are swallowed before the encoder: the transport buffer stays empty.
-//!    Release returns input to the terminal on the very next key.
+//!    keys are swallowed before the encoder on both keyboard entry points
+//!    (`handle_key_event` and `handle_key_event_ref`), and every non-key input
+//!    path is dropped at one of the two byte routers — `push_input_bytes`
+//!    (paste, IME commit, a programmatic write, and the CTX-0243 snap that runs
+//!    ahead of it) and `route_input_bytes_to` (pointer reports, focus reports):
+//!    nothing is encoded, nothing is buffered, and the transport buffer stays
+//!    empty. Release returns input to the terminal on the very next key,
+//!    byte-identically.
 //! 5. **Typed refusals, fail-closed.** Duplicate present, present on a
 //!    non-terminal-backed panel, present with no panel mounted, release with no
-//!    layer, and a stale or foreign layer handle all fail typed and change
-//!    nothing.
+//!    layer, a stale or foreign layer handle, and a scene detach behind a live
+//!    layer all fail typed and change nothing. A presented record can only
+//!    leave by release or by the container dying with it.
 //!
 //! Every assertion reads observable state — the PTY's own winsize, the pane's
 //! grid, the transport buffer, the presented frame report — never a value the
 //! production code derived from the same container it asserted against.
+//!
+//! # Verification limits
+//!
+//! A row whose observable is a *live pane's* kernel winsize needs a real PTY:
+//! a pane-backed panel is a `PaneSession`, which owns a `Pty`, so no build
+//! without a PTY backend can construct one. Six rows read that observable and
+//! therefore call `bitty_test_support::require_pty!()` as their **first
+//! statement** — `present_swaps_…`, `geometry_stays_…`,
+//! `primary_owner_freezes_…`, `a_pixel_only_…`, `a_foreign_handle_…`, and
+//! `release_reconciles_…` — so the whole row skips on such a build (the
+//! workspace-wide skip convention, not evidence). The gate lives in the row
+//! and never in a helper: `require_pty!()` expands to a plain `return`, which
+//! inside a helper only leaves the helper and lets the rest of the row run
+//! against a pane that was never spawned. `BITTY_TEST_FORCE_NO_PTY=1 cargo test
+//! -p bitty-runtime --test panel_content_presentation` is the check: the six
+//! rows print `SKIP live-PTY test` (visible with `-- --nocapture`) and the run
+//! reports `17 passed; 0 failed` — libtest counts a skipped row as passed, so
+//! the SKIP notices are what tell the two apart.
+//!
+//! The PTY-independent halves of the same claims are proven here without the
+//! gate: `grid_geometry_freeze_holds_without_a_pty_backend` covers the grid
+//! half of the freeze, and the input rows — including the router-gate and
+//! submit-outcome rows — need no PTY at all. The refusal row's second case
+//! deliberately keeps no live pane, so it cannot skip.
 
 #![cfg(unix)]
 
-use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, PhysicalSize, PressState};
+use bitty_platform::{
+    CursorPosition, KeyEvent, KeyLocation, LogicalKey, MouseButton, MouseEvent, PhysicalSize,
+    PressState,
+};
+use bitty_rich::host::SubmitBudget;
 use bitty_rich::scene::{
     BlockAnchor, BlockId, RichBlock, Scene, SceneNode, ScrollBehavior, StyledSpan,
 };
 use bitty_runtime::registry::{
-    PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
+    LeaseHolder, PanelError, PanelLease, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
 };
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    LayoutNode, Runtime, SplitAxis, TerminalSubmitOutcome, TerminalSubmitUnavailable, UiRect, View,
+    ViewId,
+};
 use bitty_ui::panel::ViewContent;
 
 /// Primary leaf: paints the runtime-global primary grid (no pane session).
@@ -128,8 +171,11 @@ fn char_press(ch: char) -> KeyEvent {
     }
 }
 
+/// Spawns `PANE`'s shell. Callers must gate themselves with
+/// `bitty_test_support::require_pty!()` **first**: the macro expands to a plain
+/// `return`, so a gate inside this helper would leave the helper and let the
+/// caller continue against a pane that was never spawned (bitty#3250 review).
 fn spawn_pane(rt: &mut Runtime) {
-    bitty_test_support::require_pty!();
     rt.spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], 40, 12)
         .expect("pane shell spawns");
 }
@@ -140,6 +186,7 @@ fn spawn_pane(rt: &mut Runtime) {
 
 #[test]
 fn present_swaps_content_kind_and_keeps_the_terminal_alive() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);
@@ -248,6 +295,7 @@ fn present_swaps_content_kind_and_keeps_the_terminal_alive() {
 
 #[test]
 fn geometry_stays_frozen_while_hidden_and_restores_with_one_resize() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);
@@ -408,12 +456,66 @@ fn primary_owner_freezes_on_window_resize_and_restores_once() {
     assert_eq!(rt.content_restore_resizes(), 1);
 }
 
+#[test]
+fn a_pixel_only_winsize_change_never_reaches_the_hidden_pty() {
+    bitty_test_support::require_pty!();
+    // bitty#3250 R3: `TIOCSWINSZ` delivers `SIGWINCH` even when only the pixel
+    // fields move, so the freeze has to cover the ioctl itself and not just
+    // the cell axes. A DPI/font-zoom change at a fixed grid is exactly that
+    // pixel-only write.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 30"])
+        .expect("primary shell spawns");
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let extent = rt.surface_extent().expect("headless extent");
+
+    // Control: with nothing presented the same gesture really does move the
+    // kernel's pixel fields, so the frozen reading below is the gate and not a
+    // gesture that never reached the ioctl.
+    let before = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    rt.apply_dpi_scale(1.5, Some(extent));
+    let scaled = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    assert_ne!(
+        (scaled.2, scaled.3),
+        (before.2, before.3),
+        "an unpresented primary must take the pixel geometry the DPI change asks for"
+    );
+
+    rt.apply_dpi_scale(1.0, Some(extent));
+    let frozen = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("pixels"))
+        .expect("the primary owner is a terminal-backed panel");
+
+    rt.apply_dpi_scale(1.5, Some(extent));
+    assert_eq!(
+        rt.pty_pixel_size(),
+        Some(frozen),
+        "a pixel-only winsize change must not reach the hidden PTY while the layer is up"
+    );
+
+    // The freeze is a gate, not a latch: release and the next reflow deliver
+    // the geometry the hidden gesture could not.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the primary");
+    rt.handle_resize(PhysicalSize::new(1400, 900))
+        .expect("window resize applies");
+    let after = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    assert_ne!(
+        (after.2, after.3),
+        (frozen.2, frozen.3),
+        "the lifted freeze must resync the pixel axes"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Row 4: input ownership
 // ---------------------------------------------------------------------------
 
 #[test]
-fn presented_layer_owns_the_keys_and_release_returns_them() {
+fn presented_layer_swallows_keys_and_release_returns_the_encoder() {
     let mut rt = runtime();
     install(&mut rt, single_leaf());
     install_panel_at(&mut rt, PRIMARY);
@@ -432,23 +534,33 @@ fn presented_layer_owns_the_keys_and_release_returns_them() {
         .expect("present is admitted");
     let swallowed_before = rt.content_input_swallowed();
 
+    // Both keyboard entry points swallow. The owned event is dropped and
+    // counted; it is *not* retained for a later delivery (the owner-polled
+    // queue is a later slice), so no presented-time key is ever returned.
     assert_eq!(
         rt.handle_key_event(char_press('y')),
         None,
         "a presented layer swallows the key before the encoder"
     );
     assert_eq!(
-        rt.content_input_swallowed(),
-        swallowed_before + 1,
-        "the swallowed key is counted, not silently dropped"
+        rt.handle_key_event_ref(&char_press('w')),
+        None,
+        "the borrowed entry point reads the same gate (bitty#3250 R1)"
     );
-    assert!(
-        rt.pending_input_len() == 0,
+    assert_eq!(
+        rt.content_input_swallowed(),
+        swallowed_before + 2,
+        "every swallowed key is counted, not silently dropped"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
         "no key byte may reach the displaced terminal's transport"
     );
     assert_eq!(rt.drain_pending_input(), Vec::<u8>::new());
 
-    // Release hands the keyboard back on the next key, byte-identically.
+    // Release hands the keyboard back: only post-release keys are encoded, and
+    // they are byte-identical to the pre-present encoding.
     rt.release_panel_content(PRIMARY, presented.token)
         .expect("release restores input ownership");
     assert_eq!(
@@ -456,11 +568,282 @@ fn presented_layer_owns_the_keys_and_release_returns_them() {
         Some(vec![b'z']),
         "keys reach the terminal again after release"
     );
-    assert_eq!(rt.drain_pending_input(), vec![b'z']);
+    assert_eq!(
+        rt.handle_key_event_ref(&char_press('v')),
+        Some(vec![b'v']),
+        "the borrowed entry point returns the key too once the layer is gone"
+    );
+    assert_eq!(rt.drain_pending_input(), vec![b'z', b'v']);
     assert_eq!(
         rt.content_input_swallowed(),
-        swallowed_before + 1,
-        "only the presented keypress was swallowed"
+        swallowed_before + 2,
+        "only the presented keypresses were swallowed"
+    );
+}
+
+#[test]
+fn paste_ime_and_programmatic_writes_cannot_reach_a_hidden_shell() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    // Focus reporting is on (DECSET 1004), so the window focus transitions
+    // below really produce protocol bytes for the primary owner.
+    rt.set_focused(true);
+    rt.handle_pty_bytes(b"\x1b[?1004h");
+
+    // Control: with no layer every path below reaches the transport, so the
+    // assertions after present are about the gate, not about a path that was
+    // never live.
+    rt.write_input(b"raw");
+    assert_eq!(rt.drain_pending_input(), b"raw".to_vec());
+    rt.handle_ime_commit("composed".to_string());
+    assert_eq!(rt.drain_pending_input(), b"composed".to_vec());
+    rt.paste_text("pasted");
+    assert_eq!(rt.drain_pending_input(), b"pasted".to_vec());
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("no-bytes"))
+        .expect("present is admitted");
+
+    // bitty#3250 R2: paste, IME commit, and a programmatic write share the one
+    // router, so one gate covers all three.
+    let dropped_before = rt.content_input_dropped_bytes();
+    rt.write_input(b"raw-bytes");
+    assert_eq!(
+        rt.content_input_dropped_bytes(),
+        dropped_before + b"raw-bytes".len() as u64,
+        "a programmatic write is dropped byte for byte"
+    );
+    let after_write = rt.content_input_dropped_bytes();
+    rt.handle_ime_commit("composed".to_string());
+    assert!(
+        rt.content_input_dropped_bytes() > after_write,
+        "a composed IME commit must not reach the hidden shell"
+    );
+    let after_ime = rt.content_input_dropped_bytes();
+    rt.paste_text("pasted");
+    assert!(
+        rt.content_input_dropped_bytes() > after_ime,
+        "a paste must not reach the hidden shell"
+    );
+    assert!(
+        !rt.push_input_bytes(b"submit"),
+        "the router reports the bytes as not delivered"
+    );
+    // Focus-report protocol bytes take the explicit-target router rather than
+    // `push_input_bytes`; the same gate has to cover them, or a workspace
+    // switch would still hand `CSI O`/`CSI I` to the hidden shell.
+    let after_submit = rt.content_input_dropped_bytes();
+    rt.set_focused(false);
+    assert!(
+        rt.content_input_dropped_bytes() > after_submit,
+        "a focus report must not reach the hidden shell"
+    );
+    rt.set_focused(true);
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "dropped bytes are not buffered anywhere"
+    );
+    assert_eq!(
+        rt.pending_input_dropped(),
+        0,
+        "this is the content gate, not the overflow path"
+    );
+    assert_eq!(rt.drain_pending_input(), Vec::<u8>::new());
+
+    // Release restores the paths.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores input ownership");
+    rt.write_input(b"back");
+    assert_eq!(rt.drain_pending_input(), b"back".to_vec());
+}
+
+#[test]
+fn a_dropped_write_never_snaps_a_scrolled_viewport_to_live() {
+    // bitty#3250 R2, second half: `push_input_bytes` carries a content gate of
+    // its own, and that hunk is load-bearing on an axis `route_input_bytes_to`
+    // cannot cover — the CTX-0243 snap-to-live runs *before* the router, so a
+    // paste or a programmatic write into a presented panel would yank a
+    // scrolled viewport to the bottom even though the byte assertion in
+    // `paste_ime_and_programmatic_writes_cannot_reach_a_hidden_shell` still
+    // passes on the router gate. This row pins that half.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    // Real scrollback, so paging up moves the viewport the snap would reset.
+    for i in 0..80 {
+        rt.handle_pty_bytes(format!("line-{i}\r\n").as_bytes());
+    }
+    rt.tick().expect("baseline frame");
+    assert!(rt.scroll_focused_page(true), "the focused leaf pages");
+    let scrolled = rt
+        .presented_scroll_offset(PRIMARY)
+        .expect("the primary owner is a live leaf");
+    assert!(
+        scrolled > 0,
+        "the scroll gesture must move the viewport, or the snap assert proves nothing"
+    );
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("scrolled"))
+        .expect("present is admitted on the primary owner");
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(scrolled),
+        "presenting a layer must not disturb the recorded viewport"
+    );
+
+    let dropped_before = rt.content_input_dropped_bytes();
+    assert!(
+        !rt.push_input_bytes(b"paste"),
+        "the router gate reports the bytes as not delivered"
+    );
+    assert_eq!(
+        rt.content_input_dropped_bytes(),
+        dropped_before + b"paste".len() as u64,
+        "the router gate counts what it dropped"
+    );
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(scrolled),
+        "a write the gate dropped must not snap the viewport to live (CTX-0243 snap)"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a dropped write is not buffered on the way out"
+    );
+
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores input ownership");
+    // Control: the same write is no longer dropped, so the CTX-0243 snap runs
+    // exactly as it did before the layer existed. (The bytes themselves buffer
+    // headless here: this fixture has no PTY writer, which is exactly why the
+    // drop has to be proven by its own counter and not by the return value.)
+    rt.push_input_bytes(b"live");
+    assert_eq!(
+        rt.presented_scroll_offset(PRIMARY),
+        Some(0),
+        "after release the same write reaches the snap-to-live path again"
+    );
+}
+
+#[test]
+fn a_content_gate_drop_reports_a_drop_not_a_headless_buffer() {
+    // bitty#3250 R2: `push_input_bytes` answers `false` both for a frame that
+    // only buffered headless and for one the content gate dropped. A caller
+    // that maps every `false` to "buffered" mislabels the drop, so
+    // `terminal.submit` reports the two apart and never charges the budget for
+    // a frame that was thrown away.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("composer"))
+        .expect("present is admitted on the primary owner");
+
+    let mut lease = PanelLease::idle();
+    let holder = LeaseHolder(7);
+    lease.acquire(holder, 100, 0).expect("lease acquires");
+    let mut budget = SubmitBudget::new("composer.test", 1024 * 1024);
+    let dropped_before = rt.content_input_dropped_bytes();
+    let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+
+    assert_eq!(
+        outcome,
+        TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::ContentLayerPresented),
+        "a content-gate drop is not a headless buffer"
+    );
+    assert_eq!(
+        budget.used(),
+        0,
+        "a dropped frame is never charged against the submit window"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a dropped frame is not buffered headless"
+    );
+    assert_eq!(
+        rt.content_input_dropped_bytes(),
+        dropped_before + b"\x1b[200~cargo test\x1b[201~\r".len() as u64,
+        "the dropped frame is counted byte for byte"
+    );
+
+    // Control: with no layer the same call still reports `Unavailable` on this
+    // headless fixture (no PTY writer), but now for the *other* reason — it
+    // buffered the frame instead of dropping it. That is the distinction the
+    // row is about: same `false` from the router, two different outcomes.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores input ownership");
+    let mut budget = SubmitBudget::new("composer.test", 1024 * 1024);
+    let outcome = rt.terminal_submit("cargo test", &lease, holder, 1, &mut budget);
+    assert_eq!(
+        outcome,
+        TerminalSubmitOutcome::Unavailable(TerminalSubmitUnavailable::BufferedOnly),
+        "with the layer gone the frame buffers headless, it is not dropped"
+    );
+    assert_eq!(
+        rt.pending_input(),
+        b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
+        "the buffered frame is kept for a later delivery, which the dropped one was not"
+    );
+}
+
+#[test]
+fn grid_geometry_freeze_holds_without_a_pty_backend() {
+    // The PTY-backed freeze rows skip on a build without a PTY. This row keeps
+    // the same claim's grid half — the reflow gate, not the ioctl — observable
+    // on every build (bitty#3250 R9).
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let frozen = (rt.snapshot().width, rt.snapshot().height);
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("grid"))
+        .expect("present is admitted on the primary owner");
+    let freezes_before = rt.content_geometry_freezes();
+
+    rt.handle_resize(PhysicalSize::new(1200, 700))
+        .expect("window resize applies");
+
+    assert!(
+        rt.content_geometry_freezes() > freezes_before,
+        "the primary reflow ran and was frozen (not skipped entirely)"
+    );
+    assert_eq!(
+        (rt.snapshot().width, rt.snapshot().height),
+        frozen,
+        "the frozen primary grid keeps its committed size"
+    );
+
+    // Release lifts the freeze, so the same grid follows the current frame.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the primary");
+    let frame = frame_of(&rt, PRIMARY);
+    assert_eq!(
+        (rt.snapshot().width, rt.snapshot().height),
+        (usize::from(frame.cols), usize::from(frame.rows)),
+        "the restored grid takes the current content rect"
+    );
+    assert_ne!(
+        (usize::from(frame.cols), usize::from(frame.rows)),
+        frozen,
+        "the gesture must have moved the leaf, or the restore proves nothing"
+    );
+    // The restore counter is read on the PTY side (bitty#3250 R10): the grid
+    // above did move, but no `TIOCGWINSZ` exists here to move, so a counter
+    // that reported the *intent* would be claiming a resize the kernel never
+    // saw.
+    assert_eq!(
+        rt.content_restore_resizes(),
+        0,
+        "without a PTY winsize there is no restore resize to count"
     );
 }
 
@@ -481,10 +864,11 @@ fn present_refuses_without_a_host_without_a_panel_and_off_terminal_content() {
         other => panic!("expected ContentUnavailable, got {other:?}"),
     }
 
-    // A host installed, but no panel mounted at this view.
+    // A host installed, but no panel mounted at this view. No live pane is
+    // spawned: the refusal happens before any session is consulted, so this
+    // row keeps its assertion on a build without a PTY backend (bitty#3250 R9).
     let mut rt = runtime();
     install(&mut rt, two_panes());
-    spawn_pane(&mut rt);
     install_panel_at(&mut rt, PANE);
     match rt.present_panel_content(PRIMARY, text_layer("none")) {
         Err(PanelError::ContentUnavailable { view_id, reason }) => {
@@ -585,6 +969,7 @@ fn duplicate_present_release_without_layer_and_stale_handle_are_typed() {
 
 #[test]
 fn a_foreign_handle_cannot_release_another_panels_layer() {
+    bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
     spawn_pane(&mut rt);
@@ -718,4 +1103,146 @@ fn disposing_the_panel_drops_its_layer_record() {
     // The token is dead after the container is gone, and nothing restores.
     assert_eq!(rt.panel_content_layer(PRIMARY), None);
     assert!(rt.release_panel_content(PRIMARY, presented.token).is_err());
+}
+
+#[test]
+fn release_reconciles_a_pixel_only_winsize_after_a_dpi_change() {
+    bitty_test_support::require_pty!();
+    // A durable fixed-size leaf comes back to the same `cols`/`rows` after a
+    // font-zoom/DPI change, so a release that only compared the cell rect
+    // would leave the PTY advertising stale pixels — the exact ioctl the
+    // freeze deferred. The release has to reconcile the owner's own winsize.
+    let mut rt = runtime();
+    let mut view = View::new(PRIMARY, 80, 24);
+    view.set_fixed_size(Some(bitty_ui::Size::new(40, 12)));
+    install(&mut rt, LayoutNode::leaf(view));
+    rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 30"])
+        .expect("primary shell spawns");
+    install_panel_at(&mut rt, PRIMARY);
+    // The spawn takes the container grid; one reflow puts the PTY on the fixed
+    // leaf's flag, which is the size the layer freezes.
+    rt.handle_resize(rt.surface_extent().expect("headless extent"))
+        .expect("window resize applies");
+    rt.tick().expect("baseline frame");
+    let extent = rt.surface_extent().expect("headless extent");
+    assert_eq!(
+        rt.pty_size(),
+        Some((40, 12)),
+        "the fixed-size leaf pins the primary grid, not the container"
+    );
+    let frozen = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("fixed"))
+        .expect("present is admitted");
+    rt.apply_dpi_scale(1.5, Some(extent));
+    assert_eq!(
+        rt.pty_pixel_size(),
+        Some(frozen),
+        "the freeze defers the pixel-only ioctl while the layer is up"
+    );
+    assert_eq!(rt.content_restore_resizes(), 0);
+
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the primary");
+    assert_eq!(
+        rt.pty_size(),
+        Some((40, 12)),
+        "the cell rect did not move, so this release owes no cell resize"
+    );
+    let restored = rt.pty_pixel_size().expect("primary PTY pixel winsize");
+    assert_ne!(
+        (restored.2, restored.3),
+        (frozen.2, frozen.3),
+        "release must reconcile the pixel axes the hidden gesture could not send"
+    );
+    assert_eq!(
+        rt.content_restore_resizes(),
+        1,
+        "the pixel-only reconciliation is counted as the one restore resize"
+    );
+}
+
+#[test]
+fn a_pointer_press_dropped_by_the_gate_does_not_arm_a_drag() {
+    // A press the content gate drops never reached the application, so it must
+    // not latch a drag either: a `?1002` app reports motion only while a
+    // button is held, which makes a phantom latch observable after the layer
+    // is gone.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    rt.handle_pty_bytes(b"\x1b[?1002h\x1b[?1006h");
+    rt.handle_cursor_moved(CursorPosition { x: 22.0, y: 22.0 });
+    rt.drain_pending_input();
+
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("pointer"))
+        .expect("present is admitted");
+    rt.handle_mouse_input(MouseEvent::new(MouseButton::Left, PressState::Pressed));
+    assert_eq!(
+        rt.pending_input_len(),
+        0,
+        "a press report must not reach the hidden shell"
+    );
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the terminal content");
+    rt.drain_pending_input();
+
+    rt.handle_cursor_moved(CursorPosition {
+        x: 22.0 + 18.0,
+        y: 22.0,
+    });
+    assert_eq!(
+        rt.drain_pending_input(),
+        Vec::<u8>::new(),
+        "motion after the layer is gone must not report a drag the app never started"
+    );
+}
+
+#[test]
+fn detaching_a_scene_cannot_strand_a_presented_layer() {
+    // bitty#3250 R5: the plugin unmount path detaches a panel's scene for any
+    // owned panel. Behind a live content layer that would remove the paint half
+    // and leave the record naming a `Rich` kind nothing can restore, so the
+    // detach has to refuse while the layer is presented.
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    rt.tick().expect("baseline frame");
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("owned"))
+        .expect("present is admitted");
+
+    let host = rt.scene_host().expect("host installed");
+    {
+        let mut host = host.try_borrow_mut().expect("host is free");
+        match host.detach_panel_scene(presented.panel) {
+            Err(PanelError::ContentBusy { panel_id }) => assert_eq!(panel_id, presented.panel),
+            other => panic!("a detach behind a live layer must refuse, got {other:?}"),
+        }
+        assert!(
+            host.panel_scene(presented.panel).is_some(),
+            "the refusal leaves the layer's scene attached"
+        );
+        assert_eq!(
+            host.presented_content_count(),
+            1,
+            "the refusal leaves the record presented, never stranded"
+        );
+    }
+
+    // Release detaches the layer's own scene; a later detach is then a no-op.
+    rt.release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the terminal content");
+    let host = rt.scene_host().expect("host installed");
+    let mut host = host.try_borrow_mut().expect("host is free");
+    assert!(
+        !host
+            .detach_panel_scene(presented.panel)
+            .expect("a released panel detaches freely"),
+        "release already detached the layer's scene"
+    );
+    assert_eq!(host.presented_content_count(), 0);
 }

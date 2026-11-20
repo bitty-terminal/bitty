@@ -2652,6 +2652,14 @@ jobs:
               if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')) {
                 throw "scoop which bitty did not resolve to an executable shim: $shim"
               }
+              # bitty#3224: the '.com' allowlist admits any console companion, so
+              # also require the resolved shim to be the manifest-declared
+              # `bitty.com` member of the installed app (under `current`).
+              $shimFull = [IO.Path]::GetFullPath($shim)
+              $appComFull = [IO.Path]::GetFullPath($appCom)
+              if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "scoop which bitty resolved to '$shim', not the manifest shim '$appCom'"
+              }
               $out = (& $shim --version 2>&1 | Out-String)
               $code = $LASTEXITCODE
               if ($code -ne 0) { throw "bitty --version exited $code" }

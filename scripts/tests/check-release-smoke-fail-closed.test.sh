@@ -152,6 +152,14 @@ expect_contains "$SMOKE" 'Test-Path -LiteralPath $shim -PathType Leaf' \
 # bitty#3224: the Scoop shim allowlist includes '.com' for the bitty.com console companion.
 expect_contains "$SMOKE" "GetExtension(\$shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')" \
   "Scoop smoke requires an executable shim extension"
+# bitty#3224: '.com' alone admits any console companion, so the leg must resolve
+# the provider path (`scoop which` prints `~\...`) and compare it with the target.
+expect_contains "$SMOKE" '(Get-Item -LiteralPath $shim).FullName' \
+  "Scoop smoke resolves the shim path through the provider"
+expect_contains "$SMOKE" 'if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {' \
+  "Scoop smoke compares the resolved shim with the manifest target"
+expect_contains "$SMOKE" 'not the manifest shim' \
+  "Scoop smoke reports both resolved paths on a shim mismatch"
 expect_contains "$SMOKE" 'Test-Path -LiteralPath $exe -PathType Leaf' \
   "native Windows smoke requires an existing executable file"
 expect_contains "$RELEASE" 'prerelease: false' \

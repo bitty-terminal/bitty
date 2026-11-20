@@ -2655,10 +2655,12 @@ jobs:
               # bitty#3224: the '.com' allowlist admits any console companion, so
               # also require the resolved shim to be the manifest-declared
               # `bitty.com` member of the installed app (under `current`).
-              $shimFull = [IO.Path]::GetFullPath($shim)
-              $appComFull = [IO.Path]::GetFullPath($appCom)
+              # Resolve through the provider: `scoop which` prints a `~\`-relative
+              # path, which [IO.Path] cannot expand.
+              $shimFull = (Get-Item -LiteralPath $shim).FullName
+              $appComFull = (Get-Item -LiteralPath $appCom).FullName
               if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {
-                throw "scoop which bitty resolved to '$shim', not the manifest shim '$appCom'"
+                throw "scoop which bitty resolved to '$shimFull', not the manifest shim '$appComFull'"
               }
               $out = (& $shim --version 2>&1 | Out-String)
               $code = $LASTEXITCODE

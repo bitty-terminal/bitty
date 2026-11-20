@@ -12598,6 +12598,11 @@ claims = []
     }
 
     /// Concatenated grid glyphs of `view`'s own pane session.
+    ///
+    /// Only the live-PTY rows read this; the primary-owner row needs no pane
+    /// session, so the helper is gated with them or it is dead code on a build
+    /// without a POSIX shell (`-D warnings` in the Windows leg).
+    #[cfg(unix)]
     fn pane_glyphs(app: &TerminalApp, view: ViewId) -> String {
         match app.runtime.pane_snapshot(&view) {
             Some(snapshot) => snapshot.cells.iter().map(|cell| cell.glyph).collect(),

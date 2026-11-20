@@ -2433,8 +2433,11 @@ impl Runtime {
                 if column < band_column || column >= band_column.saturating_add(width) {
                     continue;
                 }
+                // bitty#3282: a row band is hit where it is *painted*, i.e. on
+                // its cell row inside the granted rect, so the pointer never
+                // hits band fill that is no longer drawn.
                 let rect = match edge.axis() {
-                    BandAxis::Row => geometry.row_band(edge, band_row, band_column, width),
+                    BandAxis::Row => geometry.cell_row(edge, band_row, band_column, width),
                     BandAxis::Column => geometry.area_band(band_row, band_column, width, height),
                 };
                 if !rect.contains(pos.x, pos.y) {

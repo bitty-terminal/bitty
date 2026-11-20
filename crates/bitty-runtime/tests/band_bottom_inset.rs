@@ -32,6 +32,15 @@
 //! `fractional_dpi_surface_flushes_the_band_to_the_inset` fail with the band's
 //! last painted row exactly `remainder` above the inset (captured output is in
 //! the PR body); the exact-multiple control passes on both trees.
+//!
+//! bitty#3282 (CTX-1919) tightened the same fixtures: the granted rect may be
+//! taller than one cell (the innermost band absorbs the remainder), but the
+//! *painted* band — fills, glyphs, rule, and hit zone — is exactly that one
+//! cell row, bottom-aligned on the inset, with the absorbed remainder left as
+//! window background above it. `bottom_band_glyphs_sit_in_the_painted_cell_row`
+//! pins the glyph row itself (the first and last foreground ink rows inside
+//! the painted cell row) against an exact-multiple control, because fill
+//! coverage alone cannot see where the glyphs were pinned.
 
 use bitty_lua::ui::{ClickArg, ClickCommand, UiNode, UiSlot};
 use bitty_platform::{CursorPosition, MouseButton, PhysicalSize, PressState};
@@ -235,6 +244,22 @@ impl Painted {
         )
     }
 
+    /// Rows in `[y0, y1)` carrying a pixel that differs from the band's own
+    /// `fill` color — the glyph ink painted over the capsule fill. Blended
+    /// glyph pixels never equal a theme token, so "differs from the fill" is
+    /// the observable for the glyph row (bitty#3282).
+    fn ink_rows_over_fill(&self, fill: [u8; 4], y0: i32, y1: i32) -> Vec<usize> {
+        rows_with_ink(
+            &self.buffer,
+            self.width,
+            self.probe.0,
+            self.probe.1,
+            usize::try_from(y0.max(0)).expect("non-negative"),
+            usize::try_from(y1.max(0)).expect("non-negative"),
+            fill,
+        )
+    }
+
     /// Physical center of band cell 0, for hit-test probes at physical row `y`.
     fn probe_point(&self, y: i32) -> CursorPosition {
         CursorPosition {
@@ -377,28 +402,40 @@ fn band_bottom_is_the_physical_inset_on_a_remainder_surface() {
             .collect::<Vec<_>>(),
         "the window padding is the only gap below the band"
     );
+    // bitty#3282: the granted rect is taller than one cell, but the *painted*
+    // band is exactly one cell row, bottom-aligned on the inset. The absorbed
+    // remainder becomes background above the content instead of dead fill under
+    // the glyphs.
+    let content_top = inset - painted.cell_h();
     let band_rows = painted.ink_rows(background, painted.stack_top, painted.surface_h);
     assert_eq!(
         band_rows.first(),
-        Some(&usize::try_from(painted.stack_top).expect("row")),
-        "the band's content-facing edge does not move"
+        Some(&usize::try_from(content_top).expect("row")),
+        "the painted band starts one cell above the inset"
     );
     assert_eq!(
         band_rows.last(),
         Some(&usize::try_from(inset - 1).expect("row")),
-        "the band's last painted row is the inset edge, {remainder} px lower than before"
+        "the painted band still ends on the inset edge"
     );
     assert_eq!(
         band_rows.len(),
-        usize::try_from(inset - painted.stack_top).expect("rows"),
-        "the band is one contiguous run from the container edge to the inset"
+        usize::try_from(painted.cell_h()).expect("rows"),
+        "the painted band is exactly one cell tall, not cell + remainder"
     );
-    // The strip the old rule left blank is now the band's own fill.
-    for y in inset - i32::try_from(remainder).expect("remainder")..inset {
-        assert_eq!(
-            painted.color_rows(bg, y, y + 1),
-            vec![usize::try_from(y).expect("row")],
-            "row {y} of the old remainder strip is band fill, not window background"
+    // The shared chrome rule owns the first row of the painted cell row, and
+    // every row below it is the band's own fill.
+    assert_eq!(
+        painted.color_rows(bg, content_top, inset),
+        (content_top + 1..inset)
+            .map(|y| usize::try_from(y).expect("row"))
+            .collect::<Vec<_>>(),
+        "the cell row is band fill below the chrome rule"
+    );
+    for y in painted.stack_top..content_top {
+        assert!(
+            painted.color_rows(background, y, y + 1) == vec![usize::try_from(y).expect("row")],
+            "row {y} of the absorbed remainder is window background, not band fill"
         );
     }
     painted.assert_hit_matches_paint(&rt, &band_rows, BandEdge::Bottom);
@@ -459,20 +496,32 @@ fn stacked_bottom_bands_tile_the_zone_with_no_seam() {
         Some(&usize::try_from(inset - 1).expect("row")),
         "the outer band ends on the inset, 7 px lower than before"
     );
+    // bitty#3282: the *painted* stack is contiguous and exactly two cells tall;
+    // each band's granted remainder is background above its own content row, so
+    // only the innermost band moves and the seam between bands stays closed.
+    let painted_top = inset - 2 * painted.cell_h();
     assert_eq!(
         band_rows.first(),
-        Some(&usize::try_from(stack_top).expect("row")),
-        "the stack starts at the container's bottom edge"
+        Some(&usize::try_from(painted_top).expect("row")),
+        "the painted stack starts two cells above the inset"
     );
     assert_eq!(
         band_rows.len(),
-        usize::try_from(inset - stack_top).expect("rows"),
-        "the stack is contiguous: no seam between bands, no gap above"
+        usize::try_from(2 * painted.cell_h()).expect("rows"),
+        "the painted stack is two contiguous cell rows"
     );
     assert!(
-        painted.color_rows(background, stack_top, inset).is_empty(),
-        "no background row inside the bottom band zone"
+        painted
+            .color_rows(background, painted_top, inset)
+            .is_empty(),
+        "no background row inside the painted stack"
     );
+    for y in stack_top..painted_top {
+        assert!(
+            painted.color_rows(background, y, y + 1) == vec![usize::try_from(y).expect("row")],
+            "row {y} of the absorbed remainder is window background"
+        );
+    }
     painted.assert_hit_matches_paint(&rt, &band_rows, BandEdge::Bottom);
 
     // Each band keeps its own one-cell budget: the outer band is the last cell
@@ -727,5 +776,84 @@ fn bottom_anchor_leaves_the_pty_winsize_unchanged() {
         rt.band_row_container().height,
         rt.window_cells().height.saturating_sub(1),
         "the container keeps the band row outside the leaf"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bitty#3282: the glyph row, not just the fill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bottom_band_glyphs_sit_in_the_painted_cell_row() {
+    // The dead strip the issue measured sat *below* the glyphs: paint used the
+    // granted rect's full height for both the per-run fill and the glyph
+    // origin, so the ink was pinned `remainder` px above the bottom-aligned
+    // cell row it must occupy, and the slack hung under it as band fill.
+    //
+    // This regression pins the glyph row itself. The deterministic
+    // rasterizer paints the same ink for the same text on every surface, so an
+    // exact-multiple control states the ink offsets inside a normal cell row;
+    // the remainder fixture must paint them at exactly those offsets inside
+    // the painted cell row. Blended glyph pixels never equal a theme token,
+    // so the observable is a pixel over the band's own fill that differs from
+    // it (the probe columns carry the text, the chrome rule is skipped by
+    // starting one row below the painted top).
+    let remainder = 7;
+    let mut rt = fixture(ROWS, remainder);
+    rt.set_chrome_bands(ChromeBands {
+        bottom: vec![bottom_band("bar", "status bar", "bright_red")],
+        ..Default::default()
+    });
+    rt.tick().expect("tick presents the band");
+    assert_eq!(rt.band_host_stats().paint_violations, 0);
+    let painted = Painted::capture(&rt);
+    let bg = token(&rt, "bright_red");
+    let background = token(&rt, "background");
+    let inset = painted.inset();
+    let content_top = inset - painted.cell_h();
+
+    let mut control = fixture(ROWS, 0);
+    control.set_chrome_bands(ChromeBands {
+        bottom: vec![bottom_band("bar", "status bar", "bright_red")],
+        ..Default::default()
+    });
+    control.tick().expect("control presents the band");
+    let control = Painted::capture(&control);
+    let control_top = control.inset() - control.cell_h();
+
+    let control_ink = control.ink_rows_over_fill(bg, control_top + 1, control.inset());
+    assert!(
+        !control_ink.is_empty(),
+        "the control band paints glyph ink over its fill"
+    );
+    let band_ink = painted.ink_rows_over_fill(bg, content_top + 1, inset);
+    assert_eq!(
+        band_ink.len(),
+        control_ink.len(),
+        "the band paints its glyphs over the painted cell row's fill"
+    );
+    let first = i32::try_from(band_ink[0]).expect("row fits i32");
+    let last = i32::try_from(*band_ink.last().expect("ink rows")).expect("row fits i32");
+    let control_first = i32::try_from(control_ink[0]).expect("row fits i32");
+    let control_last = i32::try_from(*control_ink.last().expect("ink rows")).expect("row fits i32");
+    assert_eq!(
+        first - content_top,
+        control_first - control_top,
+        "glyph origin: the ink starts at the painted cell row's own top, \
+         not the granted rect's"
+    );
+    assert_eq!(
+        last - content_top,
+        control_last - control_top,
+        "last foreground row: the ink ends at the painted cell row's own \
+         bottom offset, so no glyph row is stranded in the absorbed remainder"
+    );
+    // Nothing glyph-like or fill-like paints in the absorbed remainder: it is
+    // pure window background above the painted row.
+    assert!(
+        painted
+            .ink_rows(background, painted.stack_top, content_top)
+            .is_empty(),
+        "the absorbed remainder above the painted row is window background"
     );
 }

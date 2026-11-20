@@ -194,6 +194,60 @@ impl BandPixelGeometry {
         self.rect(y, height, column, width_cells)
     }
 
+    /// The cell row a band's painted content occupies.
+    ///
+    /// A bottom band's granted rect can be taller than one cell: the innermost
+    /// band absorbs the sub-cell remainder at its content-facing edge so the
+    /// stack stays flush with the window inset (bitty#3263). Painting capsule
+    /// fills and glyphs at that full height turned the absorbed remainder into
+    /// dead fill under the text (bitty#3282), so content is bottom-aligned
+    /// inside the granted rect: the remainder stays *above* it, on the
+    /// content-facing side, and the painted row still ends on the physical
+    /// inset. Top and column bands have no slack and keep the granted rect.
+    #[must_use]
+    pub(super) fn cell_row(
+        &self,
+        edge: BandEdge,
+        row: u16,
+        column: u16,
+        width_cells: u16,
+    ) -> BandPixels {
+        let granted = self.row_band(edge, row, column, width_cells);
+        if edge != BandEdge::Bottom {
+            return granted;
+        }
+        let cell_h = self.cell_h;
+        if cell_h == 0 || granted.height <= cell_h {
+            return granted;
+        }
+        let drop = granted.height - cell_h;
+        BandPixels {
+            y: granted
+                .y
+                .saturating_add(i32::try_from(drop).unwrap_or(i32::MAX)),
+            height: cell_h,
+            ..granted
+        }
+    }
+
+    /// Sub-cell distance a bottom band's painted content sits below its cell
+    /// origin (bitty#3282): the slack [`Self::cell_row`] removes from the top of
+    /// the granted rect. `0` for every other edge, for an exact multiple, and
+    /// for a band without slack.
+    #[must_use]
+    pub(super) fn content_drop(&self, edge: BandEdge, row: u16) -> i32 {
+        if edge != BandEdge::Bottom {
+            return 0;
+        }
+        let (_, height) = self.bottom_row(row);
+        let height = u32::try_from(height).unwrap_or(0);
+        if height > self.cell_h {
+            i32::try_from(height - self.cell_h).unwrap_or(i32::MAX)
+        } else {
+            0
+        }
+    }
+
     /// Physical y displacement of row band row `row` on `edge` from its own cell
     /// origin — the sub-cell distance a bottom band was moved down to meet the
     /// window's physical inset (bitty#3263).

@@ -322,7 +322,7 @@ installs it, lands in `/usr/lib/systemd/user/bittyd.service`.
 | `packaging/freebsd/x11/bitty`                            | no: deliberate. The accepted endpoint contract (`D-15`) refuses FreeBSD (`LOCAL_PEERCRED` exposes `xucred` without a peer pid)                 | no                                                                              |
 | `packaging/netbsd/x11/bitty`                             | no: deliberate. NetBSD is not a `D-15` cell, so the daemon refuses it                                                                          | no                                                                              |
 | `packaging/openbsd/x11/bitty`                            | no: deliberate. OpenBSD is not a `D-15` cell, so the daemon refuses it                                                                         | no                                                                              |
-| `packaging/flathub/` (Flatpak)                           | no daemon: the Flatpak sandbox has no systemd user manager, so the build installs neither `bin/bittyd` nor its unit (bitty#3004)                                                                                                               | no                                                                              |
+| `packaging/flathub/` (Flatpak)                           | no daemon: the Flatpak sandbox has no systemd user manager, so the build installs neither `bin/bittyd` nor its unit (bitty#3004)               | no                                                                              |
 | `scripts/make-appimage.sh`                               | no: the AppDir carries one executable, copied from `--binary`                                                                                  | no                                                                              |
 | Homebrew (`release.yml` renders the formula at tag time) | no: the formula installs the bare macOS binary as `bitty`                                                                                      | no                                                                              |
 | Scoop (`release.yml` renders the manifest at tag time)   | no: the manifest shims the bare `.exe` as `bitty`                                                                                              | no                                                                              |
@@ -1079,7 +1079,7 @@ Unsigned 0.1.0 verifies the seed by hash only: the release `SHA256SUMS` entry
 must match the downloaded bytes, and the first successful install records a
 TOFU pin under `<user>/<name>/tarball.sha256`. A later payload substitution
 for an installed extension fails closed as pin-mismatch until an explicit
-`--force` re-pin. The seed allowlists the _initial_ URL only. It follows
+`--force` re-pin. The seed allowlists the *initial* URL only. It follows
 `curl --location` redirects, and `--proto =https` keeps them on HTTPS, but the
 effective host and path are not pinned: a redirect can move the fetch to
 another origin. The hash chain binds the tarball to the `SHA256SUMS` fetched in

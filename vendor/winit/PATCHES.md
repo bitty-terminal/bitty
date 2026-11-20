@@ -22,31 +22,31 @@ from the digest pinned below. See [Integrity](#integrity).
 
 ## Provenance
 
-| Item            | Value                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------- |
-| Crate source    | `winit 0.30.13` (published 2026-03-02)                                                |
-| Source path     | `$CARGO_HOME/registry/src/index.crates.io-*/winit-0.30.13/`                           |
-| Source revision | `e9809ef54b18499bb4f2cac945719ecc2a61061b` (recorded in `.cargo_vcs_info.json`)       |
-| Upstream PR     | <https://github.com/rust-windowing/winit/pull/4710>                                   |
-| PR title        | `[0.30] Wayland: emit Occluded for the xdg-shell suspended state`                     |
-| Base commit     | `e9809ef54b18499bb4f2cac945719ecc2a61061b` (branch `v0.30.x`)                         |
-| Head commit     | `e2cb6c08499b66bad6b2c5890b0e9dd21856d906` (branch `wayland-suspended-occluded-0.30`) |
-| PR commits      | one: `e2cb6c08`, authored 2026-09-23                                                  |
-| Patch           | `patches/0001-wayland-xdg-suspended-occluded.diff`                                    |
-| Patch SHA-256   | `467156b345e49449422a7ba968ff5a259c085e8f953b75b5daec7a7b4c6c220c`                    |
-| Patch 2         | `patches/0002-codeql-null-guards.diff`                                                |
-| Patch 2 SHA-256 | `31331ad8e0c71e6dd15fc0fd95512750d9b00842ee56de11c1d46904e52e0b05`                    |
-| Patch 2 origin  | local hardening for CodeQL alerts 9 and 10 (not an upstream change)                   |
-| Patch 3         | `patches/0003-wayland-dispatch-pending-on-shared-display.diff`                        |
-| Patch 3 SHA-256 | `82a294870c8a44f47005284f4edba41cf3d902a5b9a2559895fec6ef0bd6b237`                    |
-| Patch 3 origin  | local fix for Wayland ANR and suspended-workspace frame callback handling (#3096, #3116) |
-| Patch 4         | `patches/0004-wayland-flush-frame-callback-before-present.diff`                       |
-| Patch 4 SHA-256 | `f7d05a910f566c9569a8f0a731948558f4704fbc5896bca7a5006616ffdcd6f5`                    |
+| Item            | Value                                                                                      |
+| --------------- | -------------------------------------------------------------------------------------      |
+| Crate source    | `winit 0.30.13` (published 2026-03-02)                                                     |
+| Source path     | `$CARGO_HOME/registry/src/index.crates.io-*/winit-0.30.13/`                                |
+| Source revision | `e9809ef54b18499bb4f2cac945719ecc2a61061b` (recorded in `.cargo_vcs_info.json`)            |
+| Upstream PR     | <https://github.com/rust-windowing/winit/pull/4710>                                        |
+| PR title        | `[0.30] Wayland: emit Occluded for the xdg-shell suspended state`                          |
+| Base commit     | `e9809ef54b18499bb4f2cac945719ecc2a61061b` (branch `v0.30.x`)                              |
+| Head commit     | `e2cb6c08499b66bad6b2c5890b0e9dd21856d906` (branch `wayland-suspended-occluded-0.30`)      |
+| PR commits      | one: `e2cb6c08`, authored 2026-09-23                                                       |
+| Patch           | `patches/0001-wayland-xdg-suspended-occluded.diff`                                         |
+| Patch SHA-256   | `467156b345e49449422a7ba968ff5a259c085e8f953b75b5daec7a7b4c6c220c`                         |
+| Patch 2         | `patches/0002-codeql-null-guards.diff`                                                     |
+| Patch 2 SHA-256 | `31331ad8e0c71e6dd15fc0fd95512750d9b00842ee56de11c1d46904e52e0b05`                         |
+| Patch 2 origin  | local hardening for CodeQL alerts 9 and 10 (not an upstream change)                        |
+| Patch 3         | `patches/0003-wayland-dispatch-pending-on-shared-display.diff`                             |
+| Patch 3 SHA-256 | `82a294870c8a44f47005284f4edba41cf3d902a5b9a2559895fec6ef0bd6b237`                         |
+| Patch 3 origin  | local fix for Wayland ANR and suspended-workspace frame callback handling (#3096, #3116)   |
+| Patch 4         | `patches/0004-wayland-flush-frame-callback-before-present.diff`                            |
+| Patch 4 SHA-256 | `f7d05a910f566c9569a8f0a731948558f4704fbc5896bca7a5006616ffdcd6f5`                         |
 | Patch 4 origin  | local fix to flush `wl_surface.frame` before off-thread `vkQueuePresentKHR` commit (#3155) |
-| Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`             |
-| Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                 |
-| Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                    |
-| Tree digest     | `621d115a3e0d761832465cd1b38fcd787ce232c772c61684ccdd9aafc333118a`                    |
+| Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`                  |
+| Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                      |
+| Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                         |
+| Tree digest     | `621d115a3e0d761832465cd1b38fcd787ce232c772c61684ccdd9aafc333118a`                         |
 
 The PR base equals the released `0.30.13` commit, which is why the patch applies
 to the crates.io source without offsets. Only the five files below differ from

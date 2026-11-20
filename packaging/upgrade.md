@@ -16,11 +16,11 @@ bitty upgrade --rollback   # script/AppImage: restore bitty.prev
 
 ## Exit codes
 
-| Code | Meaning                                                                                                                     |
-| ---- | --------------------------------------------------------------------------------------------------------------------------- |
-| `0`  | Done, already current, or a plan/command was printed                                                                        |
-| `1`  | `--check` found an update, or a fetch/verify/replace failed, or the channel is unknown                                      |
-| `2`  | Usage error (contradictory flags, stray positional)                                                                         |
+| Code | Meaning                                                                                                                                           |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------                       |
+| `0`  | Done, already current, or a plan/command was printed                                                                                              |
+| `1`  | `--check` found an update, or a fetch/verify/replace failed, or the channel is unknown                                                            |
+| `2`  | Usage error (contradictory flags, stray positional)                                                                                               |
 | `7`  | Permission class: system-owned channel (without `--dry-run`), safe-mode write refusal, or a Windows self-managed install that needs the installer |
 
 `bitty upgrade --check` is read-only and allowed under `--safe`; `--dry-run`

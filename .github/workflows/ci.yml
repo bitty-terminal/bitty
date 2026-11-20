@@ -344,6 +344,17 @@ jobs:
         if: matrix.shard == 1
         run: bash scripts/check-pty-gated-tests.sh
 
+      # CTX-1916 (bitty#3274): the Windows release verification gate ran only
+      # through `just check`, which PR CI never invokes (CTX-1778 precedent),
+      # so nothing on a pull request guarded the release workflow's portable
+      # ZIP directories and trimmed version assertions; run the gate against
+      # the real workflow plus its fixture test so the class cannot regress.
+      - name: Check Windows release verification gate
+        if: matrix.shard == 1
+        run: |
+          bash scripts/check-release-windows-verify.sh
+          bash scripts/tests/check-release-windows-verify.test.sh
+
       # CTX-0847: cargo-nextest isolates every test in its own process, caps
       # the real-process `live-pty` group so system suites cannot starve each
       # other on small runners, bounds each test with a timeout, and reports

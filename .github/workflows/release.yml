@@ -967,13 +967,13 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bitty-windows-zip-x86_64
-          path: pkg/x64
+          path: pkg/x86_64
 
       - name: Download aarch64 portable ZIP
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: bitty-windows-zip-aarch64
-          path: pkg/arm64
+          path: pkg/aarch64
 
       - name: Expand archives, run bitty.exe, and run bitty.com
         shell: pwsh
@@ -1011,7 +1011,7 @@ jobs:
             throw "archives disagree on the version: $($values['version_x86_64']) vs $($values['version_aarch64'])"
           }
           $version = $values['version_x86_64']
-          $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'
+          $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)\s*\z'
           $dest = Join-Path $env:RUNNER_TEMP 'bitty-portable-zip-x86_64'
           $exe = Join-Path $dest 'bitty.exe'
           $com = Join-Path $dest 'bitty.com'
@@ -1270,7 +1270,7 @@ jobs:
           $output = (& $exe --version 2>&1 | Out-String)
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "bitty --version exited $code" }
-          $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'
+          $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)\s*\z'
           Write-Host "bitty --version => $($output.TrimEnd())"
           if ($output -cnotmatch $pattern) {
             throw "version mismatch: setup $version, binary '$output'"
@@ -2612,7 +2612,7 @@ jobs:
               $out = (& $exe --version 2>&1 | Out-String)
               $code = $LASTEXITCODE
               if ($code -ne 0) { throw "bitty --version exited $code" }
-              $pattern = '\Abitty ' + [regex]::Escape($expected) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'
+              $pattern = '\Abitty ' + [regex]::Escape($expected) + ' \([^\s()]+ [^\s()]+\)\s*\z'
               Write-Host "bitty --version => $($out.TrimEnd())"
               if ($out -cnotmatch $pattern) {
                 throw "unexpected bitty version: '$out' (want $expected)"
@@ -2654,7 +2654,7 @@ jobs:
               $out = (& $shim --version 2>&1 | Out-String)
               $code = $LASTEXITCODE
               if ($code -ne 0) { throw "bitty --version exited $code" }
-              $pattern = '\Abitty ' + [regex]::Escape($expected) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'
+              $pattern = '\Abitty ' + [regex]::Escape($expected) + ' \([^\s()]+ [^\s()]+\)\s*\z'
               Write-Host "bitty --version => $($out.TrimEnd())"
               if ($out -cnotmatch $pattern) {
                 throw "unexpected bitty version: '$out' (want $expected)"

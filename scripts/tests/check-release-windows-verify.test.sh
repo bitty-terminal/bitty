@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # check-release-windows-verify.test.sh — CTX-1916 enumerated fixture suite for
 # the Windows verification gate; CTX-1918 (bitty#3281) extended it to the
-# preview workflow, so the fixtures now cover both workflow files.
+# preview workflow, so the fixtures now cover both workflow files, and
+# CTX-1917 (bitty#3279) added the scoop-shim rule-3 case.
 #
 # The suite never hand-picks its cases: it enumerates EVERY directory under
 # scripts/tests/fixtures/release-windows-verify/ in sorted order and exercises
@@ -38,6 +39,7 @@
 #   preview-newline                -> rule-2: the pre-#3278 newline-anchored preview pattern
 #   preview-pattern-variable-name  -> rule-2: the regression is bound to `$pat`, not `$pattern`
 #   preview-undefined-operand       -> rule-2: the comparison operand no assignment defines
+#   scoop-shim                     -> rule-3: the pre-fix leg omits '.com' and the companion binding
 #   stale-comment                  -> rule-1: a stale comment cites the pre-rename root
 #   zip-path                       -> rule-1: download path differs from the loop root
 #
@@ -66,7 +68,7 @@ SEEN=""
 
 # --- Registry: every fixture must be declared in exactly one list ------------
 FIXTURES_MUST_PASS="clean correct-with-comment preview-clean"
-FIXTURES_MUST_REJECT="comment-after-suffix:rule-2 lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 pattern-variable-name:rule-2 preview-derived-pattern:rule-2 preview-here-string:rule-2 preview-newline:rule-2 preview-pattern-variable-name:rule-2 preview-undefined-operand:rule-2 stale-comment:rule-1 zip-path:rule-1"
+FIXTURES_MUST_REJECT="comment-after-suffix:rule-2 lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 pattern-variable-name:rule-2 preview-derived-pattern:rule-2 preview-here-string:rule-2 preview-newline:rule-2 preview-pattern-variable-name:rule-2 preview-undefined-operand:rule-2 scoop-shim:rule-3 stale-comment:rule-1 zip-path:rule-1"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -199,6 +201,24 @@ done
 for name in $REJECT_NAMES; do
   list_contains "$SEEN" "$name" || fail "FIXTURES_MUST_REJECT entry '$name' has no directory under '$FIXTURES'"
 done
+
+# --- scoop-shim specifics ----------------------------------------------------
+# The registry pins the verdict (rejected, rule-3 reported); these pins carry
+# the #3280 case's sharper expectations: the rejection must name the omitted
+# '.com' extension, and the Scoop defect must be the fixture's only defect —
+# a rule-1 or rule-2 failure on it would mean the fixture overstates the
+# regression it pins.
+scoop_status=0
+scoop_out="$("$GATE" --root "$FIXTURES/scoop-shim" 2>&1)" || scoop_status=$?
+if ((scoop_status == 0)); then
+  fail "must-reject fixture 'scoop-shim' was accepted by the gate; the enumeration above should have caught this"
+else
+  grep -q "'\.com'" <<<"$scoop_out" ||
+    fail "scoop-shim rejection did not name the missing '.com' extension: $scoop_out"
+  if grep -q 'rule-1\|rule-2' <<<"$scoop_out"; then
+    fail "scoop-shim fixture also broke an unrelated rule: $scoop_out"
+  fi
+fi
 
 if ((FAIL != 0)); then
   echo "check-release-windows-verify.test.sh: FAILED" >&2

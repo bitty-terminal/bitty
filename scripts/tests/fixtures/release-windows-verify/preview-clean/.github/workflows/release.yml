@@ -28,3 +28,56 @@ jobs:
             if (-not $zip) { throw "portable ZIP artifact not found for $arch" }
           }
           $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)\s*\z'
+
+  post-release-smoke:
+    name: Post-release E2E (${{ matrix.channel }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - channel: "Windows Scoop (R2)"
+            os: windows-latest
+            run: |
+              $expected = $env:RELEASE_VERSION
+              scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
+              scoop install bitty
+              # bitty#3224: the manifest installs the portable ZIP and shims its
+              # `bitty.com` member, so the console companion must be extracted.
+              $appDir = (scoop prefix bitty | Select-Object -First 1)
+              $appCom = Join-Path $appDir.Trim() 'bitty.com'
+              if (-not (Test-Path -LiteralPath $appCom -PathType Leaf)) {
+                throw "scoop install did not extract bitty.com: $appCom"
+              }
+              $shim = (scoop which bitty | Select-Object -First 1)
+              $shim = $shim.Trim()
+              if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
+                throw "scoop which bitty did not resolve to an existing file: $shim"
+              }
+              # bitty#3224: the manifest deliberately shims bitty.com, so '.com' is
+              # an intended shim.
+              if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')) {
+                throw "scoop which bitty did not resolve to an executable shim: $shim"
+              }
+              # bitty#3224: the '.com' allowlist admits any console companion, so
+              # also require the resolved shim to be the manifest-declared
+              # `bitty.com` member of the installed app (under `current`). Resolve
+              # through the provider: `scoop which` prints a `~\`-relative path,
+              # which [IO.Path] cannot expand.
+              $shimFull = (Get-Item -LiteralPath $shim).FullName
+              $appComFull = (Get-Item -LiteralPath $appCom).FullName
+              if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "scoop which bitty resolved to '$shimFull', not the manifest shim '$appComFull'"
+              }
+              $out = (& $shim --version 2>&1 | Out-String)
+              $code = $LASTEXITCODE
+              if ($code -ne 0) { throw "bitty --version exited $code" }
+              $pattern = '\Abitty ' + [regex]::Escape($expected) + ' \([^\s()]+ [^\s()]+\)\s*\z'
+              Write-Host "bitty --version => $($out.TrimEnd())"
+              if ($out -cnotmatch $pattern) {
+                throw "unexpected bitty version: '$out' (want $expected)"
+              }
+    steps:
+      - name: Test installation from CDN (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ${{ matrix.run }}

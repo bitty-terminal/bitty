@@ -278,24 +278,30 @@ fn decorated_hit_testing_uses_frame_for_hit_and_content_for_cells() {
     let mut rt = runtime_with(Decoration::default());
     single_leaf(&mut rt);
     let pad = rt.window_padding_physical() as f64;
-    // Content starts at gaps_out 6 + border 1 + content_inset 6 = 13px.
-    // A position inside the content maps to the content-local cell.
+    // bitty#3284: the painted grid is centred inside the content box.
+    // The frame is the container minus the 6 px outer gap (708 x 444),
+    // the content box starts at gaps_out 6 + border 1 + content_inset 6
+    // = 13 px and spans 694 x 430 px: 77 cols of 9 (1 px leftover, split
+    // 0/1) and 22 rows of 19 (12 px leftover, split 6/6), so the painted
+    // grid origin is (13, 19). A position inside a painted cell maps to
+    // that cell.
     let inside = CursorPosition {
         x: pad + 13.0 + 9.0 * 2.0 + 1.0,
-        y: pad + 13.0 + 19.0 * 4.0 + 1.0,
+        y: pad + 19.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(inside),
         Some((ViewId::new(1), CellPos::new(4, 2)))
     );
-    // The global mapping subtracts the outer gap plus border plus inset.
+    // The global mapping subtracts the outer gap plus border plus inset
+    // plus the same sub-cell split, so it names the same painted cell.
     assert_eq!(rt.cursor_to_cell(inside), CellPos::new(4, 2));
     // A position over the 1px border ring still hits the frame and clamps
     // to the first content cell (spec rule 4: radius never widens hit
     // testing beyond the frame).
     let on_border = CursorPosition {
         x: pad + 6.5,
-        y: pad + 13.0 + 19.0 * 4.0 + 1.0,
+        y: pad + 19.0 + 19.0 * 4.0 + 1.0,
     };
     assert_eq!(
         rt.cursor_to_present_cell(on_border),

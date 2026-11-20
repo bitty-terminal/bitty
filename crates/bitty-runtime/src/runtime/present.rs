@@ -1815,7 +1815,12 @@ impl Runtime {
         {
             return None;
         }
-        if retained.origin != (frame.content.x, frame.content.y) {
+        // bitty#3284: the retained list was translated against the centred
+        // grid origin, so the region-copy shortcut demands the same origin.
+        if retained.origin != {
+            let live = self.live_cell_metrics();
+            frame.grid_origin(live.width, live.height)
+        } {
             return None;
         }
         if retained.scroll_offset != view_scroll_offset || retained.fade_factor != fade {
@@ -4396,11 +4401,15 @@ impl Runtime {
     /// The leaf must be a panel with an attached `Scene` in the installed
     /// [`PanelRuntime`](crate::registry::PanelRuntime); everything else keeps
     /// the grid path. The scene paint list is clipped to the compositor-owned
-    /// leaf content rect (`origin` + `frame.content`) and composed after that
-    /// leaf's grid primitives: cell fills, overlay-seam glyphs, and image
-    /// placement references. A refused paint keeps the retained primitives for
-    /// an unchanged surface, clip, fade, occluder set, and atlas epoch, and
-    /// advances the attributed refusal counters.
+    /// leaf painted grid rect (bitty#3284: `origin` is the window-space grid
+    /// origin, and the extent is the whole-cell grid clamped to the content
+    /// box) and composed after that leaf's grid primitives: cell fills,
+    /// overlay-seam glyphs, and image placement references. The panel
+    /// therefore shares the one centred origin the grid paints at, and the
+    /// sub-cell remainder stripes stay background on every side. A refused
+    /// paint keeps the retained primitives for an unchanged surface, clip,
+    /// fade, occluder set, and atlas epoch, and advances the attributed
+    /// refusal counters.
     ///
     /// Returns `true` when a scene glyph placement reset the atlas epoch after
     /// the leaf pass settled, so the caller must rebuild the attempt.
@@ -4417,14 +4426,11 @@ impl Runtime {
         float_layer: Option<&mut bitty_render::grid::FloatDrawLayer>,
         built: &mut CombinedLeaves,
     ) -> bool {
+        let live = self.live_cell_metrics();
+        let grid = frame.grid_rect(live.width, live.height);
         let surface = bitty_render::scene::SceneSurface::new(
-            bitty_render::geometry::RectPx::new(
-                origin.0,
-                origin.1,
-                frame.content.width,
-                frame.content.height,
-            ),
-            self.live_cell_metrics(),
+            bitty_render::geometry::RectPx::new(origin.0, origin.1, grid.width, grid.height),
+            live,
         );
         let refusals = self.scene_paint_refusals;
         let a11y_refusals = self.scene_a11y_refusals;
@@ -4561,8 +4567,6 @@ impl Runtime {
                     .animation_progress(AnimationKind::Open, Some(view_id), now)
                     .map(|p| p.clamp(0.0, 1.0))
                     .unwrap_or(1.0);
-                let origin_px_x = px_add(pad_px, frame.content.x);
-                let origin_px_y = px_add(pad_px, frame.content.y);
                 // The ring arm uses the strict focus match; the cursor arm
                 // keeps the `unwrap_or(true)` default for a layout with no
                 // resolvable focus. Both preserve their pre-CTX-0386 shape.
@@ -4577,7 +4581,16 @@ impl Runtime {
                 // slot below. `false` on every leaf without a layer, so the
                 // grid path stays byte-identical.
                 let content_hidden = self.content_layer_presented(view_id);
-
+                // bitty#3284: every leaf primitive — fills, glyphs, cursor,
+                // scene surface, retained reuse — translates from the
+                // centred grid origin, the same point the pointer path maps
+                // through, so paint and hit stay one mapping.
+                let (grid_x, grid_y) = {
+                    let live = self.live_cell_metrics();
+                    frame.grid_origin(live.width, live.height)
+                };
+                let origin_px_x = px_add(pad_px, grid_x);
+                let origin_px_y = px_add(pad_px, grid_y);
                 // Each origin's damage comes from its own ring (CTX-0386).
                 // `last_presented_generation` is consumed per present: the
                 // session field for panes, the runtime scalar for the primary
@@ -4649,8 +4662,12 @@ impl Runtime {
                         {
                             return None;
                         }
-                        let dx = frame.content.x.saturating_sub(leaf.origin.0);
-                        let dy = frame.content.y.saturating_sub(leaf.origin.1);
+                        // bitty#3284: the retained list carries the centred
+                        // grid origin; a pure translation (drag ghost,
+                        // sub-cell move) shifts by the grid-origin delta, so
+                        // the reuse stays bit-identical to a fresh pass.
+                        let dx = grid_x.saturating_sub(leaf.origin.0);
+                        let dy = grid_y.saturating_sub(leaf.origin.1);
                         Some((dx, dy))
                     })
                 };
@@ -4741,9 +4758,14 @@ impl Runtime {
                     if let Some(path) = resolved.image.as_deref() {
                         if let Some(key) = self.background_keys.get(path).cloned() {
                             if let Some(image) = self.backgrounds.get(&key) {
+                                // bitty#3284: the per-View image is the pane's
+                                // *background*, so it keeps covering exactly
+                                // the content rect — the centred grid paints
+                                // over it and the sub-cell stripes stay
+                                // covered, never window background.
                                 let dest = bitty_rich::RectPx::new(
-                                    origin_px_x,
-                                    origin_px_y,
+                                    px_add(pad_px, frame.content.x),
+                                    px_add(pad_px, frame.content.y),
                                     frame.content.width,
                                     frame.content.height,
                                 );
@@ -5366,7 +5388,9 @@ impl Runtime {
                     self.presented_leaf_frames.insert(
                         view_id,
                         PresentedLeaf {
-                            origin: (frame.content.x, frame.content.y),
+                            // bitty#3284: the painted origin the list was
+                            // translated against — the centred grid origin.
+                            origin: (grid_x, grid_y),
                             content_size: (frame.content.width, frame.content.height),
                             scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
                             fade_factor: fade,
@@ -5678,10 +5702,14 @@ impl Runtime {
         // open.
         if flash_active && frame.cols > 0 && frame.content.width > 0 {
             let width = px_span(frame.cols, live.width);
+            // bitty#3284: the strip is one painted cell row — the top row —
+            // so it sits on the centred grid origin like every other
+            // cell-anchored primitive.
+            let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(
-                    px_add(pad_px, frame.content.x),
-                    px_add(pad_px, frame.content.y),
+                    px_add(pad_px, grid_x),
+                    px_add(pad_px, grid_y),
                     width,
                     live.height,
                 ),
@@ -5928,8 +5956,11 @@ impl Runtime {
         if rects.is_empty() {
             return;
         }
-        let origin_px_x = px_add(pad_px, frame.content.x);
-        let origin_px_y = px_add(pad_px, frame.content.y);
+        // bitty#3284: selection fills are cell-anchored — translate from the
+        // centred grid origin the press path mapped the pointer through.
+        let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
+        let origin_px_x = px_add(pad_px, grid_x);
+        let origin_px_y = px_add(pad_px, grid_y);
         for mut fill in rects {
             fill.rect.x = px_add(fill.rect.x, origin_px_x);
             fill.rect.y = px_add(fill.rect.y, origin_px_y);
@@ -5985,8 +6016,11 @@ impl Runtime {
             return;
         }
         let thickness = (live.height / 8).clamp(1, 2);
-        let origin_x = px_add(pad_px, frame.content.x);
-        let origin_y = px_add(pad_px, frame.content.y);
+        // bitty#3284: the underline sits under its painted cell row, so it
+        // starts from the centred grid origin.
+        let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
+        let origin_x = px_add(pad_px, grid_x);
+        let origin_y = px_add(pad_px, grid_y);
         let row_y = px_add(origin_y, px_side(px_span_usize(local_row, live.height)));
         let y = px_add(
             row_y,
@@ -6155,12 +6189,16 @@ impl Runtime {
         // metrics cannot wrap the products or the sums.
         let pill_w = px_span_usize(text_cells, live.width);
         let full_w = px_span(frame.cols, live.width);
+        // bitty#3284: the banner pill is one painted cell row (the last one),
+        // right-aligned inside the grid, so both axes read the centred grid
+        // origin.
+        let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
         let origin_px_x = px_add(
-            px_add(pad_px, frame.content.x),
+            px_add(pad_px, grid_x),
             px_side(full_w.saturating_sub(pill_w)),
         );
         let banner_y = px_add(
-            px_offset_cells(frame.content.y, frame.rows.saturating_sub(1), live.height),
+            px_offset_cells(grid_y, frame.rows.saturating_sub(1), live.height),
             pad_px,
         );
         layers.combined_overlay.push(bitty_render::grid::FillRect {
@@ -6262,8 +6300,11 @@ impl Runtime {
             return;
         }
         let thickness = bitty_rich::hyperlink::underline_thickness(live.height);
-        let origin_x = px_add(pad_px, frame.content.x);
-        let origin_y = px_add(pad_px, frame.content.y);
+        // bitty#3284: the underline sits under its painted cell row, so it
+        // starts from the centred grid origin.
+        let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
+        let origin_x = px_add(pad_px, grid_x);
+        let origin_y = px_add(pad_px, grid_y);
         let row_y = px_add(origin_y, px_side(px_span_usize(local_row, live.height)));
         let y = px_add(
             row_y,
@@ -6372,12 +6413,15 @@ impl Runtime {
             {
                 continue;
             }
+            // bitty#3284: hint pills badge their target cell, so they read
+            // the centred grid origin like every cell-anchored overlay.
+            let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
             let origin_x = px_add(
-                px_add(pad_px, frame.content.x),
+                px_add(pad_px, grid_x),
                 px_offset_cells(0, cell.col, live.width),
             );
             let origin_y = px_add(
-                px_add(pad_px, frame.content.y),
+                px_add(pad_px, grid_y),
                 px_offset_cells(0, cell.row, live.height),
             );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
@@ -7178,6 +7222,9 @@ impl Runtime {
         let live = self.live_cell_metrics();
         let cell_w = live.width;
         let cell_h = live.height;
+        // bitty#3284: the unanchored arm below composes over painted cell
+        // rows; the anchored arm follows band edges and stays unchanged.
+        let (grid_x, grid_y) = frame.grid_origin(cell_w, cell_h);
         let clip_cols = anchored.map_or(frame.cols, |anchor| anchor.cols);
         let (_clipped, text_cells) = clip_to_width_cells(&overlay_row.text, clip_cols);
         let pill_w = px_span_usize(text_cells.max(1), cell_w);
@@ -7196,11 +7243,13 @@ impl Runtime {
                 ),
             ),
             None => (
+                // bitty#3284: an unanchored pill composes over the pane's
+                // painted cell rows, so it centres on the grid origin.
                 px_add(
-                    px_add(pad_px, frame.content.x),
+                    px_add(pad_px, grid_x),
                     px_side(full_w.saturating_sub(pill_w)) / 2,
                 ),
-                px_add(pad_px, px_offset_cells(frame.content.y, row, cell_h)),
+                px_add(pad_px, px_offset_cells(grid_y, row, cell_h)),
             ),
         };
         Some(OverlayPill {
@@ -7864,12 +7913,14 @@ impl Runtime {
                     let _ = self.kitty_raster_cache.insert(cache_key, fresh.clone());
                     fresh
                 };
-                // Leaf fills/glyphs translate by the pane content origin
-                // (window padding already added); image blits use the same
-                // window space so they land exactly over their cells.
+                // Leaf fills/glyphs translate by the pane's painted grid
+                // origin (window padding already added; bitty#3284); image
+                // blits use the same window space so they land exactly over
+                // their cells.
+                let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
                 let dest = bitty_render::geometry::RectPx::new(
-                    px_add(px_add(basis.pad_px, frame.content.x), rect_px.x),
-                    px_add(px_add(basis.pad_px, frame.content.y), rect_px.y),
+                    px_add(px_add(basis.pad_px, grid_x), rect_px.x),
+                    px_add(px_add(basis.pad_px, grid_y), rect_px.y),
                     rect_px.width,
                     rect_px.height,
                 );
@@ -8140,9 +8191,13 @@ impl Runtime {
                 mask_uncovered_unicode_pixels(&mut fresh, union, &group.rects);
                 fresh
             };
+            // bitty#3284: unicode image anchors are cell-rects over the
+            // pane's painted grid, so the blit dest translates from the
+            // centred grid origin, exactly like the glyphs beside them.
+            let (grid_x, grid_y) = frame.grid_origin(metrics.width, metrics.height);
             let dest = bitty_render::geometry::RectPx::new(
-                px_add(px_add(pad_px, frame.content.x), union.x),
-                px_add(px_add(pad_px, frame.content.y), union.y),
+                px_add(px_add(pad_px, grid_x), union.x),
+                px_add(px_add(pad_px, grid_y), union.y),
                 union.width,
                 union.height,
             );
@@ -11019,12 +11074,18 @@ mod plugin_overlay_paint_tests {
         assert!(!layers.combined_glyphs.is_empty(), "text paints glyphs");
         assert!(layers.any_needs_draw);
         let (cell_w, _) = rt.live_cell_size();
+        // bitty#3284: the row centres inside the focused frame's painted
+        // grid. The grid origin is the content top-left plus the sub-cell
+        // split (704 - 60 cells of 9 px = 164 px, split 82/82), then the
+        // five-cell row centres inside the grid.
         let expected = 8
-            + 100
+            + frame.content.x
+            + i32::try_from((frame.content.width - u32::from(frame.cols) * cell_w) / 2)
+                .expect("sub-cell split fits i32")
             + i32::try_from((u32::from(frame.cols) - 5) * cell_w / 2).expect("center offset fits");
         assert_eq!(
             layers.combined_overlay_content[0].rect.x, expected,
-            "the five-cell row centers in the focused frame"
+            "the five-cell row centers in the focused frame's painted grid"
         );
     }
 
@@ -11651,7 +11712,13 @@ mod plugin_overlay_paint_tests {
             "only fitting rows paint"
         );
         let (cell_w, _) = rt.live_cell_size();
-        let frame_left = 8 + 100;
+        // bitty#3284: rows sit inside the focused frame's painted grid; the
+        // left edge is the content top-left plus the sub-cell split
+        // (704 - 12 cells of 9 px = 596 px, split 298/298).
+        let frame_left = 8
+            + frame.content.x
+            + i32::try_from((frame.content.width - u32::from(frame.cols) * cell_w) / 2)
+                .expect("sub-cell split fits i32");
         let frame_width = u32::from(frame.cols) * cell_w;
         let first = &layers.combined_overlay_content[0];
         assert_eq!(

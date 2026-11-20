@@ -87,25 +87,36 @@ fn frame_of(rt: &Runtime, view: ViewId) -> PresentFrame {
         .unwrap_or_else(|| panic!("{view:?} must be presented"))
 }
 
-/// Centre of frame-local cell `(row, col)` of `view`'s content frame.
+/// Centre of frame-local cell `(row, col)` of `view`'s painted grid.
+///
+/// bitty#3284: the grid is centred inside the content box, so the probe
+/// reads [`PresentFrame::grid_origin`] — the same origin paint and
+/// hit-testing translate by.
 fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition {
     let frame = frame_of(rt, view);
     let (cw, ch) = rt.live_cell_size();
+    let (grid_x, grid_y) = frame.grid_origin(cw, ch);
     let pad = f64::from(rt.window_padding_physical());
     CursorPosition {
-        x: pad + f64::from(frame.content.x) + (f64::from(col) + 0.5) * f64::from(cw),
-        y: pad + f64::from(frame.content.y) + (f64::from(row) + 0.5) * f64::from(ch),
+        x: pad + f64::from(grid_x) + (f64::from(col) + 0.5) * f64::from(cw),
+        y: pad + f64::from(grid_y) + (f64::from(row) + 0.5) * f64::from(ch),
     }
 }
 
 /// Physical position of a headless primary cell (default 9x19 metrics,
 /// 8px padding + 14px decoration inset).
+///
+/// bitty#3284: the painted primary grid is centred inside the 694x430
+/// content box (12 px row leftover, split 6/6; 1 px column leftover, split
+/// 0/1), so the probe adds the 6 px row split to stay inside the painted
+/// cell it names.
 fn primary_cell(col: u16, row: u16) -> CursorPosition {
     const PAD: f64 = 8.0;
     const DECORATION: f64 = 14.0;
+    const ROW_SPLIT: f64 = 6.0;
     CursorPosition {
         x: PAD + DECORATION + f64::from(col) * 9.0,
-        y: PAD + DECORATION + f64::from(row) * 19.0,
+        y: PAD + DECORATION + ROW_SPLIT + f64::from(row) * 19.0,
     }
 }
 

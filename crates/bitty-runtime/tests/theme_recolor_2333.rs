@@ -179,16 +179,22 @@ impl Probe {
         assert!(frame.cols > 0 && frame.rows > 0, "non-empty content frame");
         // `present_frames` is window-container relative; the present path
         // translates it by the window padding inset (`pad_px`).
+        //
+        // bitty#3284: the painted grid is centred inside the content box,
+        // so every probe reads the grid origin, the one origin paint,
+        // hit-testing and the banner pill translate by.
         let pad = rt.config().window_padding as i32;
+        let (live_w, live_h) = rt.live_cell_size();
+        let (grid_x, grid_y) = frame.grid_origin(live_w, live_h);
         Self {
             width: extent.width() as usize,
             height: extent.height() as usize,
             rows: frame.rows,
             cols: frame.cols,
-            content_x: frame.content.x + pad,
-            content_y: frame.content.y + pad,
-            cell_w: frame.content.width as usize / usize::from(frame.cols),
-            cell_h: frame.content.height as usize / usize::from(frame.rows),
+            content_x: grid_x + pad,
+            content_y: grid_y + pad,
+            cell_w: live_w as usize,
+            cell_h: live_h as usize,
         }
     }
 

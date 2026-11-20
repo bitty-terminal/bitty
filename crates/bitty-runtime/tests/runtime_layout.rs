@@ -156,19 +156,26 @@ fn cursor_to_cell_subtracts_outer_gap_and_decoration() {
     // the grid origin shifts by (18px, 38px); the mapping must subtract
     // it (0157 math) instead of drifting by the gap. CTX-0223 adds the
     // default 8px window padding first; CTX-0294/CTX-0333 adds the default
-    // decoration outer gap + border + content inset (6 + 2 + 6 = 14px at
-    // scale 1.0), so the probe moves to pad + gap + decoration + 2 cells =
-    // (58, 98).
+    // decoration outer gap + border + content inset (6 + 1 + 6 = 13px at
+    // scale 1.0).
+    //
+    // bitty#3284: the painted grid is centred inside the content box, and
+    // the mapping subtracts the same split. The 80x24 container gives a
+    // 694 x 430 px content box: 77 cols of 9 (1 px leftover, split 0/1)
+    // and 22 rows of 19 (12 px leftover, split 6/6), so the probe moves
+    // down by the 6 px row split to stay inside painted row 2.
     let rt = make_gapped_runtime(0, 2);
-    // col = (58 - 8 - 18 - 14) / 9 = 2, row = (98 - 8 - 38 - 14) / 19 = 2.
-    let pos = CursorPosition { x: 58.0, y: 98.0 };
+    // col = (58 - 8 - 18 - 13 - 0) / 9 = 2, row = (104 - 8 - 38 - 13 - 6) / 19 = 2.
+    let pos = CursorPosition { x: 58.0, y: 104.0 };
     assert_eq!(rt.cursor_to_cell(pos), CellPos::new(2, 2));
     // A click inside the outer gap clamps to the first cell (never
     // negative, never panics).
     let in_gap = CursorPosition { x: 9.0, y: 19.0 };
     assert_eq!(rt.cursor_to_cell(in_gap), CellPos::new(0, 0));
     // Zero-gap, zero-padding, undecorated runtime keeps the legacy
-    // mapping bit-identical (CTX-0177 cell algebra with no px decoration).
+    // mapping bit-identical (CTX-0177 cell algebra with no px decoration;
+    // bitty#3284: the 720 x 456 content box is an exact 80x24 multiple,
+    // so the centring split is zero and nothing moves).
     let plain = Runtime::new(RuntimeConfig {
         window_padding: 0,
         decoration: bitty_runtime::Decoration::ZERO,

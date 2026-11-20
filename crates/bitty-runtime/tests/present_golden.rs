@@ -65,6 +65,18 @@
 //! a regional-indicator flag, and a selector-16 heart each occupy two columns
 //! instead of six, two, and one. This is an explicit Terminal Truth behavior
 //! change, not golden drift.
+//!
+//! Every digest in this matrix was re-recorded under bitty#3284 (CTX-1920):
+//! the floored pane grid is now centred inside its content rect instead of
+//! pooling the whole sub-cell remainder below the last row. At the shipped
+//! defaults (736x472 window, 8px padding, 694x430 content box, 9x19 cells)
+//! every frame in this matrix is a non-multiple, so every digest moved: the
+//! grid origin shifts down by the 6px row split, paints, cursor, selection,
+//! banners and the paste pill all translate with it, and the horizontal 1px
+//! leftover floors to a 0px split (placement unchanged on that axis). An
+//! exact-multiple content box keeps a 0px split and stays byte-identical
+//! (pinned by the pane-centre regression suite, `pane_grid_centre.rs`).
+//! This is an explicit behavior change, not golden drift.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -146,7 +158,7 @@ fn assert_digest(name: &str, rt: &Runtime, stats: &PresentStats, golden: u64) {
 fn golden_first_frame_then_idle() {
     let mut rt = make_runtime();
     let first = rt.tick().expect("first tick presents");
-    assert_digest("first_frame", &rt, &first, 0xf194_7117_d9e4_06d1);
+    assert_digest("first_frame", &rt, &first, 0x0189_81e3_bd95_3e51);
     assert!(rt.tick().is_none(), "no damage -> idle");
 }
 
@@ -154,13 +166,13 @@ fn golden_first_frame_then_idle() {
 fn golden_pty_bytes_incremental() {
     let mut rt = make_runtime();
     let first = rt.tick().expect("first tick presents");
-    assert_digest("pty_first", &rt, &first, 0xf194_7117_d9e4_06d1);
+    assert_digest("pty_first", &rt, &first, 0x0189_81e3_bd95_3e51);
     rt.handle_pty_bytes(b"hello ");
     let a = rt.tick().expect("first bytes present");
-    assert_digest("pty_a", &rt, &a, 0x0f2b_d55f_c555_fdef);
+    assert_digest("pty_a", &rt, &a, 0x4bcf_55a4_8b9c_0aaf);
     rt.handle_pty_bytes(b"world");
     let b = rt.tick().expect("second bytes present");
-    assert_digest("pty_b", &rt, &b, 0xdb0d_8943_cffc_5944);
+    assert_digest("pty_b", &rt, &b, 0x2e3b_830d_5c9d_14a4);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -170,13 +182,13 @@ fn golden_alt_screen_enter_and_leave() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes(b"\x1b[?1049h");
     let enter = rt.tick().expect("alt entry presents");
-    assert_digest("alt_enter", &rt, &enter, 0x70df_d3be_01c5_b977);
+    assert_digest("alt_enter", &rt, &enter, 0xe862_1b96_2ab0_f637);
     rt.handle_pty_bytes(b"vim");
     let paint = rt.tick().expect("alt content presents");
-    assert_digest("alt_paint", &rt, &paint, 0x0703_34c4_bbd8_8438);
+    assert_digest("alt_paint", &rt, &paint, 0x4282_d32a_b3b2_79f8);
     rt.handle_pty_bytes(b"\x1b[?1049l");
     let leave = rt.tick().expect("alt exit presents");
-    assert_digest("alt_leave", &rt, &leave, 0x1630_ba5b_a706_a42d);
+    assert_digest("alt_leave", &rt, &leave, 0xba47_256d_12b3_1f2d);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -199,7 +211,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(false),
         "banner must still be in the full phase"
     );
-    assert_digest("paste_full", &rt, &full, 0xcfab_5f21_5a14_c6c3);
+    assert_digest("paste_full", &rt, &full, 0x3c59_76f6_95e1_2953);
     // Issue #1438 (CTX-0843): the paste-confirm timeout (default 30s) is
     // shorter than PASTE_BANNER_FULL_DURATION + 30s, so the timer cancels
     // the pending paste first. Test the collapse at full-duration + 1s
@@ -211,7 +223,7 @@ fn golden_paste_banner_full_then_flash_then_idle() {
         Some(true),
         "banner must have collapsed to the flash"
     );
-    assert_digest("paste_flash", &rt, &flash, 0x7ad9_7eb9_743b_b536);
+    assert_digest("paste_flash", &rt, &flash, 0x24ce_b367_7fb3_0986);
     assert!(
         rt.tick_at(flash_at + Duration::from_millis(200)).is_none(),
         "banner phase is steady -> idle"
@@ -238,7 +250,7 @@ fn golden_selection_overlay() {
     // The delta is exactly one 9x19 cell (171 px) at the cursor rect: cursor
     // hue 0xA0-alpha replaces selection hue there; stats (fills=45,
     // images=0) and the IME caret are unchanged.
-    assert_digest("selection", &rt, &selected, 0x5c80_fabc_d84e_7799);
+    assert_digest("selection", &rt, &selected, 0x33c4_45c0_b067_f6b9);
 }
 
 #[test]
@@ -253,10 +265,10 @@ fn golden_ime_preedit_overlay() {
     // caret fills), so the same-cell cursor rect carries the cursor hue.
     // Delta is exactly one 9x19 cell (171 px) at the IME caret rect;
     // stats (fills=26, images=0) and the caret (21,21,9,19) are unchanged.
-    assert_digest("preedit_shown", &rt, &shown, 0x7af5_3b82_302c_66f3);
+    assert_digest("preedit_shown", &rt, &shown, 0xdccb_d3f7_846d_fc73);
     rt.handle_ime_preedit(None, None);
     let cleared = rt.tick().expect("preedit clear present");
-    assert_digest("preedit_cleared", &rt, &cleared, 0xa769_7a2c_a636_3963);
+    assert_digest("preedit_cleared", &rt, &cleared, 0x8af2_97c0_325c_0f63);
 }
 
 #[test]
@@ -271,7 +283,7 @@ fn golden_split_leaves() {
     ));
     rt.handle_pty_bytes(b"split");
     let split = rt.tick().expect("split present");
-    assert_digest("split", &rt, &split, 0x39c2_b771_e396_d134);
+    assert_digest("split", &rt, &split, 0x2bda_b813_0852_8dd4);
     assert!(rt.tick().is_none(), "back to idle");
 }
 
@@ -286,7 +298,7 @@ fn golden_scrollback_viewport() {
     // Page scroll defaults to 75% of the viewport (issue #2475), so this
     // digest is the 18-of-24-row default, not a full page.
     let scrolled = rt.tick().expect("scrolled present");
-    assert_digest("scrollback", &rt, &scrolled, 0x4dfd_9752_ab9b_c0ee);
+    assert_digest("scrollback", &rt, &scrolled, 0xdeec_00f1_f558_0bee);
 }
 
 #[test]
@@ -295,7 +307,7 @@ fn golden_wide_and_combining_glyphs() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("A\u{4e2d}\u{1f389}e\u{0301}".as_bytes());
     let mixed = rt.tick().expect("mixed-width present");
-    assert_digest("wide_combining", &rt, &mixed, 0xe9ea_3dd7_45ca_5be5);
+    assert_digest("wide_combining", &rt, &mixed, 0x1746_1ff1_288d_8a05);
 }
 
 #[test]
@@ -307,7 +319,7 @@ fn golden_grapheme_zwj_family() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".as_bytes());
     let frame = rt.tick().expect("ZWJ family presents");
-    assert_digest("zwj_family", &rt, &frame, 0xa8e6_4ae0_5cc4_be97);
+    assert_digest("zwj_family", &rt, &frame, 0xd2d8_e307_3422_f1b7);
 }
 
 #[test]
@@ -317,7 +329,7 @@ fn golden_grapheme_regional_indicator_pair() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{1F1EF}\u{1F1F5}".as_bytes());
     let frame = rt.tick().expect("regional indicator pair presents");
-    assert_digest("regional_pair", &rt, &frame, 0x4ad6_df79_54e8_ea76);
+    assert_digest("regional_pair", &rt, &frame, 0xce33_4e38_c974_3ef6);
 }
 
 #[test]
@@ -328,7 +340,7 @@ fn golden_grapheme_variation_selector() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{2764}\u{FE0F}".as_bytes());
     let frame = rt.tick().expect("variation selector presents");
-    assert_digest("variation_selector", &rt, &frame, 0x4ad6_df79_54e8_ea76);
+    assert_digest("variation_selector", &rt, &frame, 0xce33_4e38_c974_3ef6);
 }
 
 #[test]
@@ -342,5 +354,5 @@ fn golden_cjk_wide_and_box_drawing() {
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("A\u{6F22}\u{2502}\u{2500}\u{2588}B".as_bytes());
     let frame = rt.tick().expect("CJK and box drawing presents");
-    assert_digest("cjk_box_drawing", &rt, &frame, 0xd642_d55b_d615_83c0);
+    assert_digest("cjk_box_drawing", &rt, &frame, 0xa87f_a62d_af02_f120);
 }

@@ -80,23 +80,32 @@ fn split_runtime() -> Runtime {
     rt
 }
 
+/// Pane painted-grid origin in window space.
+///
+/// bitty#3284: the grid is centred inside the content box, so image
+/// anchors land at the grid origin; the helper returns the same origin
+/// the present path translates blits by.
 fn pane_frame(rt: &Runtime) -> (u16, u16, i32, i32) {
     let frame = rt
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == PANE)
         .expect("pane presented");
-    (frame.cols, frame.rows, frame.content.x, frame.content.y)
+    let (cw, ch) = rt.live_cell_size();
+    let (grid_x, grid_y) = frame.grid_origin(cw, ch);
+    (frame.cols, frame.rows, grid_x, grid_y)
 }
 
-/// Content origin of the primary leaf in window space.
+/// Painted-grid origin of the primary leaf in window space (bitty#3284:
+/// centred inside the content box, the one origin blits translate by).
 fn primary_origin(rt: &Runtime) -> (i32, i32) {
     let frame = rt
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == PRIMARY)
         .expect("primary presented");
-    (frame.content.x, frame.content.y)
+    let (cw, ch) = rt.live_cell_size();
+    frame.grid_origin(cw, ch)
 }
 
 /// Bounds + count of opaque red pixels in the presented frame.
@@ -160,7 +169,7 @@ fn yazi_shape(id: u32, width: u32, height: u32, at_row: u16, at_col: u16) -> Vec
 #[test]
 fn yazi_placeholder_run_paints_a_real_image() {
     let mut rt = split_runtime();
-    let (_, _, content_x, content_y) = pane_frame(&rt);
+    let (_, _, grid_x, grid_y) = pane_frame(&rt);
     let id = 0x010203u32;
     // 80x76 -> 9 columns x 4 rows at 9x19.
     rt.handle_pane_bytes(PANE, &yazi_shape(id, 80, 76, 5, 0));
@@ -177,10 +186,10 @@ fn yazi_placeholder_run_paints_a_real_image() {
         "the whole span is one image blit, not one per placeholder row"
     );
     let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("placeholder image painted");
-    // Pane content + window padding (8px) is the grid origin; the run
-    // starts at grid row 5.
-    assert_eq!(x0, usize::try_from(content_x).unwrap() + 8);
-    assert_eq!(y0, usize::try_from(content_y).unwrap() + 8 + 5 * 19);
+    // Pane painted-grid origin + window padding (8px); the run starts at
+    // grid row 5 (bitty#3284: the origin is centred in the content box).
+    assert_eq!(x0, usize::try_from(grid_x).unwrap() + 8);
+    assert_eq!(y0, usize::try_from(grid_y).unwrap() + 8 + 5 * 19);
     // The 9-cell span is 81px; preserving the 80x76 aspect fits the
     // image to 80x76 (a 1px band on the span's right edge), exactly like
     // kitty's "fit to the rectangle, aspect preserved" rule.
@@ -192,7 +201,7 @@ fn yazi_placeholder_run_paints_a_real_image() {
 #[test]
 fn direct_png_placement_letterboxes_centered_in_requested_rect() {
     let mut rt = split_runtime();
-    let (_, _, content_x, content_y) = pane_frame(&rt);
+    let (_, _, grid_x, grid_y) = pane_frame(&rt);
     // 8x8 square image into a 10x5 cell rect (90x95 px): kitty preserves
     // the aspect ratio and centers the 90x90 result, leaving a 2px top and
     // 3px bottom letterbox instead of stretching to 95px.
@@ -203,8 +212,8 @@ fn direct_png_placement_letterboxes_centered_in_requested_rect() {
     rt.handle_pane_bytes(PANE, seq.as_bytes());
     assert!(rt.tick().is_some(), "placement presents");
     let (x0, y0, x1, y1, count) = red_bounds(&rt).expect("png painted");
-    assert_eq!(x0, usize::try_from(content_x).unwrap() + 8);
-    assert_eq!(y0, usize::try_from(content_y).unwrap() + 8 + 2);
+    assert_eq!(x0, usize::try_from(grid_x).unwrap() + 8);
+    assert_eq!(y0, usize::try_from(grid_y).unwrap() + 8 + 2);
     assert_eq!(x1 - x0 + 1, 90);
     assert_eq!(y1 - y0 + 1, 90);
     assert_eq!(count, 90 * 90);
@@ -230,10 +239,10 @@ fn layout_resize_repaints_the_image_once_at_its_centered_position() {
         LayoutNode::leaf(View::new(PANE, 80, 24)),
     ));
     rt.tick();
-    let (_, _, content_x, content_y) = pane_frame(&rt);
+    let (_, _, grid_x, grid_y) = pane_frame(&rt);
     let (x0, y0, _, _, after_count) = red_bounds(&rt).expect("repaint");
-    assert_eq!(x0, usize::try_from(content_x).unwrap() + 8);
-    assert_eq!(y0, usize::try_from(content_y).unwrap() + 8 + 2);
+    assert_eq!(x0, usize::try_from(grid_x).unwrap() + 8);
+    assert_eq!(y0, usize::try_from(grid_y).unwrap() + 8 + 2);
     assert_eq!(
         after_count, first_count,
         "exactly one image survives the resize"

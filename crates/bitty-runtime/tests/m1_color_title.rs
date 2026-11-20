@@ -172,13 +172,16 @@ fn osc_title_reaches_state_and_cold_handoff() {
 /// at the presentation boundary. Since #1349 the digest also covers the
 /// in-grid status bar row when it paints; CTX-0838 (#1441) hides the
 /// lone-workspace bar, so the first frame (single workspace) carries no bar.
+/// Re-recorded under bitty#3284 (CTX-1920): the pane grid is centred inside
+/// its content rect, and this default-config frame is a non-multiple, so the
+/// presented pixels moved with the grid origin.
 #[test]
 fn golden_default_theme_first_frame_digest() {
     let mut rt = themed_deterministic();
     let first = rt.tick().expect("first themed frame presents");
     let actual = digest(&rt, &first);
     assert_eq!(
-        actual, 0xf194_7117_d9e4_06d1,
+        actual, 0x0189_81e3_bd95_3e51,
         "default themed frame digest changed (actual 0x{actual:016x})"
     );
     let rgba = rt.headless_rgba().expect("rgba");

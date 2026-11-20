@@ -32,12 +32,17 @@ fn feed_text(rt: &mut Runtime, text: &str) {
 /// Includes the default 8px window padding inset and the default Core-owned
 /// decoration inset (14px at scale 1.0), matching the existing selection
 /// integration tests.
+///
+/// bitty#3284: the painted grid is centred inside the 694x430 content box
+/// (12 px row leftover, split 6/6; 1 px column leftover, split 0/1), so the
+/// probe adds the 6 px row split to stay inside the painted cell it names.
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
     const PAD: f64 = 8.0;
     const DECORATION: f64 = 14.0;
+    const ROW_SPLIT: f64 = 6.0;
     CursorPosition {
         x: PAD + DECORATION + f64::from(col) * 9.0,
-        y: PAD + DECORATION + f64::from(row) * 19.0,
+        y: PAD + DECORATION + ROW_SPLIT + f64::from(row) * 19.0,
     }
 }
 

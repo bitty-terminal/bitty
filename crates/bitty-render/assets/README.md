@@ -62,16 +62,16 @@ regression resolves on a host that ships no CJK face — a CI image without one
 must fail the test when the per-cluster retry regresses, instead of skipping
 the reported bug.
 
-| Property         | Value                                                                 |
-| ---------------- | --------------------------------------------------------------------- |
-| Source           | Noto Sans CJK SC Regular 2.004 (`.ttc` member index 2)                |
-| Tool             | `pyftsubset` (fonttools) plus a fontTools name-table rename           |
-| Family name      | `Bitty Han Test` (OFL 1.1 section 3 rename)                           |
+| Property         | Value                                                                                    |
+| ---------------- | ---------------------------------------------------------------------                    |
+| Source           | Noto Sans CJK SC Regular 2.004 (`.ttc` member index 2)                                   |
+| Tool             | `pyftsubset` (fonttools) plus a fontTools name-table rename                              |
+| Family name      | `Bitty Han Test` (OFL 1.1 section 3 rename)                                              |
 | Codepoints       | `U+0020-U+007E`, `U+4E03 U+4E8C U+4E94 U+533B U+5934 U+7528 U+75DB U+8BF7 U+95EE U+997F` |
-| Glyphs           | 105                                                                   |
-| Size             | 9,092 bytes                                                           |
-| SHA-256          | `938210454facad6522bd287a2622d223723849bad5052a2dfc620d6ed0ed3e55`    |
-| Licence          | SIL OFL 1.1, see `LICENSES/bitty-han-test.txt`                         |
+| Glyphs           | 105                                                                                      |
+| Size             | 9,092 bytes                                                                              |
+| SHA-256          | `938210454facad6522bd287a2622d223723849bad5052a2dfc620d6ed0ed3e55`                       |
+| Licence          | SIL OFL 1.1, see `LICENSES/bitty-han-test.txt`                                           |
 
 Twelve Han scalars are the reported line `> 请问饿七五二二头痛医头用`; the ASCII
 range carries its `>` prompt prefix and digits. Regeneration:

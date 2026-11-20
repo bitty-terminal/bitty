@@ -149,27 +149,27 @@ locally, a per-target upload in CI):
 
 `summary.json` fields that matter to a review:
 
-| Field                                                     | Meaning                                                                                      |
+| Field | Meaning |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `revision`, `revision_dirty`                              | Commit the campaign ran against; a dirty tree is recorded, not hidden                        |
-| `toolchain`, `cargo_fuzz`                                 | `rustc` and `cargo-fuzz` versions actually used                                              |
-| `sanitizer.name`, `.cargo_fuzz_flag`, `.instrumentation`  | The sanitizer build: the forwarded `--sanitizer=<name>`, its `-Zsanitizer=` instrumentation, and the leak-detection runtime it implies |
-| `sanitizer.leak_detection`, `.leak_detection_source`      | The leak-checking runtime the build is *intended* to use (`lsan` for ASan, `none` otherwise) — intent, not proof that a check ran |
+| `revision`, `revision_dirty` | Commit the campaign ran against; a dirty tree is recorded, not hidden |
+| `toolchain`, `cargo_fuzz` | `rustc` and `cargo-fuzz` versions actually used |
+| `sanitizer.name`, `.cargo_fuzz_flag`, `.instrumentation` | The sanitizer build: the forwarded `--sanitizer=<name>`, its `-Zsanitizer=` instrumentation, and the leak-detection runtime it implies |
+| `sanitizer.leak_detection`, `.leak_detection_source` | The leak-checking runtime the build is *intended* to use (`lsan` for ASan, `none` otherwise) — intent, not proof that a check ran |
 | `sanitizer.leak_detection_effective`, `.leak_detection_disabled_by` | Whether the leak check actually runs, and the inherited option that would disable it (`ASAN_OPTIONS=detect_leaks=0` / `LSAN_OPTIONS=...`); only `true` makes `leaks: 0` an evidence claim |
-| `libfuzzer`                                               | `-max_total_time`, `-timeout`, `-rss_limit_mb`, `-workers`, `-detect_leaks` for the run      |
-| `targets[].secs_fuzzed`                                   | libFuzzer's own `Done <runs> runs in <secs> second(s)` budget                                |
-| `targets[].secs_actual`                                   | Wall clock of the whole per-target step, including its build                                 |
-| `targets[].runs`, `exec_per_sec`, `new_units`             | Executions and new units the budget bought                                                   |
-| `targets[].coverage_edges`, `.coverage_features`          | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters; `null` when the log carried none |
-| `targets[].corpus_seeds`, `corpus_delta`                  | Seed units at start; units the run added before the retention trim                           |
-| `targets[].corpus_units`, `.corpus_digest`                | Units hashed and the sha256 over them; `null` digest blocks `clean`                          |
+| `libfuzzer` | `-max_total_time`, `-timeout`, `-rss_limit_mb`, `-workers`, `-detect_leaks` for the run |
+| `targets[].secs_fuzzed` | libFuzzer's own `Done <runs> runs in <secs> second(s)` budget |
+| `targets[].secs_actual` | Wall clock of the whole per-target step, including its build |
+| `targets[].runs`, `exec_per_sec`, `new_units` | Executions and new units the budget bought |
+| `targets[].coverage_edges`, `.coverage_features` | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters; `null` when the log carried none |
+| `targets[].corpus_seeds`, `corpus_delta` | Seed units at start; units the run added before the retention trim |
+| `targets[].corpus_units`, `.corpus_digest` | Units hashed and the sha256 over them; `null` digest blocks `clean` |
 | `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified` | The sanitizer claimed for this target, what the binary probe found (`found`/`mismatch`/`absent`/`not-applicable`), and whether it verified |
-| `targets[].evidence_missing`                              | Named provenance facts the run could not capture; non-empty means the target cannot be `clean` |
-| `targets[].peak_rss_mb`                                   | Peak resident set reported by libFuzzer                                                      |
+| `targets[].evidence_missing` | Named provenance facts the run could not capture; non-empty means the target cannot be `clean` |
+| `targets[].peak_rss_mb` | Peak resident set reported by libFuzzer |
 | `targets[].crashes`, `oom`, `timeouts`, `other_artifacts` | Finding classes counted from artifacts the run itself added (pre-existing files counted separately, below) |
 | `targets[].pre_existing_artifacts`, `pre_existing_artifact_names` | Artifacts the directory already held when the run started: count and names; any entry here blocks `clean`, because a re-discovered input reuses its name |
-| `targets[].exit_code`, `result`                           | Process status and `clean` / `finding` / `error` / `inconclusive`                            |
-| `totals`, `result`                                        | Whole-campaign roll-up; one `result` decides a run page                                      |
+| `targets[].exit_code`, `result` | Process status and `clean` / `finding` / `error` / `inconclusive` |
+| `totals`, `result` | Whole-campaign roll-up; one `result` decides a run page |
 
 No host path is recorded, so a summary is safe to attach to a security-corpus
 entry as-is. The `report` job merges the per-target records into one
@@ -193,11 +193,11 @@ gap, and a run that cannot produce them is recorded `inconclusive` with the fact
 named in `targets[].evidence_missing` — a clean count alone is not accepted
 evidence:
 
-| Addition           | Recorded as                                                                                   | How it is captured                                                                                                                                                                                                                                    | Absent means                                                        |
+| Addition | Recorded as | How it is captured | Absent means |
 | ------------------ | --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified`      | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the exact binary this run built (`<target-dir>/<host-triple>/release/<target>` — never a bare `release/` copy, which cargo does not write) is probed for the runtime symbol (`__asan_init`, ...) and a binary without it is a contradiction, while an unidentifiable build reports `absent` | `sanitizer-build` on a contradiction; `sanitizer-none` for a `SANITIZER=none` build; `sanitizer-leaks-unchecked` for a sanitizer libFuzzer does not drive LSan with, or a run whose sanitizer options disable the check; `clean` is refused in all cases |
-| Corpus digest      | `targets[].corpus_digest`, `.corpus_units`, `corpus/<target>.sha256`                           | sha256 over the name-sorted `<unit-sha256>  <unit-name>` manifest of every regular file in the corpus the run ended with (before the retention trim) — discovered units are named by content hash, so a `*.bin` filter would omit exactly what the run found — and an unreadable unit fails the digest instead of shortening it | `corpus-digest`; a host without `sha256sum`/`shasum` cannot claim clean |
-| Coverage signal    | `targets[].coverage_edges`, `.coverage_features`                                               | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters from its last pulse line, parsed as bounded integers (`0..2^32-1`, anything else is absent)                                                                                        | `coverage`; `clean` is refused                                      |
+| Sanitizer identity | `sanitizer.*` (campaign), `targets[].sanitizer`, `.sanitizer_probe`, `.sanitizer_verified` | `--sanitizer=<name>` is forwarded to `cargo-fuzz` (validated against `address`/`leak`/`memory`/`thread`/`none`), so ASan and its LSan runtime are named by the flag that caused them; the exact binary this run built (`<target-dir>/<host-triple>/release/<target>` — never a bare `release/` copy, which cargo does not write) is probed for the runtime symbol (`__asan_init`, ...) and a binary without it is a contradiction, while an unidentifiable build reports `absent` | `sanitizer-build` on a contradiction; `sanitizer-none` for a `SANITIZER=none` build; `sanitizer-leaks-unchecked` for a sanitizer libFuzzer does not drive LSan with, or a run whose sanitizer options disable the check; `clean` is refused in all cases |
+| Corpus digest | `targets[].corpus_digest`, `.corpus_units`, `corpus/<target>.sha256` | sha256 over the name-sorted `<unit-sha256>  <unit-name>` manifest of every regular file in the corpus the run ended with (before the retention trim) — discovered units are named by content hash, so a `*.bin` filter would omit exactly what the run found — and an unreadable unit fails the digest instead of shortening it | `corpus-digest`; a host without `sha256sum`/`shasum` cannot claim clean |
+| Coverage signal | `targets[].coverage_edges`, `.coverage_features` | libFuzzer's own `cov` (edges) and `ft` (frontier features) counters from its last pulse line, parsed as bounded integers (`0..2^32-1`, anything else is absent) | `coverage`; `clean` is refused |
 
 The rules are ordered so that they can only ever subtract a `clean`: a finding,
 an artifact left in the directory, libFuzzer's error exit, or a runner error
@@ -216,17 +216,17 @@ folded into a clean count.
 
 ### Field to P0-AC-002 clause
 
-| P0-AC-002 clause                                      | Fields that evidence it                                                                                                                                                                        |
+| P0-AC-002 clause | Fields that evidence it |
 | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A **long-running** campaign, not a one-off            | `requested_secs`, `targets[].secs_fuzzed`, `targets[].secs_actual`, `targets[].runs`, `started_utc`/`finished_utc`; the merged record's `expected_targets`/`received_targets`/`missing_targets` |
-| **Zero crashes**                                      | `targets[].crashes`, `artifacts[]`, `pre_existing_artifacts`, `targets[].result`                                                                                                                  |
+| A **long-running** campaign, not a one-off | `requested_secs`, `targets[].secs_fuzzed`, `targets[].secs_actual`, `targets[].runs`, `started_utc`/`finished_utc`; the merged record's `expected_targets`/`received_targets`/`missing_targets` |
+| **Zero crashes** | `targets[].crashes`, `artifacts[]`, `pre_existing_artifacts`, `targets[].result` |
 | **Zero crashes** — the artifact directory was empty at start | `targets[].pre_existing_artifact_names` (with `.pre_existing_artifacts`): a file already present blocks `clean`, because libFuzzer reuses the name of a re-discovered input, so a stale artifact could otherwise launder a clean count |
-| **Zero hangs**                                        | `targets[].slow_units`, `targets[].timeouts`, and `libfuzzer.timeout_secs` — the bound that defines a hang                                                                                       |
-| **Zero memory-safety findings**                       | `targets[].leaks` **with** `sanitizer.leak_detection_effective: true` and the `sanitizer.instrumentation` that produced it: `leaks: 0` is memory-safety evidence only when the build had the sanitizer *and* the runtime actually ran the leak check |
+| **Zero hangs** | `targets[].slow_units`, `targets[].timeouts`, and `libfuzzer.timeout_secs` — the bound that defines a hang |
+| **Zero memory-safety findings** | `targets[].leaks` **with** `sanitizer.leak_detection_effective: true` and the `sanitizer.instrumentation` that produced it: `leaks: 0` is memory-safety evidence only when the build had the sanitizer *and* the runtime actually ran the leak check |
 | **Zero memory-safety findings** — the leak check was requested of the runtime | `libfuzzer.detect_leaks` (the `-detect_leaks=` value the driver forwarded, `1` only for an ASan build whose runtime still has the check enabled; `0` means the campaign never asked for it, so `leaks: 0` proves nothing) |
 | **Zero memory-safety findings** — the binary is the sanitizer build the flag names | `targets[].sanitizer_probe` (`found`/`mismatch`/`absent`/`not-applicable`: the located build's runtime symbol), `targets[].sanitizer_verified` (`false` on `absent`/`mismatch`; a `mismatch` is a contradiction and blocks `clean`) |
-| **Corpus retained in-repo, with a hash artifact**      | `targets[].corpus_seeds`, `.corpus_units`, `.corpus_digest`, `corpus/<target>.sha256`                                                                                                            |
-| **Provenance an auditor can re-run**                  | `revision`, `revision_dirty`, `toolchain`, `cargo_fuzz`, `sanitizer.*`, `libfuzzer`, `targets[].coverage_edges`/`.coverage_features`                                                              |
+| **Corpus retained in-repo, with a hash artifact** | `targets[].corpus_seeds`, `.corpus_units`, `.corpus_digest`, `corpus/<target>.sha256` |
+| **Provenance an auditor can re-run** | `revision`, `revision_dirty`, `toolchain`, `cargo_fuzz`, `sanitizer.*`, `libfuzzer`, `targets[].coverage_edges`/`.coverage_features` |
 | **Provenance an auditor can re-run** — nothing silently missing | `targets[].evidence_missing`: empty on every target is a precondition of `clean`; a named gap (`coverage`, `corpus-digest`, `sanitizer-build`, `sanitizer-none`, `sanitizer-leaks-unchecked`) makes the run `inconclusive` whatever its finding counts are, so a reviewer can see which clause the record cannot support instead of reading a bare zero |
 
 A review that finds a `clean` record missing any row of the first table returns

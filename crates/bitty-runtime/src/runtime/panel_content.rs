@@ -111,6 +111,8 @@
 //! mechanism that can honor them owns the change, and a bottom band has no
 //! placement at all yet.
 
+use bitty_render::geometry::RectPx;
+use bitty_render::scene::{ScenePaintBudget, SceneSurface, paint_scene};
 use bitty_rich::scene::Scene;
 use bitty_ui::Point;
 use bitty_ui::PresentationMode;
@@ -672,6 +674,46 @@ impl Runtime {
         self.content_input_dropped_bytes
     }
 
+    /// Plain-text projection of the GUI content layer presented on the panel
+    /// of `view` (bitty#2388, the observability half of the ctl producer).
+    ///
+    /// The layer is what the panel actually paints while it is up: the
+    /// displaced grid is not painted, so a read of "what this terminal
+    /// shows" that returned the hidden grid would report bytes nobody can
+    /// see (the same rule that made `terminal text` carry painted image
+    /// footprints, issue #2875 scope 6). The projection paints the layer's
+    /// attached scene through the same [`bitty_render::scene::paint_scene`]
+    /// the shipped present loop uses and joins the painted text lines in
+    /// paint order, bounded by the scene's own paint budget.
+    ///
+    /// `None` when the panel presents no layer, no host is installed, the
+    /// shared host is borrowed, the scene paints no text, or the paint is
+    /// refused. The caller then reports the grid it already reads, so an
+    /// observation never fails because a layer is up.
+    #[must_use]
+    pub fn presented_panel_content_text(&self, view: ViewId) -> Option<String> {
+        let layer = self.panel_content_layer(view)?;
+        let cell = self.live_cell_metrics();
+        let host = self.scene_host.as_ref()?.try_borrow().ok()?;
+        let scene = host.panel_scene(layer.panel)?;
+        let rect = self.content_rect_for(view)?;
+        let surface = SceneSurface::new(
+            RectPx::new(
+                0,
+                0,
+                u32::from(rect.width).saturating_mul(cell.width),
+                u32::from(rect.height).saturating_mul(cell.height),
+            ),
+            cell,
+        );
+        let paint = paint_scene(scene, surface, ScenePaintBudget::default()).ok()?;
+        let text = paint.plain_text();
+        if text.is_empty() {
+            return None;
+        }
+        Some(text)
+    }
+
     /// Whether the primary owner's content layer freezes its geometry.
     ///
     /// `false` when there is no primary owner or the owner presents no layer,
@@ -866,6 +908,7 @@ impl Runtime {
             }
             if self.content_owner_winsize(restored.view) != before {
                 self.content_restore_resizes = self.content_restore_resizes.saturating_add(1);
+                bitty_render::telemetry::content_restore_resized();
             }
         }
         // The restored grid and the dropped layer share the content rect: one

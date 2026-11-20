@@ -86,6 +86,137 @@ pub const METHOD_TAB_CLOSE: &str = "bitty.debug/tabClose";
 /// Every tab wire method, in canonical verb order.
 pub const TAB_METHODS: [&str; 3] = [METHOD_TAB_OPEN, METHOD_TAB_SWITCH, METHOD_TAB_CLOSE];
 
+/// Wire methods for the Core panel-content debug pair (bitty#2388, CTX-1913).
+///
+/// Declared here for the same reason as [`METHOD_TAB_OPEN`]: the `bitty-ipc`
+/// pin's control-scope table is closed, so a method the pin predates is
+/// refused with `NotFound` before the shared control queue could ever apply
+/// it. The pair therefore registers additively on the servo's dispatcher and
+/// travels through the bounded panel-content lane
+/// ([`crate::ctl::panel_content`]), whose app-side service runs the
+/// `apply_control` arms that call
+/// [`bitty_runtime::Runtime::present_panel_content`] and
+/// [`bitty_runtime::Runtime::release_panel_content`].
+///
+/// Debug surface, not a plugin authority: Core authors the scene, the verbs
+/// grant no `ui.panel` capability, and no plugin-facing API changes.
+pub const METHOD_PANEL_CONTENT_PRESENT: &str = "bitty.debug/panelContentPresent";
+
+/// Wire method for `ctl panel release` (bitty#2388, CTX-1913).
+pub const METHOD_PANEL_CONTENT_RELEASE: &str = "bitty.debug/panelContentRelease";
+
+/// Every panel-content wire method, in canonical verb order.
+pub const PANEL_CONTENT_METHODS: [&str; 2] =
+    [METHOD_PANEL_CONTENT_PRESENT, METHOD_PANEL_CONTENT_RELEASE];
+
+/// Content-layer token grammar: the opaque ordinal the present verb's receipt
+/// reported, as `1..=20` ASCII digits.
+///
+/// Frame-agnostic and pure so the CLI parse and the server-side params parse
+/// agree on the shape; liveness is resolved server-side
+/// (`ContentNotPresented` / `ContentTokenMismatch`), never here.
+///
+/// # Errors
+///
+/// A one-line diagnostic naming the expected shape.
+pub fn parse_panel_content_token(raw: &str) -> Result<u64, String> {
+    if raw.is_empty() || raw.len() > 20 {
+        return Err(format!(
+            "content token must be 1..=20 digits, got {raw:?} (the present receipt's token)"
+        ));
+    }
+    if !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "content token must be ascii digits, got {raw:?} (the present receipt's token)"
+        ));
+    }
+    raw.parse::<u64>()
+        .map_err(|_| format!("content token does not fit a u64: {raw:?}"))
+}
+
+/// Wire params for `ctl panel release`: `{"panel_id":"p:N","token":"T"}`.
+///
+/// `panel_id` passed [`parse_panel_id`] and `token` passed
+/// [`parse_panel_content_token`], so both values are digits and need no JSON
+/// escaping. Built by hand to keep the shape byte-stable.
+#[must_use]
+pub fn panel_content_release_params(panel_id: &str, token: u64) -> String {
+    format!("{{\"panel_id\":\"{panel_id}\",\"token\":\"{token}\"}}")
+}
+
+/// Parse release params back into a validated `(p:N, token)` pair.
+///
+/// Strict and bounded, mirroring [`parse_tab_params`]: exactly the two
+/// string fields in the emitted order, nothing else, so a malformed or
+/// over-long document is a typed `InvalidParams` rather than a defaulted
+/// target.
+///
+/// # Errors
+///
+/// A one-line diagnostic when the document is missing, over-long, carries an
+/// unknown or out-of-order field, or names a panel id or token the grammar
+/// refuses.
+pub fn parse_panel_content_release_params(params: Option<&str>) -> Result<(String, u64), String> {
+    let raw = params.ok_or_else(|| String::from("missing params.panel_id"))?;
+    if raw.len() > bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES {
+        return Err(format!(
+            "params too large ({} bytes, max {})",
+            raw.len(),
+            bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES
+        ));
+    }
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| String::from("params must be one JSON object"))?
+        .trim();
+    let (first, second) = body
+        .split_once(',')
+        .ok_or_else(|| String::from("params must carry exactly two fields: panel_id, token"))?;
+    let (key, value) = first
+        .split_once(':')
+        .ok_or_else(|| String::from("params must carry exactly two fields: panel_id, token"))?;
+    if key.trim() != "\"panel_id\"" {
+        return Err(format!(
+            "unknown or misplaced params field {} (panel_id comes first)",
+            key.trim()
+        ));
+    }
+    let value = value.trim();
+    let quoted_panel = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| String::from("params.panel_id must be a string like \"p:1\""))?;
+    if quoted_panel.contains('"') || quoted_panel.contains('\\') {
+        return Err(String::from(
+            "params.panel_id must not contain quotes or escapes",
+        ));
+    }
+    parse_panel_id(quoted_panel)?;
+    let (key, value) = second
+        .split_once(':')
+        .ok_or_else(|| String::from("params.token must be a string like \"7\""))?;
+    if key.trim() != "\"token\"" {
+        return Err(format!(
+            "unknown params field {} (only panel_id, token are accepted)",
+            key.trim()
+        ));
+    }
+    let value = value.trim();
+    let quoted_token = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| String::from("params.token must be a string like \"7\""))?;
+    if quoted_token.contains('"') || quoted_token.contains('\\') {
+        return Err(String::from(
+            "params.token must not contain quotes or escapes",
+        ));
+    }
+    let token = parse_panel_content_token(quoted_token)?;
+    Ok((quoted_panel.to_string(), token))
+}
+
 /// Panel id grammar: `p:<1..=10 digits>`, the identity `panel list` reports.
 ///
 /// Frame-agnostic and pure so the CLI parse and the server-side params parse
@@ -248,6 +379,22 @@ pub enum CtlRequest {
         /// Target panel id (`p:N`), validated at parse.
         panel_id: String,
     },
+    /// `panel present p:N` (bitty#2388, CTX-1913): present the Core-owned
+    /// debug GUI content layer on one panel through the runtime's content
+    /// swap. Debug producer only: Core authors the scene, no plugin is
+    /// involved, and the receipt carries the release token.
+    PanelContentPresent {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+    },
+    /// `panel release p:N TOKEN`: release the debug layer the matching
+    /// present receipt named and restore the displaced terminal.
+    PanelContentRelease {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+        /// The present receipt's token ordinal, validated at parse.
+        token: u64,
+    },
 }
 
 impl CtlRequest {
@@ -281,6 +428,8 @@ impl CtlRequest {
             Self::TabOpen { .. } => "core.tab.open",
             Self::TabSwitch { .. } => "core.tab.switch",
             Self::TabClose { .. } => "core.tab.close",
+            Self::PanelContentPresent { .. } => "core.panel.present",
+            Self::PanelContentRelease { .. } => "core.panel.release",
         }
     }
 
@@ -314,6 +463,8 @@ impl CtlRequest {
             Self::TabOpen { .. } => Some(METHOD_TAB_OPEN),
             Self::TabSwitch { .. } => Some(METHOD_TAB_SWITCH),
             Self::TabClose { .. } => Some(METHOD_TAB_CLOSE),
+            Self::PanelContentPresent { .. } => Some(METHOD_PANEL_CONTENT_PRESENT),
+            Self::PanelContentRelease { .. } => Some(METHOD_PANEL_CONTENT_RELEASE),
         }
     }
 
@@ -363,6 +514,10 @@ impl CtlRequest {
             Self::TabOpen { panel_id }
             | Self::TabSwitch { panel_id }
             | Self::TabClose { panel_id } => Some(tab_params(panel_id)),
+            Self::PanelContentPresent { panel_id } => Some(tab_params(panel_id)),
+            Self::PanelContentRelease { panel_id, token } => {
+                Some(panel_content_release_params(panel_id, *token))
+            }
         }
     }
 }
@@ -401,6 +556,7 @@ pub fn ctl_usage() -> String {
          \x20 window list | window new\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 panel list\n\
+         \x20 panel present p:N | panel release p:N TOKEN\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list (includes bounded memory diagnostics) | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
@@ -464,6 +620,10 @@ pub fn ctl_help_text(verbose: bool) -> String {
          tab open p:N                  core.tab:open (view.manage; re-attach a tab)\n  \
          tab switch p:N                core.tab:switch (view.manage; activate a tab)\n  \
          tab close p:N                 core.tab:close (view.manage; detach a tab)\n  \
+         panel present p:N             core.panel.present (view.manage; debug GUI layer,\n                                \
+         receipt names the release token)\n  \
+         panel release p:N TOKEN       core.panel.release (view.manage; restore the\n                                \
+         displaced terminal)\n  \
          config reload                 core.config.reload (config.modify, elevation)\n  \
          consent grant --scope S       core.consent.grant ([--terminal T --family F])\n  \
          consent revoke --scope S      core.consent.revoke_scope\n  \
@@ -526,7 +686,7 @@ pub const CTL_RESOURCES: &[(&str, &[&str])] = &[
     ("instance", &["list"]),
     ("window", &["list", "new"]),
     ("view", &["list", "split", "focus"]),
-    ("panel", &["list"]),
+    ("panel", &["list", "present", "release"]),
     ("terminal", &["list", "spawn", "close", "send", "text"]),
     (
         "workspace",
@@ -1056,6 +1216,45 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
                 _ => CtlRequest::TabClose { panel_id },
             };
             Ok((request, targeting))
+        }
+        (Some("panel"), Some("present")) => {
+            reject_ctl_options_for("panel present", split_dir.is_some(), spawn_cwd.is_some())?;
+            let id = single_arg(rest, "panel present", "p:N (e.g. p:1)")?;
+            parse_panel_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid panel id {id:?}: {err}"),
+            })?;
+            Ok((
+                CtlRequest::PanelContentPresent {
+                    panel_id: id.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("panel"), Some("release")) => {
+            reject_ctl_options_for("panel release", split_dir.is_some(), spawn_cwd.is_some())?;
+            let (id, token) = match rest {
+                [id, token] => (id.as_str(), token.as_str()),
+                _ => {
+                    return Err(CtlParseError::Usage {
+                        message: String::from(
+                            "bitty ctl: panel release needs p:N and TOKEN (e.g. panel release p:1 7)",
+                        ),
+                    });
+                }
+            };
+            parse_panel_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid panel id {id:?}: {err}"),
+            })?;
+            let token = parse_panel_content_token(token).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid content token {token:?}: {err}"),
+            })?;
+            Ok((
+                CtlRequest::PanelContentRelease {
+                    panel_id: id.to_string(),
+                    token,
+                },
+                targeting,
+            ))
         }
         (Some("consent"), Some("grant")) => {
             reject_extra(rest, "consent grant")?;

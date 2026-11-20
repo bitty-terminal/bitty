@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Number of tracked counters; must match the field order in
 /// [`SurfaceTelemetrySnapshot`].
-const COUNTER_SLOTS: usize = 20;
+const COUNTER_SLOTS: usize = 24;
 
 const CONFIGURE_OK: usize = 0;
 const CONFIGURE_ERR: usize = 1;
@@ -49,6 +49,21 @@ const PRESENT_UNCONFIRMED: usize = 16;
 const PRESENT_REPAIR_ATTEMPTS: usize = 17;
 const PRESENT_REPAIR_CONFIGURED: usize = 18;
 const PRESENT_REPAIR_FAILED: usize = 19;
+/// Per-leaf geometry syncs skipped because the panel presented a GUI content
+/// layer (bitty#2388 "geometry frozen while hidden"). Mirrors
+/// `Runtime::content_geometry_freezes` so the crash/stall report can name the
+/// freeze without reaching the live runtime.
+const CONTENT_GEOMETRY_FREEZES: usize = 20;
+/// Restore resizes issued by the content-layer release (bitty#2388 "exactly
+/// one resize on restore"). Mirrors
+/// `Runtime::content_restore_resizes`.
+const CONTENT_RESTORE_RESIZES: usize = 21;
+/// Keys swallowed while the focused panel presented GUI content (bitty#2388
+/// "input ownership"). Mirrors `Runtime::content_input_swallowed`.
+const CONTENT_INPUT_SWALLOWED: usize = 22;
+/// Bytes dropped because the focused panel presented GUI content (bitty#2388
+/// "input ownership"). Mirrors `Runtime::content_input_dropped_bytes`.
+const CONTENT_INPUT_DROPPED_BYTES: usize = 23;
 
 /// Last surface event recorded, stored as one byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +206,26 @@ pub struct SurfaceTelemetrySnapshot {
     pub present_repair_configured: u64,
     /// Repair Configure calls that returned an error.
     pub present_repair_failed: u64,
+    /// Per-leaf geometry syncs skipped because the panel presented a GUI
+    /// content layer (bitty#2388 "geometry frozen while hidden").
+    ///
+    /// Mirrors `Runtime::content_geometry_freezes`: the runtime owns the
+    /// authoritative count and records the mirror at the same step, so the
+    /// crash/stall report can name the freeze without reaching the live
+    /// runtime.
+    pub content_geometry_freezes: u64,
+    /// Restore resizes issued by the content-layer release (bitty#2388
+    /// "exactly one resize on restore"). Mirrors
+    /// `Runtime::content_restore_resizes`.
+    pub content_restore_resizes: u64,
+    /// Keys swallowed while the focused panel presented GUI content
+    /// (bitty#2388 "input ownership"). Mirrors
+    /// `Runtime::content_input_swallowed`.
+    pub content_input_swallowed: u64,
+    /// Bytes dropped because the focused panel presented GUI content
+    /// (bitty#2388 "input ownership"). Mirrors
+    /// `Runtime::content_input_dropped_bytes`.
+    pub content_input_dropped_bytes: u64,
     /// Last recorded event name, stable for reports.
     pub last_event: &'static str,
 }
@@ -225,6 +260,10 @@ impl Default for SurfaceTelemetrySnapshot {
             present_repair_attempts: 0,
             present_repair_configured: 0,
             present_repair_failed: 0,
+            content_geometry_freezes: 0,
+            content_restore_resizes: 0,
+            content_input_swallowed: 0,
+            content_input_dropped_bytes: 0,
             last_event: "none",
         }
     }
@@ -426,6 +465,31 @@ pub fn present_repair_result(configured: bool) {
     });
 }
 
+/// Records one geometry sync skipped because a panel presented a GUI content
+/// layer (bitty#2388). The runtime keeps the authoritative per-runtime count
+/// and records this process-wide mirror at the same step, so the crash and
+/// stall reports can name the freeze.
+pub fn content_geometry_frozen() {
+    let _ = COUNTERS[CONTENT_GEOMETRY_FREEZES].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one restore resize issued by a content-layer release (bitty#2388).
+pub fn content_restore_resized() {
+    let _ = COUNTERS[CONTENT_RESTORE_RESIZES].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one key swallowed because the focused panel presented GUI content
+/// (bitty#2388).
+pub fn content_input_swallowed() {
+    let _ = COUNTERS[CONTENT_INPUT_SWALLOWED].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records `bytes` input bytes dropped because the focused panel presented GUI
+/// content (bitty#2388).
+pub fn content_input_dropped_bytes(bytes: u64) {
+    let _ = COUNTERS[CONTENT_INPUT_DROPPED_BYTES].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// Copy the process-wide surface telemetry slot.
 #[must_use]
 pub fn snapshot() -> SurfaceTelemetrySnapshot {
@@ -467,6 +531,10 @@ pub fn snapshot() -> SurfaceTelemetrySnapshot {
         present_repair_attempts: COUNTERS[PRESENT_REPAIR_ATTEMPTS].load(Ordering::Relaxed),
         present_repair_configured: COUNTERS[PRESENT_REPAIR_CONFIGURED].load(Ordering::Relaxed),
         present_repair_failed: COUNTERS[PRESENT_REPAIR_FAILED].load(Ordering::Relaxed),
+        content_geometry_freezes: COUNTERS[CONTENT_GEOMETRY_FREEZES].load(Ordering::Relaxed),
+        content_restore_resizes: COUNTERS[CONTENT_RESTORE_RESIZES].load(Ordering::Relaxed),
+        content_input_swallowed: COUNTERS[CONTENT_INPUT_SWALLOWED].load(Ordering::Relaxed),
+        content_input_dropped_bytes: COUNTERS[CONTENT_INPUT_DROPPED_BYTES].load(Ordering::Relaxed),
         last_event: LastEvent::from_u8(LAST_EVENT.load(Ordering::Relaxed)).as_str(),
     }
 }
@@ -497,6 +565,10 @@ mod tests {
         retry_attempt();
         retry_recovered();
         present_unconfirmed();
+        content_geometry_frozen();
+        content_restore_resized();
+        content_input_swallowed();
+        content_input_dropped_bytes(7);
 
         let after = snapshot();
         assert!(after.configure_ok > before.configure_ok);
@@ -514,6 +586,22 @@ mod tests {
         assert!(after.retry_attempts > before.retry_attempts);
         assert!(after.retry_recoveries > before.retry_recoveries);
         assert!(after.present_unconfirmed > before.present_unconfirmed);
+        assert!(
+            after.content_geometry_freezes > before.content_geometry_freezes,
+            "the content freeze mirror moves with the runtime freeze gate"
+        );
+        assert!(
+            after.content_restore_resizes > before.content_restore_resizes,
+            "the restore-resize mirror moves with the release path"
+        );
+        assert!(
+            after.content_input_swallowed > before.content_input_swallowed,
+            "the swallowed-key mirror moves with the input gate"
+        );
+        assert!(
+            after.content_input_dropped_bytes >= before.content_input_dropped_bytes + 7,
+            "the dropped-byte mirror counts the bytes the router dropped"
+        );
         // `retry_rearmed` ran last: it refreshes the armed delay but is not a
         // failed present, so it must not be what moves `retry_failures`.
         assert_eq!(after.retry_last_delay_ms, 200);

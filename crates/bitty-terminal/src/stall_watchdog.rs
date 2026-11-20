@@ -2461,6 +2461,19 @@ fn render_report(report: &StallReport) -> String {
                 surface.retry_last_delay_ms,
                 context.lifecycle,
             );
+            // bitty#2388 (CTX-1913): the content-layer counters ride the
+            // same telemetry snapshot the watchdog already samples, so a
+            // stall names what the presented layer was doing to the
+            // displaced terminal (frozen geometry, the release restores,
+            // swallowed keys, dropped bytes) without a second probe.
+            let _ = writeln!(
+                out,
+                "  content: geometry_freezes={} restore_resizes={} input_swallowed={} input_dropped_bytes={}",
+                surface.content_geometry_freezes,
+                surface.content_restore_resizes,
+                surface.content_input_swallowed,
+                surface.content_input_dropped_bytes,
+            );
         }
         None => {
             let _ = writeln!(
@@ -6291,6 +6304,16 @@ mod tests {
                 band_count: 1,
                 band_plugin_ids: vec![String::from("bitty-terminal.bar")],
                 presented_frames: 41,
+                // bitty#2388 (CTX-1913): the content counters ride the same
+                // telemetry snapshot, so a stall over a presented layer names
+                // what the layer was doing to the displaced terminal.
+                surface: bitty_render::telemetry::SurfaceTelemetrySnapshot {
+                    content_geometry_freezes: 3,
+                    content_restore_resizes: 1,
+                    content_input_swallowed: 2,
+                    content_input_dropped_bytes: 45,
+                    ..Default::default()
+                },
                 surface_visible: true,
                 redraw_pending_ms: Some(750),
                 probe_redraw_seen: true,
@@ -6335,6 +6358,12 @@ mod tests {
         );
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());
         assert!(rendered.contains("surface: last=none"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "content: geometry_freezes=3 restore_resizes=1 input_swallowed=2 input_dropped_bytes=45"
+            ),
+            "the content-layer counters are surfaced in the stall report: {rendered}"
+        );
         assert!(
             rendered.contains(
                 "visible=true redraw_pending_ms=750 probe_seen=true probe_occluded=false"

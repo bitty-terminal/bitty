@@ -291,6 +291,20 @@ impl PanelContentToken {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Rebuilds a token from the ordinal [`Self::get`] reported.
+    ///
+    /// The token stays a Core-side value: this exists so a Core-owned caller
+    /// (the `bitty ctl` debug producer) can hand the release verb back the
+    /// receipt the present verb returned, exactly like an in-process caller
+    /// that keeps the typed token. It never crosses the plugin boundary: no
+    /// `bitty.ui.panel` verb accepts an ordinal, and a mismatched or stale
+    /// value still answers [`PanelError::ContentTokenMismatch`] /
+    /// [`PanelError::ContentNotPresented`] like any other caller's.
+    #[must_use]
+    pub const fn from_ordinal(ordinal: u64) -> Self {
+        Self(ordinal)
+    }
 }
 
 /// Core-owned record of a panel's presented GUI content layer and the

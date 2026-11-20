@@ -414,6 +414,20 @@ pub fn apply_control(
         // direct `a=p`/`a=T` placement) must not read as an empty hole, so
         // the projection carries the view's painted image footprints.
         let images = runtime.kitty_image_cell_spans_for_view(target_view);
+        // bitty#2388: a presented GUI content layer displaces the grid, so
+        // the honest projection of "what this terminal shows" is the layer's
+        // own text — the displaced grid is frozen under the layer and paints
+        // nothing. The reply names the mode with `"content":"layer"` so a
+        // script can tell the layer from the grid without parsing text, and
+        // a release returns the grid projection byte-identically.
+        if let Some(layer_text) = runtime.presented_panel_content_text(target_view) {
+            let mut out = String::from("{\"terminal_id\":\"");
+            out.push_str(&terminal_id);
+            out.push_str("\",\"content\":\"layer\",\"text\":\"");
+            append_json_escaped(&mut out, &bounded_text(&layer_text));
+            out.push_str("\"}");
+            return Ok(out);
+        }
         let text = runtime
             .pane_snapshot(&target_view)
             .map(|snap| snapshot_text_with_images(&snap, &images))
@@ -767,6 +781,67 @@ pub fn apply_control(
             }
         }
     }
+    if method == super::request::METHOD_PANEL_CONTENT_PRESENT {
+        // bitty#2388 (CTX-1913): the Core-owned debug producer. Core authors
+        // the scene, so the call grants no `ui.panel` capability and no
+        // plugin is involved; the receipt names the release token so a
+        // script can restore the displaced terminal. The runtime keeps every
+        // guarantee (frozen geometry, swallowed input, exact restore).
+        let panel_id = super::request::parse_tab_params(params)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let num = super::request::parse_panel_id(&panel_id)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let view = ViewId::new(num);
+        if !runtime.layout().leaf_ids().contains(&view) {
+            // Same scope as `panel list`: a `p:N` outside the live layout is
+            // not a listed panel, so it is NotFound with no partial state.
+            return Err(("usage", "NotFound", format!("no such panel {panel_id}")));
+        }
+        let scene = debug_content_layer_scene(&panel_id)?;
+        match runtime.present_panel_content(view, scene) {
+            Ok(presented) => {
+                return Ok(format!(
+                    "{{\"presented\":true,\"panel_id\":\"{panel_id}\",\"view_id\":\"v:{}\",\"token\":\"{}\",\"mode\":\"{}\"}}",
+                    presented.view.0,
+                    presented.token.get(),
+                    presented.presentation.as_str(),
+                ));
+            }
+            Err(err) => {
+                return Err(panel_content_refusal(&panel_id, &err));
+            }
+        }
+    }
+    if method == super::request::METHOD_PANEL_CONTENT_RELEASE {
+        // bitty#2388 (CTX-1913): the release half of the debug pair. The
+        // token is the present receipt's value, so the verb releases only a
+        // layer its caller can name — never a live plugin's layer by mistake
+        // (a plugin-owned row still refuses with a token mismatch).
+        let (panel_id, token) = super::request::parse_panel_content_release_params(params)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let num = super::request::parse_panel_id(&panel_id)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let view = ViewId::new(num);
+        let restores_before = runtime.content_restore_resizes();
+        match runtime.release_panel_content(
+            view,
+            bitty_runtime::registry::PanelContentToken::from_ordinal(token),
+        ) {
+            Ok(restored) => {
+                return Ok(format!(
+                    "{{\"released\":true,\"panel_id\":\"{panel_id}\",\"view_id\":\"v:{}\",\"mode\":\"{}\",\"restore_resizes\":{}}}",
+                    restored.view.0,
+                    restored.prior_presentation.as_str(),
+                    runtime
+                        .content_restore_resizes()
+                        .saturating_sub(restores_before),
+                ));
+            }
+            Err(err) => {
+                return Err(panel_content_refusal(&panel_id, &err));
+            }
+        }
+    }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
         // CTX-0814 (#1397): when the app installed a live-reload context, an
         // authorized reload re-reads the sources, classifies the change
@@ -1052,6 +1127,84 @@ fn json_string_array(items: &[String]) -> String {
     out
 }
 
+/// The Core-authored debug scene for `ctl panel present` (bitty#2388,
+/// CTX-1913).
+///
+/// One bounded text line naming the surface, so the layer is identifiable in
+/// `terminal text` and by eye. Core owns the block row, no plugin identity or
+/// generation is implicated, and the scene reuses the same SCN bounds every
+/// other scene passes.
+fn debug_content_layer_scene(
+    panel_id: &str,
+) -> Result<bitty_rich::scene::Scene, (&'static str, &'static str, String)> {
+    let mut scene = bitty_rich::scene::Scene::new();
+    let text = format!("bitty debug content layer (panel {panel_id})");
+    let block = bitty_rich::scene::RichBlock::new(
+        bitty_rich::scene::BlockId(1),
+        bitty_rich::scene::BlockAnchor::Zone(1),
+        bitty_rich::scene::SceneNode::Text(bitty_rich::scene::StyledSpan {
+            text,
+            bold: false,
+            italic: false,
+        }),
+        bitty_rich::scene::ScrollBehavior::Inline,
+        1,
+        1,
+        1,
+    )
+    .map_err(|err| {
+        (
+            "usage",
+            "InvalidParams",
+            format!("debug layer refused: {err}"),
+        )
+    })?;
+    scene.insert(block).map_err(|err| {
+        (
+            "usage",
+            "InvalidParams",
+            format!("debug layer refused: {err}"),
+        )
+    })?;
+    Ok(scene)
+}
+
+/// Map one typed `bitty_runtime::registry::PanelError` from the debug pair
+/// onto the ctl error class (bitty#2388, CTX-1913).
+///
+/// "The caller named something that is not there" is `NotFound`, "the current
+/// state forbids this" is `Conflict`, and both name the panel so a script can
+/// tell its own bad target from a live layer it cannot touch. Never a silent
+/// success.
+fn panel_content_refusal(
+    panel_id: &str,
+    err: &bitty_runtime::registry::PanelError,
+) -> (&'static str, &'static str, String) {
+    let (code, detail) = match err {
+        bitty_runtime::registry::PanelError::ContentUnavailable { reason, .. } => (
+            "NotFound",
+            format!("panel {panel_id} cannot change a content layer: {reason}"),
+        ),
+        bitty_runtime::registry::PanelError::ContentBusy { .. } => (
+            "Conflict",
+            format!("panel {panel_id} already presents a content layer"),
+        ),
+        bitty_runtime::registry::PanelError::ContentNotPresented { .. } => (
+            "NotFound",
+            format!("panel {panel_id} presents no content layer"),
+        ),
+        bitty_runtime::registry::PanelError::ContentTokenMismatch { token, .. } => (
+            "Conflict",
+            format!(
+                "content token {token} does not name panel {panel_id}'s live layer \
+                 (re-run `bitty ctl panel present` and pass its receipt token)"
+            ),
+        ),
+        other => ("Conflict", format!("panel {panel_id} refused: {other}")),
+    };
+    ("usage", code, detail)
+}
+
 /// Extract printable text from a terminal snapshot (rows joined, bounded).
 ///
 /// CTX-0321: `terminal text` must return the rendered grid, not a `Debug` dump
@@ -1117,6 +1270,250 @@ mod tests {
     use super::*;
     use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
     use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+
+    /// Extract the `"token"` ordinal from a present receipt.
+    ///
+    /// The receipt is built by hand in this module, so the marker parse is
+    /// exact; a missing or malformed token fails the test that asked.
+    fn receipt_token(receipt: &str) -> u64 {
+        const MARKER: &str = "\"token\":\"";
+        let start = receipt
+            .find(MARKER)
+            .expect("the present receipt names its token")
+            + MARKER.len();
+        let end = start + receipt[start..].find('"').expect("the token is quoted");
+        receipt[start..end]
+            .parse::<u64>()
+            .expect("the token is an ordinal")
+    }
+
+    /// One headless leaf with a mounted terminal panel and a grid line the
+    /// displaced terminal owns.
+    fn content_layer_fixture() -> (Runtime, ViewId) {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        assert!(rt.set_focus(view), "the single leaf holds focus");
+        rt.handle_pty_bytes(b"grid-line-one\r\n");
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let handle = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("panel mounts at the leaf");
+        rt.install_scene_host(host);
+        (rt, view)
+    }
+
+    /// bitty#2388 (CTX-1913): the Core-owned ctl debug pair, end to end
+    /// through `apply_control` — the same dispatch the app-turn lane service
+    /// runs.
+    ///
+    /// `panel present` swaps the leaf's terminal for the Core-authored debug
+    /// layer, so `terminal text` reports the layer (not the frozen grid) and
+    /// names the mode, `terminal send` answers the router's content-gate
+    /// drop, the mode change to `floating` is observable through
+    /// `panel list`, and `panel release` restores the displaced grid and the
+    /// mode the layer displaced.
+    #[test]
+    fn ctl_debug_pair_presents_text_drops_input_and_releases_back() {
+        let (mut rt, view) = content_layer_fixture();
+
+        // 1. Present through the debug verb; the receipt names the token.
+        let present = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:1")),
+        )
+        .expect("panel present applies");
+        assert!(present.contains("\"presented\":true"), "{present}");
+        assert!(present.contains("\"panel_id\":\"p:1\""), "{present}");
+        assert!(present.contains("\"mode\":\"tiled\""), "{present}");
+        let token = receipt_token(&present);
+
+        // 2. `terminal text` shows the layer, and says so.
+        let text = apply_control(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&ipc_ctl::params_terminal_id("t:1")),
+        )
+        .expect("terminal text applies");
+        assert!(
+            text.contains("\"content\":\"layer\""),
+            "the reply names the layer mode: {text}"
+        );
+        assert!(
+            text.contains("bitty debug content layer (panel p:1)"),
+            "the layer's own text is what the panel shows: {text}"
+        );
+        assert!(
+            !text.contains("grid-line-one"),
+            "the hidden grid is not what the panel shows: {text}"
+        );
+
+        // 3. `terminal send` answers the content-gate drop, and the dropped
+        // bytes mirror into the process telemetry the stall/crash reports
+        // read (bitty#2388 observability half).
+        let before = bitty_render::telemetry::snapshot();
+        let send = apply_control(
+            &mut rt,
+            ipc_ctl::METHOD_SEND_INPUT,
+            Some(&ipc_ctl::params_send_input("t:1", "x")),
+        )
+        .expect("terminal send applies");
+        assert!(
+            send.contains("\"dropped\":\"content-layer\""),
+            "the drop is named, not reported as a send: {send}"
+        );
+        assert!(send.contains("\"bytes\":0"), "{send}");
+        let after = bitty_render::telemetry::snapshot();
+        assert!(
+            after.content_input_dropped_bytes > before.content_input_dropped_bytes,
+            "the dropped bytes are mirrored into the report telemetry"
+        );
+
+        // 4. Mode change to `floating` through the Core-owned verb, observed
+        // through `panel list`'s role row.
+        rt.set_panel_content_presentation(
+            view,
+            bitty_runtime::registry::PanelContentToken::from_ordinal(token),
+            bitty_ui::PresentationMode::Floating,
+        )
+        .expect("a presented panel may float");
+        let panels = apply_control(&mut rt, super::super::request::METHOD_LIST_PANELS, None)
+            .expect("panel list applies");
+        assert!(
+            panels.contains("\"role\":\"floating\""),
+            "the floated layer is observable through ctl: {panels}"
+        );
+
+        // 5. Release through the debug verb: the grid and the mode it
+        // started in come back.
+        let release = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1", token,
+            )),
+        )
+        .expect("panel release applies");
+        assert!(release.contains("\"released\":true"), "{release}");
+        assert!(
+            release.contains("\"mode\":\"tiled\""),
+            "release returns the mode the layer displaced: {release}"
+        );
+        assert!(
+            release.contains("\"restore_resizes\":"),
+            "the receipt surfaces the restore-resize counter: {release}"
+        );
+        assert!(!rt.content_layer_presented(view), "no layer is left up");
+        let text_after = apply_control(
+            &mut rt,
+            ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+            Some(&ipc_ctl::params_terminal_id("t:1")),
+        )
+        .expect("terminal text applies after release");
+        assert!(
+            text_after.contains("grid-line-one"),
+            "release restores the displaced grid: {text_after}"
+        );
+        assert!(
+            !text_after.contains("\"content\":\"layer\""),
+            "the grid projection is back: {text_after}"
+        );
+        let panels_after = apply_control(&mut rt, super::super::request::METHOD_LIST_PANELS, None)
+            .expect("panel list applies after release");
+        assert!(
+            panels_after.contains("\"role\":\"tiled\""),
+            "the leaf is back in its own mode: {panels_after}"
+        );
+    }
+
+    /// bitty#2388 (CTX-1913): the pair's typed refusals — an unknown panel,
+    /// a second present, a mismatched token, and a release with nothing
+    /// presented — all fail closed with the class the receipt documents and
+    /// never a silent success.
+    #[test]
+    fn ctl_debug_pair_answers_typed_refusals() {
+        let (mut rt, _view) = content_layer_fixture();
+
+        // Unknown panel: same scope as `panel list`, so it is NotFound.
+        let missing = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:9")),
+        )
+        .expect_err("an unknown panel must refuse");
+        assert_eq!(missing.1, "NotFound", "{missing:?}");
+
+        // Malformed params are InvalidParams, never a defaulted target.
+        let malformed = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some("{\"panel_id\":\"v:1\"}"),
+        )
+        .expect_err("a non-prefixed id must refuse");
+        assert_eq!(malformed.1, "InvalidParams", "{malformed:?}");
+
+        // Present once, then a second present is Conflict (ContentBusy).
+        let present = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:1")),
+        )
+        .expect("panel present applies");
+        let token = receipt_token(&present);
+        let busy = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:1")),
+        )
+        .expect_err("one layer per panel");
+        assert_eq!(busy.1, "Conflict", "{busy:?}");
+        assert!(
+            busy.2.contains("already presents"),
+            "the refusal names the busy layer: {busy:?}"
+        );
+
+        // A mismatched token is Conflict and leaves the layer presented.
+        let mismatch = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1",
+                token + 1,
+            )),
+        )
+        .expect_err("a stale token must refuse");
+        assert_eq!(mismatch.1, "Conflict", "{mismatch:?}");
+        assert!(
+            mismatch.2.contains("does not name"),
+            "the refusal explains the token fence: {mismatch:?}"
+        );
+        assert!(rt.content_layer_presented(ViewId::new(1)));
+
+        // The matching token still releases, and a release after the release
+        // is NotFound (nothing is presented).
+        let release = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1", token,
+            )),
+        )
+        .expect("the matching token releases");
+        assert!(release.contains("\"released\":true"), "{release}");
+        let gone = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1", token,
+            )),
+        )
+        .expect_err("a released layer is gone");
+        assert_eq!(gone.1, "NotFound", "{gone:?}");
+    }
 
     /// bitty#3250 review: `terminal send` must not answer `sent_to`/`bytes` for
     /// a write the router's content gate drops. The panel in front of the

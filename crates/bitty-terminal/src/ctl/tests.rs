@@ -1265,6 +1265,128 @@ fn tab_verbs_are_documented_in_usage_help_and_completion() {
     assert!(help.contains("view.manage"));
 }
 
+/// bitty#2388 (CTX-1913): the panel-content debug pair's CLI parse, wire
+/// methods, and params round trip.
+#[test]
+fn panel_content_wire_methods_and_params_round_trip() {
+    use crate::ctl::request::{
+        METHOD_PANEL_CONTENT_PRESENT, METHOD_PANEL_CONTENT_RELEASE, parse_panel_content_token,
+    };
+
+    // Present: one `p:N` positional, the tab params shape on the wire.
+    let (req, _) = parse_ctl_request(&words(&["panel", "present", "p:3"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::PanelContentPresent {
+            panel_id: String::from("p:3")
+        }
+    );
+    assert_eq!(req.registry_id(), "core.panel.present");
+    assert_eq!(req.wire_method(), Some(METHOD_PANEL_CONTENT_PRESENT));
+    let params = req.wire_params().expect("the panel id travels on the wire");
+    assert_eq!(params, String::from("{\"panel_id\":\"p:3\"}"));
+
+    // Release: `p:N` plus the receipt's token ordinal.
+    let (req, _) =
+        parse_ctl_request(&words(&["panel", "release", "p:3", "7"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::PanelContentRelease {
+            panel_id: String::from("p:3"),
+            token: 7
+        }
+    );
+    assert_eq!(req.registry_id(), "core.panel.release");
+    assert_eq!(req.wire_method(), Some(METHOD_PANEL_CONTENT_RELEASE));
+    let params = req.wire_params().expect("the pair travels on the wire");
+    assert_eq!(
+        params,
+        String::from("{\"panel_id\":\"p:3\",\"token\":\"7\"}"),
+        "one stable release params shape"
+    );
+
+    // The handler side parses exactly what the CLI built.
+    assert_eq!(
+        crate::ctl::parse_panel_content_release_params(Some(&params)),
+        Ok((String::from("p:3"), 7))
+    );
+
+    // Usage errors stay usage errors: missing token, extra words, a
+    // non-numeric token, and misplaced flags.
+    for raw in [
+        vec!["panel", "present"],
+        vec!["panel", "present", "p:3", "extra"],
+        vec!["panel", "release"],
+        vec!["panel", "release", "p:3"],
+        vec!["panel", "release", "p:3", "7", "extra"],
+        vec!["panel", "release", "p:3", "x"],
+        vec!["panel", "release", "p:3", "99999999999999999999"],
+        vec!["panel", "release", "p:3", "7", "--cwd", "/tmp"],
+        vec!["panel", "present", "v:3"],
+    ] {
+        assert!(
+            parse_ctl_request(&words(&raw)).is_err(),
+            "{raw:?} must be a usage error"
+        );
+    }
+
+    // The token grammar is frame-agnostic: bounded digits, nothing else.
+    assert_eq!(parse_panel_content_token("7"), Ok(7));
+    for bad in ["", "x", "7x", "-1", "99999999999999999999"] {
+        assert!(parse_panel_content_token(bad).is_err(), "{bad:?} refused");
+    }
+
+    // Strict release params: unknown fields, wrong order, wrong types, and
+    // over-long documents are typed refusals, never a defaulted target.
+    for bad in [
+        None,
+        Some("{}"),
+        Some("{\"panel_id\":\"p:1\"}"),
+        Some("{\"token\":\"7\"}"),
+        Some("{\"token\":\"7\",\"panel_id\":\"p:1\"}"),
+        Some("{\"panel_id\":\"p:1\",\"token\":7}"),
+        Some("{\"panel_id\":\"p:1\",\"token\":\"7\",\"extra\":true}"),
+        Some("not json"),
+        Some("{\"panel_id\":\"v:1\",\"token\":\"7\"}"),
+        Some("{\"panel_id\":\"p:1\",\"token\":\"x\"}"),
+    ] {
+        assert!(
+            crate::ctl::parse_panel_content_release_params(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+/// bitty#2388 (CTX-1913): usage, help, and completion all list the
+/// panel-content pair, with the Core identity and the scope it needs.
+#[test]
+fn panel_content_verbs_are_documented_in_usage_help_and_completion() {
+    // The resource table is the single source for shell completion; the parser
+    // is the executable authority. Both must list the two verbs beside the
+    // existing `panel list`.
+    let completion = crate::ctl::request::CTL_RESOURCES
+        .iter()
+        .find(|(resource, _)| *resource == "panel")
+        .expect("the resource table lists `panel`");
+    assert_eq!(completion.1, &["list", "present", "release"]);
+    assert!(
+        parse_ctl_request(&words(&["panel", "present", "p:1"])).is_ok(),
+        "completion advertises `panel present` but the parser refuses it"
+    );
+    assert!(
+        parse_ctl_request(&words(&["panel", "release", "p:1", "7"])).is_ok(),
+        "completion advertises `panel release` but the parser refuses it"
+    );
+    assert!(ctl_usage().contains("panel present p:N | panel release p:N TOKEN"));
+    let help = ctl_help_text(false);
+    for text in ["panel present p:N", "panel release p:N TOKEN"] {
+        assert!(help.contains(text), "help must document `{text}`");
+    }
+    assert!(help.contains("core.panel.present"));
+    assert!(help.contains("core.panel.release"));
+    assert!(help.contains("view.manage"));
+}
+
 /// Headless app with two tiled panels (`p:1`, `p:2`) and focus on `p:1`.
 #[cfg(unix)]
 fn tab_test_app() -> crate::terminal_app::TerminalApp {

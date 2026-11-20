@@ -130,6 +130,7 @@ pub const EXIT_CONFLICT: i32 = 8;
 mod apply;
 mod client;
 pub(crate) mod new_window;
+pub(crate) mod panel_content;
 mod render;
 pub(crate) mod request;
 pub(crate) mod tab;
@@ -233,12 +234,14 @@ pub(crate) fn test_control_queue_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub use apply::{drain_global_control_queue_with, method_mutates_layout};
+pub use apply::{apply_control, drain_global_control_queue_with, method_mutates_layout};
 pub use client::{
     CtlIpcOutcome, ResolvedTarget, ctl_roundtrip, list_live_instances, resolve_ctl_target,
 };
 pub use render::{execute_ctl, execute_reload};
 pub use request::{
     CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, METHOD_NEW_WINDOW,
-    TAB_METHODS, ctl_help_text, ctl_usage, parse_ctl_request, parse_panel_id, parse_tab_params,
+    PANEL_CONTENT_METHODS, TAB_METHODS, ctl_help_text, ctl_usage, panel_content_release_params,
+    parse_ctl_request, parse_panel_content_release_params, parse_panel_id, parse_tab_params,
+    tab_params,
 };

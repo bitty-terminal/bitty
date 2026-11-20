@@ -1082,6 +1082,7 @@ impl Runtime {
             // ran and was skipped (not that it never ran).
             if self.content_layer_presented(frame.view) {
                 self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+                bitty_render::telemetry::content_geometry_frozen();
                 continue;
             }
             let (cols, rows) = match self.fixed_size_for_view(frame.view) {

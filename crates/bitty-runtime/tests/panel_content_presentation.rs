@@ -49,7 +49,10 @@
 //!    session and disposes the container, keyed on panel identity rather than a
 //!    token the close never holds. The owner's row is pruned and its release is
 //!    recorded as `closed`, so the layer is given back instead of silently
-//!    dropped with its container.
+//!    dropped with its container. Every close site shares one teardown — the
+//!    immediate `workspace_close_at` and **both** confirming arms of the
+//!    `workspace_close_request` the chord gesture presses — so the close a user
+//!    can actually trigger cannot kill a shell the layer was covering.
 //!
 //! Every assertion reads observable state — the PTY's own winsize, the pane's
 //! grid, the transport buffer, the presented frame report — never a value the
@@ -59,18 +62,19 @@
 //!
 //! A row whose observable is a *live pane's* kernel winsize needs a real PTY:
 //! a pane-backed panel is a `PaneSession`, which owns a `Pty`, so no build
-//! without a PTY backend can construct one. Six rows read that observable and
+//! without a PTY backend can construct one. Eight rows read that observable and
 //! therefore call `bitty_test_support::require_pty!()` as their **first
 //! statement** — `present_swaps_…`, `geometry_stays_…`,
-//! `primary_owner_freezes_…`, `a_pixel_only_…`, `a_foreign_handle_…`, and
-//! `release_reconciles_…` — so the whole row skips on such a build (the
-//! workspace-wide skip convention, not evidence). The gate lives in the row
-//! and never in a helper: `require_pty!()` expands to a plain `return`, which
-//! inside a helper only leaves the helper and lets the rest of the row run
+//! `primary_owner_freezes_…`, `a_pixel_only_…`, `a_foreign_handle_…`,
+//! `release_reconciles_…`, `a_workspace_close_request_confirm_arm_…`, and
+//! `a_workspace_close_restores_the_geometry_…` — so the whole row skips on such
+//! a build (the workspace-wide skip convention, not evidence). The gate lives in
+//! the row and never in a helper: `require_pty!()` expands to a plain `return`,
+//! which inside a helper only leaves the helper and lets the rest of the row run
 //! against a pane that was never spawned. `BITTY_TEST_FORCE_NO_PTY=1 cargo test
-//! -p bitty-runtime --test panel_content_presentation` is the check: the six
+//! -p bitty-runtime --test panel_content_presentation` is the check: the eight
 //! rows print `SKIP live-PTY test` (visible with `-- --nocapture`) and the run
-//! reports `17 passed; 0 failed` — libtest counts a skipped row as passed, so
+//! reports `23 passed; 0 failed` — libtest counts a skipped row as passed, so
 //! the SKIP notices are what tell the two apart.
 //!
 //! The PTY-independent halves of the same claims are proven here without the
@@ -1443,8 +1447,9 @@ fn panel_content_layer_release_is_fenced_on_the_ending_generation() {
 /// owner's row is pruned and its release is recorded as `closed` instead of the
 /// layer being dropped with its container. The row reads the plugin row and the
 /// remembered release rather than the presented record, on purpose: the
-/// disposal would clear the presented record either way, so only the row and the
-/// remembered reason prove the release actually ran.
+/// disposal clears that record either way, so `!content_layer_presented` here
+/// would pass on a close that never released anything — only the pruned row and
+/// the remembered reason prove the release ran.
 #[test]
 fn a_workspace_close_releases_the_layer_a_plugin_presented() {
     let mut rt = runtime();
@@ -1466,10 +1471,6 @@ fn a_workspace_close_releases_the_layer_a_plugin_presented() {
 
     rt.workspace_close_at(0).expect("the only workspace closes");
 
-    assert!(
-        !rt.content_layer_presented(PRIMARY),
-        "the layer does not outlive the workspace that presented it"
-    );
     assert_eq!(
         rt.ui_panel_layer_count(),
         0,
@@ -1480,5 +1481,215 @@ fn a_workspace_close_releases_the_layer_a_plugin_presented() {
             .map(|record| record.reason.as_str()),
         Some("closed"),
         "the owner learns its layer was released because the panel closed"
+    );
+}
+
+/// The chord path: `A::WorkspaceClose` reaches
+/// `Runtime::workspace_close_request`, not `workspace_close_at`.
+///
+/// That request has two independent kill arms — the repeated chord that
+/// confirms a pending arm, and the immediate arm for an already-idle slot — and
+/// both used to run `kill_workspace_sessions` + `remove_workspace` with no
+/// sweep. The gesture a user actually presses therefore killed the shell the
+/// layer covered and leaked the owner's row, while the API-level close looked
+/// fixed. This row drives the confirm arm; arming is asserted to be inert.
+#[test]
+fn a_workspace_close_request_confirm_arm_releases_the_layer() {
+    bitty_test_support::require_pty!();
+    use bitty_runtime::WsCloseRequest;
+
+    let mut rt = runtime();
+    install(&mut rt, two_panes());
+    spawn_pane(&mut rt);
+    install_panel_at(&mut rt, PANE);
+    assert!(rt.set_focus(PANE));
+    rt.tick().expect("the pane frame");
+
+    let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
+    let node = bitty_lua::UiRichNode::Text {
+        text: String::from("dashboard"),
+        bold: false,
+    };
+    let handle = rt
+        .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
+        .expect("the plugin presents on the focused panel");
+    assert!(rt.content_layer_presented(PANE));
+    assert_eq!(rt.ui_panel_layer_count(), 1);
+    assert_eq!(
+        rt.workspace_live_count(0),
+        1,
+        "the pane session is what arms the confirm gate"
+    );
+
+    // First chord press: arm only. The layer and the shell behind it stay.
+    match rt.workspace_close_request_at(0) {
+        Some(WsCloseRequest::Pending { summary }) => {
+            assert!(
+                summary.contains("Close workspace"),
+                "the arm is loud: {summary}"
+            );
+        }
+        other => panic!("a live workspace must arm, not close: {other:?}"),
+    }
+    assert_eq!(
+        rt.ui_panel_layer_count(),
+        1,
+        "arming the confirm gate must not sweep the layer"
+    );
+    assert!(
+        rt.content_layer_presented(PANE),
+        "arming the confirm gate must not release anything"
+    );
+    assert!(
+        rt.has_pane_session(&PANE),
+        "arming the confirm gate must not kill the shell"
+    );
+
+    // Second press: the confirm. The sweep has to run before the kill here too.
+    assert_eq!(
+        rt.workspace_close_request_at(0),
+        Some(WsCloseRequest::Closed { killed: 1 }),
+        "repeating the chord confirms the kill"
+    );
+    assert_eq!(
+        rt.ui_panel_layer_count(),
+        0,
+        "the confirmed close released the layer, so the owner's row is gone"
+    );
+    assert_eq!(
+        rt.ui_panel_release_record(handle)
+            .map(|record| record.reason.as_str()),
+        Some("closed"),
+        "the owner learns its layer was released because the workspace closed"
+    );
+    assert!(
+        !rt.has_pane_session(&PANE),
+        "the confirmed close still kills the shell it confirmed"
+    );
+}
+
+/// The request path's other kill arm: an idle slot (`live == 0`) closes
+/// immediately, with no arm to confirm.
+///
+/// The primary owner is terminal content without a pane session, so this slot
+/// is idle while still presenting a layer. Before the fix this arm removed the
+/// slot and disposed the container with the layer still up: the owner's row
+/// survived with no release record.
+#[test]
+fn an_idle_workspace_close_request_releases_the_layer() {
+    use bitty_runtime::WsCloseRequest;
+
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    assert!(rt.set_focus(PRIMARY));
+    rt.tick().expect("the primary frame");
+
+    let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
+    let node = bitty_lua::UiRichNode::Text {
+        text: String::from("dashboard"),
+        bold: false,
+    };
+    let handle = rt
+        .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
+        .expect("the plugin presents on the focused panel");
+    assert!(rt.content_layer_presented(PRIMARY));
+    assert_eq!(rt.ui_panel_layer_count(), 1);
+    assert_eq!(
+        rt.workspace_live_count(0),
+        0,
+        "no pane session: this slot closes on the first request"
+    );
+
+    assert_eq!(
+        rt.workspace_close_request_at(0),
+        Some(WsCloseRequest::Closed { killed: 0 }),
+        "an idle slot closes immediately"
+    );
+    assert_eq!(
+        rt.ui_panel_layer_count(),
+        0,
+        "the immediate close released the layer, so the owner's row is gone"
+    );
+    assert_eq!(
+        rt.ui_panel_release_record(handle)
+            .map(|record| record.reason.as_str()),
+        Some("closed"),
+        "the owner learns its layer was released because the workspace closed"
+    );
+}
+
+/// A close must *restore* the PTY it froze, not merely leave the frozen winsize
+/// in place.
+///
+/// Row 1 and the workspace rows above assert the restored winsize equals the
+/// frozen one, which a release that skipped the resize entirely would also
+/// satisfy — nothing moved, so nothing had to move back. This row moves the
+/// leaf's content rect while the layer is up (the PTY stays frozen by design),
+/// so the close's release has to issue a real resize: the kernel-side restore
+/// counter only increments when `TIOCGWINSZ` actually changed.
+#[test]
+fn a_workspace_close_restores_the_geometry_the_layer_froze() {
+    bitty_test_support::require_pty!();
+    use bitty_runtime::WsCloseRequest;
+
+    let mut rt = runtime();
+    install(&mut rt, two_panes());
+    spawn_pane(&mut rt);
+    install_panel_at(&mut rt, PANE);
+    assert!(rt.set_focus(PANE));
+    rt.handle_pane_bytes(PANE, b"frozen\r\n");
+    rt.tick().expect("baseline frame");
+
+    let frozen = rt.pane_pty_size(&PANE).expect("pane winsize");
+    let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
+    let node = bitty_lua::UiRichNode::Text {
+        text: String::from("dashboard"),
+        bold: false,
+    };
+    let handle = rt
+        .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
+        .expect("the plugin presents on the focused panel");
+
+    rt.handle_resize(PhysicalSize::new(1200, 700))
+        .expect("window resize applies");
+    let frame = frame_of(&rt, PANE);
+    assert_ne!(
+        (frame.cols, frame.rows),
+        frozen,
+        "the leaf must have moved while hidden, or the restore resize proves nothing"
+    );
+    assert_eq!(
+        rt.pane_pty_size(&PANE),
+        Some(frozen),
+        "the PTY is still at the size the layer froze"
+    );
+    assert_eq!(rt.content_restore_resizes(), 0, "no restore has run yet");
+
+    // Arm, then confirm: the sweep that runs on the confirm has to resize.
+    assert!(matches!(
+        rt.workspace_close_request_at(0),
+        Some(WsCloseRequest::Pending { .. })
+    ));
+    assert_eq!(
+        rt.workspace_close_request_at(0),
+        Some(WsCloseRequest::Closed { killed: 1 })
+    );
+
+    assert_eq!(
+        rt.content_restore_resizes(),
+        1,
+        "the close issued exactly one restore resize, measured on the kernel side"
+    );
+    assert_eq!(
+        rt.ui_panel_layer_count(),
+        0,
+        "the same sweep pruned the owner's row"
+    );
+    assert_eq!(
+        rt.ui_panel_release_record(handle)
+            .map(|record| record.reason.as_str()),
+        Some("closed"),
+        "and recorded the release reason"
     );
 }

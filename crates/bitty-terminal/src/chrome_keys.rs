@@ -12786,10 +12786,10 @@ claims = []
 
         app.close_plugin_panel_leaf(panel, Some(view));
 
-        assert!(
-            !app.runtime.content_layer_presented(view),
-            "the panel close releases the layer it was covering"
-        );
+        // The leaf's container is disposed here, and disposal clears the
+        // presented record on its own — `!content_layer_presented` would pass
+        // on a close that released nothing. The pruned owner row and the
+        // remembered `closed` reason are the discriminating observables.
         assert_eq!(
             app.runtime.ui_panel_layer_count(),
             0,
@@ -12803,6 +12803,169 @@ claims = []
             "the owner learns its layer was released because the panel closed"
         );
         assert_eq!(app.runtime.leaf_count(), 1, "and then retires the leaf");
+    }
+
+    /// bitty#2388 (CTX-1912): the close's restore has to *move* the PTY back,
+    /// not leave a frozen one in place.
+    ///
+    /// The row above asserts the winsize that comes back is the frozen one and
+    /// that the grid is byte-identical — both stay green on a release that skips
+    /// the resize and the repaint entirely, because nothing moved while the
+    /// layer was up, so nothing had to move back. Here the leaf's content rect
+    /// moves while the layer is up (frozen PTY by design), so a release that
+    /// skipped the restore would leave the winsize at the old rect and the grid
+    /// at the old width: the kernel-side counter stays 0 and both assertions
+    /// fail.
+    #[test]
+    #[cfg(unix)]
+    fn close_view_restore_resizes_the_pane_after_a_hidden_reflow() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+
+        let view = ViewId::new(2);
+        let (mut app, _panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+                LayoutNode::leaf(View::new(view, 40, 24)),
+            ),
+            view,
+        );
+        app.runtime
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime.handle_pane_bytes(view, b"before-layer\r\n");
+        app.runtime.tick().expect("the pane frame");
+        let frozen = app.runtime.pane_pty_size(&view).expect("live winsize");
+
+        app.runtime
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the panel presents a layer over its own terminal");
+
+        // The gesture the freeze exists for: the leaf's frame moves, the PTY
+        // must not.
+        app.runtime
+            .handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
+            .expect("window resize applies");
+        app.runtime.tick().expect("the reflowed frame");
+        let frame = app
+            .runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("the layer's frame");
+        assert_ne!(
+            (frame.cols, frame.rows),
+            frozen,
+            "the gesture must move the leaf, or the restore resize proves nothing"
+        );
+        assert_eq!(
+            app.runtime.pane_pty_size(&view),
+            Some(frozen),
+            "the hidden PTY keeps its frozen winsize"
+        );
+        assert_eq!(
+            app.runtime.content_restore_resizes(),
+            0,
+            "no restore has run yet"
+        );
+
+        // First press: the layer goes, the pane stays — restored, not frozen.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert_eq!(
+            app.runtime.content_restore_resizes(),
+            1,
+            "the release resized the PTY it froze (measured on the kernel side)"
+        );
+        assert_eq!(
+            app.runtime.pane_pty_size(&view),
+            Some((frame.cols, frame.rows)),
+            "the PTY comes back at the leaf's current content rect"
+        );
+        assert_eq!(
+            app.runtime.pane_snapshot(&view).expect("pane grid").width,
+            usize::from(frame.cols),
+            "and the grid was repainted at that width, not left frozen"
+        );
+        assert_eq!(
+            app.runtime.panel_content_kind(view),
+            Some(bitty_runtime::registry::ViewContent::Terminal(view.0)),
+            "the container is terminal-backed again"
+        );
+    }
+
+    /// bitty#2388 (CTX-1912): input ownership comes back with the terminal.
+    ///
+    /// The swallowed-key row proves the gate closes; this one proves it opens
+    /// again on the close path, and on the *pane's* PTY rather than the
+    /// headless buffer: the pressed bytes have to reach the displaced shell and
+    /// come back out of it, so a release that cleared the record without
+    /// lifting the gate (or that left the encoder pointing elsewhere) fails.
+    #[test]
+    #[cfg(unix)]
+    fn a_released_layer_hands_the_keyboard_back_to_the_pane() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+
+        let view = ViewId::new(2);
+        let (mut app, _panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+                LayoutNode::leaf(View::new(view, 40, 24)),
+            ),
+            view,
+        );
+        app.runtime
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime.tick().expect("the pane frame");
+
+        app.runtime
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the panel presents a layer over its own terminal");
+        let swallowed = app.runtime.content_input_swallowed();
+        assert!(
+            !drive_chrome(&mut app, char_press("q", "q", false)),
+            "a plain character is no chrome chord"
+        );
+        assert_eq!(
+            app.runtime.content_input_swallowed(),
+            swallowed + 1,
+            "a presented layer owns the keys"
+        );
+
+        // First press: the layer goes, the shell stays and owns the keyboard.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert!(
+            !app.runtime.content_layer_presented(view),
+            "the release is what lifted the input gate"
+        );
+
+        let token = "xqzq-4242";
+        for ch in format!("echo {token}").chars() {
+            let text = ch.to_string();
+            drive_chrome(&mut app, char_press(&text, &text, false));
+        }
+        drive_chrome(&mut app, named_press(NamedKey::Enter));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pane_glyphs(&app, view).contains(token) {
+            let grid = pane_glyphs(&app, view);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the typed command never reached the pane's shell; grid tail: {:?}",
+                grid.trim_end()
+            );
+            let _ = app.poll_pty_pump();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            app.runtime.content_input_swallowed(),
+            swallowed + 1,
+            "only the presented keypress was swallowed; the rest reached the PTY"
+        );
     }
 
     #[test]

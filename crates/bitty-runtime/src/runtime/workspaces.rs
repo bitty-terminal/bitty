@@ -2708,6 +2708,11 @@ impl Runtime {
     /// `index` (the arm survives a switch, and switching to it and repeating
     /// the close chord confirms). Unknown indices fail closed with `None`:
     /// nothing is armed or closed.
+    ///
+    /// Both kill arms close through [`Self::close_workspace_now`], so a panel
+    /// presenting a content layer gives the displaced terminal back before the
+    /// shell behind it dies — the same sweep `Self::workspace_close_at` runs,
+    /// on the gesture a user actually presses.
     pub fn workspace_close_request_at(&mut self, index: usize) -> Option<WsCloseRequest> {
         if index >= self.workspaces.len() {
             return None;
@@ -2719,15 +2724,13 @@ impl Runtime {
             .is_some_and(|p| p.index == index)
         {
             self.pending_ws_close = None;
-            let killed = self.kill_workspace_sessions(index);
-            self.remove_workspace(index);
+            let killed = self.close_workspace_now(index);
             return Some(WsCloseRequest::Closed { killed });
         }
         let live = self.workspace_live_count(index);
         if live == 0 {
             self.pending_ws_close = None;
-            let killed = self.kill_workspace_sessions(index);
-            self.remove_workspace(index);
+            let killed = self.close_workspace_now(index);
             return Some(WsCloseRequest::Closed { killed });
         }
         let seq = self
@@ -2754,18 +2757,34 @@ impl Runtime {
         if index >= self.workspaces.len() {
             return Err(String::from("no such workspace"));
         }
+        Ok(self.close_workspace_now(index))
+    }
 
-        // bitty#2388 (CTX-1912): a presented content layer displaces the shell
-        // it covers, so it is given back before the close kills the session
-        // behind it and disposes the container. Otherwise the first close of a
-        // workspace silently killed shells nobody could see, and the layer's
-        // owner never learned its handle died.
+    /// The one teardown every close path runs: give the presented content back,
+    /// kill the slot's sessions, remove the slot. Returns sessions killed.
+    ///
+    /// bitty#2388 (CTX-1912): a presented content layer displaces the shell it
+    /// covers, so it is given back before the close kills the session behind it
+    /// and disposes the container. Otherwise a close silently killed shells
+    /// nobody could see, and the layer's owner never learned its handle died.
+    /// Every close site goes through here — the immediate `self.workspace_close_at`,
+    /// and both confirming arms of [`Self::workspace_close_request_at`] (the
+    /// chord path a user actually presses, `A::WorkspaceClose`) — because the
+    /// sweep was once wired into only one of them and the gesture leaked the
+    /// displaced shell it had just killed.
+    ///
+    /// Arming the confirm gate is *not* a close: nothing here runs until the
+    /// pending arm is repeated or the slot is already idle.
+    ///
+    /// Callers own the preconditions (an in-range `index`, a satisfied confirm
+    /// gate); this never fails, so the sweep cannot fail a close and the close
+    /// cannot fail the sweep.
+    fn close_workspace_now(&mut self, index: usize) -> usize {
         self.release_presented_panel_content_of_workspace(index);
         let killed = self.kill_workspace_sessions(index);
         // CTX-0907: event emission moved into remove_workspace to avoid duplication
         self.remove_workspace(index);
-
-        Ok(killed)
+        killed
     }
 
     /// Close workspace `one_based` by positional display index (key path).

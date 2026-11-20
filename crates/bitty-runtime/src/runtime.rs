@@ -173,6 +173,7 @@ pub mod session;
 pub mod shell_jump;
 pub mod submit_host;
 pub mod tabs;
+pub mod ui_panel;
 pub mod workspace_memory;
 pub mod workspaces;
 
@@ -206,6 +207,7 @@ use self::mouse_chrome::{
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, ImeCaret, select_renderer};
 use self::scrollbar::ScrollbarDrag;
+use self::ui_panel::UiPanelLayerRecord;
 use self::workspaces::{PendingWsClose, WorkspaceSlot};
 
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
@@ -861,6 +863,22 @@ pub struct Runtime {
     /// "no byte reaches the displaced terminal while its panel presents a
     /// layer": the counter moves and the transport buffer stays empty.
     content_input_dropped_bytes: u64,
+    /// Layers presented through the plugin-facing `bitty.ui.panel.*` surface,
+    /// keyed by the host-derived handle the caller holds (bitty#2388,
+    /// CTX-1909).
+    ///
+    /// This map is the *plugin* half of a presented layer: the Core record
+    /// ([`crate::registry::PresentedPanelContent`]) owns the swap and the
+    /// restore, while this row owns the owner identity and the recorded
+    /// placement hint the Core record deliberately does not carry. A handle is
+    /// minted here, never supplied by the plugin, and it dies with its entry on
+    /// release, at the presenting generation's end, or when the Core record it
+    /// names is gone.
+    ui_panel_layers: std::collections::BTreeMap<i64, UiPanelLayerRecord>,
+    /// Next `bitty.ui.panel` handle. Monotonic and never reused, so a released
+    /// handle can never address a later layer (the same rule the Core token
+    /// follows).
+    next_ui_panel_handle: i64,
     /// Consecutive frames dropped because the overlay phase reset the glyph
     /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
     ///
@@ -2452,6 +2470,8 @@ impl Runtime {
             content_restore_resizes: 0,
             content_input_swallowed: 0,
             content_input_dropped_bytes: 0,
+            ui_panel_layers: std::collections::BTreeMap::new(),
+            next_ui_panel_handle: 1,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,
@@ -2798,6 +2818,8 @@ impl Runtime {
             content_restore_resizes: 0,
             content_input_swallowed: 0,
             content_input_dropped_bytes: 0,
+            ui_panel_layers: std::collections::BTreeMap::new(),
+            next_ui_panel_handle: 1,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,

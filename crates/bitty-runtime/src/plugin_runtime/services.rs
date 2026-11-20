@@ -31,8 +31,8 @@ use bitty_lua::{
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm,
     OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
     OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, SpawnCwd, StashedFunction,
-    TargetSnapshotRow, ThemeTable, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest,
-    component_bridge_error, env_grant_shape_ok, validate_env_key,
+    TargetSnapshotRow, ThemeTable, UiPanelSpec, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo,
+    WorkspaceRequest, component_bridge_error, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_rich::{
@@ -906,6 +906,63 @@ pub trait PanelSceneBackend {
     ) -> Result<bool, BridgeError>;
 }
 
+/// Panel-scoped content presentation backend for `bitty.ui.panel.present`,
+/// `bitty.ui.panel.update`, and `bitty.ui.panel.release` (bitty#2388,
+/// CTX-1909).
+///
+/// The verbs present plugin content **in place of** the focused, terminal-backed
+/// panel's content: the implementation resolves the target itself (the plugin
+/// supplies no panel, view, coordinate, size, or surface handle), keeps the
+/// displaced terminal alive and hidden, and restores it on release. Owner and
+/// generation travel with every call because the one-layer-per-panel and
+/// one-layer-per-generation rules, and the `E_UI_NOT_OWNER` fence, are decided
+/// against them.
+///
+/// `present` returns the **host-derived** handle the caller passes back to
+/// `update` and `release`; it is never supplied by the plugin.
+/// `release_owner` is the generation edge: it runs before the placeholder is
+/// presented so a dead generation's layer never outlives it, and it must be
+/// idempotent because the Core generation edge may already have released the
+/// record by binding. `None` (no backend) fails closed at every verb, so a host
+/// without a presentation path can never gain one from the always-present
+/// `bitty.ui` namespace.
+pub trait PanelContentBackend {
+    /// Present `node` on the focused terminal-backed panel; returns the
+    /// host-derived handle, or a typed refusal that changed nothing.
+    fn present(
+        &self,
+        owner: &PluginId,
+        generation: u32,
+        spec: &bitty_lua::UiPanelSpec,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<i64, BridgeError>;
+
+    /// Replace the content of the layer `handle` names, if this generation owns
+    /// it. A stale or foreign handle is `E_UI_NOT_OWNER` and changes nothing.
+    fn update(
+        &self,
+        owner: &PluginId,
+        generation: u32,
+        handle: i64,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError>;
+
+    /// Release the layer `handle` names and restore the terminal it displaced.
+    /// A stale or foreign handle is `E_UI_NOT_OWNER`.
+    fn release(
+        &self,
+        owner: &PluginId,
+        generation: u32,
+        handle: i64,
+        reason: &str,
+    ) -> Result<bool, BridgeError>;
+
+    /// Release every layer this generation of `owner` presented (generation
+    /// edge). Idempotent: a layer the Core edge already released is forgotten,
+    /// not restored twice. Returns how many layers this call released.
+    fn release_owner(&self, owner: &PluginId, generation: u32) -> usize;
+}
+
 /// Settings source that has no settings.
 #[derive(Debug, Default)]
 pub struct EmptySettings;
@@ -1092,6 +1149,13 @@ pub struct UiAccess {
     /// `ui.overlay` (mount), `ui.overlay.focus` (capture), or `ui.rich`, and
     /// none of those imply it. Draw authority is never input authority.
     pub present: bool,
+    /// `ui.panel` granted (bitty#2388, CTX-1909) — present plugin content in
+    /// place of the focused panel's terminal content and own the input that
+    /// displaced terminal no longer receives. Its own head: none of
+    /// `ui.rich`/`ui.overlay`/`ui.overlay.focus`/`ui.present` implies it and it
+    /// implies none of them. The scene the caller hands over still needs
+    /// `ui.rich`, so a present-only grant cannot draw an arbitrary tree.
+    pub panel: bool,
     /// Manifest `[lazy].claims` (exclusive slot claims; `workspaceline` for the `tabline` slot).
     pub claims: Vec<String>,
 }
@@ -2007,6 +2071,14 @@ pub struct PluginServices {
     /// and their handles; this generation only calls it and releases its own
     /// scenes through `clear_ui_blocks`.
     ui_scene_backend: RefCell<Option<Rc<crate::scene_host::SceneHost>>>,
+    /// Panel content presentation backend (bitty#2388, CTX-1909).
+    ///
+    /// Installed only for `ui.panel` generations; absent means every
+    /// `bitty.ui.panel.*` verb fails closed with `E_UI_UNAVAILABLE`. The backend
+    /// owns the content swap, the displaced-terminal record, and the handle the
+    /// caller holds; this generation only calls it and releases its own layers
+    /// through `clear_ui_blocks`.
+    panel_content_backend: RefCell<Option<Rc<dyn PanelContentBackend>>>,
     /// Activation generation this registry mints handles for (`set_ui_epoch`).
     ///
     /// The scene host takes it as the block's attribution generation and as
@@ -2289,6 +2361,7 @@ impl PluginServices {
             ui_blocks: RefCell::new(UiBlocks::new()),
             window_focused: RefCell::new(Rc::new(Cell::new(true))),
             ui_scene_backend: RefCell::new(None),
+            panel_content_backend: RefCell::new(None),
             ui_epoch: Cell::new(0),
             overlay_capture: RefCell::new(None),
             presentation_overlay: RefCell::new(None),
@@ -2753,6 +2826,15 @@ impl PluginServices {
     /// layer.
     pub fn set_ui_scene_backend(&self, backend: Option<Rc<crate::scene_host::SceneHost>>) {
         *self.ui_scene_backend.borrow_mut() = backend;
+    }
+
+    /// Attach the panel content presentation backend (bitty#2388, CTX-1909).
+    ///
+    /// Installed only for `ui.panel` generations; without it every
+    /// `bitty.ui.panel.*` verb keeps failing closed with `E_UI_UNAVAILABLE`. The
+    /// call-time `ui.panel` + `ui.rich` gates stay as the second layer.
+    pub fn set_panel_content_backend(&self, backend: Option<Rc<dyn PanelContentBackend>>) {
+        *self.panel_content_backend.borrow_mut() = backend;
     }
 
     /// Attach the runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -3333,6 +3415,17 @@ impl PluginServices {
         // survives suspend, dispose, crash, or reload.
         if let Some(backend) = self.ui_scene_backend.borrow().clone() {
             backend.release_owner(&self.plugin_id, self.ui_epoch.get());
+        }
+        // bitty#2388 (CTX-1909): a presented content layer cannot outlive the
+        // generation that presented it. This is the fail-closed edge the record
+        // names (`unloaded`/`crashed`/`reloaded`/`disabled`/`suspended`): the
+        // terminal comes back before the placeholder is presented, and a layer
+        // the Core edge already released is only forgotten, never restored
+        // twice.
+        if let Some(backend) = self.panel_content_backend.borrow().clone() {
+            let owner = PluginId::new(&self.plugin_id)
+                .expect("plugin id validated before activation creates services");
+            backend.release_owner(&owner, self.ui_epoch.get());
         }
         self.ui_blocks.borrow_mut().clear();
         self.spec_overlay_handles.borrow_mut().clear();
@@ -7988,6 +8081,112 @@ impl HostServices for PluginServices {
         Err(BridgeError::not_implemented("bitty.panel.destroy"))
     }
 
+    /// Present plugin content in place of the focused panel's terminal content
+    /// (bitty#2388, CTX-1909 — `bitty.ui.panel.present`).
+    ///
+    /// Two grants, checked in least-privilege order: `ui.rich` for the scene the
+    /// caller hands over, then `ui.panel` for the presentation and the input it
+    /// displaces. Safe mode refuses with [`E_UI_UNAVAILABLE`] before the backend
+    /// is consulted, and a generation without a backend keeps failing closed the
+    /// same way, so an ungranted plugin can never reach the Core swap.
+    fn ui_panel_present(
+        &self,
+        spec: &UiPanelSpec,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<i64, BridgeError> {
+        let (rich, panel) = {
+            let access = self.ui_access.borrow();
+            (access.rich, access.panel)
+        };
+        if !rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        if !panel {
+            return Err(BridgeError::capability_denied("ui.panel"));
+        }
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "safe mode presents no panel content",
+            ));
+        }
+        let backend = self.panel_content_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no panel content surface",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.present(&owner, self.ui_epoch.get(), spec, node)
+    }
+
+    /// Replace the content of a layer this generation presented (bitty#2388,
+    /// CTX-1909 — `bitty.ui.panel.update`).
+    ///
+    /// Same two grants as the present: an update rewrites what a granted
+    /// presentation paints, so it is never cheaper than presenting. Safe mode
+    /// refuses with [`E_UI_UNAVAILABLE`] before the backend is consulted, the
+    /// same gate `present` applies: a generation running under safe policy must
+    /// not repaint a layer, including one it could never have created itself.
+    fn ui_panel_update(
+        &self,
+        handle: i64,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError> {
+        let (rich, panel) = {
+            let access = self.ui_access.borrow();
+            (access.rich, access.panel)
+        };
+        if !rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        if !panel {
+            return Err(BridgeError::capability_denied("ui.panel"));
+        }
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "safe mode updates no panel content",
+            ));
+        }
+        let backend = self.panel_content_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no panel content surface",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.update(&owner, self.ui_epoch.get(), handle, node)
+    }
+
+    /// Release a layer this generation presented and restore the terminal it
+    /// displaced (bitty#2388, CTX-1909 — `bitty.ui.panel.release`).
+    ///
+    /// `ui.panel` is required; `ui.rich` is not, because releasing paints
+    /// nothing. Cleanup stays reachable after a grant is revoked mid-session so
+    /// a layer can never strand the panel it covers.
+    fn ui_panel_release(&self, handle: i64, reason: &str) -> Result<bool, BridgeError> {
+        if !self.ui_access.borrow().panel {
+            return Err(BridgeError::capability_denied("ui.panel"));
+        }
+        let backend = self.panel_content_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no panel content surface",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.release(&owner, self.ui_epoch.get(), handle, reason)
+    }
+
     fn panel_get_presentation(&self, panel_id: u64) -> Result<Option<String>, BridgeError> {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
@@ -9799,6 +9998,53 @@ mod tests {
         );
     }
 
+    /// Panel-content backend that only counts the updates that reached it.
+    ///
+    /// Used to prove the safe-mode gate in `ui_panel_update`: the refusal must
+    /// happen before this type, and clearing safe mode must be what lets the
+    /// call through (so a backend that always fails could not fake it).
+    #[derive(Default)]
+    struct CountingPanelContent {
+        updates: Cell<u32>,
+    }
+
+    impl PanelContentBackend for CountingPanelContent {
+        fn present(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _spec: &bitty_lua::UiPanelSpec,
+            _node: &bitty_lua::UiRichNode,
+        ) -> Result<i64, BridgeError> {
+            Ok(1)
+        }
+
+        fn update(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _handle: i64,
+            _node: &bitty_lua::UiRichNode,
+        ) -> Result<bool, BridgeError> {
+            self.updates.set(self.updates.get() + 1);
+            Ok(true)
+        }
+
+        fn release(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _handle: i64,
+            _reason: &str,
+        ) -> Result<bool, BridgeError> {
+            Ok(true)
+        }
+
+        fn release_owner(&self, _owner: &PluginId, _generation: u32) -> usize {
+            0
+        }
+    }
+
     fn ui_services(access: UiAccess) -> PluginServices {
         let services = services();
         services.set_ui_access(access);
@@ -9811,6 +10057,7 @@ mod tests {
             overlay: false,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: Vec::new(),
         }
     }
@@ -9822,6 +10069,7 @@ mod tests {
             overlay: true,
             overlay_focus: true,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
@@ -9860,6 +10108,7 @@ mod tests {
             overlay: true,
             overlay_focus: true,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::clone(capture));
@@ -9903,6 +10152,7 @@ mod tests {
             overlay: true,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         // CTX-0941: with the grant, the Core hosts the focusable overlay and
@@ -9928,6 +10178,7 @@ mod tests {
             overlay: true,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
@@ -10048,6 +10299,57 @@ mod tests {
         );
     }
 
+    /// bitty#2388 (CTX-1909): `update` is gated by safe mode exactly like
+    /// `present`, and the refusal happens before the backend is consulted.
+    ///
+    /// The asymmetry was invisible from the plugin surface — a safe-mode
+    /// generation cannot *create* a layer — but `update` is the verb that
+    /// rewrites whatever the panel currently presents, so it carries the same
+    /// policy gate as the verb that creates it rather than relying on the
+    /// create-side gate alone.
+    #[test]
+    fn ui_panel_update_refuses_in_safe_mode_before_the_backend() {
+        let backend = Rc::new(CountingPanelContent::default());
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: false,
+            overlay_focus: false,
+            present: false,
+            panel: true,
+            claims: Vec::new(),
+        });
+        services
+            .set_panel_content_backend(Some(Rc::clone(&backend) as Rc<dyn PanelContentBackend>));
+        let node = bitty_lua::UiRichNode::Text {
+            text: "layer".to_string(),
+            bold: false,
+        };
+
+        services.set_safe_mode(true);
+        let error = services
+            .ui_panel_update(1, &node)
+            .expect_err("safe mode denies a panel content update");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert_eq!(
+            backend.updates.get(),
+            0,
+            "the refusal happens before the backend"
+        );
+
+        services.set_safe_mode(false);
+        assert!(
+            services
+                .ui_panel_update(1, &node)
+                .expect("cleared safe mode"),
+            "the same call is forwarded once safe mode is cleared"
+        );
+        assert_eq!(
+            backend.updates.get(),
+            1,
+            "the gate, not a stale failure, is what refused"
+        );
+    }
+
     #[test]
     fn overlay_safe_mode_denies_capture_but_not_release() {
         let services = focus_services();
@@ -10096,6 +10398,7 @@ mod tests {
             overlay: true,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         services.set_presentation_overlay(overlay.clone());
@@ -10144,6 +10447,7 @@ mod tests {
             overlay: true,
             overlay_focus: false,
             present: true,
+            panel: false,
             claims: Vec::new(),
         });
         assert!(
@@ -10470,6 +10774,7 @@ mod tests {
             overlay: false,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: vec!["tabline".to_string()],
         });
         let error = services
@@ -10481,6 +10786,7 @@ mod tests {
             overlay: false,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: vec!["workspaceline".to_string()],
         });
         let error = services
@@ -10500,6 +10806,7 @@ mod tests {
             overlay: true,
             overlay_focus: false,
             present: false,
+            panel: false,
             claims: vec!["workspaceline".to_string()],
         });
         for slot in UiSlot::ALL {
@@ -10863,6 +11170,7 @@ mod tests {
             overlay: true,
             overlay_focus: true,
             present: true,
+            panel: false,
             claims: Vec::new(),
         });
         granted.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
@@ -12701,6 +13009,7 @@ mod tests {
             overlay,
             overlay_focus: overlay,
             present: false,
+            panel: false,
             claims: Vec::new(),
         });
         if wire_state {

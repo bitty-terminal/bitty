@@ -34,6 +34,7 @@ pub mod legacy_store;
 pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
+pub mod panel_content_backend;
 pub mod panel_generation;
 pub mod plugin_settings;
 pub mod presentation_overlay;
@@ -139,6 +140,7 @@ pub use overlay::{
     ReleasedEvent, TIMEOUT_RELEASE_REASON, UNLOADED_RELEASE_REASON, is_owner_release_reason,
     is_release_reason,
 };
+pub use panel_content_backend::RuntimePanelContentBackend;
 pub use panel_generation::{
     CONTROLLER_GENERATION_BASE, PanelEdgeBind, PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume,
     PanelEdgeSuspend, PanelGenerationPort, PluginGeneration, controller_generation,
@@ -155,11 +157,11 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
     KeymapSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification,
-    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCloseHandler, PanelCreateHandler,
-    PanelCreateOrigin, PanelPinHandler, PanelPinQueue, PanelSceneBackend, PluginServices,
-    ProcessEnv, QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest, QueuedWorkspaceRequest,
-    SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord, ServiceDirectory,
-    ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
+    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCloseHandler, PanelContentBackend,
+    PanelCreateHandler, PanelCreateOrigin, PanelPinHandler, PanelPinQueue, PanelSceneBackend,
+    PluginServices, ProcessEnv, QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest,
+    QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord,
+    ServiceDirectory, ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
     TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue, ThemePersistHandler,
     ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps, UnavailableSnapshot,
     UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource, keymap_row,
@@ -880,6 +882,16 @@ pub struct PluginRuntime {
     /// CTX-1859: panel-scoped declarative UI backend for `bitty.panel.mount` /
     /// `update` / `unmount`.
     panel_scene_backend: Option<Rc<dyn PanelSceneBackend>>,
+    /// bitty#2388 (CTX-1909): the panel content presentation backend for
+    /// `bitty.ui.panel.present` / `update` / `release`.
+    ///
+    /// Installed by the composition root before activation and shared with
+    /// every `ui.panel` generation; the backend owns the content swap, the
+    /// displaced-terminal record, and the handle the caller holds, while each
+    /// generation's services own the call-time gates and release their own
+    /// layers on the generation edge. `None` leaves every `bitty.ui.panel.*`
+    /// verb failing closed with `E_UI_UNAVAILABLE`.
+    panel_content_backend: Option<Rc<dyn PanelContentBackend>>,
     /// CTX-1641 (bitty#2785): the Core-owned terminal-slot scene host.
     ///
     /// Installed by the composition root before activation and shared with
@@ -1167,6 +1179,7 @@ impl PluginRuntime {
             panel_create_backend: None,
             panel_close_backend: None,
             panel_scene_backend: None,
+            panel_content_backend: None,
             ui_scene_backend: None,
             panel_generation_port: None,
             last_panel_edge: None,
@@ -1824,6 +1837,17 @@ impl PluginRuntime {
     /// / `update` / `unmount` (CTX-1859).
     pub fn set_panel_scene_backend(&mut self, backend: Option<Rc<dyn PanelSceneBackend>>) {
         self.panel_scene_backend = backend;
+    }
+
+    /// Install the panel content presentation backend for `bitty.ui.panel.*`
+    /// (bitty#2388, CTX-1909).
+    ///
+    /// Call before activation: each `ui.panel` generation captures the shared
+    /// backend when its services are built, and a generation without the grant
+    /// captures nothing. Without a backend a granted call fails closed with
+    /// `E_UI_UNAVAILABLE`, like every other unhosted surface.
+    pub fn set_panel_content_backend(&mut self, backend: Option<Rc<dyn PanelContentBackend>>) {
+        self.panel_content_backend = backend;
     }
 
     /// Install the Core-owned terminal-slot scene host (CTX-1641, bitty#2785).
@@ -3237,6 +3261,13 @@ impl PluginRuntime {
         let ui_present = granted
             .iter()
             .any(|capability| capability.as_str() == "ui.present");
+        // bitty#2388 (CTX-1909): present plugin content in place of the focused
+        // panel's terminal content and own the input it displaces. Its own head,
+        // so no other UI grant implies it and it implies none of them; the scene
+        // it presents still needs `ui.rich`, gated separately at call time.
+        let ui_panel = granted
+            .iter()
+            .any(|capability| capability.as_str() == "ui.panel");
         let debug_inspect = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.inspect");
@@ -3378,6 +3409,7 @@ impl PluginRuntime {
             overlay: ui_overlay,
             overlay_focus: ui_overlay_focus,
             present: ui_present,
+            panel: ui_panel,
             claims: manifest.lazy.claims.clone(),
         });
         // CTX-0941: safe mode never presents a focusable overlay. The flag
@@ -3493,6 +3525,13 @@ impl PluginRuntime {
         if ui_rich {
             plugin_services.set_ui_scene_backend(self.ui_scene_backend.clone());
             plugin_services.set_panel_scene_backend(self.panel_scene_backend.clone());
+        }
+        // bitty#2388 (CTX-1909): the panel content presentation backend, shared
+        // only with `ui.panel` generations (no backend without the grant). The
+        // call-time `ui.panel` + `ui.rich` gates in `ui_panel_present` stay as
+        // the second layer.
+        if ui_panel {
+            plugin_services.set_panel_content_backend(self.panel_content_backend.clone());
         }
         // CTX-1239 (issue #2101): the `bitty.terminal.submit` intent queue.
         // Shared only with `terminal.input.submit` generations (no queue

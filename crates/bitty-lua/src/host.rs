@@ -55,6 +55,7 @@ use crate::ui::{
     UiBlockState, UiNode, UiSceneScope, UiSlot, UiTolerated, component_invalid,
     read_component_with_tolerated,
 };
+use crate::ui_panel::{UiPanelSpec, read_panel_release_reason, read_panel_spec};
 use crate::ui_rich::{UiRichNode, read_rich_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
@@ -986,6 +987,33 @@ pub const E_UI_ALREADY_CAPTURED: &str = "E_UI_ALREADY_CAPTURED";
 /// exception: a foreign release is an idempotent no-op, never an error.
 pub const E_UI_NOT_OWNER: &str = "E_UI_NOT_OWNER";
 
+/// Stable `runtime`-class code for a second owner asking to present a content
+/// layer on a panel that already presents one (bitty#2388
+/// `E_UI_PANEL_BUSY`).
+///
+/// One GUI surface per panel: a panel that presents somebody else's layer is
+/// already a container with content, so a second present fails closed instead
+/// of stacking, replacing, or queueing behind the owner.
+pub const E_UI_PANEL_BUSY: &str = "E_UI_PANEL_BUSY";
+
+/// Stable `runtime`-class code for the same plugin generation presenting twice
+/// (bitty#2388 `E_UI_PANEL_NESTED`).
+///
+/// Distinct from [`E_UI_PANEL_BUSY`] because the cause is different and the fix
+/// is different: one generation owns at most one layer, so re-opening from a
+/// generation that already holds one is a nesting bug in the plugin, not
+/// contention with another owner.
+pub const E_UI_PANEL_NESTED: &str = "E_UI_PANEL_NESTED";
+
+/// Stable `runtime`-class code for a present with no target (bitty#2388
+/// `E_UI_PANEL_UNAVAILABLE`).
+///
+/// The target is the focused panel, and it must be terminal-backed: no focused
+/// panel, no panel mounted there, or a panel whose content is not a live
+/// terminal all fail closed here. The host never picks a different panel to
+/// present into.
+pub const E_UI_PANEL_UNAVAILABLE: &str = "E_UI_PANEL_UNAVAILABLE";
+
 /// Maximum captured input events a single overlay capture session retains.
 ///
 /// The Core-side capture queue is bounded fail-safe: overflow drops the oldest
@@ -1198,6 +1226,19 @@ impl BridgeError {
     /// correct. Field access is unchanged.
     #[must_use]
     pub fn to_error<'gc>(&self, ctx: Context<'gc>) -> Error<'gc> {
+        self.to_error_value(ctx).into()
+    }
+
+    /// Render this error as the same table **without raising it**.
+    ///
+    /// The panel verbs (`bitty.ui.panel.present/update/release`) return their
+    /// typed refusal as a second return value — the design record's
+    /// `handle, err` signature (bitty#2388) — so the caller needs the table as
+    /// a value rather than as a thrown error. The shape is byte-identical to
+    /// [`BridgeError::to_error`], including the `__tostring` metamethod, so a
+    /// plugin's `err.code` is the same string whichever channel delivered it.
+    #[must_use]
+    pub fn to_error_value<'gc>(&self, ctx: Context<'gc>) -> Value<'gc> {
         let table = Table::new(&ctx);
         let _ = table.set(ctx, "class", self.class);
         let _ = table.set(ctx, "code", self.code);
@@ -1213,7 +1254,7 @@ impl BridgeError {
             }),
         );
         table.set_metatable(&ctx, Some(metatable));
-        Value::Table(table).into()
+        Value::Table(table)
     }
 }
 
@@ -2146,6 +2187,133 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.ui_update_scene(handle, node)
+    }
+
+    /// Present plugin content in place of the focused panel's terminal content
+    /// (bitty#2388, CTX-1909 — `bitty.ui.panel.present`).
+    ///
+    /// The target is Core-resolved: the focused panel, which must be
+    /// terminal-backed (a pane session or the primary PTY). The plugin never
+    /// supplies a panel id, a view id, a coordinate, a size, or a surface
+    /// handle, and nothing here can name a panel the user did not focus.
+    ///
+    /// `spec` is the closed descriptor [`UiPanelSpec`] (a placement *hint* and
+    /// the fixed restore behavior); `node` is the already-admitted declarative
+    /// scene the bridge read. The implementation owns capability gating
+    /// (`ui.panel` for the content and its input, `ui.rich` for the scene
+    /// itself), the one-layer-per-panel and one-layer-per-generation rules, and
+    /// the displaced-terminal record.
+    ///
+    /// Returns the host-derived, generation-owned handle the caller passes to
+    /// [`HostServices::ui_panel_update`] and [`HostServices::ui_panel_release`].
+    /// Refusals are typed and change nothing: [`E_UI_PANEL_BUSY`]
+    /// (another owner presents on that panel), [`E_UI_PANEL_NESTED`] (this
+    /// generation already presents), [`E_UI_PANEL_UNAVAILABLE`] (no focused
+    /// terminal-backed target), [`E_UI_UNAVAILABLE`] (no host surface or safe
+    /// mode), plus `E_CAPABILITY_DENIED` for a missing grant.
+    ///
+    /// The default fails closed with [`E_UI_UNAVAILABLE`], so a host without a
+    /// content-presentation path can never gain one from the always-present
+    /// `bitty.ui` namespace (`LUA-OQ-2`).
+    fn ui_panel_present(
+        &self,
+        _spec: &UiPanelSpec,
+        _node: &UiRichNode,
+    ) -> Result<i64, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.panel surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_panel_present`] (CTX-0464 contract).
+    ///
+    /// Presenting commits a content layer and freezes the displaced terminal's
+    /// geometry, so the bridge uses the check-then-act mutating path: an
+    /// expired call returns [`BridgeError::timeout`] and presents nothing.
+    fn ui_panel_present_with_expiry(
+        &self,
+        spec: &UiPanelSpec,
+        node: &UiRichNode,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_panel_present(spec, node)
+    }
+
+    /// Replace the content of a layer this generation presented
+    /// (bitty#2388, CTX-1909 — `bitty.ui.panel.update`).
+    ///
+    /// `handle` is a handle [`HostServices::ui_panel_present`] returned to this
+    /// generation. The displaced terminal, the panel, its placement, and the
+    /// frozen geometry are untouched: only the layer's scene is replaced.
+    ///
+    /// Returns `Ok(true)` when the content was replaced. A stale, foreign, or
+    /// already-released handle fails typed with [`E_UI_NOT_OWNER`] and keeps
+    /// the last good content. The default fails closed with
+    /// [`E_UI_UNAVAILABLE`].
+    fn ui_panel_update(&self, _handle: i64, _node: &UiRichNode) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.panel surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_panel_update`] (CTX-0464 contract).
+    ///
+    /// An update commits a replacement scene, so an expired call returns
+    /// [`BridgeError::timeout`] and leaves the last-known-good content intact.
+    fn ui_panel_update_with_expiry(
+        &self,
+        handle: i64,
+        node: &UiRichNode,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_panel_update(handle, node)
+    }
+
+    /// Release the layer this generation presented and restore the terminal it
+    /// displaced (bitty#2388, CTX-1909 — `bitty.ui.panel.release`).
+    ///
+    /// `reason` is the caller's disposition, already validated against the
+    /// closed set by the bridge ([`crate::ui_panel::read_panel_release_reason`]).
+    /// The restore is Core-owned and exact: the recorded content kind, the same
+    /// panel and attachment, the frozen PTY geometry (one resize only when the
+    /// leaf's content rect moved), and the panel's prior presentation mode.
+    ///
+    /// A stale, foreign, or already-released handle fails typed with
+    /// [`E_UI_NOT_OWNER`] — the record's rule for this surface — and changes
+    /// nothing. The default fails closed with [`E_UI_UNAVAILABLE`].
+    fn ui_panel_release(&self, _handle: i64, _reason: &str) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.panel surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_panel_release`] (CTX-0464 contract).
+    ///
+    /// A release past the call deadline returns [`BridgeError::timeout`] and
+    /// leaves the layer presented, so a post-deadline restore never commits
+    /// behind a caller that already saw a timeout.
+    fn ui_panel_release_with_expiry(
+        &self,
+        handle: i64,
+        reason: &str,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_panel_release(handle, reason)
     }
 
     /// Claim the Core-owned exclusive focusable-overlay input capture for one
@@ -7057,6 +7225,155 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("present table accepts 'hide'");
     ui.set(ctx, "present", readonly_table(ctx, present))
         .expect("ui table accepts 'present'");
+
+    // bitty#2388 (CTX-1909): `bitty.ui.panel.*` presents plugin content *in
+    // place of* the focused panel's terminal content and owns the input that
+    // displaced terminal no longer receives. It is a different surface from
+    // `bitty.panel.*` (panel allocation) and from `bitty.ui.present` (a
+    // non-focusable draw above the focused view): the target here is
+    // Core-resolved (the focused, terminal-backed panel), the displaced
+    // terminal stays alive and hidden, and release restores it.
+    //
+    // Every verb returns its refusal as a second value instead of raising
+    // (`handle, err` / `ok, err` — the design record's signature), with the
+    // same `{ class, code, message }` table a raised bridge error carries, so
+    // a caller that checks `err.code` sees the record's stable spellings.
+    let ui_panel = Table::new(&ctx);
+    ui_panel
+        .set(
+            ctx,
+            "present",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let node = match read_rich_component(stack.get(0)) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let spec = match read_panel_spec(stack.get(1)) {
+                        Ok(spec) => spec,
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_panel_present_with_expiry(&spec, &node, expiry)
+                    });
+                    match outcome {
+                        Ok(handle) => {
+                            stack.replace(ctx, (Value::Integer(handle), Value::Nil));
+                        }
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                        }
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'present'");
+    ui_panel
+        .set(
+            ctx,
+            "update",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            let error = component_invalid(
+                                "ui.panel.update handle must be an integer from ui.panel.present",
+                            );
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let node = match read_rich_component(stack.get(1)) {
+                        Ok(node) => node,
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_panel_update_with_expiry(handle, &node, expiry)
+                    });
+                    match outcome {
+                        Ok(updated) => {
+                            stack.replace(ctx, (Value::Boolean(updated), Value::Nil));
+                        }
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                        }
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'update'");
+    ui_panel
+        .set(
+            ctx,
+            "release",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            let error = component_invalid(
+                                "ui.panel.release handle must be an integer from ui.panel.present",
+                            );
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let reason = match stack.get(1) {
+                        Value::Nil => None,
+                        Value::String(reason) => Some(reason.display_lossy().to_string()),
+                        _ => {
+                            let error =
+                                component_invalid("ui.panel.release reason must be a string");
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let reason = match read_panel_release_reason(reason.as_deref()) {
+                        Ok(reason) => reason.to_string(),
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_panel_release_with_expiry(handle, &reason, expiry)
+                    });
+                    match outcome {
+                        Ok(released) => {
+                            stack.replace(ctx, (Value::Boolean(released), Value::Nil));
+                        }
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                        }
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'release'");
+    ui.set(ctx, "panel", readonly_table(ctx, ui_panel))
+        .expect("ui table accepts 'panel'");
 
     // W-29 (CTX-0942, DEC-0085 thin host): read-only targeting mechanism over
     // the existing `bitty-ui` targeting types, exposed under the existing

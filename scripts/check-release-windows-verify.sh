@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # check-release-windows-verify.sh — CTX-1916 (bitty#3274) static gate for the
 # Windows verification jobs; CTX-1918 (bitty#3281) extends the version
-# assertion rules from release.yml to the preview workflow as well.
+# assertion rules from release.yml to the preview workflow as well, and
+# CTX-1917 (bitty#3279) adds rule 3: the post-release Scoop leg must accept
+# the `bitty.com` shim the manifest declares.
 #
 # Those jobs only run on a release tag or a nightly preview slot, so a defect
 # there is discovered after the tag is pushed (or the preview published) and
@@ -37,6 +39,20 @@
 #     variable". A workflow without a single parseable version assertion is
 #     itself a failure — the gate must not pass vacuously just because the
 #     other workflow carries one.
+#
+#   Rule 3 (release.yml) — the post-release Scoop leg accepts the shim the
+#     manifest declares. The Scoop manifest maps `bin: [["bitty.com", "bitty"]]`,
+#     so a bare `bitty` resolves to the `bitty.com` console companion: the
+#     executable-extension allowlist must include '.com', and the resolved
+#     shim must be bound to the installed app's `bitty.com` member exactly
+#     the way #3278 shipped the binding — both sides resolved through the
+#     provider (`(Get-Item -LiteralPath <path>).FullName`, because
+#     `scoop which` prints a `~\`-relative path `[IO.Path]` cannot expand) and
+#     compared with `[StringComparison]::OrdinalIgnoreCase`. The leg must
+#     also resolve the bare command with `scoop which bitty` and probe the
+#     resolved shim with `--version`. Any missing piece is a failure, and so
+#     is a leg the scan cannot parse; comments are stripped before matching,
+#     so prose cannot satisfy the rule.
 #
 # Usage: scripts/check-release-windows-verify.sh [--root <dir>]
 #   --root scans <dir> instead of the repository root (fixture tests). Both
@@ -421,6 +437,102 @@ assertion_counts = {
     workflow: scan_version_assertions(workflow, source) for workflow, source in workflows
 }
 
+
+# --- Rule 3 (release.yml): the Scoop leg accepts the declared companion -----
+# bitty#3279: the re-run of the v0.0.46 release (44741426851) failed the
+# Windows Scoop leg because the shipped shim is the manifest-declared
+# `bitty.com` companion, while the leg allowlisted only '.exe'/'.cmd'/
+# '.bat'/'.ps1' and never checked what the shim resolved to. #3278 landed
+# the acceptance in the workflow itself; this rule pins it so a revert, or a
+# manifest that drops the shim, fails the static gate instead of the next
+# release run.
+
+SCOOP_CHANNEL = "Windows Scoop (R2)"
+
+scoop_leg = ""
+post_release, _ = job_block(texts[RELEASE], "post-release-smoke")
+if not post_release:
+    fail(RELEASE, "rule-3", "post-release-smoke job not found")
+else:
+    marker = post_release.find(f'channel: "{SCOOP_CHANNEL}"')
+    if marker < 0:
+        fail(RELEASE, "rule-3", f'post-release-smoke has no "{SCOOP_CHANNEL}" leg')
+    else:
+        rest = post_release[marker:]
+        end = len(rest)
+        for stop in (rest.find('\n          - channel: "'), rest.find("\n    steps:")):
+            if stop >= 0:
+                end = min(end, stop)
+        scoop_leg = rest[:end]
+
+if scoop_leg:
+    # Comments explain the invariant in prose; only the executed lines count.
+    body = "\n".join(code for _, code in code_lines(scoop_leg))
+
+    if "scoop which bitty" not in body:
+        fail(
+            RELEASE,
+            "rule-3",
+            "the Scoop leg does not resolve a bare `bitty` with scoop which",
+        )
+
+    if not re.search(r"&\s*\$shim\s+--version", body):
+        fail(RELEASE, "rule-3", "the Scoop leg does not run the resolved shim's --version")
+
+    allowlist = re.search(
+        r"GetExtension\(\s*\$shim\s*\)\s+-notin\s+@\(([^)]*)\)", body
+    )
+    if not allowlist:
+        fail(
+            RELEASE,
+            "rule-3",
+            "the Scoop leg has no executable-extension allowlist for the shim",
+        )
+    else:
+        extensions = re.findall(r"'([^']+)'", allowlist.group(1))
+        if ".com" not in extensions:
+            fail(
+                RELEASE,
+                "rule-3",
+                "the Scoop executable-extension allowlist omits '.com', the "
+                "console companion the manifest shims: " + " ".join(extensions),
+            )
+
+    # The companion binding #3278 shipped: the leg must locate the installed
+    # app's 'bitty.com' member, resolve both sides through the provider, and
+    # compare them case-insensitively. A leaf-name-only comparison is weaker
+    # (another directory's bitty.com would pass) and a raw `scoop which`
+    # string can never equal the extracted path, so the gate pins the
+    # resolved-path equality itself — a revert to a weaker form fails here.
+    binding = [
+        (
+            "the app's 'bitty.com' companion path",
+            r"Join-Path\s+\$appDir(?:\s*\.\s*Trim\(\))?\s+'bitty\.com'",
+        ),
+        (
+            "the resolved shim path",
+            r"\$shimFull\s*=\s*\(Get-Item\s+(?:-LiteralPath\s+)?\$shim\)\.FullName",
+        ),
+        (
+            "the resolved app path",
+            r"\$appComFull\s*=\s*\(Get-Item\s+(?:-LiteralPath\s+)?\$appCom\)\.FullName",
+        ),
+        (
+            "the case-insensitive companion comparison",
+            r"\$shimFull\.Equals\(\s*\$appComFull\s*,"
+            r"\s*\[StringComparison\]::OrdinalIgnoreCase\s*\)",
+        ),
+    ]
+    missing = [name for name, pattern in binding if not re.search(pattern, body)]
+    if missing:
+        fail(
+            RELEASE,
+            "rule-3",
+            "the Scoop leg does not bind the resolved shim to the app's "
+            "'bitty.com' member; missing " + ", ".join(missing),
+        )
+
+
 if failures:
     for failure in failures:
         print(f"check-release-windows-verify: FAIL: {failure}", file=sys.stderr)
@@ -432,5 +544,6 @@ for workflow, _ in workflows:
         f"{assertion_counts[workflow]} version assertion(s) tolerate trimmed output"
     )
 print(f"check-release-windows-verify: portable ZIP directories match the loop: {', '.join(sorted(downloads))}")
+print("check-release-windows-verify: the Scoop leg accepts and asserts the bitty.com shim")
 print("check-release-windows-verify: PASS")
 PY

@@ -2709,7 +2709,7 @@ impl Runtime {
     /// the close chord confirms). Unknown indices fail closed with `None`:
     /// nothing is armed or closed.
     ///
-    /// Both kill arms close through [`Self::close_workspace_now`], so a panel
+    /// Both kill arms close through `Self::close_workspace_now`, so a panel
     /// presenting a content layer gives the displaced terminal back before the
     /// shell behind it dies — the same sweep `Self::workspace_close_at` runs,
     /// on the gesture a user actually presses.

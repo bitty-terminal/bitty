@@ -2648,7 +2648,8 @@ jobs:
               if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
                 throw "scoop which bitty did not resolve to an existing file: $shim"
               }
-              if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1')) {
+              # bitty#3224: the manifest deliberately shims bitty.com, so '.com' is an intended shim.
+              if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')) {
                 throw "scoop which bitty did not resolve to an executable shim: $shim"
               }
               $out = (& $shim --version 2>&1 | Out-String)

@@ -2383,14 +2383,12 @@ impl Runtime {
             .map(|(tiled, floats)| tiled + floats)
     }
 
-    /// Kill every pane session owned by workspace `index`'s leaves.
-    /// Returns the number torn down.
+    /// Every view whose session a close of workspace `index` retires.
     ///
-    /// CTX-1147: workspace-local detached floats die with their workspace,
-    /// so their sessions are torn down here too (unlike pinned sessions,
-    /// which are window-global and survive the close).
-    fn kill_workspace_sessions(&mut self, index: usize) -> usize {
-        let ids: Vec<ViewId> = if index == self.active_workspace {
+    /// The active slot is read from the live layout/float store; an inactive one
+    /// from its stash. An unknown index has no views.
+    fn workspace_session_views(&self, index: usize) -> Vec<ViewId> {
+        if index == self.active_workspace {
             self.layout
                 .leaf_ids()
                 .into_iter()
@@ -2404,9 +2402,19 @@ impl Runtime {
                     .into_iter()
                     .chain(slot.floats.ids())
                     .collect(),
-                None => return 0,
+                None => Vec::new(),
             }
-        };
+        }
+    }
+
+    /// Kill every pane session owned by workspace `index`'s leaves.
+    /// Returns the number torn down.
+    ///
+    /// CTX-1147: workspace-local detached floats die with their workspace,
+    /// so their sessions are torn down here too (unlike pinned sessions,
+    /// which are window-global and survive the close).
+    fn kill_workspace_sessions(&mut self, index: usize) -> usize {
+        let ids = self.workspace_session_views(index);
         let mut killed = 0usize;
         for id in ids {
             if self.close_pane_session(&id) {
@@ -2610,6 +2618,31 @@ impl Runtime {
         self.last_workspace_panel_disposal = Some(report);
     }
 
+    /// Releases every content layer presented on a panel of workspace `index`
+    /// (bitty#2388, CTX-1912), before the close kills those sessions and
+    /// disposes those containers.
+    ///
+    /// A workspace close is a teardown of every panel the slot owns: the
+    /// sessions die in [`Self::kill_workspace_sessions`] and the containers in
+    /// [`Self::dispose_panels_of_workspace`]. A layer still presented at that
+    /// moment is content covering a shell about to be killed, and its owner
+    /// would never learn the handle died. Each layer is released through the
+    /// Core seam keyed on panel identity
+    /// ([`Runtime::release_presented_panel_content`]), so the plugin row is
+    /// pruned and the owner's `panel.content.released` observation records the
+    /// `closed` reason before the teardown — and the displaced terminal gets its
+    /// grid and winsize back rather than dying frozen.
+    ///
+    /// A refused release deliberately does not fail the close. The workspace is
+    /// going away either way, and a refusal leaves exactly the state a close
+    /// without this sweep left; the record itself cannot outlive the container,
+    /// because `dispose_panels_of_workspace` takes it with the panel.
+    fn release_presented_panel_content_of_workspace(&mut self, index: usize) {
+        for view in self.workspace_session_views(index) {
+            let _ = self.release_presented_panel_content(view);
+        }
+    }
+
     /// Report of the panel sweep the most recent workspace close ran
     /// (OQ-084 C.9), or `None` when no close has met an installed panel host.
     ///
@@ -2675,6 +2708,11 @@ impl Runtime {
     /// `index` (the arm survives a switch, and switching to it and repeating
     /// the close chord confirms). Unknown indices fail closed with `None`:
     /// nothing is armed or closed.
+    ///
+    /// Both kill arms close through `Self::close_workspace_now`, so a panel
+    /// presenting a content layer gives the displaced terminal back before the
+    /// shell behind it dies — the same sweep `Self::workspace_close_at` runs,
+    /// on the gesture a user actually presses.
     pub fn workspace_close_request_at(&mut self, index: usize) -> Option<WsCloseRequest> {
         if index >= self.workspaces.len() {
             return None;
@@ -2686,15 +2724,13 @@ impl Runtime {
             .is_some_and(|p| p.index == index)
         {
             self.pending_ws_close = None;
-            let killed = self.kill_workspace_sessions(index);
-            self.remove_workspace(index);
+            let killed = self.close_workspace_now(index);
             return Some(WsCloseRequest::Closed { killed });
         }
         let live = self.workspace_live_count(index);
         if live == 0 {
             self.pending_ws_close = None;
-            let killed = self.kill_workspace_sessions(index);
-            self.remove_workspace(index);
+            let killed = self.close_workspace_now(index);
             return Some(WsCloseRequest::Closed { killed });
         }
         let seq = self
@@ -2721,12 +2757,34 @@ impl Runtime {
         if index >= self.workspaces.len() {
             return Err(String::from("no such workspace"));
         }
+        Ok(self.close_workspace_now(index))
+    }
 
+    /// The one teardown every close path runs: give the presented content back,
+    /// kill the slot's sessions, remove the slot. Returns sessions killed.
+    ///
+    /// bitty#2388 (CTX-1912): a presented content layer displaces the shell it
+    /// covers, so it is given back before the close kills the session behind it
+    /// and disposes the container. Otherwise a close silently killed shells
+    /// nobody could see, and the layer's owner never learned its handle died.
+    /// Every close site goes through here — the immediate `self.workspace_close_at`,
+    /// and both confirming arms of [`Self::workspace_close_request_at`] (the
+    /// chord path a user actually presses, `A::WorkspaceClose`) — because the
+    /// sweep was once wired into only one of them and the gesture leaked the
+    /// displaced shell it had just killed.
+    ///
+    /// Arming the confirm gate is *not* a close: nothing here runs until the
+    /// pending arm is repeated or the slot is already idle.
+    ///
+    /// Callers own the preconditions (an in-range `index`, a satisfied confirm
+    /// gate); this never fails, so the sweep cannot fail a close and the close
+    /// cannot fail the sweep.
+    fn close_workspace_now(&mut self, index: usize) -> usize {
+        self.release_presented_panel_content_of_workspace(index);
         let killed = self.kill_workspace_sessions(index);
         // CTX-0907: event emission moved into remove_workspace to avoid duplication
         self.remove_workspace(index);
-
-        Ok(killed)
+        killed
     }
 
     /// Close workspace `one_based` by positional display index (key path).

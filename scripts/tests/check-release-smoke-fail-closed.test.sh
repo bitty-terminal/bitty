@@ -158,7 +158,11 @@ expect_contains "$SMOKE" '(Get-Item -LiteralPath $shim).FullName' \
   "Scoop smoke resolves the shim path through the provider"
 expect_contains "$SMOKE" 'if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {' \
   "Scoop smoke compares the resolved shim with the manifest target"
-expect_contains "$SMOKE" 'not the manifest shim' \
+# bitty#3281: pin the resolved-path interpolation itself, not just the tail
+# words — a revert to the unresolved `$shim`/`$appCom` interpolation keeps the
+# old fragment matching while the reported paths regress to `~\`-abbreviated
+# text the operator cannot act on.
+expect_contains "$SMOKE" "resolved to '\$shimFull', not the manifest shim '\$appComFull'" \
   "Scoop smoke reports both resolved paths on a shim mismatch"
 expect_contains "$SMOKE" 'Test-Path -LiteralPath $exe -PathType Leaf' \
   "native Windows smoke requires an existing executable file"

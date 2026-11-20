@@ -1,0 +1,37 @@
+name: Preview Release
+on:
+  schedule:
+    - cron: "30 21 * * *"
+jobs:
+  # P-07: Windows is a required preview smoke. The archive is assembled on
+  # Linux (the stable packer) and executed on a clean Windows runner.
+  smoke-windows:
+    name: Windows smoke
+    runs-on: windows-latest
+    steps:
+      - name: Download the Windows archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-preview-archive-x86_64-pc-windows-msvc
+          path: pkg
+
+      - name: Expand and run bitty.exe and bitty.com
+        shell: pwsh
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+        run: |
+          $output = (& $exe --version 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "bitty --version exited $code" }
+          $pattern = '\Abitty ' + [regex]::Escape($env:BASE_VERSION) + ' \(preview [^\s()]+\)\s*\z'
+          $proxyPattern = $pattern + '(?:\r\n|\n)'
+          Write-Host "bitty --version => $($output.TrimEnd())"
+          if ($output -cnotmatch $pattern) {
+            throw "version/channel mismatch: '$output'"
+          }
+          # bitty#3224: the console companion proxy must block and return the
+          # wrapped output/exit code, which is what a shell launch relies on.
+          $viaProxy = ([string](& $com --version 2>&1 | Out-String)).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "bitty.com --version exited $LASTEXITCODE" }
+          if ($viaProxy -cnotmatch $proxyPattern) { throw "bitty.com --version mismatch: '$viaProxy'" }
+          Write-Host "bitty.com --version => $viaProxy"

@@ -531,6 +531,9 @@ release-smoke-test:
 # a bookkeeping defect there costs a whole release attempt. v0.0.46 lost one to a
 # download directory that did not match the expand loop and to a version pattern
 # that required a trailing newline the console-proxy probe had trimmed away.
+# CTX-1918 (#3281): the gate parses BOTH .github/workflows/release.yml and
+# preview.yml, so a newline-anchored version/channel assertion reintroduced in
+# the nightly preview workflow fails CI instead of passing vacuously.
 release-windows-verify:
     ./scripts/check-release-windows-verify.sh
 

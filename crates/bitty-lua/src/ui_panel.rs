@@ -59,6 +59,27 @@ pub const UI_PANEL_RELEASE_DEFAULT_REASON: &str = "released";
 /// value).
 pub const UI_PANEL_REASON_MAX_BYTES: usize = 64;
 
+/// Maximum queued input events per presented layer (bitty#2388 D7/Bounds).
+///
+/// The queue is Core-owned and lives with the presented layer: overflow drops
+/// the oldest event, counts it, and raises the poll result's sticky
+/// `overflowed` flag. It is never a plugin-visible callback queue and never
+/// grows past this bound, so a plugin that stops polling cannot exhaust host
+/// memory (security invariant 7, "bounded inputs").
+pub const UI_PANEL_INPUT_QUEUE_MAX: usize = 256;
+
+/// Default `bitty.ui.panel.poll(handle)` drain size.
+///
+/// The record fixes a cheap default so one call cannot hand a plugin the whole
+/// queue; a caller may ask for more up to [`UI_PANEL_INPUT_QUEUE_MAX`].
+pub const UI_PANEL_INPUT_POLL_MAX_DEFAULT: usize = 64;
+
+/// Maximum bytes of one queued input event's text (bitty#2388 "Bounds").
+///
+/// Shared with the focusable-overlay capture bound: one bounded key payload is
+/// 4096 bytes, truncated at a `char` boundary before it is enqueued.
+pub const UI_PANEL_INPUT_TEXT_MAX_BYTES: usize = 4096;
+
 /// Bounded marshalling limits for the flat `spec` table.
 ///
 /// The table is flat and carries at most two scalar fields, so a depth of one

@@ -30,9 +30,9 @@ use bitty_lua::{
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm,
     OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
-    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, SpawnCwd, StashedFunction,
-    TargetSnapshotRow, ThemeTable, UiPanelSpec, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo,
-    WorkspaceRequest, component_bridge_error, env_grant_shape_ok, validate_env_key,
+    OverlayInput, OverlayPoll, PanelPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, SpawnCwd,
+    StashedFunction, TargetSnapshotRow, ThemeTable, UiPanelSpec, WORKSPACE_LIST_MAX_ITEMS,
+    WorkspaceInfo, WorkspaceRequest, component_bridge_error, env_grant_shape_ok, validate_env_key,
 };
 use bitty_package::Version;
 use bitty_rich::{
@@ -957,10 +957,42 @@ pub trait PanelContentBackend {
         reason: &str,
     ) -> Result<bool, BridgeError>;
 
+    /// Drain up to `max` queued key events of the layer `handle` names
+    /// (bitty#2388 `bitty.ui.panel.poll`, CTX-1911).
+    ///
+    /// Owner-initiated cold-path read of the Core-owned queue: the plugin asks,
+    /// Core never calls. Events come back oldest-first and `max` is clamped to
+    /// the queue bound. A stale, foreign, previous-generation, or released
+    /// handle fails typed with `E_UI_NOT_OWNER` and drains nothing; a handle
+    /// Core released for the owning generation answers `released` plus the
+    /// reason instead.
+    fn poll(
+        &self,
+        owner: &PluginId,
+        generation: u32,
+        handle: i64,
+        max: usize,
+    ) -> Result<bitty_lua::PanelPoll, BridgeError>;
+
     /// Release every layer this generation of `owner` presented (generation
     /// edge). Idempotent: a layer the Core edge already released is forgotten,
     /// not restored twice. Returns how many layers this call released.
-    fn release_owner(&self, owner: &PluginId, generation: u32) -> usize;
+    ///
+    /// `reason` is the lifecycle cause the edge is ending the generation for
+    /// (`suspended`, `reloaded`, `disabled`, `unloaded`, `crashed`); it is
+    /// recorded on each released layer's `panel.content.released` observation.
+    fn release_owner(&self, owner: &PluginId, generation: u32, reason: &str) -> usize;
+
+    /// Drain the bounded `panel.content.*` observations the runtime produced
+    /// since the last call (bitty#2388 D8, CTX-1911).
+    ///
+    /// One implementation per host, and the default reports none: a host with
+    /// no content surface has nothing to observe, exactly like its refusals.
+    /// The drained values carry no content and no key bytes, so the delivery
+    /// call site can hand each one to the bus without further filtering.
+    fn drain_events(&self) -> Vec<crate::runtime::ui_panel::PanelContentEvent> {
+        Vec::new()
+    }
 }
 
 /// Settings source that has no settings.
@@ -3409,6 +3441,18 @@ impl PluginServices {
     /// covered: the whole registry (including every recorded spec handle)
     /// is dropped, so no orphan survives unload or crash.
     pub fn clear_ui_blocks(&self) {
+        self.clear_ui_blocks_with_reason(crate::runtime::ui_panel::PANEL_CONTENT_RELEASE_UNLOADED);
+    }
+
+    /// [`PluginServices::clear_ui_blocks`] with the lifecycle cause the
+    /// generation is being torn down for (bitty#2388, CTX-1911).
+    ///
+    /// The panel content release records `reason` on the layer's
+    /// `panel.content.released` observation, so a dashboard that is closed by a
+    /// suspend can tell that cause from a reload, a disable, or a crash. The
+    /// reason is one of the record's closed spellings; every other release here
+    /// is identical whichever value is passed.
+    pub fn clear_ui_blocks_with_reason(&self, reason: &str) {
         // bitty#2785: the generation's terminal-slot scene leaves with its
         // blocks. The scene host detaches the scene and disposes the
         // Core-owned panel, so neither a stale scene nor a placement bind
@@ -3425,7 +3469,7 @@ impl PluginServices {
         if let Some(backend) = self.panel_content_backend.borrow().clone() {
             let owner = PluginId::new(&self.plugin_id)
                 .expect("plugin id validated before activation creates services");
-            backend.release_owner(&owner, self.ui_epoch.get());
+            backend.release_owner(&owner, self.ui_epoch.get(), reason);
         }
         self.ui_blocks.borrow_mut().clear();
         self.spec_overlay_handles.borrow_mut().clear();
@@ -8187,6 +8231,54 @@ impl HostServices for PluginServices {
         backend.release(&owner, self.ui_epoch.get(), handle, reason)
     }
 
+    /// Drain the Core-owned key queue of a layer this generation presented
+    /// (bitty#2388, CTX-1911 — `bitty.ui.panel.poll`).
+    ///
+    /// `ui.panel` is required and `ui.rich` is not: draining paints nothing.
+    /// Safe mode refuses with [`E_UI_UNAVAILABLE`] before the backend is
+    /// consulted — a generation running under safe policy must not read keys
+    /// aimed at a surface it could never have created. The backend owns the
+    /// owner/generation fence and returns `E_UI_NOT_OWNER` for a stale, foreign,
+    /// or released handle without draining anything.
+    fn ui_panel_poll(&self, handle: i64, max: usize) -> Result<PanelPoll, BridgeError> {
+        if !self.ui_access.borrow().panel {
+            return Err(BridgeError::capability_denied("ui.panel"));
+        }
+        if self.safe_mode.get() {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "safe mode polls no panel content",
+            ));
+        }
+        let backend = self.panel_content_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no panel content surface",
+            )
+        })?;
+        let owner = PluginId::new(&self.plugin_id)
+            .expect("plugin id validated before activation creates services");
+        backend.poll(&owner, self.ui_epoch.get(), handle, max)
+    }
+
+    /// Expiry-aware [`PluginServices::ui_panel_poll`] (CTX-0464 contract).
+    ///
+    /// Draining mutates the Core-owned queue, so the bridge checks the deadline
+    /// first: an expired call drains nothing.
+    fn ui_panel_poll_with_expiry(
+        &self,
+        handle: i64,
+        max: usize,
+        expiry: Instant,
+    ) -> Result<PanelPoll, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_panel_poll(handle, max)
+    }
+
     fn panel_get_presentation(&self, panel_id: u64) -> Result<Option<String>, BridgeError> {
         if !self.panel_focus_granted.get() {
             return Err(BridgeError::capability_denied("panel.focus"));
@@ -10040,7 +10132,21 @@ mod tests {
             Ok(true)
         }
 
-        fn release_owner(&self, _owner: &PluginId, _generation: u32) -> usize {
+        fn poll(
+            &self,
+            _owner: &PluginId,
+            _generation: u32,
+            _handle: i64,
+            _max: usize,
+        ) -> Result<PanelPoll, BridgeError> {
+            Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "counting backend has no input queue",
+            ))
+        }
+
+        fn release_owner(&self, _owner: &PluginId, _generation: u32, _reason: &str) -> usize {
             0
         }
     }

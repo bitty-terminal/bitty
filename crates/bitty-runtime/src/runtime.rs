@@ -207,7 +207,9 @@ use self::mouse_chrome::{
 use self::panes::PaneSession;
 use self::present::{AnyRasterizer, ImeCaret, select_renderer};
 use self::scrollbar::ScrollbarDrag;
-use self::ui_panel::UiPanelLayerRecord;
+use self::ui_panel::{
+    PanelContentEvent, PanelContentInputQueue, UiPanelLayerRecord, UiPanelReleaseRecord,
+};
 use self::workspaces::{PendingWsClose, WorkspaceSlot};
 
 /// The Correct Terminal orchestration: owns PTY, parser, terminal state,
@@ -879,6 +881,22 @@ pub struct Runtime {
     /// handle can never address a later layer (the same rule the Core token
     /// follows).
     next_ui_panel_handle: i64,
+    /// Core-owned bounded key queue of each presented layer, keyed by the same
+    /// host-derived handle (bitty#2388 D7, CTX-1911).
+    ///
+    /// Written only on the input path ([`Runtime::capture_panel_content_key`]),
+    /// drained only by `bitty.ui.panel.poll`
+    /// ([`Runtime::ui_panel_poll`]), and dropped with its layer by every
+    /// release path. It carries bounded key text and never a PTY, a terminal
+    /// snapshot, or a plugin callback.
+    ui_panel_input: std::collections::BTreeMap<i64, PanelContentInputQueue>,
+    /// Bounded `panel.content.*` observations awaiting the cold-path drain
+    /// (bitty#2388 D8, CTX-1911).
+    ui_panel_events: std::collections::VecDeque<PanelContentEvent>,
+    /// Remembered releases of ended handles, so an owner's next `poll` can
+    /// read `released` plus the reason instead of a bare refusal
+    /// (bitty#2388 `poll` result shape).
+    ui_panel_released: std::collections::BTreeMap<i64, UiPanelReleaseRecord>,
     /// Consecutive frames dropped because the overlay phase reset the glyph
     /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
     ///
@@ -2472,6 +2490,9 @@ impl Runtime {
             content_input_dropped_bytes: 0,
             ui_panel_layers: std::collections::BTreeMap::new(),
             next_ui_panel_handle: 1,
+            ui_panel_input: std::collections::BTreeMap::new(),
+            ui_panel_events: std::collections::VecDeque::new(),
+            ui_panel_released: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,
@@ -2820,6 +2841,9 @@ impl Runtime {
             content_input_dropped_bytes: 0,
             ui_panel_layers: std::collections::BTreeMap::new(),
             next_ui_panel_handle: 1,
+            ui_panel_input: std::collections::BTreeMap::new(),
+            ui_panel_events: std::collections::VecDeque::new(),
+            ui_panel_released: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,

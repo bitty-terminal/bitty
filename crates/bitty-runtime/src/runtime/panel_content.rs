@@ -39,7 +39,7 @@
 //! | Content kind flips, layer paints in the content rect | [`PanelRuntime::present_panel_content`](crate::registry::PanelRuntime::present_panel_content) attaches the scene to the panel's existing scene slot, which the shipped present loop already composes (`runtime::scene_present`) |
 //! | Geometry frozen while hidden | `Runtime::sync_pane_geometry_to` (`runtime::panes`), `Runtime::sync_primary_geometry` (`runtime::layout_focus`), and `Runtime::reflow_content_to_chrome` (`runtime::resize`) skip the `LogicalRect -> PTY` step for a presented view and count the freeze; `Runtime::resize_primary_pty` skips the winsize ioctl itself, so a pixel-only change (font zoom, DPI) cannot deliver `SIGWINCH` either |
 //! | Exactly one restore resize, then a full repaint | [`Runtime::release_panel_content`] measures the current content rect (and the owner's own winsize, pixel axes included), issues the existing per-leaf resize path once when either no longer matches the frozen rect, and arms `pending_full_redraw` |
-//! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) swallow the key for a presented focused view and count it |
+//! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) append the key to the presented layer's Core-owned bounded queue and swallow it (`Runtime::capture_panel_content_key`); a layer with no plugin row has no queue, so the key is only counted |
 //! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
 //! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
@@ -92,13 +92,12 @@
 //!
 //! # Not in this slice
 //!
-//! The Lua surface (`bitty.ui.panel.present/update/poll/release`), the
-//! `ui.panel` capability, the owner-polled input queue and its
-//! `panel.content.*` events, placement-hint application, band exclusion,
-//! plugin key bindings, nested-owner refusal (`E_UI_PANEL_NESTED`), and
-//! suppressing the displaced leaf's grid paint pass are follow-ups recorded in
-//! the pull request body. Nothing here stubs them: there is no queue to drain,
-//! no capability to grant, and no owner identity to nest against yet.
+//! The plugin-facing verbs (`bitty.ui.panel.present/update/poll/release`) and
+//! the `ui.panel` capability are CTX-1909; the owner-polled input queue, its
+//! `poll` drain, and the `panel.content.*` events are CTX-1911. Placement-hint
+//! application, band exclusion, plugin key bindings, and suppressing the
+//! displaced leaf's grid paint pass remain follow-ups recorded in the pull
+//! request body.
 //!
 //! The mode verb (CTX-1902) is Core-owned and token-fenced, and it is the mode
 //! *change* half only. A plugin-facing path is not part of it: `bitty.panel.
@@ -223,6 +222,12 @@ impl Runtime {
     /// the next frame is a full repaint, so no partial grid or stale layer
     /// pixels survive.
     ///
+    /// A release Core drives itself (the app's token release, a closed or
+    /// disposed panel) records the reason
+    /// [`PANEL_CONTENT_RELEASE_CLOSED`](super::ui_panel::PANEL_CONTENT_RELEASE_CLOSED);
+    /// the owner-facing verb passes its own disposition, and the generation
+    /// edge passes the lifecycle cause.
+    ///
     /// # Errors
     ///
     /// [`PanelError::ContentUnavailable`] when no panel host is installed or no
@@ -240,12 +245,36 @@ impl Runtime {
         view: ViewId,
         token: PanelContentToken,
     ) -> Result<RestoredPanelContent, PanelError> {
+        self.release_panel_content_at(view, token, super::ui_panel::PANEL_CONTENT_RELEASE_CLOSED)
+    }
+
+    /// [`Runtime::release_panel_content`] with an explicit release reason.
+    ///
+    /// The reason only ever reaches the two observation surfaces — the
+    /// `panel.content.released` event and the remembered release `poll`
+    /// reports. The restore itself is byte-identical for every reason, which is
+    /// why one private body serves them all: a reason can never change what
+    /// comes back.
+    pub(super) fn release_panel_content_at(
+        &mut self,
+        view: ViewId,
+        token: PanelContentToken,
+        reason: &str,
+    ) -> Result<RestoredPanelContent, PanelError> {
         let Some(host) = self.scene_host.clone() else {
             return Err(PanelError::ContentUnavailable {
                 view_id: view,
                 reason: "no panel host installed",
             });
         };
+        // The plugin row is read *before* the release, because the release
+        // prunes it (one prune point for every path) and the observation still
+        // has to name the owner and handle it belonged to.
+        let row = self
+            .ui_panel_layers
+            .values()
+            .find(|layer| layer.token == token)
+            .cloned();
         let restored = match host.try_borrow_mut() {
             Ok(mut host) => host.release_panel_content(view, token),
             Err(_) => Err(PanelError::ContentUnavailable {
@@ -258,6 +287,13 @@ impl Runtime {
         // (bitty#2388, CTX-1909): one prune point for every release path, so no
         // `bitty.ui.panel` handle can survive into a panel somebody else owns.
         self.forget_ui_panel_layer(restored.token);
+        // bitty#2388 (CTX-1911): the release is observable without polling, and
+        // the owner's next poll can read `released` plus the reason. Emitted
+        // only for a layer a plugin presented; a Core-presented layer has no
+        // owner to tell.
+        if let Some(row) = row {
+            self.note_panel_content_release(&row, reason);
+        }
         // The presentation half of "exact restore" runs before the geometry
         // half: the mode decides the content rect the restore resize measures,
         // so the panel must already be back in its own mode when the rect is
@@ -294,7 +330,23 @@ impl Runtime {
         // The generation edge released this layer, so any `bitty.ui.panel`
         // handle that named it is dead here — before the caller can present
         // anything over the returned terminal (bitty#2388, CTX-1909).
+        let row = self
+            .ui_panel_layers
+            .values()
+            .find(|layer| layer.token == restored.token)
+            .cloned();
         self.forget_ui_panel_layer(restored.token);
+        // bitty#2388 (CTX-1911): a row that survived to this point (the edge's
+        // own `release_owner` reported zero on a borrow conflict) is released
+        // here, and the owner still has to learn about it. The port carries the
+        // displaced record, not the lifecycle cause, so the reason is the
+        // record's catch-all for a generation that ended —
+        // `PANEL_CONTENT_RELEASE_UNLOADED`. The precise cause (suspend, reload,
+        // disable, crash) is recorded by the edge's own `release_owner` call
+        // when that path runs, which is the one that normally does.
+        if let Some(row) = row {
+            self.note_panel_content_release(&row, super::ui_panel::PANEL_CONTENT_RELEASE_UNLOADED);
+        }
         let before = self.view_presentation(restored.view);
         self.restore_panel_presentation(restored);
         if self.view_presentation(restored.view) == before {
@@ -535,9 +587,11 @@ impl Runtime {
 
     /// Number of keys swallowed because the focused panel presented content.
     ///
-    /// A swallowed key is never encoded and never reaches the PTY; it is
-    /// counted and dropped (the owner-polled queue is a later slice, so there
-    /// is deliberately no queue to leak keys into).
+    /// A swallowed key is never encoded and never reaches the PTY. When the
+    /// layer was presented through `bitty.ui.panel`, the key is also appended to
+    /// that layer's Core-owned bounded queue, which the plugin drains with
+    /// `poll` on its own cold path; a layer presented without a plugin row has
+    /// no queue, so the key is counted and dropped.
     #[must_use]
     pub const fn content_input_swallowed(&self) -> u64 {
         self.content_input_swallowed

@@ -582,9 +582,11 @@ impl Runtime {
         // bitty#2388: the focused panel's content kind decides input routing.
         // While a GUI content layer is presented, no key is encoded and no byte
         // reaches the PTY — the displaced shell must never receive typing it
-        // cannot show. The key is counted and dropped: the owner-polled queue
-        // (`bitty.ui.panel.poll`) is a later slice, so nothing is retained here.
-        // Every other state keeps the byte-identical encoder path below.
+        // cannot show. The key is appended to the layer's Core-owned bounded
+        // queue (bitty.ui.panel.poll drains it on the plugin's cold path) and
+        // counted; a layer nobody presented through `bitty.ui.panel` has no
+        // queue, so the key is swallowed and counted exactly as before. Every
+        // other state keeps the byte-identical encoder path below.
         if self.focused_content_layer_presents() {
             if is_modifier {
                 self.inspect_ring.push_modifiers(
@@ -595,6 +597,7 @@ impl Runtime {
                 self.publish_inspect_snapshot();
             }
             self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            self.capture_panel_content_key(&event, is_modifier);
             return None;
         }
         if is_modifier {
@@ -718,7 +721,8 @@ impl Runtime {
         // `handle_key_event_at`. It re-implements the encoder preamble, so
         // without the gate here a key pressed while the focused panel presents
         // a content layer was encoded straight into the displaced shell. The
-        // swallow is counted exactly like the owned path's.
+        // swallow is counted exactly like the owned path's, and the key reaches
+        // the same Core-owned queue (bitty#2388, CTX-1911).
         if self.focused_content_layer_presents() {
             if is_modifier {
                 self.inspect_ring.push_modifiers(
@@ -729,6 +733,7 @@ impl Runtime {
                 self.publish_inspect_snapshot();
             }
             self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            self.capture_panel_content_key(event, is_modifier);
             return None;
         }
         let pressed = Some(event.state == PressState::Pressed);

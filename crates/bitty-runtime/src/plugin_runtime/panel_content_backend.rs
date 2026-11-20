@@ -106,14 +106,35 @@ impl PanelContentBackend for RuntimePanelContentBackend {
             .ui_panel_release(owner, generation, handle, reason)
     }
 
-    fn release_owner(&self, owner: &PluginId, generation: u32) -> usize {
+    fn poll(
+        &self,
+        owner: &PluginId,
+        generation: u32,
+        handle: i64,
+        max: usize,
+    ) -> Result<bitty_lua::PanelPoll, BridgeError> {
+        self.borrow_mut()?
+            .ui_panel_poll(owner, generation, handle, max)
+    }
+
+    fn release_owner(&self, owner: &PluginId, generation: u32, reason: &str) -> usize {
         match self.borrow_mut() {
-            Ok(mut runtime) => runtime.ui_panel_release_owner(owner, generation),
+            Ok(mut runtime) => runtime.ui_panel_release_owner(owner, generation, reason),
             // The generation edge runs while the runtime may be mid-call. The
             // Core edge releases the record by binding anyway, and the entry is
             // pruned when that release reaches the runtime, so nothing is
             // stranded: reporting zero here is honest, not a lost release.
             Err(_) => 0,
+        }
+    }
+
+    fn drain_events(&self) -> Vec<crate::runtime::ui_panel::PanelContentEvent> {
+        match self.borrow_mut() {
+            Ok(mut runtime) => runtime.drain_panel_content_events(),
+            // A borrowed runtime has nothing to hand over right now; the
+            // observations stay queued (bounded) for the next cold tick instead
+            // of being dropped.
+            Err(_) => Vec::new(),
         }
     }
 }

@@ -36,6 +36,7 @@ if [[ ! -f "$FLAKE" ]]; then
 else
   pass "flake.nix exists"
   FLAKE_CONTENT="$(cat "$FLAKE")"
+  expect_contains "$FLAKE_CONTENT" "version = cargoToml.workspace.package.version;" "flake.nix requires the Cargo workspace version with no fallback"
   expect_contains "$FLAKE_CONTENT" "nixConfig = {" "flake.nix declares nixConfig"
   expect_contains "$FLAKE_CONTENT" "https://bitty.cachix.org" "flake.nix points to bitty.cachix.org substituter"
   expect_contains "$FLAKE_CONTENT" "bitty.cachix.org-1:yglUvUc8ehSxMCnU5t5p7Rer56pGE+TNI7/pWbWDdmc=" "flake.nix declares Cachix public key"

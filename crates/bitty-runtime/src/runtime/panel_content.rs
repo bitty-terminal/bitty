@@ -45,6 +45,7 @@
 //! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
 //! | Mode given back on release | [`Runtime::release_panel_content`] restores the mode recorded at present time when the leaf still carries the mode the layer last requested, and leaves the leaf alone when somebody else moved it |
 //! | Mode given back at a generation edge | the edge's release cannot stamp (the plugin runtime owns no layout), so it carries the typed [`RestoredPanelContent`] to [`Runtime::restore_released_panel_presentation`], which applies the same two guards before the next frame |
+//! | Layer released by a close, without a token | [`Runtime::release_presented_panel_content`] names the layer by the **panel identity** a close already holds (the host resolves the record from its live placement mirror), so a close gesture never needs a [`PanelContentToken`]: the first close press restores the displaced terminal, the next retires the panel |
 //! | Types refusals, nothing changes | `PanelError::{ContentBusy, ContentUnavailable, ContentNotPresented, ContentTokenMismatch, ContentPresentationUnsupported}` |
 //!
 //! Every gate is keyed on "does the panel mounted at this view present a
@@ -357,6 +358,69 @@ impl Runtime {
         self.presented_leaf_frames.remove(&restored.view);
         self.pending_full_redraw = true;
         true
+    }
+
+    /// Releases the layer the panel at `view` presents, without a token
+    /// (bitty#2388, CTX-1912).
+    ///
+    /// [`Runtime::release_panel_content`] is the owner's verb: it is fenced on
+    /// the [`PanelContentToken`] the caller that *presented* the layer holds.
+    /// The close and teardown paths own Core authority over the panel they are
+    /// about to remove but never a token — a user close gesture is not the
+    /// caller that presented — so they could only ever reach the layer by being
+    /// handed somebody else's authority. This seam is the other authority: it
+    /// names the layer the way a close already can, by the **panel identity**
+    /// the layout gives it. The host resolves the panel from its live placement
+    /// mirror and the record from that panel, so the token never leaves Core:
+    /// nothing is minted, forwarded, or exposed on the plugin surface.
+    ///
+    /// The release itself is the ordinary one: the plugin row (if any) is
+    /// pruned, its owner's `panel.content.released` observation records
+    /// [`PANEL_CONTENT_RELEASE_CLOSED`](super::ui_panel::PANEL_CONTENT_RELEASE_CLOSED),
+    /// the presentation mode the layer moved comes back, the geometry takes at
+    /// most one restore resize, and the next frame is a full repaint. Only the
+    /// authority differs, never the restore.
+    ///
+    /// Returns `Ok(None)` when the panel presents no layer — a plain terminal
+    /// panel, a view no panel is mounted at, or a layer already released — so a
+    /// close can read "nothing to restore" and "restored" as the same
+    /// permission to proceed. A refusal (`ContentUnavailable`, a borrowed
+    /// shared host) leaves the layer presented and the displaced shell alive,
+    /// which is why the close paths abort on it instead of tearing down a shell
+    /// nobody can see.
+    ///
+    /// Returns [`PanelError::ContentNotPresented`] /
+    /// [`PanelError::ContentTokenMismatch`] only when the record left between
+    /// the identity read and the release (a concurrent owner release); the
+    /// caller's panel is then already back on its terminal and no restore ran
+    /// twice.
+    pub fn release_presented_panel_content(
+        &mut self,
+        view: ViewId,
+    ) -> Result<Option<RestoredPanelContent>, PanelError> {
+        let Some(host) = self.scene_host.clone() else {
+            // No host, no record: every runtime before bitty#2388, and every
+            // headless one. The close has nothing to restore.
+            return Ok(None);
+        };
+        let token = match host.try_borrow() {
+            Ok(host) => host
+                .presented_content_for_view(view)
+                .map(|layer| layer.token),
+            // Fail closed: a close that cannot read the record must not tear
+            // down the shell behind it.
+            Err(_) => {
+                return Err(PanelError::ContentUnavailable {
+                    view_id: view,
+                    reason: "panel host is borrowed",
+                });
+            }
+        };
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        self.release_panel_content_at(view, token, super::ui_panel::PANEL_CONTENT_RELEASE_CLOSED)
+            .map(Some)
     }
 
     /// Presents the layer of the panel at `view` in `mode` (bitty#2388,

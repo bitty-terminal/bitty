@@ -43,6 +43,13 @@
 //!    terminal-backed, the freeze and the input gate lift, and a later
 //!    generation presents on the same panel. The release is fenced on that
 //!    binding, so a displaced generation cannot reach the record.
+//! 7. **A close gives the displaced terminal back.** A workspace close (and the
+//!    app's close paths, covered by their own rows) releases a layer still
+//!    presented on a panel of that workspace *before* the sweep kills the
+//!    session and disposes the container, keyed on panel identity rather than a
+//!    token the close never holds. The owner's row is pruned and its release is
+//!    recorded as `closed`, so the layer is given back instead of silently
+//!    dropped with its container.
 //!
 //! Every assertion reads observable state — the PTY's own winsize, the pane's
 //! grid, the transport buffer, the presented frame report — never a value the
@@ -1421,4 +1428,57 @@ fn panel_content_layer_release_is_fenced_on_the_ending_generation() {
         Err(PanelError::ContentNotPresented { panel_id }) => assert_eq!(panel_id, presented.panel),
         other => panic!("a spent token must report ContentNotPresented, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row 7: a close gives the displaced terminal back (CTX-1912)
+// ---------------------------------------------------------------------------
+
+/// A workspace close is a teardown of every panel the slot owns: the sessions
+/// die in the close and the containers are disposed, so a layer still presented
+/// at that moment is content covering a shell about to be killed.
+///
+/// The layer must be given back *before* that sweep, through the Core seam keyed
+/// on panel identity (`Runtime::release_presented_panel_content`), so the
+/// owner's row is pruned and its release is recorded as `closed` instead of the
+/// layer being dropped with its container. The row reads the plugin row and the
+/// remembered release rather than the presented record, on purpose: the
+/// disposal would clear the presented record either way, so only the row and the
+/// remembered reason prove the release actually ran.
+#[test]
+fn a_workspace_close_releases_the_layer_a_plugin_presented() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panel_at(&mut rt, PRIMARY);
+    assert!(rt.set_focus(PRIMARY));
+    rt.tick().expect("the primary frame");
+
+    let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
+    let node = bitty_lua::UiRichNode::Text {
+        text: String::from("dashboard"),
+        bold: false,
+    };
+    let handle = rt
+        .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
+        .expect("the plugin presents on the focused panel");
+    assert!(rt.content_layer_presented(PRIMARY));
+    assert_eq!(rt.ui_panel_layer_count(), 1);
+
+    rt.workspace_close_at(0).expect("the only workspace closes");
+
+    assert!(
+        !rt.content_layer_presented(PRIMARY),
+        "the layer does not outlive the workspace that presented it"
+    );
+    assert_eq!(
+        rt.ui_panel_layer_count(),
+        0,
+        "the close released the layer, so the owner's row is gone"
+    );
+    assert_eq!(
+        rt.ui_panel_release_record(handle)
+            .map(|record| record.reason.as_str()),
+        Some("closed"),
+        "the owner learns its layer was released because the panel closed"
+    );
 }

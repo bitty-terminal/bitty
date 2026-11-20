@@ -1546,6 +1546,41 @@ impl TerminalApp {
         self.runtime.set_focus(new_id);
     }
 
+    /// Gives a leaf's displaced terminal back before a close tears it down
+    /// (bitty#2388, CTX-1912).
+    ///
+    /// Returns whether the close may proceed. A leaf that presents no content
+    /// layer — every panel before bitty#2388 — answers `true` and the close runs
+    /// unchanged. A leaf that presents one has the layer released here and
+    /// answers `false`: the layer is a *displacement* of this leaf's terminal,
+    /// so the first close press restores the grid, the child pid, and the
+    /// winsize the layer hid, and the next press closes the panel the user is
+    /// actually looking at. Without that step the first press killed a shell
+    /// nobody could see.
+    ///
+    /// A refused release answers `false` too, and that is the fail-closed half:
+    /// the layer is still painted, so closing now would retire the panel and
+    /// kill the shell behind content that cannot be dismissed, leaving a
+    /// shell-less panel with no terminal left to restore.
+    fn release_presented_panel_content_for_close(&mut self, view: ViewId) -> bool {
+        match self.runtime.release_presented_panel_content(view) {
+            Ok(None) => true,
+            Ok(Some(restored)) => {
+                eprintln!(
+                    "bitty: keymap close_view -> released presented panel content on {view:?} (panel {}) — press close again to close the panel",
+                    restored.panel.0
+                );
+                false
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: keymap close_view could not release presented panel content on {view:?} ({error}) — close ignored"
+                );
+                false
+            }
+        }
+    }
+
     /// Remove the Dwindle `View` leaf (or floating/pinned view) hosting
     /// `panel_id` and dispose the panel record if still live (CTX-1859).
     pub(crate) fn close_plugin_panel_leaf(
@@ -1553,6 +1588,35 @@ impl TerminalApp {
         panel_id: bitty_runtime::registry::PanelId,
         hinted_view: Option<ViewId>,
     ) {
+        // bitty#2388 (CTX-1912): a presented content layer displaces the
+        // panel's terminal, so the layer is given back before the leaf (and the
+        // shell behind it) is retired — keyed on the panel identity the host
+        // still binds, never on the caller's hint. A refused release is the one
+        // case this close must not run: closing now would leave the panel
+        // painted over a shell that no longer exists.
+        let mounted_view = match self.runtime.scene_host() {
+            Some(host) => match host.try_borrow() {
+                Ok(host) => host.placement_view_of(panel_id),
+                Err(_) => {
+                    eprintln!(
+                        "warning: plugin panel {} close refused: panel host is borrowed",
+                        panel_id.0
+                    );
+                    return;
+                }
+            },
+            // No host, no panel record, therefore no layer to release.
+            None => None,
+        };
+        if let Some(view) = mounted_view {
+            if let Err(error) = self.runtime.release_presented_panel_content(view) {
+                eprintln!(
+                    "warning: plugin panel {} close refused: presented content layer not released ({error})",
+                    panel_id.0
+                );
+                return;
+            }
+        }
         let view_id = hinted_view.or_else(|| {
             self.runtime
                 .scene_host()
@@ -2187,6 +2251,15 @@ impl TerminalApp {
                         return false;
                     }
                 };
+                // bitty#2388 (CTX-1912): a presented content layer displaces
+                // this leaf's terminal, so the close gives the terminal back
+                // before it retires anything — including the last-pane
+                // window-close gesture below, which used to exit out from under
+                // a presented layer and kill the shell the user never saw. One
+                // press releases, the next closes.
+                if !self.release_presented_panel_content_for_close(focused) {
+                    return false;
+                }
                 // A zoomed view collapses the live layout to one leaf, so
                 // consult the backup the restore would bring back before
                 // deciding whether this is the last-pane window-close.
@@ -3809,6 +3882,7 @@ mod tests {
     use crate::spawn::SpawnSpec;
     use crate::terminal_app::TerminalApp;
     use bitty_platform::{PlatformEvent, WindowId};
+    use bitty_runtime::registry::PanelId;
     use bitty_runtime::{CloseConfirmMode, PanelLayoutMode, Runtime, RuntimeConfig};
     // Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
     // without the gate the import is unused on Windows.
@@ -12459,6 +12533,271 @@ claims = []
             .expect("restored frame");
         assert_eq!(restored.tier, Some(bitty_runtime::OverlayTier::Float));
         assert_eq!((restored.cols, restored.rows), (before.cols, before.rows));
+    }
+
+    // ── CTX-1912 (bitty#2388): a close gives the displaced terminal back ──
+
+    /// App with one `Terminal` panel mounted on `view`, laid out and focused,
+    /// and no content layer yet.
+    ///
+    /// Mirrors the composition root: the shared host is installed on the runtime
+    /// and the panel is attributed to the workspace the app is on, so
+    /// `present_panel_content` and the close paths see the placement the shipped
+    /// process sees instead of a test-only one.
+    fn panel_close_app(layout: LayoutNode, view: ViewId) -> (TerminalApp, PanelId) {
+        use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
+
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut runtime = Runtime::with_defaults().expect("must build");
+        runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        runtime.set_layout(layout);
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let handle = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("the panel mounts at the leaf");
+        runtime.install_scene_host(host);
+        assert!(runtime.set_focus(view), "the fixture focus must be live");
+        let app = TerminalApp::with_theme(
+            runtime,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        (app, handle.id)
+    }
+
+    /// The one-block rich scene a presented layer paints.
+    fn content_layer(text: &str) -> bitty_rich::scene::Scene {
+        use bitty_rich::scene::{
+            BlockAnchor, BlockId, RichBlock, Scene, SceneNode, ScrollBehavior, StyledSpan,
+        };
+        let mut scene = Scene::new();
+        scene
+            .insert(
+                RichBlock::new(
+                    BlockId(1),
+                    BlockAnchor::Zone(1),
+                    SceneNode::Text(StyledSpan {
+                        text: text.to_string(),
+                        bold: false,
+                        italic: false,
+                    }),
+                    ScrollBehavior::Inline,
+                    1,
+                    1,
+                    1,
+                )
+                .expect("block fits SCN-1..3"),
+            )
+            .expect("scene admits the block");
+        scene
+    }
+
+    /// Concatenated grid glyphs of `view`'s own pane session.
+    fn pane_glyphs(app: &TerminalApp, view: ViewId) -> String {
+        match app.runtime.pane_snapshot(&view) {
+            Some(snapshot) => snapshot.cells.iter().map(|cell| cell.glyph).collect(),
+            None => String::new(),
+        }
+    }
+
+    /// bitty#2388 (CTX-1912): the first close press on a panel that presents a
+    /// content layer gives the displaced terminal back instead of closing it.
+    ///
+    /// The layer covers a live shell, so "close" has to mean the panel the user
+    /// can see. Before this row the whole close path ran `restore_zoom` +
+    /// `close_pane_session` with the layer still presented: the first press
+    /// killed a child nobody had ever seen and dropped the layer on the way out.
+    /// This row fails without the release seam, and it discriminates each half
+    /// of the restore: the content kind comes back, the child pid is unchanged,
+    /// the frozen winsize is what comes back, the grid is byte-identical, the
+    /// panel record still names the leaf — and only the *next* press closes.
+    #[test]
+    #[cfg(unix)]
+    fn close_view_releases_its_presented_layer_before_it_closes_the_leaf() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+        use bitty_runtime::registry::ViewContent;
+
+        let view = ViewId::new(2);
+        let (mut app, panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+                LayoutNode::leaf(View::new(view, 40, 24)),
+            ),
+            view,
+        );
+        app.runtime
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime.handle_pane_bytes(view, b"before-close\r\n");
+        app.runtime.tick().expect("the pane frame");
+
+        let pid = app.runtime.pane_pid(&view).expect("live pane child");
+        let winsize = app.runtime.pane_pty_size(&view).expect("live winsize");
+        let glyphs = pane_glyphs(&app, view);
+        assert!(
+            glyphs.contains("before-close"),
+            "the pane grid must carry the shell's output: {glyphs:?}"
+        );
+
+        app.runtime
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the panel presents a layer over its own terminal");
+        assert!(app.runtime.content_layer_presented(view));
+
+        // First press: the layer is given back, nothing is closed.
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "releasing the layer is not a close"
+        );
+        assert!(
+            !app.runtime.content_layer_presented(view),
+            "the close press must release the presented layer"
+        );
+        assert_eq!(
+            app.runtime.panel_content_kind(view),
+            Some(ViewContent::Terminal(view.0)),
+            "the container is terminal-backed again"
+        );
+        assert_eq!(app.runtime.leaf_count(), 2, "the leaf stays open");
+        assert_eq!(app.runtime.focused_view(), Some(view));
+        assert_eq!(
+            app.runtime.pane_pid(&view),
+            Some(pid),
+            "the displaced child was never killed"
+        );
+        assert_eq!(
+            app.runtime.pane_pty_size(&view),
+            Some(winsize),
+            "the winsize the layer froze is exactly the one that comes back"
+        );
+        assert_eq!(
+            pane_glyphs(&app, view),
+            glyphs,
+            "the restored grid is byte-identical"
+        );
+        {
+            let host = app.runtime.scene_host().expect("panel host");
+            let host = host.borrow();
+            assert_eq!(
+                host.placement_view_of(panel),
+                Some(view),
+                "the panel still names the same leaf"
+            );
+            assert_eq!(
+                host.presented_content_count(),
+                0,
+                "the record is gone, the container is not"
+            );
+        }
+
+        // Second press: nothing left to restore, so it is the close it always
+        // was.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert_eq!(app.runtime.leaf_count(), 1, "the second press closes");
+        assert!(
+            app.runtime.pane_pid(&view).is_none(),
+            "closing the panel tears down its shell"
+        );
+    }
+
+    /// bitty#2388 (CTX-1912): the quit half.
+    ///
+    /// `close_view` on the last panel of the last workspace is the window-close
+    /// gesture, so a presented layer there used to be answered by *exiting* —
+    /// the strongest form of "the first press killed the displaced shell". The
+    /// press must give the layer back instead, and only the next one may exit.
+    /// No PTY is needed: the primary owner is terminal content too, so this row
+    /// cannot silently skip on a build without a PTY backend.
+    #[test]
+    fn close_view_on_the_last_panel_releases_the_layer_before_it_exits() {
+        use bitty_config::ChromeAction;
+
+        let view = ViewId::new(1);
+        let (mut app, _panel) = panel_close_app(LayoutNode::leaf(View::new(view, 80, 24)), view);
+        app.runtime.tick().expect("the primary frame");
+        app.runtime
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the primary panel presents a layer");
+        assert!(app.runtime.content_layer_presented(view));
+
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "the first press must give the layer back, not exit out from under it"
+        );
+        assert!(!app.runtime.content_layer_presented(view));
+
+        assert!(
+            app.apply_chrome_action(ChromeAction::CloseView),
+            "with nothing left to restore, the next press is the window close"
+        );
+    }
+
+    /// bitty#2388 (CTX-1912): the plugin-driven close takes the same release
+    /// first, keyed on the panel identity the host still binds.
+    ///
+    /// The layer here is presented through the plugin surface, so the release is
+    /// observable after the leaf is gone: the owner's row is pruned and its
+    /// remembered release says `closed`. Disposing the container clears the
+    /// presented record either way, so the row and the reason are what prove the
+    /// release ran instead of the layer being dropped with the panel.
+    #[test]
+    #[cfg(unix)]
+    fn closing_a_plugin_panel_leaf_releases_its_layer_before_the_leaf_goes() {
+        require_pty!();
+
+        let view = ViewId::new(2);
+        let (mut app, panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+                LayoutNode::leaf(View::new(view, 40, 24)),
+            ),
+            view,
+        );
+        app.runtime
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime.tick().expect("the pane frame");
+        let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
+        let node = bitty_lua::UiRichNode::Text {
+            text: String::from("dashboard"),
+            bold: false,
+        };
+        let handle = app
+            .runtime
+            .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
+            .expect("the plugin presents on the focused panel");
+        assert!(app.runtime.content_layer_presented(view));
+        assert_eq!(app.runtime.ui_panel_layer_count(), 1);
+
+        app.close_plugin_panel_leaf(panel, Some(view));
+
+        assert!(
+            !app.runtime.content_layer_presented(view),
+            "the panel close releases the layer it was covering"
+        );
+        assert_eq!(
+            app.runtime.ui_panel_layer_count(),
+            0,
+            "the close released the layer, so the owner's row is gone"
+        );
+        assert_eq!(
+            app.runtime
+                .ui_panel_release_record(handle)
+                .map(|record| record.reason.as_str()),
+            Some("closed"),
+            "the owner learns its layer was released because the panel closed"
+        );
+        assert_eq!(app.runtime.leaf_count(), 1, "and then retires the leaf");
     }
 
     #[test]

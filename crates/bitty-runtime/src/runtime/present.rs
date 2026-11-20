@@ -6678,7 +6678,11 @@ impl Runtime {
             // geometry even for a non-zero window origin.
             let col_offset =
                 u32::from(band_x).saturating_add(u32::try_from(start).unwrap_or(u32::MAX));
-            let rect = geometry.row_band(
+            // bitty#3282: paint the band's *cell row*, not the granted rect.
+            // The innermost bottom band is taller than one cell because it
+            // absorbs the sub-cell remainder (bitty#3263); filling the whole
+            // rect left that remainder as dead band fill under the glyphs.
+            let rect = geometry.cell_row(
                 edge,
                 row,
                 u16::try_from(col_offset).unwrap_or(u16::MAX),
@@ -6715,7 +6719,9 @@ impl Runtime {
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule_h = chrome.border_px.max(1);
-        let rule_rect = geometry.row_band(
+        // bitty#3282: the rule marks the content-facing edge of the painted
+        // band, so it follows the same cell row the fills use.
+        let rule_rect = geometry.cell_row(
             edge,
             row,
             band_x,
@@ -6975,7 +6981,14 @@ impl Runtime {
             // `remainder` pixels above it. Zero for the exact-multiple case,
             // for a top band, and for the innermost band (which keeps its cell
             // top).
-            let y_offset = self.band_vertical_offset(anchor.edge, band_row, pad_px);
+            // bitty#3282: the painted cell row sits `content_drop` px below the
+            // granted rect's top, so anchored rows follow it as well.
+            let y_offset = self
+                .band_vertical_offset(anchor.edge, band_row, pad_px)
+                .saturating_add(
+                    self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
+                        .content_drop(anchor.edge, band_row),
+                );
             let x = centered_tooltip_x(anchor.start_col, anchor.end_col, stack_cells, window.width);
             Some(AnchoredOverlayStack {
                 start_row,
@@ -7005,8 +7018,10 @@ impl Runtime {
         // sub-cell remainder above the band is not left blank.
         let band_limit_px = match (anchored.and_then(|stack| stack.limit_row), anchor) {
             (Some(limit), Some(anchor)) => Some(
+                // bitty#3282: clip at the painted cell row, not at the granted
+                // rect, so the card ends on the band it is anchored to.
                 self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
-                    .row_band(anchor.edge, limit, 0, 0)
+                    .cell_row(anchor.edge, limit, 0, 0)
                     .y,
             ),
             _ => None,
@@ -10548,6 +10563,74 @@ mod plugin_overlay_paint_tests {
                 + (i32::from(outer_row) - 2) * i32::try_from(cell_h).unwrap()
                 + i32::try_from(remainder).unwrap(),
             "the whole stack moved down with the band"
+        );
+    }
+
+    #[test]
+    fn bottom_band_tooltip_ends_on_the_painted_cell_row() {
+        // bitty#3282: a single bottom band absorbs the sub-cell remainder above
+        // its cell row, so an anchored card must end on the cell row the band
+        // actually paints -- ending on the granted rect's top left it
+        // `remainder` pixels away from the component it describes.
+        let mut rt = runtime();
+        let (cell_w, cell_h) = rt.live_cell_size();
+        let pad = rt.window_padding_physical();
+        let remainder: u32 = 9;
+        let rows: u32 = 6;
+        let surface_h = cell_h
+            .saturating_mul(rows)
+            .saturating_add(pad.saturating_mul(2))
+            .saturating_add(remainder);
+        rt.handle_resize(PhysicalSize::new(
+            cell_w
+                .saturating_mul(40)
+                .saturating_add(pad.saturating_mul(2)),
+            surface_h,
+        ))
+        .expect("resize onto a remainder surface");
+        rt.set_chrome_bands(ChromeBands {
+            bottom: vec![surface_with_rows(&["bar"])],
+            ..Default::default()
+        });
+        rt.tick().expect("present the band");
+
+        let pad_i = i32::try_from(pad).expect("padding fits i32");
+        let cell_h_i = i32::try_from(cell_h).expect("cell height fits i32");
+        let inset = i32::try_from(surface_h).expect("surface fits i32") - pad_i;
+        let band_row = rt
+            .visible_band_row(BandEdge::Bottom, 0)
+            .expect("bottom band row");
+        let geometry = rt.band_pixel_geometry(pad);
+        let granted_top = geometry.row_band(BandEdge::Bottom, band_row, 0, 0).y;
+        let cell_top = geometry.cell_row(BandEdge::Bottom, band_row, 0, 0).y;
+        assert_eq!(
+            cell_top - granted_top,
+            i32::try_from(remainder).expect("remainder fits i32"),
+            "fixture precondition: the painted row sits the remainder below the granted rect"
+        );
+        assert_eq!(
+            cell_top,
+            inset - cell_h_i,
+            "the painted row ends on the inset"
+        );
+
+        rt.set_plugin_overlay(Some(surface_with_rows(&["detail", "more"])));
+        rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
+            edge: BandEdge::Bottom,
+            visible_index: 0,
+            start_col: 4,
+            end_col: 10,
+        }));
+        let mut layers = FrameLayers::default();
+        rt.paint_plugin_overlay(&[one_frame()], pad_i, &mut layers);
+        let last = layers
+            .combined_overlay_content
+            .last()
+            .expect("the anchored stack paints");
+        assert_eq!(
+            last.rect.y + i32::try_from(last.rect.height).expect("row height"),
+            cell_top,
+            "the last tooltip row ends on the band's painted cell row"
         );
     }
 

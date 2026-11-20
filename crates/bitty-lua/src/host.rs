@@ -1175,6 +1175,10 @@ pub struct PanelPoll {
     pub seq: u64,
     /// Drained events, oldest first (empty for a released layer).
     pub events: Vec<OverlayInput>,
+    /// Key events this layer's queue dropped since the layer was presented:
+    /// both the event-count overflow and the per-plugin text-byte budget evict
+    /// oldest-first and are counted here, so a drop is never silent.
+    pub dropped: u64,
     /// Sticky overflow flag for this layer.
     pub overflowed: bool,
     /// Terminal reason, present only when `active` is `false`.
@@ -3457,12 +3461,20 @@ fn overlay_poll_value(poll: &OverlayPoll) -> LuaValue {
 }
 
 /// Marshal a detailed panel content poll result into the record's table shape
-/// (bitty#2388, CTX-1911): `{ status, seq, events, overflowed, reason? }` with
-/// exactly these fields. `reason` is present only with `"released"`.
+/// (bitty#2388, CTX-1911): `{ status, seq, events, dropped, overflowed,
+/// reason? }` with exactly these fields. `reason` is present only with
+/// `"released"`.
 ///
-/// The record asks the panel poll to mirror the overlay poll, so the two
-/// marshalling functions agree field for field; only the payload the events
-/// carry differs, and it does not.
+/// The record asks the panel poll to mirror the overlay poll, so the five
+/// record fields agree with the overlay poll field for field; only the payload
+/// the events carry differs, and it does not. `dropped` is the one additive
+/// field, and it is not an invention: the binding isolation contract
+/// (`runtime/isolation-resource-rfc.md` RC-5) requires overflow drops to be
+/// "counted and attributed", and the owner draining its own layer is the only
+/// reader that can attribute them — the sticky `overflowed` boolean alone
+/// cannot tell an owner how much it lost. See
+/// [`UI_PANEL_INPUT_BUDGET_BYTES`](crate::UI_PANEL_INPUT_BUDGET_BYTES) for the
+/// bounds that produce the count.
 fn panel_poll_value(poll: &PanelPoll) -> LuaValue {
     let status = if poll.active { "active" } else { "released" };
     let mut pairs = vec![
@@ -3477,6 +3489,10 @@ fn panel_poll_value(poll: &PanelPoll) -> LuaValue {
         (
             LuaValue::String("events".to_string()),
             input_events_value(&poll.events),
+        ),
+        (
+            LuaValue::String("dropped".to_string()),
+            LuaValue::Integer(i64::try_from(poll.dropped).unwrap_or(i64::MAX)),
         ),
         (
             LuaValue::String("overflowed".to_string()),

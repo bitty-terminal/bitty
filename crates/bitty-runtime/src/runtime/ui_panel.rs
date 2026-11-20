@@ -38,10 +38,15 @@
 //! same queue through the same call. Nothing on that path runs plugin code, and
 //! no byte reaches the displaced PTY.
 //!
-//! The queue is per layer, capped at [`UI_PANEL_INPUT_QUEUE_MAX`] events of at
-//! most [`UI_PANEL_INPUT_TEXT_MAX_BYTES`] bytes, with drop-oldest overflow and
-//! a sticky flag. It is dropped the moment the layer ends, so no key survives
-//! into a panel somebody else owns.
+//! The queue is per layer, bounded twice: at most
+//! [`UI_PANEL_INPUT_QUEUE_MAX`] events **and** at most
+//! [`UI_PANEL_INPUT_BUDGET_BYTES`] of held text (the per-plugin bound
+//! `runtime/isolation-resource-rfc.md` RC-5 fixes at 256 KiB). Each event's
+//! text is truncated to [`UI_PANEL_INPUT_TEXT_MAX_BYTES`], which is a
+//! per-event cap and not a budget. Both bounds evict oldest-first, count the
+//! eviction, and raise a sticky flag; the byte budget wins on conflict, so the
+//! event count is an upper bound it may cut short. The queue is dropped the
+//! moment the layer ends, so no key survives into a panel somebody else owns.
 //!
 //! # Typed refusals
 //!
@@ -78,8 +83,8 @@
 
 use bitty_lua::{
     BridgeError, E_UI_NOT_OWNER, E_UI_PANEL_BUSY, E_UI_PANEL_NESTED, E_UI_PANEL_UNAVAILABLE,
-    E_UI_UNAVAILABLE, OverlayInput, OverlayKeyChord, PanelPoll, UI_PANEL_INPUT_QUEUE_MAX,
-    UI_PANEL_INPUT_TEXT_MAX_BYTES, UiPanelSpec,
+    E_UI_UNAVAILABLE, OverlayInput, OverlayKeyChord, PanelPoll, UI_PANEL_INPUT_BUDGET_BYTES,
+    UI_PANEL_INPUT_QUEUE_MAX, UI_PANEL_INPUT_TEXT_MAX_BYTES, UiPanelSpec,
 };
 use bitty_plugin_host::manifest::PluginId;
 use bitty_rich::scene::{BlockId, Scene};
@@ -103,9 +108,11 @@ pub const PANEL_CONTENT_RELEASE_UNLOADED: &str = "unloaded";
 ///
 /// The application drains observations on its cold tick, so an owner that
 /// present/releases in a loop inside one callback would otherwise grow the
-/// buffer without bound. Overflow drops the oldest observation and counts it,
-/// mirroring `PENDING_RELEASED_MAX` in `plugin_runtime::overlay`, the
-/// focusable-overlay capture's identical bound.
+/// buffer without bound. Overflow drops the oldest observation **and counts
+/// it** ([`Runtime::ui_panel_events_dropped`]), mirroring
+/// `PENDING_RELEASED_MAX`/`released_dropped` in `plugin_runtime::overlay`, the
+/// focusable-overlay capture's identical bound. A drop is never silent: the
+/// count is Core-owned, saturating, and readable by the owner.
 pub const PANEL_CONTENT_EVENT_QUEUE_MAX: usize = 64;
 
 /// How many released handles are remembered for a post-release `poll`.
@@ -123,13 +130,33 @@ pub const PANEL_CONTENT_RELEASE_MEMORY_MAX: usize = 64;
 /// `bitty.ui.panel.poll`. Nothing here calls into a VM, so the input hot path
 /// gains one `push_back` and no plugin code (`P0-AC-015`).
 ///
-/// Bounds: [`UI_PANEL_INPUT_QUEUE_MAX`] events, [`UI_PANEL_INPUT_TEXT_MAX_BYTES`]
-/// bytes each, drop-oldest overflow with a sticky flag. The events are the
-/// same bounded key payload the focusable overlay capture queues
-/// ([`OverlayInput`]), so one key channel has one shape.
+/// # Bounds (two, and which one wins)
+///
+/// * [`UI_PANEL_INPUT_QUEUE_MAX`] events — an **event count** bound.
+/// * [`UI_PANEL_INPUT_BUDGET_BYTES`] of held text — the **per-plugin byte
+///   budget**, charged to this layer because a layer holds exactly one
+///   plugin's keys.
+/// * [`UI_PANEL_INPUT_TEXT_MAX_BYTES`] per event — a **truncation cap only**,
+///   never a budget.
+///
+/// Both bounds evict oldest-first and count what they evict, so the sticky
+/// `overflowed` flag and the `dropped` counter cover either cause. The byte
+/// budget wins on conflict: 256 events of 4096 bytes would be 1 MiB per
+/// layer, while `runtime/isolation-resource-rfc.md` (bitty-plugins-docs) RC-5
+/// fixes the per-plugin bound at 1024 events / 256 KiB, and
+/// `specifications/panel-gui-content-presentation-candidate.md`
+/// (bitty-terminal-docs) defers owner queue budgets to "the accepted isolation
+/// contract" — so the count is an upper bound the byte budget may cut short.
+/// With 4096-byte events exactly `256 KiB / 4096 = 64` fit.
+///
+/// The events are the same bounded key payload the focusable overlay capture
+/// queues ([`OverlayInput`]), so one key channel has one shape.
 #[derive(Debug, Default)]
 pub struct PanelContentInputQueue {
     events: std::collections::VecDeque<OverlayInput>,
+    /// Accounted text bytes held by `events`, the value the per-plugin budget
+    /// bounds. Kept incrementally so the hot path never walks the queue.
+    text_bytes: usize,
     next_sequence: u64,
     last_delivered: u64,
     dropped: u64,
@@ -155,7 +182,15 @@ impl PanelContentInputQueue {
         self.events.is_empty()
     }
 
-    /// Queued events dropped by the drop-oldest overflow bound.
+    /// Held text bytes, never above [`UI_PANEL_INPUT_BUDGET_BYTES`].
+    #[must_use]
+    pub const fn text_bytes(&self) -> usize {
+        self.text_bytes
+    }
+
+    /// Events dropped by either bound (count overflow or byte budget) since
+    /// the layer was presented. Saturating, so a pathological session can
+    /// never wrap the count back to "nothing was dropped".
     #[must_use]
     pub const fn dropped(&self) -> u64 {
         self.dropped
@@ -173,32 +208,72 @@ impl PanelContentInputQueue {
         self.last_delivered
     }
 
-    /// Append one key event, dropping the oldest when the queue is full.
+    /// Append one key event, dropping the oldest while either bound is
+    /// exceeded.
     ///
     /// The text is truncated to [`UI_PANEL_INPUT_TEXT_MAX_BYTES`] at a `char`
     /// boundary, so a single event can never exceed the record's payload
-    /// bound. The chord rides alongside the flat text exactly like the overlay
-    /// capture's (issue #2098): without it `ctrl+enter` and a bare `enter`
-    /// marshal identically.
+    /// bound; that cap is per event and not a budget. The chord rides
+    /// alongside the flat text exactly like the overlay capture's (issue
+    /// #2098): without it `ctrl+enter` and a bare `enter` marshal
+    /// identically.
     pub fn push_key(&mut self, text: &str, chord: Option<OverlayKeyChord>) {
-        if self.events.len() >= UI_PANEL_INPUT_QUEUE_MAX {
-            self.events.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-            self.overflowed = true;
+        let text = bounded_panel_text(text);
+        let width = text.len();
+        // Evict oldest-first while either bound would be broken. The count
+        // bound is checked first so the loop cannot spin when the byte budget
+        // already holds the queue below the count.
+        while self.events.len() >= UI_PANEL_INPUT_QUEUE_MAX
+            || self.text_bytes + width > UI_PANEL_INPUT_BUDGET_BYTES
+        {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+        if self.text_bytes + width > UI_PANEL_INPUT_BUDGET_BYTES {
+            // Not reachable with the declared constants (one event is at most
+            // 4096 of 262144 bytes), but the budget is the authority: a text
+            // that cannot fit even in an empty queue is dropped and counted
+            // rather than held over budget.
+            self.note_drop();
+            return;
         }
         self.next_sequence = self.next_sequence.saturating_add(1);
+        self.text_bytes += width;
         self.events.push_back(OverlayInput {
             sequence: self.next_sequence,
             kind: "key".to_string(),
-            text: bounded_panel_text(text),
+            text,
             chord: chord.filter(OverlayKeyChord::is_modified),
         });
+    }
+
+    /// Drop the oldest queued event, releasing its bytes and counting it.
+    ///
+    /// Returns `false` when the queue is empty, which is what stops the
+    /// eviction loop.
+    fn evict_oldest(&mut self) -> bool {
+        let Some(evicted) = self.events.pop_front() else {
+            return false;
+        };
+        self.text_bytes = self.text_bytes.saturating_sub(evicted.text.len());
+        self.note_drop();
+        true
+    }
+
+    /// Count one drop and raise the sticky flag.
+    fn note_drop(&mut self) {
+        self.dropped = self.dropped.saturating_add(1);
+        self.overflowed = true;
     }
 
     /// Drain up to `max` queued events, oldest first.
     fn drain(&mut self, max: usize) -> Vec<OverlayInput> {
         let take = max.min(self.events.len());
         let drained: Vec<OverlayInput> = self.events.drain(..take).collect();
+        for event in &drained {
+            self.text_bytes = self.text_bytes.saturating_sub(event.text.len());
+        }
         if let Some(last) = drained.last() {
             self.last_delivered = last.sequence;
         }
@@ -301,6 +376,10 @@ pub struct UiPanelReleaseRecord {
     pub reason: String,
     /// Whether the layer's queue had overflowed before it was dropped.
     pub overflowed: bool,
+    /// Key events the layer's queue dropped (event count or byte budget)
+    /// before release, so the owner's post-release `poll` still learns how
+    /// much of its input it lost.
+    pub dropped: u64,
     /// Sequence of the last event the owner drained from the layer.
     pub seq: u64,
 }
@@ -577,8 +656,9 @@ impl Runtime {
     /// an owner-initiated cold-path read: Core never calls a plugin callback on
     /// the input path (`P0-AC-015`), so the hot path stays one queue append.
     /// Events come back oldest-first, `max` is clamped to
-    /// [`UI_PANEL_INPUT_QUEUE_MAX`], and the sticky `overflowed` flag reports
-    /// whether the drop-oldest bound discarded anything.
+    /// [`UI_PANEL_INPUT_QUEUE_MAX`], and the result reports both the sticky
+    /// `overflowed` flag and the `dropped` count, so an owner that lost keys to
+    /// either bound learns how many instead of nothing.
     ///
     /// After Core ended the layer, the owner's next poll reports `released`
     /// with the recorded reason and no events — the same remembered-release
@@ -616,6 +696,7 @@ impl Runtime {
                 active: true,
                 seq: queue.last_delivered(),
                 events,
+                dropped: queue.dropped(),
                 overflowed: queue.overflowed(),
                 reason: None,
             });
@@ -626,6 +707,7 @@ impl Runtime {
                     active: false,
                     seq: record.seq,
                     events: Vec::new(),
+                    dropped: record.dropped,
                     overflowed: record.overflowed,
                     reason: Some(record.reason.clone()),
                 });
@@ -643,6 +725,46 @@ impl Runtime {
         self.ui_panel_input
             .get(&handle)
             .map_or(0, PanelContentInputQueue::len)
+    }
+
+    /// Held text bytes of the layer `handle`'s queue, never above
+    /// [`UI_PANEL_INPUT_BUDGET_BYTES`].
+    ///
+    /// Read-only projection for diagnostics and tests: a byte count, never the
+    /// text itself.
+    #[must_use]
+    pub fn ui_panel_queued_bytes(&self, handle: i64) -> usize {
+        self.ui_panel_input
+            .get(&handle)
+            .map_or(0, PanelContentInputQueue::text_bytes)
+    }
+
+    /// Key events the layer `handle`'s queue dropped, live or already released
+    /// (bitty#2388, CTX-1911).
+    ///
+    /// The same value `poll` reports as `dropped`, readable by the Core owner
+    /// without a plugin round trip.
+    #[must_use]
+    pub fn ui_panel_dropped(&self, handle: i64) -> u64 {
+        if let Some(queue) = self.ui_panel_input.get(&handle) {
+            return queue.dropped();
+        }
+        self.ui_panel_released
+            .get(&handle)
+            .map_or(0, |record| record.dropped)
+    }
+
+    /// `panel.content.*` observations dropped by the bounded observation buffer
+    /// since this runtime was created (bitty#2388 D8, CTX-1911).
+    ///
+    /// The buffer is runtime-wide — it holds observations for every layer — so
+    /// this count is runtime-wide too, and it is the count the buffer's
+    /// drop-oldest bound must never make silent. The per-layer count is
+    /// [`Runtime::ui_panel_dropped`] / the poll result's `dropped`, which covers
+    /// a layer's own key queue.
+    #[must_use]
+    pub const fn ui_panel_events_dropped(&self) -> u64 {
+        self.ui_panel_events_dropped
     }
 
     /// The remembered release of `handle`, if a later `poll` may still report
@@ -749,11 +871,11 @@ impl Runtime {
     /// One call site shape for every release path, so an event can never be
     /// claimed for a layer that was not actually released.
     pub(super) fn note_panel_content_release(&mut self, layer: &UiPanelLayerRecord, reason: &str) {
-        let (overflowed, seq) = self
+        let (overflowed, dropped, seq) = self
             .ui_panel_input
             .remove(&layer.handle)
-            .map_or((false, 0), |queue| {
-                (queue.overflowed(), queue.last_delivered())
+            .map_or((false, 0, 0), |queue| {
+                (queue.overflowed(), queue.dropped(), queue.last_delivered())
             });
         let reason = bounded_reason(reason);
         self.push_panel_content_event(PanelContentEvent::Released {
@@ -768,6 +890,7 @@ impl Runtime {
                 generation: layer.generation,
                 reason,
                 overflowed,
+                dropped,
                 seq,
             },
         );
@@ -779,10 +902,18 @@ impl Runtime {
         }
     }
 
-    /// Appends one observation, dropping the oldest at the queue bound.
+    /// Appends one observation, counting every arrival it has to evict.
+    ///
+    /// The buffer is runtime-wide (it holds observations for every layer), so
+    /// its drop count is runtime-wide: [`Runtime::ui_panel_events_dropped`].
+    /// Nothing leaves this buffer unaccounted for — the overlay precedent is
+    /// `plugin_runtime::overlay`'s `released_dropped`, which counts the same
+    /// way — and the count is what makes a shrunk buffer visible to a test
+    /// instead of silently green.
     fn push_panel_content_event(&mut self, event: PanelContentEvent) {
         if self.ui_panel_events.len() >= PANEL_CONTENT_EVENT_QUEUE_MAX {
             self.ui_panel_events.pop_front();
+            self.ui_panel_events_dropped = self.ui_panel_events_dropped.saturating_add(1);
         }
         self.ui_panel_events.push_back(event);
     }

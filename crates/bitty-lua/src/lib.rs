@@ -144,10 +144,11 @@ pub use ui_catalog::{
     ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor,
 };
 pub use ui_panel::{
-    UI_PANEL_INPUT_POLL_MAX_DEFAULT, UI_PANEL_INPUT_QUEUE_MAX, UI_PANEL_INPUT_TEXT_MAX_BYTES,
-    UI_PANEL_PLACEMENTS, UI_PANEL_REASON_MAX_BYTES, UI_PANEL_RELEASE_DEFAULT_REASON,
-    UI_PANEL_RELEASE_REASONS, UI_PANEL_RESTORE_PREVIOUS, UI_PANEL_SPEC_FIELDS, UiPanelPlacement,
-    UiPanelRestore, UiPanelSpec, read_panel_release_reason, read_panel_spec,
+    UI_PANEL_INPUT_BUDGET_BYTES, UI_PANEL_INPUT_POLL_MAX_DEFAULT, UI_PANEL_INPUT_QUEUE_MAX,
+    UI_PANEL_INPUT_TEXT_MAX_BYTES, UI_PANEL_PLACEMENTS, UI_PANEL_REASON_MAX_BYTES,
+    UI_PANEL_RELEASE_DEFAULT_REASON, UI_PANEL_RELEASE_REASONS, UI_PANEL_RESTORE_PREVIOUS,
+    UI_PANEL_SPEC_FIELDS, UiPanelPlacement, UiPanelRestore, UiPanelSpec, read_panel_release_reason,
+    read_panel_spec,
 };
 pub use ui_rich::UiRichNode;
 pub use ui_style::{

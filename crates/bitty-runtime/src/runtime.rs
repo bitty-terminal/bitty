@@ -893,6 +893,14 @@ pub struct Runtime {
     /// Bounded `panel.content.*` observations awaiting the cold-path drain
     /// (bitty#2388 D8, CTX-1911).
     ui_panel_events: std::collections::VecDeque<PanelContentEvent>,
+    /// Observations dropped by [`Self::ui_panel_events`]'s drop-oldest bound
+    /// since the runtime was created (bitty#2388 D8, CTX-1911).
+    ///
+    /// The buffer is runtime-wide, so the count is runtime-wide and saturating:
+    /// one observation over the bound must never leave the buffer unaccounted
+    /// for. Readable through [`Runtime::ui_panel_events_dropped`]; the
+    /// per-layer count is the poll result's `dropped`.
+    ui_panel_events_dropped: u64,
     /// Remembered releases of ended handles, so an owner's next `poll` can
     /// read `released` plus the reason instead of a bare refusal
     /// (bitty#2388 `poll` result shape).
@@ -2492,6 +2500,7 @@ impl Runtime {
             next_ui_panel_handle: 1,
             ui_panel_input: std::collections::BTreeMap::new(),
             ui_panel_events: std::collections::VecDeque::new(),
+            ui_panel_events_dropped: 0,
             ui_panel_released: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
@@ -2843,6 +2852,7 @@ impl Runtime {
             next_ui_panel_handle: 1,
             ui_panel_input: std::collections::BTreeMap::new(),
             ui_panel_events: std::collections::VecDeque::new(),
+            ui_panel_events_dropped: 0,
             ui_panel_released: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,

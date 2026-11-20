@@ -1850,6 +1850,63 @@ impl PluginRuntime {
         self.panel_content_backend = backend;
     }
 
+    /// Drain the runtime's `panel.content.*` observations and deliver each one
+    /// to the bus (bitty#2388 D8, CTX-1911).
+    ///
+    /// This is the whole delivery half of the two audit events: the runtime
+    /// produces bounded observations (a release, a level-triggered
+    /// input-availability nudge), this call names the closed kind and fans the
+    /// payload out to every active subscriber. It is a cold-path call — the
+    /// application tick, never the input path — and it runs no plugin code
+    /// before the payload exists, so a handler can only observe what already
+    /// happened.
+    ///
+    /// The backend is asked for its observations with the shared-runtime borrow
+    /// released again before any delivery, so a handler that re-enters
+    /// `bitty.ui.panel.poll` cannot alias it. Payloads carry `{ owner, handle,
+    /// reason }` for a release and `{ owner, handle, queued }` for a nudge:
+    /// no content, no key bytes, no terminal state.
+    ///
+    /// Returns the number of handler invocations that completed. No backend, no
+    /// observations, or no subscriber all answer `0`.
+    pub fn pump_panel_content_events(&mut self) -> usize {
+        let Some(backend) = self.panel_content_backend.clone() else {
+            return 0;
+        };
+        let observations = backend.drain_events();
+        if observations.is_empty() {
+            return 0;
+        }
+        let mut delivered = 0usize;
+        for observation in observations {
+            let payload = match &observation {
+                crate::runtime::ui_panel::PanelContentEvent::Released {
+                    owner,
+                    handle,
+                    reason,
+                } => LuaValue::table([
+                    ("owner", LuaValue::String(owner.clone())),
+                    ("handle", LuaValue::Integer(*handle)),
+                    ("reason", LuaValue::String(reason.clone())),
+                ]),
+                crate::runtime::ui_panel::PanelContentEvent::InputAvailable {
+                    owner,
+                    handle,
+                    queued,
+                } => LuaValue::table([
+                    ("owner", LuaValue::String(owner.clone())),
+                    ("handle", LuaValue::Integer(*handle)),
+                    (
+                        "queued",
+                        LuaValue::Integer(i64::try_from(*queued).unwrap_or(i64::MAX)),
+                    ),
+                ]),
+            };
+            delivered = delivered.saturating_add(self.deliver_event(observation.kind(), &payload));
+        }
+        delivered
+    }
+
     /// Install the Core-owned terminal-slot scene host (CTX-1641, bitty#2785).
     ///
     /// Call before activation: each `ui.rich` generation captures the shared
@@ -3874,7 +3931,10 @@ impl PluginRuntime {
         }
         entry.state = LifecycleState::Suspended;
         if let Some(services) = entry.services.as_ref() {
-            services.clear_ui_blocks();
+            // bitty#2388 (CTX-1911): a park releases the generation's content
+            // layer, and the release observation names the cause, so an owner
+            // can tell a suspend from a reload or a crash.
+            services.clear_ui_blocks_with_reason(PlaceholderReason::Suspended.as_str());
             // W-29: suspend ends this generation's targeting session and drops
             // its lenses; outstanding handles go stale by construction.
             services.revoke_targeting_lenses();
@@ -4021,7 +4081,9 @@ impl PluginRuntime {
         // CTX-0428: a disposed generation's handles are dead; clear the host
         // registry so a stale handle cannot be served while the entry lingers.
         if let Some(services) = entry.services.as_ref() {
-            services.clear_ui_blocks();
+            // bitty#2388 (CTX-1911): the lifecycle cause this dispose was
+            // called for is the cause the content release reports.
+            services.clear_ui_blocks_with_reason(reason.as_str());
             // W-29: unload/crash/dispose ends the session and drops the
             // generation's lenses, so no orphaned session or dangling lens
             // survives the generation.
@@ -5451,7 +5513,10 @@ impl PluginRuntime {
             // dead owner/epoch, and every later mount would fail
             // `E_UI_UNAVAILABLE` for the process lifetime.
             if let Some(services) = entry.services.as_ref() {
-                services.clear_ui_blocks();
+                // bitty#2388 (CTX-1911): the rollback releases the generation's
+                // content layer with the `crashed` cause — the generation never
+                // reached a runnable state.
+                services.clear_ui_blocks_with_reason(PlaceholderReason::Crashed.as_str());
                 // W-29: clear this generation's targeting session and the
                 // app-shared annotation layer before the services handle is
                 // dropped. A generation that failed while its hint overlay

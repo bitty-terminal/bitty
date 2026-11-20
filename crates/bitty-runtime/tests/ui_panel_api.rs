@@ -40,14 +40,45 @@
 //!     `PluginRuntime::reload` edge restores the terminal, advances the
 //!     generation by exactly one, and neither generation can address the
 //!     other's layer afterwards.
+//! 12. **Keys aimed at a presented panel queue instead of reaching the PTY.**
+//!     CTX-1911: every key pressed while the layer is up is appended to the
+//!     layer's Core-owned queue, `bitty.ui.panel.poll` drains it oldest-first
+//!     (named keys keep an identifiable spelling), the displaced shell's grid
+//!     never moves, and the first key after release encodes again.
+//! 13. **The queue and the drain are bounded.** 256 events per layer with
+//!     drop-oldest overflow, a counted drop, and a sticky flag; `max` clamped
+//!     to that bound; a 64-event default drain.
+//! 14. **Stale, foreign, and released handles are typed refusals.** A foreign
+//!     generation and an unknown handle are `E_UI_NOT_OWNER`, the owner's poll
+//!     after a release reads `released` plus the reason, a malformed `max` is
+//!     `E_UI_COMPONENT_INVALID`, a generation-edge release reports its cause,
+//!     and `poll` needs `ui.panel` before any handle is resolved.
+//! 15. **The two audit events reach a subscriber.** `panel.content.released`
+//!     and `panel.content.input-available` are emitted by the runtime, drained
+//!     through the backend, delivered by
+//!     `PluginRuntime::pump_panel_content_events`, and observed as bounded
+//!     payloads (owner/handle/reason, owner/handle/queued) with no key bytes.
+//! 16. **The queue's held text is the per-plugin bound.** 256 events is a
+//!     count bound and 4096 bytes a per-event cap; the aggregate text a layer
+//!     may hold is `UI_PANEL_INPUT_BUDGET_BYTES` (256 KiB, the isolation
+//!     contract's RC-5 per-plugin budget), and the byte budget wins: at
+//!     maximum-size events it holds `256 KiB / 4096` events, not 256.
+//! 17. **An evicted observation is counted.** The bounded `panel.content.*`
+//!     buffer's drop-oldest bound surfaces in
+//!     `Runtime::ui_panel_events_dropped`, so retained + dropped accounts for
+//!     every release.
+//! 18. **A `cancelled` release records `cancelled`.** The non-default owner
+//!     disposition is read back from the observation and from `poll`, so a
+//!     release path that hardcoded the default fails a row.
 //!
 //! # Verification limits
 //!
-//! Rows 1, 2, 4, 5, 8, 9, 10, and 11 read a live pane's kernel winsize or grid,
-//! so they call `bitty_test_support::require_pty!()` as their **first
-//! statement** and skip on a build without a PTY backend (the workspace skip
-//! convention, not evidence). Rows 3, 6, and 7 need no PTY: they assert a typed
-//! code produced before any terminal is touched.
+//! Rows 1, 2, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, and 18 read a live
+//! pane's kernel winsize or grid, so they call
+//! `bitty_test_support::require_pty!()` as their **first statement** and skip
+//! on a build without a PTY backend (the workspace skip convention, not
+//! evidence). Rows 3, 6, 7, and the `ui.panel` grant row of 14 need no PTY:
+//! they assert a typed code produced before any terminal is touched.
 //!
 //! Row 9 addresses the fence through `Runtime::ui_panel_update` /
 //! `Runtime::ui_panel_release` rather than through a Lua verb, because no
@@ -63,15 +94,20 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use bitty_lua::{BridgeError, LuaValue};
-use bitty_platform::PhysicalSize;
+use bitty_lua::{
+    BridgeError, LuaValue, UI_PANEL_INPUT_BUDGET_BYTES, UI_PANEL_INPUT_QUEUE_MAX,
+    UI_PANEL_INPUT_TEXT_MAX_BYTES,
+};
+use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PhysicalSize, PressState};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig, RuntimePanelContentBackend,
     SnapshotSource,
 };
 use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    LayoutNode, PANEL_CONTENT_EVENT_QUEUE_MAX, Runtime, SplitAxis, UiRect, View, ViewId,
+};
 use bitty_ui::panel::ViewContent;
 
 mod common;
@@ -168,9 +204,51 @@ const COMMANDS: &[&str] = &[
     "release",
     "release_handle",
     "release_bad_reason",
+    "release_cancelled",
     "release_twice",
     "release_unknown",
+    "poll",
+    "poll_max",
+    "poll_handle",
+    "poll_bad_max",
+    "poll_texts",
+    "poll_head",
 ];
+
+/// The observer plugin's command: report everything the bus handed it.
+const OBSERVER_COMMANDS: &[&str] = &["events"];
+
+/// The observer body: subscribe to both `panel.content.*` kinds and record a
+/// `kind:owner:handle:value:field-count` row per delivery.
+///
+/// The field count is the audit assertion: a payload that grew a content or key
+/// field would change it, so "observation-only, no content" is a value the test
+/// reads instead of a promise.
+const OBSERVER_INIT: &str = r#"
+local log = {}
+
+local function count(table_value)
+  local total = 0
+  for _ in pairs(table_value) do total = total + 1 end
+  return total
+end
+
+bitty.events.subscribe("panel.content.released", function(envelope)
+  local payload = envelope.payload
+  log[#log + 1] = envelope.kind .. ":" .. tostring(payload.owner) .. ":"
+    .. tostring(payload.handle) .. ":" .. tostring(payload.reason) .. ":" .. tostring(count(payload))
+end)
+
+bitty.events.subscribe("panel.content.input-available", function(envelope)
+  local payload = envelope.payload
+  log[#log + 1] = envelope.kind .. ":" .. tostring(payload.owner) .. ":"
+    .. tostring(payload.handle) .. ":" .. tostring(payload.queued) .. ":" .. tostring(count(payload))
+end)
+
+bitty.commands.register({ id = "events", title = "Events", run = function()
+  return "OK:" .. table.concat(log, ";")
+end })
+"#;
 
 /// The plugin body shared by every fixture.
 ///
@@ -258,6 +336,13 @@ bitty.commands.register({ id = "release_bad_reason", title = "Release bad reason
   return report(ok, err)
 end })
 
+-- The one non-default owner disposition: `cancelled` must be recorded as
+-- itself, so a release path that hardcodes the default `released` fails a row.
+bitty.commands.register({ id = "release_cancelled", title = "Release cancelled", run = function()
+  local ok, err = bitty.ui.panel.release(handle, "cancelled")
+  return report(ok, err)
+end })
+
 bitty.commands.register({ id = "release_twice", title = "Release twice", run = function()
   local first = report(bitty.ui.panel.release(handle))
   local second = report(bitty.ui.panel.release(handle))
@@ -268,19 +353,117 @@ bitty.commands.register({ id = "release_unknown", title = "Release unknown", run
   local ok, err = bitty.ui.panel.release(424242, "released")
   return report(ok, err)
 end })
+
+-- bitty.ui.panel.poll (bitty#2388, CTX-1911): the result is reported as
+-- status|seq|count|dropped|overflowed|first-seq|last-seq|first-text|last-text|reason
+-- so a test can assert every field the design record fixes, plus order and the
+-- bounded payload, without a second marshalling surface. `dropped` is the
+-- per-layer count of keys the queue evicted (event count or byte budget).
+local function poll_report(target, max)
+  local result, err = bitty.ui.panel.poll(target, max)
+  if err then return "ERR:" .. err.code end
+  local count = #result.events
+  local first_seq, first_text, last_seq, last_text = "none", "none", "none", "none"
+  if count > 0 then
+    first_seq = tostring(result.events[1].seq)
+    first_text = tostring(result.events[1].text)
+    last_seq = tostring(result.events[count].seq)
+    last_text = tostring(result.events[count].text)
+  end
+  return "OK:" .. result.status .. "|" .. tostring(result.seq) .. "|"
+    .. tostring(count) .. "|" .. tostring(result.dropped) .. "|"
+    .. tostring(result.overflowed) .. "|"
+    .. first_seq .. "|" .. last_seq .. "|" .. first_text .. "|" .. last_text .. "|"
+    .. tostring(result.reason)
+end
+
+-- The same drain, but with every event's text spelled out in order, so a row
+-- can assert what a *middle* event carried (row 12's `Escape`, which produces
+-- no printable text and must still be identifiable in the queue).
+local function poll_texts_report(target, max)
+  local result, err = bitty.ui.panel.poll(target, max)
+  if err then return "ERR:" .. err.code end
+  local count = #result.events
+  local first_seq, last_seq = "none", "none"
+  local texts = {}
+  if count > 0 then
+    first_seq = tostring(result.events[1].seq)
+    last_seq = tostring(result.events[count].seq)
+    for index = 1, count do texts[index] = tostring(result.events[index].text) end
+  end
+  return "OK:" .. result.status .. "|" .. tostring(result.seq) .. "|"
+    .. tostring(count) .. "|" .. tostring(result.dropped) .. "|"
+    .. tostring(result.overflowed) .. "|"
+    .. first_seq .. "|" .. last_seq .. "|" .. table.concat(texts, ",") .. "|"
+    .. tostring(result.reason)
+end
+
+bitty.commands.register({ id = "poll", title = "Poll", run = function()
+  return poll_report(handle, nil)
+end })
+
+bitty.commands.register({ id = "poll_texts", title = "Poll texts", run = function()
+  return poll_texts_report(handle, nil)
+end })
+
+-- The head of the queue without its text, for payloads too large to carry back
+-- through one command result (the bridge caps a returned value at 8 KiB, and a
+-- 4096-byte key appears twice in the summary form):
+-- `status|seq|count|dropped|overflowed|first-seq|first-text-bytes`.
+bitty.commands.register({ id = "poll_head", title = "Poll head", run = function()
+  local result, err = bitty.ui.panel.poll(handle, 1)
+  if err then return "ERR:" .. err.code end
+  local count = #result.events
+  local first_seq, first_bytes = "none", "none"
+  if count > 0 then
+    first_seq = tostring(result.events[1].seq)
+    first_bytes = tostring(#result.events[1].text)
+  end
+  return "OK:" .. result.status .. "|" .. tostring(result.seq) .. "|"
+    .. tostring(count) .. "|" .. tostring(result.dropped) .. "|"
+    .. tostring(result.overflowed) .. "|" .. first_seq .. "|" .. first_bytes
+end })
+
+bitty.commands.register({ id = "poll_max", title = "Poll max", run = function(max)
+  return poll_report(handle, max)
+end })
+
+bitty.commands.register({ id = "poll_handle", title = "Poll handle", run = function(target)
+  return poll_report(target, nil)
+end })
+
+bitty.commands.register({ id = "poll_bad_max", title = "Poll bad max", run = function()
+  return poll_report(handle, 0)
+end })
 "#;
 
-/// Write one fixture plugin whose `init.lua` registers [`COMMANDS`].
-fn write_plugin(root: &Path, id: &str, capabilities: &[&str]) {
+/// Write one fixture plugin: `init` source, its manifest command list, its
+/// capability grants, and the bus kinds it may subscribe to.
+///
+/// `events` are the bus kinds the manifest declares under `[lazy]`, which is
+/// what lets `bitty.events.subscribe` accept them for this generation.
+fn write_plugin(
+    root: &Path,
+    id: &str,
+    capabilities: &[&str],
+    events: &[&str],
+    commands: &[&str],
+    init: &str,
+) {
     let plugin = root.join(id);
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
     let capabilities_toml = capabilities
         .iter()
         .map(|capability| format!("{capability} = true\n"))
         .collect::<String>();
-    let qualified = COMMANDS
+    let qualified = commands
         .iter()
         .map(|command| format!("\"{id}:{command}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let events_toml = events
+        .iter()
+        .map(|event| format!("\"{event}\""))
         .collect::<Vec<_>>()
         .join(", ");
     std::fs::write(
@@ -299,12 +482,12 @@ plugin-api = "^1.0"
 {capabilities_toml}
 [lazy]
 commands = [{qualified}]
-events = []
+events = [{events_toml}]
 "#
         ),
     )
     .expect("manifest");
-    std::fs::write(plugin.join("lua/init.lua"), INIT).expect("init");
+    std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
 }
 
 struct Fixture {
@@ -347,7 +530,7 @@ impl Fixture {
     ) -> Self {
         let root = temp_dir(tag);
         for (id, capabilities) in declared {
-            write_plugin(&root, id, capabilities);
+            write_plugin(&root, id, capabilities, &[], COMMANDS, INIT);
         }
         let live = live_runtime(layout, mount, focus);
         let mut plugins = plugin_runtime(&root, Rc::clone(&live), with_backend);
@@ -403,6 +586,68 @@ impl Fixture {
             .spawn_shell_for_view(PANE, "/bin/sh", &["-c", "sleep 30"], 40, 12)
             .expect("pane shell spawns");
         self.live.borrow_mut().tick().expect("baseline frame");
+    }
+
+    /// Write, discover, and activate an observer plugin that subscribes to both
+    /// `panel.content.*` kinds. Returns its id.
+    ///
+    /// A second plugin is the honest observer: it holds no content grant, so a
+    /// payload it can read is a payload that carries nothing privileged.
+    fn add_observer(&mut self, id: &str) -> PluginId {
+        write_plugin(
+            &self.root,
+            id,
+            &[],
+            &["panel.content.released", "panel.content.input-available"],
+            OBSERVER_COMMANDS,
+            OBSERVER_INIT,
+        );
+        self.plugins.discover();
+        let observer = PluginId::new(id).expect("valid id");
+        let report = self
+            .plugins
+            .activate(&observer)
+            .expect("observer activates");
+        assert_eq!(report.state, LifecycleState::Active);
+        observer
+    }
+
+    /// The observer's recorded bus log, one row per delivery.
+    fn observer_log(&mut self, observer: &PluginId) -> Vec<String> {
+        let report = common::settle_dispatch(&mut self.plugins, observer, "events", &[])
+            .expect_string("events");
+        let payload = report
+            .strip_prefix("OK:")
+            .expect("the events command answers");
+        if payload.is_empty() {
+            return Vec::new();
+        }
+        payload.split(';').map(str::to_string).collect()
+    }
+}
+
+/// One key press with the text the platform would deliver.
+fn char_key(text: &str) -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Character(text.to_string()),
+        text: Some(text.to_string()),
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    }
+}
+
+/// One named-key press (`Escape`, `Enter`, …) — no produced text, like a real
+/// control key.
+fn named_key(named: NamedKey) -> KeyEvent {
+    KeyEvent {
+        logical_key: LogicalKey::Named(named),
+        text: None,
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
     }
 }
 
@@ -1189,5 +1434,592 @@ fn a_reloaded_generation_releases_the_layer_and_the_predecessor_owns_nothing() {
         live.content_restore_resizes(),
         1,
         "neither refused call restored the terminal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 12 (CTX-1911): keys aimed at a presented panel queue oldest-first, never
+// reach the PTY, and go back to the shell once the layer is released
+// ---------------------------------------------------------------------------
+
+/// The record's `Terminal -> Gui` input branch, end to end: three keys pressed
+/// while the layer is up are appended to the layer's Core-owned queue, drained
+/// by `bitty.ui.panel.poll` in press order, and never encoded. The displaced
+/// shell receives nothing — the pane grid is byte-identical and the swallowed
+/// counter moves — and the very next key after release encodes again, which is
+/// the half a queue that merely dropped keys could not show.
+#[test]
+fn keys_aimed_at_a_presented_panel_queue_oldest_first_and_never_reach_the_pty() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("input-queue", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let before = pane_text(&fixture.live, PANE);
+
+    for key in [char_key("j"), char_key("k"), named_key(NamedKey::Escape)] {
+        assert_eq!(
+            fixture.live.borrow_mut().handle_key_event_ref(&key),
+            None,
+            "a presented panel encodes no key"
+        );
+    }
+    // The owned entry point (`handle_key_event_at`, the window path) is a second
+    // copy of the same gate and must reach the same queue; driving only the
+    // borrowed one would leave that half of the routing untested.
+    assert_eq!(
+        fixture
+            .live
+            .borrow_mut()
+            .handle_key_event_at(char_key("q"), std::time::Instant::now()),
+        None,
+        "the owned keyboard path encodes no key either"
+    );
+    {
+        let live = fixture.live.borrow();
+        assert_eq!(
+            live.ui_panel_queued(handle),
+            4,
+            "every key from either entry point is retained for the owner"
+        );
+        assert_eq!(
+            live.content_input_swallowed(),
+            4,
+            "the swallow counter still reports the gate firing"
+        );
+    }
+    assert_eq!(
+        pane_text(&fixture.live, PANE),
+        before,
+        "no key reached the displaced shell"
+    );
+
+    // Oldest first, and the named key carries its own spelling: a control key
+    // produces no text, so `Escape` must still be identifiable *in the queue*
+    // — the third event, not just the head or the tail the summary form
+    // reports. A queue that dropped or mangled it fails here.
+    let polled = fixture.run_ok("poll_texts");
+    assert_eq!(
+        polled, "active|4|4|0|false|1|4|j,k,Escape,q|nil",
+        "poll drains oldest-first, keeps `Escape` identifiable in the middle, and counts no drops"
+    );
+    assert_eq!(
+        fixture.run_ok("poll"),
+        "active|4|0|0|false|none|none|none|none|nil",
+        "a drained queue reports nothing new and keeps the last sequence"
+    );
+
+    // Release restores the terminal and ends the gate: the next key encodes.
+    assert_eq!(fixture.run_ok("release"), "true");
+    assert_eq!(
+        fixture
+            .live
+            .borrow_mut()
+            .handle_key_event_ref(&char_key("a")),
+        Some(b"a".to_vec()),
+        "keys reach the shell again once the layer is gone"
+    );
+    assert_eq!(
+        fixture.live.borrow().ui_panel_queued(handle),
+        0,
+        "the queue died with its layer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 13 (CTX-1911): the queue is bounded, drops oldest, and poll clamps
+// ---------------------------------------------------------------------------
+
+/// Bounds from the record's table: 256 queued events per layer, drop-oldest
+/// overflow with a sticky flag, `max` clamped to the same bound, and a default
+/// drain of 64. The retained sequence window (45..=300 of 300 presses) is what
+/// proves oldest-first *dropping* rather than oldest-first delivery of a
+/// truncated head.
+#[test]
+fn the_panel_key_queue_is_bounded_and_poll_clamps_its_drain() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("input-bounds", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+
+    for _ in 0..300 {
+        assert_eq!(
+            fixture
+                .live
+                .borrow_mut()
+                .handle_key_event_ref(&char_key("x")),
+            None
+        );
+    }
+    assert_eq!(
+        fixture.live.borrow().ui_panel_queued(handle),
+        256,
+        "the queue never exceeds the 256-event bound"
+    );
+
+    let drained = fixture.run_on_args(PLUGIN, "poll_max", &[LuaValue::Integer(4000)]);
+    let parts: Vec<&str> = drained
+        .strip_prefix("OK:")
+        .unwrap_or_else(|| panic!("poll must answer, got {drained}"))
+        .split('|')
+        .collect();
+    assert_eq!(parts[0], "active", "the layer is still presented");
+    assert_eq!(parts[1], "300", "seq counts every event ever queued");
+    assert_eq!(
+        parts[2], "256",
+        "max is clamped to the queue bound, not honored at 4000"
+    );
+    assert_eq!(
+        parts[3], "44",
+        "the count bound evicted 44 events and counted every one"
+    );
+    assert_eq!(parts[4], "true", "overflow is sticky");
+    assert_eq!(
+        parts[5], "45",
+        "the 300th push evicted the 44 oldest events"
+    );
+    assert_eq!(parts[6], "300", "the newest event is still queued");
+    assert_eq!(parts[7], "x", "the retained window starts at press 45");
+    assert_eq!(fixture.live.borrow().ui_panel_queued(handle), 0);
+
+    // The default drain is 64: 70 presses, then one nil-max poll leaves 6.
+    for _ in 0..70 {
+        let _ = fixture
+            .live
+            .borrow_mut()
+            .handle_key_event_ref(&char_key("y"));
+    }
+    let default_poll = fixture.run_ok("poll");
+    let parts: Vec<&str> = default_poll.split('|').collect();
+    assert_eq!(parts[0], "active");
+    assert_eq!(parts[2], "64", "a nil max drains the 64-event default");
+    assert_eq!(
+        parts[3], "44",
+        "the count is cumulative and moves only on an eviction: this batch of 70 one-byte \
+         presses fit inside the text budget with room to spare"
+    );
+    assert_eq!(
+        parts[4], "true",
+        "overflow is sticky for the layer: 300 earlier presses already dropped events"
+    );
+    assert_eq!(fixture.live.borrow().ui_panel_queued(handle), 6);
+    let rest = fixture.run_ok("poll");
+    let parts: Vec<&str> = rest.split('|').collect();
+    assert_eq!(parts[2], "6", "the remainder drains on the next call");
+}
+
+// ---------------------------------------------------------------------------
+// Row 14 (CTX-1911): stale and foreign handles are refused, a released layer
+// reports its reason, and the queue needs the grant
+// ---------------------------------------------------------------------------
+
+/// Every refusal the record names for this verb, plus the released shape: a
+/// foreign generation, an unknown handle, and a released handle fail typed with
+/// `E_UI_NOT_OWNER`; the owner's poll after a release reads `released` with the
+/// recorded reason; a malformed `max` is a validation refusal; and a generation
+/// without `ui.panel` is denied before any handle is resolved.
+#[test]
+fn poll_refuses_stale_and_foreign_handles_and_reports_a_release() {
+    bitty_test_support::require_pty!();
+    const OTHER: &str = "xuepoo.other";
+    let mut fixture = Fixture::build(
+        "input-refusals",
+        &[
+            (PLUGIN, &["ui.rich", "ui.panel"]),
+            (OTHER, &["ui.rich", "ui.panel"]),
+        ],
+        two_panes(),
+        PANE,
+        PANE,
+        true,
+    );
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+
+    assert_eq!(
+        fixture.run_on_args(PLUGIN, "poll_handle", &[LuaValue::Integer(424242)]),
+        "ERR:E_UI_NOT_OWNER",
+        "an unknown handle names nothing"
+    );
+    assert_eq!(
+        fixture.run_on_args(OTHER, "poll_handle", &[LuaValue::Integer(handle)]),
+        "ERR:E_UI_NOT_OWNER",
+        "another generation must not drain somebody else's keys"
+    );
+    assert_eq!(
+        fixture.run("poll_bad_max"),
+        "ERR:E_UI_COMPONENT_INVALID",
+        "a non-positive max is a shape error, not a silent default"
+    );
+    assert_eq!(
+        fixture.live.borrow().ui_panel_queued(handle),
+        0,
+        "every refusal above drained nothing"
+    );
+
+    // Two keys, then the owner's own release: the queue is dropped, and the
+    // owner's next poll reads the outcome instead of a bare refusal.
+    let _ = fixture
+        .live
+        .borrow_mut()
+        .handle_key_event_ref(&char_key("j"));
+    let _ = fixture
+        .live
+        .borrow_mut()
+        .handle_key_event_ref(&char_key("k"));
+    assert_eq!(fixture.run_ok("release"), "true");
+    assert_eq!(
+        fixture.run_ok("poll"),
+        "released|0|0|0|false|none|none|none|none|released",
+        "a released layer reports its reason and carries no events"
+    );
+    assert_eq!(
+        fixture.run("release"),
+        "ERR:E_UI_NOT_OWNER",
+        "release stays a typed refusal after the row is gone"
+    );
+
+    // A generation edge releases the layer and the reason names the cause; the
+    // Core call is the owner+generation pair the Lua surface uses.
+    let fresh: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let (owner, generation) = {
+        let live = fixture.live.borrow();
+        let layer = live.ui_panel_layer(fresh).expect("fresh layer");
+        (layer.owner.clone(), layer.generation)
+    };
+    let _ = fixture
+        .live
+        .borrow_mut()
+        .handle_key_event_ref(&char_key("j"));
+    fixture
+        .plugins
+        .suspend(&PluginId::new(PLUGIN).expect("valid id"))
+        .expect("suspend");
+    let released = fixture
+        .live
+        .borrow_mut()
+        .ui_panel_poll(&owner, generation, fresh, 8)
+        .expect("a released layer answers");
+    assert!(!released.active, "the layer was released by the edge");
+    assert_eq!(
+        released.reason.as_deref(),
+        Some("suspended"),
+        "the generation edge records the lifecycle cause"
+    );
+    assert!(
+        released.events.is_empty(),
+        "a released layer hands over no keys"
+    );
+}
+
+#[test]
+fn poll_needs_the_ui_panel_grant_before_any_handle_is_resolved() {
+    let mut fixture = Fixture::new("input-grant", &["ui.rich"]);
+    assert_eq!(
+        fixture.run_on_args(PLUGIN, "poll_handle", &[LuaValue::Integer(1)]),
+        "ERR:E_CAPABILITY_DENIED",
+        "the grant is checked before the handle, so no handle shape leaks"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 15 (CTX-1911): the two audit events reach a subscriber
+// ---------------------------------------------------------------------------
+
+/// Observation-only delivery of both `panel.content.*` kinds over the real
+/// chain: the runtime queues the observation, the backend drains it,
+/// `PluginRuntime::pump_panel_content_events` names the closed kind and fans it
+/// out, and an ungranted subscriber records exactly the bounded payload.
+///
+/// The payload's field count is asserted (`3` for a nudge, `3` for a release),
+/// so a payload that grew a content or key field fails this row instead of
+/// silently widening the audit surface.
+#[test]
+fn the_panel_content_events_reach_a_subscriber_with_bounded_payloads() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("content-events", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let observer = fixture.add_observer("xuepoo.observer");
+    assert!(
+        fixture.observer_log(&observer).is_empty(),
+        "nothing is observed before anything happens"
+    );
+
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+    let _ = fixture
+        .live
+        .borrow_mut()
+        .handle_key_event_ref(&char_key("j"));
+    let _ = fixture
+        .live
+        .borrow_mut()
+        .handle_key_event_ref(&char_key("k"));
+
+    // Cold-path pump, exactly what the application tick would call.
+    assert_eq!(
+        fixture.plugins.pump_panel_content_events(),
+        1,
+        "one observer, one level-triggered nudge"
+    );
+    assert_eq!(
+        fixture.observer_log(&observer),
+        vec![format!(
+            "panel.content.input-available:{PLUGIN}:{handle}:2:3"
+        )],
+        "the nudge names owner, handle, depth, and nothing else"
+    );
+    assert!(
+        fixture.plugins.pump_panel_content_events() == 1,
+        "the nudge is level-triggered while input stays undrained"
+    );
+    assert_eq!(
+        fixture.observer_log(&observer).len(),
+        2,
+        "a still-undrained queue nudges again on the next tick"
+    );
+    assert_eq!(fixture.run_ok("poll").split('|').nth(2), Some("2"));
+    assert_eq!(
+        fixture.plugins.pump_panel_content_events(),
+        0,
+        "a drained queue produces no nudge"
+    );
+
+    // The owner's release: the observation carries the reason and no keys.
+    assert_eq!(fixture.run_ok("release"), "true");
+    assert_eq!(
+        fixture.plugins.pump_panel_content_events(),
+        1,
+        "the release reaches the subscriber"
+    );
+    assert_eq!(
+        fixture.observer_log(&observer),
+        vec![
+            format!("panel.content.input-available:{PLUGIN}:{handle}:2:3"),
+            format!("panel.content.input-available:{PLUGIN}:{handle}:2:3"),
+            format!("panel.content.released:{PLUGIN}:{handle}:released:3"),
+        ],
+        "the release names owner, handle, reason, and nothing else"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 16 (CTX-1911): the queue's held text is the per-plugin 256 KiB bound,
+// not 256 events x 4096 bytes
+// ---------------------------------------------------------------------------
+
+/// The two bounds the isolation contract and the design record fix, proven to
+/// be enforced together with the byte budget winning.
+///
+/// The numbers are read from the declared constants, so this row tracks a
+/// contract revision instead of pinning today's values: `fits = budget /
+/// per-event cap` is what a layer may hold, and the row presses `fits + 6`
+/// maximum-size keys. That eviction is **byte-driven** — `fits` is far below
+/// the event-count bound — so a queue that only enforced the count would hold
+/// `fits + 6` events and fail here, and a queue that dropped the budget
+/// entirely would hold `fits + 6` at 1 MiB of text.
+#[test]
+fn the_queue_holds_the_per_plugin_byte_budget_not_one_mib() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("input-bytes", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+
+    let per_event = UI_PANEL_INPUT_TEXT_MAX_BYTES;
+    let fits = UI_PANEL_INPUT_BUDGET_BYTES / per_event;
+    assert!(
+        fits < UI_PANEL_INPUT_QUEUE_MAX,
+        "at maximum-size events the byte budget is the binding bound, not the event count"
+    );
+    assert!(
+        fits >= 1,
+        "the byte budget must hold at least one maximum-size event: a budget below the \
+         per-event cap would leave the queue unable to retain a single key"
+    );
+    let presses = fits + 6;
+    let text = "z".repeat(per_event);
+    for _ in 0..presses {
+        assert_eq!(
+            fixture
+                .live
+                .borrow_mut()
+                .handle_key_event_ref(&char_key(&text)),
+            None,
+            "a presented panel still encodes no key"
+        );
+    }
+
+    {
+        let live = fixture.live.borrow();
+        assert_eq!(
+            live.ui_panel_queued(handle),
+            fits,
+            "the byte budget, not the 256-event count, bounded the queue"
+        );
+        assert_eq!(
+            live.ui_panel_queued_bytes(handle),
+            fits * per_event,
+            "held text is exactly the budget"
+        );
+        assert!(
+            live.ui_panel_queued_bytes(handle) <= UI_PANEL_INPUT_BUDGET_BYTES,
+            "held text never exceeds the per-plugin bound"
+        );
+        assert_eq!(
+            live.ui_panel_dropped(handle),
+            6,
+            "every byte-budget eviction is counted, not silent"
+        );
+    }
+
+    // One event per call, and its text is reported by length rather than by
+    // value: the drained batch is bounded by the bridge's 8 KiB return-value
+    // limit as well (`max` events of 4096 bytes can exceed it), so the row
+    // checks the head of the retained window here and reads the queue-side
+    // accounting from the Core accessors above.
+    let head = fixture.run_ok("poll_head");
+    let parts: Vec<&str> = head.split('|').collect();
+    assert_eq!(parts[0], "active");
+    assert_eq!(parts[2], "1", "one event drained");
+    assert_eq!(parts[3], "6", "the drain reports the same drop count");
+    assert_eq!(
+        parts[4], "true",
+        "byte-budget eviction raises the sticky flag"
+    );
+    assert_eq!(
+        parts[5],
+        (presses - fits + 1).to_string(),
+        "drop-oldest: the retained window starts after the evicted head"
+    );
+    assert_eq!(
+        parts[6],
+        per_event.to_string(),
+        "the drained event carries one full-size payload, not a truncated one"
+    );
+    assert_eq!(
+        fixture.live.borrow().ui_panel_queued(handle),
+        fits - 1,
+        "the rest of the retained window stays queued"
+    );
+    assert_eq!(
+        fixture.live.borrow().ui_panel_queued_bytes(handle),
+        (fits - 1) * per_event,
+        "draining releases exactly the text it handed over"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 17 (CTX-1911): an observation the bounded buffer evicts is counted
+// ---------------------------------------------------------------------------
+
+/// The observation buffer's drop-oldest bound must be observable, not silent.
+///
+/// Two halves, and both are load-bearing:
+///
+/// * **The bound is the declared mirror.** `PANEL_CONTENT_EVENT_QUEUE_MAX` is
+///   the overlay capture's `PENDING_RELEASED_MAX` by design, so a *silent*
+///   shrink of one of them is a bug: the accounting identity below still adds
+///   up at any depth, which is exactly why a value-only shrink left the suite
+///   green before this row existed. Asserting the mirror makes that shrink red.
+/// * **The accounting identity.** `retained + dropped == releases` at the
+///   declared depth, so an eviction can never be lost.
+///
+/// The behavioural half reads the bound from the constant (a deliberate
+/// revision of the mirror as a unit still gets coverage); the identity half
+/// reads it from the constant too. Only the mirror equality pins a value, and
+/// it pins it to another declared value rather than to a bare number.
+#[test]
+fn the_panel_content_observation_buffer_counts_what_it_evicts() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("content-drops", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+
+    assert_eq!(
+        PANEL_CONTENT_EVENT_QUEUE_MAX,
+        bitty_runtime::plugin_runtime::overlay::PENDING_RELEASED_MAX,
+        "the panel observation buffer is the overlay capture's released buffer by \
+         contract: shrinking one without the other silently changes how many releases \
+         survive a cold tick"
+    );
+    let bound = PANEL_CONTENT_EVENT_QUEUE_MAX;
+    let rounds = bound + 6;
+    for _ in 0..rounds {
+        let _: i64 = fixture.run_ok("present").parse().expect("integer handle");
+        assert_eq!(fixture.run_ok("release"), "true");
+    }
+
+    let mut live = fixture.live.borrow_mut();
+    assert_eq!(
+        live.ui_panel_events_dropped(),
+        6,
+        "every observation the buffer evicted is counted"
+    );
+    let drained = live.drain_panel_content_events();
+    assert_eq!(
+        drained.len(),
+        bound,
+        "the buffer holds exactly its bound, oldest evicted first"
+    );
+    assert_eq!(
+        drained.len() as u64 + live.ui_panel_events_dropped(),
+        rounds as u64,
+        "no observation is unaccounted for: retained + dropped == releases"
+    );
+    assert_eq!(
+        live.ui_panel_events_dropped(),
+        6,
+        "draining does not reset the count"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 18 (CTX-1911): a `cancelled` release records `cancelled`
+// ---------------------------------------------------------------------------
+
+/// The closed release vocabulary has two owner dispositions, and every earlier
+/// row releases with the default one. A release path that hardcoded
+/// `"released"` would therefore pass the whole suite, so this row asks for
+/// `cancelled` and reads the reason back from both surfaces the record fixes:
+/// the `panel.content.released` observation and the owner's next `poll`.
+#[test]
+fn a_cancelled_release_records_its_own_reason() {
+    bitty_test_support::require_pty!();
+    let mut fixture = Fixture::new("release-cancelled", &["ui.rich", "ui.panel"]);
+    fixture.spawn_pane();
+    let observer = fixture.add_observer("xuepoo.observer");
+    let handle: i64 = fixture.run_ok("present").parse().expect("integer handle");
+
+    assert!(
+        fixture.observer_log(&observer).is_empty(),
+        "nothing is observed before anything happens"
+    );
+    assert_eq!(
+        fixture.run_ok("release_cancelled"),
+        "true",
+        "the non-default owner disposition is accepted"
+    );
+    assert_eq!(
+        fixture.plugins.pump_panel_content_events(),
+        1,
+        "the release reaches the subscriber"
+    );
+    assert_eq!(
+        fixture.observer_log(&observer),
+        vec![format!(
+            "panel.content.released:{PLUGIN}:{handle}:cancelled:3"
+        )],
+        "the observation carries the reason the owner asked for, not the default"
+    );
+    assert_eq!(
+        fixture.run_ok("poll"),
+        "released|0|0|0|false|none|none|none|none|cancelled",
+        "the remembered release carries the same reason"
+    );
+    assert_eq!(
+        fixture
+            .live
+            .borrow()
+            .ui_panel_release_record(handle)
+            .map(|record| record.reason.as_str()),
+        Some("cancelled"),
+        "the Core record agrees with both plugin-visible surfaces"
     );
 }

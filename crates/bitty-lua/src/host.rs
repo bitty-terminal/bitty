@@ -55,7 +55,10 @@ use crate::ui::{
     UiBlockState, UiNode, UiSceneScope, UiSlot, UiTolerated, component_invalid,
     read_component_with_tolerated,
 };
-use crate::ui_panel::{UiPanelSpec, read_panel_release_reason, read_panel_spec};
+use crate::ui_panel::{
+    UI_PANEL_INPUT_POLL_MAX_DEFAULT, UI_PANEL_INPUT_QUEUE_MAX, UiPanelSpec,
+    read_panel_release_reason, read_panel_spec,
+};
 use crate::ui_rich::{UiRichNode, read_rich_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
@@ -1148,6 +1151,37 @@ pub struct OverlayPoll {
     /// Sticky overflow flag for this session.
     pub overflowed: bool,
     /// Terminal reason, present only when not active.
+    pub reason: Option<String>,
+}
+
+/// Detailed panel content poll result (bitty#2388, CTX-1911).
+///
+/// The record asks `bitty.ui.panel.poll` to mirror the accepted focusable
+/// overlay poll shape: `active` selects the `status` field (`"active"` while
+/// this generation's layer is live, `"released"` once Core released it), `seq`
+/// is the monotonic sequence of the last event delivered to this handle,
+/// `events` holds drained input oldest-first, `overflowed` is sticky once the
+/// queue's drop-oldest bound dropped an older event, and `reason` is present
+/// only with `"released"`.
+///
+/// The events are the same bounded key payload the overlay capture uses
+/// ([`OverlayInput`]): one event shape for one bounded key channel, never a
+/// second vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelPoll {
+    /// Whether the presenting layer is still live for this generation.
+    pub active: bool,
+    /// Last delivered sequence in this layer.
+    pub seq: u64,
+    /// Drained events, oldest first (empty for a released layer).
+    pub events: Vec<OverlayInput>,
+    /// Key events this layer's queue dropped since the layer was presented:
+    /// both the event-count overflow and the per-plugin text-byte budget evict
+    /// oldest-first and are counted here, so a drop is never silent.
+    pub dropped: u64,
+    /// Sticky overflow flag for this layer.
+    pub overflowed: bool,
+    /// Terminal reason, present only when `active` is `false`.
     pub reason: Option<String>,
 }
 
@@ -2316,6 +2350,44 @@ pub trait HostServices {
         self.ui_panel_release(handle, reason)
     }
 
+    /// Drain up to `max` queued input events for the layer `handle` names
+    /// (bitty#2388, CTX-1911 — `bitty.ui.panel.poll`).
+    ///
+    /// The queue is Core-owned and lives with the presented layer, so this is
+    /// an owner-initiated cold-path read: Core never calls a plugin callback on
+    /// the input hot path (`P0-AC-015`), exactly like the accepted overlay
+    /// capture poll it mirrors. Events come back oldest-first, `max` is clamped
+    /// to the queue bound, and the result carries `status`/`seq`/`overflowed`
+    /// plus `reason` once the layer is released.
+    ///
+    /// A stale, foreign, previous-generation, or never-presented handle fails
+    /// typed with [`E_UI_NOT_OWNER`] and drains nothing. The default fails
+    /// closed with [`E_UI_UNAVAILABLE`].
+    fn ui_panel_poll(&self, _handle: i64, _max: usize) -> Result<PanelPoll, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no ui.panel surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_panel_poll`] (CTX-0464 contract).
+    ///
+    /// Draining is a mutation of the Core-owned queue, so the bridge uses the
+    /// check-then-act path: an expired call returns [`BridgeError::timeout`]
+    /// and leaves every queued event where it was.
+    fn ui_panel_poll_with_expiry(
+        &self,
+        handle: i64,
+        max: usize,
+        expiry: Instant,
+    ) -> Result<PanelPoll, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_panel_poll(handle, max)
+    }
+
     /// Claim the Core-owned exclusive focusable-overlay input capture for one
     /// transient interaction (CTX-0941, v2 scope of OQ-056).
     ///
@@ -3261,7 +3333,14 @@ fn workspace_list_value(rows: &[WorkspaceInfo]) -> LuaValue {
 /// produced by a bare key; unmodified input keeps the exact prior shape. The
 /// host already drained at most [`OVERLAY_CAPTURE_POLL_MAX`] events and
 /// bounded each text payload.
-fn overlay_events_value(events: &[OverlayInput]) -> LuaValue {
+/// Marshal drained key events into the accepted event-list shape:
+/// `{ seq, type, text, data? }`, oldest first.
+///
+/// Shared by the focusable-overlay capture poll (CTX-0941) and the panel
+/// content poll (bitty#2388, CTX-1911): both drain the same bounded key-event
+/// payload, so both marshal it identically and a plugin author learns one
+/// shape.
+fn input_events_value(events: &[OverlayInput]) -> LuaValue {
     LuaValue::array(
         events
             .iter()
@@ -3365,7 +3444,55 @@ fn overlay_poll_value(poll: &OverlayPoll) -> LuaValue {
         ),
         (
             LuaValue::String("events".to_string()),
-            overlay_events_value(&poll.events),
+            input_events_value(&poll.events),
+        ),
+        (
+            LuaValue::String("overflowed".to_string()),
+            LuaValue::Bool(poll.overflowed),
+        ),
+    ];
+    if let Some(reason) = poll.reason.as_ref() {
+        pairs.push((
+            LuaValue::String("reason".to_string()),
+            LuaValue::String(reason.clone()),
+        ));
+    }
+    LuaValue::Table(pairs)
+}
+
+/// Marshal a detailed panel content poll result into the record's table shape
+/// (bitty#2388, CTX-1911): `{ status, seq, events, dropped, overflowed,
+/// reason? }` with exactly these fields. `reason` is present only with
+/// `"released"`.
+///
+/// The record asks the panel poll to mirror the overlay poll, so the five
+/// record fields agree with the overlay poll field for field; only the payload
+/// the events carry differs, and it does not. `dropped` is the one additive
+/// field, and it is not an invention: the binding isolation contract
+/// (`runtime/isolation-resource-rfc.md` RC-5) requires overflow drops to be
+/// "counted and attributed", and the owner draining its own layer is the only
+/// reader that can attribute them — the sticky `overflowed` boolean alone
+/// cannot tell an owner how much it lost. See
+/// [`UI_PANEL_INPUT_BUDGET_BYTES`](crate::UI_PANEL_INPUT_BUDGET_BYTES) for the
+/// bounds that produce the count.
+fn panel_poll_value(poll: &PanelPoll) -> LuaValue {
+    let status = if poll.active { "active" } else { "released" };
+    let mut pairs = vec![
+        (
+            LuaValue::String("status".to_string()),
+            LuaValue::String(status.to_string()),
+        ),
+        (
+            LuaValue::String("seq".to_string()),
+            LuaValue::Integer(i64::try_from(poll.seq).unwrap_or(i64::MAX)),
+        ),
+        (
+            LuaValue::String("events".to_string()),
+            input_events_value(&poll.events),
+        ),
+        (
+            LuaValue::String("dropped".to_string()),
+            LuaValue::Integer(i64::try_from(poll.dropped).unwrap_or(i64::MAX)),
         ),
         (
             LuaValue::String("overflowed".to_string()),
@@ -7372,6 +7499,59 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
             }),
         )
         .expect("panel table accepts 'release'");
+    ui_panel
+        .set(
+            ctx,
+            "poll",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            let error = component_invalid(
+                                "ui.panel.poll handle must be an integer from ui.panel.present",
+                            );
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    // The record fixes a cheap default (one call never hands a
+                    // plugin the whole queue) and clamps an explicit request to
+                    // the 256-event bound. A non-positive or non-integer `max`
+                    // is a shape error, not a silent default: a caller that
+                    // asked for something impossible must not believe it was
+                    // honoured.
+                    let max = match stack.get(1) {
+                        Value::Nil => UI_PANEL_INPUT_POLL_MAX_DEFAULT,
+                        Value::Integer(max) if max >= 1 => usize::try_from(max)
+                            .unwrap_or(usize::MAX)
+                            .min(UI_PANEL_INPUT_QUEUE_MAX),
+                        _ => {
+                            let error =
+                                component_invalid("ui.panel.poll max must be a positive integer");
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                            return Ok(CallbackReturn::Return);
+                        }
+                    };
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .ui_panel_poll_with_expiry(handle, max, expiry)
+                    });
+                    match outcome {
+                        Ok(poll) => {
+                            stack.replace(ctx, (panel_poll_value(&poll).to_lua(ctx), Value::Nil));
+                        }
+                        Err(error) => {
+                            stack.replace(ctx, (Value::Nil, error.to_error_value(ctx)));
+                        }
+                    }
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("panel table accepts 'poll'");
     ui.set(ctx, "panel", readonly_table(ctx, ui_panel))
         .expect("ui table accepts 'panel'");
 

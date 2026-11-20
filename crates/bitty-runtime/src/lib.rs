@@ -308,6 +308,11 @@ pub use runtime::session::{
     SessionSnapshot, SessionStartupOutcome, WorkspaceSnapshot,
 };
 pub use runtime::submit_host::{TerminalSubmitOutcome, TerminalSubmitUnavailable};
+pub use runtime::ui_panel::{
+    PANEL_CONTENT_EVENT_QUEUE_MAX, PANEL_CONTENT_RELEASE_CLOSED, PANEL_CONTENT_RELEASE_MEMORY_MAX,
+    PANEL_CONTENT_RELEASE_UNLOADED, PanelContentEvent, PanelContentInputQueue,
+    UiPanelReleaseRecord,
+};
 pub use runtime::workspace_memory::{
     MAX_WORKSPACE_MEMORY_LEAVES, MAX_WORKSPACE_MEMORY_PANE_SESSIONS,
     WORKSPACE_MEMORY_REPORT_JSON_MAX_BYTES, WorkspaceMemoryAggregate, WorkspaceMemoryReport,

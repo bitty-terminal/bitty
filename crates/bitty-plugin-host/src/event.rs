@@ -207,6 +207,28 @@ pub enum EventKind {
     /// non-terminal panel (`ViewContent::Panel(PanelId)`). Delivered only to
     /// the owning plugin generation's `PluginId`.
     PanelInput,
+    /// Panel content release observation (bitty#2388 D8, CTX-1911).
+    ///
+    /// Additive v2 growth: when a presented `bitty.ui.panel` content layer
+    /// ends, Core delivers this observation-only bus event with payload
+    /// `{ owner, handle, reason }` (`owner` and `reason` text, `handle` the
+    /// opaque layer handle). `reason` is the closed release vocabulary
+    /// (`released`/`cancelled` from the owner, `closed`/`suspended`/`reloaded`/
+    /// `disabled`/`crashed`/`unloaded` from Core). The payload carries no
+    /// content, no key bytes, and no terminal state. Any subscriber may observe
+    /// it; no phase may intercept or veto it.
+    PanelContentReleased,
+    /// Panel content input-availability nudge (bitty#2388 D8, CTX-1911).
+    ///
+    /// Additive v2 growth: while a presented layer has undrained queued input,
+    /// the host delivers this observation-only bus event on the cold path with
+    /// payload `{ owner, handle, queued }` (text owner id, opaque layer handle,
+    /// queued event count) so the owner can drain through
+    /// `bitty.ui.panel.poll` and repaint. Level-triggered: at most one per tick
+    /// per layer while its queue stays non-empty, never on the input hot path
+    /// (`P0-AC-015`). The payload carries no input bytes. Any subscriber may
+    /// observe it; no phase may intercept or veto it.
+    PanelContentInputAvailable,
     // Interception (exactly four for v1)
     InterceptCommandDispatch,
     InterceptTerminalSpawn,
@@ -240,6 +262,8 @@ impl EventKind {
             "overlay.input.available" => Ok(Self::OverlayInputAvailable),
             "overlay.dismissed" => Ok(Self::OverlayDismissed),
             "panel.input" => Ok(Self::PanelInput),
+            "panel.content.released" => Ok(Self::PanelContentReleased),
+            "panel.content.input-available" => Ok(Self::PanelContentInputAvailable),
             "intercept.command-dispatch" => Ok(Self::InterceptCommandDispatch),
             "intercept.terminal-spawn" => Ok(Self::InterceptTerminalSpawn),
             "intercept.paste" => Ok(Self::InterceptPaste),
@@ -274,6 +298,8 @@ impl EventKind {
             Self::OverlayInputAvailable => "overlay.input.available",
             Self::OverlayDismissed => "overlay.dismissed",
             Self::PanelInput => "panel.input",
+            Self::PanelContentReleased => "panel.content.released",
+            Self::PanelContentInputAvailable => "panel.content.input-available",
             Self::InterceptCommandDispatch => "intercept.command-dispatch",
             Self::InterceptTerminalSpawn => "intercept.terminal-spawn",
             Self::InterceptPaste => "intercept.paste",
@@ -306,7 +332,9 @@ impl EventKind {
             | Self::OverlayReleased
             | Self::OverlayInputAvailable
             | Self::OverlayDismissed
-            | Self::PanelInput => EventClass::Observation,
+            | Self::PanelInput
+            | Self::PanelContentReleased
+            | Self::PanelContentInputAvailable => EventClass::Observation,
             Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptPaste
@@ -330,6 +358,7 @@ impl EventKind {
                 | Self::FocusChanged
                 | Self::SelectionChanged
                 | Self::OverlayInputAvailable
+                | Self::PanelContentInputAvailable
         )
     }
 
@@ -382,6 +411,8 @@ impl EventKind {
             | Self::OverlayInputAvailable
             | Self::OverlayDismissed
             | Self::PanelInput
+            | Self::PanelContentReleased
+            | Self::PanelContentInputAvailable
             | Self::InterceptCommandDispatch
             | Self::InterceptTerminalSpawn
             | Self::InterceptOpenUrl => PayloadPolicy::Ungated,

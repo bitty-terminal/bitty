@@ -59,6 +59,73 @@ pub const UI_PANEL_RELEASE_DEFAULT_REASON: &str = "released";
 /// value).
 pub const UI_PANEL_REASON_MAX_BYTES: usize = 64;
 
+/// Maximum queued input events per presented layer (bitty#2388 D7/Bounds).
+///
+/// The queue is Core-owned and lives with the presented layer: overflow drops
+/// the oldest event, counts it, and raises the poll result's sticky
+/// `overflowed` flag. It is never a plugin-visible callback queue and never
+/// grows past this bound, so a plugin that stops polling cannot exhaust host
+/// memory (security invariant 7, "bounded inputs").
+///
+/// This is an **event count** bound only. The record also fixes
+/// [`UI_PANEL_INPUT_BUDGET_BYTES`] for the text the queue may hold, and that
+/// byte budget may cut the queue short of this count: the count is an upper
+/// bound, not a promise that this many events fit. See the reconciliation note
+/// on [`UI_PANEL_INPUT_BUDGET_BYTES`].
+pub const UI_PANEL_INPUT_QUEUE_MAX: usize = 256;
+
+/// Maximum held text bytes across the whole key queue of one presented layer.
+///
+/// # Why the queue has a byte budget at all
+///
+/// [`UI_PANEL_INPUT_QUEUE_MAX`] events of [`UI_PANEL_INPUT_TEXT_MAX_BYTES`]
+/// bytes each would be 1 MiB of held text per presented layer, while the
+/// binding plugin resource contract fixes the **per-plugin** event budget at
+/// 1024 events / 256 KiB aggregate: `runtime/isolation-resource-rfc.md`
+/// (bitty-plugins-docs), RC-5, "PerPlugin 1024 events / 256 KiB aggregate",
+/// enforced at `EventPipeline::publish` with `DropOldest`. A presented layer
+/// holds one plugin's keys, so it is charged against that same per-plugin
+/// bound rather than against a per-layer relaxation of it.
+///
+/// The other document, `specifications/panel-gui-content-presentation-candidate.md`
+/// (bitty-terminal-docs), fixes the 256-event depth and the 4096-byte event
+/// payload, and its *Bounds* table defers the owner budget explicitly: "Owner
+/// call budgets | Per-plugin CPU, memory, task, and queue budgets per the
+/// accepted isolation contract". So the record's own clause hands the
+/// aggregate bound to the isolation contract, and **RC-5's 256 KiB governs on
+/// conflict**. Nothing is widened and no owner decision is needed: the
+/// record's event count and per-event payload are kept exactly as written.
+///
+/// # How the two bounds combine
+///
+/// * event count: at most [`UI_PANEL_INPUT_QUEUE_MAX`] events
+/// * held text: at most this many accounted text bytes
+/// * per event: [`UI_PANEL_INPUT_TEXT_MAX_BYTES`] is a **truncation cap only**
+///
+/// Both bounds evict the oldest event (drop-oldest, counted, sticky
+/// `overflowed`), so the byte budget may hold the queue below the event count.
+/// With 4096-byte events exactly `256 KiB / 4096` of them fit, which is why
+/// the count bound alone can never be what protects host memory here.
+pub const UI_PANEL_INPUT_BUDGET_BYTES: usize = 256 * 1024;
+
+/// Default `bitty.ui.panel.poll(handle)` drain size.
+///
+/// The record fixes a cheap default so one call cannot hand a plugin the whole
+/// queue; a caller may ask for more up to [`UI_PANEL_INPUT_QUEUE_MAX`].
+pub const UI_PANEL_INPUT_POLL_MAX_DEFAULT: usize = 64;
+
+/// Maximum bytes of one queued input event's text (bitty#2388 "Bounds").
+///
+/// Shared with the focusable-overlay capture bound: one bounded key payload is
+/// 4096 bytes, truncated at a `char` boundary before it is enqueued.
+///
+/// This is a **per-event truncation cap only**, never a budget: it says
+/// nothing about how much text a queue may hold. That is
+/// [`UI_PANEL_INPUT_BUDGET_BYTES`], the per-plugin bound the whole queue is
+/// charged against. Reading this cap as a budget is what produced the 1 MiB
+/// per-layer figure the reconciliation on that constant corrects.
+pub const UI_PANEL_INPUT_TEXT_MAX_BYTES: usize = 4096;
+
 /// Bounded marshalling limits for the flat `spec` table.
 ///
 /// The table is flat and carries at most two scalar fields, so a depth of one

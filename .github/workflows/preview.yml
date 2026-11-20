@@ -554,7 +554,7 @@ jobs:
           $output = (& $exe --version 2>&1 | Out-String)
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "bitty --version exited $code" }
-          $pattern = '\Abitty ' + [regex]::Escape($env:BASE_VERSION) + ' \(preview [^\s()]+\)(?:\r\n|\n)\z'
+          $pattern = '\Abitty ' + [regex]::Escape($env:BASE_VERSION) + ' \(preview [^\s()]+\)\s*\z'
           Write-Host "bitty --version => $($output.TrimEnd())"
           if ($output -cnotmatch $pattern) {
             throw "version/channel mismatch: '$output'"

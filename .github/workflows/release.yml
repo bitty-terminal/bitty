@@ -2648,8 +2648,19 @@ jobs:
               if (-not (Test-Path -LiteralPath $shim -PathType Leaf)) {
                 throw "scoop which bitty did not resolve to an existing file: $shim"
               }
-              if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1')) {
+              # bitty#3224: the manifest deliberately shims bitty.com, so '.com' is an intended shim.
+              if ([IO.Path]::GetExtension($shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')) {
                 throw "scoop which bitty did not resolve to an executable shim: $shim"
+              }
+              # bitty#3224: the '.com' allowlist admits any console companion, so
+              # also require the resolved shim to be the manifest-declared
+              # `bitty.com` member of the installed app (under `current`).
+              # Resolve through the provider: `scoop which` prints a `~\`-relative
+              # path, which [IO.Path] cannot expand.
+              $shimFull = (Get-Item -LiteralPath $shim).FullName
+              $appComFull = (Get-Item -LiteralPath $appCom).FullName
+              if (-not $shimFull.Equals($appComFull, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "scoop which bitty resolved to '$shimFull', not the manifest shim '$appComFull'"
               }
               $out = (& $shim --version 2>&1 | Out-String)
               $code = $LASTEXITCODE

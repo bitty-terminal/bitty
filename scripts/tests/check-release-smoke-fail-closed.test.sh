@@ -149,7 +149,8 @@ expect_count "$SMOKE" '2>&1 | Out-String' 3 \
   "PowerShell post-release legs capture native stdout and stderr"
 expect_contains "$SMOKE" 'Test-Path -LiteralPath $shim -PathType Leaf' \
   "Scoop smoke requires an existing shim file"
-expect_contains "$SMOKE" "GetExtension(\$shim) -notin @('.exe', '.cmd', '.bat', '.ps1')" \
+# bitty#3224: the Scoop shim allowlist includes '.com' for the bitty.com console companion.
+expect_contains "$SMOKE" "GetExtension(\$shim) -notin @('.exe', '.cmd', '.bat', '.ps1', '.com')" \
   "Scoop smoke requires an executable shim extension"
 expect_contains "$SMOKE" 'Test-Path -LiteralPath $exe -PathType Leaf' \
   "native Windows smoke requires an existing executable file"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check-release-windows-verify.test.sh — CTX-1916 enumerated fixture suite for
-# the release workflow's Windows verification gate.
+# the Windows verification gate; CTX-1918 (bitty#3281) extended it to the
+# preview workflow, so the fixtures now cover both workflow files.
 #
 # The suite never hand-picks its cases: it enumerates EVERY directory under
 # scripts/tests/fixtures/release-windows-verify/ in sorted order and exercises
@@ -22,20 +23,35 @@
 # that declares a fixture's expectation, and the pin works in both directions —
 # a registered name whose directory is missing fails the suite too.
 #
-# Fixture inventory (pinned against the v0.0.46 release run, 44718678246):
-#   clean                 -> gate passes
-#   comment-after-suffix  -> rule-2: only a trailing comment ends in `\s*\z`
-#   correct-with-comment  -> gate passes; a correct assertion may carry a comment
-#   lookup-root           -> rule-1: loop root renamed, the gate must follow the lookup
-#   newline               -> rule-2: assertion needs a newline
-#   newline-suffix        -> rule-2: newline before `\s*\z`
-#   pattern-variable-name -> rule-2: the assertion is bound to `$pat`, not `$pattern`
-#   stale-comment         -> rule-1: a stale comment cites the pre-rename root
-#   zip-path              -> rule-1: download path differs from the loop root
+# Fixture inventory (pinned against the v0.0.46 release run, 44718678246, and
+# the nightly-preview defect class bitty#3276/#3281):
+#   clean                          -> gate passes
+#   comment-after-suffix           -> rule-2: only a trailing comment ends in `\s*\z`
+#   correct-with-comment           -> gate passes; a correct assertion may carry a comment
+#   lookup-root                    -> rule-1: loop root renamed, the gate must follow the lookup
+#   newline                        -> rule-2: assertion needs a newline
+#   newline-suffix                 -> rule-2: newline before `\s*\z`
+#   pattern-variable-name          -> rule-2: the assertion is bound to `$pat`, not `$pattern`
+#   preview-clean                  -> gate passes; the preview workflow's post-#3278 shape
+#   preview-derived-pattern        -> rule-2: `$proxyPattern = $pattern + ...` cannot be parsed
+#   preview-here-string            -> rule-2: the assertion moved into a here-string
+#   preview-newline                -> rule-2: the pre-#3278 newline-anchored preview pattern
+#   preview-pattern-variable-name  -> rule-2: the regression is bound to `$pat`, not `$pattern`
+#   preview-undefined-operand       -> rule-2: the comparison operand no assignment defines
+#   stale-comment                  -> rule-1: a stale comment cites the pre-rename root
+#   zip-path                       -> rule-1: download path differs from the loop root
 #
-# The fixtures cover the rule shapes; the real workflow is checked separately
+# Every fixture directory carries BOTH .github/workflows/release.yml and
+# .github/workflows/preview.yml, because the gate scans both files under
+# --root (bitty#3281): the release-side fixtures pair their release.yml variant
+# with the clean preview.yml copy, and the preview-side fixtures pair their
+# preview.yml variant with the clean release.yml copy. A fixture root missing
+# either file is rejected by the gate itself (fail closed), never tolerated.
+#
+# The fixtures cover the rule shapes; the real workflows are checked separately
 # by `just release-windows-verify` (part of `just check`) and by CI, so a
-# regression in .github/workflows/release.yml itself cannot slip through.
+# regression in .github/workflows/release.yml or preview.yml cannot slip
+# through even when it matches no fixture.
 set -euo pipefail
 
 # Byte-stable ordering for the sorted enumeration and all matching below.
@@ -49,8 +65,8 @@ FAIL=0
 SEEN=""
 
 # --- Registry: every fixture must be declared in exactly one list ------------
-FIXTURES_MUST_PASS="clean correct-with-comment"
-FIXTURES_MUST_REJECT="comment-after-suffix:rule-2 lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 pattern-variable-name:rule-2 stale-comment:rule-1 zip-path:rule-1"
+FIXTURES_MUST_PASS="clean correct-with-comment preview-clean"
+FIXTURES_MUST_REJECT="comment-after-suffix:rule-2 lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 pattern-variable-name:rule-2 preview-derived-pattern:rule-2 preview-here-string:rule-2 preview-newline:rule-2 preview-pattern-variable-name:rule-2 preview-undefined-operand:rule-2 stale-comment:rule-1 zip-path:rule-1"
 
 fail() {
   echo "FAIL: $*" >&2

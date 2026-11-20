@@ -238,9 +238,12 @@ fn cursor_to_cell_mapping_is_headless_and_clamped() {
     let rt = make_runtime();
     // Default readable cell 9x19 (CTX-0157), the default 8px window
     // padding inset (CTX-0223), and the default CTX-0294/CTX-0333
-    // decoration outer gap + border + content inset (6 + 1 + 6 px): cell
-    // (2, 2) starts at (8 + 13 + 18, 8 + 13 + 38) = (39, 59).
-    let pos = CursorPosition { x: 41.0, y: 61.0 };
+    // decoration outer gap + border + content inset (6 + 1 + 6 px): the
+    // content box top-left is (21, 21). bitty#3284 centres the 77x22
+    // painted grid inside the 694x430 content box, so its origin is
+    // (21, 27) and cell (2, 2) spans (39..48, 65..84); the probe sits
+    // at (41, 67), inside the painted cell.
+    let pos = CursorPosition { x: 41.0, y: 67.0 };
     let cell = rt.cursor_to_cell(pos);
     assert_eq!(cell, CellPos::new(2, 2));
     // Negative and far-outside clamp.
@@ -326,15 +329,22 @@ fn mouse_drag(rt: &mut Runtime, start: CursorPosition, waypoints: &[CursorPositi
 ///
 /// CTX-0223 + CTX-0294/CTX-0333: includes the default 8px window padding
 /// inset and the default Core-owned decoration outer gap + border + content
-/// inset (6 + 2 + 6 = 14px at scale 1.0), so the grid origin sits at
-/// (22, 22) physical pixels and raw `col * 9` coordinates would land inside
-/// the decoration bands.
+/// inset (6 + 1 + 6 = 13px at scale 1.0), so the content box top-left sits
+/// at (21, 21) physical pixels and raw `col * 9` coordinates would land
+/// inside the decoration bands.
+///
+/// bitty#3284: the painted grid is centred inside the content box. The
+/// default 736x472 window leaves a 694x430 content box: 77 cols of 9
+/// (1 px leftover, split 0/1) and 22 rows of 19 (12 px leftover, split
+/// 6/6), so the painted grid origin is (21, 27). The probe adds the 6 px
+/// row split so every position lands inside the painted cell it names.
 fn cell_pos(col: u16, row: u16) -> CursorPosition {
     const PAD: f64 = 8.0;
     const DECORATION: f64 = 14.0;
+    const ROW_SPLIT: f64 = 6.0;
     CursorPosition {
         x: PAD + DECORATION + f64::from(col) * 9.0,
-        y: PAD + DECORATION + f64::from(row) * 19.0,
+        y: PAD + DECORATION + ROW_SPLIT + f64::from(row) * 19.0,
     }
 }
 

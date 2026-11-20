@@ -39,20 +39,22 @@ fn primary_frame(rt: &Runtime) -> PresentFrame {
     *rt.present_frames().first().expect("primary frame")
 }
 
-/// Absolute physical x of a cell edge (`col == 0` is the content left edge).
+/// Absolute physical x of a cell edge (`col == 0` is the painted grid's left
+/// edge; bitty#3284 centres the grid inside the content box, so the edge
+/// helper reads [`PresentFrame::grid_origin`], the same origin paint and
+/// hit-testing translate by).
 fn cell_edge_x(rt: &Runtime, frame: &PresentFrame, col: u16) -> f64 {
-    let (cell_w, _) = rt.live_cell_size();
-    f64::from(rt.window_padding_physical())
-        + f64::from(frame.content.x)
-        + f64::from(col) * f64::from(cell_w)
+    let (cell_w, cell_h) = rt.live_cell_size();
+    let (grid_x, _) = frame.grid_origin(cell_w, cell_h);
+    f64::from(rt.window_padding_physical()) + f64::from(grid_x) + f64::from(col) * f64::from(cell_w)
 }
 
-/// Absolute physical y of a cell edge (`row == 0` is the content top edge).
+/// Absolute physical y of a cell edge (`row == 0` is the painted grid's top
+/// edge; see [`cell_edge_x`]).
 fn cell_edge_y(rt: &Runtime, frame: &PresentFrame, row: u16) -> f64 {
-    let (_, cell_h) = rt.live_cell_size();
-    f64::from(rt.window_padding_physical())
-        + f64::from(frame.content.y)
-        + f64::from(row) * f64::from(cell_h)
+    let (cell_w, cell_h) = rt.live_cell_size();
+    let (_, grid_y) = frame.grid_origin(cell_w, cell_h);
+    f64::from(rt.window_padding_physical()) + f64::from(grid_y) + f64::from(row) * f64::from(cell_h)
 }
 
 fn at(rt: &Runtime, frame: &PresentFrame, col: u16, row: u16) -> CursorPosition {

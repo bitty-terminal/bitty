@@ -188,6 +188,87 @@ pub struct PresentFrame {
     pub tier: Option<OverlayTier>,
 }
 
+/// Sub-cell leftover of `content` on one axis after the whole-cell grid
+/// (bitty#3284): half of it sits above the grid, half below.
+///
+/// `present_frames` floors the grid to whole cells inside the content rect,
+/// so `content - cells * cell` is the remainder the paint path must place.
+/// Splitting it evenly keeps the first and last row margins within one pixel
+/// instead of pooling everything below the grid. A paint grid larger than
+/// the box (the CTX-1088 oversized fixed window) saturates at `content`: the
+/// clipped window stays pinned to the content origin.
+fn grid_centre_offset(content: u32, cells: u16, cell: u32) -> u32 {
+    if cell == 0 || content == 0 {
+        return 0;
+    }
+    let span = u64::from(cells) * u64::from(cell);
+    if span >= u64::from(content) {
+        return 0;
+    }
+    u32::try_from((u64::from(content) - span) / 2).unwrap_or(0)
+}
+
+impl PresentFrame {
+    /// The painted grid origin of this frame (bitty#3284): the content
+    /// rect's top-left plus the sub-cell remainder split so the floored grid
+    /// is centred inside the content box.
+    ///
+    /// Every paint, cursor, selection, panel and pointer hit origin reads
+    /// this one point, so a pointer inside a painted cell resolves to that
+    /// cell. The rule is the same on both axes: the frame inset is
+    /// symmetric per axis, so the grid inherits that symmetry, and the
+    /// horizontal leftover (1 px at the shipped defaults) floors to a 0 px
+    /// offset there, keeping today's left-anchored placement. An
+    /// exact-multiple content box centres to its own top-left, so every
+    /// exact-multiple frame paints byte-identically.
+    ///
+    /// Cell metrics are passed in (not carried) because the frame is a
+    /// geometry snapshot: the live metrics at paint time are authoritative,
+    /// exactly like every other pixel translation in the present path.
+    #[must_use]
+    pub fn grid_origin(&self, cell_w: u32, cell_h: u32) -> (i32, i32) {
+        let dx = grid_centre_offset(self.content.width, self.cols, cell_w);
+        let dy = grid_centre_offset(self.content.height, self.rows, cell_h);
+        (
+            self.content
+                .x
+                .saturating_add(i32::try_from(dx).unwrap_or(i32::MAX)),
+            self.content
+                .y
+                .saturating_add(i32::try_from(dy).unwrap_or(i32::MAX)),
+        )
+    }
+
+    /// The painted grid rectangle of this frame (bitty#3284): the centred
+    /// grid origin with the whole-cell extent, clamped to the content box.
+    ///
+    /// The extent is `cols * cell_w` x `rows * cell_h` for every ordinary
+    /// frame (an exact fit of the floored grid); the clamp only guards the
+    /// CTX-1088 oversized fixed window, whose paint grid exceeds the slot
+    /// it is clipped into. Consumers that compose cell-aligned content —
+    /// the GUI scene surface above all — get exactly the pixels the
+    /// terminal grid owns, with the leftover stripes left as background.
+    #[must_use]
+    pub fn grid_rect(&self, cell_w: u32, cell_h: u32) -> bitty_render::geometry::RectPx {
+        let (x, y) = self.grid_origin(cell_w, cell_h);
+        let w = if cell_w == 0 {
+            0
+        } else {
+            (u64::from(self.cols) * u64::from(cell_w))
+                .min(u64::from(self.content.width))
+                .min(u64::from(u32::MAX)) as u32
+        };
+        let h = if cell_h == 0 {
+            0
+        } else {
+            (u64::from(self.rows) * u64::from(cell_h))
+                .min(u64::from(self.content.height))
+                .min(u64::from(u32::MAX)) as u32
+        };
+        bitty_render::geometry::RectPx::new(x, y, w, h)
+    }
+}
+
 /// Mutable borrow of the owned layout tree (CTX-0603, #1165).
 ///
 /// Returned by [`Runtime::layout_mut`]: dereferences to the live
@@ -458,6 +539,12 @@ impl Runtime {
     /// view's shared map performs the inversion. The map is identity when the
     /// policy is off or the view fails closed (windowed/truncated/alt
     /// stale), matching the renderer's paint decision.
+    ///
+    /// bitty#3284: the painted primary grid is centred inside its content
+    /// box, and this mapping subtracts the same sub-cell split (derived from
+    /// the container-origin content box it already assumes), so a pointer
+    /// inside a painted cell resolves to that cell here too — one origin
+    /// with [`Self::cursor_to_present_cell`].
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
@@ -480,15 +567,39 @@ impl Runtime {
             (f64::from(self.config.gaps_out) + f64::from(self.container.x)) * cell_w + deco_px;
         let gap_px_y =
             (f64::from(self.config.gaps_out) + f64::from(self.container.y)) * cell_h + deco_px;
+        // bitty#3284: the painted primary grid is centred inside its
+        // content box ([`PresentFrame::grid_origin`]), so this legacy
+        // global mapping shifts by the same sub-cell split before
+        // dividing. The split is derived from the container-origin
+        // content box this mapping already assumes, so it is exact for
+        // the default single-pane layout it serves and keeps the same
+        // approximation character as before for splits — one origin with
+        // the paint path, never a second authority.
+        let frame_w_px = f64::from(u32::from(self.container.width)) * cell_w;
+        let frame_h_px = f64::from(u32::from(self.container.height)) * cell_h;
+        let content_w_px = (frame_w_px - deco_px * 2.0).max(0.0);
+        let content_h_px = (frame_h_px - deco_px * 2.0).max(0.0);
+        let cols_assumed = if cell_w <= 0.0 {
+            0.0
+        } else {
+            (content_w_px / cell_w).floor()
+        };
+        let rows_assumed = if cell_h <= 0.0 {
+            0.0
+        } else {
+            (content_h_px / cell_h).floor()
+        };
+        let centre_x = ((content_w_px - cols_assumed * cell_w) / 2.0).max(0.0);
+        let centre_y = ((content_h_px - rows_assumed * cell_h) / 2.0).max(0.0);
         let col = if cell_w <= 0.0 {
             0
         } else {
-            ((pos.x - pad_px - gap_px_x) / cell_w).floor() as i64
+            ((pos.x - pad_px - gap_px_x - centre_x) / cell_w).floor() as i64
         };
         let row = if cell_h <= 0.0 {
             0
         } else {
-            ((pos.y - pad_px - gap_px_y) / cell_h).floor() as i64
+            ((pos.y - pad_px - gap_px_y - centre_y) / cell_h).floor() as i64
         };
         let max_col = snap.width.saturating_sub(1) as i64;
         let max_row = snap.height.saturating_sub(1) as i64;
@@ -2404,9 +2515,17 @@ impl Runtime {
         } else {
             first
         };
-        let content = frame.content;
-        let local_col = ((x - f64::from(content.x)) / cell_w).floor().max(0.0);
-        let local_row = ((y - f64::from(content.y)) / cell_h).floor().max(0.0);
+        // bitty#3284: the pointer maps through the same centred grid origin
+        // the paint path translates by, so a pixel inside a painted cell
+        // resolves to that cell. The remainder stripes above and below the
+        // grid floor into the first/last row, exactly like the decoration
+        // band always has.
+        let (grid_x, grid_y) = {
+            let live = self.live_cell_metrics();
+            frame.grid_origin(live.width, live.height)
+        };
+        let local_col = ((x - f64::from(grid_x)) / cell_w).floor().max(0.0);
+        let local_row = ((y - f64::from(grid_y)) / cell_h).floor().max(0.0);
         if local_col > f64::from(u16::MAX) || local_row > f64::from(u16::MAX) {
             return None;
         }
@@ -2434,8 +2553,15 @@ impl Runtime {
             return None;
         }
         let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad - f64::from(frame.content.x);
-        let y = pos.y - pad - f64::from(frame.content.y);
+        // bitty#3284: clamp against the centred grid origin the paint path
+        // uses, so a drag or selection edge resolves the same cell a fresh
+        // render paints there.
+        let (grid_x, grid_y) = {
+            let live = self.live_cell_metrics();
+            frame.grid_origin(live.width, live.height)
+        };
+        let x = pos.x - pad - f64::from(grid_x);
+        let y = pos.y - pad - f64::from(grid_y);
         let max_col = i64::from(frame.cols.saturating_sub(1));
         let max_row = i64::from(frame.rows.saturating_sub(1));
         Some(CellPos::new(
@@ -2462,7 +2588,13 @@ impl Runtime {
             return None;
         }
         let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad - f64::from(frame.content.x);
+        // bitty#3284: boundaries count cell edges from the centred grid
+        // origin, matching the fill placement the selection paint reads.
+        let (grid_x, _grid_y) = {
+            let live = self.live_cell_metrics();
+            frame.grid_origin(live.width, live.height)
+        };
+        let x = pos.x - pad - f64::from(grid_x);
         Some(SelectionBoundary::new(boundary_frame_axis(
             x, cell_w, frame.cols,
         )))

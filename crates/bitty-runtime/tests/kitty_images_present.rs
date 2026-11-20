@@ -694,18 +694,22 @@ fn focused_cursor_wins_over_covering_image() {
     );
     // Same geometry pins as `tick_cursor_overlay_uses_theme_cursor_hue`
     // in `runtime_present.rs`: default 9x19 cells, 8px window padding,
-    // 14px decoration inset, 736px window width.
+    // 14px decoration inset, 736px window width. bitty#3284 centres the
+    // 77x22 painted grid inside the 694x430 content box, so both the
+    // image blit and the cursor rect sit 6px lower (12px row leftover,
+    // split 6/6; the 1px column leftover floors to a 0px split).
     let cfg = RuntimeConfig::default();
     assert_eq!((cfg.cell_width, cfg.cell_height), (9, 19));
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
     assert_eq!(pad, 8, "default padding inset is 8px at scale 1.0");
     const DECORATION: usize = 14;
+    const ROW_SPLIT: usize = 6;
     let width = usize::try_from(cfg.window_extent().width()).expect("width fits usize");
     let rgba = rt.headless_rgba().expect("rgba after tick");
     // Cursor cell (0,0): theme cursor #f5e0dc at 0xA0 alpha, premultiplied
     // overwrite by the overlay fill — not image red.
     let cx = pad + DECORATION + 4;
-    let cy = pad + DECORATION + 9;
+    let cy = pad + DECORATION + ROW_SPLIT + 9;
     let idx = (cy * width + cx) * 4;
     assert_eq!(
         &rgba[idx..idx + 4],

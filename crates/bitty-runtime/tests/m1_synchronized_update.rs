@@ -254,6 +254,9 @@ fn synchronized_update_window_is_bounded_at_100ms() {
 /// downstream visual review. Since #1349 the digest also covers the
 /// in-grid status bar row when it paints; CTX-0838 (#1441) hides the
 /// lone-workspace bar, so this single-workspace commit carries no bar.
+/// Re-recorded under bitty#3284 (CTX-1920): the pane grid is centred inside
+/// its content rect, and this default-config frame is a non-multiple, so the
+/// presented pixels moved with the grid origin.
 #[test]
 fn golden_synchronized_update_commit_frame() {
     let mut rt = harness();
@@ -266,7 +269,7 @@ fn golden_synchronized_update_commit_frame() {
     let commit = rt.tick_at(t0 + Duration::from_millis(1)).expect("commit");
     let actual = digest(&rt, &commit);
     assert_eq!(
-        actual, 0x636f_64b4_dce4_c871,
+        actual, 0x5609_bfdf_d7d5_e171,
         "synchronized-update commit digest changed (actual 0x{actual:016x})"
     );
 }

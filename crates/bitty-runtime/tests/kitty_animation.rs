@@ -337,22 +337,27 @@ fn compose_src_y_selects_source_row_on_wire() {
     /// preserves its aspect ratio, so the image is centered in that rect
     /// and its first pixel is offset by the fitted letterbox inset (not
     /// the cell origin). Same frame math the present path uses.
+    ///
+    /// bitty#3284: the image anchors at the centred grid origin, exactly
+    /// like the glyphs beside it, so the probe reads
+    /// [`PresentFrame::grid_origin`].
     fn dest_first_pixel(rgba: &[u8], rt: &Runtime) -> [u8; 4] {
         let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits");
         let extent = rt.surface_extent().expect("surface extent exists");
         let stride = usize::try_from(extent.width()).expect("width fits");
-        let content = rt.present_frames()[0].content;
+        let frame = rt.present_frames()[0];
         let (cell_w, cell_h) = rt.live_cell_size();
+        let (grid_x, grid_y) = frame.grid_origin(cell_w, cell_h);
         let fit = bitty_rich::fit_aspect_rect(
             bitty_rich::RectPx::new(0, 0, cell_w * 2, cell_h * 2),
             2,
             2,
         );
         let x = pad
-            + usize::try_from(content.x).expect("content x fits")
+            + usize::try_from(grid_x).expect("grid x fits")
             + usize::try_from(fit.x).expect("fit x fits");
         let y = pad
-            + usize::try_from(content.y).expect("content y fits")
+            + usize::try_from(grid_y).expect("grid y fits")
             + usize::try_from(fit.y).expect("fit y fits");
         let i = (y * stride + x) * 4;
         [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]

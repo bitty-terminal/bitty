@@ -497,8 +497,9 @@ fn scene_host(view: ViewId, scene: bitty_rich::scene::Scene) -> (PanelRuntime, P
     (host, handle)
 }
 
-/// The compositor-owned leaf content rect the present loop hands the scene
-/// path: `frame.content` translated by the window padding.
+/// The compositor-owned leaf painted grid rect the present loop hands the
+/// scene path: `frame.grid_rect` (bitty#3284: the centred grid) translated
+/// by the window padding.
 fn presented_surface(rt: &Runtime, view: ViewId) -> SceneSurface {
     let frame = rt
         .presented_allocations()
@@ -506,12 +507,14 @@ fn presented_surface(rt: &Runtime, view: ViewId) -> SceneSurface {
         .find(|frame| frame.view == view)
         .expect("leaf was presented");
     let pad = i32::try_from(rt.window_padding_physical()).expect("padding fits i32");
+    let metrics = rt.live_cell_size();
+    let grid = frame.grid_rect(metrics.0, metrics.1);
     SceneSurface::new(
         RectPx::new(
-            frame.content.x.saturating_add(pad),
-            frame.content.y.saturating_add(pad),
-            frame.content.width,
-            frame.content.height,
+            grid.x.saturating_add(pad),
+            grid.y.saturating_add(pad),
+            grid.width,
+            grid.height,
         ),
         cell(),
     )

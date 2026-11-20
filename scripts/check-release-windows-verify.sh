@@ -12,12 +12,15 @@
 #
 #   Rule 1 — the portable-ZIP verifier reads the directories it downloaded.
 #     Each `bitty-windows-zip-<arch>` artifact download path must equal the
-#     `pkg/<arch>` directory the expand loop iterates for that same arch.
+#     directory the expand loop's own lookup builds for that same arch, i.e.
+#     `Join-Path '<root>' $arch` -> `<root>/<arch>`. The lookup expression is
+#     parsed, not assumed: a rename of the joined root is a rule-1 failure.
 #
 #   Rule 2 — a version assertion tolerates a trimmed capture.
 #     The payload is checked variously as a raw multi-line string and as a
-#     `.Trim()`-ed console capture, so every `\Abitty <v> \(tok tok\)` pattern
-#     must end with `\s*\z` and must not require a literal trailing newline.
+#     `.Trim()`-ed console capture. The trailing expression after `\)` must be
+#     exactly `\s*\z`, so a mandatory newline anywhere before the optional
+#     whitespace (for example `(?:\r\n|\n)\s*\z`) is rejected.
 #
 # Usage: scripts/check-release-windows-verify.sh [--root <dir>]
 #   --root scans <dir> instead of the repository root (fixture tests).
@@ -89,19 +92,30 @@ else:
 downloads = dict(
     (m.group(1), m.group(2))
     for m in re.finditer(
-        r"name: bitty-windows-zip-(\w+)\n\s+path: (pkg/\S+)", zip_job
+        r"name: bitty-windows-zip-(\w+)\n\s+path: (\S+)", zip_job
     )
 )
-for arch in arches:
-    if arch not in downloads:
-        fail("rule-1", f"no bitty-windows-zip-{arch} download in verify-windows-zip")
-        continue
-    expected = f"pkg/{arch}"
-    if downloads[arch] != expected:
-        fail(
-            "rule-1",
-            f"bitty-windows-zip-{arch} downloads to {downloads[arch]} but the loop reads {expected}",
-        )
+
+# Rule 1 compares against the verifier's own lookup, not a constant: the loop
+# builds its path from `Join-Path '<root>' $arch`, so parse that expression.
+lookup = re.search(r"Join-Path\s+'([^']+)'\s+\$arch", zip_job)
+if not lookup:
+    fail("rule-1", "verify-windows-zip does not build its archive directory with Join-Path '<root>' $arch")
+    lookup_root = None
+else:
+    lookup_root = lookup.group(1).rstrip("/")
+
+if lookup_root is not None:
+    for arch in arches:
+        if arch not in downloads:
+            fail("rule-1", f"no bitty-windows-zip-{arch} download in verify-windows-zip")
+            continue
+        expected = f"{lookup_root}/{arch}"
+        if downloads[arch] != expected:
+            fail(
+                "rule-1",
+                f"bitty-windows-zip-{arch} downloads to {downloads[arch]} but the loop reads {expected}",
+            )
 
 for extra, dest in downloads.items():
     if extra not in arches:
@@ -120,10 +134,18 @@ if not assertions:
     fail("rule-2", "no version assertion found; the gate would be vacuous")
 
 for line in assertions:
-    if "(?:\\r\\n|\\n)\\z" in line or "(?:\\n|\\r\\n)\\z" in line:
-        fail("rule-2", f"assertion requires a trailing newline: {line}")
-    elif not line.rstrip().endswith("\\s*\\z'"):
-        fail("rule-2", f"assertion does not tolerate a trimmed capture: {line}")
+    # The pattern is the last single-quoted segment of the line; everything
+    # after `\)` must be exactly the optional-whitespace terminator.
+    tail_marker = line.rfind("\\)")
+    if tail_marker < 0:
+        fail("rule-2", f"assertion has no version-suffix terminator: {line}")
+        continue
+    tail = line[tail_marker + 2 :]
+    if tail != "\\s*\\z'":
+        fail(
+            "rule-2",
+            f"assertion suffix must be exactly \\s*\\z (no mandatory newline): {line}",
+        )
 
 if failures:
     for failure in failures:

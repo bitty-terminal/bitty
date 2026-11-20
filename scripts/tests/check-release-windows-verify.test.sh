@@ -3,12 +3,19 @@
 # workflow's Windows verification gate.
 #
 # The v0.0.46 release run (44718678246) failed in two Windows verification jobs
-# after every build succeeded. Both defects are pinned here against synthetic
-# workflow fixtures, so the gate is proven to reject them:
+# after every build succeeded. Both defects — and the two near-misses the first
+# draft of this gate would have accepted — are pinned against synthetic workflow
+# fixtures, so each one is proven to be rejected:
 #
-#   fixtures/release-windows-verify/clean       -> gate passes
-#   fixtures/release-windows-verify/zip-path    -> Mismatched ZIP directory
-#   fixtures/release-windows-verify/newline     -> assertion needs a newline
+#   fixtures/release-windows-verify/clean           -> gate passes
+#   fixtures/release-windows-verify/zip-path        -> download path != loop root
+#   fixtures/release-windows-verify/lookup-root     -> loop root renamed, gate
+#                                                      must follow the lookup
+#   fixtures/release-windows-verify/newline         -> assertion needs a newline
+#   fixtures/release-windows-verify/newline-suffix  -> newline before `\s*\z`
+#
+# The real workflow's default-root check runs in CI via
+# `scripts/check-release-windows-verify.sh`.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -30,19 +37,21 @@ if ((clean_status != 0)); then
 fi
 grep -q 'PASS' <<<"$clean_out" || fail "clean fixture did not report PASS"
 
-zip_out="$("$GATE" --root "$FIXTURES/zip-path" 2>&1)" || zip_status=$?
-zip_status="${zip_status:-0}"
-if ((zip_status == 0)); then
-  fail "mismatched portable-ZIP directory was accepted"
-fi
-grep -q 'rule-1' <<<"$zip_out" || fail "ZIP mismatch did not report rule-1: $zip_out"
+# expect_rejected <fixture> <rule> <description>
+expect_rejected() {
+  local fixture="$1" rule="$2" description="$3" out status
+  out="$("$GATE" --root "$FIXTURES/$fixture" 2>&1)" || status=$?
+  status="${status:-0}"
+  if ((status == 0)); then
+    fail "$description was accepted"
+  fi
+  grep -q "$rule" <<<"$out" || fail "$description did not report $rule: $out"
+}
 
-newline_out="$("$GATE" --root "$FIXTURES/newline" 2>&1)" || newline_status=$?
-newline_status="${newline_status:-0}"
-if ((newline_status == 0)); then
-  fail "newline-requiring version assertion was accepted"
-fi
-grep -q 'rule-2' <<<"$newline_out" || fail "newline assertion did not report rule-2: $newline_out"
+expect_rejected zip-path rule-1 "a download path that differs from the loop root"
+expect_rejected lookup-root rule-1 "a renamed Join-Path lookup root"
+expect_rejected newline rule-2 "an assertion requiring a trailing newline"
+expect_rejected newline-suffix rule-2 "a mandatory newline before the \\s*\\z suffix"
 
 if ((FAIL != 0)); then
   exit 1

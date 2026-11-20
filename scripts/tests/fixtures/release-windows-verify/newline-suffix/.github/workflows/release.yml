@@ -1,0 +1,30 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+jobs:
+  verify-windows-zip:
+    name: Verify Windows ZIP unzip-and-run
+    runs-on: windows-latest
+    steps:
+      - name: Download x86_64 portable ZIP
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-windows-zip-x86_64
+          path: pkg/x86_64
+
+      - name: Download aarch64 portable ZIP
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-windows-zip-aarch64
+          path: pkg/aarch64
+
+      - name: Expand archives, run bitty.exe, and run bitty.com
+        shell: pwsh
+        run: |
+          foreach ($arch in @('x86_64', 'aarch64')) {
+            $zip = Get-ChildItem -Path (Join-Path 'pkg' $arch) -Filter '*.zip' | Select-Object -First 1
+            if (-not $zip) { throw "portable ZIP artifact not found for $arch" }
+          }
+          $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\s*\z'

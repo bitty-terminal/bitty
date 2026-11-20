@@ -24,6 +24,7 @@ jobs:
         shell: pwsh
         run: |
           foreach ($arch in @('x86_64', 'aarch64')) {
-            Write-Host $arch
+            $zip = Get-ChildItem -Path (Join-Path 'pkg' $arch) -Filter '*.zip' | Select-Object -First 1
+            if (-not $zip) { throw "portable ZIP artifact not found for $arch" }
           }
           $pattern = '\Abitty ' + [regex]::Escape($version) + ' \([^\s()]+ [^\s()]+\)(?:\r\n|\n)\z'

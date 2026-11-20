@@ -23,14 +23,19 @@
 # a registered name whose directory is missing fails the suite too.
 #
 # Fixture inventory (pinned against the v0.0.46 release run, 44718678246):
-#   clean           -> gate passes
-#   lookup-root     -> rule-1: loop root renamed, the gate must follow the lookup
-#   newline         -> rule-2: assertion needs a newline
-#   newline-suffix  -> rule-2: newline before `\s*\z`
-#   zip-path        -> rule-1: download path differs from the loop root
+#   clean                 -> gate passes
+#   comment-after-suffix  -> rule-2: only a trailing comment ends in `\s*\z`
+#   correct-with-comment  -> gate passes; a correct assertion may carry a comment
+#   lookup-root           -> rule-1: loop root renamed, the gate must follow the lookup
+#   newline               -> rule-2: assertion needs a newline
+#   newline-suffix        -> rule-2: newline before `\s*\z`
+#   pattern-variable-name -> rule-2: the assertion is bound to `$pat`, not `$pattern`
+#   stale-comment         -> rule-1: a stale comment cites the pre-rename root
+#   zip-path              -> rule-1: download path differs from the loop root
 #
-# The real workflow's default-root check runs in CI via
-# `scripts/check-release-windows-verify.sh`.
+# The fixtures cover the rule shapes; the real workflow is checked separately
+# by `just release-windows-verify` (part of `just check`) and by CI, so a
+# regression in .github/workflows/release.yml itself cannot slip through.
 set -euo pipefail
 
 # Byte-stable ordering for the sorted enumeration and all matching below.
@@ -44,8 +49,8 @@ FAIL=0
 SEEN=""
 
 # --- Registry: every fixture must be declared in exactly one list ------------
-FIXTURES_MUST_PASS="clean"
-FIXTURES_MUST_REJECT="lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 zip-path:rule-1"
+FIXTURES_MUST_PASS="clean correct-with-comment"
+FIXTURES_MUST_REJECT="comment-after-suffix:rule-2 lookup-root:rule-1 newline:rule-2 newline-suffix:rule-2 pattern-variable-name:rule-2 stale-comment:rule-1 zip-path:rule-1"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -55,7 +60,7 @@ fail() {
 # True when the exact word $2 appears in the space-separated list $1.
 list_contains() {
   case " $1 " in
-    *" $2 "*) return 0 ;;
+  *" $2 "*) return 0 ;;
   esac
   return 1
 }
@@ -91,14 +96,14 @@ reject_rule() {
 # separator and spaces between entries), so a corrupted list can never glob
 # against the working directory when the loops below expand it.
 case "$FIXTURES_MUST_PASS" in
-  *[!A-Za-z0-9._[:space:]-]*)
-    fail "malformed FIXTURES_MUST_PASS: '$FIXTURES_MUST_PASS' (expected fixture names separated by spaces)"
-    ;;
+*[!A-Za-z0-9._[:space:]-]*)
+  fail "malformed FIXTURES_MUST_PASS: '$FIXTURES_MUST_PASS' (expected fixture names separated by spaces)"
+  ;;
 esac
 case "$FIXTURES_MUST_REJECT" in
-  *[!A-Za-z0-9._[:space:]:-]*)
-    fail "malformed FIXTURES_MUST_REJECT: '$FIXTURES_MUST_REJECT' (expected '<fixture>:<rule>' entries separated by spaces)"
-    ;;
+*[!A-Za-z0-9._[:space:]:-]*)
+  fail "malformed FIXTURES_MUST_REJECT: '$FIXTURES_MUST_REJECT' (expected '<fixture>:<rule>' entries separated by spaces)"
+  ;;
 esac
 
 REJECT_NAMES=""
@@ -107,7 +112,7 @@ for entry in $FIXTURES_MUST_REJECT; do
 done
 
 for name in $FIXTURES_MUST_PASS; do
-  if (( $(word_count "$FIXTURES_MUST_PASS" "$name") > 1 )); then
+  if (($(word_count "$FIXTURES_MUST_PASS" "$name") > 1)); then
     fail "duplicate FIXTURES_MUST_PASS entry '$name'"
   fi
 done
@@ -117,7 +122,7 @@ for entry in $FIXTURES_MUST_REJECT; do
   fi
 done
 for name in $REJECT_NAMES; do
-  if (( $(word_count "$REJECT_NAMES" "$name") > 1 )); then
+  if (($(word_count "$REJECT_NAMES" "$name") > 1)); then
     fail "duplicate FIXTURES_MUST_REJECT registration for fixture '$name'"
   fi
   if list_contains "$FIXTURES_MUST_PASS" "$name"; then
@@ -136,34 +141,34 @@ for fixture_dir in "$FIXTURES"/*; do
   out="$("$GATE" --root "$fixture_dir" 2>&1)" || status=$?
 
   if list_contains "$FIXTURES_MUST_PASS" "$fixture"; then
-    if (( status != 0 )); then
-      printf '  %-4s %-16s expect=pass   result=REJECTED (exit %s)\n' FAIL "$fixture" "$status"
+    if ((status != 0)); then
+      printf '  %-4s %-22s expect=pass   result=REJECTED (exit %s)\n' FAIL "$fixture" "$status"
       fail "unexpected reject: must-pass fixture '$fixture' was rejected by the gate (exit $status):"
       printf '%s\n' "$out" >&2
     elif grep -q 'PASS' <<<"$out"; then
-      printf '  %-4s %-16s expect=pass   result=PASS (exit 0)\n' ok "$fixture"
+      printf '  %-4s %-22s expect=pass   result=PASS (exit 0)\n' ok "$fixture"
     else
-      printf '  %-4s %-16s expect=pass   result=exit 0 without reporting PASS\n' FAIL "$fixture"
+      printf '  %-4s %-22s expect=pass   result=exit 0 without reporting PASS\n' FAIL "$fixture"
       fail "must-pass fixture '$fixture' exited 0 but the gate did not report PASS: $out"
     fi
   elif rule="$(reject_rule "$fixture")"; then
-    if (( status == 0 )); then
-      printf '  %-4s %-16s expect=reject %s result=ACCEPTED (exit 0)\n' FAIL "$fixture" "$rule"
+    if ((status == 0)); then
+      printf '  %-4s %-22s expect=reject %s result=ACCEPTED (exit 0)\n' FAIL "$fixture" "$rule"
       fail "unexpected pass: must-reject fixture '$fixture' was accepted by the gate (no fixture outside FIXTURES_MUST_PASS may pass):"
       printf '%s\n' "$out" >&2
     elif grep -q "$rule" <<<"$out"; then
-      printf '  %-4s %-16s expect=reject %s result=REJECTED (exit %s, reported %s)\n' ok "$fixture" "$rule" "$status" "$rule"
+      printf '  %-4s %-22s expect=reject %s result=REJECTED (exit %s, reported %s)\n' ok "$fixture" "$rule" "$status" "$rule"
     else
-      printf '  %-4s %-16s expect=reject %s result=REJECTED (exit %s) without reporting %s\n' FAIL "$fixture" "$rule" "$status" "$rule"
+      printf '  %-4s %-22s expect=reject %s result=REJECTED (exit %s) without reporting %s\n' FAIL "$fixture" "$rule" "$status" "$rule"
       fail "must-reject fixture '$fixture' was rejected (exit $status) but the gate did not report $rule: $out"
     fi
   else
     # Unregistered directory — the exact gap the enumeration exists to close.
-    if (( status == 0 )); then
-      printf '  %-4s %-16s expect=registered result=ACCEPTED (exit 0)\n' FAIL "$fixture"
+    if ((status == 0)); then
+      printf '  %-4s %-22s expect=registered result=ACCEPTED (exit 0)\n' FAIL "$fixture"
       fail "unexpected pass: fixture '$fixture' is registered in neither list and the gate accepted it — register it in FIXTURES_MUST_PASS or FIXTURES_MUST_REJECT"
     else
-      printf '  %-4s %-16s expect=registered result=REJECTED (exit %s)\n' FAIL "$fixture" "$status"
+      printf '  %-4s %-22s expect=registered result=REJECTED (exit %s)\n' FAIL "$fixture" "$status"
       fail "unregistered fixture '$fixture': the gate rejected it (exit $status), but a fixture registered in neither list is exercised only by accident — register it in FIXTURES_MUST_PASS or FIXTURES_MUST_REJECT"
     fi
   fi
@@ -179,7 +184,7 @@ for name in $REJECT_NAMES; do
   list_contains "$SEEN" "$name" || fail "FIXTURES_MUST_REJECT entry '$name' has no directory under '$FIXTURES'"
 done
 
-if (( FAIL != 0 )); then
+if ((FAIL != 0)); then
   echo "check-release-windows-verify.test.sh: FAILED" >&2
   exit 1
 fi

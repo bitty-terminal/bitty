@@ -1239,17 +1239,24 @@ fn main() {
         .is_some_and(|profile| !profile.trim().is_empty());
     let inspect_context =
         runtime_inspect::RuntimeInspectContext::from_app(&app_config, &inspect_env, args.safe);
+    // bitty#2388 (CTX-1929): the runtime moves behind the shared handle here
+    // so plugin discovery can hand `RuntimePanelContentBackend` the SAME
+    // runtime this process drives, and the app below is constructed over the
+    // identical handle. A `--safe` run seeds nothing: every
+    // `bitty.ui.panel.*` verb keeps failing closed with `E_UI_UNAVAILABLE`,
+    // the same fail-closed surface shape the runtime-side fixtures record.
+    let shared_runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
     let plugin_session = plugin_runtime::discover_and_activate(
         args.safe,
-        runtime.config().cols,
-        runtime.config().rows,
+        shared_runtime.borrow().config().cols,
+        shared_runtime.borrow().config().rows,
         &plugin_runtime::StartupSeed {
-            workspaces: &runtime.workspace_summaries(),
+            workspaces: &shared_runtime.borrow().workspace_summaries(),
             keymaps: &keymaps,
             targets: &startup_targets,
-            leaves: &runtime.layout().leaf_ids(),
-            pinned: &runtime.pinned_views(),
-            image_roots: &runtime.config().background_image_roots,
+            leaves: &shared_runtime.borrow().layout().leaf_ids(),
+            pinned: &shared_runtime.borrow().pinned_views(),
+            image_roots: &shared_runtime.borrow().config().background_image_roots,
             history_capture: app_config.effective.history.capture.clone(),
             inspect: Some(&inspect_context),
             // CTX-1613: only a direct child of the resolved config root is a
@@ -1269,11 +1276,15 @@ fn main() {
             // bitty#2785: the terminal-slot scene target starts at the
             // focused leaf so an activation-time `ui.mount("terminal", …)`
             // has a deterministic route; the tick loop keeps it live.
-            scene_target: runtime.focused_view(),
+            scene_target: shared_runtime.borrow().focused_view(),
             // OQ-084 B-2: the create seam starts with the presented
             // workspace's minted id; the tick loop keeps it live. No plugin
             // input can name this workspace.
-            focused_workspace: runtime.focused_workspace_id(),
+            focused_workspace: shared_runtime.borrow().focused_workspace_id(),
+            // bitty#2388 (CTX-1929): the shared handle this seed carries is
+            // what the composition root installs as the panel content
+            // backend; `--safe` leaves it `None` and the verbs fail closed.
+            shared_runtime: (!args.safe).then(|| std::rc::Rc::clone(&shared_runtime)),
         },
     );
     let live_snapshot = plugin_session
@@ -1334,7 +1345,7 @@ fn main() {
     // generation's authority.
     if let Some(plugins) = plugin_runtime_handle.as_ref() {
         let mirrored = component_bridge::mirror_plugin_authority(
-            &mut runtime,
+            &mut shared_runtime.borrow_mut(),
             plugins,
             |plugin, reason| {
                 logging::warn(|| {
@@ -1392,7 +1403,7 @@ fn main() {
     if should_store_ipc_socket_path(args.headless, args.test_mode) {
         let env = bitty_ipc::devtools::SocketEnv::from_process_env();
         if let Ok((path, _)) = bitty_ipc::devtools::resolve_socket_path_from_env(&env, None) {
-            runtime.set_ipc_socket_path(path);
+            shared_runtime.borrow_mut().set_ipc_socket_path(path);
         }
     }
     // CTX-1719: a windowed run defers the primary and pane shell spawn until
@@ -1407,7 +1418,7 @@ fn main() {
     // spawns eagerly on its own fresh runtime).
     let defer_startup_spawn = defers_startup_spawn(args.headless, args.test_mode);
     if !defer_startup_spawn {
-        let startup_spawn = spawn_startup_shells(&mut runtime, &spawn_spec);
+        let startup_spawn = spawn_startup_shells(&mut shared_runtime.borrow_mut(), &spawn_spec);
         // bitty#2928: an unresolvable default child shell is fatal even
         // without `--fail-loud` — a headless tick is not a working terminal.
         // A resolved program that fails to spawn stays fail-soft.
@@ -1433,7 +1444,7 @@ fn main() {
         // `--safe` keeps the probe-only reply (built-in config, no external
         // layers).
         install_reload_context(&args, &app_config);
-        std::process::exit(test_mode::run(&mut runtime));
+        std::process::exit(test_mode::run(&mut shared_runtime.borrow_mut()));
     }
 
     if args.headless {
@@ -1441,7 +1452,7 @@ fn main() {
         // the interactive path. There is no tick loop before the smoke run,
         // so sample the current committed scrollback once here.
         if let Some(history) = live_history.as_ref() {
-            plugin_runtime::capture_history(&runtime, history);
+            plugin_runtime::capture_history(&shared_runtime.borrow(), history);
         }
         // In headless mode we still fed synthetic bytes via run_headless_smoke, but the live PTY
         // (if any) has been spawned above and will be polled on AboutToWait. For deterministic CI
@@ -1460,7 +1471,7 @@ fn main() {
                 .as_ref()
                 .map_or(String::from("(none)"), |p| p.display().to_string()),
         );
-        let code = run_headless_smoke(&mut runtime);
+        let code = run_headless_smoke(&mut shared_runtime.borrow_mut());
         std::process::exit(code);
     }
 
@@ -1475,8 +1486,8 @@ fn main() {
     // CTX-0144: serve BITTY_SOCKET for the devtools-protocol handshake + read-only
     // round-trip. Fail-soft: socket failure never crashes the terminal.
     let ipc_serve = ipc_serve::serve_in_background(ipc_serve::ServerDescriptor {
-        cols: runtime.config().cols,
-        rows: runtime.config().rows,
+        cols: shared_runtime.borrow().config().cols,
+        rows: shared_runtime.borrow().config().rows,
         test_mode: false,
     });
     if ipc_serve.is_enabled() {
@@ -1500,8 +1511,11 @@ fn main() {
             String::from("bitty: accessibility projection suppressed in --safe (safe-mode clean)")
         });
     }
-    let mut app = TerminalApp::with_theme(
-        runtime,
+    // CTX-1929 (bitty#2388): the app takes the SAME shared handle that was
+    // seeded into plugin discovery, so the backend the composition root
+    // installed drives the runtime this app owns.
+    let mut app = TerminalApp::with_theme_shared(
+        shared_runtime,
         &app_config.theme_name,
         app_config.source,
         keymaps,

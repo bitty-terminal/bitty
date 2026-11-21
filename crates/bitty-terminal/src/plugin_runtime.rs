@@ -27,8 +27,8 @@ use bitty_runtime::plugin_runtime::{
     LifecycleState, LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
     PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume, PanelEdgeSuspend, PanelGenerationPort,
     PanelPinHandler, PanelPinQueue, PanelSceneBackend, PluginRuntime, PluginRuntimeConfig,
-    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
-    WorkspaceInfo, WorkspaceSource, adopt_legacy_store, controller_generation,
+    QueuedPinRequest, RuntimePanelContentBackend, SnapshotSource, TargetSource, TranscriptHistory,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceSource, adopt_legacy_store, controller_generation,
 };
 use bitty_runtime::registry::{
     Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
@@ -1888,6 +1888,16 @@ pub(crate) struct StartupSeed<'a> {
     /// presents; the tick loop keeps it live. `None` fails the create closed
     /// with `E_UI_UNAVAILABLE` rather than allocating an unattributed record.
     pub(crate) focused_workspace: Option<WorkspaceId>,
+    /// Shared handle to the Core runtime the app owns (bitty#2388, CTX-1929).
+    ///
+    /// `Some` installs `RuntimePanelContentBackend` before activation, so a
+    /// generation granted `ui.rich` + `ui.panel` reaches the real
+    /// `Runtime::ui_panel_present` swap through the same handle the app
+    /// drives. `None` (safe mode, a test, a caller that owns no runtime)
+    /// leaves the backend unwired and every `bitty.ui.panel.*` verb fails
+    /// closed with `E_UI_UNAVAILABLE`, exactly like every other unhosted
+    /// surface.
+    pub(crate) shared_runtime: Option<std::rc::Rc<std::cell::RefCell<bitty_runtime::Runtime>>>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -2131,6 +2141,19 @@ pub(crate) fn discover_with_roots(
             (None, None)
         }
     };
+    // bitty#2388 (CTX-1929): install the panel content presentation backend
+    // over the SAME shared runtime handle the app owns, so a generation
+    // granted `ui.rich` + `ui.panel` reaches the real
+    // `Runtime::ui_panel_present` swap — the only path to the Core content
+    // layer — instead of failing closed with `E_UI_UNAVAILABLE`. Installed
+    // before activation per the `set_panel_content_backend` contract; the
+    // backend itself is a forwarder (it resolves no panel, grants nothing),
+    // and a reentrant call fails closed through its `try_borrow_mut`. A seed
+    // without the handle (safe mode, a caller that owns no runtime) leaves
+    // the verb failing closed, like every other unhosted surface.
+    if let Some(shared) = seed.shared_runtime.clone() {
+        runtime.set_panel_content_backend(Some(Rc::new(RuntimePanelContentBackend::new(shared))));
+    }
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the
     // RC-1 accounting; only the atomic-commit bytes flow through here.
@@ -2964,6 +2987,7 @@ mod tests {
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3042,6 +3066,7 @@ mod tests {
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3160,6 +3185,7 @@ mod tests {
         context: &'a crate::runtime_inspect::RuntimeInspectContext,
     ) -> StartupSeed<'a> {
         StartupSeed {
+            shared_runtime: None,
             workspaces: &[],
             keymaps: &[],
             targets: &[],
@@ -3317,6 +3343,7 @@ mod tests {
         let table = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &[],
             keymaps: &table,
             targets: &[],
@@ -3541,6 +3568,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3618,6 +3646,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3694,6 +3723,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3927,6 +3957,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4098,6 +4129,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4500,6 +4532,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4750,6 +4783,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4850,6 +4884,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4957,6 +4992,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -5243,6 +5279,7 @@ error("activation fails after mounting the terminal slot scene")
         let leaves = rt.layout().leaf_ids();
         let pinned = rt.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -5720,6 +5757,7 @@ error("activation fails after mounting the terminal slot scene")
         let leaves = rt.layout().leaf_ids();
         let pinned = rt.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -7831,5 +7869,443 @@ error("activation fails after mounting the terminal slot scene")
             assert!(!legacy_state.exists());
             install.cleanup();
         }
+    }
+
+    // ── bitty#2388 (CTX-1929): the plugin producer wire ─────────────────
+    //
+    // The composition root under test: a granted plugin's
+    // `bitty.ui.panel.present` must reach the real Core swap in the shipped
+    // app (the backend installed over the same shared handle the app owns),
+    // and the app tick must deliver `panel.content.*` to a subscriber. All
+    // three rows run the real discovery/activation path over a dev root.
+
+    /// Presenter body. `present` keeps the handle in a plugin-local upvalue so
+    /// a later command releases exactly the layer it presented, the way a
+    /// real plugin would. Every verb reports `OK:<value>` or `ERR:<code>`,
+    /// so a refusal travels as a value carrying the record's code.
+    const PANEL_CONTENT_ID: &str = "xuepoo.panelcontent";
+    const PANEL_CONTENT_OBSERVER_ID: &str = "xuepoo.panelcontentobs";
+
+    const PANEL_CONTENT_INIT: &str = r#"
+local handle = nil
+
+local function report(value, err)
+  if err then return "ERR:" .. err.code end
+  return "OK:" .. tostring(value)
+end
+
+bitty.commands.register({ id = "present", title = "Present", run = function()
+  local value, err = bitty.ui.panel.present(
+    { kind = "Text", text = "panel-content-wire" }, {}
+  )
+  if not err then handle = value end
+  return report(value, err)
+end })
+
+bitty.commands.register({ id = "release", title = "Release", run = function()
+  local ok, err = bitty.ui.panel.release(handle)
+  return report(ok, err)
+end })
+"#;
+
+    /// Observer body: subscribe to the release observation and record a
+    /// `kind:owner:handle:reason` row per delivery, served through the
+    /// `events` command.
+    const PANEL_CONTENT_OBSERVER_INIT: &str = r#"
+local log = {}
+
+bitty.events.subscribe("panel.content.released", function(envelope)
+  local payload = envelope.payload
+  log[#log + 1] = envelope.kind .. ":" .. tostring(payload.owner) .. ":"
+    .. tostring(payload.handle) .. ":" .. tostring(payload.reason)
+end)
+
+bitty.commands.register({ id = "events", title = "Events", run = function()
+  return "OK:" .. table.concat(log, ";")
+end })
+"#;
+
+    fn write_panel_content_plugin(
+        root: &Path,
+        id: &str,
+        capabilities: &[&str],
+        events: &[&str],
+        commands: &[&str],
+        init: &str,
+    ) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        let qualified = commands
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let events_toml = events
+            .iter()
+            .map(|event| format!("\"{event}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                r#"[plugin]
+id = "{id}"
+name = "Panel content wire"
+version = "0.1.0"
+description = "bitty.ui.panel producer wire"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+{capabilities_toml}[lazy]
+commands = [{qualified}]
+events = [{events_toml}]
+"#
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
+    }
+
+    /// The composition-root fixture: a split runtime with a live shell on the
+    /// focused leaf, the real discovery/activation path over a dev root, and
+    /// the app built over the SAME shared handle the seed carried.
+    ///
+    /// `seed_handle` selects whether the composition root installs the panel
+    /// content backend: `true` is the wired app, `false` is the fail-closed
+    /// twin (no backend, the verb answers `E_UI_UNAVAILABLE`).
+    fn panel_content_app(
+        tag: &str,
+        seed_handle: bool,
+    ) -> (crate::terminal_app::TerminalApp, ViewId) {
+        let root = pin_test_dir(tag);
+        write_panel_content_plugin(
+            &root,
+            PANEL_CONTENT_ID,
+            &["ui.rich", "ui.panel"],
+            &[],
+            &["present", "release"],
+            PANEL_CONTENT_INIT,
+        );
+        write_panel_content_plugin(
+            &root,
+            PANEL_CONTENT_OBSERVER_ID,
+            &[],
+            &["panel.content.released"],
+            &["events"],
+            PANEL_CONTENT_OBSERVER_INIT,
+        );
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut runtime = Runtime::with_defaults().expect("must build");
+        runtime.set_container(UiRect::new(0, 0, 80, 24));
+        let view = ViewId::new(2);
+        runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(view, 40, 24)),
+        ));
+        assert!(runtime.set_focus(view), "the fixture focus must be live");
+        let summaries = runtime.workspace_summaries();
+        let leaves = runtime.layout().leaf_ids();
+        let pinned = runtime.pinned_views();
+        let focused_workspace = runtime.focused_workspace_id();
+        // bitty#2388 (CTX-1929): the handle the seed carries is the handle
+        // the app below is built over, exactly as `main` wires it.
+        let shared = Rc::new(std::cell::RefCell::new(runtime));
+        let seed = StartupSeed {
+            shared_runtime: seed_handle.then(|| Rc::clone(&shared)),
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: Some(view),
+            focused_workspace,
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let PluginSession {
+            runtime: plugin_runtime,
+            panels,
+            scene_target,
+            focused_workspace,
+            panel_layout_ops,
+            ..
+        } = session;
+        let panels = panels.expect("production panel host");
+        // Mount the Terminal panel the way the composition root would, on the
+        // same host the app installs below, so `present` resolves a real
+        // placement mirror.
+        let panel = panels
+            .borrow_mut()
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        panels
+            .borrow_mut()
+            .mount_panel(panel.id, panel.generation, view)
+            .expect("the panel mounts at the leaf");
+        let app = crate::terminal_app::TerminalApp::with_theme_shared(
+            shared,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime))
+        .with_panel_scene_host(Some(Rc::clone(&panels)))
+        .with_scene_target(Some(scene_target))
+        .with_focused_workspace(Some(focused_workspace))
+        .with_panel_layout_ops(panel_layout_ops);
+        // The focused leaf owns a live shell and a committed frame, the exact
+        // state the close-path regression rows build.
+        app.runtime
+            .borrow_mut()
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime
+            .borrow_mut()
+            .handle_pane_bytes(view, b"before-present\r\n");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
+        (app, view)
+    }
+
+    /// Dispatch one plugin command through the app's qualified path, settling
+    /// an RC-1 park on the cold ticks the same way the input-boundary rows do.
+    fn invoke_settled(app: &mut crate::terminal_app::TerminalApp, qualified: &str) -> String {
+        for _ in 0..=PARK_RESUME_TICKS {
+            match app.invoke_plugin_command(qualified, &LuaValue::Nil) {
+                Ok(LuaValue::String(text)) => return text,
+                Ok(LuaValue::Bool(false)) => {
+                    // bitty #2314: parked work resumes on the cold tick.
+                    let _ = app.drive_tick();
+                }
+                Ok(other) => panic!("unexpected reply for {qualified}: {other:?}"),
+                Err(error) => panic!("command {qualified} refused: {error}"),
+            }
+        }
+        panic!("command {qualified} never completed within {PARK_RESUME_TICKS} cold ticks");
+    }
+
+    /// The observer's recorded bus log, one row per delivery.
+    fn panel_content_observer_log(app: &mut crate::terminal_app::TerminalApp) -> Vec<String> {
+        let reply = invoke_settled(app, &format!("{PANEL_CONTENT_OBSERVER_ID}:events"));
+        let payload = reply
+            .strip_prefix("OK:")
+            .expect("the events command answers");
+        if payload.is_empty() {
+            return Vec::new();
+        }
+        payload.split(';').map(str::to_string).collect()
+    }
+
+    /// bitty#2388 (CTX-1929): a granted plugin presents a real content layer
+    /// in the shipped app. Before the wire this row's first assertion failed
+    /// with `ERR:E_UI_UNAVAILABLE` (the audit's "dead in the shipped app"
+    /// verdict); now the verb answers a live handle, the displaced PTY stays
+    /// alive with its winsize frozen, the owner's release restores the
+    /// grid with exactly one restore resize, and a re-presented layer is
+    /// popped by the first close press before the second closes the leaf —
+    /// the same parity the chrome close rows record.
+    #[test]
+    fn granted_plugin_presents_and_releases_a_real_content_layer() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-wire", true);
+
+        let pid = app
+            .runtime
+            .borrow()
+            .pane_pid(&view)
+            .expect("live pane child");
+        let winsize = app
+            .runtime
+            .borrow()
+            .pane_pty_size(&view)
+            .expect("live winsize");
+        let resizes_before = app.runtime.borrow().content_restore_resizes();
+
+        // Present: the verb that used to answer E_UI_UNAVAILABLE.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        let Some(handle) = reply.strip_prefix("OK:") else {
+            panic!("present must answer a handle, not a refusal: {reply}");
+        };
+        let handle: i64 = handle.parse().expect("integer handle");
+        assert!(handle > 0, "the handle is live: {handle}");
+
+        // The layer is real: the app's runtime presents it and the displaced
+        // child is untouched, its winsize frozen exactly as the audit rows
+        // record.
+        assert!(app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(app.runtime.borrow().pane_pid(&view), Some(pid));
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "presenting a layer must not resize the hidden PTY"
+        );
+
+        // The audit's "exactly one restore resize" needs a moved leaf: the
+        // window-resize gesture relayouts while the layer holds the leaf, the
+        // freeze keeps the hidden PTY at the frozen winsize, and the release
+        // then owes exactly one measured `TIOCGWINSZ` movement (the counter
+        // reports kernel-side movement, not intent — bitty#3250 R10).
+        app.runtime
+            .borrow_mut()
+            .handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
+            .expect("window resize applies");
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "the freeze keeps the hidden PTY at the frozen winsize across the relayout"
+        );
+        let frame = app
+            .runtime
+            .borrow()
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .unwrap_or_else(|| panic!("{view:?} must be presented"));
+        let target = (frame.cols, frame.rows);
+        assert_ne!(
+            target, winsize,
+            "the gesture must have moved the leaf, or the restore resize proves nothing"
+        );
+
+        // The owner's release restores the grid: one restore resize to the
+        // current rect, the container is terminal-backed again.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:release"));
+        assert_eq!(reply, "OK:true", "the release must succeed: {reply}");
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(target),
+            "release resizes the displaced PTY exactly once, to the current rect"
+        );
+        assert_eq!(
+            app.runtime.borrow().content_restore_resizes(),
+            resizes_before + 1,
+            "exactly one restore resize per release"
+        );
+        assert!(app.runtime.borrow().pane_pid(&view).is_some());
+
+        // Re-present, then the close gesture pops the layer first: press one
+        // releases (not a close), press two closes the leaf.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        assert!(
+            reply.starts_with("OK:"),
+            "the re-present must answer a handle: {reply}"
+        );
+        use bitty_config::ChromeAction;
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "releasing the layer is not a close"
+        );
+        assert!(
+            !app.runtime.borrow().content_layer_presented(view),
+            "the first close press must release the presented layer"
+        );
+        assert_eq!(
+            app.runtime.borrow().pane_pid(&view),
+            Some(pid),
+            "the displaced child was never killed"
+        );
+        // The second press closes the leaf. `apply_chrome_action` falls
+        // through to a `false` tail for the ordinary leaf close (only the
+        // explicit arms return true), so the row asserts the closed state
+        // the way the chrome parity rows do — not the fall-through return.
+        let _ = app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "the leaf is closed");
+        assert!(
+            app.runtime.borrow().pane_pid(&view).is_none(),
+            "the closed leaf's pane shell is reaped"
+        );
+    }
+
+    /// bitty#2388 (CTX-1929): the close-triggered release reaches the
+    /// subscriber on the app tick — the app-side twin of the runtime fixture
+    /// that proved the pump itself. The first close press records the
+    /// observation with reason `closed`; one `drive_tick` delivers it.
+    #[test]
+    fn close_triggered_release_reaches_the_subscriber_on_the_app_tick() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-events", true);
+
+        assert!(
+            panel_content_observer_log(&mut app).is_empty(),
+            "nothing is observed before anything happens"
+        );
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        let handle = match reply
+            .strip_prefix("OK:")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            Some(handle) => handle,
+            None => panic!("present must answer a handle, not a refusal: {reply}"),
+        };
+
+        use bitty_config::ChromeAction;
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "the first press releases the layer, it does not close"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+
+        // The cold tick is the whole delivery: the pump names the closed kind
+        // and fans the bounded payload out to the subscriber.
+        let _ = app.drive_tick();
+        assert_eq!(
+            panel_content_observer_log(&mut app),
+            vec![format!(
+                "panel.content.released:{PANEL_CONTENT_ID}:{handle}:closed"
+            )],
+            "the release observation names owner, handle, and the closed reason"
+        );
+
+        // Delivery is once: another tick observes nothing new.
+        let _ = app.drive_tick();
+        assert_eq!(
+            panel_content_observer_log(&mut app),
+            vec![format!(
+                "panel.content.released:{PANEL_CONTENT_ID}:{handle}:closed"
+            )],
+            "the observation is delivered exactly once"
+        );
+        // The leaf is still open; the second press would close it.
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    }
+
+    /// bitty#2388 (CTX-1929): with no backend installed (the `--safe` shape,
+    /// or any caller that owns no shared runtime), the granted verb keeps
+    /// failing closed with `E_UI_UNAVAILABLE` — the app-side twin of the
+    /// runtime fixture's no-backend row.
+    #[test]
+    fn without_a_backend_the_verb_still_fails_closed() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-no-backend", false);
+
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        assert_eq!(
+            reply, "ERR:E_UI_UNAVAILABLE",
+            "no backend, no surface: {reply}"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert!(
+            panel_content_observer_log(&mut app).is_empty(),
+            "nothing is observed because nothing happened"
+        );
     }
 }

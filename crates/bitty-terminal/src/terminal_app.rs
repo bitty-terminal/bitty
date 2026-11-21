@@ -1262,8 +1262,37 @@ impl TerminalApp {
     /// startup shows only the shell (and shell init output). The window
     /// title still carries the resolved preset + source layer, so the
     /// config path remains visible without polluting the grid.
+    ///
+    /// Test-only convenience today: production wraps the runtime before
+    /// plugin discovery so the same shared handle reaches the panel content
+    /// backend (CTX-1929), which only [`Self::with_theme_shared`] accepts;
+    /// every non-test caller therefore uses the shared form.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_theme(
         runtime: Runtime,
+        theme_name: &str,
+        source: &str,
+        keymaps: Vec<bitty_config::ResolvedKeymap>,
+        spawn_spec: SpawnSpec,
+    ) -> Self {
+        Self::with_theme_shared(
+            std::rc::Rc::new(std::cell::RefCell::new(runtime)),
+            theme_name,
+            source,
+            keymaps,
+            spawn_spec,
+        )
+    }
+
+    /// Same construction over a runtime the caller already wrapped in the
+    /// shared handle (bitty#2388, CTX-1929).
+    ///
+    /// Production wraps before plugin discovery so the SAME handle can be
+    /// handed to the composition root for
+    /// `RuntimePanelContentBackend::new`; this constructor is the seam that
+    /// accepts it. Behavior is otherwise identical to [`Self::with_theme`].
+    pub(crate) fn with_theme_shared(
+        runtime: std::rc::Rc<std::cell::RefCell<Runtime>>,
         theme_name: &str,
         source: &str,
         keymaps: Vec<bitty_config::ResolvedKeymap>,
@@ -1272,7 +1301,6 @@ impl TerminalApp {
         // CTX-1929: the runtime lives behind the shared handle from here on;
         // the two startup reads below take it through a `borrow()` guard and
         // the field stores the same handle the app drives for its lifetime.
-        let runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
         let event_tracker = EventTracker::from_runtime(&runtime.borrow());
         let stall_watchdog =
             StallWatchdog::from_env(std::sync::Arc::clone(runtime.borrow().hang_gauges()));
@@ -2582,6 +2610,14 @@ impl TerminalApp {
         // Cold-tick only, never the input hot path (P0-AC-015); no-op
         // without a plugin runtime or armed timers.
         self.pump_plugin_timers();
+        // bitty#2388 (CTX-1929): deliver the runtime's queued
+        // `panel.content.released` / `panel.content.input-available`
+        // observations on the same cold path, right after the timer pump
+        // that may have produced them, so a subscriber sees a close-triggered
+        // release and an input nudge on this tick instead of never. The pump
+        // runs no plugin code before the payload exists, and the release
+        // observation itself was already recorded by the runtime.
+        self.pump_panel_content_events();
         // CTX-1332 (issue #2213, P0-AC-015): input-triggered band commands are
         // NOT delivered from this render/terminal tick. The cold delivery
         // pump runs only from the `AboutToWait` arm, before this tick runs
@@ -3201,6 +3237,25 @@ impl TerminalApp {
         let fired = plugin_runtime.pump_due_timers();
         let _ = plugin_runtime.recover_wall_failed_plugins_throttled(std::time::Instant::now());
         fired
+    }
+
+    /// Deliver the runtime's queued `panel.content.*` observations to their
+    /// subscribers (bitty#2388 D8, CTX-1929).
+    ///
+    /// Thin app-side twin of the timer pump above: the runtime already
+    /// recorded the bounded observations (a release with its reason, a
+    /// level-triggered input-availability nudge), and
+    /// [`PluginRuntime::pump_panel_content_events`] names the closed kind and
+    /// fans the payload out to every active subscriber. Called from
+    /// [`Self::drive_tick`] on the cold path only — never the input path —
+    /// and a handler can only observe what already happened. No plugin
+    /// runtime or no backend answers `0`; the verb keeps failing closed
+    /// with `E_UI_UNAVAILABLE` without one.
+    fn pump_panel_content_events(&mut self) -> usize {
+        let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
+            return 0;
+        };
+        plugin_runtime.pump_panel_content_events()
     }
 
     /// Revoke the active overlay capture unconditionally (user focus-switch

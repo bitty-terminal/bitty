@@ -67,7 +67,7 @@
 //!   not accepted and has no consumer here; the catalog emits no style field
 //!   and reserves hooks for a successor acceptance. A `style`-shaped key on
 //!   a constructor descriptor is an unknown field and fails closed (see
-//!   [`reject_unknown_keys`]), never a tolerated drop.
+//!   `reject_unknown_keys`), never a tolerated drop.
 //! - **Cold path, one pure constructor consumer.** Composition is a pure
 //!   function over bounded data. It does not construct or call a Lua VM and
 //!   is not wired into PTY, input, damage, or render loops; the only

@@ -428,13 +428,17 @@ return {}
 
         fn cursor(&mut self, column: u16) {
             // CTX-1929: the shared runtime handle; the guard lives for the
-            // helper's own body only.
-            let rt = self.app.runtime.borrow();
-            let row = rt
-                .plugin_band_row(bitty_runtime::BandEdge::Bottom, 0)
-                .expect("mounted bottom row");
-            let (cw, ch) = rt.live_cell_size();
-            let pad = f64::from(rt.window_padding_physical());
+            // extraction block only, so the mutable event call below cannot
+            // overlap the borrow (E0502 on the input-vm-test-support leg).
+            let (row, cw, ch, pad) = {
+                let rt = self.app.runtime.borrow();
+                let row = rt
+                    .plugin_band_row(bitty_runtime::BandEdge::Bottom, 0)
+                    .expect("mounted bottom row");
+                let (cw, ch) = rt.live_cell_size();
+                let pad = f64::from(rt.window_padding_physical());
+                (row, cw, ch, pad)
+            };
             let delta = self.event(WindowEventKind::CursorMoved(CursorPosition {
                 x: pad + (f64::from(column) + 0.5) * f64::from(cw),
                 y: pad + (f64::from(row) + 0.5) * f64::from(ch),

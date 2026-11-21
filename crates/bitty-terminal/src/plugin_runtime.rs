@@ -7972,6 +7972,27 @@ events = [{events_toml}]
         std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
     }
 
+    /// `(program, argv)` the panel-content fixture spawns under the focused
+    /// leaf.
+    ///
+    /// Mirrors `generation_edge_keepalive`: the rows under test are
+    /// platform-neutral; only the leaf's shell is not. `cmd.exe` has no
+    /// `/bin/sh`, so a Unix literal here fails the spawn on Windows
+    /// (`os error 2`) before the panel-content rows are ever exercised. Each
+    /// platform arm stays mutually exclusive so no arm is dead code on the
+    /// other platform.
+    fn panel_leaf_shell() -> (&'static str, &'static [&'static str]) {
+        #[cfg(unix)]
+        let shell = ("/bin/sh", &[][..]);
+        #[cfg(windows)]
+        let shell = ("cmd.exe", &[][..]);
+        // No PTY backend: `require_pty!` skips the row before it spawns, so
+        // the arm only has to keep the signature honest.
+        #[cfg(not(any(unix, windows)))]
+        let shell = ("/bin/sh", &[][..]);
+        shell
+    }
+
     /// The composition-root fixture: a split runtime with a live shell on the
     /// focused leaf, the real discovery/activation path over a dev root, and
     /// the app built over the SAME shared handle the seed carried.
@@ -8070,9 +8091,10 @@ events = [{events_toml}]
         .with_panel_layout_ops(panel_layout_ops);
         // The focused leaf owns a live shell and a committed frame, the exact
         // state the close-path regression rows build.
+        let (shell, shell_args) = panel_leaf_shell();
         app.runtime
             .borrow_mut()
-            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .spawn_shell_for_view(view, shell, shell_args, 40, 24)
             .expect("the panel leaf owns a shell");
         app.runtime
             .borrow_mut()

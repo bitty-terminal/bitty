@@ -115,6 +115,10 @@ audio.spectrum = true
 #   have no enum kind, so the shipped default plus the local closed-set check
 #   in `M.read_settings` own the fallback (an unknown value paints `index`
 #   and reports one bounded diagnostic).
+# - `show_single` keeps the bar mounted and painted when one workspace is the
+#   only one (`true`, the shipped default, so an installed bar is always
+#   visible). `false` restores the historical Core auto-hide on a lone
+#   workspace; `show = false` remains the explicit way to turn the bar off.
 # - Per-module option collections (`workspaces`, `clock`, `network`,
 #   `bluetooth`, `backlight`, `idle`, `pulseaudio`, `microphone`, `spectrum`,
 #   `cpu`, `memory`, `battery`) are read as one table per module name
@@ -140,7 +144,7 @@ audio.spectrum = true
 #   no rewrites.
 show = { type = "bool", default = true }
 edge = { type = "string", default = "bottom" }
-show_single = { type = "bool", default = false }
+show_single = { type = "bool", default = true }
 name_max_chars = { type = "int", default = 32 }
 label = { type = "string", default = "index" }
 icons = { type = "string", default = "ascii" }

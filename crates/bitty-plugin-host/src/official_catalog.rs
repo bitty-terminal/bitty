@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "78a95def7af284f5dcb1b896def3372e6a347cea";
+pub const SOURCE_REVISION: &str = "8b608db41dba524a0c30afb771d18c698ad3b1a8";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -33,8 +33,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-featured.devtools",
         name: "Bitty DevTools",
         repository: "https://github.com/bitty-terminal/devtools.git",
-        pin: "badde42a18da6262876ff275a33ff4964a2ccb5e",
-        manifest_hash: "sha256:8dbbab2287687272c12f96d5b8ebc18b8c1f492c08ac422a393a06e990b73267",
+        pin: "88acd1d6422391dc43c1f96e626ed1758e515cc0",
+        manifest_hash: "sha256:bb8e296044b7cd067c5513adf37d982b825bf63e9b06d923e6dd5676f761032c",
         compat_bitty: Some(">=0.0.21"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only inspection and event tracing of the Bitty plugin runtime.",
@@ -44,8 +44,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.bar",
         name: "Unified Bar",
         repository: "https://github.com/bitty-terminal/bar.git",
-        pin: "a00f26974c51bb2067f70302cca2dcef6685436f",
-        manifest_hash: "sha256:327837b4fea90e9f90529c7761db9539ded0627937735f01ebc370a22a705bfb",
+        pin: "d26e65c8be6eea5db02a8d2d723a826b48816fac",
+        manifest_hash: "sha256:bb851e7aa9e5762ab114533a48d0a15d44b2c2acf8fd26613d30e1669cbad512",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),
         description: "Consolidated workspace-bar, tabs, and statusline presentation over generic chrome insets.",
@@ -99,8 +99,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.file-manager",
         name: "File Manager",
         repository: "https://github.com/bitty-terminal/file-manager.git",
-        pin: "558bf5a2306225ee6fdff109cf739fa15f894a93",
-        manifest_hash: "sha256:b26f36ecbe7ce5b3fb0338c90c594f98a104de021a9b7eab4b6b6af8645fa010",
+        pin: "38ee03b0baa54f82784c91e6235c57d80d1a3244",
+        manifest_hash: "sha256:6667a0c6937c4bbeb9998b4d56db209abde53d0dbc5bae135c606f608e101f18",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),
         description: "Bounded read-only directory listing, navigation, and preview for a caller-chosen root.",

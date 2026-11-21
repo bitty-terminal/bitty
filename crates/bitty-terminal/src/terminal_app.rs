@@ -1805,7 +1805,7 @@ impl TerminalApp {
         watchdog.update_context(WatchdogContext {
             focused_view: self.runtime.focused_view().map(|view| view.0),
             leaf_count: self.runtime.leaf_count(),
-            pane_count: self.runtime.pane_session_ids().len(),
+            pane_count: self.runtime.pane_view_ids().len(),
             scrollback_lines: self.runtime.scrollback_len(),
             plugin_count,
             plugin_ids,
@@ -2742,7 +2742,7 @@ impl TerminalApp {
         // split shell's query answers never wait for the next pump.
         // Bounded per pane (reply cap, fail-closed); no-op when quiet.
         let mut pane_written = 0usize;
-        for id in self.runtime.pane_session_ids() {
+        for id in self.runtime.pane_view_ids() {
             pane_written += self.runtime.write_pane_replies(id);
         }
         if pane_written > 0 && self.tick_logging_enabled() {
@@ -4847,7 +4847,7 @@ impl TerminalApp {
     /// leaf. See [`Self::window_has_nothing_left`].
     pub(crate) fn reap_exited_shells(&mut self) -> ShellExitOutcome {
         // 1. Split pane sessions: poll each active session's child.
-        let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_session_ids();
+        let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_view_ids();
         let mut closed_any = false;
 
         for view in pane_ids {

@@ -15588,7 +15588,7 @@ fn close_last_tiled_pane_tears_down_the_session_it_painted_issue_2389() {
     );
     let orphans: Vec<ViewId> = app
         .runtime
-        .pane_session_ids()
+        .pane_view_ids()
         .into_iter()
         .filter(|view| {
             !app.runtime.layout().leaf_ids().contains(view)
@@ -18207,7 +18207,7 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
     app.runtime
         .spawn_shell_for_view(float, "/bin/sh", &[], 40, 12)
         .expect("pane session spawns");
-    assert_eq!(app.runtime.pane_session_ids(), vec![float]);
+    assert_eq!(app.runtime.pane_view_ids(), vec![float]);
     assert!(app.runtime.set_focus(float));
 
     // Last good session: both tiled panes with live attachment, saved before
@@ -18228,7 +18228,7 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
     assert_eq!(app.runtime.floated_views(), vec![float]);
     assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
     assert_eq!(
-        app.runtime.pane_session_ids(),
+        app.runtime.pane_view_ids(),
         vec![float],
         "the detached float keeps its pane session"
     );
@@ -18311,7 +18311,7 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
     assert_eq!(app.runtime.floated_views(), vec![float]);
     app.runtime.shutdown();
     assert!(
-        app.runtime.pane_session_ids().is_empty(),
+        app.runtime.pane_view_ids().is_empty(),
         "shutdown tears down the surviving pane session"
     );
     assert!(!app.runtime.has_pty());

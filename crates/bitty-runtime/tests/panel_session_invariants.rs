@@ -170,7 +170,7 @@ fn assert_session_ids_live(rt: &mut Runtime, context: &str) {
             "{context}: primary owner {owner:?} must be a live leaf (WS-INV-7)"
         );
     }
-    let sessions = rt.pane_session_ids();
+    let sessions = rt.pane_view_ids();
     let mut unique = sessions.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -191,7 +191,7 @@ fn assert_session_ids_live(rt: &mut Runtime, context: &str) {
 /// PTY winsize equal the decorated content frame the present path paints.
 fn assert_visible_geometry_coherent(rt: &Runtime, context: &str) {
     let frames = rt.present_frames();
-    for id in rt.pane_session_ids() {
+    for id in rt.pane_view_ids() {
         let Some(frame) = frames.iter().find(|frame| frame.view == id) else {
             continue;
         };

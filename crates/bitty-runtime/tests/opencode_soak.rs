@@ -385,7 +385,7 @@ fn opencode_shaped_soak_stays_bounded() {
     // CodeQL rust/cleartext-logging: the panic message must not carry any
     // value derived from the session ids; `is_empty()` alone names the defect.
     assert!(
-        rt.pane_session_ids().is_empty(),
+        rt.pane_view_ids().is_empty(),
         "attach/detach churn must not leave pane sessions"
     );
 

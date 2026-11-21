@@ -110,7 +110,7 @@ fn split_leaves_own_distinct_shells_with_isolated_grids() {
     assert!(rt.has_pane_session(&ViewId::new(2)));
     assert!(!rt.has_pane_session(&ViewId::new(1)));
     assert_eq!(rt.pane_count(), 1);
-    assert_eq!(rt.pane_session_ids(), vec![ViewId::new(2)]);
+    assert_eq!(rt.pane_view_ids(), vec![ViewId::new(2)]);
     // Distinct live children behind the two leaves.
     let primary_pid = rt.pty_pid().expect("primary pid");
     let pane_pid = rt.pane_pid(&ViewId::new(2)).expect("pane pid");
@@ -239,7 +239,7 @@ fn close_pane_session_tears_down_child() {
     wait_until_child_absent(child_pid);
     assert!(!rt.has_pane_session(&ViewId::new(2)));
     assert_eq!(rt.pane_pid(&ViewId::new(2)), None);
-    assert!(rt.pane_session_ids().is_empty());
+    assert!(rt.pane_view_ids().is_empty());
     assert!(rt.pane_snapshot(&ViewId::new(2)).is_none());
     // Ticking a layout whose leaf lost its session falls back to the
     // shared grid without incident.

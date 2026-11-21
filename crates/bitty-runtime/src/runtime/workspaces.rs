@@ -3820,13 +3820,13 @@ mod tests {
         assert_eq!(rt.workspace_occupied_indices(), vec![0, 2]);
         assert!(!rt.workspace_is_occupied(1));
         assert!(rt.workspace_switch(0));
-        let before = rt.pane_session_ids();
+        let before = rt.pane_view_ids();
         assert_eq!(before.len(), 2);
         let target = rt.workspace_next_occupied().expect("must jump to ws3");
         assert_eq!(target, 2);
         assert_eq!(rt.active_workspace_index(), 2);
         assert_eq!(rt.workspace_count(), 3, "jump must not kill");
-        assert_eq!(rt.pane_session_ids().len(), 2, "sessions intact");
+        assert_eq!(rt.pane_view_ids().len(), 2, "sessions intact");
         for id in &before {
             assert!(rt.has_pane_session(id), "session survives jump");
         }
@@ -3967,7 +3967,7 @@ mod tests {
         rt.spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws2 shell must spawn");
         assert!(rt.workspace_switch(0));
-        let before_ids = rt.pane_session_ids();
+        let before_ids = rt.pane_view_ids();
         let before_count = rt.workspace_count();
         let before_leaves: usize = rt
             .workspace_summaries()
@@ -3976,7 +3976,7 @@ mod tests {
             .sum();
         rt.workspace_next_occupied().expect("must jump");
         assert_eq!(rt.workspace_count(), before_count, "no workspace killed");
-        assert_eq!(rt.pane_session_ids().len(), before_ids.len());
+        assert_eq!(rt.pane_view_ids().len(), before_ids.len());
         for id in &before_ids {
             assert!(rt.has_pane_session(id), "every session survives");
         }
@@ -3990,7 +3990,7 @@ mod tests {
         // Mirror back preserves the same invariants.
         rt.workspace_prev_occupied().expect("must jump back");
         assert_eq!(rt.workspace_count(), before_count);
-        assert_eq!(rt.pane_session_ids().len(), before_ids.len());
+        assert_eq!(rt.pane_view_ids().len(), before_ids.len());
         assert!(rt.focused_view().is_some());
     }
 

@@ -1100,7 +1100,9 @@ impl TerminalApp {
     /// applies to the real tree instead of the single-leaf zoom view
     /// (CTX-0481: staleness-checked inside [`ZoomState`]).
     pub(crate) fn restore_zoom(&mut self) -> bool {
-        self.chrome.zoom.restore_for_mutation(&mut self.runtime)
+        self.chrome
+            .zoom
+            .restore_for_mutation(&mut self.runtime.borrow_mut())
     }
 
     /// Zoom-aware panel count across the whole window (CTX-1039, #1843).
@@ -1114,17 +1116,22 @@ impl TerminalApp {
         let active = self
             .chrome
             .zoom
-            .backup_leaf_count(&self.runtime)
-            .unwrap_or_else(|| self.runtime.window_leaf_count());
+            .backup_leaf_count(&self.runtime.borrow())
+            .unwrap_or_else(|| self.runtime.borrow().window_leaf_count());
         // Zoom backup counts layout leaves only; add live floats/pins (and
         // the scratchpad slot, issue #2167) that the backup predates. The
         // non-zoom path already includes them via `window_leaf_count`.
-        if self.chrome.zoom.backup_leaf_count(&self.runtime).is_some() {
+        if self
+            .chrome
+            .zoom
+            .backup_leaf_count(&self.runtime.borrow())
+            .is_some()
+        {
             active
-                + self.runtime.floated_count()
-                + self.runtime.pinned_count()
-                + self.runtime.scratchpad_count()
-                + self.runtime.inactive_workspaces_leaf_count()
+                + self.runtime.borrow().floated_count()
+                + self.runtime.borrow().pinned_count()
+                + self.runtime.borrow().scratchpad_count()
+                + self.runtime.borrow().inactive_workspaces_leaf_count()
         } else {
             active
         }
@@ -1144,10 +1151,13 @@ impl TerminalApp {
     pub(crate) fn window_live_non_terminal_leaf_count(&self) -> usize {
         let active_tiled = self
             .runtime
-            .workspace_seq_at(self.runtime.active_workspace_index())
+            .borrow()
+            .workspace_seq_at(self.runtime.borrow().active_workspace_index())
             .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
-            .unwrap_or_else(|| self.runtime.layout().leaf_ids());
-        self.runtime.live_non_terminal_leaf_count_over(active_tiled)
+            .unwrap_or_else(|| self.runtime.borrow().layout().leaf_ids());
+        self.runtime
+            .borrow()
+            .live_non_terminal_leaf_count_over(active_tiled)
     }
 
     /// Occupied workspace indices in index order for the occupied cycle
@@ -1163,9 +1173,10 @@ impl TerminalApp {
     /// workspace count; time O(w * l).
     #[must_use]
     pub(crate) fn occupied_indices_for_cycle(&self) -> Vec<usize> {
-        (0..self.runtime.workspace_count())
+        (0..self.runtime.borrow().workspace_count())
             .filter(|&index| {
-                self.runtime.workspace_is_occupied(index) || self.backup_holds_live_session(index)
+                self.runtime.borrow().workspace_is_occupied(index)
+                    || self.backup_holds_live_session(index)
             })
             .collect()
     }
@@ -1173,14 +1184,16 @@ impl TerminalApp {
     /// Whether workspace `index`'s zoom backup owns a live session
     /// (CTX-1100). Read-only: the backup entry is never consumed here.
     fn backup_holds_live_session(&self, index: usize) -> bool {
-        let Some(seq) = self.runtime.workspace_seq_at(index) else {
+        let Some(seq) = self.runtime.borrow().workspace_seq_at(index) else {
             return false;
         };
         let Some(ids) = self.chrome.zoom.backup_leaf_ids_for_seq(seq) else {
             return false;
         };
-        ids.iter()
-            .any(|id| self.runtime.has_pane_session(id) || self.runtime.primary_view() == Some(*id))
+        ids.iter().any(|id| {
+            self.runtime.borrow().has_pane_session(id)
+                || self.runtime.borrow().primary_view() == Some(*id)
+        })
     }
 
     /// Switch to the next occupied workspace rightward with wrap (CTX-1100).
@@ -1192,7 +1205,7 @@ impl TerminalApp {
     /// Returns the new active index, or `None` with state untouched.
     fn cycle_next_occupied(&mut self) -> Option<usize> {
         let occupied = self.occupied_indices_for_cycle();
-        self.runtime.workspace_next_in(&occupied)
+        self.runtime.borrow_mut().workspace_next_in(&occupied)
     }
 
     /// Switch to the previous occupied workspace leftward with wrap (CTX-1100).
@@ -1200,7 +1213,7 @@ impl TerminalApp {
     /// Exact mirror of [`Self::cycle_next_occupied`].
     fn cycle_prev_occupied(&mut self) -> Option<usize> {
         let occupied = self.occupied_indices_for_cycle();
-        self.runtime.workspace_prev_in(&occupied)
+        self.runtime.borrow_mut().workspace_prev_in(&occupied)
     }
 
     /// Drives one named scratchpad verb (issue #3205).
@@ -1216,8 +1229,8 @@ impl TerminalApp {
     /// bounded cold queue (never a VM entry on the input hot path).
     fn apply_scratchpad_verb(&mut self, label: &str, name: Option<String>, verb: ScratchpadVerb) {
         let name = name.unwrap_or_else(|| bitty_runtime::DEFAULT_SCRATCHPAD.to_string());
-        let occupied = self.runtime.scratchpad_has_name(&name);
-        let focused = self.runtime.focused_view();
+        let occupied = self.runtime.borrow().scratchpad_has_name(&name);
+        let focused = self.runtime.borrow().focused_view();
         if verb == ScratchpadVerb::Move && !occupied {
             let Some(target) = focused else {
                 eprintln!(
@@ -1225,21 +1238,28 @@ impl TerminalApp {
                 );
                 return;
             };
-            if !self.runtime.layout().leaf_ids().contains(&target) {
+            if !self.runtime.borrow().layout().leaf_ids().contains(&target) {
                 eprintln!("warning: keymap {label} needs a tiled focused pane — ignoring");
                 return;
             }
-            if self.runtime.layout().leaf_count() <= 1 {
+            if self.runtime.borrow().layout().leaf_count() <= 1 {
                 eprintln!("warning: keymap {label} would strand an empty layout — ignoring");
                 return;
             }
         }
         self.restore_zoom();
         let result = match verb {
-            ScratchpadVerb::Toggle => self.runtime.scratchpad_toggle_named(&name, None),
-            ScratchpadVerb::Move => self.runtime.scratchpad_move_named(&name, focused),
+            ScratchpadVerb::Toggle => self
+                .runtime
+                .borrow_mut()
+                .scratchpad_toggle_named(&name, None),
+            ScratchpadVerb::Move => self
+                .runtime
+                .borrow_mut()
+                .scratchpad_move_named(&name, focused),
             ScratchpadVerb::ToTiled => self
                 .runtime
+                .borrow_mut()
                 .scratchpad_to_tiled_named(&name)
                 .map(bitty_runtime::ScratchpadActivation::RestoredToTiled),
         };
@@ -1326,23 +1346,28 @@ impl TerminalApp {
     ) {
         let bitty_runtime::ScratchpadSpawn::Pty { cmd, args, cwd } = spawn else {
             // The runtime only returns `Spawn` for PTY specs.
-            self.runtime.scratchpad_discard(name);
+            self.runtime.borrow_mut().scratchpad_discard(name);
             return;
         };
-        let (cols, rows) = self.runtime.presented_frame_cells(view).unwrap_or((80, 24));
+        let (cols, rows) = self
+            .runtime
+            .borrow()
+            .presented_frame_cells(view)
+            .unwrap_or((80, 24));
         let argv: Vec<&str> = args.iter().map(String::as_str).collect();
         let cwd_path = cwd.as_deref().map(std::path::Path::new);
-        match self
+        let scrutinee = self
             .runtime
-            .spawn_shell_for_view_in(view, &cmd, &argv, cols, rows, cwd_path)
-        {
+            .borrow_mut()
+            .spawn_shell_for_view_in(view, &cmd, &argv, cols, rows, cwd_path);
+        match scrutinee {
             Ok(()) => eprintln!(
                 "bitty: keymap {label} -> slot '{name}' spawned {cmd} in {view:?} pid={:?}",
-                self.runtime.pane_pid(&view)
+                self.runtime.borrow().pane_pid(&view)
             ),
             Err(err) => {
                 // No empty floating ghost: the slot rolls back with its leaf.
-                self.runtime.scratchpad_discard(name);
+                self.runtime.borrow_mut().scratchpad_discard(name);
                 eprintln!(
                     "warning: keymap {label} spawn failed ({err}) — slot '{name}' rolled back"
                 );
@@ -1360,12 +1385,15 @@ impl TerminalApp {
     fn apply_scratchpad_toggle(&mut self) {
         // A shown/hidden slot only flips visibility; the focused view's mode is
         // irrelevant (the slot's panel lives outside the layout).
-        if self.runtime.scratchpad_occupied() {
+        if self.runtime.borrow().scratchpad_occupied() {
             self.restore_zoom();
-            match self
+            // CTX-1929: hoist the toggle out of the match scrutinee so the
+            // borrow guard is released before the arm dispatches app work.
+            let activation = self
                 .runtime
-                .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, None)
-            {
+                .borrow_mut()
+                .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, None);
+            match activation {
                 Ok(activation) => {
                     self.finish_scratchpad_activation("scratchpad-toggle", activation)
                 }
@@ -1378,12 +1406,16 @@ impl TerminalApp {
         // Empty slot: the legacy command parks the focused tiled leaf. Do not
         // consume a single-leaf zoom backup behind a refusal (CodeRabbit PR
         // #1903 discipline).
-        if self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+        if self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1) {
             self.restore_zoom();
         }
-        let focused = self.runtime.focused_view();
+        let focused = self.runtime.borrow().focused_view();
         if let Some(id) = focused {
-            let current = match self.runtime.layout().find_leaf(id) {
+            // CTX-1929: `find_leaf` hands back a reference into the runtime,
+            // so the guard binding must outlive the match reads.
+            let rt = self.runtime.borrow();
+            let scrutinee = rt.layout().find_leaf(id);
+            let current = match scrutinee {
                 Some(leaf) => leaf.presentation(),
                 None => {
                     eprintln!("warning: keymap scratchpad-toggle needs a tiled pane — ignoring");
@@ -1400,14 +1432,17 @@ impl TerminalApp {
                 return;
             }
         }
-        if self.runtime.layout().leaf_count() <= 1 {
+        if self.runtime.borrow().layout().leaf_count() <= 1 {
             eprintln!("warning: keymap scratchpad-toggle would strand an empty layout — ignoring");
             return;
         }
-        match self
+        // CTX-1929: hoist the toggle out of the match scrutinee (guard release
+        // before the arm dispatches app work).
+        let activation = self
             .runtime
-            .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, focused)
-        {
+            .borrow_mut()
+            .scratchpad_toggle_named(bitty_runtime::DEFAULT_SCRATCHPAD, focused);
+        match activation {
             Ok(activation) => self.finish_scratchpad_activation("scratchpad-toggle", activation),
             Err(err) => eprintln!("warning: keymap scratchpad-toggle refused ({err}) — ignoring"),
         }
@@ -1419,7 +1454,8 @@ impl TerminalApp {
     /// `None` (no shell-integration marks yet) warns loudly instead of
     /// inventing a target; terminal truth is untouched either way.
     fn apply_fold_verb(&mut self, action: bitty_runtime::cw_present::CwFoldAction, name: &str) {
-        match self.runtime.cw_fold_latest(action) {
+        let scrutinee = self.runtime.borrow_mut().cw_fold_latest(action);
+        match scrutinee {
             Some(folded) => {
                 eprintln!(
                     "bitty: keymap {name} -> latest command {}",
@@ -1441,7 +1477,7 @@ impl TerminalApp {
         panel_id: bitty_runtime::registry::PanelId,
         generation: bitty_runtime::registry::Generation,
     ) {
-        let Some(scene_host) = self.runtime.scene_host() else {
+        let Some(scene_host) = self.runtime.borrow().scene_host() else {
             return;
         };
         if !matches!(
@@ -1451,8 +1487,9 @@ impl TerminalApp {
             return;
         }
         self.restore_zoom();
-        let new_id = self.runtime.next_view_id_global();
-        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+        let new_id = self.runtime.borrow().next_view_id_global();
+        let scrutinee = self.runtime.borrow().validate_new_view_appearance(new_id);
+        if let Err(err) = scrutinee {
             eprintln!("warning: plugin panel materialize refused: {err}");
             return;
         }
@@ -1465,7 +1502,7 @@ impl TerminalApp {
         let adopt_slot = self
             .pending_plugin_scratchpad
             .take()
-            .filter(|pending| !self.runtime.scratchpad_has_name(&pending.slot));
+            .filter(|pending| !self.runtime.borrow().scratchpad_has_name(&pending.slot));
         let mount_gen = scene_host
             .borrow()
             .registry()
@@ -1480,10 +1517,11 @@ impl TerminalApp {
                 eprintln!("warning: plugin panel mount failed: {err}");
                 return;
             }
-            match self
+            let scrutinee = self
                 .runtime
-                .scratchpad_adopt(name, View::new(new_id, 80, 24))
-            {
+                .borrow_mut()
+                .scratchpad_adopt(name, View::new(new_id, 80, 24));
+            match scrutinee {
                 Ok(id) => {
                     eprintln!(
                         "bitty: plugin panel {panel_id:?} adopted into scratchpad '{name}' as {id:?}"
@@ -1499,7 +1537,7 @@ impl TerminalApp {
                 }
             }
         }
-        if self.runtime.layout().leaf_count() == 0 {
+        if self.runtime.borrow().layout().leaf_count() == 0 {
             if adopt_slot.is_none() {
                 if let Err(err) = scene_host
                     .borrow_mut()
@@ -1510,17 +1548,17 @@ impl TerminalApp {
                 }
             }
             let layout = LayoutNode::leaf(View::new(new_id, 80, 24));
-            self.runtime.set_layout(layout);
-            self.runtime.set_focus(new_id);
+            self.runtime.borrow_mut().set_layout(layout);
+            self.runtime.borrow_mut().set_focus(new_id);
             return;
         }
-        let Some(plan) = self.runtime.panel_split_plan() else {
+        let Some(plan) = self.runtime.borrow().panel_split_plan() else {
             eprintln!(
                 "warning: plugin panel create has no leaf that fits two 10x4 panes — ignoring"
             );
             return;
         };
-        let mut layout = self.runtime.layout().clone();
+        let mut layout = self.runtime.borrow().layout().clone();
         if !split_focused_leaf(
             &mut layout,
             plan.target,
@@ -1540,10 +1578,11 @@ impl TerminalApp {
                 return;
             }
         }
-        self.runtime.set_layout(layout);
+        self.runtime.borrow_mut().set_layout(layout);
         self.runtime
+            .borrow_mut()
             .note_panel_split_created(new_id, plan.spiral_phase);
-        self.runtime.set_focus(new_id);
+        self.runtime.borrow_mut().set_focus(new_id);
     }
 
     /// Gives a leaf's displaced terminal back before a close tears it down
@@ -1563,7 +1602,11 @@ impl TerminalApp {
     /// kill the shell behind content that cannot be dismissed, leaving a
     /// shell-less panel with no terminal left to restore.
     fn release_presented_panel_content_for_close(&mut self, view: ViewId) -> bool {
-        match self.runtime.release_presented_panel_content(view) {
+        let scrutinee = self
+            .runtime
+            .borrow_mut()
+            .release_presented_panel_content(view);
+        match scrutinee {
             Ok(None) => true,
             Ok(Some(restored)) => {
                 eprintln!(
@@ -1594,7 +1637,8 @@ impl TerminalApp {
         // still binds, never on the caller's hint. A refused release is the one
         // case this close must not run: closing now would leave the panel
         // painted over a shell that no longer exists.
-        let mounted_view = match self.runtime.scene_host() {
+        let scrutinee = self.runtime.borrow().scene_host();
+        let mounted_view = match scrutinee {
             Some(host) => match host.try_borrow() {
                 Ok(host) => host.placement_view_of(panel_id),
                 Err(_) => {
@@ -1609,7 +1653,11 @@ impl TerminalApp {
             None => None,
         };
         if let Some(view) = mounted_view {
-            if let Err(error) = self.runtime.release_presented_panel_content(view) {
+            let scrutinee = self
+                .runtime
+                .borrow_mut()
+                .release_presented_panel_content(view);
+            if let Err(error) = scrutinee {
                 eprintln!(
                     "warning: plugin panel {} close refused: presented content layer not released ({error})",
                     panel_id.0
@@ -1619,32 +1667,39 @@ impl TerminalApp {
         }
         let view_id = hinted_view.or_else(|| {
             self.runtime
+                .borrow()
                 .scene_host()
                 .and_then(|host| host.borrow().placement_view_of(panel_id))
         });
         if let Some(view_id) = view_id {
             self.restore_zoom();
-            if self.runtime.floated_views().contains(&view_id)
-                || self.runtime.pinned_views().contains(&view_id)
+            if self.runtime.borrow().floated_views().contains(&view_id)
+                || self.runtime.borrow().pinned_views().contains(&view_id)
             {
-                let _ = self.runtime.discard_floating_view(view_id);
-            } else if self.runtime.layout().find_leaf(view_id).is_some() {
-                let mut layout = self.runtime.layout().clone();
-                if self.runtime.layout().leaf_count() > 1 {
+                let _ = self.runtime.borrow_mut().discard_floating_view(view_id);
+            } else if self.runtime.borrow().layout().find_leaf(view_id).is_some() {
+                let mut layout = self.runtime.borrow().layout().clone();
+                if self.runtime.borrow().layout().leaf_count() > 1 {
                     if close_focused_leaf(&mut layout, view_id) {
-                        if let Some(previous) = survivor_after_close(self.runtime.layout(), view_id)
-                        {
-                            self.runtime.set_focus(previous);
+                        let scrutinee =
+                            survivor_after_close(self.runtime.borrow().layout(), view_id);
+                        if let Some(previous) = scrutinee {
+                            self.runtime.borrow_mut().set_focus(previous);
                         }
-                        self.runtime.set_layout_closing(layout, view_id);
+                        self.runtime
+                            .borrow_mut()
+                            .set_layout_closing(layout, view_id);
                     }
                 } else {
                     layout.remove_leaf(view_id);
-                    self.runtime.set_layout_closing(layout, view_id);
+                    self.runtime
+                        .borrow_mut()
+                        .set_layout_closing(layout, view_id);
                 }
             }
         }
-        if let Some(scene_host) = self.runtime.scene_host() {
+        let scrutinee = self.runtime.borrow().scene_host();
+        if let Some(scene_host) = scrutinee {
             let mut host = scene_host.borrow_mut();
             if let Some(generation) = host.panel_allocation_generation(panel_id) {
                 let _ = host.dispose_panel(panel_id, generation);
@@ -1655,7 +1710,7 @@ impl TerminalApp {
     /// Dispose a plugin-owned panel mounted on `view_id` when the user closes
     /// that leaf via `CloseView` (CTX-1859).
     fn dispose_plugin_panel_on_view(&mut self, view_id: ViewId) {
-        let Some(scene_host) = self.runtime.scene_host() else {
+        let Some(scene_host) = self.runtime.borrow().scene_host() else {
             return;
         };
         let mut host = scene_host.borrow_mut();
@@ -1693,21 +1748,22 @@ impl TerminalApp {
         label: &str,
     ) -> Option<ViewId> {
         self.restore_zoom();
-        if self.runtime.focused_view().is_none() {
+        if self.runtime.borrow().focused_view().is_none() {
             eprintln!("warning: keymap {label} has no focused pane — ignoring");
             return None;
         }
-        let mut layout = self.runtime.layout().clone();
+        let mut layout = self.runtime.borrow().layout().clone();
         // CTX-0378: the id comes from the runtime-wide allocator
         // (every slot + the live layout), never this layout's max + 1:
         // `pane_sessions` is keyed globally by `ViewId`, so a local
         // scan would alias another workspace's shell and the spawn
         // below would replace its session.
-        let new_id = self.runtime.next_view_id_global();
+        let new_id = self.runtime.borrow().next_view_id_global();
         // CTX-0343 first match: a previously inert `ws:`/`view:`
         // selector can match the fresh `View`; fail the creation
         // closed before the layout commits it.
-        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+        let scrutinee = self.runtime.borrow().validate_new_view_appearance(new_id);
+        if let Err(err) = scrutinee {
             eprintln!("warning: keymap {label} refused: {err}");
             return None;
         }
@@ -1734,8 +1790,8 @@ impl TerminalApp {
         // Issue #3020: the focused pane's pinned kernel cwd seeds the fresh
         // shell (Ghostty/kitty/WezTerm parity), with the `OSC 7` report as the
         // fallback when the kernel cwd cannot be proven.
-        let inherited_cwd = self.runtime.inherited_spawn_cwd(new_id);
-        self.runtime.set_layout(layout);
+        let inherited_cwd = self.runtime.borrow().inherited_spawn_cwd(new_id);
+        self.runtime.borrow_mut().set_layout(layout);
         // CTX-0176: the fresh leaf gets its own shell/PTY sized to the
         // decorated content frame it is painted in — best-effort (startup
         // parity). On failure the pane stays empty (CTX-0359: it never
@@ -1755,9 +1811,11 @@ impl TerminalApp {
         // session restore inline the same present-frame lookup.
         let (cols, rows) = self
             .runtime
+            .borrow()
             .presented_frame_cells(new_id)
             .or_else(|| {
                 self.runtime
+                    .borrow()
                     .layout_allocations()
                     .iter()
                     .find(|(id, _)| *id == new_id)
@@ -1765,7 +1823,7 @@ impl TerminalApp {
             })
             .unwrap_or((80, 24));
         let spawn_result = spawn_pane_shell_in(
-            &mut self.runtime,
+            &mut self.runtime.borrow_mut(),
             &self.spawn_spec,
             new_id,
             cols,
@@ -1775,13 +1833,13 @@ impl TerminalApp {
         // CTX-0364: focus follows the fresh pane (kitty/ghostty
         // parity). The CTX-0357 inheritance source was captured above,
         // before the layout install moved focus to the fresh leaf.
-        self.runtime.set_focus(new_id);
+        self.runtime.borrow_mut().set_focus(new_id);
         match spawn_result {
             Ok(()) => eprintln!(
                 "bitty: keymap {label} -> leafs={} focused={:?} pane_shell={new_id:?} pid={:?}",
-                self.runtime.leaf_count(),
-                self.runtime.focused_view(),
-                self.runtime.pane_pid(&new_id),
+                self.runtime.borrow().leaf_count(),
+                self.runtime.borrow().focused_view(),
+                self.runtime.borrow().pane_pid(&new_id),
             ),
             Err(err) => eprintln!(
                 "warning: keymap {label} pane shell spawn failed ({err}) — pane {new_id:?} stays empty",
@@ -1799,12 +1857,13 @@ impl TerminalApp {
     /// float/pin stays composited exactly as it was.
     fn create_panel_on_empty_base(&mut self, focused: ViewId) {
         self.restore_zoom();
-        let new_id = self.runtime.next_view_id_global();
-        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+        let new_id = self.runtime.borrow().next_view_id_global();
+        let scrutinee = self.runtime.borrow().validate_new_view_appearance(new_id);
+        if let Err(err) = scrutinee {
             eprintln!("warning: keymap new_panel refused: {err}");
             return;
         }
-        let container = self.runtime.container();
+        let container = self.runtime.borrow().container();
         let view = View::new(
             new_id,
             usize::from(container.width.max(1)),
@@ -1867,7 +1926,7 @@ impl TerminalApp {
         &mut self,
         request: bitty_runtime::TabRequest,
     ) -> Result<bitty_runtime::TabOutcome, bitty_ui::TabError> {
-        self.runtime.tab_apply(request)
+        self.runtime.borrow_mut().tab_apply(request)
     }
 
     /// Execute one bound chrome action (single owner: the PTY never sees the
@@ -1903,23 +1962,23 @@ impl TerminalApp {
             A::GotoSplit(dir) => {
                 self.restore_zoom();
                 let focus = split_dir_to_focus(dir);
-                let next = self.runtime.move_focus(focus);
+                let next = self.runtime.borrow_mut().move_focus(focus);
                 eprintln!(
                     "bitty: keymap goto_split:{} -> {:?} leafs={}",
                     dir.canonical(),
                     next,
-                    self.runtime.leaf_count()
+                    self.runtime.borrow().leaf_count()
                 );
             }
             A::MoveSplit(dir) => {
                 self.restore_zoom();
                 let focus = split_dir_to_focus(dir);
-                if self.runtime.move_focused_panel(focus) {
+                if self.runtime.borrow_mut().move_focused_panel(focus) {
                     eprintln!(
                         "bitty: keymap move_split:{} -> focused={:?} leafs={}",
                         dir.canonical(),
-                        self.runtime.focused_view(),
-                        self.runtime.leaf_count()
+                        self.runtime.borrow().focused_view(),
+                        self.runtime.borrow().leaf_count()
                     );
                 } else {
                     eprintln!(
@@ -1930,10 +1989,11 @@ impl TerminalApp {
             }
             A::ToggleSplit => {
                 self.restore_zoom();
-                if let Some(axis) = self.runtime.toggle_focused_split_axis() {
+                let scrutinee = self.runtime.borrow_mut().toggle_focused_split_axis();
+                if let Some(axis) = scrutinee {
                     eprintln!(
                         "bitty: keymap toggle_split -> axis={axis:?} focused={:?}",
-                        self.runtime.focused_view()
+                        self.runtime.borrow().focused_view()
                     );
                 } else {
                     eprintln!("warning: keymap toggle_split has no enclosing split — ignoring");
@@ -1941,41 +2001,41 @@ impl TerminalApp {
             }
             A::FocusNext => {
                 self.restore_zoom();
-                let next = self.runtime.move_focus(FocusDirection::Next);
+                let next = self.runtime.borrow_mut().move_focus(FocusDirection::Next);
                 eprintln!(
                     "bitty: keymap focus_next -> {next:?} leafs={}",
-                    self.runtime.leaf_count()
+                    self.runtime.borrow().leaf_count()
                 );
             }
             A::FocusPrev => {
                 self.restore_zoom();
-                let next = self.runtime.move_focus(FocusDirection::Prev);
+                let next = self.runtime.borrow_mut().move_focus(FocusDirection::Prev);
                 eprintln!(
                     "bitty: keymap focus_prev -> {next:?} leafs={}",
-                    self.runtime.leaf_count()
+                    self.runtime.borrow().leaf_count()
                 );
             }
             A::FocusId(n) => {
                 self.restore_zoom();
-                let ok = self.runtime.set_focus(ViewId::new(n));
+                let ok = self.runtime.borrow_mut().set_focus(ViewId::new(n));
                 if ok {
                     eprintln!("bitty: keymap focus:{n} -> focused");
                 } else {
                     eprintln!(
                         "warning: keymap focus:{n} not in layout (leaf ids {:?}) — ignoring",
-                        self.runtime.layout().leaf_ids()
+                        self.runtime.borrow().layout().leaf_ids()
                     );
                 }
             }
             A::ScrollPageUp => {
-                if self.runtime.scroll_focused_page(true) {
+                if self.runtime.borrow_mut().scroll_focused_page(true) {
                     eprintln!("bitty: keymap scroll_page_up -> paged");
                 } else {
                     eprintln!("warning: keymap scroll_page_up has no focused pane — ignoring");
                 }
             }
             A::ScrollPageDown => {
-                if self.runtime.scroll_focused_page(false) {
+                if self.runtime.borrow_mut().scroll_focused_page(false) {
                     eprintln!("bitty: keymap scroll_page_down -> paged");
                 } else {
                     eprintln!("warning: keymap scroll_page_down has no focused pane — ignoring");
@@ -2158,23 +2218,24 @@ impl TerminalApp {
                 // Explicit directional splits always bisect the focused
                 // leaf, independent of `PanelLayoutMode` (which only
                 // controls the adaptive `NewPanel` path below).
-                let Some(focused) = self.runtime.focused_view() else {
+                let Some(focused) = self.runtime.borrow().focused_view() else {
                     eprintln!("warning: keymap {label} has no focused pane — ignoring");
                     return false;
                 };
                 self.restore_zoom();
-                if self.runtime.layout().leaf_count() == 0 {
+                if self.runtime.borrow().layout().leaf_count() == 0 {
                     self.create_panel_on_empty_base(focused);
                     return false;
                 }
-                let target = if self.runtime.layout().find_leaf(focused).is_some() {
+                let target = if self.runtime.borrow().layout().find_leaf(focused).is_some() {
                     focused
                 } else {
                     let Some(fallback) = self
                         .runtime
+                        .borrow()
                         .panel_split_plan()
                         .map(|p| p.target)
-                        .or_else(|| self.runtime.layout().leaf_ids().into_iter().next())
+                        .or_else(|| self.runtime.borrow().layout().leaf_ids().into_iter().next())
                     else {
                         eprintln!("warning: keymap {label} found no target pane — ignoring");
                         return false;
@@ -2195,7 +2256,8 @@ impl TerminalApp {
                 //
                 // CTX-0964 (#1698, DEC-0099): `BisectLargest` splits the
                 // largest-area leaf with its raw `width >= height` axis.
-                let focused = match self.runtime.focused_view() {
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap new_panel has no focused pane — ignoring");
@@ -2213,12 +2275,12 @@ impl TerminalApp {
                 // the split below would refuse and silently drop the
                 // chord. Materialize the fresh panel as the tiled base
                 // instead; the surviving float/pin keeps its place.
-                if self.runtime.layout().leaf_count() == 0 {
+                if self.runtime.borrow().layout().leaf_count() == 0 {
                     self.create_panel_on_empty_base(focused);
                     return false;
                 }
-                let layout_mode = self.runtime.panel_layout_mode();
-                let Some(plan) = self.runtime.panel_split_plan() else {
+                let layout_mode = self.runtime.borrow().panel_layout_mode();
+                let Some(plan) = self.runtime.borrow().panel_split_plan() else {
                     eprintln!(
                         "warning: keymap new_panel has no leaf that fits two 10x4 panes — ignoring"
                     );
@@ -2240,11 +2302,13 @@ impl TerminalApp {
                     // pane stays focused; any other active pane restarts at
                     // Right (never a stale leaf-count phase).
                     self.runtime
+                        .borrow_mut()
                         .note_panel_split_created(created, plan.spiral_phase);
                 }
             }
             A::CloseView => {
-                let focused = match self.runtime.focused_view() {
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap close_view has no focused pane — ignoring");
@@ -2278,11 +2342,12 @@ impl TerminalApp {
                     // window?` confirmation, and repeating the same chord
                     // confirms the quit (`Esc` cancels). Never a silent
                     // no-op.
-                    if self.runtime.window_close_request() {
+                    if self.runtime.borrow_mut().window_close_request() {
                         eprintln!("bitty: keymap close_view -> last pane, window close confirmed");
                         return true;
                     }
-                    if let Some(summary) = self.runtime.close_confirm_banner_text() {
+                    let scrutinee = self.runtime.borrow().close_confirm_banner_text();
+                    if let Some(summary) = scrutinee {
                         eprintln!("bitty: keymap close_view PENDING -> {summary}");
                     }
                     return false;
@@ -2294,20 +2359,21 @@ impl TerminalApp {
                 let close_last_tiled_panel = self
                     .chrome
                     .zoom
-                    .backup_leaf_count(&self.runtime)
-                    .map_or(self.runtime.leaf_count() <= 1, |count| count == 1);
+                    .backup_leaf_count(&self.runtime.borrow())
+                    .map_or(self.runtime.borrow().leaf_count() <= 1, |count| count == 1);
                 // CTX-1337 (#2222): a pinned panel is window-global and
                 // survives an emptied workspace, so its composited base
                 // keeps the workspace meaningful; never prune it away from
                 // the pin. Floats stay workspace-local, so they still prune
                 // exactly like the CTX-1297 path.
                 let prune_last_tiled_workspace = close_last_tiled_panel
-                    && self.runtime.floated_count() == 0
-                    && self.runtime.pinned_count() == 0
-                    && self.runtime.workspace_count() > 1;
+                    && self.runtime.borrow().floated_count() == 0
+                    && self.runtime.borrow().pinned_count() == 0
+                    && self.runtime.borrow().workspace_count() > 1;
                 let zoom_backup_views = if prune_last_tiled_workspace {
                     self.runtime
-                        .workspace_seq_at(self.runtime.active_workspace_index())
+                        .borrow()
+                        .workspace_seq_at(self.runtime.borrow().active_workspace_index())
                         .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
                         .unwrap_or_default()
                 } else {
@@ -2316,8 +2382,11 @@ impl TerminalApp {
                 let close_confirm_views = if prune_last_tiled_workspace {
                     if zoom_backup_views.is_empty() {
                         self.runtime
+                            .borrow()
                             .primary_view()
-                            .filter(|primary| self.runtime.layout().find_leaf(*primary).is_some())
+                            .filter(|primary| {
+                                self.runtime.borrow().layout().find_leaf(*primary).is_some()
+                            })
                             .into_iter()
                             .collect()
                     } else {
@@ -2332,9 +2401,10 @@ impl TerminalApp {
                 // surgery below run only on the proceed path, so a cancel
                 // leaves the zoomed layout untouched.
                 let close_request = if close_confirm_views.is_empty() {
-                    self.runtime.view_close_request(focused)
+                    self.runtime.borrow_mut().view_close_request(focused)
                 } else {
                     self.runtime
+                        .borrow_mut()
                         .view_close_request_for_views(focused, &close_confirm_views)
                 };
                 match close_request {
@@ -2354,8 +2424,8 @@ impl TerminalApp {
                 // session would leave the empty bordered panel behind
                 // (unkillable). Discard the floating view instead so the
                 // panel disappears and focus returns to tiling.
-                if self.runtime.floated_views().contains(&focused)
-                    || self.runtime.pinned_views().contains(&focused)
+                if self.runtime.borrow().floated_views().contains(&focused)
+                    || self.runtime.borrow().pinned_views().contains(&focused)
                 {
                     // CTX-1336 (#2221): a float can be the active
                     // workspace's last live view (its tiled base closed).
@@ -2363,17 +2433,23 @@ impl TerminalApp {
                     // the emptied workspace exactly like the CTX-1297
                     // last-tiled-panel path, so focus follows a live
                     // workspace instead of a blank surface.
-                    let prune_after_discard = self.runtime.floated_views() == vec![focused]
-                        && self.runtime.layout().leaf_count() == 0
-                        && self.runtime.pinned_count() == 0
-                        && self.runtime.workspace_count() > 1;
-                    if self.runtime.discard_floating_view(focused) {
+                    let prune_after_discard = self.runtime.borrow().floated_views()
+                        == vec![focused]
+                        && self.runtime.borrow().layout().leaf_count() == 0
+                        && self.runtime.borrow().pinned_count() == 0
+                        && self.runtime.borrow().workspace_count() > 1;
+                    if self.runtime.borrow_mut().discard_floating_view(focused) {
                         self.dispose_plugin_panel_on_view(focused);
                         eprintln!("bitty: keymap close_view -> discarded floating {focused:?}");
                     }
                     if prune_after_discard {
-                        let workspace = self.runtime.active_workspace_index();
-                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                        let workspace = self.runtime.borrow().active_workspace_index();
+                        if self
+                            .runtime
+                            .borrow_mut()
+                            .workspace_close_at(workspace)
+                            .is_ok()
+                        {
                             eprintln!(
                                 "bitty: keymap close_view -> last float closed, empty workspace pruned"
                             );
@@ -2385,8 +2461,8 @@ impl TerminalApp {
                     }
                     eprintln!(
                         "bitty: keymap close_view -> leafs={} focused={:?}",
-                        self.runtime.leaf_count(),
-                        self.runtime.focused_view()
+                        self.runtime.borrow().leaf_count(),
+                        self.runtime.borrow().focused_view()
                     );
                     return false;
                 }
@@ -2399,8 +2475,13 @@ impl TerminalApp {
                 // session-less ghost tile behind.
                 if close_last_tiled_panel {
                     if prune_last_tiled_workspace {
-                        let workspace = self.runtime.active_workspace_index();
-                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                        let workspace = self.runtime.borrow().active_workspace_index();
+                        if self
+                            .runtime
+                            .borrow_mut()
+                            .workspace_close_at(workspace)
+                            .is_ok()
+                        {
                             eprintln!(
                                 "bitty: keymap close_view -> last panel closed, empty workspace pruned"
                             );
@@ -2409,7 +2490,7 @@ impl TerminalApp {
                                 "warning: keymap close_view could not prune empty workspace — ignoring"
                             );
                         }
-                    } else if self.runtime.floated_count() > 0 {
+                    } else if self.runtime.borrow().floated_count() > 0 {
                         // CTX-1336 (#2221): a detached float survives in
                         // this workspace, so the closed tiled host is a
                         // pane close. Tearing down only its session kept a
@@ -2423,14 +2504,14 @@ impl TerminalApp {
                         // it even when the primary owner id names the leaf,
                         // so killing the primary PTY here stranded the pane
                         // session with no owning leaf.
-                        let was_primary = self.runtime.paints_primary_grid(&focused);
+                        let was_primary = self.runtime.borrow().paints_primary_grid(&focused);
                         if was_primary {
-                            if self.runtime.close_primary_session() {
+                            if self.runtime.borrow_mut().close_primary_session() {
                                 eprintln!(
                                     "bitty: keymap close_view tore down primary shell {focused:?} (float base drained)"
                                 );
                             }
-                        } else if self.runtime.close_pane_session(&focused) {
+                        } else if self.runtime.borrow_mut().close_pane_session(&focused) {
                             eprintln!(
                                 "bitty: keymap close_view tore down last tiled panel shell {focused:?} (float base drained)"
                             );
@@ -2439,22 +2520,25 @@ impl TerminalApp {
                         // refuses it, the layout-level remove yields the
                         // empty base that the float composite expects
                         // (G1/DEC-0099: the float stays a float).
-                        let mut layout = self.runtime.layout().clone();
+                        let mut layout = self.runtime.borrow().layout().clone();
                         if layout.remove_leaf(focused).is_some() {
-                            self.runtime.set_layout_closing(layout, focused);
+                            self.runtime
+                                .borrow_mut()
+                                .set_layout_closing(layout, focused);
                         }
                         // CTX-1859: the leaf is gone, so a plugin panel bound
                         // to it must not outlive it as an unreachable record.
                         self.dispose_plugin_panel_on_view(focused);
-                        if let Some(survivor) = self.runtime.floated_views().last().copied() {
-                            self.runtime.set_focus(survivor);
+                        let scrutinee = self.runtime.borrow().floated_views().last().copied();
+                        if let Some(survivor) = scrutinee {
+                            self.runtime.borrow_mut().set_focus(survivor);
                         }
                         eprintln!(
                             "bitty: keymap close_view -> float base drained, leafs={} focused={:?}",
-                            self.runtime.leaf_count(),
-                            self.runtime.focused_view()
+                            self.runtime.borrow().leaf_count(),
+                            self.runtime.borrow().focused_view()
                         );
-                    } else if self.runtime.pinned_count() > 0 {
+                    } else if self.runtime.borrow().pinned_count() > 0 {
                         // CTX-1337 (#2222): a pinned panel survives outside
                         // the live layout, so the closed tiled host is a
                         // pane close. Unlike a float the pin never covers
@@ -2466,21 +2550,23 @@ impl TerminalApp {
                         // Issue #2389: same paint-precedence rule as the
                         // float base branch — retire the session the leaf
                         // actually painted.
-                        let was_primary = self.runtime.paints_primary_grid(&focused);
+                        let was_primary = self.runtime.borrow().paints_primary_grid(&focused);
                         if was_primary {
-                            if self.runtime.close_primary_session() {
+                            if self.runtime.borrow_mut().close_primary_session() {
                                 eprintln!(
                                     "bitty: keymap close_view tore down primary shell {focused:?} (pinned base drained)"
                                 );
                             }
-                        } else if self.runtime.close_pane_session(&focused) {
+                        } else if self.runtime.borrow_mut().close_pane_session(&focused) {
                             eprintln!(
                                 "bitty: keymap close_view tore down last tiled panel shell {focused:?} (pinned base drained)"
                             );
                         }
-                        if let Some(survivor) =
-                            self.runtime.retire_sole_tiled_leaf_for_pinned(focused)
-                        {
+                        let scrutinee = self
+                            .runtime
+                            .borrow_mut()
+                            .retire_sole_tiled_leaf_for_pinned(focused);
+                        if let Some(survivor) = scrutinee {
                             eprintln!(
                                 "bitty: keymap close_view -> pinned base drained, {survivor:?} focused/primary"
                             );
@@ -2495,44 +2581,47 @@ impl TerminalApp {
                         self.dispose_plugin_panel_on_view(focused);
                         eprintln!(
                             "bitty: keymap close_view -> pins={} leafs={} focused={:?}",
-                            self.runtime.pinned_count(),
-                            self.runtime.leaf_count(),
-                            self.runtime.focused_view()
+                            self.runtime.borrow().pinned_count(),
+                            self.runtime.borrow().leaf_count(),
+                            self.runtime.borrow().focused_view()
                         );
-                    } else if self.runtime.paints_primary_grid(&focused) {
-                        if self.runtime.close_primary_session() {
+                    } else if self.runtime.borrow().paints_primary_grid(&focused) {
+                        if self.runtime.borrow_mut().close_primary_session() {
                             eprintln!(
                                 "bitty: keymap close_view tore down primary shell {focused:?} (workspace kept for float)"
                             );
                         }
-                    } else if self.runtime.close_pane_session(&focused) {
+                    } else if self.runtime.borrow_mut().close_pane_session(&focused) {
                         eprintln!(
                             "bitty: keymap close_view tore down last tiled panel shell {focused:?} (workspace kept for float)"
                         );
                     }
                     return false;
                 }
-                let mut layout = self.runtime.layout().clone();
+                let mut layout = self.runtime.borrow().layout().clone();
                 if close_focused_leaf(&mut layout, focused) {
-                    if let Some(previous) = survivor_after_close(self.runtime.layout(), focused) {
+                    let scrutinee = survivor_after_close(self.runtime.borrow().layout(), focused);
+                    if let Some(previous) = scrutinee {
                         // Set focus before the closing layout is installed so
                         // primary ownership re-homes to this same survivor.
-                        self.runtime.set_focus(previous);
+                        self.runtime.borrow_mut().set_focus(previous);
                     }
                     // CTX-0359: an explicit close is the only layout change
                     // allowed to re-home the primary owner; a plain
                     // `set_layout` (zoom, restore) must preserve it.
-                    self.runtime.set_layout_closing(layout, focused);
+                    self.runtime
+                        .borrow_mut()
+                        .set_layout_closing(layout, focused);
                     // CTX-0176: tear down the closed leaf's shell (drop kills
                     // + reaps the child; no-op when it never owned one).
-                    if self.runtime.close_pane_session(&focused) {
+                    if self.runtime.borrow_mut().close_pane_session(&focused) {
                         eprintln!("bitty: keymap close_view tore down pane shell {focused:?}");
                     }
                     self.dispose_plugin_panel_on_view(focused);
                     eprintln!(
                         "bitty: keymap close_view -> leafs={} focused={:?}",
-                        self.runtime.leaf_count(),
-                        self.runtime.focused_view()
+                        self.runtime.borrow().leaf_count(),
+                        self.runtime.borrow().focused_view()
                     );
                 } else {
                     eprintln!("warning: keymap close_view found no focused pane — ignoring");
@@ -2540,14 +2629,15 @@ impl TerminalApp {
             }
             A::ResizeSplit(dir) => {
                 self.restore_zoom();
-                let focused = match self.runtime.focused_view() {
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap resize_split has no focused pane — ignoring");
                         return false;
                     }
                 };
-                let mut layout = self.runtime.layout().clone();
+                let mut layout = self.runtime.borrow().layout().clone();
                 if resize_focused_pane_with_step(&mut layout, focused, dir, self.chrome.resize_step)
                 {
                     // Issue #2798: the step reflows the pane grids with the
@@ -2555,12 +2645,12 @@ impl TerminalApp {
                     // must paint those committed rectangles. The install
                     // latches the unpresented commit (same funnel as the
                     // pointer resize path); only the chrome rings fade.
-                    self.runtime.set_layout_committed(layout);
+                    self.runtime.borrow_mut().set_layout_committed(layout);
                     // CTX-0967: a committed keyboard resize arms the resize
                     // transition on the focused panel. Ratios commit
                     // immediately (terminal content is never interpolated);
                     // only the resized panels' chrome rings fade.
-                    self.runtime.trigger_animation(
+                    self.runtime.borrow_mut().trigger_animation(
                         bitty_runtime::AnimationKind::Resize,
                         Some(focused),
                         std::time::Instant::now(),
@@ -2579,7 +2669,8 @@ impl TerminalApp {
                 // 0x03 (SIGINT); now chrome owns it and fish never sees the
                 // byte. Reuses the Wayland-first clipboard path (CTX-0160)
                 // with headless fallback; refusals warn like other chrome.
-                match self.runtime.copy_selection_to_clipboard() {
+                let scrutinee = self.runtime.borrow_mut().copy_selection_to_clipboard();
+                match scrutinee {
                     Ok(Some(text)) => {
                         eprintln!("bitty: keymap copy_to_clipboard -> {} bytes", text.len())
                     }
@@ -2597,6 +2688,7 @@ impl TerminalApp {
                 // keeps the bytes (fail-closed, never a mis-jump).
                 if self
                     .runtime
+                    .borrow_mut()
                     .jump_to_prompt(bitty_runtime::runtime::shell_jump::PromptDirection::Prev)
                 {
                     eprintln!("bitty: keymap jump_to_prompt:prev -> jumped");
@@ -2610,6 +2702,7 @@ impl TerminalApp {
                 // CTX-0952: mirror toward live.
                 if self
                     .runtime
+                    .borrow_mut()
                     .jump_to_prompt(bitty_runtime::runtime::shell_jump::PromptDirection::Next)
                 {
                     eprintln!("bitty: keymap jump_to_prompt:next -> jumped");
@@ -2623,7 +2716,7 @@ impl TerminalApp {
                 // CTX-0952: select exactly the last command's output rows
                 // (ghostty `selectOutput` shape). Empty/absent marks: loud
                 // no-op, live selection untouched.
-                if self.runtime.select_command_output() {
+                if self.runtime.borrow_mut().select_command_output() {
                     eprintln!("bitty: keymap select_command_output -> selected");
                 } else {
                     eprintln!(
@@ -2645,10 +2738,12 @@ impl TerminalApp {
                 // chord with an unchanged clipboard confirms delivery, Esc
                 // cancels. CTX-1372: a bare Enter press also confirms through
                 // the runtime's `confirm_pending_paste` seam (identical bytes).
-                match self.runtime.paste_from_clipboard() {
+                let scrutinee = self.runtime.borrow_mut().paste_from_clipboard();
+                match scrutinee {
                     Ok(Some(true)) => {
                         let summary = self
                             .runtime
+                            .borrow()
                             .pending_paste_summary()
                             .unwrap_or_else(|| "pending confirmation".to_string());
                         eprintln!("bitty: paste_from_clipboard -> {summary}");
@@ -2669,16 +2764,18 @@ impl TerminalApp {
                 // and submits it to the identical suspicious-paste gate;
                 // empty sources are a loud-but-harmless no-op and read
                 // failures are recorded for `last_clipboard_error`.
-                match self.runtime.paste_from_primary() {
+                let scrutinee = self.runtime.borrow_mut().paste_from_primary();
+                match scrutinee {
                     Some(true) => {
                         let summary = self
                             .runtime
+                            .borrow()
                             .pending_paste_summary()
                             .unwrap_or_else(|| "pending confirmation".to_string());
                         eprintln!("bitty: paste_from_primary -> {summary}");
                     }
                     Some(false) => eprintln!("bitty: paste_from_primary delivered"),
-                    None => match self.runtime.last_clipboard_error() {
+                    None => match self.runtime.borrow().last_clipboard_error() {
                         Some(err) => eprintln!(
                             "warning: paste_from_primary clipboard error ({err}) — ignoring"
                         ),
@@ -2690,11 +2787,12 @@ impl TerminalApp {
             }
             A::WorkspaceNew => {
                 // CTX-0257 (DEC-0034 entry): fresh workspace, switched to it.
-                match self.runtime.workspace_new() {
+                let scrutinee = self.runtime.borrow_mut().workspace_new();
+                match scrutinee {
                     Ok(index) => eprintln!(
                         "bitty: keymap workspace_new -> workspace {} ({})",
                         index + 1,
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                     Err(err) => {
                         eprintln!("warning: keymap workspace_new refused ({err}) — ignoring")
@@ -2705,10 +2803,11 @@ impl TerminalApp {
                 // CTX-0257: idle closes immediately; live arms a pending
                 // confirm (loud banner), repeat confirms the kill, Esc
                 // cancels via the runtime key path. Never a silent kill.
-                match self.runtime.workspace_close_request() {
+                let scrutinee = self.runtime.borrow_mut().workspace_close_request();
+                match scrutinee {
                     WsCloseRequest::Closed { killed } => eprintln!(
                         "bitty: keymap workspace_close -> ({}) killed={killed}",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                     WsCloseRequest::Pending { summary } => {
                         eprintln!("bitty: keymap workspace_close PENDING -> {summary}")
@@ -2716,27 +2815,27 @@ impl TerminalApp {
                 }
             }
             A::WorkspacePrev => {
-                let index = self.runtime.workspace_prev();
+                let index = self.runtime.borrow_mut().workspace_prev();
                 eprintln!(
                     "bitty: keymap workspace_prev -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspace_names().join(" ")
+                    self.runtime.borrow().workspace_names().join(" ")
                 );
             }
             A::WorkspaceNext => {
-                let index = self.runtime.workspace_next();
+                let index = self.runtime.borrow_mut().workspace_next();
                 eprintln!(
                     "bitty: keymap workspace_next -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspace_names().join(" ")
+                    self.runtime.borrow().workspace_names().join(" ")
                 );
             }
             A::WorkspaceLast => {
-                let index = self.runtime.workspace_last();
+                let index = self.runtime.borrow_mut().workspace_last();
                 eprintln!(
                     "bitty: keymap workspace_last -> workspace {} ({})",
                     index + 1,
-                    self.runtime.workspace_names().join(" ")
+                    self.runtime.borrow().workspace_names().join(" ")
                 );
             }
             A::WorkspaceNextOccupied => {
@@ -2751,12 +2850,12 @@ impl TerminalApp {
                         eprintln!(
                             "bitty: keymap workspace_next_occupied -> workspace {} ({})",
                             index + 1,
-                            self.runtime.workspace_names().join(" ")
+                            self.runtime.borrow().workspace_names().join(" ")
                         );
                     }
                     None => eprintln!(
                         "warning: keymap workspace_next_occupied needs two occupied workspaces ({}) — ignoring",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                 }
             }
@@ -2769,12 +2868,12 @@ impl TerminalApp {
                         eprintln!(
                             "bitty: keymap workspace_prev_occupied -> workspace {} ({})",
                             index + 1,
-                            self.runtime.workspace_names().join(" ")
+                            self.runtime.borrow().workspace_names().join(" ")
                         );
                     }
                     None => eprintln!(
                         "warning: keymap workspace_prev_occupied needs two occupied workspaces ({}) — ignoring",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                 }
             }
@@ -2783,15 +2882,16 @@ impl TerminalApp {
                 // exceeds the live count; zero fails closed with no state
                 // change. Reuses the workspace_switch path via
                 // workspace_focus_clamped.
-                match self.runtime.workspace_focus_clamped(n) {
+                let scrutinee = self.runtime.borrow_mut().workspace_focus_clamped(n);
+                match scrutinee {
                     Some(index) => eprintln!(
                         "bitty: keymap workspace_focus:{n} -> workspace {} ({})",
                         index + 1,
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                     None => eprintln!(
                         "warning: keymap workspace_focus:{n} has no such workspace ({}) — ignoring",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                 }
             }
@@ -2803,7 +2903,13 @@ impl TerminalApp {
                 // fail-closed. Zoom restores first so the move operates on
                 // the real tiled tree, not the zoom proxy.
                 self.restore_zoom();
-                match self.runtime.workspace_move_focused_to_one_based(n) {
+                // CTX-1929: hoist the move out of the match scrutinee (guard
+                // release before the arm revokes the capture).
+                let move_outcome = self
+                    .runtime
+                    .borrow_mut()
+                    .workspace_move_focused_to_one_based(n);
+                match move_outcome {
                     Ok((moved, from, to)) => {
                         // CTX-1289: release the transient capture only after a
                         // real move landed. A refused move leaves the overlay
@@ -2812,25 +2918,26 @@ impl TerminalApp {
                         self.revoke_overlay_capture();
                         eprintln!(
                             "bitty: keymap workspace_move:{n} -> moved {moved:?} ws:{from} -> ws:{to} ({})",
-                            self.runtime.workspace_names().join(" ")
+                            self.runtime.borrow().workspace_names().join(" ")
                         )
                     }
                     Err(err) => eprintln!(
                         "warning: keymap workspace_move:{n} refused ({err}) ({}) — ignoring",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                 }
             }
             A::WorkspaceSwap(n) => {
                 self.restore_zoom();
-                match self.runtime.workspace_swap_current_with(n) {
+                let scrutinee = self.runtime.borrow_mut().workspace_swap_current_with(n);
+                match scrutinee {
                     Ok((from_seq, to_seq)) => eprintln!(
                         "bitty: keymap workspace_swap:{n} -> swapped ws:{from_seq} <-> ws:{to_seq} ({})",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                     Err(err) => eprintln!(
                         "warning: keymap workspace_swap:{n} refused ({err}) ({}) — ignoring",
-                        self.runtime.workspace_names().join(" ")
+                        self.runtime.borrow().workspace_names().join(" ")
                     ),
                 }
             }
@@ -2838,24 +2945,29 @@ impl TerminalApp {
                 // CTX-0538: zoom is scoped to the active workspace, so a
                 // toggle here engages/disengages only this workspace's
                 // entry (closes/restores prune the dead keys).
-                self.chrome.zoom.prune(&self.runtime);
-                if self.chrome.zoom.is_zoomed(&self.runtime) {
-                    if self.chrome.zoom.disengage(&mut self.runtime) {
+                self.chrome.zoom.prune(&self.runtime.borrow());
+                if self.chrome.zoom.is_zoomed(&self.runtime.borrow()) {
+                    if self.chrome.zoom.disengage(&mut self.runtime.borrow_mut()) {
                         eprintln!(
                             "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
-                            self.runtime.leaf_count(),
-                            self.runtime.focused_view()
+                            self.runtime.borrow().leaf_count(),
+                            self.runtime.borrow().focused_view()
                         );
                     }
                 } else {
-                    let focused = match self.runtime.focused_view() {
+                    let scrutinee = self.runtime.borrow().focused_view();
+                    let focused = match scrutinee {
                         Some(id) => id,
                         None => {
                             eprintln!("warning: keymap toggle_zoom has no focused pane — ignoring");
                             return false;
                         }
                     };
-                    if self.chrome.zoom.engage(&mut self.runtime, focused) {
+                    if self
+                        .chrome
+                        .zoom
+                        .engage(&mut self.runtime.borrow_mut(), focused)
+                    {
                         eprintln!("bitty: keymap toggle_zoom on -> {focused:?}");
                     } else {
                         eprintln!("warning: keymap toggle_zoom found no focused pane — ignoring");
@@ -2887,16 +2999,21 @@ impl TerminalApp {
                 // landing in the proxy is covered by the stale-backup
                 // discipline on disengage. No focused pane warns and keeps
                 // everything.
-                let focused = match self.runtime.focused_view() {
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap toggle_floating has no focused pane — ignoring");
                         return false;
                     }
                 };
-                let detaching = !self.runtime.floated_views().contains(&focused);
+                let detaching = !self.runtime.borrow().floated_views().contains(&focused);
                 if detaching {
-                    let current = match self.runtime.layout().find_leaf(focused) {
+                    // CTX-1929: `find_leaf` hands back a reference into the
+                    // runtime, so the guard binding outlives the match reads.
+                    let rt = self.runtime.borrow();
+                    let scrutinee = rt.layout().find_leaf(focused);
+                    let current = match scrutinee {
                         Some(leaf) => leaf.presentation(),
                         None => {
                             eprintln!(
@@ -2915,13 +3032,16 @@ impl TerminalApp {
                         return false;
                     }
                 }
-                if !detaching || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1) {
+                if !detaching
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
+                {
                     self.restore_zoom();
                 }
-                match self
+                let scrutinee = self
                     .runtime
-                    .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(focused))
-                {
+                    .borrow_mut()
+                    .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(focused));
+                match scrutinee {
                     Ok(None) => eprintln!("bitty: keymap toggle_floating -> {focused:?} detached"),
                     Ok(Some(restored)) => {
                         eprintln!("bitty: keymap toggle_floating -> {restored:?} restored")
@@ -2957,17 +3077,22 @@ impl TerminalApp {
                 // restore: its post-restore mode flip has no leaf-count
                 // refusal, the mode already validated above.) No focused pane
                 // warns and keeps everything.
-                let focused = match self.runtime.focused_view() {
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
                     Some(id) => id,
                     None => {
                         eprintln!("warning: keymap toggle_pinned has no focused pane — ignoring");
                         return false;
                     }
                 };
-                let pinning = !self.runtime.pinned_views().contains(&focused);
-                let from_float_store = self.runtime.floated_views().contains(&focused);
+                let pinning = !self.runtime.borrow().pinned_views().contains(&focused);
+                let from_float_store = self.runtime.borrow().floated_views().contains(&focused);
                 if pinning && !from_float_store {
-                    let current = match self.runtime.layout().find_leaf(focused) {
+                    // CTX-1929: `find_leaf` hands back a reference into the
+                    // runtime, so the guard binding outlives the match reads.
+                    let rt = self.runtime.borrow();
+                    let scrutinee = rt.layout().find_leaf(focused);
+                    let current = match scrutinee {
                         Some(leaf) => leaf.presentation(),
                         None => {
                             eprintln!(
@@ -2988,14 +3113,15 @@ impl TerminalApp {
                 }
                 if !pinning
                     || from_float_store
-                    || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1)
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
                 {
                     self.restore_zoom();
                 }
-                match self
+                let scrutinee = self
                     .runtime
-                    .apply_pin_command(bitty_runtime::PIN_CMD_TOGGLE, Some(focused))
-                {
+                    .borrow_mut()
+                    .apply_pin_command(bitty_runtime::PIN_CMD_TOGGLE, Some(focused));
+                match scrutinee {
                     Ok(None) => eprintln!("bitty: keymap toggle_pinned -> {focused:?} pinned"),
                     Ok(Some(restored)) => {
                         eprintln!("bitty: keymap toggle_pinned -> {restored:?} unpinned")
@@ -3023,26 +3149,32 @@ impl TerminalApp {
                 // re-derives the renderer at the live DPI scale, and reflows
                 // the grid from the current surface extent. Bounded and
                 // fail-closed at the ends (warn + keep current size).
-                match self.runtime.zoom_in() {
+                let scrutinee = self.runtime.borrow_mut().zoom_in();
+                match scrutinee {
                     Ok(()) => eprintln!(
                         "bitty: keymap increase_font_size -> {:.1}pt",
-                        self.runtime.font_size()
+                        self.runtime.borrow().font_size()
                     ),
                     Err(err) => eprintln!("warning: keymap increase_font_size refused ({err})"),
                 }
             }
-            A::DecreaseFontSize => match self.runtime.zoom_out() {
-                Ok(()) => eprintln!(
-                    "bitty: keymap decrease_font_size -> {:.1}pt",
-                    self.runtime.font_size()
-                ),
-                Err(err) => eprintln!("warning: keymap decrease_font_size refused ({err})"),
-            },
+            A::DecreaseFontSize => {
+                // CTX-1929: hoisted out of the inner match scrutinee (guard
+                // release before the arms re-read the font size).
+                let scrutinee = self.runtime.borrow_mut().zoom_out();
+                match scrutinee {
+                    Ok(()) => eprintln!(
+                        "bitty: keymap decrease_font_size -> {:.1}pt",
+                        self.runtime.borrow().font_size()
+                    ),
+                    Err(err) => eprintln!("warning: keymap decrease_font_size refused ({err})"),
+                }
+            }
             A::ResetFontSize => {
-                self.runtime.reset_zoom();
+                self.runtime.borrow_mut().reset_zoom();
                 eprintln!(
                     "bitty: keymap reset_font_size -> {:.1}pt",
-                    self.runtime.font_size()
+                    self.runtime.borrow().font_size()
                 );
             }
         }
@@ -3063,10 +3195,10 @@ impl TerminalApp {
     /// every new modal surface feeds this predicate instead of growing a
     /// fourth gate.
     pub(crate) fn modal_capture_active(&self) -> bool {
-        self.runtime.has_pending_paste()
-            || self.runtime.has_pending_ws_close()
-            || self.runtime.has_pending_close_confirm()
-            || self.runtime.overlay_modal_active()
+        self.runtime.borrow().has_pending_paste()
+            || self.runtime.borrow().has_pending_ws_close()
+            || self.runtime.borrow().has_pending_close_confirm()
+            || self.runtime.borrow().overlay_modal_active()
     }
 
     /// Classify one matchable keypress into its dispatch layer (CTX-0275).
@@ -3157,16 +3289,17 @@ impl TerminalApp {
             // close, so a pending window arm stays captured there.
             let is_last_pane = self.effective_window_leaf_count() <= 1;
             (
-                self.runtime.has_pending_paste(),
-                self.runtime.has_pending_ws_close(),
-                self.runtime.has_pending_close_confirm(),
+                self.runtime.borrow().has_pending_paste(),
+                self.runtime.borrow().has_pending_ws_close(),
+                self.runtime.borrow().has_pending_close_confirm(),
                 // CTX-0370: only an arm on the currently focused view is
                 // confirmed by the close-view chord.
                 self.runtime
+                    .borrow()
                     .pending_close_view()
-                    .is_some_and(|view| self.runtime.focused_view() == Some(view)),
-                self.runtime.overlay_modal_active(),
-                self.runtime.pending_close_is_window(),
+                    .is_some_and(|view| self.runtime.borrow().focused_view() == Some(view)),
+                self.runtime.borrow().overlay_modal_active(),
+                self.runtime.borrow().pending_close_is_window(),
                 is_last_pane,
             )
         } else {
@@ -3215,13 +3348,14 @@ impl TerminalApp {
     /// close-confirm cancellation stays silent exactly as today. Always
     /// returns `true`.
     pub(crate) fn handle_emergency_escape(&mut self, key: &KeyEvent) -> bool {
-        let had_pending = self.runtime.has_pending_paste();
-        let before_len = self.runtime.pending_input_len();
-        self.runtime.handle_key_event(key.clone());
-        let has_pending = self.runtime.has_pending_paste();
-        let after_len = self.runtime.pending_input_len();
+        let had_pending = self.runtime.borrow().has_pending_paste();
+        let before_len = self.runtime.borrow().pending_input_len();
+        self.runtime.borrow_mut().handle_key_event(key.clone());
+        let has_pending = self.runtime.borrow().has_pending_paste();
+        let after_len = self.runtime.borrow().pending_input_len();
         if has_pending {
-            if let Some(summary) = self.runtime.pending_paste_summary() {
+            let scrutinee = self.runtime.borrow().pending_paste_summary();
+            if let Some(summary) = scrutinee {
                 eprintln!("bitty: paste -> {summary}");
             }
         } else if had_pending && after_len > before_len {
@@ -3257,7 +3391,7 @@ impl TerminalApp {
     /// Composer modal routing is retired (E-CUT, CTX-0968): the plugin owns
     /// editing UX via overlay/capture; there is no Core session to route to.
     fn route_cw_modal(&mut self, key: &KeyEvent, keyref: &bitty_config::KeyRef) -> bool {
-        if self.runtime.is_copy_mode() || self.runtime.is_search_mode() {
+        if self.runtime.borrow().is_copy_mode() || self.runtime.borrow().is_search_mode() {
             return false;
         }
         let now_ms = self.chrome.leader_now_ms();
@@ -3273,7 +3407,7 @@ impl TerminalApp {
         {
             return true;
         }
-        if self.runtime.cw_hint_is_armed() {
+        if self.runtime.borrow().cw_hint_is_armed() {
             return self.route_hint_armed(key, keyref);
         }
         if self.chrome.leader.arms(*keyref) {
@@ -3314,12 +3448,15 @@ impl TerminalApp {
         now_ms: u64,
     ) -> bool {
         use crate::prefix_dispatch::{PrefixPress, classify_prefix_press};
+        // CTX-1929: read the armed flag before the match so the borrow guard
+        // is not held across the arms' `&mut self` dispatch.
+        let hint_armed = self.runtime.borrow().cw_hint_is_armed();
         match classify_prefix_press(
             &self.chrome.leader,
             &self.chrome.prefix_bindings,
             *keyref,
             self.chrome.leader_state.is_armed(),
-            self.runtime.cw_hint_is_armed(),
+            hint_armed,
             key.repeat,
         ) {
             PrefixPress::Ignored => false,
@@ -3342,7 +3479,7 @@ impl TerminalApp {
                 true
             }
             PrefixPress::Rearm => {
-                if self.runtime.cw_hint_is_armed() {
+                if self.runtime.borrow().cw_hint_is_armed() {
                     // Keep the hint re-arm semantics (a fresh batch per
                     // arming); the Leader window restarts with it.
                     self.arm_hint_session();
@@ -3386,7 +3523,7 @@ impl TerminalApp {
     /// session, CTX-0723 #981). Idempotent; terminal truth untouched.
     fn disarm_hint_session(&mut self) {
         self.chrome.leader_state = bitty_config::LeaderState::Idle;
-        self.runtime.cw_hint_disarm();
+        self.runtime.borrow_mut().cw_hint_disarm();
     }
 
     /// Arms a fresh hint session on a Leader press (CTX-0723 #981).
@@ -3401,10 +3538,17 @@ impl TerminalApp {
         let generation = self.chrome.hint_generation;
         let scope = self
             .runtime
+            .borrow()
             .focused_view()
             .map_or(HintScope::default(), |view| HintScope(view.0));
         let bound = self.bound_bare_keys();
-        match self.runtime.cw_hint_arm(scope, generation, &bound) {
+        // CTX-1929: hoist the arm out of the match scrutinee (guard release
+        // before the arms run).
+        let arm_outcome = self
+            .runtime
+            .borrow_mut()
+            .cw_hint_arm(scope, generation, &bound);
+        match arm_outcome {
             Ok(0) => {
                 self.disarm_hint_session();
                 eprintln!("warning: leader armed an empty hint batch (no targets) — disarming");
@@ -3467,7 +3611,10 @@ impl TerminalApp {
     /// outcome loudly (CTX-0723 #981).
     fn push_hint_letter(&mut self, c: char) {
         use bitty_runtime::cw_present::HintKeyOutcome;
-        match self.runtime.cw_hint_push_key(c) {
+        // CTX-1929: hoist the push out of the match scrutinee (guard release
+        // before the arms dispatch the outcome).
+        let push_outcome = self.runtime.borrow_mut().cw_hint_push_key(c);
+        match push_outcome {
             HintKeyOutcome::NeedMore => {}
             HintKeyOutcome::Dispatched(outcome) => {
                 self.chrome.leader_state = bitty_config::LeaderState::Idle;
@@ -3510,7 +3657,7 @@ impl TerminalApp {
                 );
             }
             DispatchOutcome::FocusView { view } => {
-                if self.runtime.set_focus(ViewId::new(view)) {
+                if self.runtime.borrow_mut().set_focus(ViewId::new(view)) {
                     eprintln!("bitty: hint -> focused view {view}");
                 } else {
                     eprintln!("warning: hint -> view {view} is not a live leaf — focus unchanged");
@@ -3730,7 +3877,7 @@ impl TerminalApp {
                     // emergency path while modal); unbound keys route to
                     // the runtime copy containment, which consumes them
                     // with no PTY bytes.
-                    if self.runtime.is_copy_mode() {
+                    if self.runtime.borrow().is_copy_mode() {
                         use bitty_config::KeyName as CopyModeKey;
                         if keyref.key == CopyModeKey::Escape {
                             return false;
@@ -3753,7 +3900,7 @@ impl TerminalApp {
                     // paste/close emergency path while modal); unbound keys
                     // route to the runtime search containment, which consumes
                     // them with no PTY bytes.
-                    if self.runtime.is_search_mode() {
+                    if self.runtime.borrow().is_search_mode() {
                         use bitty_config::KeyName as SearchModeKey;
                         if keyref.key == SearchModeKey::Escape {
                             return false;
@@ -4300,29 +4447,36 @@ mod tests {
         );
         // Copy with no selection warns and touches nothing.
         app.apply_chrome_action(ChromeAction::CopyToClipboard);
-        assert_eq!(app.runtime.clipboard().headless_contents(), "");
+        assert_eq!(app.runtime.borrow().clipboard().headless_contents(), "");
         // Select everything, copy: clipboard mirrors the selection text.
-        app.runtime.select_all();
-        let selected = app.runtime.selection_text().expect("selection");
+        app.runtime.borrow_mut().select_all();
+        let selected = app.runtime.borrow().selection_text().expect("selection");
         assert!(selected.contains("hello"), "grid holds fed text");
         app.apply_chrome_action(ChromeAction::CopyToClipboard);
-        assert_eq!(app.runtime.clipboard().headless_contents(), selected);
+        assert_eq!(
+            app.runtime.borrow().clipboard().headless_contents(),
+            selected
+        );
         // Pasting the grid-shaped clipboard goes through the inspection
         // gate (embedded newlines are suspicious): held pending, nothing
         // delivered silently.
-        app.runtime.clear_selection();
+        app.runtime.borrow_mut().clear_selection();
         app.apply_chrome_action(ChromeAction::PasteFromClipboard);
-        assert!(app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         // Clean clipboard text delivers immediately as PTY input bytes.
-        assert!(app.runtime.cancel_pending_paste());
+        assert!(app.runtime.borrow_mut().cancel_pending_paste());
         app.runtime
+            .borrow_mut()
             .clipboard_mut()
             .set_text("clean-paste".to_string())
             .expect("headless set");
         app.apply_chrome_action(ChromeAction::PasteFromClipboard);
-        assert!(!app.runtime.has_pending_paste());
-        assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert_eq!(
+            app.runtime.borrow_mut().drain_pending_input(),
+            b"clean-paste"
+        );
     }
 
     #[test]
@@ -4369,14 +4523,15 @@ mod tests {
         app.apply_chrome_action(ChromeAction::SelectCommandOutput);
         let expected = format!("out{:02}", h + 1);
         assert_eq!(
-            app.runtime.selection_text().as_deref(),
+            app.runtime.borrow().selection_text().as_deref(),
             Some(expected.as_str())
         );
         // Jump prev pages into history; jump next walks back toward live.
         app.apply_chrome_action(ChromeAction::JumpToPromptPrev);
-        let vid = app.runtime.focused_view().expect("focused view");
+        let vid = app.runtime.borrow().focused_view().expect("focused view");
         let up = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(vid)
             .expect("leaf")
@@ -4385,12 +4540,17 @@ mod tests {
         app.apply_chrome_action(ChromeAction::JumpToPromptNext);
         let down = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(vid)
             .expect("leaf")
             .scroll_offset();
         assert!(down < up, "next jump walks back toward live");
-        assert_eq!(app.runtime.pending_input_len(), 0, "no PTY bytes produced");
+        assert_eq!(
+            app.runtime.borrow().pending_input_len(),
+            0,
+            "no PTY bytes produced"
+        );
     }
 
     #[test]
@@ -4413,17 +4573,18 @@ mod tests {
         app.apply_chrome_action(ChromeAction::JumpToPromptPrev);
         app.apply_chrome_action(ChromeAction::JumpToPromptNext);
         app.apply_chrome_action(ChromeAction::SelectCommandOutput);
-        let vid = app.runtime.focused_view().expect("focused view");
+        let vid = app.runtime.borrow().focused_view().expect("focused view");
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(vid)
                 .expect("leaf")
                 .scroll_offset(),
             0
         );
-        assert!(!app.runtime.has_selection());
-        assert_eq!(app.runtime.pending_input_len(), 0);
+        assert!(!app.runtime.borrow().has_selection());
+        assert_eq!(app.runtime.borrow().pending_input_len(), 0);
     }
 
     // CTX-0229 headless chord driver: the same dispatch `handle_event`
@@ -4435,7 +4596,7 @@ mod tests {
         if !consumed {
             match kind {
                 WindowEventKind::KeyboardInput(key) => {
-                    app.runtime.handle_key_event(key);
+                    app.runtime.borrow_mut().handle_key_event(key);
                 }
                 WindowEventKind::ModifiersChanged(_)
                 | WindowEventKind::Focused(_)
@@ -4451,10 +4612,12 @@ mod tests {
                 | WindowEventKind::CursorEntered
                 | WindowEventKind::CursorLeft
                 | WindowEventKind::Ime(_) => {
-                    app.runtime.handle_platform_event(PlatformEvent::Window {
-                        window_id: WindowId::from_raw_public(1),
-                        kind,
-                    });
+                    app.runtime
+                        .borrow_mut()
+                        .handle_platform_event(PlatformEvent::Window {
+                            window_id: WindowId::from_raw_public(1),
+                            kind,
+                        });
                 }
             }
         }
@@ -4562,14 +4725,14 @@ mod tests {
         let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
         press_paste_chord(&mut app);
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"PASTE-FROM-CLIPBOARD-OK",
             "paste delivers clipboard bytes with zero trailing key bytes"
         );
         // Clean release cascade: nothing further reaches the PTY.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"",
             "release cascade after paste stays silent"
         );
@@ -4585,7 +4748,7 @@ mod tests {
         let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
         press_paste_chord(&mut app);
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"PASTE-FROM-CLIPBOARD-OK"
         );
         // Operator releases `Ctrl` while `V` is still held (auto-repeat
@@ -4596,14 +4759,14 @@ mod tests {
             "decayed repeat of a chrome-held key stays swallowed"
         );
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"",
             "no trailing V may reach the PTY after the paste"
         );
         // The physical release ends ownership; later typing works again.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"v");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"v");
     }
 
     #[test]
@@ -4613,11 +4776,11 @@ mod tests {
         let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
         assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
         assert!(!drive_chrome(&mut app, char_press("v", "v", true)));
-        assert_eq!(app.runtime.drain_pending_input(), b"vv");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"vv");
         // Bare `Ctrl+V` (no shift) stays shell input as `0x16` (CTX-0187).
         assert!(!drive_chrome(&mut app, mods_event(false, true)));
         assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"\x16");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"\x16");
     }
 
     #[test]
@@ -4628,7 +4791,7 @@ mod tests {
         assert!(!drive_chrome(&mut app, mods_event(true, true)));
         assert!(drive_chrome(&mut app, char_press("C", "C", false)));
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"",
             "copy chord never types into the PTY"
         );
@@ -4636,7 +4799,7 @@ mod tests {
         // Bare `c` afterwards is fresh shell input, not swallowed.
         assert!(!drive_chrome(&mut app, mods_event(false, false)));
         assert!(!drive_chrome(&mut app, char_press("c", "c", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"c");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"c");
     }
 
     #[test]
@@ -4646,7 +4809,7 @@ mod tests {
         let mut app = paste_test_app("PASTE-FROM-CLIPBOARD-OK");
         press_paste_chord(&mut app);
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"PASTE-FROM-CLIPBOARD-OK"
         );
         // Focus loss with `V` still "held" (release missed while unfocused).
@@ -4654,7 +4817,7 @@ mod tests {
         // A later `Shift+V` is fresh typing, not a chrome duplicate.
         assert!(!drive_chrome(&mut app, mods_event(true, false)));
         assert!(!drive_chrome(&mut app, char_press("V", "V", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"V");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"V");
     }
 
     #[test]
@@ -4665,13 +4828,13 @@ mod tests {
         press_paste_chord(&mut app);
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"PASTE-FROM-CLIPBOARD-OK"
         );
         press_paste_chord(&mut app);
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"PASTE-FROM-CLIPBOARD-OK"
         );
     }
@@ -4689,17 +4852,17 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::FocusPrev);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::FocusId(2));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
         // Unknown id warns and keeps focus.
         app.apply_chrome_action(ChromeAction::FocusId(99));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
     }
 
     #[test]
@@ -4730,19 +4893,22 @@ mod tests {
                 LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
             ),
         );
-        app.runtime.set_layout(l_shape);
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.runtime.borrow_mut().set_layout(l_shape);
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
-        assert_eq!(app.runtime.leaf_count(), 1, "zoom proxy installed");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "zoom proxy installed");
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Down));
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "focus movement restores the real tree"
         );
-        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(3)),
             "down from the zoomed top-right pane lands below"
         );
@@ -4761,31 +4927,31 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         // Split focused pane right: 2 -> 3 leaves; focus follows the fresh
         // pane (CTX-0364).
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
-        assert_eq!(app.runtime.leaf_count(), 3);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(3)));
         // Resize nudges without changing leaf count.
         app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Right));
-        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
         // Zoom collapses to one leaf and restores the tree.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
         // Close removes the focused leaf and refocuses inside the tree.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
-        assert_eq!(app.runtime.leaf_count(), 2);
-        assert!(app.runtime.focused_view().is_some());
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        assert!(app.runtime.borrow().focused_view().is_some());
         // Issue #1783: the last pane is the window-close gesture, never a
         // silent no-op. Idle `when_busy` exits immediately.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     /// Painted frame of `view` in `rt` (the present layer's geometry).
@@ -4857,22 +5023,31 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         // Enough output that the focused primary pane owns scrollback, so
         // the overlay scrollbar has a track and thumb to place.
         for i in 0..40 {
             app.runtime
+                .borrow_mut()
                 .handle_pty_bytes(format!("scrollback line {i:02}\r\n").as_bytes());
         }
-        assert!(app.runtime.scrollback_len() > 0, "fixture needs scrollback");
+        assert!(
+            app.runtime.borrow().scrollback_len() > 0,
+            "fixture needs scrollback"
+        );
         let mut now = std::time::Instant::now();
-        app.runtime.tick_at(now).expect("baseline presents");
-        let focused = app.runtime.focused_view().expect("focused pane");
+        app.runtime
+            .borrow_mut()
+            .tick_at(now)
+            .expect("baseline presents");
+        let focused = app.runtime.borrow().focused_view().expect("focused pane");
         assert_eq!(focused, ViewId::new(1), "primary pane owns the scrollbar");
 
         // Every step must move the divider: an inert step would satisfy the
         // painted/committed comparison without exercising a reflow.
-        let mut content_width = painted_frame(&app.runtime, focused, now).content.width;
+        let mut content_width = painted_frame(&app.runtime.borrow(), focused, now)
+            .content
+            .width;
         for (step, dir) in [
             SplitDir::Right,
             SplitDir::Right,
@@ -4886,27 +5061,31 @@ mod tests {
             app.apply_chrome_action(ChromeAction::ResizeSplit(dir));
             now = armed + std::time::Duration::from_millis(40);
             app.runtime
+                .borrow_mut()
                 .tick_at(now)
                 .unwrap_or_else(|| panic!("step {step} presents"));
-            let committed = app.runtime.present_frames();
-            let painted = app.runtime.paint_frames_at(now);
+            let committed = app.runtime.borrow().present_frames();
+            let painted = app.runtime.borrow().paint_frames_at(now);
             assert_eq!(
                 painted, committed,
                 "step {step}: the reflowed grid must paint its committed bounds"
             );
             assert!(
                 app.runtime
+                    .borrow()
                     .animation_progress(AnimationKind::Resize, Some(focused), now)
                     .is_some(),
                 "step {step}: only the resize ring fades"
             );
-            let next_width = painted_frame(&app.runtime, focused, now).content.width;
+            let next_width = painted_frame(&app.runtime.borrow(), focused, now)
+                .content
+                .width;
             assert_ne!(
                 next_width, content_width,
                 "step {step}: the keyboard step must move the divider"
             );
             content_width = next_width;
-            assert_scrollbar_track_hugs_painted_content(&app.runtime, now);
+            assert_scrollbar_track_hugs_painted_content(&app.runtime.borrow(), now);
         }
 
         // A split and a resize can share one transition window: the new
@@ -4915,18 +5094,21 @@ mod tests {
         let armed = std::time::Instant::now();
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
         assert!(
-            app.runtime.set_focus(focused),
+            app.runtime.borrow_mut().set_focus(focused),
             "focus returns to the tiled pane"
         );
         app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Right));
         now = armed + std::time::Duration::from_millis(40);
-        app.runtime.tick_at(now).expect("split + resize presents");
+        app.runtime
+            .borrow_mut()
+            .tick_at(now)
+            .expect("split + resize presents");
         assert_eq!(
-            app.runtime.paint_frames_at(now),
-            app.runtime.present_frames(),
+            app.runtime.borrow().paint_frames_at(now),
+            app.runtime.borrow().present_frames(),
             "a resize over an open transition must still paint the commit"
         );
-        assert_scrollbar_track_hugs_painted_content(&app.runtime, now);
+        assert_scrollbar_track_hugs_painted_content(&app.runtime.borrow(), now);
 
         // PR #2796 review follow-up: a pane with an in-flight bounds tween
         // that this step does *not* resize must not resume it once the
@@ -4937,7 +5119,7 @@ mod tests {
         // The root ratio differs from the settled split so the kept pane
         // itself carries an in-flight bounds tween that the resize must
         // cancel even though it does not resize that pane.
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.35,
             LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
@@ -4948,26 +5130,33 @@ mod tests {
                 LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
             ),
         ));
-        app.runtime.tick_at(overlap).expect("open presents");
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.runtime
+            .borrow_mut()
+            .tick_at(overlap)
+            .expect("open presents");
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
         let armed = std::time::Instant::now();
         app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Down));
         let committed_frame = armed + std::time::Duration::from_millis(40);
         app.runtime
+            .borrow_mut()
             .tick_at(committed_frame)
             .expect("resize presents");
         assert_eq!(
-            app.runtime.paint_frames_at(committed_frame),
-            app.runtime.present_frames(),
+            app.runtime.borrow().paint_frames_at(committed_frame),
+            app.runtime.borrow().present_frames(),
             "the resized column paints its commit"
         );
         // The next present runs after the latch cleared: the kept pane's
         // suppressed tween must be gone, never resumed from its old start.
         let after = committed_frame + std::time::Duration::from_millis(20);
-        app.runtime.tick_at(after).expect("post-commit presents");
+        app.runtime
+            .borrow_mut()
+            .tick_at(after)
+            .expect("post-commit presents");
         assert_eq!(
-            app.runtime.paint_frames_at(after),
-            app.runtime.present_frames(),
+            app.runtime.borrow().paint_frames_at(after),
+            app.runtime.borrow().present_frames(),
             "a suppressed pane tween must not resume after the commit"
         );
 
@@ -4975,18 +5164,19 @@ mod tests {
         // resume from a suppressed surface and jump the painted geometry.
         let settled = after + std::time::Duration::from_millis(300);
         app.runtime
+            .borrow_mut()
             .tick_at(settled)
             .expect("settled frame presents");
         assert_eq!(
-            app.runtime.paint_frames_at(settled),
-            app.runtime.present_frames(),
+            app.runtime.borrow().paint_frames_at(settled),
+            app.runtime.borrow().present_frames(),
             "the settled frame must stay committed"
         );
         assert!(
-            !app.runtime.animations_active_at(settled),
+            !app.runtime.borrow().animations_active_at(settled),
             "the ring transitions expire"
         );
-        assert_scrollbar_track_hugs_painted_content(&app.runtime, settled);
+        assert_scrollbar_track_hugs_painted_content(&app.runtime.borrow(), settled);
     }
 
     fn last_pane_test_app(mode: CloseConfirmMode) -> TerminalApp {
@@ -4998,7 +5188,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
         let rt = Runtime::new(cfg).expect("headless runtime builds");
-        let mut app = TerminalApp::with_theme(
+        let app = TerminalApp::with_theme(
             rt,
             bitty_config::theme::DEFAULT_THEME_NAME,
             "default",
@@ -5007,8 +5197,9 @@ mod tests {
         );
         // Single leaf: the focused last pane.
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         let _ = ChromeAction::CloseView;
         app
     }
@@ -5021,8 +5212,8 @@ mod tests {
         // #1783: never a silent no-op).
         let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5030,7 +5221,7 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = last_pane_test_app(CloseConfirmMode::Never);
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5039,10 +5230,11 @@ mod tests {
         let mut app = last_pane_test_app(CloseConfirmMode::Always);
         // First press arms the window gate and keeps running.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
-        assert!(app.runtime.has_pending_close_confirm());
-        assert!(app.runtime.pending_close_is_window());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
+        assert!(app.runtime.borrow().pending_close_is_window());
         let banner = app
             .runtime
+            .borrow()
             .close_confirm_banner_text()
             .expect("armed banner");
         assert!(banner.contains("Close window?"), "{banner}");
@@ -5050,7 +5242,7 @@ mod tests {
         assert!(banner.contains("Esc cancels"), "{banner}");
         // Repeat confirms the exit.
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5062,18 +5254,21 @@ mod tests {
         // the surviving workspace; only the last panel in the whole window
         // is the window-close gesture (issue #1783).
         let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.workspace_new().expect("second workspace opens");
-        assert_eq!(app.runtime.workspace_count(), 2);
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         // The fresh active workspace holds a single panel: the repro shape.
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         assert_eq!(app.effective_window_leaf_count(), 2);
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
         assert!(
-            !app.runtime.has_pending_close_confirm(),
+            !app.runtime.borrow().has_pending_close_confirm(),
             "no window arm may pend when panels survive elsewhere"
         );
         assert_eq!(
-            app.runtime.workspace_count(),
+            app.runtime.borrow().workspace_count(),
             1,
             "empty workspace is pruned"
         );
@@ -5082,14 +5277,14 @@ mod tests {
             1,
             "the surviving workspace owns the remaining panel"
         );
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         assert!(
-            app.runtime.focused_view().is_some(),
+            app.runtime.borrow().focused_view().is_some(),
             "focus follows the surviving workspace"
         );
         // The surviving workspace still holds its panel and remains usable.
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(app.runtime.focused_view().is_some());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(app.runtime.borrow().focused_view().is_some());
     }
 
     #[test]
@@ -5101,21 +5296,24 @@ mod tests {
         // dead tiled leaf retires and the pin takes focus plus primary
         // ownership; the stale session-less leaf must never survive.
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
 
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
+        assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -5128,27 +5326,33 @@ mod tests {
         // workspace exists (unlike a workspace-local float, which dies with
         // its pruned workspace).
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        app.runtime.workspace_new().expect("second workspace opens");
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert!(app.runtime.workspace_switch(0));
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
 
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
         assert_eq!(
-            app.runtime.workspace_count(),
+            app.runtime.borrow().workspace_count(),
             2,
             "a pin-owning base must not be pruned"
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -5158,49 +5362,56 @@ mod tests {
         use bitty_config::ChromeAction;
 
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("primary shell spawns");
-        let primary = app.runtime.primary_view().expect("primary owner");
-        assert!(app.runtime.has_pty());
+        let primary = app.runtime.borrow().primary_view().expect("primary owner");
+        assert!(app.runtime.borrow().has_pty());
 
         let pinned = ViewId::new(2);
-        assert!(app.runtime.set_focus(pinned));
+        assert!(app.runtime.borrow_mut().set_focus(pinned));
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
-        assert_eq!(app.runtime.focused_view(), Some(primary));
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(primary));
 
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
-        assert!(!app.runtime.has_pty(), "primary shell must be torn down");
-        assert!(!app.runtime.has_pty_reader());
-        assert!(!app.runtime.has_pty_writer());
+        assert!(
+            !app.runtime.borrow().has_pty(),
+            "primary shell must be torn down"
+        );
+        assert!(!app.runtime.borrow().has_pty_reader());
+        assert!(!app.runtime.borrow().has_pty_writer());
         assert_eq!(
-            app.runtime.primary_view(),
+            app.runtime.borrow().primary_view(),
             Some(pinned),
             "CTX-1337 (#2222): the surviving pin owns the empty base"
         );
-        assert_eq!(app.runtime.primary_spawn_recipe(), None);
+        assert_eq!(app.runtime.borrow().primary_spawn_recipe(), None);
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             Vec::new(),
             "the dead primary leaf retires instead of staying session-less"
         );
-        assert_eq!(app.runtime.pinned_views(), vec![pinned]);
-        assert_eq!(app.runtime.focused_view(), Some(pinned));
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert!(!app.runtime.workspace_is_occupied(0));
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(pinned));
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
+        assert!(!app.runtime.borrow().workspace_is_occupied(0));
         assert!(
-            !app.runtime.close_primary_session(),
+            !app.runtime.borrow_mut().close_primary_session(),
             "teardown is idempotent"
         );
 
-        app.runtime.workspace_new().expect("empty workspace opens");
-        let fresh = app.runtime.focused_view().expect("fresh focus");
-        assert!(!app.runtime.has_pane_session(&fresh));
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("empty workspace opens");
+        let fresh = app.runtime.borrow().focused_view().expect("fresh focus");
+        assert!(!app.runtime.borrow().has_pane_session(&fresh));
         assert!(
-            !app.runtime.has_pty(),
+            !app.runtime.borrow().has_pty(),
             "closed primary recipe must not replay"
         );
     }
@@ -5212,22 +5423,28 @@ mod tests {
         use bitty_config::ChromeAction;
 
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("first workspace primary shell spawns");
-        let first = app.runtime.focused_view().expect("primary leaf focus");
+        let first = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("primary leaf focus");
         let second = ViewId::new(2);
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(second, "/bin/sh", &[], 40, 12)
             .expect("first workspace second shell spawns");
         assert!(
-            app.runtime.set_focus(second),
+            app.runtime.borrow_mut().set_focus(second),
             "hidden sibling focus is valid"
         );
-        app.runtime.write_input(b"sleep 30\n");
+        app.runtime.borrow_mut().write_input(b"sleep 30\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.runtime.pane_foreground_job(&second).is_none() {
+        while app.runtime.borrow().pane_foreground_job(&second).is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "hidden sibling job never started"
@@ -5235,36 +5452,50 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        app.runtime.workspace_new().expect("second workspace opens");
-        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        let survivor = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("survivor leaf focus");
         assert!(
-            app.runtime.has_pane_session(&survivor),
+            app.runtime.borrow().has_pane_session(&survivor),
             "new workspace replays the primary shell recipe"
         );
-        assert!(app.runtime.workspace_switch(0));
-        assert!(app.runtime.set_focus(first));
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert!(app.runtime.borrow_mut().set_focus(first));
 
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "zoom installs one proxy leaf");
-        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(2));
-        assert_eq!(app.runtime.pane_view_ids(), vec![second, survivor]);
-        assert_eq!(app.runtime.primary_view(), Some(first));
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "zoom installs one proxy leaf"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            Some(2)
+        );
+        assert_eq!(app.runtime.borrow().pane_view_ids(), vec![second, survivor]);
+        assert_eq!(app.runtime.borrow().primary_view(), Some(first));
 
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(app.runtime.has_pane_session(&second));
-        assert!(app.runtime.has_pane_session(&survivor));
-        assert!(!app.runtime.has_pane_session(&first));
-        assert_eq!(app.runtime.primary_view(), Some(second));
-        assert_eq!(app.runtime.focused_view(), Some(second));
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(app.runtime.borrow().has_pane_session(&second));
+        assert!(app.runtime.borrow().has_pane_session(&survivor));
+        assert!(!app.runtime.borrow().has_pane_session(&first));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(second));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(second));
 
-        assert!(app.runtime.workspace_switch(1));
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert_eq!(app.runtime.focused_view(), Some(survivor));
+        assert!(app.runtime.borrow_mut().workspace_switch(1));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
     }
 
     #[test]
@@ -5275,12 +5506,17 @@ mod tests {
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
         app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("primary shell spawns");
-        let primary = app.runtime.primary_view().expect("primary owner exists");
-        app.runtime.write_input(b"sleep 30\n");
+        let primary = app
+            .runtime
+            .borrow()
+            .primary_view()
+            .expect("primary owner exists");
+        app.runtime.borrow_mut().write_input(b"sleep 30\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.runtime.primary_foreground_job().is_none() {
+        while app.runtime.borrow().primary_foreground_job().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "primary job never started"
@@ -5288,19 +5524,27 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        app.runtime.workspace_new().expect("second workspace opens");
-        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
-        assert!(app.runtime.workspace_switch(0));
-        assert_eq!(app.runtime.focused_view(), Some(primary));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        let survivor = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("survivor leaf focus");
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(primary));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
 
         // The first CloseView must inspect the doomed workspace's primary
         // shell, even though the focused leaf has no private pane session.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
-        assert!(app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.pending_close_view(), Some(primary));
+        assert!(app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().pending_close_view(), Some(primary));
         let summary = app
             .runtime
+            .borrow()
             .close_confirm_banner_text()
             .expect("busy primary must arm a visible confirmation");
         assert!(summary.contains("Running job:"), "{summary}");
@@ -5308,21 +5552,21 @@ mod tests {
 
         // Esc still cancels the pending focused target without pruning.
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert_eq!(app.runtime.primary_view(), Some(primary));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().primary_view(), Some(primary));
 
         // Re-arm the same target, then the repeated action confirms and
         // prunes the now-doomed workspace.
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
         app.apply_chrome_action(ChromeAction::CloseView);
 
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert_eq!(app.runtime.primary_view(), Some(survivor));
-        assert_eq!(app.runtime.focused_view(), Some(survivor));
-        assert!(app.runtime.has_pane_session(&survivor));
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
+        assert_eq!(app.runtime.borrow().primary_view(), Some(survivor));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
+        assert!(app.runtime.borrow().has_pane_session(&survivor));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5333,12 +5577,17 @@ mod tests {
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
         app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("first workspace primary shell spawns");
-        let first = app.runtime.focused_view().expect("primary leaf focus");
-        app.runtime.write_input(b"sleep 30\n");
+        let first = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("primary leaf focus");
+        app.runtime.borrow_mut().write_input(b"sleep 30\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.runtime.primary_foreground_job().is_none() {
+        while app.runtime.borrow().primary_foreground_job().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "primary job never started"
@@ -5346,19 +5595,37 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        app.runtime.workspace_new().expect("second workspace opens");
-        let survivor = app.runtime.focused_view().expect("survivor leaf focus");
-        assert!(app.runtime.workspace_switch(0));
-        assert!(app.runtime.set_focus(first));
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        let survivor = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("survivor leaf focus");
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert!(app.runtime.borrow_mut().set_focus(first));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "zoom installs one proxy leaf");
-        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "zoom installs one proxy leaf"
+        );
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            Some(1)
+        );
 
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.pending_close_view(), app.runtime.focused_view());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(
+            app.runtime.borrow().pending_close_view(),
+            app.runtime.borrow().focused_view()
+        );
         let summary = app
             .runtime
+            .borrow()
             .close_confirm_banner_text()
             .expect("busy primary backup must arm a visible confirmation");
         assert!(summary.contains("Running job:"), "{summary}");
@@ -5368,27 +5635,27 @@ mod tests {
             summary.chars().count() <= bitty_runtime::CLOSE_CONFIRM_BANNER_MAX_CHARS,
             "confirmation stays bounded: {summary}"
         );
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert_eq!(app.runtime.primary_view(), Some(first));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().primary_view(), Some(first));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
 
         // Cancellation leaves the proxy and the backup session alive.
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
-        assert_eq!(app.runtime.primary_view(), Some(first));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(first));
 
         // Re-arm the same target, then the repeated close confirms the prune.
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
 
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.workspace_count(), 1);
-        assert_ne!(app.runtime.primary_view(), Some(first));
-        assert!(app.runtime.has_pane_session(&survivor));
-        assert_eq!(app.runtime.primary_view(), Some(survivor));
-        assert_eq!(app.runtime.focused_view(), Some(survivor));
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
+        assert_ne!(app.runtime.borrow().primary_view(), Some(first));
+        assert!(app.runtime.borrow().has_pane_session(&survivor));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(survivor));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5398,15 +5665,18 @@ mod tests {
         // ghost workspace. Once the remaining real panel closes, the event
         // path must request window exit rather than require Mod+w first.
         let mut app = last_pane_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.workspace_new().expect("second workspace opens");
-        assert_eq!(app.runtime.workspace_count(), 2);
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
 
         let mods = alt_mods_event();
         assert!(!app.intercept_chrome_key(&mods));
         let first_q = WindowEventKind::KeyboardInput(test_char_key("q"));
         assert!(app.intercept_chrome_key(&first_q));
         assert!(!app.take_chrome_exit_request());
-        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
 
         let mut first_q_release = test_char_key("q");
         first_q_release.state = PressState::Released;
@@ -5416,7 +5686,7 @@ mod tests {
         let second_q = WindowEventKind::KeyboardInput(test_char_key("q"));
         assert!(app.intercept_chrome_key(&second_q));
         assert!(app.take_chrome_exit_request());
-        assert_eq!(app.runtime.workspace_count(), 1);
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
     }
 
     #[test]
@@ -5432,31 +5702,39 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
-        assert_eq!(app.runtime.leaf_count(), 2);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
 
         // Zoom pane 1: collapses to 1 leaf.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
 
         // Navigating with GotoSplit restores zoom immediately and moves focus.
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
-        assert_eq!(app.runtime.leaf_count(), 2, "must unzoom on navigation");
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().leaf_count(),
+            2,
+            "must unzoom on navigation"
+        );
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert_eq!(
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(2)),
             "focus must move right"
         );
 
         // Zoom pane 2, then FocusPrev: unzooms and focuses pane 1.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         app.apply_chrome_action(ChromeAction::FocusPrev);
-        assert_eq!(app.runtime.leaf_count(), 2, "must unzoom on focus_prev");
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            2,
+            "must unzoom on focus_prev"
+        );
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -5478,29 +5756,29 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(1)));
         // Zoom onto the non-owner pane v:2 and back: ownership is untouched.
         app.apply_chrome_action(ChromeAction::FocusId(2));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         assert_eq!(
-            app.runtime.primary_view(),
+            app.runtime.borrow().primary_view(),
             Some(ViewId::new(1)),
             "zoom on a non-owner must not re-home the primary"
         );
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
         assert_eq!(
-            app.runtime.primary_view(),
+            app.runtime.borrow().primary_view(),
             Some(ViewId::new(1)),
             "zoom round trip must preserve the primary owner"
         );
         // An explicit close of the owner is the one path that re-homes it.
         app.apply_chrome_action(ChromeAction::FocusId(1));
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(2)));
     }
 
     #[test]
@@ -5523,9 +5801,13 @@ mod tests {
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "zoom collapses to one leaf");
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "zoom collapses to one leaf"
+        );
         // Out-of-band mutation while zoomed: a three-leaf tree installed by
         // a path that did not go through the zoom-aware action helpers.
         let newer = LayoutNode::split(
@@ -5534,10 +5816,10 @@ mod tests {
             two_pane_layout(),
             LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
         );
-        app.runtime.set_layout(newer);
+        app.runtime.borrow_mut().set_layout(newer);
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             3,
             "a stale zoom backup must not clobber the newer layout"
         );
@@ -5549,20 +5831,23 @@ mod tests {
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let rt = Runtime::with_defaults().expect("must build");
-        let mut app = TerminalApp::with_theme(
+        let app = TerminalApp::with_theme(
             rt,
             bitty_config::theme::DEFAULT_THEME_NAME,
             "default",
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
-        app.runtime.workspace_new().expect("second workspace");
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace");
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         // Back to workspace 1 and lay the split tree into it again (the new
         // workspace switch stashed the fresh leaf, so re-install the split).
-        assert!(app.runtime.workspace_switch(0));
-        app.runtime.set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app
     }
 
@@ -5573,37 +5858,49 @@ mod tests {
         // B never sees A's backup.
         use bitty_config::ChromeAction;
         let mut app = workspace_zoom_test_app();
-        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "A zoom collapses to one leaf");
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "A zoom collapses to one leaf"
+        );
 
         // Switch to B: the live layout is B's own (single leaf), and the
         // zoom state must not leak into it. Disengaging in B is a clean
         // no-op (B holds no zoom), never a comparison against A's backup.
-        assert!(app.runtime.workspace_switch(1));
+        assert!(app.runtime.borrow_mut().workspace_switch(1));
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "B keeps its own single-leaf layout"
         );
-        assert!(!app.chrome.zoom.restore_for_mutation(&mut app.runtime));
+        assert!(
+            !app.chrome
+                .zoom
+                .restore_for_mutation(&mut app.runtime.borrow_mut())
+        );
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "restore in B must not touch B's layout"
         );
 
         // Back to A: the zoom is still engaged there and disengaging
         // restores A's exact tree.
-        assert!(app.runtime.workspace_switch(0));
-        assert_eq!(app.runtime.leaf_count(), 1, "A is still zoomed");
-        assert!(app.chrome.zoom.restore_for_mutation(&mut app.runtime));
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "A is still zoomed");
+        assert!(
+            app.chrome
+                .zoom
+                .restore_for_mutation(&mut app.runtime.borrow_mut())
+        );
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             2,
             "disengaging in A restores A's exact two-leaf tree"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -5612,17 +5909,21 @@ mod tests {
         // another path may still restore the useful real tree later.
         use bitty_config::ChromeAction;
         let mut app = workspace_zoom_test_app();
-        let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
+        let seq = app
+            .runtime
+            .borrow()
+            .workspace_seq_at(0)
+            .expect("workspace sequence");
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(
             app.chrome.zoom.backup_leaf_ids_for_seq(seq),
             Some(vec![ViewId::new(1), ViewId::new(2)])
         );
-        assert!(app.runtime.workspace_switch(1));
+        assert!(app.runtime.borrow_mut().workspace_switch(1));
 
         // Replace A's proxy with a different shape while A is inactive.
         assert!(
-            app.runtime.set_stashed_layout_for_seq(
+            app.runtime.borrow_mut().set_stashed_layout_for_seq(
                 seq,
                 LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
             )
@@ -5630,7 +5931,7 @@ mod tests {
         assert!(
             !app.chrome
                 .zoom
-                .restore_for_view_mutation(&mut app.runtime, ViewId::new(1))
+                .restore_for_view_mutation(&mut app.runtime.borrow_mut(), ViewId::new(1))
         );
         assert_eq!(
             app.chrome.zoom.backup_leaf_ids_for_seq(seq),
@@ -5648,20 +5949,32 @@ mod tests {
         // Zoom A onto v:2 (one-leaf proxy on v:2).
         app.apply_chrome_action(ChromeAction::FocusId(2));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
         // Switch to B and toggle: B engages its own zoom (single leaf is
         // idempotently zoomed), and A's entry is untouched.
-        assert!(app.runtime.workspace_switch(1));
+        assert!(app.runtime.borrow_mut().workspace_switch(1));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "B toggles its own zoom");
-        app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "B disengages its own zoom");
-        // Back in A the zoom is still live and restores the real tree.
-        assert!(app.runtime.workspace_switch(0));
-        assert_eq!(app.runtime.leaf_count(), 1, "A is still zoomed");
-        assert!(app.chrome.zoom.restore_for_mutation(&mut app.runtime));
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
+            1,
+            "B toggles its own zoom"
+        );
+        app.apply_chrome_action(ChromeAction::ToggleZoom);
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "B disengages its own zoom"
+        );
+        // Back in A the zoom is still live and restores the real tree.
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "A is still zoomed");
+        assert!(
+            app.chrome
+                .zoom
+                .restore_for_mutation(&mut app.runtime.borrow_mut())
+        );
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
             2,
             "A's backup must survive B's toggles"
         );
@@ -5696,10 +6009,10 @@ mod tests {
         // single-gesture close (zero change for existing users).
         use bitty_config::ChromeAction;
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5708,23 +6021,34 @@ mod tests {
         // leaves the layout untouched; repeating the chord confirms.
         use bitty_config::ChromeAction;
         let mut app = close_confirm_test_app(CloseConfirmMode::Always);
-        app.runtime.set_layout(two_pane_layout());
-        app.runtime.set_focus(ViewId::new(2));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_focus(ViewId::new(2));
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.leaf_count(), 2, "pending must not close");
-        assert_eq!(app.runtime.pending_close_view(), Some(ViewId::new(2)));
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            2,
+            "pending must not close"
+        );
+        assert_eq!(
+            app.runtime.borrow().pending_close_view(),
+            Some(ViewId::new(2))
+        );
         assert!(app.modal_capture_active());
-        assert!(app.runtime.close_confirm_banner_text().is_some());
+        assert!(app.runtime.borrow().close_confirm_banner_text().is_some());
         // Esc cancels through the emergency dispatch (never reaches the PTY).
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.leaf_count(), 2, "cancel keeps the pane");
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            2,
+            "cancel keeps the pane"
+        );
         // Re-arm, then repeat confirms the close.
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5736,17 +6060,18 @@ mod tests {
         use bitty_config::ChromeAction;
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         let view = ViewId::new(2);
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, "/bin/sh", &[], 40, 12)
             .expect("pane shell must spawn headless");
-        app.runtime.set_focus(view);
-        app.runtime.write_input(b"sleep 30\n");
+        app.runtime.borrow_mut().set_focus(view);
+        app.runtime.borrow_mut().write_input(b"sleep 30\n");
         // Poll until the foreground job is visible (bounded).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if app.runtime.pane_foreground_job(&view).is_some() {
+            if app.runtime.borrow().pane_foreground_job(&view).is_some() {
                 break;
             }
             assert!(std::time::Instant::now() < deadline, "job never started");
@@ -5754,11 +6079,16 @@ mod tests {
         }
         // First close arms; the job and its session stay alive.
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.leaf_count(), 2, "busy pane must not close yet");
-        assert!(app.runtime.has_pane_session(&view));
+        assert!(app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            2,
+            "busy pane must not close yet"
+        );
+        assert!(app.runtime.borrow().has_pane_session(&view));
         let banner = app
             .runtime
+            .borrow()
             .close_confirm_banner_text()
             .expect("busy arm must be visible");
         assert!(
@@ -5768,9 +6098,9 @@ mod tests {
         assert!(banner.contains("Esc cancels"), "names cancel: {banner}");
         // Repeat confirms: pane closes and its shell is torn down.
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(!app.runtime.has_pane_session(&view));
-        assert!(!app.runtime.has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pane_session(&view));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
     }
 
     #[test]
@@ -5779,16 +6109,16 @@ mod tests {
         // fresh pane immediately, matching the ctl path and kitty/ghostty.
         use bitty_config::{ChromeAction, SplitDir};
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(1)),
             "seed focus on v:1"
         );
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
-        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(3)),
             "new_split must focus the fresh pane v:3"
         );
@@ -5808,22 +6138,31 @@ mod tests {
             ChromeAction::NewPanel,
         ] {
             let mut app = workspace_test_app_with_spec(platform_spawn_spec());
-            let before = app.runtime.focused_view().expect("seed focus");
+            let before = app.runtime.borrow().focused_view().expect("seed focus");
             app.apply_chrome_action(action.clone());
-            let fresh = app.runtime.focused_view().expect("fresh pane focused");
+            let fresh = app
+                .runtime
+                .borrow()
+                .focused_view()
+                .expect("fresh pane focused");
             assert_ne!(fresh, before, "{action:?} must focus the fresh pane");
             let frame = app
                 .runtime
+                .borrow()
                 .present_frames()
                 .into_iter()
                 .find(|frame| frame.view == fresh)
                 .expect("fresh pane has a present frame");
             assert_eq!(
-                app.runtime.pane_pty_size(&fresh),
+                app.runtime.borrow().pane_pty_size(&fresh),
                 Some((frame.cols, frame.rows)),
                 "{action:?}: the fresh shell must start at the decorated content frame"
             );
-            let snap = app.runtime.pane_snapshot(&fresh).expect("fresh grid");
+            let snap = app
+                .runtime
+                .borrow()
+                .pane_snapshot(&fresh)
+                .expect("fresh grid");
             assert_eq!(
                 (snap.width, snap.height),
                 (usize::from(frame.cols), usize::from(frame.rows)),
@@ -5831,13 +6170,17 @@ mod tests {
             );
             // The first present's geometry sync must be a no-op: a post-spawn
             // resize is the SIGWINCH that disturbs the first prompt row.
-            let _ = app.runtime.tick();
+            let _ = app.runtime.borrow_mut().tick();
             assert_eq!(
-                app.runtime.pane_pty_size(&fresh),
+                app.runtime.borrow().pane_pty_size(&fresh),
                 Some((frame.cols, frame.rows)),
                 "{action:?}: the first present must not resize the fresh shell"
             );
-            let snap = app.runtime.pane_snapshot(&fresh).expect("fresh grid");
+            let snap = app
+                .runtime
+                .borrow()
+                .pane_snapshot(&fresh)
+                .expect("fresh grid");
             assert_eq!(
                 (snap.width, snap.height),
                 (usize::from(frame.cols), usize::from(frame.rows)),
@@ -5853,15 +6196,19 @@ mod tests {
         // (Horizontal), the new panel goes second (right), focus follows it.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        let focused_before = app.runtime.focused_view().expect("seed focus");
+        let focused_before = app.runtime.borrow().focused_view().expect("seed focus");
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 2);
-        let focused_after = app.runtime.focused_view().expect("focus follows");
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        let focused_after = app.runtime.borrow().focused_view().expect("focus follows");
         assert_ne!(
             focused_before, focused_after,
             "focus must move to the fresh pane"
         );
-        match app.runtime.layout() {
+        // CTX-1929: `layout` hands back a reference into the runtime, so the
+        // guard binding outlives the match reads.
+        let rt = app.runtime.borrow();
+        let scrutinee = rt.layout();
+        match scrutinee {
             LayoutNode::Split {
                 axis,
                 first,
@@ -5889,16 +6236,21 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 24, 80));
-        let focused_before = app.runtime.focused_view().expect("seed focus");
+        let focused_before = app.runtime.borrow().focused_view().expect("seed focus");
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 2);
-        let focused_after = app.runtime.focused_view().expect("focus follows");
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        let focused_after = app.runtime.borrow().focused_view().expect("focus follows");
         assert_ne!(
             focused_before, focused_after,
             "focus must move to the fresh pane"
         );
-        match app.runtime.layout() {
+        // CTX-1929: `layout` hands back a reference into the runtime, so the
+        // guard binding outlives the match reads.
+        let rt = app.runtime.borrow();
+        let scrutinee = rt.layout();
+        match scrutinee {
             LayoutNode::Split {
                 axis,
                 first,
@@ -5924,23 +6276,25 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
         // Issue #2571: Spiral is the fresh-app default, no opt-in needed.
         assert_eq!(
-            app.runtime.panel_layout_mode(),
+            app.runtime.borrow().panel_layout_mode(),
             PanelLayoutMode::Spiral,
             "a fresh app defaults to Spiral"
         );
 
-        let v1 = app.runtime.focused_view().expect("seed focus");
+        let v1 = app.runtime.borrow().focused_view().expect("seed focus");
 
         // Split 1 (1 -> 2): phase 0, Right (place_new_first = false).
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 2);
-        let v2 = app.runtime.focused_view().expect("v2 focus");
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        let v2 = app.runtime.borrow().focused_view().expect("v2 focus");
         assert_ne!(v1, v2);
         assert_eq!(
             app.runtime
+                .borrow()
                 .panel_split_plan()
                 .map(|plan| plan.place_new_first),
             Some(false),
@@ -5949,11 +6303,12 @@ mod tests {
 
         // Split 2 (2 -> 3): phase 1, Bottom (place_new_first = false).
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 3);
-        let v3 = app.runtime.focused_view().expect("v3 focus");
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
+        let v3 = app.runtime.borrow().focused_view().expect("v3 focus");
         assert_ne!(v2, v3);
         assert_eq!(
             app.runtime
+                .borrow()
                 .panel_split_plan()
                 .map(|plan| plan.place_new_first),
             Some(true),
@@ -5962,11 +6317,12 @@ mod tests {
 
         // Split 3 (3 -> 4): phase 2, Left (place_new_first = true).
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 4);
-        let v4 = app.runtime.focused_view().expect("v4 focus");
+        assert_eq!(app.runtime.borrow().leaf_count(), 4);
+        let v4 = app.runtime.borrow().focused_view().expect("v4 focus");
         assert_ne!(v3, v4);
         assert_eq!(
             app.runtime
+                .borrow()
                 .panel_split_plan()
                 .map(|plan| plan.place_new_first),
             Some(true),
@@ -5975,13 +6331,13 @@ mod tests {
 
         // Split 4 (4 -> 5): phase 3, Top (place_new_first = true).
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 5);
-        let v5 = app.runtime.focused_view().expect("v5 focus");
+        assert_eq!(app.runtime.borrow().leaf_count(), 5);
+        let v5 = app.runtime.borrow().focused_view().expect("v5 focus");
         assert_ne!(v4, v5);
 
         // Next split wraps back to phase 0 (Right).
         assert!(
-            !app.runtime.panel_split_place_new_first(),
+            !app.runtime.borrow().panel_split_place_new_first(),
             "5 -> 6 wraps back to phase 0 (place_new_first = false)"
         );
     }
@@ -5995,6 +6351,7 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
         let expected = [
             SplitAxis::Horizontal,
@@ -6005,6 +6362,7 @@ mod tests {
         for (index, axis) in expected.into_iter().enumerate() {
             let plan = app
                 .runtime
+                .borrow()
                 .panel_split_plan()
                 .expect("the spiral target must stay feasible");
             assert_eq!(
@@ -6027,11 +6385,13 @@ mod tests {
         // 40x6: a horizontal 20+20 split fits, a vertical split cannot fit
         // two 4-row panes.
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 40, 6));
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
         let plan = app
             .runtime
+            .borrow()
             .panel_split_plan()
             .expect("the perpendicular axis must stay available");
         assert_eq!(
@@ -6045,7 +6405,7 @@ mod tests {
         );
         assert_eq!(plan.spiral_phase, Some(1), "the chain keeps its phase");
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 3);
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
     }
 
     /// A tall container starts from the vertical base axis: Down, Right, Up,
@@ -6056,6 +6416,7 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 40, 80));
         let expected = [
             (SplitAxis::Vertical, false),
@@ -6066,6 +6427,7 @@ mod tests {
         for (index, (axis, place_first)) in expected.into_iter().enumerate() {
             let plan = app
                 .runtime
+                .borrow()
                 .panel_split_plan()
                 .expect("the tall spiral target must stay feasible");
             assert_eq!(
@@ -6148,10 +6510,11 @@ mod tests {
         // focus following the restored leaf.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        let focused = app.runtime.focused_view().expect("seed focus");
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        let focused = app.runtime.borrow().focused_view().expect("seed focus");
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(focused)
                 .expect("focused leaf")
@@ -6160,31 +6523,39 @@ mod tests {
         );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
         assert_eq!(
-            app.runtime.floated_views(),
+            app.runtime.borrow().floated_views(),
             vec![focused],
             "first toggle detaches"
         );
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "the vacated slot collapses to the survivor"
         );
-        let survivor = app.runtime.focused_view().expect("re-homed focus");
+        let survivor = app.runtime.borrow().focused_view().expect("re-homed focus");
         assert_ne!(survivor, focused);
         assert!(
-            app.runtime.set_focus(focused),
+            app.runtime.borrow_mut().set_focus(focused),
             "the detached float stays focusable"
         );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert!(!app.runtime.floated_occupied(), "second toggle restores");
-        assert_eq!(app.runtime.leaf_count(), 2, "a fresh split returns");
+        assert!(
+            !app.runtime.borrow().floated_occupied(),
+            "second toggle restores"
+        );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().leaf_count(),
+            2,
+            "a fresh split returns"
+        );
+        assert_eq!(
+            app.runtime.borrow().focused_view(),
             Some(focused),
             "restore focuses the re-inserted leaf"
         );
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(focused)
                 .expect("focused leaf")
@@ -6204,15 +6575,15 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        app.runtime.set_layout(two_pane_layout());
-        let focused = app.runtime.focused_view().expect("seed focus");
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        let focused = app.runtime.borrow().focused_view().expect("seed focus");
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert_eq!(app.runtime.floated_views(), vec![focused]);
+        assert_eq!(app.runtime.borrow().floated_views(), vec![focused]);
         assert!(
-            app.runtime.set_focus(focused),
+            app.runtime.borrow_mut().set_focus(focused),
             "the detached panel is a focus target"
         );
 
@@ -6222,21 +6593,21 @@ mod tests {
             "the move gesture is chrome-owned while a float is focused"
         );
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "the shifted symbol must never reach the shell"
         );
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             1,
             "the gesture switches to the target workspace"
         );
         assert_eq!(
-            app.runtime.floated_views(),
+            app.runtime.borrow().floated_views(),
             vec![focused],
             "the panel moved into the target workspace"
         );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(focused),
             "focus follows the panel"
         );
@@ -6249,18 +6620,21 @@ mod tests {
         // panel behind. CloseView must discard it instead.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        let focused = app.runtime.focused_view().expect("seed focus");
-        app.runtime.float_detach(focused).expect("detach");
-        assert!(app.runtime.floated_views().contains(&focused));
-        assert!(app.runtime.set_focus(focused));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        let focused = app.runtime.borrow().focused_view().expect("seed focus");
+        app.runtime
+            .borrow_mut()
+            .float_detach(focused)
+            .expect("detach");
+        assert!(app.runtime.borrow().floated_views().contains(&focused));
+        assert!(app.runtime.borrow_mut().set_focus(focused));
         app.apply_chrome_action(ChromeAction::CloseView);
         assert!(
-            !app.runtime.floated_views().contains(&focused),
+            !app.runtime.borrow().floated_views().contains(&focused),
             "dead float must disappear, never linger empty"
         );
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert_ne!(app.runtime.focused_view(), Some(focused));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert_ne!(app.runtime.borrow().focused_view(), Some(focused));
     }
 
     #[test]
@@ -6274,51 +6648,57 @@ mod tests {
         use bitty_config::ChromeAction;
         for mode in [PresentationMode::Fullscreen, PresentationMode::Scratchpad] {
             let mut app = workspace_test_app();
-            app.runtime.set_layout(two_pane_layout());
-            let focused = app.runtime.focused_view().expect("seed focus");
-            let mut seeded = app.runtime.layout().clone();
+            app.runtime.borrow_mut().set_layout(two_pane_layout());
+            let focused = app.runtime.borrow().focused_view().expect("seed focus");
+            let mut seeded = app.runtime.borrow().layout().clone();
             let leaf = seeded.find_leaf_mut(focused).expect("focused leaf");
             assert!(PresentationMode::request_transition(leaf, mode));
-            app.runtime.set_layout(seeded);
+            app.runtime.borrow_mut().set_layout(seeded);
             app.apply_chrome_action(ChromeAction::ToggleZoom);
-            assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
-            let before = format!("{:?}", app.runtime.layout());
+            assert!(
+                app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+                "zoom engaged"
+            );
+            let before = format!("{:?}", app.runtime.borrow().layout());
             app.apply_chrome_action(ChromeAction::ToggleFloating);
             assert_eq!(
-                format!("{:?}", app.runtime.layout()),
+                format!("{:?}", app.runtime.borrow().layout()),
                 before,
                 "rejected toggle on zoomed {mode} must not touch the layout"
             );
             assert!(
-                app.chrome.zoom.is_zoomed(&app.runtime),
+                app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
                 "rejected toggle on zoomed {mode} must keep the zoom backup"
             );
             assert_eq!(
-                app.runtime.focused_view(),
+                app.runtime.borrow().focused_view(),
                 Some(focused),
                 "rejected toggle keeps focus"
             );
             assert!(
-                !app.runtime.floated_occupied(),
+                !app.runtime.borrow().floated_occupied(),
                 "rejected toggle detaches nothing"
             );
         }
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        let focused = app.runtime.focused_view().expect("seed focus");
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        let focused = app.runtime.borrow().focused_view().expect("seed focus");
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "valid toggle consumes the zoom restore"
         );
         assert_eq!(
-            app.runtime.floated_views(),
+            app.runtime.borrow().floated_views(),
             vec![focused],
             "toggle detaches on the real tree"
         );
-        assert_eq!(app.runtime.leaf_count(), 1, "the slot collapses");
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "the slot collapses");
     }
 
     #[test]
@@ -6385,18 +6765,26 @@ mod tests {
         // still floating panel to the active workspace as a normal float.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 80, 24));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
 
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
 
-        app.runtime.workspace_new().expect("second workspace opens");
+        app.runtime
+            .borrow_mut()
+            .workspace_new()
+            .expect("second workspace opens");
         let hits: Vec<_> = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .filter(|frame| frame.view == ViewId::new(1))
@@ -6406,11 +6794,12 @@ mod tests {
 
         // Focus the sticky float (valid outside the live layout) and toggle
         // again: it unpins back into the active workspace as a float.
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert!(!app.runtime.pinned_occupied());
+        assert!(!app.runtime.borrow().pinned_occupied());
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(ViewId::new(1))
                 .expect("leaf back in the live tree")
@@ -6420,17 +6809,19 @@ mod tests {
         );
 
         // Normal float behavior resumes: it stays in its workspace.
-        app.runtime.workspace_prev();
+        app.runtime.borrow_mut().workspace_prev();
         assert!(
             app.runtime
+                .borrow()
                 .present_frames()
                 .iter()
                 .all(|frame| frame.view != ViewId::new(1)),
             "unpinned float stays in its workspace"
         );
-        app.runtime.workspace_next();
+        app.runtime.borrow_mut().workspace_next();
         assert!(
             app.runtime
+                .borrow()
                 .present_frames()
                 .iter()
                 .any(|frame| frame.view == ViewId::new(1)),
@@ -6447,29 +6838,30 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
-        let before = format!("{:?}", app.runtime.layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert!(app.runtime.pinned_views().is_empty());
-        assert_eq!(format!("{:?}", app.runtime.layout()), before);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(app.runtime.borrow().pinned_views().is_empty());
+        assert_eq!(format!("{:?}", app.runtime.borrow().layout()), before);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
 
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
-        let mut seeded = app.runtime.layout().clone();
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+        let mut seeded = app.runtime.borrow().layout().clone();
         let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
         assert!(PresentationMode::request_transition(
             leaf,
             PresentationMode::Fullscreen
         ));
-        app.runtime.set_layout(seeded);
-        let before = format!("{:?}", app.runtime.layout());
+        app.runtime.borrow_mut().set_layout(seeded);
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert!(app.runtime.pinned_views().is_empty());
-        assert_eq!(format!("{:?}", app.runtime.layout()), before);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(app.runtime.borrow().pinned_views().is_empty());
+        assert_eq!(format!("{:?}", app.runtime.borrow().layout()), before);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -6480,36 +6872,40 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
-        let before = format!("{:?}", app.runtime.layout());
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(ChromeAction::TogglePinned);
         assert!(
-            app.runtime.pinned_views().is_empty(),
+            app.runtime.borrow().pinned_views().is_empty(),
             "refused pin parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime),
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
         assert_eq!(
-            format!("{:?}", app.runtime.layout()),
+            format!("{:?}", app.runtime.borrow().layout()),
             before,
             "refusal keeps the layout byte-identical"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -6521,36 +6917,40 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
-        let before = format!("{:?}", app.runtime.layout());
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(ChromeAction::ToggleFloating);
         assert!(
-            app.runtime.floated_views().is_empty(),
+            app.runtime.borrow().floated_views().is_empty(),
             "refused detach parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime),
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
         assert_eq!(
-            format!("{:?}", app.runtime.layout()),
+            format!("{:?}", app.runtime.borrow().layout()),
             before,
             "refusal keeps the layout byte-identical"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -6560,22 +6960,28 @@ mod tests {
         // zoom backup is consumed.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backed-up tree holds both leaves"
         );
         app.apply_chrome_action(ChromeAction::TogglePinned);
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "valid pin consumes the zoom restore"
         );
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
     }
 
     #[test]
@@ -6588,8 +6994,8 @@ mod tests {
         // back to the tiling. No toggle is a window close.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         let toggle =
             ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into());
         assert!(
@@ -6597,40 +7003,46 @@ mod tests {
             "hide is not a close"
         );
         assert!(
-            app.runtime.scratchpad_occupied(),
+            app.runtime.borrow().scratchpad_occupied(),
             "first toggle parks the focused leaf"
         );
         assert!(
             app.runtime
+                .borrow()
                 .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD),
             "the parked leaf shows as a float overlay"
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
         assert!(!app.apply_chrome_action(toggle), "show/hide is not a close");
         assert!(
-            app.runtime.scratchpad_occupied(),
+            app.runtime.borrow().scratchpad_occupied(),
             "the hidden slot keeps its panel"
         );
         assert!(
             !app.runtime
+                .borrow()
                 .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
         );
 
         // `scratchpad_to_tiled` is the explicit restore verb.
         assert!(!app.apply_chrome_action(ChromeAction::ScratchpadToTiled(None)));
-        assert!(!app.runtime.scratchpad_occupied());
+        assert!(!app.runtime.borrow().scratchpad_occupied());
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)],
             "restore keeps anchor order"
         );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(1)),
             "restore focuses the returned leaf"
         );
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(ViewId::new(1))
                 .expect("restored leaf")
@@ -6651,53 +7063,60 @@ mod tests {
             || ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into());
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
-        let before = format!("{:?}", app.runtime.layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(toggle());
-        assert!(!app.runtime.scratchpad_occupied(), "refusal parks nothing");
-        assert_eq!(format!("{:?}", app.runtime.layout()), before);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(
+            !app.runtime.borrow().scratchpad_occupied(),
+            "refusal parks nothing"
+        );
+        assert_eq!(format!("{:?}", app.runtime.borrow().layout()), before);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
 
         for mode in [PresentationMode::Floating, PresentationMode::Scratchpad] {
             let mut app = workspace_test_app();
-            app.runtime.set_layout(two_pane_layout());
-            assert!(app.runtime.set_focus(ViewId::new(1)));
-            let mut seeded = app.runtime.layout().clone();
+            app.runtime.borrow_mut().set_layout(two_pane_layout());
+            assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+            let mut seeded = app.runtime.borrow().layout().clone();
             let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
             assert!(PresentationMode::request_transition(leaf, mode));
-            app.runtime.set_layout(seeded);
+            app.runtime.borrow_mut().set_layout(seeded);
             app.apply_chrome_action(toggle());
             assert!(
-                app.runtime.scratchpad_occupied(),
+                app.runtime.borrow().scratchpad_occupied(),
                 "{mode} leaf parks into the slot"
             );
-            assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+            assert_eq!(
+                app.runtime.borrow().layout().leaf_ids(),
+                vec![ViewId::new(2)]
+            );
         }
 
         // Fullscreen has its own verb and is refused fail-closed.
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
-        let mut seeded = app.runtime.layout().clone();
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+        let mut seeded = app.runtime.borrow().layout().clone();
         let leaf = seeded.find_leaf_mut(ViewId::new(1)).expect("focused leaf");
         assert!(PresentationMode::request_transition(
             leaf,
             PresentationMode::Fullscreen
         ));
-        app.runtime.set_layout(seeded);
-        let before = format!("{:?}", app.runtime.layout());
+        app.runtime.borrow_mut().set_layout(seeded);
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(toggle());
         assert!(
-            !app.runtime.scratchpad_occupied(),
+            !app.runtime.borrow().scratchpad_occupied(),
             "refusal on fullscreen parks nothing"
         );
         assert_eq!(
-            format!("{:?}", app.runtime.layout()),
+            format!("{:?}", app.runtime.borrow().layout()),
             before,
             "refusal on fullscreen keeps the layout byte-identical"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -6709,38 +7128,42 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
-        let before = format!("{:?}", app.runtime.layout());
+        let before = format!("{:?}", app.runtime.borrow().layout());
         app.apply_chrome_action(ChromeAction::InvokeCommand(
             bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
-            !app.runtime.scratchpad_occupied(),
+            !app.runtime.borrow().scratchpad_occupied(),
             "refused hide parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime),
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
         assert_eq!(
-            format!("{:?}", app.runtime.layout()),
+            format!("{:?}", app.runtime.borrow().layout()),
             before,
             "refusal keeps the layout byte-identical"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     /// Runtime config with one plugin-backed scratchpad slot (`logs`).
@@ -6793,7 +7216,10 @@ mod tests {
             .expect("an accepted launch arms the adoption latch");
         assert_eq!(armed.slot, "logs");
         assert_eq!(armed.command, "bitty-featured.devtools:plugins");
-        assert!(app.runtime.scratchpad_names().is_empty(), "no slot yet");
+        assert!(
+            app.runtime.borrow().scratchpad_names().is_empty(),
+            "no slot yet"
+        );
 
         // No plugin runtime is alive, so the dispatch is refused. Adoption
         // must not survive it: nothing will ever fill this slot.
@@ -6803,7 +7229,7 @@ mod tests {
             app.pending_plugin_scratchpad.is_none(),
             "a refused launch must not adopt the next unrelated plugin panel"
         );
-        assert!(app.runtime.scratchpad_names().is_empty());
+        assert!(app.runtime.borrow().scratchpad_names().is_empty());
     }
 
     #[test]
@@ -6813,12 +7239,15 @@ mod tests {
         // zoom backup is consumed.
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
+        assert!(
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            "zoom engaged"
+        );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backed-up tree holds both leaves"
         );
@@ -6826,11 +7255,14 @@ mod tests {
             bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "valid hide consumes the zoom restore"
         );
-        assert!(app.runtime.scratchpad_occupied());
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert!(app.runtime.borrow().scratchpad_occupied());
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
     }
 
     #[test]
@@ -6845,14 +7277,15 @@ mod tests {
         let mut app = workspace_test_app();
         let small = ViewId::new(100);
         let largest = ViewId::new(101);
-        let seed = app.runtime.focused_view().expect("seed focus");
+        let seed = app.runtime.borrow().focused_view().expect("seed focus");
         let probe = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(seed)
             .cloned()
             .expect("seed leaf");
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.25,
             LayoutNode::leaf(View::new(
@@ -6866,16 +7299,21 @@ mod tests {
                 usize::from(probe.rows()),
             )),
         ));
-        assert!(app.runtime.set_focus(small));
+        assert!(app.runtime.borrow_mut().set_focus(small));
         app.runtime
+            .borrow_mut()
             .set_panel_layout_mode(PanelLayoutMode::BisectLargest);
-        assert_eq!(app.runtime.panel_bisect_target(), Some(largest));
+        assert_eq!(app.runtime.borrow().panel_bisect_target(), Some(largest));
         app.apply_chrome_action(ChromeAction::NewPanel);
-        assert_eq!(app.runtime.leaf_count(), 3);
-        let fresh = app.runtime.focused_view().expect("focus follows fresh");
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
+        let fresh = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("focus follows fresh");
         assert_ne!(fresh, small, "fresh pane takes focus");
         assert_ne!(fresh, largest, "fresh pane is new");
-        let allocs = app.runtime.layout_allocations();
+        let allocs = app.runtime.borrow().layout_allocations();
         let rect_of = |id: ViewId| {
             allocs
                 .iter()
@@ -6906,14 +7344,15 @@ mod tests {
         let mut app = workspace_test_app();
         let small = ViewId::new(100);
         let largest = ViewId::new(101);
-        let seed = app.runtime.focused_view().expect("seed focus");
+        let seed = app.runtime.borrow().focused_view().expect("seed focus");
         let probe = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(seed)
             .cloned()
             .expect("seed leaf");
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.25,
             LayoutNode::leaf(View::new(
@@ -6927,15 +7366,20 @@ mod tests {
                 usize::from(probe.rows()),
             )),
         ));
-        assert!(app.runtime.set_focus(small));
+        assert!(app.runtime.borrow_mut().set_focus(small));
         app.runtime
+            .borrow_mut()
             .set_panel_layout_mode(PanelLayoutMode::BisectLargest);
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
-        assert_eq!(app.runtime.leaf_count(), 3);
-        let fresh = app.runtime.focused_view().expect("focus follows fresh");
+        assert_eq!(app.runtime.borrow().leaf_count(), 3);
+        let fresh = app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("focus follows fresh");
         assert_ne!(fresh, small, "fresh pane takes focus");
         assert_ne!(fresh, largest, "fresh pane is new");
-        let allocs = app.runtime.layout_allocations();
+        let allocs = app.runtime.borrow().layout_allocations();
         let rect_of = |id: ViewId| {
             allocs
                 .iter()
@@ -6957,11 +7401,16 @@ mod tests {
     fn chrome_new_panel_eight_times_stays_balanced_and_closes_in_tree_order() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_panel_layout_mode(PanelLayoutMode::Balanced);
+        app.runtime
+            .borrow_mut()
+            .set_panel_layout_mode(PanelLayoutMode::Balanced);
         for _ in 0..8 {
             app.apply_chrome_action(ChromeAction::NewPanel);
-            let allocs = app.runtime.layout_allocations();
-            assert_eq!(app.runtime.layout().validate_structure(), Ok(allocs.len()));
+            let allocs = app.runtime.borrow().layout_allocations();
+            assert_eq!(
+                app.runtime.borrow().layout().validate_structure(),
+                Ok(allocs.len())
+            );
             for (id, rect) in &allocs {
                 assert!(
                     rect.width >= bitty_runtime::MIN_PANE_COLS
@@ -6970,8 +7419,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(app.runtime.leaf_count(), 9);
-        let allocs = app.runtime.layout_allocations();
+        assert_eq!(app.runtime.borrow().leaf_count(), 9);
+        let allocs = app.runtime.borrow().layout_allocations();
         let area = |rect: &bitty_runtime::UiRect| u32::from(rect.width) * u32::from(rect.height);
         let smallest = allocs.iter().map(|(_, r)| area(r)).min().expect("panes");
         let largest = allocs.iter().map(|(_, r)| area(r)).max().expect("panes");
@@ -6982,18 +7431,24 @@ mod tests {
 
         // Close every pane but one: focus follows the pane that expands into
         // the vacated slot, and the tree stays a valid binary tree.
-        while app.runtime.leaf_count() > 1 {
-            let closed = app.runtime.focused_view().expect("focus");
+        // CTX-1929: a `while` scrutinee would hold the borrow guard across
+        // the body's close dispatch, so the count is re-read per iteration
+        // through a fresh statement instead.
+        loop {
+            if app.runtime.borrow().leaf_count() <= 1 {
+                break;
+            }
+            let closed = app.runtime.borrow().focused_view().expect("focus");
             app.apply_chrome_action(ChromeAction::CloseView);
             // The repeat-close arm is headless idle here, so the pane closes
             // immediately; focus must never dangle on the closed leaf.
-            assert_ne!(app.runtime.focused_view(), Some(closed));
+            assert_ne!(app.runtime.borrow().focused_view(), Some(closed));
             assert_eq!(
-                app.runtime.layout().validate_structure(),
-                Ok(app.runtime.leaf_count())
+                app.runtime.borrow().layout().validate_structure(),
+                Ok(app.runtime.borrow().leaf_count())
             );
         }
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
     }
 
     /// Issue #2571: a fresh app (no explicit `panel_layout_mode`) presses
@@ -7007,25 +7462,33 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         assert_eq!(
-            app.runtime.panel_layout_mode(),
+            app.runtime.borrow().panel_layout_mode(),
             PanelLayoutMode::Spiral,
             "a fresh app defaults to Spiral (issue #2571)"
         );
         app.runtime
+            .borrow_mut()
             .set_container(bitty_runtime::UiRect::new(0, 0, 160, 64));
 
         let mut phases = Vec::new();
         for press in 1..=8 {
-            let plan = app.runtime.panel_split_plan().expect("feasible plan");
+            let plan = app
+                .runtime
+                .borrow()
+                .panel_split_plan()
+                .expect("feasible plan");
             phases.push(plan.spiral_phase);
             app.apply_chrome_action(ChromeAction::NewPanel);
             assert_eq!(
-                app.runtime.leaf_count(),
+                app.runtime.borrow().leaf_count(),
                 press + 1,
                 "each Mod+N press must land a pane"
             );
-            let allocs = app.runtime.layout_allocations();
-            assert_eq!(app.runtime.layout().validate_structure(), Ok(allocs.len()));
+            let allocs = app.runtime.borrow().layout_allocations();
+            assert_eq!(
+                app.runtime.borrow().layout().validate_structure(),
+                Ok(allocs.len())
+            );
             for (id, rect) in &allocs {
                 assert!(
                     rect.width >= bitty_runtime::MIN_PANE_COLS
@@ -7034,7 +7497,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(app.runtime.leaf_count(), 9);
+        assert_eq!(app.runtime.borrow().leaf_count(), 9);
         assert_eq!(
             phases,
             vec![
@@ -7052,30 +7515,42 @@ mod tests {
 
         // Close the created pane: the survivor breaks the chain, so the next
         // press starts again at phase 0 (Right) instead of a stale Left/Top.
-        let closed = app.runtime.focused_view().expect("focus");
+        let closed = app.runtime.borrow().focused_view().expect("focus");
         app.apply_chrome_action(ChromeAction::CloseView);
-        let survivor = app.runtime.focused_view().expect("survivor");
+        let survivor = app.runtime.borrow().focused_view().expect("survivor");
         assert_ne!(survivor, closed);
-        let plan = app.runtime.panel_split_plan().expect("plan after close");
+        let plan = app
+            .runtime
+            .borrow()
+            .panel_split_plan()
+            .expect("plan after close");
         assert_eq!(plan.spiral_phase, Some(0), "a close resets to Right");
         assert!(!plan.place_new_first);
 
         // Any focus outside the recorded creation chain resets the phase too.
         let other = app
             .runtime
+            .borrow()
             .layout()
             .leaf_ids()
             .into_iter()
             .find(|id| *id != survivor)
             .expect("another leaf survives");
-        assert!(app.runtime.set_focus(survivor));
-        app.runtime.note_panel_split_created(survivor, Some(2));
-        let plan = app.runtime.panel_split_plan().expect("primed plan");
-        assert_eq!(plan.spiral_phase, Some(3));
-        assert!(plan.place_new_first);
-        assert!(app.runtime.set_focus(other));
+        assert!(app.runtime.borrow_mut().set_focus(survivor));
+        app.runtime
+            .borrow_mut()
+            .note_panel_split_created(survivor, Some(2));
         let plan = app
             .runtime
+            .borrow()
+            .panel_split_plan()
+            .expect("primed plan");
+        assert_eq!(plan.spiral_phase, Some(3));
+        assert!(plan.place_new_first);
+        assert!(app.runtime.borrow_mut().set_focus(other));
+        let plan = app
+            .runtime
+            .borrow()
             .panel_split_plan()
             .expect("plan after focus move");
         assert_eq!(
@@ -7096,15 +7571,16 @@ mod tests {
         const PRESSES: usize = 8;
         let mut app = workspace_test_app();
         assert_eq!(
-            app.runtime.panel_layout_mode(),
+            app.runtime.borrow().panel_layout_mode(),
             PanelLayoutMode::Spiral,
             "a fresh app defaults to Spiral"
         );
-        app.runtime.set_container(container);
+        app.runtime.borrow_mut().set_container(container);
         let mut fallbacks = 0;
         for press in 1..=PRESSES {
             let plan = app
                 .runtime
+                .borrow()
                 .panel_split_plan()
                 .unwrap_or_else(|| panic!("press {press} at {container:?} must have a plan"));
             if plan.spiral_phase.is_none() {
@@ -7112,13 +7588,13 @@ mod tests {
             }
             app.apply_chrome_action(ChromeAction::NewPanel);
             assert_eq!(
-                app.runtime.leaf_count(),
+                app.runtime.borrow().leaf_count(),
                 press + 1,
                 "press {press} at {container:?} must land a pane"
             );
-            let allocs = app.runtime.layout_allocations();
+            let allocs = app.runtime.borrow().layout_allocations();
             assert_eq!(
-                app.runtime.layout().validate_structure(),
+                app.runtime.borrow().layout().validate_structure(),
                 Ok(allocs.len()),
                 "press {press} at {container:?} must keep a valid binary tree"
             );
@@ -7138,17 +7614,18 @@ mod tests {
         let mut balanced = workspace_test_app();
         balanced
             .runtime
+            .borrow_mut()
             .set_panel_layout_mode(PanelLayoutMode::Balanced);
-        balanced.runtime.set_container(container);
+        balanced.runtime.borrow_mut().set_container(container);
         for _ in 0..PRESSES {
             balanced.apply_chrome_action(ChromeAction::NewPanel);
         }
         assert_eq!(
-            app.runtime.leaf_count(),
-            balanced.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
+            balanced.runtime.borrow().leaf_count(),
             "default Spiral with fallback must match explicit Balanced capacity at {container:?}"
         );
-        assert_eq!(app.runtime.leaf_count(), PRESSES + 1);
+        assert_eq!(app.runtime.borrow().leaf_count(), PRESSES + 1);
     }
 
     /// Issue #2571 review: an 80x24 window must not lose `Mod+N` after five
@@ -7172,21 +7649,23 @@ mod tests {
     fn chrome_new_panel_spiral_does_not_reverse_after_close() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        app.runtime
+            .borrow_mut()
+            .set_panel_layout_mode(PanelLayoutMode::Spiral);
         for _ in 0..3 {
             app.apply_chrome_action(ChromeAction::NewPanel);
         }
         // Three consecutive presses continue the spiral; the next plan is
         // Left/Top (place_new_first) as designed.
-        let plan = app.runtime.panel_split_plan().expect("plan");
+        let plan = app.runtime.borrow().panel_split_plan().expect("plan");
         assert!(plan.place_new_first, "the chain reaches the left/top phase");
 
         // Close the focused pane; the survivor takes the space.
-        let closed = app.runtime.focused_view().expect("focus");
+        let closed = app.runtime.borrow().focused_view().expect("focus");
         app.apply_chrome_action(ChromeAction::CloseView);
-        let survivor = app.runtime.focused_view().expect("survivor");
+        let survivor = app.runtime.borrow().focused_view().expect("survivor");
         assert_ne!(survivor, closed);
-        let before = app.runtime.layout_allocations();
+        let before = app.runtime.borrow().layout_allocations();
         let survivor_before = before
             .iter()
             .find(|(id, _)| *id == survivor)
@@ -7196,13 +7675,13 @@ mod tests {
         // The next Mod+N must split the survivor to the right/below, never
         // to the left from the stale phase.
         app.apply_chrome_action(ChromeAction::NewPanel);
-        let after = app.runtime.layout_allocations();
+        let after = app.runtime.borrow().layout_allocations();
         let survivor_after = after
             .iter()
             .find(|(id, _)| *id == survivor)
             .map(|(_, rect)| *rect)
             .expect("survivor allocation");
-        let fresh = app.runtime.focused_view().expect("fresh focus");
+        let fresh = app.runtime.borrow().focused_view().expect("fresh focus");
         let fresh_rect = after
             .iter()
             .find(|(id, _)| *id == fresh)
@@ -7250,33 +7729,35 @@ mod tests {
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
         let ws1_pid = app
             .runtime
+            .borrow()
             .pane_pid(&ViewId::new(2))
             .expect("ws1 split shell must spawn");
         // ws2: fresh workspace owns v:3 and the replayed shell.
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        let ws2_view = app.runtime.focused_view().expect("ws2 focus");
+        let ws2_view = app.runtime.borrow().focused_view().expect("ws2 focus");
         assert_eq!(ws2_view, ViewId::new(3));
-        let ws2_pid = app.runtime.pane_pid(&ws2_view).expect("ws2 shell");
+        let ws2_pid = app.runtime.borrow().pane_pid(&ws2_view).expect("ws2 shell");
         // Back to ws1 and split: the global allocator must give v:4.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(4)),
             "keymap split must allocate the global next id, not ws1's v:3"
         );
         assert_eq!(
-            app.runtime.pane_pid(&ws2_view),
+            app.runtime.borrow().pane_pid(&ws2_view),
             Some(ws2_pid),
             "ws2's shell must survive the ws1 split (no session replacement)"
         );
         assert_eq!(
-            app.runtime.pane_pid(&ViewId::new(2)),
+            app.runtime.borrow().pane_pid(&ViewId::new(2)),
             Some(ws1_pid),
             "ws1's earlier split shell must stay live"
         );
         let new_pid = app
             .runtime
+            .borrow()
             .pane_pid(&ViewId::new(4))
             .expect("new split shell must spawn");
         assert_ne!(new_pid, ws2_pid, "distinct shells for distinct views");
@@ -7289,9 +7770,9 @@ mod tests {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(ViewId::new(2)),
             "workspace_new must focus the fresh workspace view"
         );
@@ -7312,13 +7793,14 @@ mod tests {
         );
         for i in 0..200 {
             let line = format!("line {i:03}\n");
-            app.runtime.handle_pty_bytes(line.as_bytes());
+            app.runtime.borrow_mut().handle_pty_bytes(line.as_bytes());
         }
-        app.runtime.tick();
-        assert!(app.runtime.state().scrollback_len() > 0);
+        app.runtime.borrow_mut().tick();
+        assert!(app.runtime.borrow().state().scrollback_len() > 0);
         app.apply_chrome_action(ChromeAction::ScrollPageUp);
         let offset = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(ViewId::new(1))
             .expect("single leaf")
@@ -7327,6 +7809,7 @@ mod tests {
         app.apply_chrome_action(ChromeAction::ScrollPageDown);
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(ViewId::new(1))
                 .expect("single leaf")
@@ -7358,17 +7841,17 @@ mod tests {
             two_pane_layout(),
             LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
 
         app.apply_chrome_action(ChromeAction::CloseView);
 
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(3)]
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(1)));
     }
 
     #[test]
@@ -7382,20 +7865,20 @@ mod tests {
             two_pane_layout(),
             LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
 
         app.apply_chrome_action(ChromeAction::CloseView);
 
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(2), ViewId::new(3)]
         );
         // Closing the top/left child focuses the sibling subtree's first
         // leaf — the pane that expands into the closed slot (issue #2521
         // follow-up), never a positional jump to the last survivor.
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
-        assert_eq!(app.runtime.primary_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
+        assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(2)));
     }
 
     // CTX-0257 workspace ops entry (DEC-0034): keys + tabline through the
@@ -7490,30 +7973,36 @@ mod tests {
     fn chrome_workspace_ops_move_active_and_queries_follow() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
+        assert_eq!(
+            app.runtime.borrow().workspace_names(),
+            vec![String::from("ws1")]
+        );
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
         assert_eq!(
-            app.runtime.workspace_names(),
+            app.runtime.borrow().workspace_names(),
             vec![String::from("ws1"), String::from("ws2")]
         );
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         app.apply_chrome_action(ChromeAction::WorkspaceNext);
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         app.apply_chrome_action(ChromeAction::WorkspacePrev);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         app.apply_chrome_action(ChromeAction::WorkspaceLast);
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         // Beyond-count N clamps to the last workspace (issue #1365); here
         // the clamp target is already active, so state holds.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         // Idle close is immediate (never pends, never kills).
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
-        assert!(!app.runtime.has_pending_ws_close());
-        assert_eq!(app.runtime.workspace_names(), vec![String::from("ws1")]);
+        assert!(!app.runtime.borrow().has_pending_ws_close());
+        assert_eq!(
+            app.runtime.borrow().workspace_names(),
+            vec![String::from("ws1")]
+        );
     }
 
     #[test]
@@ -7524,15 +8013,15 @@ mod tests {
         let mut app = workspace_test_app();
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert_eq!(app.runtime.workspace_count(), 3);
-        assert!(app.runtime.workspace_occupied_indices().is_empty());
-        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
+        assert!(app.runtime.borrow().workspace_occupied_indices().is_empty());
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.workspace_count(), 3);
-        assert!(app.runtime.focused_view().is_some());
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
+        assert!(app.runtime.borrow().focused_view().is_some());
     }
 
     #[test]
@@ -7544,38 +8033,53 @@ mod tests {
         require_pty!();
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        let ws1_leaf = app.runtime.focused_view().expect("ws1 focus");
+        let ws1_leaf = app.runtime.borrow().focused_view().expect("ws1 focus");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws1 shell must spawn");
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        let ws3_leaf = app.runtime.focused_view().expect("ws3 focus");
+        let ws3_leaf = app.runtime.borrow().focused_view().expect("ws3 focus");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(ws3_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws3 shell must spawn");
-        assert_eq!(app.runtime.workspace_count(), 3);
-        assert_eq!(app.runtime.workspace_occupied_indices(), vec![0, 2]);
-        assert!(app.runtime.workspace_switch(0));
-        let before = app.runtime.pane_view_ids();
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
+        assert_eq!(
+            app.runtime.borrow().workspace_occupied_indices(),
+            vec![0, 2]
+        );
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        let before = app.runtime.borrow().pane_view_ids();
         assert_eq!(before.len(), 2);
         // Mod+[ is next occupied rightward.
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
         // At the rightmost occupied, next wraps to the leftmost.
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         // Mod+] mirrors: from ws1 prev wraps to ws3, then skips ws2 back.
         app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
         app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.workspace_count(), 3, "cycle must not kill");
-        assert_eq!(app.runtime.pane_view_ids().len(), before.len());
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert_eq!(
+            app.runtime.borrow().workspace_count(),
+            3,
+            "cycle must not kill"
+        );
+        assert_eq!(app.runtime.borrow().pane_view_ids().len(), before.len());
         for id in &before {
-            assert!(app.runtime.has_pane_session(id), "session survives cycle");
+            assert!(
+                app.runtime.borrow().has_pane_session(id),
+                "session survives cycle"
+            );
         }
-        assert!(app.runtime.focused_view().is_some(), "focus survives cycle");
+        assert!(
+            app.runtime.borrow().focused_view().is_some(),
+            "focus survives cycle"
+        );
     }
 
     #[test]
@@ -7591,10 +8095,10 @@ mod tests {
         // ws2 first (fresh single leaf), then split ws1 with a high id so
         // later allocations can never collide with the escaped tree.
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert!(app.runtime.workspace_switch(0));
-        let first = app.runtime.focused_view().expect("ws1 focus");
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
+        let first = app.runtime.borrow().focused_view().expect("ws1 focus");
         let second = ViewId::new(9);
-        let mut layout = app.runtime.layout().clone();
+        let mut layout = app.runtime.borrow().layout().clone();
         let old = layout.find_leaf(first).cloned().expect("ws1 leaf");
         layout = LayoutNode::split(
             SplitAxis::Horizontal,
@@ -7602,56 +8106,69 @@ mod tests {
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(second, 80, 24)),
         );
-        app.runtime.set_layout(layout);
+        app.runtime.borrow_mut().set_layout(layout);
         // Live session only on the second leaf; zoom onto the session-less
         // first leaf so the live proxy hides the session.
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(second, "/bin/sh", &[], 40, 12)
             .expect("ws1 second shell must spawn");
-        assert!(app.runtime.set_focus(first));
+        assert!(app.runtime.borrow_mut().set_focus(first));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.runtime.leaf_count(), 1, "zoom collapses to proxy");
         assert_eq!(
-            app.runtime.workspace_live_count(0),
+            app.runtime.borrow().leaf_count(),
+            1,
+            "zoom collapses to proxy"
+        );
+        assert_eq!(
+            app.runtime.borrow().workspace_live_count(0),
             0,
             "proxy alone reads empty at runtime level"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backup still holds the real tree"
         );
         // ws2 gets its own shell; the zoom-aware list sees both workspaces
         // while the runtime list sees only ws2.
-        assert!(app.runtime.workspace_switch(1));
-        let ws2_leaf = app.runtime.focused_view().expect("ws2 focus");
+        assert!(app.runtime.borrow_mut().workspace_switch(1));
+        let ws2_leaf = app.runtime.borrow().focused_view().expect("ws2 focus");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws2 shell must spawn");
-        assert_eq!(app.runtime.workspace_occupied_indices(), vec![1]);
+        assert_eq!(app.runtime.borrow().workspace_occupied_indices(), vec![1]);
         assert_eq!(app.occupied_indices_for_cycle(), vec![0, 1]);
         // From ws2 (rightmost occupied) next wraps onto zoomed ws1; the
         // backup survives the round trip instead of being consumed.
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime),
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "cycle must not consume the zoom backup"
         );
         // Mirror back to ws2; sessions and workspaces intact.
         app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.workspace_count(), 2, "cycle must not kill");
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        assert_eq!(
+            app.runtime.borrow().workspace_count(),
+            2,
+            "cycle must not kill"
+        );
         assert!(
-            app.runtime.has_pane_session(&second),
+            app.runtime.borrow().has_pane_session(&second),
             "backed-up session survives"
         );
         assert!(
-            app.runtime.has_pane_session(&ws2_leaf),
+            app.runtime.borrow().has_pane_session(&ws2_leaf),
             "ws2 session survives"
         );
-        assert!(app.runtime.focused_view().is_some(), "focus survives");
+        assert!(
+            app.runtime.borrow().focused_view().is_some(),
+            "focus survives"
+        );
     }
 
     /// Overlay-capture app for the CTX-1100 capture tests: one Lua plugin
@@ -7943,9 +8460,9 @@ claims = []
         let (mut app, root, data) = overlay_capture_test_app("refusal");
         // Two workspaces, zero occupied: every cycle refuses.
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert!(app.runtime.workspace_occupied_indices().is_empty());
-        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert!(app.runtime.borrow().workspace_occupied_indices().is_empty());
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
         assert!(app.overlay_capture_active(), "setup must hold capture");
         let queued = overlay_queued_len(&app);
         assert!(
@@ -7961,7 +8478,7 @@ claims = []
             queued,
             "refused chord never queues as overlay input"
         );
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         assert!(
             drive_mod_char(&mut app, "]", false, true, false, false),
             "Mod+] stays chrome-owned"
@@ -7971,8 +8488,8 @@ claims = []
             "refused prev-cycle preserves capture"
         );
         assert_eq!(overlay_queued_len(&app), queued);
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -7986,16 +8503,18 @@ claims = []
         require_pty!();
         use bitty_config::ChromeAction;
         let (mut app, root, data) = overlay_capture_test_app("success");
-        let ws1_leaf = app.runtime.focused_view().expect("ws1 focus");
+        let ws1_leaf = app.runtime.borrow().focused_view().expect("ws1 focus");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(ws1_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws1 shell must spawn");
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        let ws2_leaf = app.runtime.focused_view().expect("ws2 focus");
+        let ws2_leaf = app.runtime.borrow().focused_view().expect("ws2 focus");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(ws2_leaf, "/bin/sh", &[], 40, 12)
             .expect("ws2 shell must spawn");
-        assert!(app.runtime.workspace_switch(0));
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
         assert!(app.overlay_capture_active(), "setup must hold capture");
         assert!(
             drive_mod_char(&mut app, "[", false, true, false, false),
@@ -8005,7 +8524,7 @@ claims = []
             !app.overlay_capture_active(),
             "successful cycle ends the capture"
         );
-        assert_eq!(app.runtime.active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
     }
@@ -8020,22 +8539,22 @@ claims = []
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         // Exact jump.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(2));
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
         // Clamp: Alt+6 / Alt+9 with 3 workspaces go to workspace 3.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(6));
-        assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(9));
-        assert_eq!(app.runtime.active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
         // Zero fails closed with state untouched.
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(0));
-        assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
     }
 
     #[test]
@@ -8046,11 +8565,11 @@ claims = []
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
         app.apply_chrome_action(ChromeAction::WorkspaceNew);
-        assert!(app.runtime.workspace_switch(0));
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
         // Split ws1 so the source has two leaves; focus the second.
         let moved_id = ViewId::new(9);
-        let mut layout = app.runtime.layout().clone();
-        let focused = app.runtime.focused_view().expect("focus");
+        let mut layout = app.runtime.borrow().layout().clone();
+        let focused = app.runtime.borrow().focused_view().expect("focus");
         let old = layout.find_leaf(focused).cloned().expect("leaf");
         let fresh_leaf = View::new(moved_id, usize::from(old.cols()), usize::from(old.rows()));
         layout = LayoutNode::split(
@@ -8059,32 +8578,32 @@ claims = []
             LayoutNode::leaf(old),
             LayoutNode::leaf(fresh_leaf),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(moved_id));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(moved_id));
         app.apply_chrome_action(ChromeAction::WorkspaceMove(2));
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             1,
             "move follows focus"
         );
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
-        assert!(!app.runtime.has_pending_ws_close());
-        assert!(app.runtime.layout().leaf_ids().contains(&moved_id));
-        assert_eq!(app.runtime.focused_view(), Some(moved_id));
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
+        assert!(!app.runtime.borrow().has_pending_ws_close());
+        assert!(app.runtime.borrow().layout().leaf_ids().contains(&moved_id));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(moved_id));
         // Auto-creates missing target workspace N (CTX-0945) and follows
         // focus there too.
         app.apply_chrome_action(ChromeAction::WorkspaceMove(9));
-        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
         assert_eq!(
-            app.runtime.workspace_names(),
+            app.runtime.borrow().workspace_names(),
             vec![
                 String::from("ws1"),
                 String::from("ws2"),
                 String::from("ws9")
             ]
         );
-        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 1);
     }
 
     // Live-spawn: runs a real POSIX shell (`/bin/sh` has no Windows
@@ -8101,8 +8620,8 @@ claims = []
         // Live session in the active workspace: manual split (headless) +
         // a real shell in the new leaf (pane_sessions.rs pattern).
         let new_id = ViewId::new(2);
-        let mut layout = app.runtime.layout().clone();
-        let focused = app.runtime.focused_view().expect("focus");
+        let mut layout = app.runtime.borrow().layout().clone();
+        let focused = app.runtime.borrow().focused_view().expect("focus");
         let old = layout.find_leaf(focused).cloned().expect("leaf");
         let fresh_leaf = View::new(new_id, usize::from(old.cols()), usize::from(old.rows()));
         layout = LayoutNode::split(
@@ -8111,27 +8630,28 @@ claims = []
             LayoutNode::leaf(old),
             LayoutNode::leaf(fresh_leaf),
         );
-        app.runtime.set_layout(layout);
+        app.runtime.borrow_mut().set_layout(layout);
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(new_id, "/bin/sh", &[], 40, 12)
             .expect("pane shell must spawn headless");
         // First Alt+W arms pending (never silent kill).
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
-        assert!(app.runtime.has_pending_ws_close());
-        assert!(app.runtime.has_pane_session(&new_id));
+        assert!(app.runtime.borrow().has_pending_ws_close());
+        assert!(app.runtime.borrow().has_pane_session(&new_id));
         // Esc through the real intercept cancels via the CTX-0275 emergency
         // layer (consumed as chrome before any keymap match): the arm drops
         // with no kill.
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_ws_close());
-        assert!(app.runtime.has_pane_session(&new_id));
+        assert!(!app.runtime.borrow().has_pending_ws_close());
+        assert!(app.runtime.borrow().has_pane_session(&new_id));
         // Re-arm, then repeat-to-confirm kills and closes.
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
-        assert!(app.runtime.has_pending_ws_close());
+        assert!(app.runtime.borrow().has_pending_ws_close());
         app.apply_chrome_action(ChromeAction::WorkspaceClose);
-        assert!(!app.runtime.has_pending_ws_close());
-        assert!(!app.runtime.has_pane_session(&new_id));
-        assert_eq!(app.runtime.workspace_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_ws_close());
+        assert!(!app.runtime.borrow().has_pane_session(&new_id));
+        assert_eq!(app.runtime.borrow().workspace_count(), 1);
     }
 
     // CTX-0275 explicit DispatchPriority: headless regression suite.
@@ -8589,18 +9109,18 @@ claims = []
         // pending paste through the real chord; every later step drives the
         // same `drive_chrome` dispatch `handle_event` performs.
         let mut app = paste_test_app("line1\nline2");
-        app.runtime.set_layout(two_pane_layout());
-        app.runtime.set_focus(ViewId::new(1));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.borrow().has_pending_paste());
         assert!(app.modal_capture_active());
         // Bound focus chord behind the banner runs normally: consumed, focus
         // moves, no PTY bytes, press-to-release ownership taken and released.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("l", "l", false)));
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(2)));
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(2)));
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(app.chrome.held.contains(&bitty_config::KeyName::Char('l')));
         assert!(!drive_chrome(&mut app, char_release("l")));
         // Unbound typing still falls through to the terminal: unconsumed
@@ -8608,16 +9128,16 @@ claims = []
         // is cleared first so this proves plain typing, not Alt+X ESC-x.
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         assert!(!drive_chrome(&mut app, char_press("x", "x", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"x");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"x");
         assert!(!drive_chrome(&mut app, char_release("x")));
         // The paste pends throughout: nothing above resolved it early.
-        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.borrow().has_pending_paste());
         // Esc dismisses the pending paste: consumed, dropped, no bytes, no
         // layout change.
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
-        assert_eq!(app.runtime.leaf_count(), 2);
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
         assert!(!drive_chrome(&mut app, esc_release()));
         // Release hygiene for the owned paste key and the alt latch.
         assert!(!drive_chrome(&mut app, char_release("V")));
@@ -8630,31 +9150,31 @@ claims = []
         // engages/disengages zoom instead of being swallowed; the paste
         // pends throughout until Esc dismisses it.
         let mut app = paste_test_app("line1\nline2");
-        app.runtime.set_layout(two_pane_layout());
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.borrow().has_pending_paste());
         // First Alt+F engages zoom on the focused leaf: consumed, layout
         // collapses to the single-leaf proxy, paste still pending, no bytes.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(!drive_chrome(&mut app, char_release("f")));
         // Second Alt+F disengages: real tree restored, paste still pending.
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
-        assert_eq!(app.runtime.leaf_count(), 2);
-        assert!(app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        assert!(app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(!drive_chrome(&mut app, char_release("f")));
         // Esc still dismisses the paste afterwards.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_paste());
+        assert!(!app.runtime.borrow().has_pending_paste());
         assert!(!drive_chrome(&mut app, esc_release()));
     }
 
@@ -8666,20 +9186,20 @@ claims = []
         // Ctrl+D with no paste pending encodes EOF normally (0x04).
         assert!(!drive_chrome(&mut app, mods_event(false, true)));
         assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"\x04");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"\x04");
         assert!(!drive_chrome(&mut app, char_release("d")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         // Arm the pending paste through the real chord.
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.borrow().has_pending_paste());
         // Ctrl+D behind the banner drops the paste: no bytes, no exit.
         assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
-        assert!(!app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(!drive_chrome(&mut app, char_release("d")));
         // Once the gate is gone Ctrl+D encodes EOF normally again.
         assert!(!drive_chrome(&mut app, char_press("d", "\u{4}", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"\x04");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"\x04");
         assert!(!drive_chrome(&mut app, char_release("d")));
         // Release hygiene for the owned paste key and the modifier latch.
         assert!(!drive_chrome(&mut app, char_release("V")));
@@ -8707,14 +9227,14 @@ claims = []
                 is_synthetic: false,
             })
         ));
-        assert_eq!(app.runtime.drain_pending_input(), b"\x03");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"\x03");
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         // Typing `exit` plus Enter passes through byte-identical.
         for ch in ["e", "x", "i", "t"] {
             assert!(!drive_chrome(&mut app, char_press(ch, ch, false)));
         }
         assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
-        assert_eq!(app.runtime.drain_pending_input(), b"exit\r");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"exit\r");
     }
 
     #[test]
@@ -8742,22 +9262,22 @@ claims = []
             maps,
             SpawnSpec::default(),
         );
-        app.runtime.set_layout(two_pane_layout());
-        assert_eq!(app.runtime.leaf_count(), 2);
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
+        assert!(app.runtime.borrow().has_pending_paste());
         // Emergency: consumed here (not routed), pending dropped, layout
         // untouched — the `close_view` remap does NOT run.
         assert!(drive_chrome(&mut app, esc_press()));
-        assert!(!app.runtime.has_pending_paste());
-        assert_eq!(app.runtime.leaf_count(), 2);
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         // With no modal active the remap applies again: Esc closes a pane.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         assert!(drive_chrome(&mut app, esc_press()));
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(!drive_chrome(&mut app, esc_release()));
     }
 
@@ -8767,14 +9287,17 @@ claims = []
         // paste chord) dispatches as User and delivers exactly once.
         let mut app = paste_test_app("line1\nline2");
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         // Release the key (ownership ends) while ctrl+shift stay latched,
         // then repeat the identical chord: confirm, not capture.
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(drive_chrome(&mut app, char_press("V", "V", false)));
-        assert!(!app.runtime.has_pending_paste());
-        assert_eq!(app.runtime.drain_pending_input(), b"line1\nline2");
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert_eq!(
+            app.runtime.borrow_mut().drain_pending_input(),
+            b"line1\nline2"
+        );
     }
 
     #[test]
@@ -8784,28 +9307,28 @@ claims = []
         // the intercept into `Runtime::handle_key_event`, which consumes it
         // and delivers only the pending bytes.
         let mut app = paste_test_app("line1\nline2");
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         press_paste_chord(&mut app);
-        assert!(app.runtime.has_pending_paste());
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(app.runtime.borrow().has_pending_paste());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         // Drop the chord's modifier latch and release so Enter is a plain
         // press (the runtime accept gesture, not a remapped chord).
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
         assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
-        assert!(!app.runtime.has_pending_paste());
+        assert!(!app.runtime.borrow().has_pending_paste());
         assert_eq!(
-            app.runtime.drain_pending_input(),
+            app.runtime.borrow_mut().drain_pending_input(),
             b"line1\nline2",
             "exactly the pending paste bytes, no CR leak"
         );
-        assert_eq!(app.runtime.leaf_count(), 2, "layout untouched");
+        assert_eq!(app.runtime.borrow().leaf_count(), 2, "layout untouched");
         // Release is byte-free.
         assert!(!drive_chrome(&mut app, named_release(NamedKey::Enter)));
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         // No gate now: Enter keeps its ordinary single-CR binding.
         assert!(!drive_chrome(&mut app, named_press(NamedKey::Enter)));
-        assert_eq!(app.runtime.drain_pending_input(), b"\r");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"\r");
         assert!(!drive_chrome(&mut app, named_release(NamedKey::Enter)));
     }
 
@@ -8819,7 +9342,7 @@ claims = []
         let text = "alpha\nbeta";
         let mut via_enter = paste_test_app(text);
         press_paste_chord(&mut via_enter);
-        assert!(via_enter.runtime.has_pending_paste());
+        assert!(via_enter.runtime.borrow().has_pending_paste());
 
         // The modifier latch from Ctrl+Shift+V must be released before this
         // Enter. Without this physical release sequence Enter is modified
@@ -8855,7 +9378,7 @@ claims = []
                 "{name} must reach runtime"
             );
             assert_eq!(
-                via_enter.runtime.drain_pending_input(),
+                via_enter.runtime.borrow_mut().drain_pending_input(),
                 expected,
                 "{name} bytes"
             );
@@ -8863,10 +9386,10 @@ claims = []
 
         let mut via_repeat = paste_test_app(text);
         press_paste_chord(&mut via_repeat);
-        assert!(via_repeat.runtime.has_pending_paste());
+        assert!(via_repeat.runtime.borrow().has_pending_paste());
         assert!(!drive_chrome(&mut via_repeat, char_release("V")));
         assert!(drive_chrome(&mut via_repeat, char_press("V", "V", false)));
-        let repeat_bytes = via_repeat.runtime.drain_pending_input();
+        let repeat_bytes = via_repeat.runtime.borrow_mut().drain_pending_input();
         assert_eq!(repeat_bytes, text.as_bytes());
 
         // Focus cancellation clears the one-shot ownership even if the
@@ -8880,7 +9403,7 @@ claims = []
             named_press(NamedKey::Enter)
         ));
         assert_eq!(
-            after_focus_loss.runtime.drain_pending_input(),
+            after_focus_loss.runtime.borrow_mut().drain_pending_input(),
             text.as_bytes()
         );
         assert!(!drive_chrome(
@@ -8898,7 +9421,10 @@ claims = []
             &mut after_focus_loss,
             named_press(NamedKey::Enter)
         ));
-        assert_eq!(after_focus_loss.runtime.drain_pending_input(), b"\r");
+        assert_eq!(
+            after_focus_loss.runtime.borrow_mut().drain_pending_input(),
+            b"\r"
+        );
         assert!(!drive_chrome(
             &mut after_focus_loss,
             named_release(NamedKey::Enter)
@@ -8924,18 +9450,18 @@ claims = []
             assert!(!drive_chrome(&mut modified, char_release("V")));
             assert!(!drive_chrome(&mut modified, clear_mods_event()));
             if let Some(negotiation) = negotiation {
-                modified.runtime.handle_pty_bytes(negotiation);
+                modified.runtime.borrow_mut().handle_pty_bytes(negotiation);
             }
             assert!(!drive_chrome(&mut modified, mods_event(true, false)));
             assert!(!drive_chrome(&mut modified, named_press(NamedKey::Shift)));
             assert!(!drive_chrome(&mut modified, named_press(NamedKey::Enter)));
             assert_eq!(
-                modified.runtime.drain_pending_input(),
+                modified.runtime.borrow_mut().drain_pending_input(),
                 expected,
                 "{name} modified Enter bytes"
             );
             assert!(
-                modified.runtime.has_pending_paste(),
+                modified.runtime.borrow().has_pending_paste(),
                 "{name} must not confirm"
             );
             assert!(!drive_chrome(&mut modified, named_release(NamedKey::Enter)));
@@ -8950,13 +9476,16 @@ claims = []
         let mut app = paste_test_app("clean-paste");
         assert!(!app.modal_capture_active());
         assert!(!drive_chrome(&mut app, char_press("v", "v", false)));
-        assert_eq!(app.runtime.drain_pending_input(), b"v");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"v");
         assert!(!drive_chrome(&mut app, char_release("v")));
         // Bound paste chord still dispatches as User and delivers clean
         // text immediately (no modal arms for clean input).
         press_paste_chord(&mut app);
-        assert!(!app.runtime.has_pending_paste());
-        assert_eq!(app.runtime.drain_pending_input(), b"clean-paste");
+        assert!(!app.runtime.borrow().has_pending_paste());
+        assert_eq!(
+            app.runtime.borrow_mut().drain_pending_input(),
+            b"clean-paste"
+        );
         assert!(!drive_chrome(&mut app, char_release("V")));
         assert!(!drive_chrome(&mut app, clear_mods_event()));
     }
@@ -9012,16 +9541,16 @@ claims = []
             maps,
             SpawnSpec::default(),
         );
-        let leafs_before = app.runtime.leaf_count();
+        let leafs_before = app.runtime.borrow().leaf_count();
         app.apply_chrome_action(ChromeAction::IncreaseFontSize);
-        assert!((app.runtime.font_size() - 13.0).abs() < f32::EPSILON);
-        assert_eq!(app.runtime.leaf_count(), leafs_before);
+        assert!((app.runtime.borrow().font_size() - 13.0).abs() < f32::EPSILON);
+        assert_eq!(app.runtime.borrow().leaf_count(), leafs_before);
         app.apply_chrome_action(ChromeAction::DecreaseFontSize);
-        assert!((app.runtime.font_size() - 12.0).abs() < f32::EPSILON);
+        assert!((app.runtime.borrow().font_size() - 12.0).abs() < f32::EPSILON);
         app.apply_chrome_action(ChromeAction::IncreaseFontSize);
         app.apply_chrome_action(ChromeAction::ResetFontSize);
-        assert!((app.runtime.font_size() - 12.0).abs() < f32::EPSILON);
-        assert_eq!(app.runtime.leaf_count(), leafs_before);
+        assert!((app.runtime.borrow().font_size() - 12.0).abs() < f32::EPSILON);
+        assert_eq!(app.runtime.borrow().leaf_count(), leafs_before);
     }
 
     // CTX-0265 which-key help popup: toggle gestures, registry rows, Esc.
@@ -9080,7 +9609,7 @@ claims = []
             !drive_chrome(&mut app, char_press("`", "`", false)),
             "Mod+backtick must not be a Core-bound chord"
         );
-        let bytes = app.runtime.drain_pending_input();
+        let bytes = app.runtime.borrow_mut().drain_pending_input();
         assert!(
             bytes.ends_with(b"`"),
             "the retired chord's byte reaches the shell (meta-prefixed): {bytes:?}"
@@ -9095,7 +9624,7 @@ claims = []
             !drive_chrome(&mut app, char_press("?", "?", false)),
             "Mod+? must not be a Core-bound chord"
         );
-        let bytes = app.runtime.drain_pending_input();
+        let bytes = app.runtime.borrow_mut().drain_pending_input();
         assert!(
             bytes.ends_with(b"?"),
             "the retired chord's byte reaches the shell (meta-prefixed): {bytes:?}"
@@ -9130,13 +9659,21 @@ claims = []
         );
         // Bound: retired — no Core session opens; layout/focus untouched.
         let mut app = app_with_keymaps(maps);
-        let leafs = app.runtime.leaf_count();
-        let leaves = app.runtime.layout().leaf_ids();
-        let focused = app.runtime.focused_view();
+        let leafs = app.runtime.borrow().leaf_count();
+        let leaves = app.runtime.borrow().layout().leaf_ids();
+        let focused = app.runtime.borrow().focused_view();
         app.apply_chrome_action(ChromeAction::OpenComposer);
-        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
-        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
-        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        assert_eq!(app.runtime.borrow().leaf_count(), leafs, "no pane surgery");
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            leaves,
+            "layout unchanged"
+        );
+        assert_eq!(
+            app.runtime.borrow().focused_view(),
+            focused,
+            "focus unchanged"
+        );
     }
 
     #[test]
@@ -9436,13 +9973,13 @@ claims = []
                 .is_empty(),
             "activation must not enqueue a plugin notification"
         );
-        assert_eq!(app.runtime.notifications_os_undelivered(), 0);
-        assert_eq!(app.runtime.notification_banner(), None);
+        assert_eq!(app.runtime.borrow().notifications_os_undelivered(), 0);
+        assert_eq!(app.runtime.borrow().notification_banner(), None);
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
             "bitty-featured.devtools:plugins".to_string().into()
         )));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.devtools:plugins: 2 plugins active"),
             "the keybinding dispatch result must surface on the banner"
         );
@@ -9450,11 +9987,11 @@ claims = []
         // `surface_dispatch_result` trips the fail-closed backend and makes
         // this counter (and the queue check below) fail.
         assert_eq!(
-            app.runtime.notifications_os_undelivered(),
+            app.runtime.borrow().notifications_os_undelivered(),
             0,
             "a keybinding command result must not attempt an OS notification"
         );
-        assert_eq!(app.runtime.notifications_os_delivered(), 0);
+        assert_eq!(app.runtime.borrow().notifications_os_delivered(), 0);
         assert!(
             app.plugin_runtime
                 .as_mut()
@@ -9465,7 +10002,7 @@ claims = []
         );
         let _ = app.drive_tick();
         assert_eq!(
-            app.runtime.notifications_os_undelivered(),
+            app.runtime.borrow().notifications_os_undelivered(),
             0,
             "the tick must not drain an implicit notification either"
         );
@@ -9474,7 +10011,7 @@ claims = []
             "bitty-featured.devtools:missing".to_string().into()
         )));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.devtools:plugins: 2 plugins active"),
             "a refused dispatch must not disturb the banner"
         );
@@ -9554,7 +10091,7 @@ claims = []
             "got {bare}"
         );
         assert_eq!(
-            app.runtime.notification_banner(),
+            app.runtime.borrow().notification_banner(),
             None,
             "a refused dispatch admits nothing"
         );
@@ -9565,7 +10102,7 @@ claims = []
                 .expect("args binding parses");
         assert!(!app.apply_chrome_action(action));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.search:search: seen:NEEDLE"),
             "the callee must observe the binding's argument (case preserved)"
         );
@@ -9576,7 +10113,7 @@ claims = []
                 .expect("structurally valid, semantically wrong");
         assert!(!app.apply_chrome_action(wrong_type));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.search:search: seen:NEEDLE"),
             "a schema refusal must not disturb the banner"
         );
@@ -9587,7 +10124,7 @@ claims = []
                 .expect("parses");
         assert!(!app.apply_chrome_action(unknown));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.search:search: seen:NEEDLE"),
             "an unknown name must not surface a result"
         );
@@ -9664,7 +10201,7 @@ claims = []
             "a refused invocation is not an applied chrome action"
         );
         assert_eq!(
-            app.runtime.notification_banner(),
+            app.runtime.borrow().notification_banner(),
             None,
             "an unparsable document must never become a bare empty-object dispatch"
         );
@@ -9674,7 +10211,7 @@ claims = []
             .expect("empty object parses");
         assert!(!app.apply_chrome_action(bare));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.bare:run: ran"),
             "the callee would have answered a bare dispatch"
         );
@@ -9706,14 +10243,14 @@ claims = []
         // refuses the unparsable document.
         let error = TerminalApp::command_args(Some("{bad")).expect_err("must refuse");
         assert!(error.contains("invalid command args JSON"), "got {error}");
-        assert_eq!(app.runtime.notification_banner(), None);
+        assert_eq!(app.runtime.borrow().notification_banner(), None);
         // The application layer is intact: a valid binding still serves after
         // the refusal.
         let ok = ChromeAction::parse(r#"command:bitty-featured.search:search -- {"needle":"ok"}"#)
             .expect("parses");
         assert!(!app.apply_chrome_action(ok));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.search:search: seen:ok")
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -9843,7 +10380,7 @@ claims = []
         assert!(app.intercept_chrome_key(&char_press("y", "y", false)));
         assert_eq!(app.pump_cold_commands(), 1, "one deferred command ran");
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-featured.help-fixture:toggle-help: ran toggle-help"),
             "the suggested chord must dispatch its owner's registered command"
         );
@@ -10367,7 +10904,7 @@ claims = []
         let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
-        let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
+        let app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
         let chord = KeyRef {
             key: KeyName::Char('y'),
             ctrl: true,
@@ -10375,12 +10912,12 @@ claims = []
             shift: false,
             super_held: false,
         };
-        app.runtime.set_overlay_modal_active(true);
+        app.runtime.borrow_mut().set_overlay_modal_active(true);
         assert_eq!(
             app.resolve_dispatch(chord, None),
             (DispatchPriority::Modal, None)
         );
-        app.runtime.set_overlay_modal_active(false);
+        app.runtime.borrow_mut().set_overlay_modal_active(false);
         assert_eq!(
             app.resolve_dispatch(chord, None).0,
             DispatchPriority::Plugin
@@ -10433,24 +10970,32 @@ claims = []
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let mut app = app_with_keymaps(maps).with_plugin_runtime(Some(plugin_runtime));
-        let leafs = app.runtime.leaf_count();
-        let leaves = app.runtime.layout().leaf_ids();
-        let focused = app.runtime.focused_view();
-        assert_eq!(app.runtime.notification_banner(), None);
+        let leafs = app.runtime.borrow().leaf_count();
+        let leaves = app.runtime.borrow().layout().leaf_ids();
+        let focused = app.runtime.borrow().focused_view();
+        assert_eq!(app.runtime.borrow().notification_banner(), None);
         assert!(!app.apply_chrome_action(ChromeAction::TogglePalette));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-terminal.palette:toggle: 3"),
             "the palette toggle result must surface on the banner"
         );
-        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
-        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
-        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        assert_eq!(app.runtime.borrow().leaf_count(), leafs, "no pane surgery");
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            leaves,
+            "layout unchanged"
+        );
+        assert_eq!(
+            app.runtime.borrow().focused_view(),
+            focused,
+            "focus unchanged"
+        );
         // Detached runtime fails closed: diagnostic only, banner untouched.
         app = app.with_plugin_runtime(None);
         assert!(!app.apply_chrome_action(ChromeAction::TogglePalette));
         assert_eq!(
-            app.runtime.notification_banner().as_deref(),
+            app.runtime.borrow().notification_banner().as_deref(),
             Some("bitty-terminal.palette:toggle: 3"),
             "a refused dispatch must not disturb the banner"
         );
@@ -10527,7 +11072,7 @@ claims = []
         );
         let _ = app.drive_tick();
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "the tick must surface the palette block for present"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -10611,7 +11156,7 @@ claims = []
         );
         let _ = app.drive_tick();
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "the tick must surface the composer block for present"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -10654,7 +11199,7 @@ claims = []
         // hosting must not route to any composer session (none exists) and
         // clears the stale latch.
         let temp = write_composer_temp("draft", &std::env::temp_dir()).expect("temp");
-        let home = app.runtime.focused_view().expect("focused leaf");
+        let home = app.runtime.borrow().focused_view().expect("focused leaf");
         assert!(app.chrome.editor.begin(ExternalEditorSession {
             view: ViewId::new(999),
             temp,
@@ -10700,6 +11245,7 @@ claims = []
     /// One marked `OSC 133` command cycle for the fold/hint live tests.
     fn mark_test_command(app: &mut TerminalApp) {
         app.runtime
+            .borrow_mut()
             .handle_pty_bytes(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07out\x1b]133;D;0\x07");
     }
 
@@ -10713,16 +11259,16 @@ claims = []
             .expect("defaults");
         let mut app = app_with_keymaps(maps);
         app.apply_chrome_action(ChromeAction::FoldToggle);
-        assert_eq!(app.runtime.cw_latest_command_id(), None);
+        assert_eq!(app.runtime.borrow().cw_latest_command_id(), None);
         mark_test_command(&mut app);
         mark_test_command(&mut app);
-        let latest = app.runtime.cw_latest_command_id().expect("marked");
+        let latest = app.runtime.borrow().cw_latest_command_id().expect("marked");
         app.apply_chrome_action(ChromeAction::FoldToggle);
-        assert!(app.runtime.cw_fold_is_folded(latest));
+        assert!(app.runtime.borrow().cw_fold_is_folded(latest));
         app.apply_chrome_action(ChromeAction::FoldExpand);
-        assert!(!app.runtime.cw_fold_is_folded(latest));
+        assert!(!app.runtime.borrow().cw_fold_is_folded(latest));
         app.apply_chrome_action(ChromeAction::FoldCollapse);
-        assert!(app.runtime.cw_fold_is_folded(latest));
+        assert!(app.runtime.borrow().cw_fold_is_folded(latest));
     }
 
     #[test]
@@ -10733,16 +11279,16 @@ claims = []
             .expect("defaults");
         let mut app = app_with_keymaps(maps);
         mark_test_command(&mut app);
-        let latest = app.runtime.cw_latest_command_id().expect("marked");
+        let latest = app.runtime.borrow().cw_latest_command_id().expect("marked");
         set_leader_mods(&mut app, true);
         let space = test_key(LogicalKey::Named(NamedKey::Space));
         assert!(
             drive_chrome(&mut app, WindowEventKind::KeyboardInput(space)),
             "leader press is chrome-owned"
         );
-        assert!(app.runtime.cw_hint_is_armed());
+        assert!(app.runtime.borrow().cw_hint_is_armed());
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "leader types no shell bytes"
         );
         set_leader_mods(&mut app, false);
@@ -10750,15 +11296,18 @@ claims = []
             &mut app,
             WindowEventKind::KeyboardInput(test_char_key("z"))
         ));
-        assert!(app.runtime.cw_hint_is_armed(), "operator waits for label");
+        assert!(
+            app.runtime.borrow().cw_hint_is_armed(),
+            "operator waits for label"
+        );
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_char_key("a"))
         ));
-        assert!(!app.runtime.cw_hint_is_armed(), "dispatch disarms");
-        assert!(app.runtime.cw_fold_is_folded(latest));
+        assert!(!app.runtime.borrow().cw_hint_is_armed(), "dispatch disarms");
+        assert!(app.runtime.borrow().cw_fold_is_folded(latest));
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "hint keystrokes never reach the PTY"
         );
     }
@@ -10779,7 +11328,7 @@ claims = []
             "disabled hints leave the leader press unconsumed"
         );
         assert!(
-            !app.runtime.cw_hint_is_armed(),
+            !app.runtime.borrow().cw_hint_is_armed(),
             "no session arms while disabled"
         );
         // Follow-up letters are not hint-owned either: unconsumed, shell-bound.
@@ -10789,7 +11338,7 @@ claims = []
             "letters keep their normal owner while disabled"
         );
         assert!(
-            !app.runtime.cw_hint_is_armed(),
+            !app.runtime.borrow().cw_hint_is_armed(),
             "letters never arm while disabled"
         );
     }
@@ -10807,13 +11356,13 @@ claims = []
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
         ));
-        assert!(app.runtime.cw_hint_is_armed());
+        assert!(app.runtime.borrow().cw_hint_is_armed());
         set_leader_mods(&mut app, false);
         assert!(drive_chrome(
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Escape)))
         ));
-        assert!(!app.runtime.cw_hint_is_armed(), "esc cancelled");
+        assert!(!app.runtime.borrow().cw_hint_is_armed(), "esc cancelled");
 
         // Re-arm, then force the window into the past: the next press
         // expires the Leader and keeps its normal owner (shell bytes).
@@ -10822,15 +11371,15 @@ claims = []
             &mut app,
             WindowEventKind::KeyboardInput(test_key(LogicalKey::Named(NamedKey::Space)))
         ));
-        assert!(app.runtime.cw_hint_is_armed());
+        assert!(app.runtime.borrow().cw_hint_is_armed());
         set_leader_mods(&mut app, false);
         app.chrome.leader_state = bitty_config::LeaderState::Armed { deadline_ms: 0 };
         assert!(
             !drive_chrome(&mut app, WindowEventKind::KeyboardInput(test_char_key("x"))),
             "expired leader falls through"
         );
-        assert!(!app.runtime.cw_hint_is_armed(), "expiry disarmed");
-        assert_eq!(app.runtime.drain_pending_input(), b"x");
+        assert!(!app.runtime.borrow().cw_hint_is_armed(), "expiry disarmed");
+        assert_eq!(app.runtime.borrow_mut().drain_pending_input(), b"x");
     }
 
     #[test]
@@ -10861,7 +11410,7 @@ claims = []
             WindowEventKind::KeyboardInput(text_key("i"))
         ));
         // Typing reached the PTY byte-identically (no composer framing).
-        let pending = app.runtime.drain_pending_input();
+        let pending = app.runtime.borrow_mut().drain_pending_input();
         assert_eq!(pending, b"hi");
     }
 
@@ -10894,13 +11443,21 @@ claims = []
         // Bound without a plugin runtime fails closed: diagnostic only,
         // no runtime mutation, no overlay, no routing change.
         let mut app = app_with_keymaps(maps);
-        let leafs = app.runtime.leaf_count();
-        let leaves = app.runtime.layout().leaf_ids();
-        let focused = app.runtime.focused_view();
+        let leafs = app.runtime.borrow().leaf_count();
+        let leaves = app.runtime.borrow().layout().leaf_ids();
+        let focused = app.runtime.borrow().focused_view();
         app.apply_chrome_action(ChromeAction::TogglePalette);
-        assert_eq!(app.runtime.leaf_count(), leafs, "no pane surgery");
-        assert_eq!(app.runtime.layout().leaf_ids(), leaves, "layout unchanged");
-        assert_eq!(app.runtime.focused_view(), focused, "focus unchanged");
+        assert_eq!(app.runtime.borrow().leaf_count(), leafs, "no pane surgery");
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            leaves,
+            "layout unchanged"
+        );
+        assert_eq!(
+            app.runtime.borrow().focused_view(),
+            focused,
+            "focus unchanged"
+        );
     }
 
     /// Latch the app modifier mirror like the compositor-fed stream does and
@@ -10938,18 +11495,18 @@ claims = []
         // Mod+T creates workspaces (the shipped creation chord; docs line).
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
-        assert_eq!(app.runtime.workspace_count(), 3);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             2,
             "Mod+T lands on ws3"
         );
         // Give ws1 two panes so a layout swap is observable, not just an index.
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        let first_leaf = app.runtime.focused_view().expect("ws1 focus");
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        let first_leaf = app.runtime.borrow().focused_view().expect("ws1 focus");
         let fresh = ViewId::new(9);
-        let mut layout = app.runtime.layout().clone();
+        let mut layout = app.runtime.borrow().layout().clone();
         let old = layout
             .find_leaf(first_leaf)
             .cloned()
@@ -10960,8 +11517,8 @@ claims = []
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(fresh, 80, 24)),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(fresh));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(fresh));
         // Every supported digit is consumed (never typed into the shell), and
         // in-range digits land exactly where they name.
         for (digit, want_index) in [("1", 0usize), ("2", 1), ("3", 2)] {
@@ -10970,29 +11527,29 @@ claims = []
                 "Mod+{digit} is bound (consumed)"
             );
             assert_eq!(
-                app.runtime.active_workspace_index(),
+                app.runtime.borrow().active_workspace_index(),
                 want_index,
                 "Mod+{digit} lands on ws{}",
                 want_index + 1
             );
             assert!(
-                app.runtime.drain_pending_input().is_empty(),
+                app.runtime.borrow_mut().drain_pending_input().is_empty(),
                 "the digit must never reach the shell"
             );
         }
         // Jumping back to ws1 re-activates ITS tree (two leaves, the split
         // leaf still focused), not ws3's single leaf.
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
-        assert!(app.runtime.layout().leaf_ids().contains(&fresh));
-        assert_eq!(app.runtime.focused_view(), Some(fresh));
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
+        assert!(app.runtime.borrow().layout().leaf_ids().contains(&fresh));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(fresh));
         // Out-of-range N clamps to the last workspace (issue #1365, accepted)
         // and still never leaks the digit.
         assert!(drive_mod_char(&mut app, "9", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 2);
-        assert_eq!(app.runtime.workspace_count(), 3);
-        assert!(app.runtime.drain_pending_input().is_empty());
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 3);
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
     }
 
     #[test]
@@ -11005,16 +11562,16 @@ claims = []
         // regardless: the bound chord is consumed, and the digit never
         // reaches the shell.
         let mut app = workspace_test_app();
-        assert_eq!(app.runtime.workspace_count(), 1, "shipped default");
+        assert_eq!(app.runtime.borrow().workspace_count(), 1, "shipped default");
         for digit in ["1", "2", "9"] {
             assert!(
                 drive_mod_char(&mut app, digit, false, true, false, false),
                 "Mod+{digit} is a bound chord (consumed)"
             );
-            assert_eq!(app.runtime.active_workspace_index(), 0);
-            assert_eq!(app.runtime.workspace_count(), 1);
+            assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+            assert_eq!(app.runtime.borrow().workspace_count(), 1);
             assert!(
-                app.runtime.drain_pending_input().is_empty(),
+                app.runtime.borrow_mut().drain_pending_input().is_empty(),
                 "the digit must never reach the shell"
             );
         }
@@ -11062,13 +11619,13 @@ claims = []
         // (issue #1803).
         let mut app = workspace_test_app();
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         // Split ws1: the move needs a second leaf to reparent.
         let moved = ViewId::new(9);
-        let mut layout = app.runtime.layout().clone();
-        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let mut layout = app.runtime.borrow().layout().clone();
+        let focused = app.runtime.borrow().focused_view().expect("ws1 focus");
         let old = layout
             .find_leaf(focused)
             .cloned()
@@ -11079,39 +11636,39 @@ claims = []
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(moved, 80, 24)),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(moved));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(moved));
         // Physical Mod+Shift+2: the platform reports `@` with Shift held.
         assert!(
             drive_mod_char(&mut app, "@", false, true, true, false),
             "the physical move gesture is chrome-owned"
         );
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "the shifted symbol must never reach the shell"
         );
         assert_eq!(
-            app.runtime.workspace_count(),
+            app.runtime.borrow().workspace_count(),
             2,
             "multi-leaf move keeps the source slot"
         );
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             1,
             "move follows focus to the target workspace"
         );
         assert_eq!(
-            app.runtime.layout().leaf_count(),
+            app.runtime.borrow().layout().leaf_count(),
             2,
             "target holds moved leaf"
         );
         // The moved pane is in the now-active ws2, focused, with its id intact.
-        assert!(app.runtime.layout().leaf_ids().contains(&moved));
-        assert_eq!(app.runtime.focused_view(), Some(moved));
+        assert!(app.runtime.borrow().layout().leaf_ids().contains(&moved));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(moved));
         // Switching back to ws1 shows the promoted survivor.
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert!(!app.runtime.layout().leaf_ids().contains(&moved));
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert!(!app.runtime.borrow().layout().leaf_ids().contains(&moved));
         // Every digit's shifted symbol folds the same way (1..=9).
         let symbols = ["!", "@", "#", "$", "%", "^", "&", "*", "("];
         for (index, symbol) in symbols.iter().enumerate() {
@@ -11121,11 +11678,11 @@ claims = []
                 "physical Mod+Shift+{one_based} ({symbol}) is consumed"
             );
             assert!(
-                app.runtime.drain_pending_input().is_empty(),
+                app.runtime.borrow_mut().drain_pending_input().is_empty(),
                 "no byte leak for {symbol}"
             );
             assert!(
-                app.runtime.workspace_count() >= 1,
+                app.runtime.borrow().workspace_count() >= 1,
                 "Mod+Shift+{one_based} keeps the >= 1 invariant (singleton sources are removed)"
             );
         }
@@ -11144,13 +11701,13 @@ claims = []
         );
         assert!(drive_mod_char(&mut app, "t", false, false, false, true));
         assert!(drive_mod_char(&mut app, "1", false, false, false, true));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         assert!(
             drive_mod_char(&mut app, "@", false, false, true, true),
             "shift+super+2 is consumed"
         );
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "no byte leak under the Super flip"
         );
     }
@@ -11164,38 +11721,42 @@ claims = []
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert!(app.runtime.workspace_close_at(1).is_ok(), "close ws2");
+        assert!(
+            app.runtime.borrow_mut().workspace_close_at(1).is_ok(),
+            "close ws2"
+        );
         assert_eq!(
-            app.runtime.workspace_names(),
+            app.runtime.borrow().workspace_names(),
             vec![String::from("ws1"), String::from("ws3")]
         );
 
         let moved = ViewId::new(52);
-        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let focused = app.runtime.borrow().focused_view().expect("ws1 focus");
         let old = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(focused)
             .cloned()
             .expect("ws1 leaf");
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(moved, 80, 24)),
         ));
-        assert!(app.runtime.set_focus(moved));
+        assert!(app.runtime.borrow_mut().set_focus(moved));
 
         assert!(drive_mod_char(&mut app, "@", false, true, true, false));
-        assert!(app.runtime.drain_pending_input().is_empty());
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert_eq!(
-            app.runtime.workspace_names(),
+            app.runtime.borrow().workspace_names(),
             vec![String::from("ws1"), String::from("ws3")]
         );
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.focused_view(), Some(moved));
-        assert!(app.runtime.layout().leaf_ids().contains(&moved));
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(moved));
+        assert!(app.runtime.borrow().layout().leaf_ids().contains(&moved));
     }
 
     // Live-spawn: real POSIX shells in two workspaces. `#[cfg(unix)]` keeps it
@@ -11209,47 +11770,51 @@ claims = []
         // The primary shell attaches to ws1's leaf and its recipe is
         // remembered; every fresh workspace replays it (CTX-0359).
         app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("primary shell must spawn headless");
-        let ws1_leaf = app.runtime.focused_view().expect("primary leaf");
+        let ws1_leaf = app.runtime.borrow().focused_view().expect("primary leaf");
         // Mod+T: a fresh workspace with its OWN shell, never the primary's.
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        let ws2_leaf = app.runtime.focused_view().expect("ws2 leaf");
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        let ws2_leaf = app.runtime.borrow().focused_view().expect("ws2 leaf");
         assert_ne!(ws2_leaf, ws1_leaf, "ws2 gets its own View");
-        assert!(app.runtime.has_pane_session(&ws2_leaf), "ws2 owns a shell");
+        assert!(
+            app.runtime.borrow().has_pane_session(&ws2_leaf),
+            "ws2 owns a shell"
+        );
         // Switching jumps the live layout and focus; the other workspace's
         // session keeps running (view layer re-activates, no session teardown).
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
-        assert_eq!(app.runtime.focused_view(), Some(ws1_leaf));
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ws1_leaf));
         assert!(
-            app.runtime.has_pane_session(&ws2_leaf),
+            app.runtime.borrow().has_pane_session(&ws2_leaf),
             "ws2's shell survives the switch away"
         );
         assert!(drive_mod_char(&mut app, "2", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 1);
-        assert_eq!(app.runtime.focused_view(), Some(ws2_leaf));
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ws2_leaf));
         // Physical Mod+Shift+1 (reported `!`): ws2's pane moves into ws1 with
         // its session and follows focus to ws1 (issue #1803).
         assert!(drive_mod_char(&mut app, "!", false, true, true, false));
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "the shifted symbol never reaches a shell"
         );
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             0,
             "the move follows focus to the target"
         );
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
         assert!(
-            app.runtime.layout().leaf_ids().contains(&ws2_leaf),
+            app.runtime.borrow().layout().leaf_ids().contains(&ws2_leaf),
             "the moved pane is live in ws1"
         );
         assert!(
-            app.runtime.has_pane_session(&ws2_leaf),
+            app.runtime.borrow().has_pane_session(&ws2_leaf),
             "the moved pane keeps its shell"
         );
     }
@@ -11295,11 +11860,11 @@ claims = []
         // observable if it won.
         assert!(drive_mod_char(&mut app, "t", false, true, false, false));
         assert!(drive_mod_char(&mut app, "1", false, true, false, false));
-        assert_eq!(app.runtime.active_workspace_index(), 0);
+        assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         // Split ws1 and focus the new leaf so `focus_next` is observable.
         let fresh = ViewId::new(9);
-        let mut layout = app.runtime.layout().clone();
-        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let mut layout = app.runtime.borrow().layout().clone();
+        let focused = app.runtime.borrow().focused_view().expect("ws1 focus");
         let old = layout
             .find_leaf(focused)
             .cloned()
@@ -11310,23 +11875,27 @@ claims = []
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(fresh, 80, 24)),
         );
-        app.runtime.set_layout(layout);
-        assert!(app.runtime.set_focus(fresh));
+        app.runtime.borrow_mut().set_layout(layout);
+        assert!(app.runtime.borrow_mut().set_focus(fresh));
         assert!(drive_mod_char(&mut app, "@", false, true, true, false));
         assert_ne!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(fresh),
             "the user's symbol chord ran (focus_next)"
         );
         assert_eq!(
-            app.runtime.layout().leaf_count(),
+            app.runtime.borrow().layout().leaf_count(),
             2,
             "no move: both ws1 panes stay put"
         );
-        assert_eq!(app.runtime.active_workspace_index(), 0, "no switch either");
-        assert_eq!(app.runtime.workspace_count(), 2);
+        assert_eq!(
+            app.runtime.borrow().active_workspace_index(),
+            0,
+            "no switch either"
+        );
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert!(
-            app.runtime.drain_pending_input().is_empty(),
+            app.runtime.borrow_mut().drain_pending_input().is_empty(),
             "a consumed chord types nothing into the shell"
         );
         // A shifted symbol with no chord either way still routes to the PTY
@@ -11651,32 +12220,33 @@ claims = []
         // programmatic setup avoids testing the modal's swallowed mutation
         // path and leaves the real move chord as the behavior under test.
         app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
-        assert_eq!(app.runtime.workspace_count(), 2);
-        assert!(app.runtime.workspace_switch(0));
+        assert_eq!(app.runtime.borrow().workspace_count(), 2);
+        assert!(app.runtime.borrow_mut().workspace_switch(0));
         let moved = ViewId::new(9);
-        let focused = app.runtime.focused_view().expect("ws1 focus");
+        let focused = app.runtime.borrow().focused_view().expect("ws1 focus");
         let old = app
             .runtime
+            .borrow()
             .layout()
             .find_leaf(focused)
             .cloned()
             .expect("ws1 leaf present");
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(old),
             LayoutNode::leaf(View::new(moved, 80, 24)),
         ));
-        assert!(app.runtime.set_focus(moved));
+        assert!(app.runtime.borrow_mut().set_focus(moved));
         assert!(app.overlay_capture_active(), "setup must retain capture");
         let _ = app.drive_tick();
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "the active capture must surface the window-ID indicator"
         );
 
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             0,
             "setup must start in the source workspace"
         );
@@ -11690,26 +12260,26 @@ claims = []
             "a successful workspace move must release overlay capture"
         );
         assert_eq!(
-            app.runtime.active_workspace_index(),
+            app.runtime.borrow().active_workspace_index(),
             1,
             "the move must follow focus to the target workspace"
         );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(moved),
             "the moved pane must remain focused"
         );
         assert!(
-            app.runtime.layout().leaf_ids().contains(&moved),
+            app.runtime.borrow().layout().leaf_ids().contains(&moved),
             "the focused pane must be reparented into the target"
         );
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "surface removal follows the capture release on the next tick"
         );
         let _ = app.drive_tick();
         assert!(
-            app.runtime.plugin_overlay().is_none(),
+            app.runtime.borrow().plugin_overlay().is_none(),
             "the window-ID indicator must disappear after capture release"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -11728,11 +12298,11 @@ claims = []
         assert!(app.overlay_capture_active(), "setup must hold capture");
         let _ = app.drive_tick();
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "the active capture must surface the window-ID indicator"
         );
-        let leaves_before = app.runtime.layout().leaf_ids();
-        let ws_before = app.runtime.workspace_count();
+        let leaves_before = app.runtime.borrow().layout().leaf_ids();
+        let ws_before = app.runtime.borrow().workspace_count();
         // Index 0 fails closed at the top of the move path.
         let _ = app.apply_chrome_action(A::WorkspaceMove(0));
         // Beyond the workspace cap also fails closed.
@@ -11742,17 +12312,17 @@ claims = []
             "a refused workspace move must preserve overlay capture"
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             leaves_before,
             "a refused move must not touch the layout"
         );
         assert_eq!(
-            app.runtime.workspace_count(),
+            app.runtime.borrow().workspace_count(),
             ws_before,
             "a refused move must not create a workspace"
         );
         assert!(
-            app.runtime.plugin_overlay().is_some(),
+            app.runtime.borrow().plugin_overlay().is_some(),
             "the window-ID indicator must remain visible after a refused move"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -11774,21 +12344,30 @@ claims = []
         use bitty_config::ChromeAction;
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(two_pane_layout());
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
         // Gap-drag shapes: shrink then widen the primary pane through the
         // same layout funnel a divider drag uses.
-        app.runtime.set_layout(gap_resized_two_pane(0.2));
-        app.runtime.set_layout(gap_resized_two_pane(0.6));
         app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.2));
+        app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.6));
+        app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("primary shell spawns");
-        let primary = app.runtime.primary_view().expect("primary owner");
-        let tiled = (app.runtime.state().width(), app.runtime.state().height());
-        assert!(app.runtime.set_focus(primary));
+        let primary = app.runtime.borrow().primary_view().expect("primary owner");
+        let tiled = (
+            app.runtime.borrow().state().width(),
+            app.runtime.borrow().state().height(),
+        );
+        assert!(app.runtime.borrow_mut().set_focus(primary));
 
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         let full = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == primary)
@@ -11799,26 +12378,31 @@ claims = []
             "test shape must actually grow in at least one axis"
         );
         assert_eq!(
-            (app.runtime.state().width(), app.runtime.state().height()),
+            (
+                app.runtime.borrow().state().width(),
+                app.runtime.borrow().state().height()
+            ),
             (usize::from(full.cols), usize::from(full.rows)),
             "fullscreen primary grid must equal the full frame"
         );
         assert_eq!(
-            app.runtime.pty_size(),
+            app.runtime.borrow().pty_size(),
             Some((full.cols, full.rows)),
             "fullscreen primary winsize must equal the full frame"
         );
-        let leaf = app
-            .runtime
-            .layout()
-            .find_leaf(primary)
-            .expect("zoomed leaf");
-        assert_eq!((leaf.cols(), leaf.rows()), (full.cols, full.rows));
+        // CTX-1929: `find_leaf` hands back a reference into the runtime, so
+        // the guard and the read are scoped to this block.
+        let leaf_dims = {
+            let rt = app.runtime.borrow();
+            let leaf = rt.layout().find_leaf(primary).expect("zoomed leaf");
+            (leaf.cols(), leaf.rows())
+        };
+        assert_eq!(leaf_dims, (full.cols, full.rows));
 
         // Busy primary: the first close arms, the repeat confirms.
-        app.runtime.write_input(b"sleep 30\n");
+        app.runtime.borrow_mut().write_input(b"sleep 30\n");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.runtime.primary_foreground_job().is_none() {
+        while app.runtime.borrow().primary_foreground_job().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "primary job never started"
@@ -11827,16 +12411,16 @@ claims = []
         }
         let started = std::time::Instant::now();
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
         app.apply_chrome_action(ChromeAction::CloseView);
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "close from fullscreen must complete bounded, took {elapsed:?}"
         );
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert_eq!(app.runtime.leaf_count(), 1);
-        assert_ne!(app.runtime.primary_view(), Some(primary));
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
+        assert_ne!(app.runtime.borrow().primary_view(), Some(primary));
     }
 
     #[test]
@@ -11849,41 +12433,52 @@ claims = []
         // geometry.
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(gap_resized_two_pane(0.2));
-        app.runtime.set_layout(gap_resized_two_pane(0.55));
         app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.2));
+        app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.55));
+        app.runtime
+            .borrow_mut()
             .spawn_shell_with_args("/bin/sh", &[])
             .expect("primary shell spawns");
-        let primary = app.runtime.primary_view().expect("primary owner");
-        assert!(app.runtime.set_focus(primary));
+        let primary = app.runtime.borrow().primary_view().expect("primary owner");
+        assert!(app.runtime.borrow_mut().set_focus(primary));
         // Re-install the tiled shape after the spawn so the pre-fullscreen
         // grid and winsize are the post-gap-drag pair (the fresh spawn starts
         // at the container size before any layout sync).
-        app.runtime.set_layout(gap_resized_two_pane(0.55));
+        app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.55));
         let tiled = (
-            app.runtime.state().width(),
-            app.runtime.state().height(),
-            app.runtime.pty_size(),
+            app.runtime.borrow().state().width(),
+            app.runtime.borrow().state().height(),
+            app.runtime.borrow().pty_size(),
         );
 
         // Mod+F: modifier latch + the bound character, exactly the chord
         // `intercept_chrome_key` resolves from a physical key event.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let full = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == primary)
             .expect("zoomed primary frame");
         assert_eq!(
-            (app.runtime.state().width(), app.runtime.state().height()),
+            (
+                app.runtime.borrow().state().width(),
+                app.runtime.borrow().state().height()
+            ),
             (usize::from(full.cols), usize::from(full.rows)),
             "Mod+F fullscreen primary grid must equal the full frame"
         );
         assert_eq!(
-            app.runtime.pty_size(),
+            app.runtime.borrow().pty_size(),
             Some((full.cols, full.rows)),
             "Mod+F fullscreen primary winsize must equal the full frame"
         );
@@ -11891,12 +12486,12 @@ claims = []
 
         // Second Mod+F restores the pre-fullscreen tiled state exactly.
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             (
-                app.runtime.state().width(),
-                app.runtime.state().height(),
-                app.runtime.pty_size(),
+                app.runtime.borrow().state().width(),
+                app.runtime.borrow().state().height(),
+                app.runtime.borrow().pty_size(),
             ),
             tiled,
             "second Mod+F restores the tiled grid and winsize"
@@ -11913,23 +12508,26 @@ claims = []
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
         for line in 1..=200 {
             app.runtime
+                .borrow_mut()
                 .handle_pty_bytes(format!("Line {line}\r\n").as_bytes());
         }
-        let primary = app.runtime.primary_view().expect("primary owner");
-        let scrollback_before = app.runtime.state().scrollback_len();
+        let primary = app.runtime.borrow().primary_view().expect("primary owner");
+        let scrollback_before = app.runtime.borrow().state().scrollback_len();
         assert!(scrollback_before >= 150, "scrollback must exist");
         app.runtime
+            .borrow_mut()
             .layout_mut()
             .find_leaf_mut(primary)
             .expect("primary leaf")
             .set_scroll_offset(25, 1000);
-        assert!(app.runtime.set_focus(primary));
+        assert!(app.runtime.borrow_mut().set_focus(primary));
 
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(primary)
                 .expect("zoomed owner")
@@ -11938,15 +12536,16 @@ claims = []
             "zoom engage keeps the owner scroll offset"
         );
         assert!(
-            app.runtime.state().scrollback_len() >= scrollback_before,
+            app.runtime.borrow().state().scrollback_len() >= scrollback_before,
             "zoom engage must not drop scrollback lines"
         );
         assert!(!drive_chrome(&mut app, char_release("f")));
 
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime
+                .borrow()
                 .layout()
                 .find_leaf(primary)
                 .expect("restored owner")
@@ -11955,7 +12554,7 @@ claims = []
             "zoom restore keeps the owner scroll offset"
         );
         assert!(
-            app.runtime.state().scrollback_len() >= scrollback_before,
+            app.runtime.borrow().state().scrollback_len() >= scrollback_before,
             "zoom restore must not drop scrollback lines"
         );
         assert!(!drive_chrome(&mut app, char_release("f")));
@@ -11970,15 +12569,19 @@ claims = []
         // winsize, and presented frame must all follow the full frame.
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::WhenBusy);
-        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.2));
         let pane = ViewId::new(2);
         let tiled = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == pane)
             .expect("pane frame");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(
                 pane,
                 "/bin/sh",
@@ -11987,13 +12590,14 @@ claims = []
                 tiled.rows,
             )
             .expect("pane shell spawns");
-        assert!(app.runtime.set_focus(pane));
+        assert!(app.runtime.borrow_mut().set_focus(pane));
 
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let full = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == pane)
@@ -12003,11 +12607,15 @@ claims = []
             "pane must actually grow from the gap-resized tiled width"
         );
         assert_eq!(
-            app.runtime.pane_pty_size(&pane),
+            app.runtime.borrow().pane_pty_size(&pane),
             Some((full.cols, full.rows)),
             "Mod+F pane winsize must equal the full frame"
         );
-        let snapshot = app.runtime.pane_snapshot(&pane).expect("pane grid");
+        let snapshot = app
+            .runtime
+            .borrow()
+            .pane_snapshot(&pane)
+            .expect("pane grid");
         assert_eq!(
             (snapshot.width, snapshot.height),
             (usize::from(full.cols), usize::from(full.rows)),
@@ -12017,9 +12625,9 @@ claims = []
         // Second Mod+F restores the tiled pane geometry.
         assert!(!drive_chrome(&mut app, char_release("f")));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         assert_eq!(
-            app.runtime.pane_pty_size(&pane),
+            app.runtime.borrow().pane_pty_size(&pane),
             Some((tiled.cols, tiled.rows)),
             "second Mod+F restores the tiled pane winsize"
         );
@@ -12038,15 +12646,19 @@ claims = []
         use bitty_config::ChromeAction;
         require_pty!();
         let mut app = close_confirm_test_app(CloseConfirmMode::Always);
-        app.runtime.set_layout(gap_resized_two_pane(0.2));
+        app.runtime
+            .borrow_mut()
+            .set_layout(gap_resized_two_pane(0.2));
         let pane = ViewId::new(2);
         let tiled = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == pane)
             .expect("pane frame");
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(
                 pane,
                 "/bin/sh",
@@ -12055,34 +12667,42 @@ claims = []
                 tiled.rows,
             )
             .expect("pane shell spawns");
-        let pid = app.runtime.pane_pid(&pane).expect("pane child pid");
-        assert!(app.runtime.set_focus(pane));
+        let pid = app
+            .runtime
+            .borrow()
+            .pane_pid(&pane)
+            .expect("pane child pid");
+        assert!(app.runtime.borrow_mut().set_focus(pane));
 
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         let full = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == pane)
             .expect("zoomed pane frame");
         assert_eq!(
-            app.runtime.pane_pty_size(&pane),
+            app.runtime.borrow().pane_pty_size(&pane),
             Some((full.cols, full.rows)),
             "zoomed pane winsize must equal the full frame"
         );
 
         let started = std::time::Instant::now();
         app.apply_chrome_action(ChromeAction::CloseView);
-        assert!(app.runtime.has_pending_close_confirm());
+        assert!(app.runtime.borrow().has_pending_close_confirm());
         app.apply_chrome_action(ChromeAction::CloseView);
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(10),
             "close must complete bounded, took {elapsed:?}"
         );
-        assert!(!app.runtime.has_pending_close_confirm());
-        assert!(!app.runtime.has_pane_session(&pane), "session reaped");
-        assert_eq!(app.runtime.leaf_count(), 1);
+        assert!(!app.runtime.borrow().has_pending_close_confirm());
+        assert!(
+            !app.runtime.borrow().has_pane_session(&pane),
+            "session reaped"
+        );
+        assert_eq!(app.runtime.borrow().leaf_count(), 1);
 
         // The owned child must be gone, not a zombie left holding the PTY.
         // `/proc` is Linux-only; other Unix targets keep the session-drop
@@ -12137,15 +12757,15 @@ claims = []
             .find_leaf_mut(ViewId::new(1))
             .expect("leaf 1")
             .set_presentation(PresentationMode::Scratchpad);
-        app.runtime.set_layout(seeded);
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(seeded);
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(toggle.clone());
         assert!(
-            !app.runtime.scratchpad_occupied(),
+            !app.runtime.borrow().scratchpad_occupied(),
             "an empty unconfigured slot refuses the chord"
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)]
         );
 
@@ -12155,45 +12775,53 @@ claims = []
             bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
-            app.runtime.scratchpad_occupied(),
+            app.runtime.borrow().scratchpad_occupied(),
             "rule-stamped Scratchpad leaf must park into the scratchpad slot"
         );
         assert!(
             app.runtime
+                .borrow()
                 .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
 
         // 3. Hiding a shown scratchpad restores zoom first so the hide lands on
         // the real tree, not the zoom proxy.
-        assert!(app.runtime.set_focus(ViewId::new(2)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         app.apply_chrome_action(toggle.clone());
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "hiding the shown scratchpad must restore zoom first"
         );
-        assert!(app.runtime.scratchpad_occupied());
+        assert!(app.runtime.borrow().scratchpad_occupied());
         assert!(
             !app.runtime
+                .borrow()
                 .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
         );
 
         // 4. Showing with `focused_view()` == None (e.g. an emptied base) still
         // works: the window-global slot does not need a focused tiled leaf.
-        let mut empty = app.runtime.layout().clone();
+        let mut empty = app.runtime.borrow().layout().clone();
         empty.remove_leaf(ViewId::new(2));
-        app.runtime.set_layout_closing(empty, ViewId::new(2));
-        assert_eq!(app.runtime.focused_view(), None);
+        app.runtime
+            .borrow_mut()
+            .set_layout_closing(empty, ViewId::new(2));
+        assert_eq!(app.runtime.borrow().focused_view(), None);
         app.apply_chrome_action(toggle);
         assert!(
             app.runtime
+                .borrow()
                 .scratchpad_visible(bitty_runtime::DEFAULT_SCRATCHPAD)
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
         assert_eq!(
-            app.runtime.layout().leaf_count(),
+            app.runtime.borrow().layout().leaf_count(),
             0,
             "no tiled leaf is minted"
         );
@@ -12204,24 +12832,39 @@ claims = []
      {
         use bitty_config::{ChromeAction, SplitDir};
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
 
         // Detach leaf 1 into the workspace float store (`Alt+A`), refocus it,
         // and press `toggle_pinned`: it must pin cleanly into `pinned_views()`.
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert!(app.runtime.floated_views().contains(&ViewId::new(1)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(
+            app.runtime
+                .borrow()
+                .floated_views()
+                .contains(&ViewId::new(1))
+        );
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::TogglePinned);
-        assert!(!app.runtime.floated_views().contains(&ViewId::new(1)));
-        assert!(app.runtime.pinned_views().contains(&ViewId::new(1)));
+        assert!(
+            !app.runtime
+                .borrow()
+                .floated_views()
+                .contains(&ViewId::new(1))
+        );
+        assert!(
+            app.runtime
+                .borrow()
+                .pinned_views()
+                .contains(&ViewId::new(1))
+        );
 
         // While the pinned panel (outside `layout`) holds focus, `NewSplit` and
         // `NewPanel` must split the surviving tiled base (`ViewId(2)`).
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
         assert_eq!(
-            app.runtime.layout().leaf_count(),
+            app.runtime.borrow().layout().leaf_count(),
             2,
             "new_split while a pinned panel is focused must split the tiled base"
         );
@@ -12231,109 +12874,134 @@ claims = []
     fn chrome_scratchpad_named_verbs_park_hide_and_restore_3205() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
 
         // An empty, unconfigured default slot refuses the toggle without
         // stealing the focused pane or touching the layout.
         app.apply_chrome_action(ChromeAction::ScratchpadToggle(None));
-        assert!(!app.runtime.scratchpad_occupied());
-        assert_eq!(app.runtime.layout().leaf_ids().len(), 2);
+        assert!(!app.runtime.borrow().scratchpad_occupied());
+        assert_eq!(app.runtime.borrow().layout().leaf_ids().len(), 2);
 
         // `move_to_scratchpad:<name>` parks the focused pane into the slot and
         // shows it as a cross-workspace float overlay.
         app.apply_chrome_action(ChromeAction::ScratchpadMove(Some(String::from("logs"))));
-        assert!(app.runtime.scratchpad_visible("logs"));
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![ViewId::new(2)]);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(app.runtime.borrow().scratchpad_visible("logs"));
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![ViewId::new(2)]
+        );
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
         assert!(
-            !app.runtime.layout().leaf_ids().contains(&ViewId::new(1)),
+            !app.runtime
+                .borrow()
+                .layout()
+                .leaf_ids()
+                .contains(&ViewId::new(1)),
             "a shown scratchpad never re-enters the layout"
         );
 
         // The toggle hides it (parks the same id) without restoring to tiled.
         app.apply_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from("logs"))));
-        assert!(!app.runtime.scratchpad_visible("logs"));
-        assert!(app.runtime.scratchpad_has_name("logs"));
-        assert!(!app.runtime.layout().leaf_ids().contains(&ViewId::new(1)));
+        assert!(!app.runtime.borrow().scratchpad_visible("logs"));
+        assert!(app.runtime.borrow().scratchpad_has_name("logs"));
+        assert!(
+            !app.runtime
+                .borrow()
+                .layout()
+                .leaf_ids()
+                .contains(&ViewId::new(1))
+        );
 
         // `scratchpad_to_tiled` returns the same panel to the tiling.
         app.apply_chrome_action(ChromeAction::ScratchpadToTiled(Some(String::from("logs"))));
-        assert!(!app.runtime.scratchpad_has_name("logs"));
+        assert!(!app.runtime.borrow().scratchpad_has_name("logs"));
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)],
             "to_tiled docks before the recorded anchor"
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
     fn chrome_scratchpad_first_trigger_spawns_and_rolls_back_on_failure_3205() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
-        assert!(
-            app.runtime
-                .set_scratchpad_specs(vec![bitty_runtime::ScratchpadSpec {
-                    name: String::from("broken"),
-                    spawn: Some(bitty_runtime::ScratchpadSpawn::Pty {
-                        cmd: String::from("bitty-3205-definitely-not-a-program"),
-                        args: Vec::new(),
-                        cwd: None,
-                    }),
-                    geometry: bitty_ui::ScratchpadGeometry::default(),
-                },])
-        );
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
+        assert!(app.runtime.borrow_mut().set_scratchpad_specs(vec![
+            bitty_runtime::ScratchpadSpec {
+                name: String::from("broken"),
+                spawn: Some(bitty_runtime::ScratchpadSpawn::Pty {
+                    cmd: String::from("bitty-3205-definitely-not-a-program"),
+                    args: Vec::new(),
+                    cwd: None,
+                }),
+                geometry: bitty_ui::ScratchpadGeometry::default(),
+            },
+        ]));
 
         // The first trigger reserves the slot leaf and asks the app to spawn;
         // the spawn fails, so the slot rolls back instead of leaving an empty
         // floating ghost (layout/focus untouched).
-        let before = app.runtime.layout().clone();
+        let before = app.runtime.borrow().layout().clone();
         app.apply_chrome_action(ChromeAction::ScratchpadToggle(Some(String::from("broken"))));
-        assert!(!app.runtime.scratchpad_has_name("broken"));
-        assert_eq!(app.runtime.layout(), &before);
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert!(!app.runtime.borrow().scratchpad_has_name("broken"));
+        assert_eq!(app.runtime.borrow().layout(), &before);
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
     }
 
     #[test]
     fn chrome_move_split_and_toggle_split_swap_tiles_nudge_floats_and_flip_axis_3155() {
         use bitty_config::{ChromeAction, SplitDir};
         let mut app = workspace_test_app();
-        app.runtime.set_layout(two_pane_layout());
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        app.runtime.borrow_mut().set_layout(two_pane_layout());
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
 
         // Tiled swap: moving leaf 1 right swaps it with leaf 2 and keeps focus on leaf 1.
         app.apply_chrome_action(ChromeAction::MoveSplit(SplitDir::Right));
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(2), ViewId::new(1)]
         );
-        assert_eq!(app.runtime.focused_view(), Some(ViewId::new(1)));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(1)));
 
         // ToggleSplit flips the enclosing Horizontal split to Vertical.
         assert_eq!(
-            app.runtime.layout().leaf_parent_axis(ViewId::new(1)),
+            app.runtime
+                .borrow()
+                .layout()
+                .leaf_parent_axis(ViewId::new(1)),
             Some(SplitAxis::Horizontal)
         );
         app.apply_chrome_action(ChromeAction::ToggleSplit);
         assert_eq!(
-            app.runtime.layout().leaf_parent_axis(ViewId::new(1)),
+            app.runtime
+                .borrow()
+                .layout()
+                .leaf_parent_axis(ViewId::new(1)),
             Some(SplitAxis::Vertical)
         );
 
         // Floating nudge: detaching leaf 1 and moving it right nudges its anchored rect.
         app.apply_chrome_action(ChromeAction::ToggleFloating);
-        assert!(app.runtime.floated_views().contains(&ViewId::new(1)));
-        assert!(app.runtime.set_focus(ViewId::new(1)));
+        assert!(
+            app.runtime
+                .borrow()
+                .floated_views()
+                .contains(&ViewId::new(1))
+        );
+        assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         let before = app
             .runtime
+            .borrow()
             .anchored_overlay_cell_rect(ViewId::new(1))
             .expect("float rect");
         app.apply_chrome_action(ChromeAction::MoveSplit(SplitDir::Right));
         let after = app
             .runtime
+            .borrow()
             .anchored_overlay_cell_rect(ViewId::new(1))
             .expect("float rect after move");
         assert!(
@@ -12415,6 +13083,7 @@ claims = []
 
     fn tab_strip(app: &TerminalApp) -> Vec<u64> {
         app.runtime
+            .borrow()
             .tab_snapshot()
             .expect("a tab action installed a strip")
             .tabs()
@@ -12428,26 +13097,32 @@ claims = []
         use bitty_config::ChromeAction;
         let mut app = tab_test_app();
         assert!(
-            app.runtime.tab_snapshot().is_none(),
+            app.runtime.borrow().tab_snapshot().is_none(),
             "the strip is projected on the first tab action"
         );
 
         // `tab_next`: cycle to the next projection; focus follows the commit.
         assert!(!app.apply_chrome_action(ChromeAction::TabNext));
         assert_eq!(tab_strip(&app), vec![1, 2]);
-        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+        assert_eq!(
+            app.runtime.borrow().focused_view().map(|view| view.0),
+            Some(2)
+        );
 
         // `tab_close`: close the active projection (p:2), focus falls back.
         assert!(!app.apply_chrome_action(ChromeAction::TabClose));
         assert_eq!(tab_strip(&app), vec![1]);
-        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+        assert_eq!(
+            app.runtime.borrow().focused_view().map(|view| view.0),
+            Some(1)
+        );
 
         // `tab_open`: re-attach the projection the close detached.
         assert!(!app.apply_chrome_action(ChromeAction::TabOpen));
         assert_eq!(tab_strip(&app), vec![1, 2]);
 
         // The layout is untouched: every action went through the commit gate.
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
     }
 
     #[test]
@@ -12459,7 +13134,10 @@ claims = []
         // neighbour that takes its slot keeps the activation.
         assert!(!app.apply_chrome_action(ChromeAction::TabClose));
         assert_eq!(tab_strip(&app), vec![2], "close the active tab");
-        assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+        assert_eq!(
+            app.runtime.borrow().focused_view().map(|view| view.0),
+            Some(2)
+        );
 
         // Closing the last tab is the typed `LastTab` refusal: the chord does
         // not exit the window (that is `close_view`), and the strip is intact.
@@ -12477,7 +13155,7 @@ claims = []
         // same gate.
         assert!(!app.apply_chrome_action(ChromeAction::TabOpen));
         assert_eq!(tab_strip(&app), vec![2, 1]);
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
     }
 
     #[test]
@@ -12486,7 +13164,9 @@ claims = []
         use bitty_runtime::{LayoutNode, PresentationMode, SplitAxis, View, ViewId};
 
         let mut app = tab_test_app();
-        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime
+            .borrow_mut()
+            .set_container(bitty_ui::Rect::new(0, 0, 80, 24));
         let mut tree = LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
@@ -12496,11 +13176,12 @@ claims = []
         tree.find_leaf_mut(ViewId::new(2))
             .unwrap()
             .set_presentation(PresentationMode::Floating);
-        app.runtime.set_layout(tree);
-        app.runtime.set_focus(ViewId::new(2));
+        app.runtime.borrow_mut().set_layout(tree);
+        app.runtime.borrow_mut().set_focus(ViewId::new(2));
 
         let before = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(2))
@@ -12509,9 +13190,10 @@ claims = []
 
         // First ToggleZoom expands the PresentationMode::Floating panel to full workspace.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let zoomed = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(2))
@@ -12524,9 +13206,10 @@ claims = []
 
         // Second ToggleZoom restores PresentationMode::Floating.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let restored = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(2))
@@ -12604,7 +13287,8 @@ claims = []
     /// without a POSIX shell (`-D warnings` in the Windows leg).
     #[cfg(unix)]
     fn pane_glyphs(app: &TerminalApp, view: ViewId) -> String {
-        match app.runtime.pane_snapshot(&view) {
+        let scrutinee = app.runtime.borrow().pane_snapshot(&view);
+        match scrutinee {
             Some(snapshot) => snapshot.cells.iter().map(|cell| cell.glyph).collect(),
             None => String::new(),
         }
@@ -12639,13 +13323,24 @@ claims = []
             view,
         );
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
             .expect("the panel leaf owns a shell");
-        app.runtime.handle_pane_bytes(view, b"before-close\r\n");
-        app.runtime.tick().expect("the pane frame");
+        app.runtime
+            .borrow_mut()
+            .handle_pane_bytes(view, b"before-close\r\n");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
 
-        let pid = app.runtime.pane_pid(&view).expect("live pane child");
-        let winsize = app.runtime.pane_pty_size(&view).expect("live winsize");
+        let pid = app
+            .runtime
+            .borrow()
+            .pane_pid(&view)
+            .expect("live pane child");
+        let winsize = app
+            .runtime
+            .borrow()
+            .pane_pty_size(&view)
+            .expect("live winsize");
         let glyphs = pane_glyphs(&app, view);
         assert!(
             glyphs.contains("before-close"),
@@ -12653,9 +13348,10 @@ claims = []
         );
 
         app.runtime
+            .borrow_mut()
             .present_panel_content(view, content_layer("dashboard"))
             .expect("the panel presents a layer over its own terminal");
-        assert!(app.runtime.content_layer_presented(view));
+        assert!(app.runtime.borrow().content_layer_presented(view));
 
         // First press: the layer is given back, nothing is closed.
         assert!(
@@ -12663,23 +13359,23 @@ claims = []
             "releasing the layer is not a close"
         );
         assert!(
-            !app.runtime.content_layer_presented(view),
+            !app.runtime.borrow().content_layer_presented(view),
             "the close press must release the presented layer"
         );
         assert_eq!(
-            app.runtime.panel_content_kind(view),
+            app.runtime.borrow().panel_content_kind(view),
             Some(ViewContent::Terminal(view.0)),
             "the container is terminal-backed again"
         );
-        assert_eq!(app.runtime.leaf_count(), 2, "the leaf stays open");
-        assert_eq!(app.runtime.focused_view(), Some(view));
+        assert_eq!(app.runtime.borrow().leaf_count(), 2, "the leaf stays open");
+        assert_eq!(app.runtime.borrow().focused_view(), Some(view));
         assert_eq!(
-            app.runtime.pane_pid(&view),
+            app.runtime.borrow().pane_pid(&view),
             Some(pid),
             "the displaced child was never killed"
         );
         assert_eq!(
-            app.runtime.pane_pty_size(&view),
+            app.runtime.borrow().pane_pty_size(&view),
             Some(winsize),
             "the winsize the layer froze is exactly the one that comes back"
         );
@@ -12689,7 +13385,7 @@ claims = []
             "the restored grid is byte-identical"
         );
         {
-            let host = app.runtime.scene_host().expect("panel host");
+            let host = app.runtime.borrow().scene_host().expect("panel host");
             let host = host.borrow();
             assert_eq!(
                 host.placement_view_of(panel),
@@ -12706,9 +13402,13 @@ claims = []
         // Second press: nothing left to restore, so it is the close it always
         // was.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
-        assert_eq!(app.runtime.leaf_count(), 1, "the second press closes");
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "the second press closes"
+        );
         assert!(
-            app.runtime.pane_pid(&view).is_none(),
+            app.runtime.borrow().pane_pid(&view).is_none(),
             "closing the panel tears down its shell"
         );
     }
@@ -12727,17 +13427,18 @@ claims = []
 
         let view = ViewId::new(1);
         let (mut app, _panel) = panel_close_app(LayoutNode::leaf(View::new(view, 80, 24)), view);
-        app.runtime.tick().expect("the primary frame");
+        app.runtime.borrow_mut().tick().expect("the primary frame");
         app.runtime
+            .borrow_mut()
             .present_panel_content(view, content_layer("dashboard"))
             .expect("the primary panel presents a layer");
-        assert!(app.runtime.content_layer_presented(view));
+        assert!(app.runtime.borrow().content_layer_presented(view));
 
         assert!(
             !app.apply_chrome_action(ChromeAction::CloseView),
             "the first press must give the layer back, not exit out from under it"
         );
-        assert!(!app.runtime.content_layer_presented(view));
+        assert!(!app.runtime.borrow().content_layer_presented(view));
 
         assert!(
             app.apply_chrome_action(ChromeAction::CloseView),
@@ -12769,9 +13470,10 @@ claims = []
             view,
         );
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
             .expect("the panel leaf owns a shell");
-        app.runtime.tick().expect("the pane frame");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
         let owner = bitty_plugin_host::manifest::PluginId::new("xuepoo.widget").expect("plugin id");
         let node = bitty_lua::UiRichNode::Text {
             text: String::from("dashboard"),
@@ -12779,10 +13481,11 @@ claims = []
         };
         let handle = app
             .runtime
+            .borrow_mut()
             .ui_panel_present(&owner, 1, &bitty_lua::UiPanelSpec::new(), &node)
             .expect("the plugin presents on the focused panel");
-        assert!(app.runtime.content_layer_presented(view));
-        assert_eq!(app.runtime.ui_panel_layer_count(), 1);
+        assert!(app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(app.runtime.borrow().ui_panel_layer_count(), 1);
 
         app.close_plugin_panel_leaf(panel, Some(view));
 
@@ -12791,18 +13494,23 @@ claims = []
         // on a close that released nothing. The pruned owner row and the
         // remembered `closed` reason are the discriminating observables.
         assert_eq!(
-            app.runtime.ui_panel_layer_count(),
+            app.runtime.borrow().ui_panel_layer_count(),
             0,
             "the close released the layer, so the owner's row is gone"
         );
         assert_eq!(
             app.runtime
+                .borrow()
                 .ui_panel_release_record(handle)
                 .map(|record| record.reason.as_str()),
             Some("closed"),
             "the owner learns its layer was released because the panel closed"
         );
-        assert_eq!(app.runtime.leaf_count(), 1, "and then retires the leaf");
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "and then retires the leaf"
+        );
     }
 
     /// bitty#2388 (CTX-1912): the close's restore has to *move* the PTY back,
@@ -12833,24 +13541,34 @@ claims = []
             view,
         );
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
             .expect("the panel leaf owns a shell");
-        app.runtime.handle_pane_bytes(view, b"before-layer\r\n");
-        app.runtime.tick().expect("the pane frame");
-        let frozen = app.runtime.pane_pty_size(&view).expect("live winsize");
+        app.runtime
+            .borrow_mut()
+            .handle_pane_bytes(view, b"before-layer\r\n");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
+        let frozen = app
+            .runtime
+            .borrow()
+            .pane_pty_size(&view)
+            .expect("live winsize");
 
         app.runtime
+            .borrow_mut()
             .present_panel_content(view, content_layer("dashboard"))
             .expect("the panel presents a layer over its own terminal");
 
         // The gesture the freeze exists for: the leaf's frame moves, the PTY
         // must not.
         app.runtime
+            .borrow_mut()
             .handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
             .expect("window resize applies");
-        app.runtime.tick().expect("the reflowed frame");
+        app.runtime.borrow_mut().tick().expect("the reflowed frame");
         let frame = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|frame| frame.view == view)
@@ -12861,12 +13579,12 @@ claims = []
             "the gesture must move the leaf, or the restore resize proves nothing"
         );
         assert_eq!(
-            app.runtime.pane_pty_size(&view),
+            app.runtime.borrow().pane_pty_size(&view),
             Some(frozen),
             "the hidden PTY keeps its frozen winsize"
         );
         assert_eq!(
-            app.runtime.content_restore_resizes(),
+            app.runtime.borrow().content_restore_resizes(),
             0,
             "no restore has run yet"
         );
@@ -12874,22 +13592,26 @@ claims = []
         // First press: the layer goes, the pane stays — restored, not frozen.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
         assert_eq!(
-            app.runtime.content_restore_resizes(),
+            app.runtime.borrow().content_restore_resizes(),
             1,
             "the release resized the PTY it froze (measured on the kernel side)"
         );
         assert_eq!(
-            app.runtime.pane_pty_size(&view),
+            app.runtime.borrow().pane_pty_size(&view),
             Some((frame.cols, frame.rows)),
             "the PTY comes back at the leaf's current content rect"
         );
         assert_eq!(
-            app.runtime.pane_snapshot(&view).expect("pane grid").width,
+            app.runtime
+                .borrow()
+                .pane_snapshot(&view)
+                .expect("pane grid")
+                .width,
             usize::from(frame.cols),
             "and the grid was repainted at that width, not left frozen"
         );
         assert_eq!(
-            app.runtime.panel_content_kind(view),
+            app.runtime.borrow().panel_content_kind(view),
             Some(bitty_runtime::registry::ViewContent::Terminal(view.0)),
             "the container is terminal-backed again"
         );
@@ -12919,20 +13641,22 @@ claims = []
             view,
         );
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
             .expect("the panel leaf owns a shell");
-        app.runtime.tick().expect("the pane frame");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
 
         app.runtime
+            .borrow_mut()
             .present_panel_content(view, content_layer("dashboard"))
             .expect("the panel presents a layer over its own terminal");
-        let swallowed = app.runtime.content_input_swallowed();
+        let swallowed = app.runtime.borrow().content_input_swallowed();
         assert!(
             !drive_chrome(&mut app, char_press("q", "q", false)),
             "a plain character is no chrome chord"
         );
         assert_eq!(
-            app.runtime.content_input_swallowed(),
+            app.runtime.borrow().content_input_swallowed(),
             swallowed + 1,
             "a presented layer owns the keys"
         );
@@ -12940,7 +13664,7 @@ claims = []
         // First press: the layer goes, the shell stays and owns the keyboard.
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
         assert!(
-            !app.runtime.content_layer_presented(view),
+            !app.runtime.borrow().content_layer_presented(view),
             "the release is what lifted the input gate"
         );
 
@@ -12962,7 +13686,7 @@ claims = []
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(
-            app.runtime.content_input_swallowed(),
+            app.runtime.borrow().content_input_swallowed(),
             swallowed + 1,
             "only the presented keypress was swallowed; the rest reached the PTY"
         );
@@ -12974,22 +13698,26 @@ claims = []
         use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
 
         let mut app = tab_test_app();
-        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime
+            .borrow_mut()
+            .set_container(bitty_ui::Rect::new(0, 0, 80, 24));
         let tree = LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
             LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
         );
-        app.runtime.set_layout(tree);
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_layout(tree);
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
         app.runtime
+            .borrow_mut()
             .float_detach(ViewId::new(1))
             .expect("detach must succeed");
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
 
         let before = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(1))
@@ -12997,9 +13725,10 @@ claims = []
 
         // First ToggleZoom fills the container.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let zoomed = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(1))
@@ -13008,9 +13737,10 @@ claims = []
 
         // Second ToggleZoom restores the detached float geometry.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime));
+        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
         let restored = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(1))
@@ -13032,21 +13762,25 @@ claims = []
         use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
 
         let mut app = workspace_test_app();
-        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime
+            .borrow_mut()
+            .set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
             LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
         ));
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
         app.runtime
+            .borrow_mut()
             .float_detach(ViewId::new(1))
             .expect("detach must succeed");
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
 
         let before = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(1))
@@ -13056,7 +13790,10 @@ claims = []
         // backup_leaf_count must be 1 (preserving StrandedLayout single-leaf
         // guards) and effective_window_leaf_count must be 2 (1 tiled + 1 float).
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(1));
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            Some(1)
+        );
         assert_eq!(app.effective_window_leaf_count(), 2);
 
         // Switching to a second workspace makes workspace 1 inactive;
@@ -13066,12 +13803,13 @@ claims = []
         assert!(
             app.chrome
                 .zoom
-                .restore_for_view_mutation(&mut app.runtime, ViewId::new(1)),
+                .restore_for_view_mutation(&mut app.runtime.borrow_mut(), ViewId::new(1)),
             "inactive workspace detached float must unzoom cleanly"
         );
         app.apply_chrome_action(ChromeAction::WorkspaceFocus(1));
         let restored = app
             .runtime
+            .borrow()
             .present_frames()
             .into_iter()
             .find(|f| f.view == ViewId::new(1))
@@ -13093,24 +13831,30 @@ claims = []
         use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
 
         let mut app = tab_test_app();
-        app.runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
-        app.runtime.set_layout(LayoutNode::split(
+        app.runtime
+            .borrow_mut()
+            .set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        app.runtime.borrow_mut().set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
             LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
         ));
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
         app.runtime
+            .borrow_mut()
             .float_detach(ViewId::new(1))
             .expect("detach must succeed");
         // Close the sole tiled leaf so the detached float is the only pane in
         // the window, then zoom it.
-        app.runtime.set_focus(ViewId::new(2));
+        app.runtime.borrow_mut().set_focus(ViewId::new(2));
         app.apply_chrome_action(ChromeAction::CloseView);
-        app.runtime.set_focus(ViewId::new(1));
+        app.runtime.borrow_mut().set_focus(ViewId::new(1));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(0));
+        assert_eq!(
+            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            Some(0)
+        );
         assert_eq!(app.effective_window_leaf_count(), 1);
     }
 }

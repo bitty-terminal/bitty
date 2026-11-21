@@ -1493,6 +1493,7 @@ fn dispatch_tab_request(
 #[cfg(unix)]
 fn tab_strip(app: &crate::terminal_app::TerminalApp) -> Vec<u64> {
     app.runtime
+        .borrow()
         .tab_snapshot()
         .expect("a tab request installed a strip")
         .tabs()
@@ -1505,7 +1506,10 @@ fn tab_strip(app: &crate::terminal_app::TerminalApp) -> Vec<u64> {
 #[test]
 fn control_tab_verbs_drive_the_validated_commit_path() {
     let mut app = tab_test_app();
-    assert!(app.runtime.tab_snapshot().is_none(), "lazy projection");
+    assert!(
+        app.runtime.borrow().tab_snapshot().is_none(),
+        "lazy projection"
+    );
     let (context, _peer) = tab_serve_context();
 
     // close: detaches the background projection, keeps p:1 active.
@@ -1516,14 +1520,20 @@ fn control_tab_verbs_drive_the_validated_commit_path() {
         "the receipt reports the committed transition: {receipt}"
     );
     assert_eq!(tab_strip(&app), vec![1]);
-    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+    assert_eq!(
+        app.runtime.borrow().focused_view().map(|view| view.0),
+        Some(1)
+    );
 
     // open: re-attaches the projection through the same commit gate.
     let (open, _) = parse_ctl_request(&words(&["tab", "open", "p:2"])).expect("parses");
     let receipt = dispatch_tab_request(&mut app, &open, &context).expect("open applied");
     assert!(receipt.contains("\"verb\":\"open\""), "{receipt}");
     assert_eq!(tab_strip(&app), vec![1, 2]);
-    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(2));
+    assert_eq!(
+        app.runtime.borrow().focused_view().map(|view| view.0),
+        Some(2)
+    );
 
     // switch: moves only the active index, focus follows (the commit refuses
     // anything else).
@@ -1531,10 +1541,13 @@ fn control_tab_verbs_drive_the_validated_commit_path() {
     let receipt = dispatch_tab_request(&mut app, &switch, &context).expect("switch applied");
     assert!(receipt.contains("\"verb\":\"switch\""), "{receipt}");
     assert_eq!(tab_strip(&app), vec![1, 2], "a switch never reorders");
-    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+    assert_eq!(
+        app.runtime.borrow().focused_view().map(|view| view.0),
+        Some(1)
+    );
 
     // The layout tree is untouched: a tab verb never edits it.
-    assert_eq!(app.runtime.layout().leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
 }
 
 #[cfg(unix)]
@@ -1554,7 +1567,10 @@ fn control_tab_refusals_are_typed_and_leave_state_alone() {
     );
     assert!(error.message.contains("unknown tab"), "{}", error.message);
     assert_eq!(tab_strip(&app), vec![1, 2]);
-    assert_eq!(app.runtime.focused_view().map(|view| view.0), Some(1));
+    assert_eq!(
+        app.runtime.borrow().focused_view().map(|view| view.0),
+        Some(1)
+    );
 
     // Closing the last tab: Conflict naming the pane verb instead.
     let (close, _) = parse_ctl_request(&words(&["tab", "close", "p:2"])).expect("parses");
@@ -2083,16 +2099,20 @@ fn control_view_split_matches_keymap_new_split() {
     app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
     let key_view = ViewId::new(2);
     assert!(
-        app.runtime.has_pane_session(&key_view),
+        app.runtime.borrow().has_pane_session(&key_view),
         "keymap split must own a shell"
     );
-    assert_eq!(app.runtime.focused_view(), Some(key_view));
-    let key_pid = app.runtime.pane_pid(&key_view).expect("keymap pane pid");
+    assert_eq!(app.runtime.borrow().focused_view(), Some(key_view));
+    let key_pid = app
+        .runtime
+        .borrow()
+        .pane_pid(&key_view)
+        .expect("keymap pane pid");
     // Ctl path on the same runtime: v:3 owns its own child and is focused.
     let all = bitty_ipc::ScopeSet::all();
     let split = ipc_ctl::params_split(ipc_ctl::SplitDirection::Right);
     let done = apply_control_envelope(
-        &mut app.runtime,
+        &mut app.runtime.borrow_mut(),
         ipc_ctl::METHOD_SPLIT_VIEW,
         Some(&split),
         &all,
@@ -2100,15 +2120,19 @@ fn control_view_split_matches_keymap_new_split() {
     assert!(done.ok, "ctl split must succeed: {done:?}");
     let ctl_view = ViewId::new(3);
     assert!(
-        app.runtime.has_pane_session(&ctl_view),
+        app.runtime.borrow().has_pane_session(&ctl_view),
         "ctl split must own a shell"
     );
-    assert_eq!(app.runtime.focused_view(), Some(ctl_view));
-    let ctl_pid = app.runtime.pane_pid(&ctl_view).expect("ctl split pane pid");
+    assert_eq!(app.runtime.borrow().focused_view(), Some(ctl_view));
+    let ctl_pid = app
+        .runtime
+        .borrow()
+        .pane_pid(&ctl_view)
+        .expect("ctl split pane pid");
     assert_ne!(key_pid, ctl_pid, "each split owns its own child");
     // Both creation paths keep the canonical side-by-side axis.
-    assert_side_by_side(&app.runtime, 1, 2, "keymap split Right");
-    assert_side_by_side(&app.runtime, 2, 3, "ctl split Right");
+    assert_side_by_side(&app.runtime.borrow(), 1, 2, "keymap split Right");
+    assert_side_by_side(&app.runtime.borrow(), 2, 3, "ctl split Right");
 }
 
 #[cfg(unix)]

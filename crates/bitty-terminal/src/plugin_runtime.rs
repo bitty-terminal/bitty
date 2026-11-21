@@ -27,8 +27,8 @@ use bitty_runtime::plugin_runtime::{
     LifecycleState, LuaValue, PaneCwdSource, PanelCloseHandler, PanelCreateHandler, PanelEdgeBind,
     PanelEdgeRelease, PanelEdgeReport, PanelEdgeResume, PanelEdgeSuspend, PanelGenerationPort,
     PanelPinHandler, PanelPinQueue, PanelSceneBackend, PluginRuntime, PluginRuntimeConfig,
-    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
-    WorkspaceInfo, WorkspaceSource, adopt_legacy_store, controller_generation,
+    QueuedPinRequest, RuntimePanelContentBackend, SnapshotSource, TargetSource, TranscriptHistory,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceSource, adopt_legacy_store, controller_generation,
 };
 use bitty_runtime::registry::{
     Generation, PANEL_PROVIDER_CAPABILITY, PanelError, PanelId, PanelRegistryConfig, PanelRuntime,
@@ -1888,6 +1888,16 @@ pub(crate) struct StartupSeed<'a> {
     /// presents; the tick loop keeps it live. `None` fails the create closed
     /// with `E_UI_UNAVAILABLE` rather than allocating an unattributed record.
     pub(crate) focused_workspace: Option<WorkspaceId>,
+    /// Shared handle to the Core runtime the app owns (bitty#2388, CTX-1929).
+    ///
+    /// `Some` installs `RuntimePanelContentBackend` before activation, so a
+    /// generation granted `ui.rich` + `ui.panel` reaches the real
+    /// `Runtime::ui_panel_present` swap through the same handle the app
+    /// drives. `None` (safe mode, a test, a caller that owns no runtime)
+    /// leaves the backend unwired and every `bitty.ui.panel.*` verb fails
+    /// closed with `E_UI_UNAVAILABLE`, exactly like every other unhosted
+    /// surface.
+    pub(crate) shared_runtime: Option<std::rc::Rc<std::cell::RefCell<bitty_runtime::Runtime>>>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -2131,6 +2141,19 @@ pub(crate) fn discover_with_roots(
             (None, None)
         }
     };
+    // bitty#2388 (CTX-1929): install the panel content presentation backend
+    // over the SAME shared runtime handle the app owns, so a generation
+    // granted `ui.rich` + `ui.panel` reaches the real
+    // `Runtime::ui_panel_present` swap — the only path to the Core content
+    // layer — instead of failing closed with `E_UI_UNAVAILABLE`. Installed
+    // before activation per the `set_panel_content_backend` contract; the
+    // backend itself is a forwarder (it resolves no panel, grants nothing),
+    // and a reentrant call fails closed through its `try_borrow_mut`. A seed
+    // without the handle (safe mode, a caller that owns no runtime) leaves
+    // the verb failing closed, like every other unhosted surface.
+    if let Some(shared) = seed.shared_runtime.clone() {
+        runtime.set_panel_content_backend(Some(Rc::new(RuntimePanelContentBackend::new(shared))));
+    }
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the
     // RC-1 accounting; only the atomic-commit bytes flow through here.
@@ -2964,6 +2987,7 @@ mod tests {
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3042,6 +3066,7 @@ mod tests {
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3160,6 +3185,7 @@ mod tests {
         context: &'a crate::runtime_inspect::RuntimeInspectContext,
     ) -> StartupSeed<'a> {
         StartupSeed {
+            shared_runtime: None,
             workspaces: &[],
             keymaps: &[],
             targets: &[],
@@ -3317,6 +3343,7 @@ mod tests {
         let table = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
             .expect("defaults");
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &[],
             keymaps: &table,
             targets: &[],
@@ -3541,6 +3568,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3618,6 +3646,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3694,6 +3723,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3748,8 +3778,8 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         );
         let pin_state = app.live_pin_state.clone().expect("pin state");
         pin_state.publish(
-            &app.runtime.layout().leaf_ids(),
-            &app.runtime.pinned_views(),
+            &app.runtime.borrow().layout().leaf_ids(),
+            &app.runtime.borrow().pinned_views(),
         );
     }
 
@@ -3765,11 +3795,11 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             "granted pin queues"
         );
         assert!(
-            app.runtime.pinned_views().is_empty(),
+            app.runtime.borrow().pinned_views().is_empty(),
             "nothing applies before the tick drain"
         );
         drain_pin_tick(&mut app);
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
         // The tick republished the snapshot, so a re-pin holds without
         // queueing and an unknown id still fails closed synchronously.
         assert_eq!(
@@ -3783,16 +3813,16 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             "unknown id fails closed"
         );
         drain_pin_tick(&mut app);
-        assert_eq!(app.runtime.pinned_views(), vec![ViewId::new(1)]);
+        assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
         assert_eq!(
             dispatch_pin(&mut app, "xuepoo.prodpin", "unpin"),
             "OK:true",
             "granted unpin queues"
         );
         drain_pin_tick(&mut app);
-        assert!(app.runtime.pinned_views().is_empty());
+        assert!(app.runtime.borrow().pinned_views().is_empty());
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)],
             "unpin restores the floating panel to the live layout"
         );
@@ -3836,11 +3866,11 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
         );
         drain_pin_tick(&mut app);
         assert!(
-            app.runtime.pinned_views().is_empty(),
+            app.runtime.borrow().pinned_views().is_empty(),
             "pin-then-unpin in one tick ends unpinned"
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)],
             "the transient pin leaves no layout trace"
         );
@@ -3861,9 +3891,9 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             "ERR:E_CAPABILITY_DENIED"
         );
         drain_pin_tick(&mut app);
-        assert!(app.runtime.pinned_views().is_empty());
+        assert!(app.runtime.borrow().pinned_views().is_empty());
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)]
         );
     }
@@ -3927,6 +3957,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -3986,6 +4017,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         );
         assert!(
             app.runtime
+                .borrow()
                 .fx_progress(ViewId::new(1), std::time::Instant::now())
                 .is_none(),
             "nothing arms before the tick drain"
@@ -3993,6 +4025,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         drain_fx_tick(&mut app);
         assert!(
             app.runtime
+                .borrow()
                 .fx_progress(ViewId::new(1), std::time::Instant::now())
                 .is_some(),
             "the drain arms the pulse on the live leaf"
@@ -4007,6 +4040,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         drain_fx_tick(&mut app);
         assert!(
             app.runtime
+                .borrow()
                 .fx_progress(ViewId::new(404), std::time::Instant::now())
                 .is_none(),
             "a vanished target never arms"
@@ -4031,11 +4065,12 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
         drain_fx_tick(&mut app);
         assert!(
             app.runtime
+                .borrow()
                 .fx_progress(ViewId::new(1), std::time::Instant::now())
                 .is_none()
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![ViewId::new(1), ViewId::new(2)]
         );
     }
@@ -4094,6 +4129,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4160,12 +4196,12 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         );
         println!("startup submit: settled parked={parked} resumes={resumes}");
         assert!(
-            app.runtime.pending_input().is_empty(),
+            app.runtime.borrow().pending_input().is_empty(),
             "nothing lands before the tick drain"
         );
         app.apply_plugin_submit_requests();
         assert_eq!(
-            app.runtime.pending_input(),
+            app.runtime.borrow().pending_input(),
             b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
             "the drain writes the byte-exact paste frame"
         );
@@ -4185,7 +4221,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
         );
         app.apply_plugin_submit_requests();
         assert_eq!(
-            app.runtime.pending_input(),
+            app.runtime.borrow().pending_input(),
             b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
             "denials emit nothing"
         );
@@ -4207,7 +4243,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             "ABSENT"
         );
         app.apply_plugin_submit_requests();
-        assert!(app.runtime.pending_input().is_empty());
+        assert!(app.runtime.borrow().pending_input().is_empty());
     }
 
     // ── bitty #2409: deterministic Parked -> one resume -> byte-exact submit
@@ -4334,11 +4370,11 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
             "the park is recorded exactly once"
         );
         assert!(
-            app.runtime.pending_input().is_empty(),
+            app.runtime.borrow().pending_input().is_empty(),
             "a park lands no terminal bytes"
         );
         assert!(
-            app.runtime.notification_banner().is_none(),
+            app.runtime.borrow().notification_banner().is_none(),
             "a park surfaces no result before the cold-tick resume"
         );
 
@@ -4397,7 +4433,7 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
 
         app.apply_plugin_submit_requests();
         assert_eq!(
-            app.runtime.pending_input(),
+            app.runtime.borrow().pending_input(),
             b"\x1b[200~cargo test\x1b[201~\r".as_slice(),
             "the resumed submit is still the byte-exact paste frame"
         );
@@ -4412,6 +4448,7 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
         );
         let banner = app
             .runtime
+            .borrow()
             .notification_banner()
             .expect("the resumed result surfaces exactly once");
         assert!(
@@ -4495,6 +4532,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4745,6 +4783,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4845,6 +4884,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -4952,6 +4992,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let leaves = live.layout().leaf_ids();
         let pinned = live.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -5238,6 +5279,7 @@ error("activation fails after mounting the terminal slot scene")
         let leaves = rt.layout().leaf_ids();
         let pinned = rt.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -5340,9 +5382,9 @@ error("activation fails after mounting the terminal slot scene")
         );
         // No command ran: the mount happened inside `init.lua`, before the app
         // existed, and the seeded placement target routed it.
-        let view = app.runtime.focused_view().expect("focused leaf");
+        let view = app.runtime.borrow().focused_view().expect("focused leaf");
         app.drive_tick().expect("first frame presents");
-        let report = app.runtime.scene_frame().clone();
+        let report = app.runtime.borrow().scene_frame().clone();
         assert_eq!(report.views, 1);
         assert!(
             report.a11y[0]
@@ -5384,7 +5426,7 @@ error("activation fails after mounting the terminal slot scene")
         );
         app.drive_tick().expect("first frame presents");
         assert_eq!(
-            app.runtime.scene_frame().views,
+            app.runtime.borrow().scene_frame().views,
             0,
             "a failed generation's scene must not paint"
         );
@@ -5406,7 +5448,7 @@ error("activation fails after mounting the terminal slot scene")
         })
         .expect("a second generation must mount after the rollback");
         app.drive_tick().expect("second frame presents");
-        let scene = app.runtime.scene_frame().clone();
+        let scene = app.runtime.borrow().scene_frame().clone();
         assert_eq!(
             scene.views, 1,
             "the second generation's scene paints on the live slot"
@@ -5429,12 +5471,12 @@ error("activation fails after mounting the terminal slot scene")
         // request to this app's drain (CTX-1641).
         let _control_queue_guard = crate::ctl::test_control_queue_lock();
         let (mut app, panels) = scene_probe_app("scene-paint");
-        let view = app.runtime.focused_view().expect("focused leaf");
+        let view = app.runtime.borrow().focused_view().expect("focused leaf");
 
         // Baseline frame of the untouched, scene-less leaf.
         app.drive_tick().expect("baseline frame presents");
-        let baseline_rgba = app.runtime.headless_rgba().expect("baseline rgba");
-        assert_eq!(app.runtime.scene_frame().views, 0);
+        let baseline_rgba = app.runtime.borrow().headless_rgba().expect("baseline rgba");
+        assert_eq!(app.runtime.borrow().scene_frame().views, 0);
 
         // The plugin mounts through the real Lua path; the composition root
         // owns the host, so this is the shipped route, not a test install.
@@ -5454,7 +5496,7 @@ error("activation fails after mounting the terminal slot scene")
         assert!(bitty_runtime::scene_host::is_scene_handle(handle));
 
         app.drive_tick().expect("scene frame presents");
-        let report = app.runtime.scene_frame().clone();
+        let report = app.runtime.borrow().scene_frame().clone();
         assert_eq!(report.views, 1, "one leaf paints the attached scene");
         assert!(report.ops > 0, "the paint list carries ops");
         assert_eq!(
@@ -5473,7 +5515,7 @@ error("activation fails after mounting the terminal slot scene")
         assert_eq!(panels.borrow().panel_scene_len(), 1);
 
         // Bounded damage: every rectangle stays inside the leaf content rect.
-        let surface = scene_surface(&app.runtime, view);
+        let surface = scene_surface(&app.runtime.borrow(), view);
         assert!(!report.damage.is_empty(), "the scene reports damage");
         for rect in &report.damage {
             assert!(
@@ -5510,9 +5552,15 @@ error("activation fails after mounting the terminal slot scene")
         );
 
         // Leaf clipping: pixels change only inside the leaf content rect.
-        let scene_rgba = app.runtime.headless_rgba().expect("scene rgba");
-        let width =
-            usize::try_from(app.runtime.surface_extent().expect("surface").width()).expect("width");
+        let scene_rgba = app.runtime.borrow().headless_rgba().expect("scene rgba");
+        let width = usize::try_from(
+            app.runtime
+                .borrow()
+                .surface_extent()
+                .expect("surface")
+                .width(),
+        )
+        .expect("width");
         let changed = changed_pixels(&baseline_rgba, &scene_rgba, width);
         assert!(!changed.is_empty(), "the scene never reached the frame");
         for pixel in &changed {
@@ -5545,7 +5593,7 @@ error("activation fails after mounting the terminal slot scene")
                 italic: false,
             })
         );
-        let updated_report = app.runtime.scene_frame().clone();
+        let updated_report = app.runtime.borrow().scene_frame().clone();
         assert_eq!(updated_report.views, 1);
         assert!(
             updated_report.a11y[0]
@@ -5566,7 +5614,7 @@ error("activation fails after mounting the terminal slot scene")
             .expect("suspend");
         app.drive_tick().expect("post-suspend frame presents");
         assert_eq!(
-            app.runtime.scene_frame().views,
+            app.runtime.borrow().scene_frame().views,
             0,
             "a suspended generation paints no scene"
         );
@@ -5576,7 +5624,7 @@ error("activation fails after mounting the terminal slot scene")
             panels.borrow().placement_panel_of(view).is_none(),
             "the placement bind leaves with the scene"
         );
-        let cleared_rgba = app.runtime.headless_rgba().expect("cleared rgba");
+        let cleared_rgba = app.runtime.borrow().headless_rgba().expect("cleared rgba");
         assert!(
             changed_pixels(&baseline_rgba, &cleared_rgba, width).is_empty(),
             "suspending the plugin restores the scene-less leaf pixels"
@@ -5709,6 +5757,7 @@ error("activation fails after mounting the terminal slot scene")
         let leaves = rt.layout().leaf_ids();
         let pinned = rt.pinned_views();
         let seed = StartupSeed {
+            shared_runtime: None,
             workspaces: &summaries,
             keymaps: &[],
             targets: &[],
@@ -5823,8 +5872,8 @@ error("activation fails after mounting the terminal slot scene")
             lua,
         );
         let (mut app, panels) = build_dwindle_app(root);
-        let primary = app.runtime.focused_view().expect("primary view");
-        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        let primary = app.runtime.borrow().focused_view().expect("primary view");
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 1);
 
         let panel_id = match dispatch_app_cmd(&mut app, "xuepoo.dwindle", "open", &[])
             .expect("open must succeed")
@@ -5834,7 +5883,7 @@ error("activation fails after mounting the terminal slot scene")
         };
         app.drive_tick().expect("tick materializes leaf");
 
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
         let pid = PanelId(panel_id as u64);
         let panel_view = panels
             .borrow()
@@ -5842,10 +5891,10 @@ error("activation fails after mounting the terminal slot scene")
             .expect("panel must be mounted to a Dwindle View");
         assert_ne!(panel_view, primary);
         assert!(
-            !app.runtime.has_pane_session(&panel_view),
+            !app.runtime.borrow().has_pane_session(&panel_view),
             "plugin panel leaf must be zero-PTY"
         );
-        assert_eq!(app.runtime.focused_view(), Some(panel_view));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(panel_view));
         assert!(panels.borrow().panel_scene(pid).is_some());
 
         let updated = dispatch_app_cmd(
@@ -5879,7 +5928,7 @@ error("activation fails after mounting the terminal slot scene")
         assert_eq!(closed, LuaValue::Bool(true));
         app.drive_tick().expect("tick removes leaf");
 
-        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 1);
         assert_eq!(panels.borrow().panel_count(), 0);
         assert_eq!(panels.borrow().placement_view_of(pid), None);
     }
@@ -5967,7 +6016,7 @@ error("activation fails after mounting the terminal slot scene")
                 "{cmd} must deny non-owner, got {err}"
             );
         }
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
         assert!(panels.borrow().panel_scene(pid).is_some());
     }
 
@@ -6023,7 +6072,7 @@ error("activation fails after mounting the terminal slot scene")
             bystander_lua,
         );
         let (mut app, panels) = build_dwindle_app(root);
-        let primary = app.runtime.focused_view().expect("primary view");
+        let primary = app.runtime.borrow().focused_view().expect("primary view");
         let panel_id =
             match dispatch_app_cmd(&mut app, "xuepoo.inputowner", "open", &[]).expect("open") {
                 LuaValue::Integer(id) => id,
@@ -6034,7 +6083,7 @@ error("activation fails after mounting the terminal slot scene")
             .borrow()
             .placement_view_of(PanelId(panel_id as u64))
             .expect("panel view");
-        assert_eq!(app.runtime.focused_view(), Some(panel_view));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(panel_view));
 
         // Non-global key 'x' routes to owning plugin, not PTY and not bystander.
         let key_x = bitty_platform::KeyEvent {
@@ -6092,7 +6141,7 @@ error("activation fails after mounting the terminal slot scene")
             location: bitty_platform::KeyLocation::Standard,
         };
         assert!(app.intercept_chrome_key(&bitty_platform::WindowEventKind::KeyboardInput(key_h)));
-        assert_eq!(app.runtime.focused_view(), Some(primary));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(primary));
     }
 
     #[test]
@@ -6128,7 +6177,7 @@ error("activation fails after mounting the terminal slot scene")
         let (mut app, panels) = build_dwindle_app(root);
         let _ = dispatch_app_cmd(&mut app, "xuepoo.reloader", "open", &[]).expect("open");
         app.drive_tick().expect("tick materializes leaf");
-        assert_eq!(app.runtime.layout().leaf_count(), 2);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 2);
 
         let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.reloader").expect("id");
         app.plugin_runtime
@@ -6139,7 +6188,7 @@ error("activation fails after mounting the terminal slot scene")
         app.drive_tick()
             .expect("tick removes the ended generation's leaf");
 
-        assert_eq!(app.runtime.layout().leaf_count(), 1);
+        assert_eq!(app.runtime.borrow().layout().leaf_count(), 1);
         assert_eq!(panels.borrow().panel_count(), 0);
     }
 
@@ -6197,7 +6246,7 @@ error("activation fails after mounting the terminal slot scene")
             .placement_view_of(panel)
             .expect("the created panel is attached to a leaf");
         assert_eq!(
-            app.runtime.view_presentation(view),
+            app.runtime.borrow().view_presentation(view),
             Some(PresentationMode::Tiled),
             "a fresh plugin panel leaf is tiled"
         );
@@ -6210,7 +6259,11 @@ error("activation fails after mounting the terminal slot scene")
         // Stamp the mode the way a workspace command does, through the single
         // transition gate — the fact the clause is about.
         {
-            let mut layout = app.runtime.layout_mut();
+            // CTX-1929: `layout_mut` hands back a reference into the runtime,
+            // so the guard binding outlives the leaf write; the binding stays
+            // `mut` because the leaf write is itself mutable.
+            let mut runtime = app.runtime.borrow_mut();
+            let mut layout = runtime.layout_mut();
             let leaf = layout.find_leaf_mut(view).expect("the panel leaf is tiled");
             assert!(PresentationMode::request_transition(
                 leaf,
@@ -6218,7 +6271,7 @@ error("activation fails after mounting the terminal slot scene")
             ));
         }
         assert_eq!(
-            app.runtime.view_presentation(view),
+            app.runtime.borrow().view_presentation(view),
             Some(PresentationMode::Floating)
         );
 
@@ -6243,7 +6296,7 @@ error("activation fails after mounting the terminal slot scene")
             "a reload retains the container for its successor (D.3)"
         );
         assert!(
-            app.runtime.layout().find_leaf(view).is_some(),
+            app.runtime.borrow().layout().find_leaf(view).is_some(),
             "the retained container keeps its leaf"
         );
         assert_eq!(
@@ -6271,7 +6324,7 @@ error("activation fails after mounting the terminal slot scene")
             "the reload edge reports the mode the retained leaf still presents"
         );
         assert_eq!(
-            app.runtime.view_presentation(view),
+            app.runtime.borrow().view_presentation(view),
             Some(PresentationMode::Floating),
             "and the leaf itself still presents it"
         );
@@ -6329,7 +6382,7 @@ error("activation fails after mounting the terminal slot scene")
         app: &mut crate::terminal_app::TerminalApp,
         panels: &Rc<RefCell<PanelRuntime>>,
     ) -> (PanelId, ViewId, ViewId) {
-        let primary = app.runtime.primary_view().expect("primary view");
+        let primary = app.runtime.borrow().primary_view().expect("primary view");
         let raw = match dispatch_app_cmd(app, "xuepoo.survivor", "open", &[])
             .expect("panel create must succeed")
         {
@@ -6344,16 +6397,16 @@ error("activation fails after mounting the terminal slot scene")
             .expect("panel must be mounted on a View");
         assert_ne!(panel_view, primary, "the panel needs its own leaf");
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             2,
             "the panel leaf must join the primary leaf"
         );
         assert!(
-            !app.runtime.has_pane_session(&panel_view),
+            !app.runtime.borrow().has_pane_session(&panel_view),
             "a plugin panel leaf must stay zero-PTY"
         );
         assert_eq!(
-            app.runtime.live_non_terminal_leaf_count(),
+            app.runtime.borrow().live_non_terminal_leaf_count(),
             1,
             "the created panel must read as exactly one live zero-PTY leaf"
         );
@@ -6391,12 +6444,13 @@ error("activation fails after mounting the terminal slot scene")
     ) -> PathBuf {
         let script = write_exiting_shell(name);
         let arg = script.to_string_lossy().into_owned();
-        app.runtime.set_focus(primary);
+        app.runtime.borrow_mut().set_focus(primary);
         app.runtime
+            .borrow_mut()
             .spawn_shell(arg.as_str())
             .expect("spawn primary shell");
         assert_eq!(
-            app.runtime.primary_view(),
+            app.runtime.borrow().primary_view(),
             Some(primary),
             "the shell must attach to the primary leaf, never to the panel leaf"
         );
@@ -6438,11 +6492,11 @@ error("activation fails after mounting the terminal slot scene")
             "the fixture must hold no panel"
         );
         assert_eq!(
-            app.runtime.live_non_terminal_leaf_count(),
+            app.runtime.borrow().live_non_terminal_leaf_count(),
             0,
             "a panel host with no panel leaf must count zero live non-terminal leaves"
         );
-        let primary = app.runtime.primary_view().expect("primary view");
+        let primary = app.runtime.borrow().primary_view().expect("primary view");
         let script = spawn_exiting_primary(&mut app, primary, "shell-only");
 
         assert_eq!(
@@ -6463,7 +6517,7 @@ error("activation fails after mounting the terminal slot scene")
         let (mut app, panels) = panel_exit_app("exit-live-panel");
         let (panel_id, panel_view, primary) = create_rich_panel(&mut app, &panels);
         assert_eq!(
-            app.runtime.pane_session_count(),
+            app.runtime.borrow().pane_session_count(),
             0,
             "the fixture must run without split pane sessions"
         );
@@ -6475,26 +6529,26 @@ error("activation fails after mounting the terminal slot scene")
             "a live plugin panel leaf must keep the session running after its only shell exits (bitty#3201)"
         );
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "the dead primary leaf must close, leaving the panel"
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![panel_view],
             "the surviving tiled leaf must be the plugin panel leaf"
         );
         assert!(
-            !app.runtime.layout().leaf_ids().contains(&primary),
+            !app.runtime.borrow().layout().leaf_ids().contains(&primary),
             "the exited primary leaf must not linger as a session-less ghost tile"
         );
         assert_eq!(
-            app.runtime.live_non_terminal_leaf_count(),
+            app.runtime.borrow().live_non_terminal_leaf_count(),
             1,
             "the panel leaf must still count as live after the shell exit"
         );
         assert!(
-            !app.runtime.has_pane_session(&panel_view),
+            !app.runtime.borrow().has_pane_session(&panel_view),
             "the surviving panel leaf must stay zero-PTY"
         );
         assert_eq!(
@@ -6507,7 +6561,7 @@ error("activation fails after mounting the terminal slot scene")
             "the panel declarative scene must survive the primary exit"
         );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(panel_view),
             "focus must land on the surviving panel leaf"
         );
@@ -6535,12 +6589,16 @@ error("activation fails after mounting the terminal slot scene")
         app.drive_tick().expect("tick removes the disposed leaf");
 
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "closing the panel must return the window to the primary leaf only"
         );
         assert!(
-            !app.runtime.layout().leaf_ids().contains(&panel_view),
+            !app.runtime
+                .borrow()
+                .layout()
+                .leaf_ids()
+                .contains(&panel_view),
             "the disposed panel leaf must be gone from the layout"
         );
         assert_eq!(
@@ -6553,7 +6611,7 @@ error("activation fails after mounting the terminal slot scene")
             "the disposed panel must hold no scene"
         );
         assert_eq!(
-            app.runtime.live_non_terminal_leaf_count(),
+            app.runtime.borrow().live_non_terminal_leaf_count(),
             0,
             "a disposed panel must never count as a live leaf"
         );
@@ -6583,12 +6641,12 @@ error("activation fails after mounting the terminal slot scene")
             "the primary exit must close the pane, not the session"
         );
         assert_eq!(
-            app.runtime.pane_session_count(),
+            app.runtime.borrow().pane_session_count(),
             0,
             "no shell session may be left in the panel-only window"
         );
         assert_eq!(
-            app.runtime.primary_exit_status(),
+            app.runtime.borrow_mut().primary_exit_status(),
             None,
             "the primary exit must already be consumed, never re-reported"
         );
@@ -6601,13 +6659,13 @@ error("activation fails after mounting the terminal slot scene")
             );
         }
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "the panel leaf must still be the window's only leaf"
         );
-        assert_eq!(app.runtime.layout().leaf_ids(), vec![panel_view]);
+        assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![panel_view]);
         assert_eq!(
-            app.runtime.live_non_terminal_leaf_count(),
+            app.runtime.borrow().live_non_terminal_leaf_count(),
             1,
             "the panel leaf must still be live content"
         );
@@ -6615,7 +6673,7 @@ error("activation fails after mounting the terminal slot scene")
             panels.borrow().panel_scene(panel_id).is_some(),
             "the panel scene must still be attached"
         );
-        assert_eq!(app.runtime.focused_view(), Some(panel_view));
+        assert_eq!(app.runtime.borrow().focused_view(), Some(panel_view));
         let _ = std::fs::remove_file(&script);
     }
 
@@ -6633,17 +6691,19 @@ error("activation fails after mounting the terminal slot scene")
         let (panel_id, panel_view, primary) = create_rich_panel(&mut app, &panels);
 
         assert!(
-            app.chrome.zoom.engage(&mut app.runtime, primary),
+            app.chrome
+                .zoom
+                .engage(&mut app.runtime.borrow_mut(), primary),
             "the primary leaf must accept the zoom proxy"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime),
+            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "the fixture must be zoomed for this regression"
         );
         // Production state, exactly as the reviewer measured it: the runtime
         // layout is the proxy (one leaf, no panel), the window total is not.
         assert_eq!(
-            app.runtime.leaf_count(),
+            app.runtime.borrow().leaf_count(),
             1,
             "the zoom proxy must collapse the live layout to one leaf"
         );
@@ -6680,12 +6740,12 @@ error("activation fails after mounting the terminal slot scene")
             "the panel declarative scene must survive a zoomed primary exit"
         );
         assert_eq!(
-            app.runtime.layout().leaf_ids(),
+            app.runtime.borrow().layout().leaf_ids(),
             vec![panel_view],
             "the zoom restore must bring the real tree back and drop only the dead primary"
         );
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime),
+            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
             "closing the zoomed primary must consume the zoom entry"
         );
         assert_eq!(
@@ -6693,7 +6753,7 @@ error("activation fails after mounting the terminal slot scene")
             1,
             "the surviving panel leaf must still read as live content after the restore"
         );
-        assert_eq!(app.runtime.pane_session_count(), 0);
+        assert_eq!(app.runtime.borrow().pane_session_count(), 0);
         let _ = std::fs::remove_file(&script);
     }
 
@@ -6717,12 +6777,12 @@ error("activation fails after mounting the terminal slot scene")
             "the primary exit must close the pane, not the session"
         );
         assert_eq!(
-            app.runtime.primary_exit_status(),
+            app.runtime.borrow_mut().primary_exit_status(),
             None,
             "the primary exit must already be consumed, never re-reported"
         );
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             Some(panel_view),
             "the surviving panel must hold focus before the plugin closes it"
         );
@@ -6742,14 +6802,14 @@ error("activation fails after mounting the terminal slot scene")
         let _ = app.drive_tick();
 
         assert!(
-            app.runtime.layout().leaf_ids().is_empty(),
+            app.runtime.borrow().layout().leaf_ids().is_empty(),
             "the window must be left with no leaf at all"
         );
-        assert_eq!(app.runtime.pane_session_count(), 0);
+        assert_eq!(app.runtime.borrow().pane_session_count(), 0);
         assert_eq!(app.effective_window_leaf_count(), 0);
         assert_eq!(app.window_live_non_terminal_leaf_count(), 0);
         assert_eq!(
-            app.runtime.focused_view(),
+            app.runtime.borrow().focused_view(),
             None,
             "an empty window has nothing to focus"
         );
@@ -7076,11 +7136,13 @@ error("activation fails after mounting the terminal slot scene")
         // shell of its own; present then freezes that terminal's geometry.
         let (program, keepalive_args) = generation_edge_keepalive();
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view(view, program, keepalive_args, 40, 12)
             .expect("the panel leaf owns a shell");
         app.drive_tick().expect("tick presents the pane");
         let presented = app
             .runtime
+            .borrow_mut()
             .present_panel_content(view, generation_edge_layer())
             .expect("the panel presents a layer over its own terminal");
         assert_eq!(presented.presentation, PresentationMode::Tiled);
@@ -7091,14 +7153,15 @@ error("activation fails after mounting the terminal slot scene")
         );
 
         app.runtime
+            .borrow_mut()
             .set_panel_content_presentation(view, presented.token, PresentationMode::Floating)
             .expect("a presented panel may float");
         assert_eq!(
-            app.runtime.view_presentation(view),
+            app.runtime.borrow().view_presentation(view),
             Some(PresentationMode::Floating),
             "the leaf itself carries the mode the layer moved it to"
         );
-        assert!(app.runtime.content_layer_presented(view));
+        assert!(app.runtime.borrow().content_layer_presented(view));
 
         // The generation that presented the layer ends, through the production
         // edge: `reload` disposes the predecessor generation, which releases its
@@ -7122,14 +7185,14 @@ error("activation fails after mounting the terminal slot scene")
             panels.borrow().panel_scene(panel).is_none(),
             "the layer's scene leaves with the record"
         );
-        assert!(!app.runtime.content_layer_presented(view));
+        assert!(!app.runtime.borrow().content_layer_presented(view));
         assert_eq!(
-            app.runtime.view_presentation(view),
+            app.runtime.borrow().view_presentation(view),
             Some(PresentationMode::Tiled),
             "the generation edge returns the panel to the mode its layer displaced"
         );
         assert_eq!(
-            app.runtime.panel_content_kind(view),
+            app.runtime.borrow().panel_content_kind(view),
             Some(ViewContent::Terminal(view.0)),
             "the container is terminal-backed again"
         );
@@ -7806,5 +7869,465 @@ error("activation fails after mounting the terminal slot scene")
             assert!(!legacy_state.exists());
             install.cleanup();
         }
+    }
+
+    // ── bitty#2388 (CTX-1929): the plugin producer wire ─────────────────
+    //
+    // The composition root under test: a granted plugin's
+    // `bitty.ui.panel.present` must reach the real Core swap in the shipped
+    // app (the backend installed over the same shared handle the app owns),
+    // and the app tick must deliver `panel.content.*` to a subscriber. All
+    // three rows run the real discovery/activation path over a dev root.
+
+    /// Presenter body. `present` keeps the handle in a plugin-local upvalue so
+    /// a later command releases exactly the layer it presented, the way a
+    /// real plugin would. Every verb reports `OK:<value>` or `ERR:<code>`,
+    /// so a refusal travels as a value carrying the record's code.
+    const PANEL_CONTENT_ID: &str = "xuepoo.panelcontent";
+    const PANEL_CONTENT_OBSERVER_ID: &str = "xuepoo.panelcontentobs";
+
+    const PANEL_CONTENT_INIT: &str = r#"
+local handle = nil
+
+local function report(value, err)
+  if err then return "ERR:" .. err.code end
+  return "OK:" .. tostring(value)
+end
+
+bitty.commands.register({ id = "present", title = "Present", run = function()
+  local value, err = bitty.ui.panel.present(
+    { kind = "Text", text = "panel-content-wire" }, {}
+  )
+  if not err then handle = value end
+  return report(value, err)
+end })
+
+bitty.commands.register({ id = "release", title = "Release", run = function()
+  local ok, err = bitty.ui.panel.release(handle)
+  return report(ok, err)
+end })
+"#;
+
+    /// Observer body: subscribe to the release observation and record a
+    /// `kind:owner:handle:reason` row per delivery, served through the
+    /// `events` command.
+    const PANEL_CONTENT_OBSERVER_INIT: &str = r#"
+local log = {}
+
+bitty.events.subscribe("panel.content.released", function(envelope)
+  local payload = envelope.payload
+  log[#log + 1] = envelope.kind .. ":" .. tostring(payload.owner) .. ":"
+    .. tostring(payload.handle) .. ":" .. tostring(payload.reason)
+end)
+
+bitty.commands.register({ id = "events", title = "Events", run = function()
+  return "OK:" .. table.concat(log, ";")
+end })
+"#;
+
+    fn write_panel_content_plugin(
+        root: &Path,
+        id: &str,
+        capabilities: &[&str],
+        events: &[&str],
+        commands: &[&str],
+        init: &str,
+    ) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let capabilities_toml = capabilities
+            .iter()
+            .map(|capability| format!("{capability} = true\n"))
+            .collect::<String>();
+        let qualified = commands
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let events_toml = events
+            .iter()
+            .map(|event| format!("\"{event}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                r#"[plugin]
+id = "{id}"
+name = "Panel content wire"
+version = "0.1.0"
+description = "bitty.ui.panel producer wire"
+
+[compat]
+plugin-api = "^1.0"
+
+[capabilities]
+{capabilities_toml}[lazy]
+commands = [{qualified}]
+events = [{events_toml}]
+"#
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
+    }
+
+    /// `(program, argv)` the panel-content fixture spawns under the focused
+    /// leaf.
+    ///
+    /// Mirrors `generation_edge_keepalive`: the rows under test are
+    /// platform-neutral; only the leaf's shell is not. `cmd.exe` has no
+    /// `/bin/sh`, so a Unix literal here fails the spawn on Windows
+    /// (`os error 2`) before the panel-content rows are ever exercised. Each
+    /// platform arm stays mutually exclusive so no arm is dead code on the
+    /// other platform.
+    fn panel_leaf_shell() -> (&'static str, &'static [&'static str]) {
+        #[cfg(unix)]
+        let shell = ("/bin/sh", &[][..]);
+        #[cfg(windows)]
+        let shell = ("cmd.exe", &[][..]);
+        // No PTY backend: `require_pty!` skips the row before it spawns, so
+        // the arm only has to keep the signature honest.
+        #[cfg(not(any(unix, windows)))]
+        let shell = ("/bin/sh", &[][..]);
+        shell
+    }
+
+    /// The composition-root fixture: a split runtime with a live shell on the
+    /// focused leaf, the real discovery/activation path over a dev root, and
+    /// the app built over the SAME shared handle the seed carried.
+    ///
+    /// `seed_handle` selects whether the composition root installs the panel
+    /// content backend: `true` is the wired app, `false` is the fail-closed
+    /// twin (no backend, the verb answers `E_UI_UNAVAILABLE`).
+    fn panel_content_app(
+        tag: &str,
+        seed_handle: bool,
+    ) -> (crate::terminal_app::TerminalApp, ViewId) {
+        let root = pin_test_dir(tag);
+        write_panel_content_plugin(
+            &root,
+            PANEL_CONTENT_ID,
+            &["ui.rich", "ui.panel"],
+            &[],
+            &["present", "release"],
+            PANEL_CONTENT_INIT,
+        );
+        write_panel_content_plugin(
+            &root,
+            PANEL_CONTENT_OBSERVER_ID,
+            &[],
+            &["panel.content.released"],
+            &["events"],
+            PANEL_CONTENT_OBSERVER_INIT,
+        );
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut runtime = Runtime::with_defaults().expect("must build");
+        runtime.set_container(UiRect::new(0, 0, 80, 24));
+        let view = ViewId::new(2);
+        runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(view, 40, 24)),
+        ));
+        assert!(runtime.set_focus(view), "the fixture focus must be live");
+        let summaries = runtime.workspace_summaries();
+        let leaves = runtime.layout().leaf_ids();
+        let pinned = runtime.pinned_views();
+        let focused_workspace = runtime.focused_workspace_id();
+        // bitty#2388 (CTX-1929): the handle the seed carries is the handle
+        // the app below is built over, exactly as `main` wires it.
+        let shared = Rc::new(std::cell::RefCell::new(runtime));
+        let seed = StartupSeed {
+            shared_runtime: seed_handle.then(|| Rc::clone(&shared)),
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: Some(view),
+            focused_workspace,
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let PluginSession {
+            runtime: plugin_runtime,
+            panels,
+            scene_target,
+            focused_workspace,
+            panel_layout_ops,
+            ..
+        } = session;
+        let panels = panels.expect("production panel host");
+        // Mount the Terminal panel the way the composition root would, on the
+        // same host the app installs below, so `present` resolves a real
+        // placement mirror.
+        let panel = panels
+            .borrow_mut()
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        panels
+            .borrow_mut()
+            .mount_panel(panel.id, panel.generation, view)
+            .expect("the panel mounts at the leaf");
+        let app = crate::terminal_app::TerminalApp::with_theme_shared(
+            shared,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime))
+        .with_panel_scene_host(Some(Rc::clone(&panels)))
+        .with_scene_target(Some(scene_target))
+        .with_focused_workspace(Some(focused_workspace))
+        .with_panel_layout_ops(panel_layout_ops);
+        // The focused leaf owns a live shell and a committed frame, the exact
+        // state the close-path regression rows build.
+        let (shell, shell_args) = panel_leaf_shell();
+        app.runtime
+            .borrow_mut()
+            .spawn_shell_for_view(view, shell, shell_args, 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime
+            .borrow_mut()
+            .handle_pane_bytes(view, b"before-present\r\n");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
+        (app, view)
+    }
+
+    /// Dispatch one plugin command through the app's qualified path, settling
+    /// an RC-1 park on the cold ticks the same way the input-boundary rows do.
+    fn invoke_settled(app: &mut crate::terminal_app::TerminalApp, qualified: &str) -> String {
+        for _ in 0..=PARK_RESUME_TICKS {
+            match app.invoke_plugin_command(qualified, &LuaValue::Nil) {
+                Ok(LuaValue::String(text)) => return text,
+                Ok(LuaValue::Bool(false)) => {
+                    // bitty #2314: parked work resumes on the cold tick.
+                    let _ = app.drive_tick();
+                }
+                Ok(other) => panic!("unexpected reply for {qualified}: {other:?}"),
+                Err(error) => panic!("command {qualified} refused: {error}"),
+            }
+        }
+        panic!("command {qualified} never completed within {PARK_RESUME_TICKS} cold ticks");
+    }
+
+    /// The observer's recorded bus log, one row per delivery.
+    fn panel_content_observer_log(app: &mut crate::terminal_app::TerminalApp) -> Vec<String> {
+        let reply = invoke_settled(app, &format!("{PANEL_CONTENT_OBSERVER_ID}:events"));
+        let payload = reply
+            .strip_prefix("OK:")
+            .expect("the events command answers");
+        if payload.is_empty() {
+            return Vec::new();
+        }
+        payload.split(';').map(str::to_string).collect()
+    }
+
+    /// bitty#2388 (CTX-1929): a granted plugin presents a real content layer
+    /// in the shipped app. Before the wire this row's first assertion failed
+    /// with `ERR:E_UI_UNAVAILABLE` (the audit's "dead in the shipped app"
+    /// verdict); now the verb answers a live handle, the displaced PTY stays
+    /// alive with its winsize frozen, the owner's release restores the
+    /// grid with exactly one restore resize, and a re-presented layer is
+    /// popped by the first close press before the second closes the leaf —
+    /// the same parity the chrome close rows record.
+    #[test]
+    fn granted_plugin_presents_and_releases_a_real_content_layer() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-wire", true);
+
+        let pid = app
+            .runtime
+            .borrow()
+            .pane_pid(&view)
+            .expect("live pane child");
+        let winsize = app
+            .runtime
+            .borrow()
+            .pane_pty_size(&view)
+            .expect("live winsize");
+        let resizes_before = app.runtime.borrow().content_restore_resizes();
+
+        // Present: the verb that used to answer E_UI_UNAVAILABLE.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        let Some(handle) = reply.strip_prefix("OK:") else {
+            panic!("present must answer a handle, not a refusal: {reply}");
+        };
+        let handle: i64 = handle.parse().expect("integer handle");
+        assert!(handle > 0, "the handle is live: {handle}");
+
+        // The layer is real: the app's runtime presents it and the displaced
+        // child is untouched, its winsize frozen exactly as the audit rows
+        // record.
+        assert!(app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(app.runtime.borrow().pane_pid(&view), Some(pid));
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "presenting a layer must not resize the hidden PTY"
+        );
+
+        // The audit's "exactly one restore resize" needs a moved leaf: the
+        // window-resize gesture relayouts while the layer holds the leaf, the
+        // freeze keeps the hidden PTY at the frozen winsize, and the release
+        // then owes exactly one measured `TIOCGWINSZ` movement (the counter
+        // reports kernel-side movement, not intent — bitty#3250 R10).
+        app.runtime
+            .borrow_mut()
+            .handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
+            .expect("window resize applies");
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "the freeze keeps the hidden PTY at the frozen winsize across the relayout"
+        );
+        let frame = app
+            .runtime
+            .borrow()
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .unwrap_or_else(|| panic!("{view:?} must be presented"));
+        let target = (frame.cols, frame.rows);
+        assert_ne!(
+            target, winsize,
+            "the gesture must have moved the leaf, or the restore resize proves nothing"
+        );
+
+        // The owner's release restores the grid: one restore resize to the
+        // current rect, the container is terminal-backed again.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:release"));
+        assert_eq!(reply, "OK:true", "the release must succeed: {reply}");
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(target),
+            "release resizes the displaced PTY exactly once, to the current rect"
+        );
+        assert_eq!(
+            app.runtime.borrow().content_restore_resizes(),
+            resizes_before + 1,
+            "exactly one restore resize per release"
+        );
+        assert!(app.runtime.borrow().pane_pid(&view).is_some());
+
+        // Re-present, then the close gesture pops the layer first: press one
+        // releases (not a close), press two closes the leaf.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        assert!(
+            reply.starts_with("OK:"),
+            "the re-present must answer a handle: {reply}"
+        );
+        use bitty_config::ChromeAction;
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "releasing the layer is not a close"
+        );
+        assert!(
+            !app.runtime.borrow().content_layer_presented(view),
+            "the first close press must release the presented layer"
+        );
+        assert_eq!(
+            app.runtime.borrow().pane_pid(&view),
+            Some(pid),
+            "the displaced child was never killed"
+        );
+        // The second press closes the leaf. `apply_chrome_action` falls
+        // through to a `false` tail for the ordinary leaf close (only the
+        // explicit arms return true), so the row asserts the closed state
+        // the way the chrome parity rows do — not the fall-through return.
+        let _ = app.apply_chrome_action(ChromeAction::CloseView);
+        assert_eq!(app.runtime.borrow().leaf_count(), 1, "the leaf is closed");
+        assert!(
+            app.runtime.borrow().pane_pid(&view).is_none(),
+            "the closed leaf's pane shell is reaped"
+        );
+    }
+
+    /// bitty#2388 (CTX-1929): the close-triggered release reaches the
+    /// subscriber on the app tick — the app-side twin of the runtime fixture
+    /// that proved the pump itself. The first close press records the
+    /// observation with reason `closed`; one `drive_tick` delivers it.
+    #[test]
+    fn close_triggered_release_reaches_the_subscriber_on_the_app_tick() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-events", true);
+
+        assert!(
+            panel_content_observer_log(&mut app).is_empty(),
+            "nothing is observed before anything happens"
+        );
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        let handle = match reply
+            .strip_prefix("OK:")
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            Some(handle) => handle,
+            None => panic!("present must answer a handle, not a refusal: {reply}"),
+        };
+
+        use bitty_config::ChromeAction;
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "the first press releases the layer, it does not close"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+
+        // The cold tick is the whole delivery: the pump names the closed kind
+        // and fans the bounded payload out to the subscriber.
+        let _ = app.drive_tick();
+        assert_eq!(
+            panel_content_observer_log(&mut app),
+            vec![format!(
+                "panel.content.released:{PANEL_CONTENT_ID}:{handle}:closed"
+            )],
+            "the release observation names owner, handle, and the closed reason"
+        );
+
+        // Delivery is once: another tick observes nothing new.
+        let _ = app.drive_tick();
+        assert_eq!(
+            panel_content_observer_log(&mut app),
+            vec![format!(
+                "panel.content.released:{PANEL_CONTENT_ID}:{handle}:closed"
+            )],
+            "the observation is delivered exactly once"
+        );
+        // The leaf is still open; the second press would close it.
+        assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    }
+
+    /// bitty#2388 (CTX-1929): with no backend installed (the `--safe` shape,
+    /// or any caller that owns no shared runtime), the granted verb keeps
+    /// failing closed with `E_UI_UNAVAILABLE` — the app-side twin of the
+    /// runtime fixture's no-backend row.
+    #[test]
+    fn without_a_backend_the_verb_still_fails_closed() {
+        bitty_test_support::require_pty!();
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-no-backend", false);
+
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        assert_eq!(
+            reply, "ERR:E_UI_UNAVAILABLE",
+            "no backend, no surface: {reply}"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert!(
+            panel_content_observer_log(&mut app).is_empty(),
+            "nothing is observed because nothing happened"
+        );
     }
 }

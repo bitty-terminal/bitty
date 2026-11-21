@@ -389,7 +389,7 @@ fn render_lifecycle(last: Lifecycle) -> String {
 
 fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -> String {
     format!(
-        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} presenter_in_flight={} presenter_in_flight_since_ms={} presenter_in_flight_ms={} presenter_stuck_presents={} presenter_recoveries={} presenter_coalesced={} presenter_acks_dropped={} present_unconfirmed={} present_repair_attempts={} present_repair_configured={} present_repair_failed={}",
+        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} presenter_in_flight={} presenter_in_flight_since_ms={} presenter_in_flight_ms={} presenter_stuck_presents={} presenter_recoveries={} presenter_coalesced={} presenter_acks_dropped={} present_unconfirmed={} present_repair_attempts={} present_repair_configured={} present_repair_failed={} content_geometry_freezes={} content_restore_resizes={} content_input_swallowed={} content_input_dropped_bytes={}",
         surface.last_event,
         surface.configure_ok,
         surface.configure_err,
@@ -418,6 +418,10 @@ fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -
         surface.present_repair_attempts,
         surface.present_repair_configured,
         surface.present_repair_failed,
+        surface.content_geometry_freezes,
+        surface.content_restore_resizes,
+        surface.content_input_swallowed,
+        surface.content_input_dropped_bytes,
     )
 }
 
@@ -563,6 +567,13 @@ mod tests {
         assert!(report.contains("phase="));
         assert!(report.contains("surface=last="));
         assert!(report.contains("retry_failures="));
+        // bitty#2388 (CTX-1913): the content-layer counters ride the same
+        // telemetry snapshot, so a panic over a presented layer names what
+        // the layer was doing to the displaced terminal.
+        assert!(report.contains("content_geometry_freezes="));
+        assert!(report.contains("content_restore_resizes="));
+        assert!(report.contains("content_input_swallowed="));
+        assert!(report.contains("content_input_dropped_bytes="));
         assert!(report.contains("lifecycle=last="));
         assert!(report.contains("backtrace:"));
         assert!(report.contains("report truncated"));

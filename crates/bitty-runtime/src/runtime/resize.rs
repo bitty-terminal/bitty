@@ -622,6 +622,7 @@ impl Runtime {
         let primary_frozen = self.primary_content_frozen();
         let primary_resize = if primary_frozen {
             self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            bitty_render::telemetry::content_geometry_frozen();
             None
         } else {
             let (_damage, report) = self.state.resize_with_report(cols, rows);
@@ -898,6 +899,7 @@ impl Runtime {
         // the single restore resize still reaches the kernel.
         if self.primary_content_frozen() {
             self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            bitty_render::telemetry::content_geometry_frozen();
             return Ok(());
         }
         let pty_cols = self.cols.min(u16::MAX as usize) as u16;

@@ -597,6 +597,7 @@ impl Runtime {
                 self.publish_inspect_snapshot();
             }
             self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            bitty_render::telemetry::content_input_swallowed();
             self.capture_panel_content_key(&event, is_modifier);
             return None;
         }
@@ -733,6 +734,7 @@ impl Runtime {
                 self.publish_inspect_snapshot();
             }
             self.content_input_swallowed = self.content_input_swallowed.saturating_add(1);
+            bitty_render::telemetry::content_input_swallowed();
             self.capture_panel_content_key(event, is_modifier);
             return None;
         }
@@ -815,6 +817,9 @@ impl Runtime {
             self.content_input_dropped_bytes = self
                 .content_input_dropped_bytes
                 .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            bitty_render::telemetry::content_input_dropped_bytes(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            );
             return false;
         }
         // CTX-0243: any input bytes snap the focused viewport to live so
@@ -946,6 +951,9 @@ impl Runtime {
             self.content_input_dropped_bytes = self
                 .content_input_dropped_bytes
                 .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            bitty_render::telemetry::content_input_dropped_bytes(
+                u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            );
             return false;
         }
         if let Some(sess) = self.pane_sessions.get_mut(&view) {

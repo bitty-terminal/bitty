@@ -346,6 +346,7 @@ impl Runtime {
         // call, no `SIGWINCH`. The freeze is counted so the skip is observable.
         if self.content_layer_presented(primary) {
             self.content_geometry_freezes = self.content_geometry_freezes.saturating_add(1);
+            bitty_render::telemetry::content_geometry_frozen();
             return;
         }
         let frames = self.present_frames();

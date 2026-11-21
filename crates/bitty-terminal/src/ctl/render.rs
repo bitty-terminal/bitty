@@ -67,6 +67,13 @@ pub(crate) const NEW_WINDOW_SKEW_MESSAGE: &str = "the running instance does not 
 pub(crate) const TAB_SKEW_MESSAGE: &str = "the running instance does not serve the `tab` verbs \
      (its ctl protocol predates them); restart the instance with this build and retry";
 
+/// Same skew class for the panel-content debug pair (bitty#2388, CTX-1913):
+/// the pair registers additively on the dispatcher, so an older instance
+/// answers `UnknownMethod`, which is an upgrade prompt, never a bad argument.
+pub(crate) const PANEL_CONTENT_SKEW_MESSAGE: &str = "the running instance does not serve the \
+     `panel present`/`panel release` verbs (its ctl protocol predates them); restart the \
+     instance with this build and retry";
+
 /// Map a server error `(category, code)` to the stable CLI exit code.
 ///
 /// - `usage/*` after IPC is a generic argument failure (exit 1); usage
@@ -559,6 +566,27 @@ fn render_outcome(
         }
         return EXIT_COMPAT;
     }
+    // bitty#2388 (CTX-1913): the panel-content pair is served by dispatcher
+    // methods a pre-existing instance does not have, so `UnknownMethod` is a
+    // protocol skew with its own upgrade prompt. `NotFound` stays the typed
+    // live refusal the release path answers, so the two are never folded
+    // together.
+    if matches!(
+        request,
+        CtlRequest::PanelContentPresent { .. } | CtlRequest::PanelContentRelease { .. }
+    ) && outcome.code == "UnknownMethod"
+    {
+        let message = PANEL_CONTENT_SKEW_MESSAGE;
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(registry, "VersionMismatch", "UnsupportedVersion", message)
+            );
+        } else {
+            eprintln!("bitty ctl: {message}");
+        }
+        return EXIT_COMPAT;
+    }
     if emit_json {
         println!(
             "{}",
@@ -803,6 +831,21 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
             };
             out.push_str(&format!(
                 "{verb} tab {panel_id} on {} — result: {result_json}\n",
+                target.instance
+            ));
+        }
+        // bitty#2388 (CTX-1913): the debug pair's receipts are the machine
+        // contract (the present receipt names the release token); one line
+        // labels the verb and the panel for the human table.
+        CtlRequest::PanelContentPresent { panel_id } => {
+            out.push_str(&format!(
+                "presented debug layer on panel {panel_id} on {} — result: {result_json}\n",
+                target.instance
+            ));
+        }
+        CtlRequest::PanelContentRelease { panel_id, .. } => {
+            out.push_str(&format!(
+                "released debug layer on panel {panel_id} on {} — result: {result_json}\n",
                 target.instance
             ));
         }

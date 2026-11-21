@@ -5549,6 +5549,39 @@ impl TerminalApp {
         true
     }
 
+    /// Services a waiting `bitty ctl panel present|release` request
+    /// (bitty#2388, CTX-1913).
+    ///
+    /// The debug pair is `Runtime` state like the tab verbs, so the
+    /// claim/apply/answer step runs on any app turn. The apply is the same
+    /// [`crate::ctl::apply_control`] dispatch the control-queue drain runs,
+    /// so a debug verb can never disagree with the served control surface;
+    /// the waiting CLI is answered with the receipt or the typed refusal the
+    /// apply produced.
+    ///
+    /// Returns whether one request was serviced.
+    pub(crate) fn service_panel_content_requests(&mut self) -> bool {
+        use crate::ctl::panel_content::PanelContentReply;
+
+        let Some(claim) = crate::ctl::panel_content::claim() else {
+            return false;
+        };
+        let reply = match crate::ctl::apply_control(
+            &mut self.runtime,
+            claim.method(),
+            Some(claim.params()),
+        ) {
+            Ok(result) => PanelContentReply::Applied { result },
+            Err((category, code, message)) => PanelContentReply::Refused {
+                category,
+                code,
+                message,
+            },
+        };
+        claim.complete(reply);
+        true
+    }
+
     /// Creates one window per latched request, in order.
     ///
     /// Split out of [`Self::service_new_window_requests`] so the latch (with
@@ -6257,6 +6290,10 @@ impl AppHandler for TerminalApp {
             // drains the control queue. The lane grants nothing: the servo
             // handler authorizes `view.manage` against the live connection.
             crate::ctl::tab::set_waker(wake.clone());
+            // bitty#2388 (CTX-1913): the `bitty ctl panel present|release`
+            // lane rides the same proxy too — same servicing turn, same
+            // authorization shape, and it grants nothing.
+            crate::ctl::panel_content::set_waker(wake.clone());
             bitty_ipc::ctl::set_control_waker(Some(wake));
         }
         crate::logging::info(|| String::from("bitty: pty wakeup armed (event-loop proxy)"));
@@ -6424,6 +6461,13 @@ impl TerminalApp {
         // turn. One atomic load when nothing is parked.
         if crate::ctl::tab::is_pending() {
             self.service_tab_requests();
+        }
+
+        // bitty#2388 (CTX-1913): a waiting `bitty ctl panel present|release`
+        // request runs the debug pair through the control apply on this
+        // turn. One atomic load when nothing is parked.
+        if crate::ctl::panel_content::is_pending() {
+            self.service_panel_content_requests();
         }
 
         // Issue #1356 / #1541: reap exited child processes across primary and

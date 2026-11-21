@@ -1790,7 +1790,12 @@ pub fn effective_binding_for_action(
 /// W-144 (CTX-0937): the search/copy-mode policy actions retired with the
 /// Core policy; their namespace moves to W-138 with the plugins (CTX-0003),
 /// so the retired spellings fail closed as unknown here.
-const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, tab_open, tab_next, tab_close, toggle_scratchpad[:<name>], move_to_scratchpad[:<name>], scratchpad_to_tiled[:<name>], new_window, command:<owner:command>";
+///
+/// bitty#3303: the list is gated by enumeration, not maintained by hand —
+/// every base spelling [`DEFAULT_KEYMAPS`] ships must appear here, and the
+/// `known_actions_hint_covers_every_default_keymaps_action` test fails when
+/// one drifts out. The open-ended `command:<owner:command>` tail stays last.
+const KNOWN_ACTIONS_HINT: &str = "expected one of goto_split:<left|right|up|down>, move_split:<left|right|up|down>, toggle_split, new_split:<left|right|up|down>, new_panel, resize_split:<left|right|up|down>, close_view, toggle_zoom, focus_next, focus_prev, focus:<1..=256>, copy_to_clipboard, paste_from_clipboard, paste_from_primary, scroll_page_up, scroll_page_down, increase_font_size, decrease_font_size, reset_font_size, open_composer, fold_toggle, fold_expand, fold_collapse, workspace_new, workspace_close, workspace_prev, workspace_next, workspace_last, workspace_next_occupied, workspace_prev_occupied, workspace_focus:<1..=16>, workspace_move:<1..=16>, workspace_swap:<1..=16>, jump_to_prompt:<prev|next>, select_command_output, toggle_palette, toggle_floating, toggle_pinned, toggle_panel_mode, tab_open, tab_next, tab_close, toggle_scratchpad[:<name>], move_to_scratchpad[:<name>], scratchpad_to_tiled[:<name>], new_window, command:<owner:command>";
 
 /// Plugin id that owns the help/which-key overlay after the Core retirement
 /// (ADR-0014 / issue #2397).
@@ -3614,6 +3619,51 @@ mod tests {
         assert!(!KNOWN_ACTIONS_HINT.contains("enter_copy_mode"));
         assert!(!KNOWN_ACTIONS_HINT.contains("open_search"));
         assert!(!KNOWN_ACTIONS_HINT.contains("search_next"));
+    }
+
+    #[test]
+    fn known_actions_hint_covers_every_default_keymaps_action() {
+        // bitty#3303: the unknown-action hint drifted from the shipped
+        // defaults — `toggle_panel_mode` landed in DEFAULT_KEYMAPS with
+        // #3302 but never joined the advertised vocabulary, so the error
+        // for a typo'd binding denied a spelling the defaults themselves
+        // ship. Gate by enumeration, not a hand-picked list: every action
+        // spelling DEFAULT_KEYMAPS ships (and the action parse table
+        // accepts) must have its base spelling listed in the hint, where a
+        // parameterized entry counts for its base (`goto_split:<...>` for
+        // `goto_split`, `toggle_scratchpad[:<name>]` for
+        // `toggle_scratchpad`). Retired spellings stay excluded: none of
+        // them ship in DEFAULT_KEYMAPS, so the enumeration never asks for
+        // one.
+        let listed = KNOWN_ACTIONS_HINT
+            .strip_prefix("expected one of ")
+            .expect("hint keeps its 'expected one of' lead-in")
+            .split(", ")
+            .map(|entry| {
+                let cut = entry.find([':', '[']).unwrap_or(entry.len());
+                &entry[..cut]
+            })
+            .collect::<std::collections::HashSet<&str>>();
+        for (_chord, action) in DEFAULT_KEYMAPS {
+            let parsed = ChromeAction::parse(action)
+                .unwrap_or_else(|err| panic!("shipped default {action:?} must parse: {err}"));
+            let base = action.split(':').next().unwrap_or(action);
+            assert!(
+                listed.contains(base),
+                "KNOWN_ACTIONS_HINT must advertise shipped action {action:?} (base {base:?}, canonical {:?})",
+                parsed.canonical()
+            );
+        }
+        // Ordering convention: the closed catalog reads as a list and the
+        // open-ended `command:<owner:command>` tail stays last.
+        let tail = KNOWN_ACTIONS_HINT
+            .rsplit(", ")
+            .next()
+            .expect("hint is a comma-separated list");
+        assert!(
+            tail.starts_with("command:"),
+            "command:<owner:command> must stay the last hint entry: {tail:?}"
+        );
     }
 
     #[test]

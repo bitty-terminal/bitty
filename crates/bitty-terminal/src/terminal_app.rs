@@ -8042,8 +8042,14 @@ mod a11y_bridge_1768_tests {
 /// [`PluginRuntime::wall_recovery_deadline`] into the idle wake-min, or a
 /// wall-failed plugin is never retried while the event loop is idle.
 ///
-/// The fault is cheap: a slice-only event handler spinning in pure Lua crosses
-/// the RC-1 slice (~50 ms), which is a terminal `RC-1 wall` verdict.
+/// The fault is deterministic: `fault()` expires the fault generation's RC-1
+/// wall slice through a harness seam before the delivery, so the
+/// slice-boundary wall check kills the next event-handler run regardless of
+/// host speed or scheduler stalls (bitty#3296). A manifest-tightened wall
+/// (bitty#3294) raced the RC-1 fuel slice on a fast host (bitty#3290) and
+/// the scheduler on a loaded one; the seam keeps the verdict real — the
+/// handler still dies on the enforcement path, and a wall-enforcement
+/// regression leaves the generation `Active` and this suite red.
 #[cfg(test)]
 mod wall_recovery_wiring_1855_tests {
     use super::*;
@@ -8072,24 +8078,7 @@ end)
         }
     }
 
-    /// Tightened RC-1 wall slice for the fault plugin manifest (the
-    /// `[limits]` tighten-only contract; `crates/bitty-runtime/tests/plugin_budgets.rs`
-    /// is the precedent).
-    ///
-    /// `fault()` needs the handler to die on the *terminal wall* verdict, and
-    /// with the 50 ms host ceiling that is a host-speed race against the
-    /// 10^7-instruction fuel slice: a host fast enough to burn the fuel in
-    /// under 50 ms only earns a plain refuel, the generation stays Active,
-    /// and the fixture panics (bitty#3290). `wall_ms = 2` makes the wall win
-    /// on any host: even an implausibly fast 10^9 instructions/s VM covers
-    /// only 2 * 10^6 of its 10^7 fuel slice before the 2 ms wall trips (fuel
-    /// could win only beyond 5 * 10^9 instructions/s), while the trivial
-    /// subscribe-only `init.lua` fits a 2 ms slice on a slow host.
-    /// `warning_ms` stays strictly below the wall per the manifest contract;
-    /// fuel and memory stay at their host ceilings (undeclared).
-    const FAULT_LIMITS_TOML: &str = "[limits]\nwall_ms = 2\nwarning_ms = 1\n";
-
-    fn write_plugin(root: &std::path::Path, id: &str, body: &str, limits: &str, extra: &str) {
+    fn write_plugin(root: &std::path::Path, id: &str, body: &str, extra: &str) {
         let plugin_dir = root.join(id);
         std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
         std::fs::write(
@@ -8097,8 +8086,7 @@ end)
             format!(
                 "[plugin]\nid = \"{id}\"\nname = \"Wall wiring 1855\"\nversion = \"0.1.0\"\n\
                  description = \"CTX-1855 recovery wiring\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
-                 [capabilities]\n\n[lazy]\ncommands = []\nevents = [\"terminal.opened\"{extra}]\n\
-                 {limits}"
+                 [capabilities]\n\n[lazy]\ncommands = []\nevents = [\"terminal.opened\"{extra}]\n"
             ),
         )
         .expect("manifest");
@@ -8118,19 +8106,12 @@ end)
         let data = std::env::temp_dir().join(format!("bitty-wall1855-{tag}-{counter}-data"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
-        write_plugin(
-            &root,
-            FAULT_ID,
-            FAULT_LUA,
-            FAULT_LIMITS_TOML,
-            ", \"config.reloaded\"",
-        );
+        write_plugin(&root, FAULT_ID, FAULT_LUA, ", \"config.reloaded\"");
         if let Some(timer_ms) = timer_ms {
             write_plugin(
                 &root,
                 CLOCK_ID,
                 &format!("bitty.timers.create({timer_ms}, function() return true end)\n"),
-                "",
                 "",
             );
         }
@@ -8183,7 +8164,25 @@ end)
     }
 
     /// Kill the fixture generation with a real `RC-1 wall` verdict.
+    ///
+    /// The wall slice is expired through the harness seam first
+    /// ([`PluginRuntime::expire_wall_slice`], bitty#3296): the
+    /// manifest-tightened 2 ms wall from bitty#3294 raced both directions —
+    /// a host fast enough to burn the 10^7-instruction fuel slice inside
+    /// the wall only earns a plain refuel and the generation stays
+    /// `Active` (bitty#3290), and a scheduler stall past the tightened
+    /// slice fails the trivial `init.lua` activation with a wall-slice
+    /// timeout instead of the handler. With the slice expired, the next
+    /// delivery fires the real slice-boundary wall check on its first
+    /// boundary (`charged >= 0`), before a single instruction of the spin
+    /// runs: the verdict is host-speed-independent, and a genuine
+    /// wall-enforcement regression leaves the generation `Active` on the
+    /// fuel verdict and turns this red.
     fn fault(app: &mut TerminalApp) {
+        assert!(
+            runtime(app).expire_wall_slice(&fault_id()),
+            "the harness seam must reach the fault plugin's live VM"
+        );
         let payload = LuaValue::table([("terminal_id", LuaValue::Integer(1))]);
         assert_eq!(
             runtime(app).deliver_event("terminal.opened", &payload),
@@ -8192,7 +8191,7 @@ end)
         );
         assert!(
             matches!(state(app), Some(LifecycleState::Failed(_))),
-            "the slice-spinning handler must fail the generation: {:?}",
+            "the wall verdict must fail the generation: {:?}",
             state(app)
         );
     }

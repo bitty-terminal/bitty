@@ -1388,6 +1388,50 @@ impl PluginRuntime {
         self.vm_wall_budget_ms = wall_budget_ms;
     }
 
+    /// Expire the live generation's RC-1 wall slice (harness seam, bitty#3296).
+    ///
+    /// The wall-recovery wiring fixture needs the *terminal wall* verdict
+    /// without a host-speed race. Tightening the fault manifest's
+    /// `[limits] wall_ms` (bitty#3294) made the wall win the RC-1 fuel race
+    /// only while the value stayed below `10^7` fuel instructions over
+    /// achievable instructions-per-second — a faster host refuels the fuel
+    /// slice first and the generation stays `Active` (bitty#3290) — while a
+    /// scheduler stall past the tightened slice failed the trivial
+    /// `init.lua` activation instead of the handler. This seam expires the
+    /// already-built generation VM's wall slice directly
+    /// ([`bitty_lua::LuaVm::expire_wall_slice`]): the next dispatch drives
+    /// the real slice-boundary wall check (which fires on its first
+    /// boundary, `charged >= 0`), suspends with
+    /// [`SuspendReason::WallClockExceeded`], and the ordinary failure path
+    /// records `Failed` + [`FailureClass::WallSliceTimeout`], so the
+    /// wiring keeps being proven end to end while the trigger itself is
+    /// host-speed-independent. A genuine wall-enforcement regression still
+    /// turns the fixture red: without the boundary check the spinning
+    /// handler earns the fuel verdict instead, which leaves the generation
+    /// `Active` and unclassified.
+    ///
+    /// Returns whether a live generation VM was found and expired (`false`
+    /// for an unknown id, a torn-down entry, or a contended VM borrow).
+    /// Production never calls this; the production RC-1 budget contract
+    /// (10^7 instructions / 50 ms wall / 8 ms warning,
+    /// bitty-plugins-docs runtime/isolation-resource-rfc.md) is unchanged
+    /// and no budget is widened.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn expire_wall_slice(&mut self, id: &PluginId) -> bool {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return false;
+        };
+        let Some(vm) = entry.vm.clone() else {
+            return false;
+        };
+        let Ok(mut vm) = vm.try_borrow_mut() else {
+            return false;
+        };
+        vm.expire_wall_slice();
+        true
+    }
+
     /// Samples the live plugin Lua heaps for memory attribution (bitty#2859).
     ///
     /// `LuaVm::memory_used` is the total the VM refreshed after its last

@@ -1371,6 +1371,35 @@ impl LuaVm {
         });
     }
 
+    /// Expire the per-call wall slice (test harness only, bitty#3296).
+    ///
+    /// Zeroes the wall budget of an already-built VM so the next
+    /// slice-boundary wall check in `drive_state` fires deterministically:
+    /// the check is `charged >= wall_budget_ms` and every reading is
+    /// `>= 0`, so the verdict lands on the first boundary, before a single
+    /// instruction executes and independent of host speed, scheduler
+    /// stalls, and the RC-1 fuel race that a manifest-tightened wall still
+    /// runs (bitty#3290, bitty#3296). The suspend path is the real one —
+    /// `SuspendReason::WallClockExceeded` fail-closed — so a harness that
+    /// drives through the ordinary dispatch still proves the wall
+    /// enforcement itself: a regression that stops checking the wall
+    /// leaves the verdict to the fuel budget instead and turns the
+    /// consuming test red.
+    ///
+    /// This is an expiry seam, not a budget knob: every construction layer
+    /// keeps refusing a zero wall ([`Self::set_budgets`] and
+    /// [`Self::with_budgets`] assert, the manifest `[limits]` validator
+    /// rejects `wall_ms = 0`), the production RC-1 contract stays
+    /// 10^7 instructions / 50 ms wall / 8 ms warning
+    /// (bitty-plugins-docs runtime/isolation-resource-rfc.md), and
+    /// production never calls this. The sibling seam for chunk drives is
+    /// [`Self::execute_with_elapsed`], which injects synthetic elapsed for
+    /// the same class of deterministic wall proofs.
+    #[doc(hidden)]
+    pub fn expire_wall_slice(&mut self) {
+        self.wall_budget_ms = 0;
+    }
+
     /// Deterministic budget check helper — headless, no wall/GPU, no Lua.
     ///
     /// Exposed for deterministic harness tests that synthesize elapsed/memory

@@ -230,7 +230,8 @@ fn window_fit_letterboxes_full_image_and_honors_position() {
         [255, 0, 0, 255],
         "image center"
     );
-    assert_eq!(probe(&rgba, 500, 250, 480), bg, "bottom letterbox band");
+    // Probe in outer padding so the centered panel outline cannot cover it.
+    assert_eq!(probe(&rgba, 500, 250, 499), bg, "bottom letterbox band");
     // Top-left position moves the same letterbox to the top edge.
     rt.set_background_appearance(
         Vec::new(),

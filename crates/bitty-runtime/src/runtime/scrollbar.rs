@@ -70,8 +70,8 @@ impl Runtime {
     /// CTX-0313: the track hugs the focused leaf's decorated content frame
     /// ([`Self::present_frames`], the same rectangle the present layer
     /// paints) instead of the raw CTX-0177 cell allocation, so the thumb
-    /// never covers the decoration gap/border bands; the physical padding
-    /// inset (CTX-0223) is added exactly like the present layer's content
+    /// never covers the decoration gap/border bands; the window-grid origin
+    /// is added exactly like the present layer's content
     /// translation. No mode gate here — callers apply
     /// [`bitty_ui::scrollbar::is_visible`] with their engagement signal.
     ///
@@ -111,12 +111,13 @@ impl Runtime {
         let frame = frames.iter().find(|frame| frame.view == fid)?;
         let view = self.layout.find_leaf(fid)?;
         let sb_len = self.scrollback_len();
+        let (origin_x, origin_y) = self.window_grid_origin();
         let track = track_rect(TrackSpec {
-            content_x: frame.content.x,
-            content_y: frame.content.y,
+            content_x: frame.content.x.saturating_add(origin_x),
+            content_y: frame.content.y.saturating_add(origin_y),
             content_w: frame.content.width,
             content_h: frame.content.height,
-            pad_px: self.window_padding_physical(),
+            pad_px: 0,
             width_px: width,
         })?;
         let thumb = thumb_geometry(

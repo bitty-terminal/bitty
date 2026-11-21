@@ -2403,11 +2403,10 @@ impl Runtime {
         if window.width == 0 || window.height == 0 {
             return None;
         }
-        let pad_px = self.window_padding_physical();
-        let pad = f64::from(pad_px);
+        let origin = self.window_grid_origin();
         let cell_w = f64::from(live.width);
         let cell_h = f64::from(live.height);
-        let origin_x = pad + f64::from(window.x) * cell_w;
+        let origin_x = f64::from(origin.0) + f64::from(window.x) * cell_w;
         // The window cell the pointer is on, in the same window-relative frame
         // [`Self::band_paint_rect`] reports.
         let cell_col = (pos.x - origin_x) / cell_w;
@@ -2415,10 +2414,7 @@ impl Runtime {
             return None;
         }
         let column = u16::try_from(cell_col.floor() as u64).ok()?;
-        // CTX-1906: the pointer's physical rect test and the paint rect are the
-        // same rect, so a band that is anchored to the physical window inset is
-        // hit where it is painted instead of where its cell row would fall.
-        let geometry = self.band_pixel_geometry(pad_px);
+        let geometry = self.band_pixel_geometry(origin);
         for edge in BAND_EDGES {
             let count = match edge.axis() {
                 BandAxis::Row => self.visible_band_count(edge),
@@ -2433,13 +2429,7 @@ impl Runtime {
                 if column < band_column || column >= band_column.saturating_add(width) {
                     continue;
                 }
-                // bitty#3282: a row band is hit where it is *painted*, i.e. on
-                // its cell row inside the granted rect, so the pointer never
-                // hits band fill that is no longer drawn.
-                let rect = match edge.axis() {
-                    BandAxis::Row => geometry.cell_row(edge, band_row, band_column, width),
-                    BandAxis::Column => geometry.area_band(band_row, band_column, width, height),
-                };
+                let rect = geometry.rect(band_row, band_column, width, height);
                 if !rect.contains(pos.x, pos.y) {
                     continue;
                 }

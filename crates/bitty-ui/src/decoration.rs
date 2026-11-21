@@ -312,7 +312,8 @@ impl OverlayUnits {
 ///
 /// Zero stays zero (no 1px floor) so `Decoration::ZERO` is an exact
 /// undecorated fast path at every scale.
-fn scaled_px(value: u16, scale: f64) -> u16 {
+#[must_use]
+pub fn scaled_px(value: u16, scale: f64) -> u16 {
     if value == 0 {
         return 0;
     }

@@ -590,9 +590,9 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let pad_px = f64::from(self.window_padding_physical());
-        let x = pos.x - pad_px;
-        let y = pos.y - pad_px;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -629,9 +629,9 @@ impl Runtime {
         if !pos.x.is_finite() || !pos.y.is_finite() {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad;
-        let y = pos.y - pad;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         let handle_px = (4.0 * self.scale_factor.get()).max(4.0);
         for frame in self.present_frames().into_iter().rev() {
             let c = frame.content;
@@ -1417,7 +1417,7 @@ impl Runtime {
     /// Maps a physical cursor position to container-cell coordinates for
     /// split-handle and tiled-drop hit-testing (issues #1348, #1710).
     ///
-    /// Removes the window padding inset plus the decoration outer inset
+    /// Removes the physical window-grid origin plus the decoration outer inset
     /// (CTX-1168, issue #1983) and converts with live cell
     /// metrics, keeping the point in container coordinates: layout
     /// hit-tests (`hit_test_leaf`, `hit_test_split_handle(s)`,
@@ -1441,7 +1441,7 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let pad_px = f64::from(self.window_padding_physical());
+        let (origin_x, origin_y) = self.window_grid_origin();
         let deco_outer_px = {
             let scaled = f64::from(self.config.decoration.gaps_out) * self.dpi_scale();
             if !scaled.is_finite() || scaled <= 0.0 {
@@ -1454,8 +1454,8 @@ impl Runtime {
         // cell space: both include the container origin (a plugin band moves
         // it down), so only the padding and the decoration outer inset are
         // removed here.
-        let x = pos.x - pad_px - deco_outer_px;
-        let y = pos.y - pad_px - deco_outer_px;
+        let x = pos.x - f64::from(origin_x) - deco_outer_px;
+        let y = pos.y - f64::from(origin_y) - deco_outer_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -1477,9 +1477,9 @@ impl Runtime {
     /// Band, border, and inset presses (frame but outside content, or no
     /// frame) return false so dividers still grab.
     fn pointer_in_content(&self, pos: CursorPosition) -> bool {
-        let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad;
-        let y = pos.y - pad;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         if x < 0.0 || y < 0.0 {
             return false;
         }
@@ -1585,10 +1585,10 @@ impl Runtime {
         // lower tiled pane's content rect; `floating_border_resize_target`
         // itself rejects any pointer inside a higher/owning frame's content.
         if let Some((leaf, edge, anchored)) = self.floating_border_resize_target(cursor) {
-            let pad = f64::from(self.window_padding_physical());
+            let (origin_x, origin_y) = self.window_grid_origin();
             let clamped = CursorPosition {
-                x: cursor.x.max(pad),
-                y: cursor.y.max(pad),
+                x: cursor.x.max(f64::from(origin_x)),
+                y: cursor.y.max(f64::from(origin_y)),
             };
             if let Some(point) = self.floating_resize_point(clamped, anchored) {
                 self.float_resize = Some(FloatResizeState {

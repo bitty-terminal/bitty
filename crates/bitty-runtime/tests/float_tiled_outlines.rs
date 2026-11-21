@@ -129,11 +129,11 @@ fn ring_width(rt: &Runtime) -> i32 {
     i32::from(rt.outline_width_physical(u32::from(rt.config().decoration.border)))
 }
 
-/// Window-space frame rectangle (padding included) as `(x0, y0, x1, y1)`.
+/// Window-space frame rectangle as `(x0, y0, x1, y1)`.
 fn window_rect(rt: &Runtime, frame: &PresentFrame) -> (i32, i32, i32, i32) {
-    let pad = rt.window_padding_physical() as i32;
-    let x0 = pad + frame.frame.x;
-    let y0 = pad + frame.frame.y;
+    let (window_x, window_y) = rt.window_grid_origin();
+    let x0 = window_x + frame.frame.x;
+    let y0 = window_y + frame.frame.y;
     (
         x0,
         y0,

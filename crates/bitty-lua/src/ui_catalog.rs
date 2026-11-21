@@ -1,4 +1,5 @@
-//! Extension component catalog (candidate catalog surface; no consumer yet).
+//! Extension component catalog (candidate catalog; plugin constructor
+//! surface wired, no host consumer).
 //!
 //! This module is the headless implementation slice of the candidate
 //! `bitty-terminal-docs/specifications/extension-component-catalog-candidate.md`
@@ -6,13 +7,25 @@
 //! blocks and composes them from the **accepted** Plugin API v1 node set only:
 //! `Text`, `Row`, `Column`, and `List` (`crate::ui::UI_V1_NODE_KINDS`).
 //!
-//! Nothing here is an accepted contract, a plugin-facing API, a compatibility
-//! promise, or a shipped extension capability. **No production consumer
-//! exists:** no host path, band host, overlay path, bridge, render loop, Lua
-//! surface, or plugin installs, composes, or renders these descriptors, and no
-//! extension can opt in today. The descriptors are host-side Rust data; no Lua
-//! value, VM, callback, renderer handle, capability, coordinate, or command
-//! binding crosses this module.
+//! Since bitty#2114 the descriptors have exactly one bounded, candidate
+//! consumer: the pure constructor functions the host bridge registers under
+//! `bitty.ui.catalog` ([`read_catalog_block`] and [`compose_catalog_block`]
+//! below). A constructor reads one descriptor table, validates and composes
+//! it here, and lowers the composed tree back into the accepted v1
+//! node-table vocabulary, so a plugin mounts the result through the unchanged
+//! `bitty.ui.mount` path. The constructors introduce no new slot, node kind,
+//! capability, error code, or mount path, and admission stays with
+//! `ui.mount`'s existing gates.
+//!
+//! Nothing here is an accepted contract, a compatibility promise, or a
+//! shipped extension capability, and beyond that constructor surface the
+//! descriptors still have no consumer: no host path, band host, overlay
+//! path, bridge, or render loop composes, presents, or recognizes these
+//! blocks automatically, and no extension is required to use them. The
+//! constructors are pure bounded data handling — the module never constructs
+//! or calls a Lua VM, and it is not wired into PTY, input, damage, or render
+//! loops. No VM callback, renderer handle, capability, coordinate, or
+//! command binding crosses back into this module.
 //!
 //! # Catalog entries
 //!
@@ -52,10 +65,14 @@
 //!   sheet title), never as the sole carrier of a state.
 //! - **No style hooks yet.** The candidate Scene Style Primitives record is
 //!   not accepted and has no consumer here; the catalog emits no style field
-//!   and reserves hooks for a successor acceptance.
-//! - **Cold path, no consumer.** Composition is a pure function over bounded
-//!   data. It does not construct or call a Lua VM and is not wired into PTY,
-//!   input, damage, or render loops; nothing in production calls it yet.
+//!   and reserves hooks for a successor acceptance. A `style`-shaped key on
+//!   a constructor descriptor is an unknown field and fails closed (see
+//!   [`reject_unknown_keys`]), never a tolerated drop.
+//! - **Cold path, one pure constructor consumer.** Composition is a pure
+//!   function over bounded data. It does not construct or call a Lua VM and
+//!   is not wired into PTY, input, damage, or render loops; the only
+//!   consumer is the `bitty.ui.catalog` constructor surface (bitty#2114),
+//!   which mounts nothing itself.
 //!
 //! # Caps (candidate; inclusive)
 //!
@@ -85,7 +102,12 @@
 
 use std::fmt;
 
-use crate::ui::{UI_MAX_DEPTH, UI_MAX_NODES, UI_MAX_TEXT_BYTES, UiNode};
+use phodopus::Value;
+
+use crate::host::{BridgeError, LuaValue};
+use crate::ui::{
+    UI_MARSHAL_LIMITS, UI_MAX_DEPTH, UI_MAX_NODES, UI_MAX_TEXT_BYTES, UiNode, component_invalid,
+};
 
 /// Maximum segments across the three regions of one `band`/`status-strip`
 /// declaration (candidate; anchored to the chrome-band candidate's
@@ -970,6 +992,445 @@ impl fmt::Display for CatalogError {
 }
 
 impl std::error::Error for CatalogError {}
+
+// ── plugin Lua constructor surface (bitty#2114) ─────────────────────────────
+//
+// The host bridge (`crate::host`) registers five pure constructor functions
+// under `bitty.ui.catalog`, one per catalog entry: `band`, `pill_row`,
+// `tooltip_detail_fallback`, `modal_sheet`, and `status_strip`. Each
+// constructor marshals one descriptor table through the helpers below,
+// validates and composes it through [`CatalogBlock::compose`] above, and
+// lowers the composed tree back into the accepted v1 node-table vocabulary
+// (`Text`/`Row`/`Column`/`List`), so the plugin mounts the result through the
+// unchanged `bitty.ui.mount` path. The constructors only marshal and validate
+// declarative data: no slot, node kind, capability, error code, or mount path
+// is added, no host service is called, and admission stays with
+// `ui.mount`'s existing gates.
+
+/// Read one raw Lua descriptor value into the typed declaration for `entry`.
+///
+/// `spelling` is the Lua function name the plugin called (for example
+/// `pill_row`); it names the surface in diagnostics while `entry` stays the
+/// declaration's canonical id. Marshalling failures (depth, node, and byte
+/// ceilings, and non-data values such as functions or cyclic tables) are
+/// surfaced as `E_UI_COMPONENT_INVALID` with the same component-shaped
+/// ceilings [`crate::ui::read_component`] uses, so a descriptor of any legal
+/// catalog size always reaches the descriptor parser and a hostile table
+/// never does.
+///
+/// # Errors
+///
+/// [`BridgeError`] with class `validation` and code `E_UI_COMPONENT_INVALID`
+/// when the value is not the entry's descriptor table shape.
+pub fn read_catalog_block(
+    entry: CatalogEntry,
+    spelling: &str,
+    value: Value<'_>,
+) -> Result<CatalogBlock, BridgeError> {
+    let marshalled = LuaValue::from_lua(value, UI_MARSHAL_LIMITS)
+        .map_err(|error| component_invalid(error.message))?;
+    read_catalog_block_value(entry, spelling, &marshalled)
+}
+
+/// [`read_catalog_block`] over an already-marshalled descriptor value.
+///
+/// This is the testable core: it is pure over [`LuaValue`] and never touches
+/// a live Lua context.
+///
+/// # Errors
+///
+/// Same as [`read_catalog_block`].
+pub fn read_catalog_block_value(
+    entry: CatalogEntry,
+    spelling: &str,
+    value: &LuaValue,
+) -> Result<CatalogBlock, BridgeError> {
+    if !matches!(value, LuaValue::Table(_)) {
+        return Err(component_invalid(format!(
+            "ui.catalog.{spelling} descriptor must be a table"
+        )));
+    }
+    match entry {
+        CatalogEntry::Band => Ok(CatalogBlock::Band(strip_from_lua_value(spelling, value)?)),
+        CatalogEntry::StatusStrip => Ok(CatalogBlock::StatusStrip(strip_from_lua_value(
+            spelling, value,
+        )?)),
+        CatalogEntry::PillRow => Ok(CatalogBlock::PillRow(pill_row_from_lua_value(
+            spelling, value,
+        )?)),
+        CatalogEntry::TooltipDetailFallback => Ok(CatalogBlock::TooltipDetailFallback(
+            detail_from_lua_value(spelling, value)?,
+        )),
+        CatalogEntry::ModalSheet => Ok(CatalogBlock::ModalSheet(modal_sheet_from_lua_value(
+            spelling, value,
+        )?)),
+    }
+}
+
+/// Validate and compose one declaration, then lower the composed tree into
+/// the accepted v1 node-table vocabulary.
+///
+/// The returned [`LuaValue`] is exactly the declarative component shape
+/// `bitty.ui.mount` accepts, so mounting it revalidates through the
+/// unchanged bridge reader and its existing capability gates. A plugin may
+/// also embed the table inside a larger scene it composes itself.
+///
+/// # Errors
+///
+/// [`BridgeError`] with class `validation` and code `E_UI_COMPONENT_INVALID`
+/// carrying the [`CatalogError`] diagnostic when the declaration fails the
+/// catalog's own validation, or when the composed tree carries a field the
+/// catalog does not compose (a fail-closed guard, never a silent drop).
+pub fn compose_catalog_block(block: &CatalogBlock) -> Result<LuaValue, BridgeError> {
+    let node = block
+        .compose()
+        .map_err(|error| component_invalid(error.to_string()))?;
+    composed_node_to_lua_value(&node)
+}
+
+/// Refuse a key outside a descriptor's closed field set.
+///
+/// The v1 node tables tolerate unknown fields because the accepted
+/// additive-minor rule froze that surface. This candidate descriptor surface
+/// has no such rule, and a silently ignored `style`/`anchor`-shaped key would
+/// recreate the "declared but never painted" confusion the mount path has to
+/// report through `ui_style_ignored` (bitty#3176). Unknown descriptor keys
+/// therefore fail closed like the panel spec (`bitty.ui.panel.present`),
+/// never tolerated.
+fn reject_unknown_keys(
+    value: &LuaValue,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), BridgeError> {
+    let LuaValue::Table(pairs) = value else {
+        return Err(component_invalid(format!("{context} must be a table")));
+    };
+    for (key, _) in pairs {
+        match key {
+            LuaValue::String(name) if allowed.contains(&name.as_str()) => {}
+            LuaValue::String(name) => {
+                return Err(component_invalid(format!(
+                    "{context} has an unknown field '{name}'"
+                )));
+            }
+            _ => {
+                return Err(component_invalid(format!(
+                    "{context} must be a string-keyed table"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a dense, 1-based array table — the same shape the v1 node reader
+/// requires of `children`. A mixed table or a sparse array fails closed
+/// instead of dropping the named or skipped entries.
+fn dense_array<'a>(value: &'a LuaValue, context: &str) -> Result<Vec<&'a LuaValue>, BridgeError> {
+    let LuaValue::Table(pairs) = value else {
+        return Err(component_invalid(format!(
+            "{context} must be an array table"
+        )));
+    };
+    let mut indexed: Vec<(i64, &LuaValue)> = Vec::with_capacity(pairs.len());
+    for (key, item) in pairs {
+        match key {
+            LuaValue::Integer(index) => indexed.push((*index, item)),
+            _ => {
+                return Err(component_invalid(format!(
+                    "{context} must be a dense 1-based array"
+                )));
+            }
+        }
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    let mut items = Vec::with_capacity(indexed.len());
+    for (position, (index, item)) in indexed.into_iter().enumerate() {
+        if index != position as i64 + 1 {
+            return Err(component_invalid(format!(
+                "{context} must be a dense 1-based array"
+            )));
+        }
+        items.push(item);
+    }
+    Ok(items)
+}
+
+/// One `band`/`status_strip` descriptor: `{ left = …, center = …, right = … }`.
+///
+/// Each region is a dense segment array; an absent or `nil` region is the
+/// legal empty region. Item caps and empty-content refusals stay with
+/// [`CatalogBlock::compose`], the single validation boundary.
+fn strip_from_lua_value(spelling: &str, value: &LuaValue) -> Result<StripDescriptor, BridgeError> {
+    reject_unknown_keys(
+        value,
+        &["left", "center", "right"],
+        &format!("ui.catalog.{spelling} descriptor"),
+    )?;
+    Ok(StripDescriptor {
+        left: region_from_lua_value(spelling, value, "left")?,
+        center: region_from_lua_value(spelling, value, "center")?,
+        right: region_from_lua_value(spelling, value, "right")?,
+    })
+}
+
+/// One strip region as a dense segment array.
+fn region_from_lua_value(
+    spelling: &str,
+    value: &LuaValue,
+    region: &str,
+) -> Result<Vec<Segment>, BridgeError> {
+    let Some(region_value) = value.get(region) else {
+        return Ok(Vec::new());
+    };
+    if matches!(region_value, LuaValue::Nil) {
+        return Ok(Vec::new());
+    }
+    let context = format!("ui.catalog.{spelling} {region}");
+    let items = dense_array(region_value, &context)?;
+    items
+        .into_iter()
+        .map(|item| segment_from_lua_value(&context, item))
+        .collect()
+}
+
+/// One segment: a plain string, or a table `{ text = string, emphasis =
+/// boolean }`. Emphasis is redundant bold, never a state carrier.
+fn segment_from_lua_value(context: &str, value: &LuaValue) -> Result<Segment, BridgeError> {
+    match value {
+        LuaValue::String(text) => Ok(Segment::new(text.clone())),
+        LuaValue::Table(_) => {
+            let segment = format!("{context} segment");
+            reject_unknown_keys(value, &["text", "emphasis"], &segment)?;
+            let Some(LuaValue::String(text)) = value.get("text") else {
+                return Err(component_invalid(format!(
+                    "{segment} text must be a string"
+                )));
+            };
+            let emphasis = match value.get("emphasis") {
+                None => false,
+                Some(LuaValue::Bool(flag)) => *flag,
+                Some(_) => {
+                    return Err(component_invalid(format!(
+                        "{segment} emphasis must be a boolean"
+                    )));
+                }
+            };
+            Ok(Segment {
+                text: text.clone(),
+                emphasis,
+            })
+        }
+        _ => Err(component_invalid(format!(
+            "{context} segment must be a string or a table"
+        ))),
+    }
+}
+
+/// One `pill_row` descriptor: `{ pills = … }`, a dense array of pills.
+fn pill_row_from_lua_value(
+    spelling: &str,
+    value: &LuaValue,
+) -> Result<PillRowDescriptor, BridgeError> {
+    reject_unknown_keys(
+        value,
+        &["pills"],
+        &format!("ui.catalog.{spelling} descriptor"),
+    )?;
+    let Some(pills_value) = value.get("pills") else {
+        return Err(component_invalid(format!(
+            "ui.catalog.{spelling} pills must be a dense 1-based array"
+        )));
+    };
+    let context = format!("ui.catalog.{spelling} pills");
+    let items = dense_array(pills_value, &context)?;
+    let pills = items
+        .into_iter()
+        .map(|item| pill_from_lua_value(&context, item))
+        .collect::<Result<Vec<Pill>, _>>()?;
+    Ok(PillRowDescriptor { pills })
+}
+
+/// One pill: a plain string (inactive), or a table
+/// `{ label = string, active = boolean }`. Active renders as redundant bold.
+fn pill_from_lua_value(context: &str, value: &LuaValue) -> Result<Pill, BridgeError> {
+    match value {
+        LuaValue::String(label) => Ok(Pill::new(label.clone())),
+        LuaValue::Table(_) => {
+            let entry = format!("{context} entry");
+            reject_unknown_keys(value, &["label", "active"], &entry)?;
+            let Some(LuaValue::String(label)) = value.get("label") else {
+                return Err(component_invalid(format!("{entry} label must be a string")));
+            };
+            let active = match value.get("active") {
+                None => false,
+                Some(LuaValue::Bool(flag)) => *flag,
+                Some(_) => {
+                    return Err(component_invalid(format!(
+                        "{entry} active must be a boolean"
+                    )));
+                }
+            };
+            Ok(Pill {
+                label: label.clone(),
+                active,
+            })
+        }
+        _ => Err(component_invalid(format!(
+            "{context} entry must be a string or a table"
+        ))),
+    }
+}
+
+/// One `tooltip_detail_fallback` descriptor: `{ text = string }`. An empty
+/// string reaches the descriptor and is refused by
+/// [`CatalogBlock::compose`] as an empty item, the same validation boundary
+/// every entry shares.
+fn detail_from_lua_value(
+    spelling: &str,
+    value: &LuaValue,
+) -> Result<DetailFallbackDescriptor, BridgeError> {
+    reject_unknown_keys(
+        value,
+        &["text"],
+        &format!("ui.catalog.{spelling} descriptor"),
+    )?;
+    let Some(LuaValue::String(text)) = value.get("text") else {
+        return Err(component_invalid(format!(
+            "ui.catalog.{spelling} text must be a string"
+        )));
+    };
+    Ok(DetailFallbackDescriptor { text: text.clone() })
+}
+
+/// One `modal_sheet` descriptor: `{ title = string, rows = … }`, `rows` a
+/// dense array of strings. An absent `rows` region is empty content and is
+/// refused by [`CatalogBlock::compose`], never silently omitted.
+fn modal_sheet_from_lua_value(
+    spelling: &str,
+    value: &LuaValue,
+) -> Result<ModalSheetDescriptor, BridgeError> {
+    reject_unknown_keys(
+        value,
+        &["title", "rows"],
+        &format!("ui.catalog.{spelling} descriptor"),
+    )?;
+    let Some(LuaValue::String(title)) = value.get("title") else {
+        return Err(component_invalid(format!(
+            "ui.catalog.{spelling} title must be a string"
+        )));
+    };
+    let rows = match value.get("rows") {
+        None => Vec::new(),
+        Some(rows_value) => {
+            let context = format!("ui.catalog.{spelling} rows");
+            let items = dense_array(rows_value, &context)?;
+            items
+                .into_iter()
+                .map(|item| match item {
+                    LuaValue::String(row) => Ok(row.clone()),
+                    _ => Err(component_invalid(format!("{context} must hold strings"))),
+                })
+                .collect::<Result<Vec<String>, _>>()?
+        }
+    };
+    Ok(ModalSheetDescriptor {
+        title: title.clone(),
+        rows,
+    })
+}
+
+/// Lower a catalog-composed tree into the accepted v1 node-table vocabulary.
+///
+/// The composers emit plain nodes only — no anchor, distribution, theme
+/// token, or command binding — and `bold` only as the redundant emphasis the
+/// catalog declares. The lowering is fail-closed about exactly that: a node
+/// carrying any field the catalog does not compose is a typed rejection
+/// instead of a silent drop, so a future composer change surfaces here and in
+/// the lowering round-trip tests rather than degrading the plugin-visible
+/// tree. Recursion is bounded by the validated tree: `compose` has already
+/// enforced `CATALOG_MAX_NODES` and `CATALOG_MAX_DEPTH`.
+fn composed_node_to_lua_value(node: &UiNode) -> Result<LuaValue, BridgeError> {
+    match node {
+        UiNode::Text {
+            anchor: None,
+            text,
+            fg: None,
+            bg: None,
+            bold,
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        } => match bold {
+            None => Ok(LuaValue::table([
+                ("kind", LuaValue::String("Text".into())),
+                ("text", LuaValue::String(text.clone())),
+            ])),
+            Some(true) => Ok(LuaValue::table([
+                ("kind", LuaValue::String("Text".into())),
+                ("text", LuaValue::String(text.clone())),
+                ("bold", LuaValue::Bool(true)),
+            ])),
+            // `text_node` writes `Some(true)` or `None`; `Some(false)` is
+            // not the canonical shape and is refused, never normalized.
+            Some(false) => Err(component_invalid(
+                "catalog composition produced a non-canonical bold state",
+            )),
+        },
+        UiNode::Row {
+            anchor: None,
+            align: None,
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        } => composed_children_to_lua_value("Row", children),
+        UiNode::Column {
+            anchor: None,
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        } => composed_children_to_lua_value("Column", children),
+        UiNode::List {
+            anchor: None,
+            children,
+            fg: None,
+            bg: None,
+            bold: None,
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        } => composed_children_to_lua_value("List", children),
+        // A styled, anchored, distributed, or bound node is not a shape the
+        // catalog composes; refusing keeps the plugin-visible tree exactly
+        // the candidate shape instead of silently dropping fields.
+        _ => Err(component_invalid(
+            "catalog composition produced a styled or bound node outside the candidate shape",
+        )),
+    }
+}
+
+/// Lower one composed container and its children.
+fn composed_children_to_lua_value(
+    kind: &str,
+    children: &[UiNode],
+) -> Result<LuaValue, BridgeError> {
+    let lowered = children
+        .iter()
+        .map(composed_node_to_lua_value)
+        .collect::<Result<Vec<LuaValue>, _>>()?;
+    Ok(LuaValue::table([
+        ("kind", LuaValue::String(kind.to_string())),
+        ("children", LuaValue::array(lowered)),
+    ]))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1969,5 +2430,369 @@ mod tests {
         for block in blocks {
             walk(&block.compose().expect("bounded block"));
         }
+    }
+
+    // ── plugin Lua constructor surface (bitty#2114) ──────────────────────
+
+    fn lv(text: &str) -> LuaValue {
+        LuaValue::String(text.to_string())
+    }
+
+    fn lv_table(pairs: &[(&str, LuaValue)]) -> LuaValue {
+        LuaValue::Table(
+            pairs
+                .iter()
+                .map(|(key, value)| (lv(key), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn lv_array(items: Vec<LuaValue>) -> LuaValue {
+        LuaValue::array(items)
+    }
+
+    /// One representative descriptor table per entry, with the exact block
+    /// it must parse into.
+    fn lua_descriptor_cases() -> [(CatalogEntry, &'static str, LuaValue, CatalogBlock); 5] {
+        [
+            (
+                CatalogEntry::Band,
+                "band",
+                lv_table(&[
+                    (
+                        "left",
+                        lv_array(vec![
+                            lv("cpu 12%"),
+                            lv_table(&[
+                                ("text", lv("mem 40%")),
+                                ("emphasis", LuaValue::Bool(true)),
+                            ]),
+                        ]),
+                    ),
+                    ("center", lv_array(vec![lv("bitty")])),
+                    ("right", lv_array(Vec::new())),
+                ]),
+                CatalogBlock::Band(StripDescriptor {
+                    left: vec![Segment::new("cpu 12%"), Segment::emphasized("mem 40%")],
+                    center: vec![Segment::new("bitty")],
+                    right: Vec::new(),
+                }),
+            ),
+            (
+                CatalogEntry::PillRow,
+                "pill_row",
+                lv_table(&[(
+                    "pills",
+                    lv_array(vec![
+                        lv("main"),
+                        lv_table(&[("label", lv("aux")), ("active", LuaValue::Bool(true))]),
+                    ]),
+                )]),
+                CatalogBlock::PillRow(PillRowDescriptor {
+                    pills: vec![Pill::new("main"), Pill::active("aux")],
+                }),
+            ),
+            (
+                CatalogEntry::TooltipDetailFallback,
+                "tooltip_detail_fallback",
+                lv_table(&[("text", lv("cpu 45%"))]),
+                CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor {
+                    text: "cpu 45%".to_string(),
+                }),
+            ),
+            (
+                CatalogEntry::ModalSheet,
+                "modal_sheet",
+                lv_table(&[
+                    ("title", lv("Sessions")),
+                    ("rows", lv_array(vec![lv("aux: running"), lv("main: idle")])),
+                ]),
+                CatalogBlock::ModalSheet(ModalSheetDescriptor {
+                    title: "Sessions".to_string(),
+                    rows: vec!["aux: running".to_string(), "main: idle".to_string()],
+                }),
+            ),
+            (
+                CatalogEntry::StatusStrip,
+                "status_strip",
+                lv_table(&[
+                    ("left", lv_array(vec![lv("ws 1")])),
+                    ("center", lv_array(Vec::new())),
+                    ("right", lv_array(vec![lv("clock")])),
+                ]),
+                CatalogBlock::StatusStrip(StripDescriptor {
+                    left: vec![Segment::new("ws 1")],
+                    center: Vec::new(),
+                    right: vec![Segment::new("clock")],
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn lua_descriptor_round_trips_per_entry() {
+        for (entry, spelling, descriptor, expected) in lua_descriptor_cases() {
+            let block =
+                read_catalog_block_value(entry, spelling, &descriptor).expect("descriptor parses");
+            assert_eq!(block, expected, "{spelling} descriptor block");
+
+            let lowered = compose_catalog_block(&block).expect("composed tree lowers");
+            // The lowered table is exactly the declarative component the
+            // mount reader accepts, and reading it back must reproduce the
+            // composed tree in full — a field the lowering dropped breaks
+            // this equality, which is the fail-closed pin for the lowering.
+            let node = UiNode::from_lua_value(&lowered).expect("lowered table mounts as v1");
+            assert_eq!(
+                node,
+                block.compose().expect("block composes"),
+                "{spelling} lowering is lossless"
+            );
+
+            let parsed = CatalogBlock::from_scene(entry, &node)
+                .expect("lowered tree is the canonical shape");
+            assert_eq!(parsed, block, "{spelling} round trip");
+            assert!(
+                block.verify(&node).is_ok(),
+                "{spelling} composed tree verifies"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_descriptor_refuses_wrong_shapes() {
+        // A non-table argument fails for every entry with the surface named.
+        let cases = lua_descriptor_cases();
+        for (entry, spelling, _, _) in &cases {
+            for wrong in [
+                LuaValue::Nil,
+                lv("text"),
+                LuaValue::Integer(1),
+                LuaValue::Bool(true),
+            ] {
+                let error = read_catalog_block_value(*entry, spelling, &wrong)
+                    .expect_err("non-table descriptor fails");
+                assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+                assert!(
+                    error.message.contains(&format!("ui.catalog.{spelling}")),
+                    "{spelling} error names the surface: {}",
+                    error.message
+                );
+            }
+        }
+
+        // Unknown descriptor keys fail closed. A candidate surface has no
+        // additive-minor rule, and a `style`-shaped key must never be the
+        // silently-dropped declaration bitty#3176 had to diagnose.
+        let styled = lv_table(&[
+            ("text", lv("x")),
+            ("style", lv_table(&[("padding", LuaValue::Integer(1))])),
+        ]);
+        let error = read_catalog_block_value(
+            CatalogEntry::TooltipDetailFallback,
+            "tooltip_detail_fallback",
+            &styled,
+        )
+        .expect_err("unknown field fails");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(
+            error.message.contains("unknown field 'style'"),
+            "{}",
+            error.message
+        );
+
+        // Segment and pill entry shapes.
+        let bad_segment_text = lv_table(&[(
+            "left",
+            lv_array(vec![lv_table(&[("text", LuaValue::Bool(true))])]),
+        )]);
+        let error = read_catalog_block_value(CatalogEntry::Band, "band", &bad_segment_text)
+            .expect_err("segment text must be a string");
+        assert!(error.message.contains("segment text must be a string"));
+
+        let bad_emphasis = lv_table(&[(
+            "left",
+            lv_array(vec![lv_table(&[
+                ("text", lv("x")),
+                ("emphasis", lv("yes")),
+            ])]),
+        )]);
+        let error = read_catalog_block_value(CatalogEntry::Band, "band", &bad_emphasis)
+            .expect_err("emphasis must be a boolean");
+        assert!(error.message.contains("emphasis must be a boolean"));
+
+        let bad_active = lv_table(&[(
+            "pills",
+            lv_array(vec![lv_table(&[
+                ("label", lv("x")),
+                ("active", LuaValue::Integer(1)),
+            ])]),
+        )]);
+        let error = read_catalog_block_value(CatalogEntry::PillRow, "pill_row", &bad_active)
+            .expect_err("active must be a boolean");
+        assert!(error.message.contains("active must be a boolean"));
+
+        // Missing required arrays and non-array regions fail.
+        let error = read_catalog_block_value(
+            CatalogEntry::PillRow,
+            "pill_row",
+            &lv_table(&[("pills", LuaValue::Nil)]),
+        )
+        .expect_err("nil pills fails");
+        assert!(error.message.contains("pills must be an array table"));
+
+        let error = read_catalog_block_value(CatalogEntry::PillRow, "pill_row", &lv_table(&[]))
+            .expect_err("missing pills fails");
+        assert!(
+            error
+                .message
+                .contains("pills must be a dense 1-based array")
+        );
+
+        let error = read_catalog_block_value(
+            CatalogEntry::ModalSheet,
+            "modal_sheet",
+            &lv_table(&[("title", lv("t")), ("rows", lv("not-a-table"))]),
+        )
+        .expect_err("rows must be an array");
+        assert!(error.message.contains("rows must be an array table"));
+
+        let error = read_catalog_block_value(
+            CatalogEntry::ModalSheet,
+            "modal_sheet",
+            &lv_table(&[
+                ("title", lv("t")),
+                ("rows", lv_array(vec![lv("ok"), LuaValue::Bool(true)])),
+            ]),
+        )
+        .expect_err("rows must hold strings");
+        assert!(error.message.contains("rows must hold strings"));
+
+        let error =
+            read_catalog_block_value(CatalogEntry::ModalSheet, "modal_sheet", &lv_table(&[]))
+                .expect_err("missing title fails");
+        assert!(error.message.contains("title must be a string"));
+
+        // Sparse and mixed arrays fail instead of dropping entries.
+        let sparse = LuaValue::Table(vec![(LuaValue::Integer(2), lv("x"))]);
+        let error =
+            read_catalog_block_value(CatalogEntry::Band, "band", &lv_table(&[("left", sparse)]))
+                .expect_err("sparse array fails");
+        assert!(error.message.contains("dense 1-based array"));
+
+        let mixed = LuaValue::Table(vec![
+            (LuaValue::Integer(1), lv("x")),
+            (lv("named"), lv("y")),
+        ]);
+        let error =
+            read_catalog_block_value(CatalogEntry::Band, "band", &lv_table(&[("left", mixed)]))
+                .expect_err("mixed array fails");
+        assert!(error.message.contains("dense 1-based array"));
+    }
+
+    #[test]
+    fn lua_constructors_enforce_catalog_caps_and_empty_rules() {
+        // 65 segments across the regions exceed CATALOG_MAX_SEGMENTS.
+        let many = lv_table(&[("left", lv_array((0..65).map(|_| lv("s")).collect()))]);
+        let block = read_catalog_block_value(CatalogEntry::Band, "band", &many)
+            .expect("descriptor parses before the cap check");
+        let error = compose_catalog_block(&block).expect_err("segment cap enforced");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(
+            error.message.contains("exceeding cap 64"),
+            "{}",
+            error.message
+        );
+
+        // An empty declaration is refused, never silently ignored.
+        let empty =
+            read_catalog_block_value(CatalogEntry::StatusStrip, "status_strip", &lv_table(&[]))
+                .expect("empty regions parse");
+        let error = compose_catalog_block(&empty).expect_err("empty block refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(
+            error.message.contains("status-strip block has no content"),
+            "{}",
+            error.message
+        );
+
+        // A bracketed pill label keeps the reserved-delimiter refusal.
+        let bracketed = lv_table(&[("pills", lv_array(vec![lv("a]b")]))]);
+        let block = read_catalog_block_value(CatalogEntry::PillRow, "pill_row", &bracketed)
+            .expect("label parses before the delimiter check");
+        let error = compose_catalog_block(&block).expect_err("reserved delimiter enforced");
+        assert!(
+            error.message.contains("reserved bracket delimiter"),
+            "{}",
+            error.message
+        );
+
+        // An over-long segment keeps the per-item byte cap.
+        let long = lv_table(&[("left", lv_array(vec![lv(&"x".repeat(65))]))]);
+        let block = read_catalog_block_value(CatalogEntry::Band, "band", &long)
+            .expect("descriptor parses before the item cap");
+        let error = compose_catalog_block(&block).expect_err("item byte cap enforced");
+        assert!(
+            error.message.contains("is 65 bytes, exceeding cap 64"),
+            "{}",
+            error.message
+        );
+
+        // An empty segment text is an empty item, not a silent blank.
+        let blank = lv_table(&[("left", lv_array(vec![lv("")]))]);
+        let block = read_catalog_block_value(CatalogEntry::Band, "band", &blank)
+            .expect("descriptor parses before the empty check");
+        let error = compose_catalog_block(&block).expect_err("empty item refused");
+        assert!(
+            error.message.contains("band item 0 is empty"),
+            "{}",
+            error.message
+        );
+
+        // An absent modal-sheet rows region is empty content, refused by the
+        // catalog's own validation boundary.
+        let rowsless = lv_table(&[("title", lv("t"))]);
+        let block = read_catalog_block_value(CatalogEntry::ModalSheet, "modal_sheet", &rowsless)
+            .expect("descriptor parses before the empty check");
+        let error = compose_catalog_block(&block).expect_err("empty sheet refused");
+        assert!(
+            error.message.contains("modal-sheet block has no content"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn lowering_refuses_fields_the_catalog_never_composes() {
+        let mut styled = UiNode::text("x");
+        if let UiNode::Text { fg, .. } = &mut styled {
+            *fg = Some("accent".to_string());
+        }
+        let error = composed_node_to_lua_value(&styled).expect_err("styled node refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(
+            error.message.contains("outside the candidate shape"),
+            "{}",
+            error.message
+        );
+
+        // `Some(false)` bold is not the canonical emphasis spelling the
+        // composers emit and is refused, never normalized.
+        let unbolded = UiNode::Text {
+            anchor: None,
+            text: "x".to_string(),
+            fg: None,
+            bg: None,
+            bold: Some(false),
+            on_click: None,
+            on_scroll: None,
+            on_hover: None,
+        };
+        let error = composed_node_to_lua_value(&unbolded).expect_err("non-canonical bold refused");
+        assert_eq!(error.code, "E_UI_COMPONENT_INVALID");
+        assert!(
+            error.message.contains("non-canonical bold state"),
+            "{}",
+            error.message
+        );
     }
 }

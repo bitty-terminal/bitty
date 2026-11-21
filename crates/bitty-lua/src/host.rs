@@ -55,6 +55,7 @@ use crate::ui::{
     UiBlockState, UiNode, UiSceneScope, UiSlot, UiTolerated, component_invalid,
     read_component_with_tolerated,
 };
+use crate::ui_catalog::{CatalogEntry, compose_catalog_block, read_catalog_block};
 use crate::ui_panel::{
     UI_PANEL_INPUT_POLL_MAX_DEFAULT, UI_PANEL_INPUT_QUEUE_MAX, UiPanelSpec,
     read_panel_release_reason, read_panel_spec,
@@ -3369,6 +3370,28 @@ fn input_events_value(events: &[OverlayInput]) -> LuaValue {
             })
             .collect(),
     )
+}
+
+/// Build one `bitty.ui.catalog.<spelling>` constructor callback (bitty#2114).
+///
+/// The callback is pure: it marshals the one descriptor argument with the
+/// component-shaped ceilings, validates and composes it through the shipped
+/// catalog, and lowers the composed tree back into the accepted v1
+/// node-table vocabulary. It calls no host service and holds no state, so a
+/// plugin with no UI grant may still build a component table; mounting it
+/// stays gated on `bitty.ui.mount`'s existing capability checks.
+fn catalog_constructor<'gc>(
+    ctx: &Context<'gc>,
+    entry: CatalogEntry,
+    spelling: &'static str,
+) -> Callback<'gc> {
+    Callback::from_fn(ctx, move |ctx, _exec, mut stack| {
+        let block = read_catalog_block(entry, spelling, stack.get(0))
+            .map_err(|error| error.to_error(ctx))?;
+        let lowered = compose_catalog_block(&block).map_err(|error| error.to_error(ctx))?;
+        stack.replace(ctx, lowered.to_lua(ctx));
+        Ok(CallbackReturn::Return)
+    })
 }
 
 /// Parse an overlay acquire spec into bounded `(title, placeholder)` hints.
@@ -7875,6 +7898,61 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("labels table accepts 'assign'");
     ui.set(ctx, "labels", readonly_table(ctx, labels))
         .expect("ui table accepts 'labels'");
+
+    // bitty#2114 (CTX-1921): the candidate extension component catalog
+    // constructors. Five pure functions under `bitty.ui.catalog`, one per
+    // shipped catalog entry (`band`, `pill_row`,
+    // `tooltip_detail_fallback`, `modal_sheet`, `status_strip`): each reads
+    // one bounded descriptor table, validates and composes it through the
+    // shipped catalog (`crate::ui_catalog`), and lowers the composed tree
+    // back into the accepted v1 node-table vocabulary so the plugin mounts it
+    // through the unchanged `bitty.ui.mount` path. No new slot, node kind,
+    // capability, error code, or mount path is introduced: the constructors
+    // only marshal and validate declarative data (cold path, no host service
+    // call, no VM construction), and admission stays with `ui.mount`'s
+    // existing `ui.rich`/`ui.overlay` gates.
+    let catalog = Table::new(&ctx);
+    catalog
+        .set(
+            ctx,
+            "band",
+            catalog_constructor(&ctx, CatalogEntry::Band, "band"),
+        )
+        .expect("catalog table accepts 'band'");
+    catalog
+        .set(
+            ctx,
+            "pill_row",
+            catalog_constructor(&ctx, CatalogEntry::PillRow, "pill_row"),
+        )
+        .expect("catalog table accepts 'pill_row'");
+    catalog
+        .set(
+            ctx,
+            "tooltip_detail_fallback",
+            catalog_constructor(
+                &ctx,
+                CatalogEntry::TooltipDetailFallback,
+                "tooltip_detail_fallback",
+            ),
+        )
+        .expect("catalog table accepts 'tooltip_detail_fallback'");
+    catalog
+        .set(
+            ctx,
+            "modal_sheet",
+            catalog_constructor(&ctx, CatalogEntry::ModalSheet, "modal_sheet"),
+        )
+        .expect("catalog table accepts 'modal_sheet'");
+    catalog
+        .set(
+            ctx,
+            "status_strip",
+            catalog_constructor(&ctx, CatalogEntry::StatusStrip, "status_strip"),
+        )
+        .expect("catalog table accepts 'status_strip'");
+    ui.set(ctx, "catalog", readonly_table(ctx, catalog))
+        .expect("ui table accepts 'catalog'");
 
     // CTX-1352 (issue #2247, W-146): the read-only `bitty.history` root is
     // present for every generation, even when no source is wired and no

@@ -1705,6 +1705,9 @@ fn long_running_virtual_and_multi_pane_chafa_never_lock_out_3159() {
             LayoutNode::leaf(View::new(primary, 80, 24)),
             LayoutNode::leaf(View::new(pane, 80, 24)),
         ));
+        // pty-gate-exempt: the spawn sits inside a `#[cfg(unix)]` block, so it is
+        // not compiled on Windows; the lint only reads the enclosing function's
+        // attributes and cannot see a cfg block in the body.
         rt.spawn_shell_for_view(pane, "/bin/sh", &["-c", "sleep 60"], 40, 24)
             .expect("spawn pane shell");
         for _ in 0..40 {

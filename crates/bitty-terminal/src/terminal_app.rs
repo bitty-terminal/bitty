@@ -8072,7 +8072,24 @@ end)
         }
     }
 
-    fn write_plugin(root: &std::path::Path, id: &str, body: &str, extra: &str) {
+    /// Tightened RC-1 wall slice for the fault plugin manifest (the
+    /// `[limits]` tighten-only contract; `crates/bitty-runtime/tests/plugin_budgets.rs`
+    /// is the precedent).
+    ///
+    /// `fault()` needs the handler to die on the *terminal wall* verdict, and
+    /// with the 50 ms host ceiling that is a host-speed race against the
+    /// 10^7-instruction fuel slice: a host fast enough to burn the fuel in
+    /// under 50 ms only earns a plain refuel, the generation stays Active,
+    /// and the fixture panics (bitty#3290). `wall_ms = 2` makes the wall win
+    /// on any host: even an implausibly fast 10^9 instructions/s VM covers
+    /// only 2 * 10^6 of its 10^7 fuel slice before the 2 ms wall trips (fuel
+    /// could win only beyond 5 * 10^9 instructions/s), while the trivial
+    /// subscribe-only `init.lua` fits a 2 ms slice on a slow host.
+    /// `warning_ms` stays strictly below the wall per the manifest contract;
+    /// fuel and memory stay at their host ceilings (undeclared).
+    const FAULT_LIMITS_TOML: &str = "[limits]\nwall_ms = 2\nwarning_ms = 1\n";
+
+    fn write_plugin(root: &std::path::Path, id: &str, body: &str, limits: &str, extra: &str) {
         let plugin_dir = root.join(id);
         std::fs::create_dir_all(plugin_dir.join("lua")).expect("dirs");
         std::fs::write(
@@ -8080,7 +8097,8 @@ end)
             format!(
                 "[plugin]\nid = \"{id}\"\nname = \"Wall wiring 1855\"\nversion = \"0.1.0\"\n\
                  description = \"CTX-1855 recovery wiring\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
-                 [capabilities]\n\n[lazy]\ncommands = []\nevents = [\"terminal.opened\"{extra}]\n"
+                 [capabilities]\n\n[lazy]\ncommands = []\nevents = [\"terminal.opened\"{extra}]\n\
+                 {limits}"
             ),
         )
         .expect("manifest");
@@ -8100,12 +8118,19 @@ end)
         let data = std::env::temp_dir().join(format!("bitty-wall1855-{tag}-{counter}-data"));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
-        write_plugin(&root, FAULT_ID, FAULT_LUA, ", \"config.reloaded\"");
+        write_plugin(
+            &root,
+            FAULT_ID,
+            FAULT_LUA,
+            FAULT_LIMITS_TOML,
+            ", \"config.reloaded\"",
+        );
         if let Some(timer_ms) = timer_ms {
             write_plugin(
                 &root,
                 CLOCK_ID,
                 &format!("bitty.timers.create({timer_ms}, function() return true end)\n"),
+                "",
                 "",
             );
         }

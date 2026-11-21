@@ -71,6 +71,11 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
   your own supervisor. _(Binary cache on `bitty.cachix.org`, see
   [`packaging/nix.md`](packaging/nix.md))_
 
+  Downstream NixOS flakes should avoid overriding the pinned nixpkgs input
+  (`inputs.bitty.inputs.nixpkgs.follows`): a different nixpkgs revision
+  changes the input derivation hashes and forfeits the `bitty.cachix.org`
+  cache hits. _(Details in [`packaging/nix.md`](packaging/nix.md))_
+
 - **AppImage (Universal Portable Linux)**:
   Download `bitty-<target>.AppImage`, `chmod +x`, and run. _(See [`packaging/appimage.md`](packaging/appimage.md))_
 - **openSUSE (Zypper / OBS)**:

@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 use bitty_lua::gate::{PluginVmBuilder, VmBudgets, build_plugin_vm};
 use bitty_lua::ui::{UI_MAX_NODES, UI_MAX_TEXT_BYTES};
 use bitty_lua::{
-    BoundedExecution, BridgeError, HostServices, LuaValue, LuaVm, MarshallingLimits, OverlayInput,
-    OverlayKeyChord, OverlayPoll, TargetSnapshotRow, UiNode,
+    BoundedExecution, BridgeError, CatalogBlock, DetailFallbackDescriptor, HostServices, LuaValue,
+    LuaVm, MarshallingLimits, ModalSheetDescriptor, OverlayInput, OverlayKeyChord, OverlayPoll,
+    Pill, PillRowDescriptor, Segment, StripDescriptor, TargetSnapshotRow, UiNode,
 };
 
 /// Gate-built VM with default RC budgets (replaces deprecated `LuaVm::new`).
@@ -1508,4 +1509,295 @@ fn anchored_update_on_an_unknown_handle_keeps_the_false_contract() {
     );
     assert_eq!(stored(&services, "ok"), Some(LuaValue::Bool(true)));
     assert_eq!(stored(&services, "result"), Some(LuaValue::Bool(false)));
+}
+
+// ── bitty.ui.catalog constructors (bitty#2114) ─────────────────────────────
+
+#[test]
+fn catalog_constructors_are_present_and_closed() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("catalog-presence");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local names = {
+          "band", "pill_row", "tooltip_detail_fallback", "modal_sheet", "status_strip",
+        }
+        local kinds = {}
+        for _, name in ipairs(names) do
+          kinds[name] = type(bitty.ui.catalog and bitty.ui.catalog[name])
+        end
+        bitty.store.set("band", kinds["band"])
+        bitty.store.set("pill_row", kinds["pill_row"])
+        bitty.store.set("tooltip_detail_fallback", kinds["tooltip_detail_fallback"])
+        bitty.store.set("modal_sheet", kinds["modal_sheet"])
+        bitty.store.set("status_strip", kinds["status_strip"])
+        -- The closed set has no hyphenated or aliased spelling.
+        bitty.store.set("hyphenated", type(bitty.ui.catalog["pill-row"]))
+        bitty.store.set("unknown", type(bitty.ui.catalog.sparkle))
+        -- The catalog table is as read-only as the rest of `bitty.ui`.
+        local writable = pcall(function() bitty.ui.catalog.band = nil end)
+        bitty.store.set("writable", writable and "yes" or "no")
+    "#,
+    );
+    for name in [
+        "band",
+        "pill_row",
+        "tooltip_detail_fallback",
+        "modal_sheet",
+        "status_strip",
+    ] {
+        assert_eq!(
+            stored(&services, name),
+            Some(LuaValue::String("function".to_string())),
+            "{name} is a constructor function"
+        );
+    }
+    assert_eq!(
+        stored(&services, "hyphenated"),
+        Some(LuaValue::String("nil".to_string())),
+        "the canonical hyphenated entry name is not a Lua spelling"
+    );
+    assert_eq!(
+        stored(&services, "unknown"),
+        Some(LuaValue::String("nil".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "writable"),
+        Some(LuaValue::String("no".to_string())),
+        "the catalog table is read-only"
+    );
+}
+
+#[test]
+fn catalog_constructors_compose_mountable_v1_scenes() {
+    // The dogfood shape of bitty#2114: a plugin composes a descriptor with
+    // `bitty.ui.catalog`, then mounts the returned table through the
+    // unchanged `bitty.ui.mount` path. The mounted tree must be exactly the
+    // catalog-composed tree, and the catalog's own recognition must read it
+    // back as the same declaration.
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("catalog-compose");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local band = bitty.ui.catalog.band({
+          left = { "cpu 12%", { text = "mem 40%", emphasis = true } },
+          center = { "bitty" },
+          right = {},
+        })
+        bitty.store.set("band_kind", band.kind)
+        bitty.store.set("band_child_kinds", type(band.children))
+        bitty.store.set("handle", bitty.ui.mount("bottom", band))
+
+        local pills = bitty.ui.catalog.pill_row({
+          pills = { "main", { label = "aux", active = true } },
+        })
+        bitty.ui.mount("top", pills)
+
+        local detail = bitty.ui.catalog.tooltip_detail_fallback({ text = "cpu 45%" })
+        bitty.store.set("detail_kind", detail.kind)
+        bitty.ui.mount("top", detail)
+
+        local sheet = bitty.ui.catalog.modal_sheet({
+          title = "Sessions",
+          rows = { "aux: running", "main: idle" },
+        })
+        bitty.store.set("sheet_kind", sheet.kind)
+        bitty.ui.mount("overlay", sheet)
+
+        local strip = bitty.ui.catalog.status_strip({
+          left = { "ws 1" },
+          center = {},
+          right = { "clock" },
+        })
+        bitty.ui.mount("bottom", strip)
+    "#,
+    );
+    assert_eq!(
+        stored(&services, "band_kind"),
+        Some(LuaValue::String("Row".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "band_child_kinds"),
+        Some(LuaValue::String("table".to_string()))
+    );
+    assert_eq!(stored(&services, "handle"), Some(LuaValue::Integer(11)));
+    assert_eq!(
+        stored(&services, "detail_kind"),
+        Some(LuaValue::String("Text".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "sheet_kind"),
+        Some(LuaValue::String("Column".to_string()))
+    );
+
+    let expected = [
+        (
+            "bottom",
+            CatalogBlock::Band(StripDescriptor {
+                left: vec![Segment::new("cpu 12%"), Segment::emphasized("mem 40%")],
+                center: vec![Segment::new("bitty")],
+                right: Vec::new(),
+            }),
+        ),
+        (
+            "top",
+            CatalogBlock::PillRow(PillRowDescriptor {
+                pills: vec![Pill::new("main"), Pill::active("aux")],
+            }),
+        ),
+        (
+            "top",
+            CatalogBlock::TooltipDetailFallback(DetailFallbackDescriptor {
+                text: "cpu 45%".to_string(),
+            }),
+        ),
+        (
+            "overlay",
+            CatalogBlock::ModalSheet(ModalSheetDescriptor {
+                title: "Sessions".to_string(),
+                rows: vec!["aux: running".to_string(), "main: idle".to_string()],
+            }),
+        ),
+        (
+            "bottom",
+            CatalogBlock::StatusStrip(StripDescriptor {
+                left: vec![Segment::new("ws 1")],
+                center: Vec::new(),
+                right: vec![Segment::new("clock")],
+            }),
+        ),
+    ];
+    let mounts = services.mounts.borrow();
+    assert_eq!(
+        mounts.len(),
+        expected.len(),
+        "every constructor mounted once"
+    );
+    for (mounted, (slot, block)) in mounts.iter().zip(expected) {
+        assert_eq!(mounted.0, slot, "mounted slot");
+        let composed = block.compose().expect("expected block composes");
+        assert_eq!(
+            mounted.1, composed,
+            "the mounted tree is exactly the catalog-composed tree"
+        );
+        let entry = block.entry();
+        let parsed = CatalogBlock::from_scene(entry, &mounted.1)
+            .expect("the mounted tree is the canonical catalog shape");
+        assert_eq!(
+            parsed, block,
+            "the catalog recognizes the mounted tree as the same declaration"
+        );
+    }
+}
+
+#[test]
+fn catalog_constructors_fail_closed_on_bad_input() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("catalog-errors");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local function refused(fn, value)
+          local ok, err = pcall(fn, value)
+          return ok and "NONE" or err.code
+        end
+        local many = {}
+        for _ = 1, 65 do many[#many + 1] = "s" end
+        bitty.store.set("non_table", refused(bitty.ui.catalog.band, "nope"))
+        bitty.store.set(
+          "unknown_field",
+          refused(bitty.ui.catalog.tooltip_detail_fallback, { text = "x", style = { padding = 1 } })
+        )
+        bitty.store.set(
+          "empty_block",
+          refused(bitty.ui.catalog.band, { left = {}, center = {}, right = {} })
+        )
+        bitty.store.set("over_cap", refused(bitty.ui.catalog.band, { left = many }))
+        bitty.store.set("empty_item", refused(bitty.ui.catalog.band, { left = { "" } }))
+        bitty.store.set(
+          "reserved_delimiter",
+          refused(bitty.ui.catalog.pill_row, { pills = { "a]b" } })
+        )
+        bitty.store.set(
+          "bad_bool",
+          refused(bitty.ui.catalog.band, { left = { { text = "x", emphasis = "yes" } } })
+        )
+        bitty.store.set("bad_array", refused(bitty.ui.catalog.pill_row, { pills = "x" }))
+        bitty.store.set(
+          "missing_field",
+          refused(bitty.ui.catalog.modal_sheet, { rows = { "r" } })
+        )
+    "#,
+    );
+    for key in [
+        "non_table",
+        "unknown_field",
+        "empty_block",
+        "over_cap",
+        "empty_item",
+        "reserved_delimiter",
+        "bad_bool",
+        "bad_array",
+        "missing_field",
+    ] {
+        assert_eq!(
+            stored(&services, key),
+            Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string())),
+            "{key} fails closed with the accepted component code"
+        );
+    }
+    assert!(
+        services.mounts.borrow().is_empty(),
+        "no refused descriptor ever reached the mount path"
+    );
+}
+
+#[test]
+fn catalog_output_embeds_into_a_larger_hand_composed_scene() {
+    // The returned table is plain v1 data: a plugin may embed a composed
+    // component inside a scene it builds itself, and the mount path
+    // validates the result exactly as any other scene.
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("catalog-embed");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        local pills = bitty.ui.catalog.pill_row({ pills = { "main", { label = "aux", active = true } } })
+        local scene = {
+          kind = "Column",
+          children = {
+            { kind = "Text", text = "header" },
+            pills,
+          },
+        }
+        bitty.store.set("handle", bitty.ui.mount("bottom", scene))
+    "#,
+    );
+    assert_eq!(stored(&services, "handle"), Some(LuaValue::Integer(11)));
+    let mounts = services.mounts.borrow();
+    assert_eq!(mounts.len(), 1);
+    let composed = CatalogBlock::PillRow(PillRowDescriptor {
+        pills: vec![Pill::new("main"), Pill::active("aux")],
+    })
+    .compose()
+    .expect("pill row composes");
+    let mounted = &mounts[0].1;
+    // Root is the plugin's Column; the second child is the composed row.
+    match mounted {
+        UiNode::Column { children, .. } => {
+            assert_eq!(children.len(), 2);
+            assert_eq!(children[0], UiNode::text("header"));
+            assert_eq!(
+                children[1], composed,
+                "the embedded pill row survived verbatim"
+            );
+        }
+        other => panic!("expected a Column root, got {}", other.kind()),
+    }
 }

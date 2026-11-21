@@ -21,8 +21,12 @@
 //! - **UI node model ([`ui`]) and candidate catalog ([`ui_catalog`]):** the
 //!   accepted v1 `Text`/`Row`/`Column`/`List` bridge types plus the headless
 //!   bitty#2114 component-catalog descriptors. Both are pure bounded data
-//!   handling; the catalog never constructs a VM, is not on a hot path, and
-//!   has no production consumer yet (candidate surface only).
+//!   handling; the catalog never constructs a VM and is not on a hot path.
+//!   Its descriptors carry one candidate consumer, the pure
+//!   `bitty.ui.catalog` constructor functions the host bridge registers
+//!   (bitty#2114): they lower a descriptor into the accepted v1 node-table
+//!   vocabulary so a plugin mounts the result through the unchanged
+//!   `bitty.ui.mount` path; no host path composes the catalog itself yet.
 //! - **Registry read page ([`keymaps`]):** the bounded page model behind
 //!   `bitty.keymaps.list()` (issue #2405). Rows carry canonical
 //!   `chord`/`action`/`source`/`context` plus the optional `title`/`command`
@@ -141,7 +145,8 @@ pub use ui_catalog::{
     CATALOG_MAX_DEPTH, CATALOG_MAX_DETAIL_BYTES, CATALOG_MAX_NODES, CATALOG_MAX_PILL_LABEL_BYTES,
     CATALOG_MAX_PILLS, CATALOG_MAX_ROWS, CATALOG_MAX_SEGMENT_BYTES, CATALOG_MAX_SEGMENTS,
     CATALOG_MAX_TEXT_BYTES, CatalogBlock, CatalogEntry, CatalogError, DetailFallbackDescriptor,
-    ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor,
+    ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor, compose_catalog_block,
+    read_catalog_block, read_catalog_block_value,
 };
 pub use ui_panel::{
     UI_PANEL_INPUT_BUDGET_BYTES, UI_PANEL_INPUT_POLL_MAX_DEFAULT, UI_PANEL_INPUT_QUEUE_MAX,

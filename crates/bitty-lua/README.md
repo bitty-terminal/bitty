@@ -125,6 +125,35 @@ and `unmount`.
 | Grant    | `ui.rich`, the same grant `mount`/`update`/`unmount` need. Without it the call fails closed with `E_CAPABILITY_DENIED`.                                                                                                                                                                                                                                                                                                                                                                                              |
 | Slots    | `top`/`bottom`/`tabline`: `presented` is `true` when the band is non-empty (reserves its row and paints), and `focused` is `presented and window_focused`. `overlay`: `presented` is `true` while the block owns capture or the presentation overlay session, and `focused` is `true` only while it owns capture and the window is focused. `terminal`: `presented` is `true` while the rich scene is attached, and `focused` is `true` when the scene's panel view is the focused target and the window is focused. |
 
+## Lua surface: `bitty.ui.catalog` (bitty#2114)
+
+```lua
+local band = bitty.ui.catalog.band({
+  left = { "cpu 12%", { text = "mem 40%", emphasis = true } },
+  center = { "bitty" },
+  right = {},
+})                                                   -- pure; no grant needed
+local handle, err = bitty.ui.mount("bottom", band)    -- needs ui.rich
+```
+
+The five extension component catalog entries (bitty#2114) ship as pure
+constructor functions: `band`, `pill_row`, `tooltip_detail_fallback`,
+`modal_sheet`, and `status_strip` under the read-only `bitty.ui.catalog`
+table. Each takes one descriptor table, validates and composes it through
+the shipped catalog (`ui_catalog.rs`), and returns the composed tree as a
+plain v1 node table — the same declarative component shape `bitty.ui.mount`
+accepts — so a plugin composes documented building blocks instead of
+hand-rolling Scene nodes. The surface is candidate: entry shapes, caps, and
+spellings are not an accepted contract yet.
+
+| Item      | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arguments | `band`/`status_strip`: `{ left = segments, center = segments, right = segments }`; a segment is a string or `{ text = string, emphasis = boolean }`, and an absent or empty region is legal. `pill_row`: `{ pills = pills }`; a pill is a string or `{ label = string, active = boolean }`. `tooltip_detail_fallback`: `{ text = string }`. `modal_sheet`: `{ title = string, rows = strings }`. Unknown descriptor fields fail closed — a `style`-shaped key is never silently dropped. |
+| Result    | The composed tree as a plain v1 node table (`Row` for band/pill row/status strip, `Column` for modal sheet, `Text` for the detail fallback). It may be mounted through `bitty.ui.mount` unchanged, updated through `bitty.ui.update`, or embedded inside a larger scene the plugin composes itself.                                                                                                                                                                             |
+| Grants    | None: the constructors are pure data handling and call no host service. Mounting the returned table stays gated on `ui.mount`'s existing `ui.rich` (or `ui.overlay` for the overlay slot) checks.                                                                                                                                                                                                                                                                               |
+| Caps      | The catalog's own inclusive caps, unchanged: 64 segments per strip, 64 pills, 64 sheet rows, 64 bytes per segment, 32 per pill label, 128 per detail/title/row, plus the accepted scene bounds `SCN-1`/`SCN-3` and the v1 depth 16. Overflow, empty declarations, empty items, and reserved pill brackets are typed refusals, never clamps.                                                                                                                                      |
+| Errors    | `E_UI_COMPONENT_INVALID` for every refusal, the only component-error code the accepted `ui.mount`/`ui.update` surface fixes.                                                                                                                                                                                                                                                                                                                                                   |
+
 ## Lua surface: `bitty.ui.panel` (bitty#2388)
 
 ```lua

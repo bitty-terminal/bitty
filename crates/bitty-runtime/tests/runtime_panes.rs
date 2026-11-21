@@ -27,7 +27,7 @@ fn pane_sessions_default_to_empty() {
     // PTY/state path is untouched.
     let mut rt = make_runtime();
     assert_eq!(rt.pane_count(), 0);
-    assert!(rt.pane_session_ids().is_empty());
+    assert!(rt.pane_view_ids().is_empty());
     assert!(!rt.has_pane_session(&ViewId::new(2)));
     assert_eq!(rt.pane_pid(&ViewId::new(2)), None);
     assert!(rt.pane_snapshot(&ViewId::new(2)).is_none());

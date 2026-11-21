@@ -881,9 +881,12 @@ impl Runtime {
         self.pane_sessions.len()
     }
 
-    /// Ids owning a private shell session, in deterministic (`ViewId`) order.
+    /// `ViewId`s whose leaf owns a private shell session, in deterministic order.
+    ///
+    /// These are layout ids (a `u64` slot), never session credentials or
+    /// terminal bytes; callers may log them for diagnostics.
     #[must_use]
-    pub fn pane_session_ids(&self) -> Vec<ViewId> {
+    pub fn pane_view_ids(&self) -> Vec<ViewId> {
         self.pane_sessions.keys().copied().collect()
     }
 

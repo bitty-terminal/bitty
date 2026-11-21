@@ -171,7 +171,7 @@ fn compressed_long_run_stays_bounded() {
     // CodeQL rust/cleartext-logging: the panic message must not carry any
     // value derived from the session ids; `is_empty()` alone names the defect.
     assert!(
-        rt.pane_session_ids().is_empty(),
+        rt.pane_view_ids().is_empty(),
         "layout churn must not leave pane sessions"
     );
 
@@ -190,7 +190,7 @@ fn compressed_long_run_stays_bounded() {
             }
             assert!(rt.close_pane_session(&ViewId::new(2)));
             assert!(
-                rt.pane_session_ids().is_empty(),
+                rt.pane_view_ids().is_empty(),
                 "cycle {cycle} left a pane session"
             );
             rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));

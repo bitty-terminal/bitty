@@ -5247,7 +5247,7 @@ mod tests {
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(app.runtime.leaf_count(), 1, "zoom installs one proxy leaf");
         assert_eq!(app.chrome.zoom.backup_leaf_count(&app.runtime), Some(2));
-        assert_eq!(app.runtime.pane_session_ids(), vec![second, survivor]);
+        assert_eq!(app.runtime.pane_view_ids(), vec![second, survivor]);
         assert_eq!(app.runtime.primary_view(), Some(first));
 
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
@@ -7557,7 +7557,7 @@ mod tests {
         assert_eq!(app.runtime.workspace_count(), 3);
         assert_eq!(app.runtime.workspace_occupied_indices(), vec![0, 2]);
         assert!(app.runtime.workspace_switch(0));
-        let before = app.runtime.pane_session_ids();
+        let before = app.runtime.pane_view_ids();
         assert_eq!(before.len(), 2);
         // Mod+[ is next occupied rightward.
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
@@ -7571,7 +7571,7 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspacePrevOccupied);
         assert_eq!(app.runtime.active_workspace_index(), 0);
         assert_eq!(app.runtime.workspace_count(), 3, "cycle must not kill");
-        assert_eq!(app.runtime.pane_session_ids().len(), before.len());
+        assert_eq!(app.runtime.pane_view_ids().len(), before.len());
         for id in &before {
             assert!(app.runtime.has_pane_session(id), "session survives cycle");
         }

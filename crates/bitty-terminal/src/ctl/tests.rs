@@ -3123,7 +3123,7 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     let active_before = rt.active_workspace_index();
     let focus_before = rt.focused_view();
     let primary_before = rt.primary_view();
-    let sessions_before = rt.pane_session_ids();
+    let sessions_before = rt.pane_view_ids();
     let pane_sessions_without_primary: Vec<_> = sessions_before
         .iter()
         .copied()
@@ -3155,7 +3155,7 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
         "active unchanged"
     );
     assert_eq!(rt.focused_view(), focus_before, "focus unchanged");
-    assert_eq!(rt.pane_session_ids(), sessions_before, "sessions unchanged");
+    assert_eq!(rt.pane_view_ids(), sessions_before, "sessions unchanged");
     assert_eq!(
         rt.primary_view(),
         primary_before,

@@ -693,7 +693,7 @@ fn presentation_plane_campaign_stays_bounded() {
                 &format!("cycle {cycles}: the attached pane must close"),
             );
             series.check(
-                rt.pane_session_ids().is_empty(),
+                rt.pane_view_ids().is_empty(),
                 &format!("cycle {cycles}: attach/detach churn left a pane session"),
             );
         }
@@ -754,7 +754,7 @@ fn presentation_plane_campaign_stays_bounded() {
         &format!("every cycle must be counted, got {}", gauges.tick_count),
     );
     series.check(
-        rt.pane_session_ids().is_empty(),
+        rt.pane_view_ids().is_empty(),
         "the campaign must not leave pane sessions",
     );
     series.check(

@@ -137,6 +137,8 @@ pub(crate) fn method_for_request(method: &str) -> Option<&'static str> {
         Some(super::request::METHOD_PANEL_CONTENT_PRESENT)
     } else if method == super::request::METHOD_PANEL_CONTENT_RELEASE {
         Some(super::request::METHOD_PANEL_CONTENT_RELEASE)
+    } else if method == super::request::METHOD_PANEL_CONTENT_MODE {
+        Some(super::request::METHOD_PANEL_CONTENT_MODE)
     } else {
         None
     }

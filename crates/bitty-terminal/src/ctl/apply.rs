@@ -842,6 +842,67 @@ pub fn apply_control(
             }
         }
     }
+    if method == super::request::METHOD_PANEL_CONTENT_MODE {
+        // bitty#2388 residue 3 (CTX-1931): the mode half of the debug pair.
+        // Core owns the gesture, so the token-free form is fenced on the
+        // layer's own token (the app thread is the only host mutator on this
+        // drain); an explicit present-receipt token keeps the release-shaped
+        // fence for a script that captured one. The change runs the runtime's
+        // single mode gate, which stamps through the command registry, records
+        // the mode, and refuses a placement-less mode typed.
+        let (panel_id, mode_word, token) = super::request::parse_panel_content_mode_params(params)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let num = super::request::parse_panel_id(&panel_id)
+            .map_err(|err| ("usage", "InvalidParams", err))?;
+        let view = ViewId::new(num);
+        if !runtime.layout().leaf_ids().contains(&view) {
+            // Same scope as `panel list`: a `p:N` outside the live layout is
+            // not a listed panel, so it is NotFound with no partial state.
+            return Err(("usage", "NotFound", format!("no such panel {panel_id}")));
+        }
+        let Some(mode) = bitty_ui::PresentationMode::parse(&mode_word) else {
+            // The params parser validated the word; a hand-built request that
+            // reaches here still answers typed, never a panic.
+            return Err((
+                "usage",
+                "InvalidParams",
+                format!("unknown mode word {mode_word:?}"),
+            ));
+        };
+        // The layer read doubles as the `changed` marker: the record's mode is
+        // what the leaf carried before the gate runs, and the gate re-validates
+        // everything against the live layer.
+        let layer = runtime.panel_content_layer(view);
+        let (layer_token, changed) = match &layer {
+            Some(layer) => (layer.token, layer.presentation != mode),
+            None => {
+                // No layer is up for this panel: the same typed refusal the
+                // runtime's gate produces, reported once here rather than
+                // minting a dummy token for the gate to refuse.
+                return Err((
+                    "usage",
+                    "NotFound",
+                    format!("panel {panel_id} presents no content layer"),
+                ));
+            }
+        };
+        let token = match token {
+            Some(explicit) => bitty_runtime::registry::PanelContentToken::from_ordinal(explicit),
+            None => layer_token,
+        };
+        match runtime.set_panel_content_presentation(view, token, mode) {
+            Ok(record) => {
+                return Ok(format!(
+                    "{{\"changed\":{changed},\"panel_id\":\"{panel_id}\",\"view_id\":\"v:{}\",\"mode\":\"{}\"}}",
+                    record.view.0,
+                    record.presentation.as_str(),
+                ));
+            }
+            Err(err) => {
+                return Err(panel_content_refusal(&panel_id, &err));
+            }
+        }
+    }
     if method == ipc_ctl::METHOD_RELOAD_CONFIG {
         // CTX-0814 (#1397): when the app installed a live-reload context, an
         // authorized reload re-reads the sources, classifies the change
@@ -1200,6 +1261,13 @@ fn panel_content_refusal(
                  (re-run `bitty ctl panel present` and pass its receipt token)"
             ),
         ),
+        bitty_runtime::registry::PanelError::ContentPresentationUnsupported { mode, .. } => (
+            "Conflict",
+            format!(
+                "panel {panel_id} cannot take mode {mode}: no in-tree placement for a \
+                 presented layer"
+            ),
+        ),
         other => ("Conflict", format!("panel {panel_id} refused: {other}")),
     };
     ("usage", code, detail)
@@ -1513,6 +1581,256 @@ mod tests {
         )
         .expect_err("a released layer is gone");
         assert_eq!(gone.1, "NotFound", "{gone:?}");
+    }
+
+    /// bitty#2388 residue 3 (CTX-1931): the mode half of the debug pair —
+    /// `panel mode` moves a presented layer between tiled and floating
+    /// through `apply_control` (the same dispatch the app-turn lane service
+    /// runs), answers every refusal typed, and a redundant request is a
+    /// no-op receipt.
+    #[test]
+    fn ctl_mode_verb_flips_the_layer_mode_and_types_every_refusal() {
+        let (mut rt, view) = content_layer_fixture();
+
+        // Present through the debug verb; the receipt names the token.
+        let present = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:1")),
+        )
+        .expect("panel present applies");
+        let token = receipt_token(&present);
+
+        // Token-free: the verb is fenced on the layer's own token, and the
+        // receipt names the mode it moved the layer to.
+        let mode = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\"}"),
+        )
+        .expect("panel mode applies");
+        assert!(mode.contains("\"changed\":true"), "{mode}");
+        assert!(mode.contains("\"panel_id\":\"p:1\""), "{mode}");
+        assert!(mode.contains("\"view_id\":\"v:1\""), "{mode}");
+        assert!(mode.contains("\"mode\":\"floating\""), "{mode}");
+
+        // `panel list`'s role row flips with the leaf.
+        let panels = apply_control(&mut rt, super::super::request::METHOD_LIST_PANELS, None)
+            .expect("panel list applies");
+        assert!(
+            panels.contains("\"role\":\"floating\""),
+            "the floated layer is observable through ctl: {panels}"
+        );
+
+        // The layer is still up, so no restore ran and no resize was owed:
+        // the displaced terminal keeps the geometry the freeze owes it.
+        assert_eq!(
+            rt.content_restore_resizes(),
+            0,
+            "a mode change never pays a restore resize"
+        );
+
+        // A redundant same-mode request is a no-op receipt.
+        let again = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\"}"),
+        )
+        .expect("a redundant request is admitted as a no-op");
+        assert!(again.contains("\"changed\":false"), "{again}");
+        assert!(again.contains("\"mode\":\"floating\""), "{again}");
+
+        // A wrong token is a typed refusal, and nothing moved.
+        let mismatch = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\",\"token\":\"999\"}"),
+        )
+        .expect_err("a stale token must refuse");
+        assert_eq!(mismatch.1, "Conflict", "{mismatch:?}");
+        assert!(
+            mismatch.2.contains("does not name"),
+            "the refusal explains the token fence: {mismatch:?}"
+        );
+
+        // The fenced form with the present receipt's token flips the layer
+        // back, proving the explicit-token path runs the same single gate.
+        let back = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some(&format!(
+                "{{\"panel_id\":\"p:1\",\"mode\":\"tiled\",\"token\":\"{token}\"}}"
+            )),
+        )
+        .expect("the fenced form applies");
+        assert!(back.contains("\"changed\":true"), "{back}");
+        assert!(back.contains("\"mode\":\"tiled\""), "{back}");
+
+        // A mode with no in-tree placement is an honest typed refusal —
+        // never a panic, never a silent no-op — and it names the mode.
+        let unsupported = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"fullscreen\"}"),
+        )
+        .expect_err("fullscreen has no in-tree placement");
+        assert_eq!(unsupported.1, "Conflict", "{unsupported:?}");
+        assert!(
+            unsupported.2.contains("fullscreen"),
+            "the refusal names the refused mode: {unsupported:?}"
+        );
+        assert_eq!(
+            rt.view_presentation(view),
+            Some(bitty_ui::PresentationMode::Tiled),
+            "the refused request moved nothing"
+        );
+
+        // An unknown panel is NotFound with no partial state.
+        let missing = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:9\",\"mode\":\"floating\"}"),
+        )
+        .expect_err("an unknown panel must refuse");
+        assert_eq!(missing.1, "NotFound", "{missing:?}");
+        assert!(missing.2.contains("no such panel p:9"), "{missing:?}");
+
+        // After the release there is no layer to move, so the verb answers
+        // the typed no-layer refusal instead of a fall-through mutation.
+        let release = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1", token,
+            )),
+        )
+        .expect("panel release applies");
+        assert!(release.contains("\"released\":true"), "{release}");
+        let no_layer = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\"}"),
+        )
+        .expect_err("a panel with no layer must refuse");
+        assert_eq!(no_layer.1, "NotFound", "{no_layer:?}");
+        assert!(
+            no_layer.2.contains("presents no content layer"),
+            "{no_layer:?}"
+        );
+        assert_eq!(
+            rt.view_presentation(view),
+            Some(bitty_ui::PresentationMode::Tiled),
+            "the released panel keeps the mode the layer gave back"
+        );
+    }
+
+    /// bitty#2388 residue 3 (CTX-1931): the release-after-mode row — the
+    /// release receipt returns the mode the layer DISPLACED (tiled), and the
+    /// restore pays exactly one resize for the reflow the freeze deferred
+    /// while the layer floated.
+    #[test]
+    #[cfg(unix)]
+    fn ctl_mode_then_release_returns_the_displaced_mode_with_one_restore_resize() {
+        bitty_test_support::require_pty!();
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.set_container(UiRect::new(0, 0, 80, 24));
+        assert!(rt.set_focus(view), "the single leaf holds focus");
+        rt.spawn_shell_for_view(view, "/bin/sh", &["-c", "sleep 30"], 40, 12)
+            .expect("the leaf owns a shell");
+        rt.handle_pane_bytes(view, b"grid-line-one\r\n");
+        rt.tick().expect("the pane presents a frame");
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let handle = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("panel mounts at the leaf");
+        rt.install_scene_host(host);
+
+        // Present through the debug verb, then float the layer through the
+        // mode verb: the hidden PTY cannot tell the mode moved.
+        let present = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_PRESENT,
+            Some(&super::super::request::tab_params("p:1")),
+        )
+        .expect("panel present applies");
+        let token = receipt_token(&present);
+        let frozen = rt.pane_pty_size(&view).expect("live winsize");
+
+        let mode = apply_control(
+            &mut rt,
+            "bitty.debug/panelContentMode",
+            Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\"}"),
+        )
+        .expect("panel mode applies");
+        assert!(mode.contains("\"changed\":true"), "{mode}");
+        assert_eq!(
+            rt.pane_pty_size(&view),
+            Some(frozen),
+            "the mode change never resizes the hidden PTY"
+        );
+        assert_eq!(
+            rt.content_restore_resizes(),
+            0,
+            "no restore ran while the layer was up"
+        );
+
+        // The gesture the freeze exists for: the window moves, the hidden
+        // PTY does not.
+        rt.handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
+            .expect("window resize applies");
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("the layer's frame");
+        assert_ne!(
+            (frame.cols, frame.rows),
+            frozen,
+            "the gesture must move the leaf, or the restore resize proves nothing"
+        );
+        assert_eq!(
+            rt.pane_pty_size(&view),
+            Some(frozen),
+            "the frozen PTY keeps the winsize the layer took"
+        );
+
+        // Release: the receipt returns the mode the layer DISPLACED and
+        // exactly one restore resize pays the deferred reflow.
+        let release = apply_control(
+            &mut rt,
+            super::super::request::METHOD_PANEL_CONTENT_RELEASE,
+            Some(&super::super::request::panel_content_release_params(
+                "p:1", token,
+            )),
+        )
+        .expect("panel release applies");
+        assert!(
+            release.contains("\"mode\":\"tiled\""),
+            "the receipt returns the displaced mode: {release}"
+        );
+        assert!(
+            release.contains("\"restore_resizes\":1"),
+            "exactly one restore resize: {release}"
+        );
+        assert_eq!(
+            rt.view_presentation(view),
+            Some(bitty_ui::PresentationMode::Tiled),
+            "release gives the displaced mode back"
+        );
+        let restored_frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("the restored frame");
+        assert_eq!(
+            rt.pane_pty_size(&view),
+            Some((restored_frame.cols, restored_frame.rows)),
+            "the PTY came back at the current content rect"
+        );
     }
 
     /// bitty#3250 review: `terminal send` must not answer `sent_to`/`bytes` for

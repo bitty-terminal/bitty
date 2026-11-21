@@ -43,6 +43,7 @@
 //! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
 //! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
+//! | Mode changed by a user gesture | [`Runtime::apply_panel_content_mode_command`] resolves one `bitty.workspace:presentation-*` command name to a mode, fences the change on the layer's own token (the gesture is Core-owned), and delegates to the same gate; with no layer presented it is a typed no-op, never a fall-through mutation |
 //! | Mode given back on release | [`Runtime::release_panel_content`] restores the mode recorded at present time when the leaf still carries the mode the layer last requested, and leaves the leaf alone when somebody else moved it |
 //! | Mode given back at a generation edge | the edge's release cannot stamp (the plugin runtime owns no layout), so it carries the typed [`RestoredPanelContent`] to [`Runtime::restore_released_panel_presentation`], which applies the same two guards before the next frame |
 //! | Layer released by a close, without a token | [`Runtime::release_presented_panel_content`] names the layer by the **panel identity** a close already holds (the host resolves the record from its live placement mirror), so a close gesture never needs a [`PanelContentToken`]: the first close press restores the displaced terminal, the next retires the panel |
@@ -109,7 +110,10 @@
 //! `Fullscreen` (app-level zoom) and `Scratchpad` (the scratchpad store) are
 //! refused with [`PanelError::ContentPresentationUnsupported`] until the
 //! mechanism that can honor them owns the change, and a bottom band has no
-//! placement at all yet.
+//! placement at all yet. The user-facing halves (CTX-1931, bitty#2388 residue
+//! 3) are the Core-owned `bitty ctl panel mode` verb and the `ctrl+alt+a`
+//! `toggle_panel_mode` keybind, both of which route through the same gate; no
+//! plugin surface changed.
 
 use bitty_render::geometry::RectPx;
 use bitty_render::scene::{ScenePaintBudget, SceneSurface, paint_scene};
@@ -586,6 +590,84 @@ impl Runtime {
     pub fn panel_content_layer(&self, view: ViewId) -> Option<PresentedPanelContent> {
         let host = self.scene_host.as_ref()?.try_borrow().ok()?;
         host.presented_content_for_view(view).cloned()
+    }
+
+    /// Applies one `bitty.workspace:presentation-{tiled,floating,...}` command
+    /// name to the content layer the panel at `view` presents (bitty#2388
+    /// residue 3, CTX-1931).
+    ///
+    /// String-dispatch twin of [`Runtime::set_panel_content_presentation`]
+    /// for the keymap path (`toggle_panel_mode` chrome action), mirroring the
+    /// [`bitty_ui::FLOATING_CMD_TOGGLE`] shape
+    /// ([`Runtime::apply_floating_command`](crate::runtime::Runtime::apply_floating_command)):
+    /// the caller hands over a workspace command **name**, never a mode, and
+    /// never a token — the gesture is Core-owned, so it is fenced on the
+    /// layer's own token, resolved from the live record (nothing is minted,
+    /// forwarded, or exposed on the plugin surface).
+    ///
+    /// Only the four
+    /// [`bitty_ui::presentation_mode_for_command`] names are accepted; anything
+    /// else is a typed `ContentUnavailable` that touches no state. The change
+    /// itself runs the single mode gate: it validates the layer, refuses a
+    /// placement-less mode (`fullscreen`/`scratchpad` →
+    /// [`PanelError::ContentPresentationUnsupported`]) exactly like the
+    /// token-fenced verb, stamps the leaf through
+    /// [`bitty_ui::apply_presentation_command`] (never a direct layout write),
+    /// and records the mode so release can tell the layer's move from
+    /// somebody else's. With no layer presented the call is a typed
+    /// [`PanelError::ContentNotPresented`] no-op: the leaf keeps its mode and
+    /// nothing falls through to the ordinary presentation commands.
+    ///
+    /// # Errors
+    ///
+    /// [`PanelError::ContentUnavailable`] when no panel host is installed, no
+    /// panel is mounted at `view`, the host is borrowed, or `command` is not a
+    /// presentation command name; [`PanelError::ContentNotPresented`] when the
+    /// panel presents no layer; [`PanelError::ContentPresentationUnsupported`]
+    /// for a command whose mode has no in-tree placement. Every refusal
+    /// leaves the leaf, the record, the focus, and the PTY exactly as they
+    /// were.
+    pub fn apply_panel_content_mode_command(
+        &mut self,
+        view: ViewId,
+        command: &str,
+    ) -> Result<PresentationMode, PanelError> {
+        let Some(host) = self.scene_host.clone() else {
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "no panel host installed",
+            });
+        };
+        // The command name is the only accepted spelling of intent: the four
+        // registry names resolve through the same table the transition gate
+        // stamps with, so the keybind can never diverge from the verb.
+        let Some(mode) = bitty_ui::presentation_mode_for_command(command) else {
+            return Err(PanelError::ContentUnavailable {
+                view_id: view,
+                reason: "unknown presentation command (expected a \
+                         bitty.workspace:presentation-{tiled,floating,...} name)",
+            });
+        };
+        let token = match host.try_borrow() {
+            Ok(host) => {
+                let panel = host.content_panel_for_view(view)?;
+                let Some(layer) = host.presented_content(panel) else {
+                    return Err(PanelError::ContentNotPresented { panel_id: panel });
+                };
+                layer.token
+            }
+            Err(_) => {
+                return Err(PanelError::ContentUnavailable {
+                    view_id: view,
+                    reason: "panel host is borrowed",
+                });
+            }
+        };
+        // The layer's own token fences the change; the gate re-validates
+        // everything (layer, mode support, leaf liveness) and stamps through
+        // the command registry, exactly as the ctl verb does.
+        self.set_panel_content_presentation(view, token, mode)
+            .map(|record| record.presentation)
     }
 
     /// The content kind this view's panel presents right now.

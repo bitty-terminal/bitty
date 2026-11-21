@@ -3051,6 +3051,66 @@ impl TerminalApp {
                     }
                 }
             }
+            A::TogglePanelMode => {
+                // bitty#2388 residue 3 (CTX-1931): toggle the FOCUSED panel's
+                // presented content-layer mode between tiled and floating through
+                // the `bitty.workspace:presentation-{tiled,floating}` command
+                // names (`Runtime::apply_panel_content_mode_command` — the same
+                // single transition gate the `ctl panel mode` verb runs, so the
+                // keybind can never diverge from the verb). Context-gated on
+                // `content_layer_presented`: a focused leaf with no layer answers a
+                // typed refusal and the tree never moves — this gesture never
+                // falls through into the ordinary `toggle_floating` detach, which
+                // is a different action on a different chord.
+                let scrutinee = self.runtime.borrow().focused_view();
+                let focused = match scrutinee {
+                    Some(id) => id,
+                    None => {
+                        eprintln!(
+                            "warning: keymap toggle_panel_mode has no focused pane — ignoring"
+                        );
+                        return false;
+                    }
+                };
+                if !self.runtime.borrow().content_layer_presented(focused) {
+                    eprintln!(
+                        "warning: keymap toggle_panel_mode needs a panel presenting a content layer — ignoring"
+                    );
+                    return false;
+                }
+                let current = match self.runtime.borrow().view_presentation(focused) {
+                    Some(mode) => mode,
+                    None => {
+                        eprintln!(
+                            "warning: keymap toggle_panel_mode found no focused pane — ignoring"
+                        );
+                        return false;
+                    }
+                };
+                let target = match current {
+                    PresentationMode::Tiled => PresentationMode::Floating,
+                    PresentationMode::Floating => PresentationMode::Tiled,
+                    other => {
+                        eprintln!(
+                            "warning: keymap toggle_panel_mode needs a tiled or floating layer, found {other:?} — ignoring"
+                        );
+                        return false;
+                    }
+                };
+                let command = bitty_runtime::presentation_command_for_mode(target);
+                let scrutinee = self
+                    .runtime
+                    .borrow_mut()
+                    .apply_panel_content_mode_command(focused, command);
+                match scrutinee {
+                    Ok(mode) => {
+                        eprintln!("bitty: keymap toggle_panel_mode -> {focused:?} now {mode:?}")
+                    }
+                    Err(err) => {
+                        eprintln!("warning: keymap toggle_panel_mode refused ({err}) — ignoring")
+                    }
+                }
+            }
             A::TogglePinned => {
                 // CTX-1083 (follow-up to CTX-1077 #1757): toggle the focused
                 // panel's pinned (sticky-float) state through the
@@ -6499,6 +6559,125 @@ mod tests {
             bitty_config::match_keymap(&super_maps, alt(KeyName::Char('a'), false, true, false)),
             None,
             "alt+a unbound under super mod"
+        );
+    }
+
+    #[test]
+    fn chrome_panel_mode_toggle_default_ctrl_mod_a_resolves() {
+        // bitty#2388 residue 3 (CTX-1931): ctrl+Mod+a toggles the FOCUSED
+        // presented layer's mode. The chord mirrors the alt+a
+        // `toggle_floating` family on the free sibling slot (ctrl+alt+a,
+        // rebinding to ctrl+super+a under a Super flip), stays clear of the
+        // shipped Alt+N panel namespace, and the alt+a binding itself is
+        // untouched.
+        use bitty_config::{ChromeAction, EffectiveConfig, KeyName, KeyRef, ModKey};
+        let maps = bitty_config::resolve_keymaps(&EffectiveConfig::default()).expect("defaults");
+        let key = |ctrl: bool, alt: bool| KeyRef {
+            key: KeyName::Char('a'),
+            ctrl,
+            alt,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            bitty_config::match_keymap(&maps, key(true, true)),
+            Some(ChromeAction::TogglePanelMode),
+            "ctrl+alt+a toggles the presented layer's mode"
+        );
+        assert_eq!(
+            bitty_config::match_keymap(&maps, key(false, true)),
+            Some(ChromeAction::ToggleFloating),
+            "alt+a still toggles the ordinary panel's floating mode"
+        );
+        let super_maps = bitty_config::resolve_keymaps(&EffectiveConfig {
+            mod_key: ModKey::Super,
+            ..Default::default()
+        })
+        .expect("super defaults");
+        assert_eq!(
+            bitty_config::match_keymap(
+                &super_maps,
+                KeyRef {
+                    key: KeyName::Char('a'),
+                    ctrl: true,
+                    alt: false,
+                    shift: false,
+                    super_held: true,
+                }
+            ),
+            Some(ChromeAction::TogglePanelMode),
+            "ctrl+super+a carries the Mod slot"
+        );
+    }
+
+    #[test]
+    fn chrome_panel_mode_toggle_flips_the_presented_layer_and_is_a_typed_no_op_without_one() {
+        // bitty#2388 residue 3 (CTX-1931): the keybind gesture is
+        // context-gated on the focused leaf presenting a content layer. With
+        // one, the toggle routes the opposite mode's PRESENTATION_CMD_*
+        // command name through the runtime's string dispatch — the same
+        // single transition gate the ctl verb runs; without one, the action
+        // answers a typed refusal and the tree never moves.
+        use bitty_config::ChromeAction;
+        let view = ViewId::new(1);
+        let (mut app, _panel) = panel_close_app(LayoutNode::leaf(View::new(view, 80, 24)), view);
+        app.runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"grid-line-one\r\n");
+
+        // No layer yet: the gesture is a typed no-op, tree unchanged.
+        let before = app.runtime.borrow().view_presentation(view);
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            before,
+            "no presented layer means no mutation"
+        );
+
+        // Present the Core-owned debug layer over the leaf's own terminal:
+        // the headless primary owner is terminal-backed, so no PTY is
+        // needed.
+        let presented = app
+            .runtime
+            .borrow_mut()
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the panel presents a layer over its own terminal");
+        assert_eq!(presented.presentation, PresentationMode::Tiled);
+
+        // The gesture flips the layer's mode through the command registry.
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Floating),
+            "the toggle floated the focused presented layer"
+        );
+        assert_eq!(
+            app.runtime
+                .borrow()
+                .panel_content_layer(view)
+                .map(|layer| layer.presentation),
+            Some(PresentationMode::Floating),
+            "and the layer's record carries the move"
+        );
+
+        // Toggling back returns it to its own slot.
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled)
+        );
+
+        // Released: the gesture is a typed no-op again.
+        app.runtime
+            .borrow_mut()
+            .release_panel_content(view, presented.token)
+            .expect("release restores the terminal");
+        let before = app.runtime.borrow().view_presentation(view);
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            before,
+            "no layer, no mutation — the released panel keeps the mode release gave back"
         );
     }
 

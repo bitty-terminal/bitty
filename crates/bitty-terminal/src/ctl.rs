@@ -241,7 +241,7 @@ pub use client::{
 pub use render::{execute_ctl, execute_reload};
 pub use request::{
     CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, METHOD_NEW_WINDOW,
-    PANEL_CONTENT_METHODS, TAB_METHODS, ctl_help_text, ctl_usage, panel_content_release_params,
-    parse_ctl_request, parse_panel_content_release_params, parse_panel_id, parse_tab_params,
-    tab_params,
+    PANEL_CONTENT_METHODS, TAB_METHODS, ctl_help_text, ctl_usage, panel_content_mode_params,
+    panel_content_release_params, parse_ctl_request, parse_panel_content_mode_params,
+    parse_panel_content_release_params, parse_panel_id, parse_tab_params, tab_params,
 };

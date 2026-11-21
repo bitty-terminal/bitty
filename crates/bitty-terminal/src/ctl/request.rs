@@ -105,9 +105,24 @@ pub const METHOD_PANEL_CONTENT_PRESENT: &str = "bitty.debug/panelContentPresent"
 /// Wire method for `ctl panel release` (bitty#2388, CTX-1913).
 pub const METHOD_PANEL_CONTENT_RELEASE: &str = "bitty.debug/panelContentRelease";
 
+/// Wire method for `ctl panel mode` (bitty#2388 residue 3, CTX-1931): move a
+/// presented panel's content layer to `tiled` or `floating` through the
+/// runtime's single mode gate.
+///
+/// Same lane and same scope as the pair: the handler authorizes `view.manage`
+/// itself and routes the request through the bounded panel-content lane, whose
+/// app-side service runs the `apply_control` arm that calls
+/// [`bitty_runtime::Runtime::set_panel_content_presentation`]. The token-free
+/// form is fenced on the layer's own token; an explicit receipt token keeps
+/// the release-shaped fence for scripts that captured it.
+pub const METHOD_PANEL_CONTENT_MODE: &str = "bitty.debug/panelContentMode";
+
 /// Every panel-content wire method, in canonical verb order.
-pub const PANEL_CONTENT_METHODS: [&str; 2] =
-    [METHOD_PANEL_CONTENT_PRESENT, METHOD_PANEL_CONTENT_RELEASE];
+pub const PANEL_CONTENT_METHODS: [&str; 3] = [
+    METHOD_PANEL_CONTENT_PRESENT,
+    METHOD_PANEL_CONTENT_RELEASE,
+    METHOD_PANEL_CONTENT_MODE,
+];
 
 /// Content-layer token grammar: the opaque ordinal the present verb's receipt
 /// reported, as `1..=20` ASCII digits.
@@ -215,6 +230,137 @@ pub fn parse_panel_content_release_params(params: Option<&str>) -> Result<(Strin
     }
     let token = parse_panel_content_token(quoted_token)?;
     Ok((quoted_panel.to_string(), token))
+}
+
+/// Wire params for `ctl panel mode`:
+/// `{"panel_id":"p:N","mode":"floating"}` with an optional
+/// `{"token":"T"}` fence.
+///
+/// `panel_id` passed [`parse_panel_id`] and `mode` passed the canonical
+/// `PresentationMode::parse` vocabulary (closed word set), so both values
+/// are grammar-checked words and need no JSON escaping. Built by hand to keep
+/// the shape byte-stable.
+#[must_use]
+pub fn panel_content_mode_params(panel_id: &str, mode: &str, token: Option<u64>) -> String {
+    match token {
+        Some(token) => {
+            format!("{{\"panel_id\":\"{panel_id}\",\"mode\":\"{mode}\",\"token\":\"{token}\"}}")
+        }
+        None => format!("{{\"panel_id\":\"{panel_id}\",\"mode\":\"{mode}\"}}"),
+    }
+}
+
+/// Parse mode params back into a validated `(p:N, mode word, token)` triple.
+///
+/// Strict and bounded, mirroring [`parse_panel_content_release_params`]:
+/// exactly the two or three string fields in the emitted order, nothing else.
+/// The mode word is the closed canonical `PresentationMode` vocabulary, so a
+/// placement-less mode (`fullscreen`, `scratchpad`) parses here and the
+/// runtime refuses it typed — a malformed or over-long document, an unknown
+/// mode word, or a non-numeric token is `InvalidParams` instead.
+///
+/// # Errors
+///
+/// A one-line diagnostic when the document is missing, over-long, carries an
+/// unknown or out-of-order field, or names a panel id, mode word, or token the
+/// grammar refuses.
+pub fn parse_panel_content_mode_params(
+    params: Option<&str>,
+) -> Result<(String, String, Option<u64>), String> {
+    let raw = params.ok_or_else(|| String::from("missing params.panel_id"))?;
+    if raw.len() > bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES {
+        return Err(format!(
+            "params too large ({} bytes, max {})",
+            raw.len(),
+            bitty_ipc::ctl::MAX_CTL_PARAMS_BYTES
+        ));
+    }
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .ok_or_else(|| String::from("params must be one JSON object"))?
+        .trim();
+    let (first, second) = body
+        .split_once(',')
+        .ok_or_else(|| String::from("params must carry at least two fields: panel_id, mode"))?;
+    let (key, value) = first
+        .split_once(':')
+        .ok_or_else(|| String::from("params must carry exactly the fields: panel_id, mode"))?;
+    if key.trim() != "\"panel_id\"" {
+        return Err(format!(
+            "unknown or misplaced params field {} (panel_id comes first)",
+            key.trim()
+        ));
+    }
+    let value = value.trim();
+    let quoted_panel = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| String::from("params.panel_id must be a string like \"p:1\""))?;
+    if quoted_panel.contains('"') || quoted_panel.contains('\\') {
+        return Err(String::from(
+            "params.panel_id must not contain quotes or escapes",
+        ));
+    }
+    parse_panel_id(quoted_panel)?;
+    // The mode field comes second; an optional token field may follow it, so
+    // split the remainder before unquoting either side.
+    let (mode_field, token_field) = match second.split_once(',') {
+        None => (second, None),
+        Some((mode_field, tail)) => (mode_field, Some(tail.trim())),
+    };
+    let (key, value) = mode_field
+        .split_once(':')
+        .ok_or_else(|| String::from("params must carry exactly the fields: panel_id, mode"))?;
+    if key.trim() != "\"mode\"" {
+        return Err(format!(
+            "unknown or misplaced params field {} (mode comes second)",
+            key.trim()
+        ));
+    }
+    let value = value.trim();
+    let quoted_mode = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .ok_or_else(|| String::from("params.mode must be a string like \"floating\""))?;
+    if quoted_mode.contains('"') || quoted_mode.contains('\\') {
+        return Err(String::from(
+            "params.mode must not contain quotes or escapes",
+        ));
+    }
+    if bitty_ui::PresentationMode::parse(quoted_mode).is_none() {
+        return Err(format!(
+            "params.mode must be one of tiled|floating|fullscreen|scratchpad, got {quoted_mode:?}"
+        ));
+    }
+    // Optional third field: the present receipt's token fence.
+    let token = match token_field {
+        None => None,
+        Some(rest) => {
+            let (key, value) = rest.split_once(':').ok_or_else(|| {
+                String::from("params must carry exactly the fields: panel_id, mode, token")
+            })?;
+            if key.trim() != "\"token\"" {
+                return Err(format!(
+                    "unknown params field {} (only panel_id, mode, token are accepted)",
+                    key.trim()
+                ));
+            }
+            let value = value.trim();
+            let quoted_token = value
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .ok_or_else(|| String::from("params.token must be a string like \"7\""))?;
+            if quoted_token.contains('"') || quoted_token.contains('\\') {
+                return Err(String::from(
+                    "params.token must not contain quotes or escapes",
+                ));
+            }
+            Some(parse_panel_content_token(quoted_token)?)
+        }
+    };
+    Ok((quoted_panel.to_string(), quoted_mode.to_string(), token))
 }
 
 /// Panel id grammar: `p:<1..=10 digits>`, the identity `panel list` reports.
@@ -395,6 +541,21 @@ pub enum CtlRequest {
         /// The present receipt's token ordinal, validated at parse.
         token: u64,
     },
+    /// `panel mode p:N tiled|floating [TOKEN]` (bitty#2388 residue 3,
+    /// CTX-1931): move the presented layer's presentation mode through the
+    /// runtime's single mode gate. Token-free form is fenced on the layer's
+    /// own token; an explicit present-receipt token keeps the release-shaped
+    /// fence. The two placement-less mode words parse and the runtime
+    /// refuses them typed.
+    PanelContentMode {
+        /// Target panel id (`p:N`), validated at parse.
+        panel_id: String,
+        /// Canonical mode word (`tiled`/`floating`/`fullscreen`/`scratchpad`),
+        /// validated at parse.
+        mode: String,
+        /// Optional present receipt's token ordinal, validated at parse.
+        token: Option<u64>,
+    },
 }
 
 impl CtlRequest {
@@ -430,6 +591,7 @@ impl CtlRequest {
             Self::TabClose { .. } => "core.tab.close",
             Self::PanelContentPresent { .. } => "core.panel.present",
             Self::PanelContentRelease { .. } => "core.panel.release",
+            Self::PanelContentMode { .. } => "core.panel.mode",
         }
     }
 
@@ -465,6 +627,7 @@ impl CtlRequest {
             Self::TabClose { .. } => Some(METHOD_TAB_CLOSE),
             Self::PanelContentPresent { .. } => Some(METHOD_PANEL_CONTENT_PRESENT),
             Self::PanelContentRelease { .. } => Some(METHOD_PANEL_CONTENT_RELEASE),
+            Self::PanelContentMode { .. } => Some(METHOD_PANEL_CONTENT_MODE),
         }
     }
 
@@ -518,6 +681,11 @@ impl CtlRequest {
             Self::PanelContentRelease { panel_id, token } => {
                 Some(panel_content_release_params(panel_id, *token))
             }
+            Self::PanelContentMode {
+                panel_id,
+                mode,
+                token,
+            } => Some(panel_content_mode_params(panel_id, mode, *token)),
         }
     }
 }
@@ -556,7 +724,7 @@ pub fn ctl_usage() -> String {
          \x20 window list | window new\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 panel list\n\
-         \x20 panel present p:N | panel release p:N TOKEN\n\
+         \x20 panel present p:N | panel release p:N TOKEN | panel mode p:N tiled|floating [TOKEN]\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list (includes bounded memory diagnostics) | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
@@ -624,6 +792,8 @@ pub fn ctl_help_text(verbose: bool) -> String {
          receipt names the release token)\n  \
          panel release p:N TOKEN       core.panel.release (view.manage; restore the\n                                \
          displaced terminal)\n  \
+         panel mode p:N tiled|floating [TOKEN]  core.panel.mode (view.manage; move the\n                                \
+         presented layer's mode; receipt names the mode)\n  \
          config reload                 core.config.reload (config.modify, elevation)\n  \
          consent grant --scope S       core.consent.grant ([--terminal T --family F])\n  \
          consent revoke --scope S      core.consent.revoke_scope\n  \
@@ -686,7 +856,7 @@ pub const CTL_RESOURCES: &[(&str, &[&str])] = &[
     ("instance", &["list"]),
     ("window", &["list", "new"]),
     ("view", &["list", "split", "focus"]),
-    ("panel", &["list", "present", "release"]),
+    ("panel", &["list", "present", "release", "mode"]),
     ("terminal", &["list", "spawn", "close", "send", "text"]),
     (
         "workspace",
@@ -1226,6 +1396,55 @@ pub fn parse_ctl_request(tokens: &[String]) -> Result<(CtlRequest, CtlTargeting)
             Ok((
                 CtlRequest::PanelContentPresent {
                     panel_id: id.to_string(),
+                },
+                targeting,
+            ))
+        }
+        (Some("panel"), Some("mode")) => {
+            // bitty#2388 residue 3 (CTX-1931): `p:N` plus one canonical mode
+            // word, with an optional present-receipt token as the third
+            // positional. The mode word is the closed `PresentationMode`
+            // vocabulary: the two answerable modes apply, the two
+            // placement-less ones parse and the runtime refuses them typed,
+            // and anything else is a usage error here.
+            reject_ctl_options_for("panel mode", split_dir.is_some(), spawn_cwd.is_some())?;
+            let (id, mode_word, token) = match rest {
+                [id, mode_word] => (id.as_str(), mode_word.as_str(), None),
+                [id, mode_word, token] => (id.as_str(), mode_word.as_str(), Some(token.as_str())),
+                _ => {
+                    return Err(CtlParseError::Usage {
+                        message: String::from(
+                            "bitty ctl: panel mode needs p:N and MODE (e.g. panel mode p:1 \\\n\
+                             floating), with an optional TOKEN from the present receipt",
+                        ),
+                    });
+                }
+            };
+            parse_panel_id(id).map_err(|err| CtlParseError::Usage {
+                message: format!("bitty ctl: invalid panel id {id:?}: {err}"),
+            })?;
+            if bitty_ui::PresentationMode::parse(mode_word).is_none() {
+                return Err(CtlParseError::Usage {
+                    message: format!(
+                        "bitty ctl: panel mode needs a canonical mode word \\\n\
+                         (tiled|floating|fullscreen|scratchpad), got {mode_word:?}"
+                    ),
+                });
+            }
+            let token =
+                match token {
+                    None => None,
+                    Some(raw) => Some(parse_panel_content_token(raw).map_err(|err| {
+                        CtlParseError::Usage {
+                            message: format!("bitty ctl: invalid content token {raw:?}: {err}"),
+                        }
+                    })?),
+                };
+            Ok((
+                CtlRequest::PanelContentMode {
+                    panel_id: id.to_string(),
+                    mode: mode_word.to_string(),
+                    token,
                 },
                 targeting,
             ))

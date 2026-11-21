@@ -394,7 +394,8 @@ impl TerminalApp {
                 ),
             )
         })?;
-        let focused = match self.runtime.focused_view() {
+        let scrutinee = self.runtime.borrow().focused_view();
+        let focused = match scrutinee {
             Some(view) => view,
             None => {
                 return Err(OpenError::warn(
@@ -408,17 +409,18 @@ impl TerminalApp {
         self.restore_zoom();
         // CTX-0378: the id comes from the runtime-wide allocator, never the
         // live layout's max + 1 (mirrors the `new_split` arm).
-        let new_id = self.runtime.next_view_id_global();
+        let new_id = self.runtime.borrow().next_view_id_global();
         // CTX-0343 first match (mirrors the `new_split` arm): fail the
         // creation closed before the layout commits it.
-        if let Err(err) = self.runtime.validate_new_view_appearance(new_id) {
+        let scrutinee = self.runtime.borrow().validate_new_view_appearance(new_id);
+        if let Err(err) = scrutinee {
             return Err(OpenError::warn(
                 EditorOpenOutcome::LeafUnavailable,
                 format!("warning: composer external editor refused: {err} — draft kept"),
             ));
         }
         // Editor below the focused pane (`Down` geometry, new leaf second).
-        let mut layout = self.runtime.layout().clone();
+        let mut layout = self.runtime.borrow().layout().clone();
         if !split_focused_leaf(
             &mut layout,
             focused,
@@ -433,16 +435,18 @@ impl TerminalApp {
                 ),
             ));
         }
-        self.runtime.set_layout(layout);
+        self.runtime.borrow_mut().set_layout(layout);
         // CTX-1707: size the hosted editor to the painted content frame, the
         // same cell space the keyboard split and `ctl` use. `set_focus` does
         // not re-sync geometry, so an allocation-sized PTY would keep the
         // rows the painter windows away for the whole editor session.
         let (cols, rows) = self
             .runtime
+            .borrow()
             .presented_frame_cells(new_id)
             .or_else(|| {
                 self.runtime
+                    .borrow()
                     .layout_allocations()
                     .iter()
                     .find(|(id, _)| *id == new_id)
@@ -452,19 +456,20 @@ impl TerminalApp {
         let temp_arg = temp.path().to_string_lossy().into_owned();
         // G-2: the leaf spawns without the ambient credentials (minimized
         // env); stdio is the PTY itself (explicit interactive exception).
-        if let Err(err) = self.runtime.spawn_shell_for_view_scrubbed(
+        let scrutinee = self.runtime.borrow_mut().spawn_shell_for_view_scrubbed(
             new_id,
             &program,
             &[temp_arg.as_str()],
             cols,
             rows,
             &minimized_env_removals(),
-        ) {
+        );
+        if let Err(err) = scrutinee {
             // Roll the leaf back (unlike `new_split`, which keeps an empty
             // pane on spawn failure): the open failed, so nothing changes.
-            let mut layout = self.runtime.layout().clone();
+            let mut layout = self.runtime.borrow().layout().clone();
             if close_focused_leaf(&mut layout, new_id) {
-                self.runtime.set_layout_closing(layout, new_id);
+                self.runtime.borrow_mut().set_layout_closing(layout, new_id);
             }
             return Err(OpenError::warn(
                 EditorOpenOutcome::SpawnFailed,
@@ -474,7 +479,7 @@ impl TerminalApp {
             ));
         }
         // CTX-0364: focus follows the fresh pane (mirrors `new_split`).
-        self.runtime.set_focus(new_id);
+        self.runtime.borrow_mut().set_focus(new_id);
         if !self.chrome.editor.begin_with_timeout(
             ExternalEditorSession {
                 view: new_id,
@@ -485,11 +490,11 @@ impl TerminalApp {
         ) {
             // Unreachable single-threaded (busy was checked above); tear the
             // leaf down rather than leak an untracked editor.
-            let mut layout = self.runtime.layout().clone();
+            let mut layout = self.runtime.borrow().layout().clone();
             if close_focused_leaf(&mut layout, new_id) {
-                self.runtime.set_layout_closing(layout, new_id);
+                self.runtime.borrow_mut().set_layout_closing(layout, new_id);
             }
-            self.runtime.close_pane_session(&new_id);
+            self.runtime.borrow_mut().close_pane_session(&new_id);
             return Err(OpenError::warn(
                 EditorOpenOutcome::Busy,
                 String::from(
@@ -519,7 +524,7 @@ impl TerminalApp {
     /// editor leaf down and restores the prior focus when it still exists.
     pub(crate) fn poll_external_editor(&mut self) -> Option<EditorOutcome> {
         let view = self.chrome.editor.pending_view()?;
-        if !self.runtime.layout().leaf_ids().contains(&view) {
+        if !self.runtime.borrow().layout().leaf_ids().contains(&view) {
             // The editor leaf went away without us (e.g. a manual
             // `close_view`): drop the session — the RAII temp goes with it.
             drop(self.chrome.editor.take());
@@ -527,7 +532,10 @@ impl TerminalApp {
             eprintln!("warning: composer external editor pane closed — session dropped");
             return Some(EditorOutcome::Cancelled);
         }
-        let status = match self.runtime.pane_try_wait(&view) {
+        // CTX-1929: hoist the poll out of the match scrutinee so the guard is
+        // released before the timeout arm kills the pane tree.
+        let pane_status = self.runtime.borrow_mut().pane_try_wait(&view);
+        let status = match pane_status {
             Some(status) => status,
             None => {
                 // Still running: enforce the bounded wait (W-103 G-3). Expiry
@@ -536,7 +544,7 @@ impl TerminalApp {
                 if !self.chrome.editor.deadline_expired() {
                     return None;
                 }
-                let _ = self.runtime.kill_pane_tree(&view);
+                let _ = self.runtime.borrow().kill_pane_tree(&view);
                 let session = self.chrome.editor.take()?;
                 eprintln!(
                     "warning: composer external editor timed out and its tree was killed — draft kept, edits discarded"
@@ -590,17 +598,19 @@ impl TerminalApp {
         // No `view_close_request` confirm gate here: the child already
         // exited, so there is no running foreground job left to protect.
         self.restore_zoom();
-        let mut layout = self.runtime.layout().clone();
+        let mut layout = self.runtime.borrow().layout().clone();
         if close_focused_leaf(&mut layout, session.view) {
             // CTX-0359: an explicit close is the only layout change allowed
             // to re-home the primary owner.
-            self.runtime.set_layout_closing(layout, session.view);
+            self.runtime
+                .borrow_mut()
+                .set_layout_closing(layout, session.view);
             // CTX-0176: tear down the closed leaf's shell (drop kills + reaps
             // the child; no-op when it never owned one). Guarded on the
             // removal (issue #2167): tearing down a leaf the surgery refused
             // would strand a session-less erased tile; the next reap pass
             // releases it from its owning container instead.
-            if self.runtime.close_pane_session(&session.view) {
+            if self.runtime.borrow_mut().close_pane_session(&session.view) {
                 eprintln!("bitty: external editor pane {:?} torn down", session.view);
             }
         } else {
@@ -611,11 +621,12 @@ impl TerminalApp {
         }
         if self
             .runtime
+            .borrow()
             .layout()
             .leaf_ids()
             .contains(&session.return_focus)
         {
-            self.runtime.set_focus(session.return_focus);
+            self.runtime.borrow_mut().set_focus(session.return_focus);
         }
         self.open_retained_composer();
         // `session.temp` drops here: the temp file is unlinked in all cases.

@@ -314,7 +314,7 @@ return {}
             // frame (CTX-1332 C-D4). No delivery is selected by this setup.
             let _ = app.drive_tick();
             assert_eq!(
-                app.runtime.published_band_origins().len(),
+                app.runtime.borrow().published_band_origins().len(),
                 1,
                 "real authorized mount presented an executable origin"
             );
@@ -396,7 +396,7 @@ return {}
         /// delta. Input must not enter a VM.
         fn queue_wheel_at(&mut self, column: u16) -> u64 {
             self.cursor(column);
-            let routed = self.app.runtime.band_host_stats().scrolls_routed;
+            let routed = self.app.runtime.borrow().band_host_stats().scrolls_routed;
             assert_eq!(
                 self.event(WindowEventKind::MouseWheel(ScrollDelta::Lines(
                     0.0,
@@ -405,7 +405,7 @@ return {}
                 0,
                 "queueing must not enter the owning VM"
             );
-            self.app.runtime.band_host_stats().scrolls_routed - routed
+            self.app.runtime.borrow().band_host_stats().scrolls_routed - routed
         }
 
         /// Pump cold ticks until no command remains parked (bitty#2314 F2).
@@ -427,7 +427,9 @@ return {}
         }
 
         fn cursor(&mut self, column: u16) {
-            let rt = &self.app.runtime;
+            // CTX-1929: the shared runtime handle; the guard lives for the
+            // helper's own body only.
+            let rt = self.app.runtime.borrow();
             let row = rt
                 .plugin_band_row(bitty_runtime::BandEdge::Bottom, 0)
                 .expect("mounted bottom row");
@@ -453,8 +455,8 @@ return {}
             assert!(self.app.window.os_cursor_sink.is_none());
             assert!(self.app.pty_rx.is_none());
             assert!(self.app._pty_thread.is_none());
-            assert_eq!(self.app.runtime.pty_size(), None);
-            assert!(!self.app.runtime.has_pty_writer());
+            assert_eq!(self.app.runtime.borrow().pty_size(), None);
+            assert!(!self.app.runtime.borrow().has_pty_writer());
             assert!(self.operations.borrow().is_empty());
         }
 
@@ -525,31 +527,50 @@ return {}
         fixture
             .app
             .runtime
+            .borrow_mut()
             .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
         fixture.cursor(BOUND_COLUMN);
-        fixture.app.runtime.start_selection(Default::default());
-        let mut selected = fixture.app.runtime.selection().expect("selection anchor");
-        selected.focus.col = 1;
-        fixture.app.runtime.set_selection(selected);
-        assert!(fixture.app.runtime.has_selection());
         fixture
             .app
             .runtime
+            .borrow_mut()
+            .start_selection(Default::default());
+        let mut selected = fixture
+            .app
+            .runtime
+            .borrow()
+            .selection()
+            .expect("selection anchor");
+        selected.focus.col = 1;
+        fixture.app.runtime.borrow_mut().set_selection(selected);
+        assert!(fixture.app.runtime.borrow().has_selection());
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
             .handle_ime_preedit(Some("composing".to_string()), Some(2));
-        let focus = fixture.app.runtime.focused_view();
-        let window_focus = fixture.app.runtime.is_window_focused();
-        let selection = fixture.app.runtime.selection();
-        let ime = fixture.app.runtime.ime_preedit().map(str::to_string);
-        let ime_area = fixture.app.runtime.ime_cursor_area();
+        let focus = fixture.app.runtime.borrow().focused_view();
+        let window_focus = fixture.app.runtime.borrow().is_window_focused();
+        let selection = fixture.app.runtime.borrow().selection();
+        let ime = fixture
+            .app
+            .runtime
+            .borrow()
+            .ime_preedit()
+            .map(str::to_string);
+        let ime_area = fixture.app.runtime.borrow().ime_cursor_area();
         let window_ime_area = fixture.app.window.ime_cursor_area;
         let before = fixture.entries();
         let delta = match gesture {
             Gesture::ClickRelease => {
                 assert_eq!(fixture.mouse(PressState::Pressed), 0);
-                assert!(fixture.app.runtime.band_release_armed());
+                assert!(fixture.app.runtime.borrow().band_release_armed());
                 let delta = fixture.mouse(PressState::Released);
-                assert!(!fixture.app.runtime.band_release_armed());
-                assert_eq!(fixture.app.runtime.band_host_stats().clicks_routed, 1);
+                assert!(!fixture.app.runtime.borrow().band_release_armed());
+                assert_eq!(
+                    fixture.app.runtime.borrow().band_host_stats().clicks_routed,
+                    1
+                );
                 delta
             }
             Gesture::Wheel => {
@@ -557,7 +578,15 @@ return {}
                     0.0,
                     WHEEL_NOTCH,
                 )));
-                assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 1);
+                assert_eq!(
+                    fixture
+                        .app
+                        .runtime
+                        .borrow()
+                        .band_host_stats()
+                        .scrolls_routed,
+                    1
+                );
                 delta
             }
         };
@@ -569,14 +598,17 @@ return {}
         );
         assert_eq!(fixture.entries(), before, "no owning-VM entry during input");
         assert!(
-            fixture.app.runtime.pending_input().is_empty(),
+            fixture.app.runtime.borrow().pending_input().is_empty(),
             "no PTY report"
         );
-        assert_eq!(fixture.app.runtime.focused_view(), focus);
-        assert_eq!(fixture.app.runtime.is_window_focused(), window_focus);
-        assert_eq!(fixture.app.runtime.selection(), selection);
-        assert_eq!(fixture.app.runtime.ime_preedit(), ime.as_deref());
-        assert_eq!(fixture.app.runtime.ime_cursor_area(), ime_area);
+        assert_eq!(fixture.app.runtime.borrow().focused_view(), focus);
+        assert_eq!(
+            fixture.app.runtime.borrow().is_window_focused(),
+            window_focus
+        );
+        assert_eq!(fixture.app.runtime.borrow().selection(), selection);
+        assert_eq!(fixture.app.runtime.borrow().ime_preedit(), ime.as_deref());
+        assert_eq!(fixture.app.runtime.borrow().ime_cursor_area(), ime_area);
         assert_eq!(fixture.app.window.ime_cursor_area, window_ime_area);
         println!(
             "{gesture:?}: owning VM input delta={delta}; routing accepted; PTY/selection/focus/IME unchanged"
@@ -595,7 +627,12 @@ return {}
         );
         fixture.assert_no_sinks();
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-featured.input-boundary:step: 1"),
             "the deferred command's bounded result surfaced"
         );
@@ -643,7 +680,15 @@ return {}
             0,
             "input must not enter the owning VM"
         );
-        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 1);
+        assert_eq!(
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .band_host_stats()
+                .scrolls_routed,
+            1
+        );
         assert_eq!(fixture.entries(), before, "no VM entry during input");
         assert_eq!(fixture.app.pump_cold_commands(), 1, "one deferred delivery");
         assert_eq!(fixture.entries(), before + 1, "exactly one VM entry");
@@ -700,7 +745,12 @@ return {}
         );
         assert_eq!(fixture.read_marker(), 1, "the body ran exactly once");
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-featured.input-boundary:slow: slow:1"),
             "the resumed result surfaces on the banner"
         );
@@ -724,7 +774,12 @@ return {}
         assert_eq!(fixture.entries(), before + 1, "one dispatch, no replay");
         assert_eq!(fixture.read_marker(), 1, "the slow body ran exactly once");
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-featured.input-boundary:slow: slow:1"),
             "the resumed result surfaces exactly once"
         );
@@ -752,7 +807,12 @@ return {}
         assert_eq!(fixture.entries(), before + 1, "one dispatch, no replay");
         assert_eq!(fixture.read_marker(), 1, "the slow body ran exactly once");
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-featured.input-boundary:slow: slow:1"),
             "the resumed band result surfaces exactly once"
         );
@@ -787,7 +847,12 @@ return {}
         .expect_value("runs");
         assert_eq!(runs, LuaValue::String("1".to_string()));
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-terminal.composer:open: open:1"),
             "the resumed composer result surfaces exactly once"
         );
@@ -829,6 +894,7 @@ return {}
         let extent = fixture
             .app
             .runtime
+            .borrow()
             .surface_extent()
             .expect("headless surface extent");
         let probes = [
@@ -863,7 +929,7 @@ return {}
         // (3) Prohibited arms: queue immediately before each probe, assert
         // zero entries, then prove the admission is still queued.
         for (name, probe) in probes {
-            let theme_before = fixture.app.runtime.config().theme;
+            let theme_before = fixture.app.runtime.borrow().config().theme;
             fixture.queue_bound_wheel();
             assert_eq!(
                 fixture.platform_event(probe),
@@ -872,7 +938,7 @@ return {}
             );
             if name == "SystemAppearanceChanged" {
                 assert_ne!(
-                    fixture.app.runtime.config().theme,
+                    fixture.app.runtime.borrow().config().theme,
                     theme_before,
                     "the appearance probe must reach drive_tick, not early-return"
                 );
@@ -951,7 +1017,7 @@ return {}
         );
         assert_eq!(fixture.entries(), before, "no owning-VM entry during input");
         assert!(
-            fixture.app.runtime.pending_input().is_empty(),
+            fixture.app.runtime.borrow().pending_input().is_empty(),
             "a consumed command chord emits no PTY bytes"
         );
         // Exactly-once later delivery on the real cold application callback.
@@ -966,7 +1032,12 @@ return {}
             "exactly one owning-VM entry on the cold pump"
         );
         assert_eq!(
-            fixture.app.runtime.notification_banner().as_deref(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .notification_banner()
+                .as_deref(),
             Some("bitty-featured.input-boundary:step: 1"),
             "the deferred command's bounded result surfaced"
         );
@@ -1041,14 +1112,16 @@ return {}
     #[test]
     fn input_vm_boundary_unbound_and_shift_fallthrough_controls() {
         let mut fixture = Fixture::new("fallthrough");
-        let seed_lines = fixture.app.runtime.snapshot().height + EXTRA_SCROLLBACK_LINES;
+        let seed_lines = fixture.app.runtime.borrow().snapshot().height + EXTRA_SCROLLBACK_LINES;
         fixture
             .app
             .runtime
+            .borrow_mut()
             .handle_pty_bytes(&b"fixture\r\n".repeat(seed_lines));
         fixture
             .app
             .runtime
+            .borrow_mut()
             .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
         fixture.cursor(UNBOUND_COLUMN);
         let before = fixture.entries();
@@ -1059,12 +1132,20 @@ return {}
             ))),
             0
         );
-        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_unclaimed, 1);
+        assert_eq!(
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .band_host_stats()
+                .scrolls_unclaimed,
+            1
+        );
         assert!(
-            !fixture.app.runtime.pending_input().is_empty(),
+            !fixture.app.runtime.borrow().pending_input().is_empty(),
             "unbound wheel reaches mouse reporting"
         );
-        fixture.app.runtime.drain_pending_input();
+        fixture.app.runtime.borrow_mut().drain_pending_input();
         fixture.cursor(BOUND_COLUMN);
         assert_eq!(
             fixture.event(WindowEventKind::ModifiersChanged(ModifiersState {
@@ -1077,7 +1158,7 @@ return {}
         );
         assert_eq!(fixture.mouse(PressState::Pressed), 0);
         assert!(
-            !fixture.app.runtime.band_release_armed(),
+            !fixture.app.runtime.borrow().band_release_armed(),
             "Shift selects terminal escape"
         );
         assert_eq!(fixture.mouse(PressState::Released), 0);
@@ -1088,13 +1169,30 @@ return {}
             ))),
             0
         );
-        assert_eq!(fixture.app.runtime.band_host_stats().clicks_routed, 0);
-        assert_eq!(fixture.app.runtime.band_host_stats().scrolls_routed, 0);
-        let focused = fixture.app.runtime.focused_view().expect("focused leaf");
+        assert_eq!(
+            fixture.app.runtime.borrow().band_host_stats().clicks_routed,
+            0
+        );
+        assert_eq!(
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .band_host_stats()
+                .scrolls_routed,
+            0
+        );
+        let focused = fixture
+            .app
+            .runtime
+            .borrow()
+            .focused_view()
+            .expect("focused leaf");
         assert!(
             fixture
                 .app
                 .runtime
+                .borrow()
                 .layout()
                 .find_leaf(focused)
                 .expect("live leaf")
@@ -1103,7 +1201,7 @@ return {}
             "Shift wheel reaches the terminal scrollback viewport"
         );
         assert!(
-            fixture.app.runtime.pending_input().is_empty(),
+            fixture.app.runtime.borrow().pending_input().is_empty(),
             "Shift emits no mouse report"
         );
         assert_eq!(fixture.entries(), before);
@@ -1164,9 +1262,15 @@ return {}
         fixture
             .app
             .runtime
+            .borrow_mut()
             .arm_present_confirmation_for_test(std::time::Instant::now());
         assert!(
-            fixture.app.runtime.present_confirm_deadline().is_some(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_confirm_deadline()
+                .is_some(),
             "precondition: a committed frame is awaiting confirmation"
         );
         let _ = fixture.platform_event(PlatformEvent::Window {
@@ -1174,7 +1278,7 @@ return {}
             kind: WindowEventKind::RedrawRequested,
         });
         assert_eq!(
-            fixture.app.runtime.present_confirm_deadline(),
+            fixture.app.runtime.borrow().present_confirm_deadline(),
             None,
             "a served frame callback confirms the committed frame"
         );
@@ -1198,35 +1302,44 @@ return {}
         // tick drains any remaining damage so the runtime is idle below.
         let _ = fixture.app.drive_tick();
         assert!(fixture.app.drive_tick().is_none(), "the runtime is idle");
-        assert!(fixture.app.runtime.is_surface_visible());
+        assert!(fixture.app.runtime.borrow().is_surface_visible());
 
         // A hide that retained nothing keeps the confirmation bound armed;
         // its expiry while hidden reopens the gate speculatively and presents
         // one blind repair. The gate is open, but nothing has proven the
         // surface visible.
-        fixture.app.runtime.set_surface_visibility_at(t0, false);
-        fixture.app.runtime.arm_present_confirmation_for_test(t0);
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .set_surface_visibility_at(t0, false);
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .arm_present_confirmation_for_test(t0);
         assert!(
             fixture
                 .app
                 .runtime
+                .borrow_mut()
                 .tick_at(t0 + std::time::Duration::from_millis(800))
                 .is_some(),
             "the blind repair presents"
         );
-        assert!(fixture.app.runtime.is_surface_visible());
+        assert!(fixture.app.runtime.borrow().is_surface_visible());
         assert!(
-            fixture.app.runtime.surface_reveal_unproven(),
+            fixture.app.runtime.borrow().surface_reveal_unproven(),
             "a headless repair cannot prove the surface visible"
         );
         assert!(
-            !fixture.app.runtime.present_owed(),
+            !fixture.app.runtime.borrow().present_owed(),
             "the repair consumed the frame"
         );
 
         fixture.app.reveal_surface_from_input();
         assert!(
-            fixture.app.runtime.present_owed(),
+            fixture.app.runtime.borrow().present_owed(),
             "input proof must queue a from-truth frame with the gate open"
         );
         assert!(
@@ -1234,7 +1347,7 @@ return {}
             "the from-truth frame presents"
         );
         assert!(
-            !fixture.app.runtime.surface_reveal_unproven(),
+            !fixture.app.runtime.borrow().surface_reveal_unproven(),
             "the input reveal settled the speculative reopen"
         );
 
@@ -1244,14 +1357,20 @@ return {}
         fixture
             .app
             .runtime
+            .borrow_mut()
             .arm_present_confirmation_for_test(std::time::Instant::now());
         fixture.app.reveal_surface_from_input();
         assert!(
-            !fixture.app.runtime.present_owed(),
+            !fixture.app.runtime.borrow().present_owed(),
             "settled input inside a live confirmation window must stay frame-on-demand"
         );
         assert!(
-            fixture.app.runtime.present_confirm_deadline().is_some(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_confirm_deadline()
+                .is_some(),
             "settled input must not cancel an active compositor confirmation timer"
         );
     }
@@ -1371,11 +1490,16 @@ return {}
         );
         drop(context);
         assert!(
-            !fixture.app.runtime.is_surface_visible(),
+            !fixture.app.runtime.borrow().is_surface_visible(),
             "Suspended must gate presentation until the surface re-maps"
         );
         assert!(
-            fixture.app.runtime.present_coalescing_deadline().is_none(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_coalescing_deadline()
+                .is_none(),
             "the hide transition must not leave a wake behind"
         );
 
@@ -1390,7 +1514,7 @@ return {}
         );
         drop(context);
         assert!(
-            fixture.app.runtime.is_surface_visible(),
+            fixture.app.runtime.borrow().is_surface_visible(),
             "Resumed must ungate presentation"
         );
     }
@@ -1413,11 +1537,16 @@ return {}
         );
         drop(context);
         assert!(
-            !fixture.app.runtime.is_surface_visible(),
+            !fixture.app.runtime.borrow().is_surface_visible(),
             "Occluded(true) must gate presentation until the reveal edge"
         );
         assert!(
-            fixture.app.runtime.present_coalescing_deadline().is_none(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_coalescing_deadline()
+                .is_none(),
             "the occlusion transition must not leave a wake behind"
         );
 
@@ -1432,7 +1561,7 @@ return {}
         );
         drop(context);
         assert!(
-            fixture.app.runtime.is_surface_visible(),
+            fixture.app.runtime.borrow().is_surface_visible(),
             "Occluded(false) must ungate presentation"
         );
     }
@@ -1449,22 +1578,45 @@ return {}
         // The exact runtime transition the `Occluded(true)` edge applies. The
         // platform crash-report bookkeeping is process-global, so the test
         // drives the gate directly instead of racing other lifecycle tests.
-        fixture.app.runtime.set_surface_visibility(false);
-        assert!(!fixture.app.runtime.is_surface_visible());
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .set_surface_visibility(false);
+        assert!(!fixture.app.runtime.borrow().is_surface_visible());
 
         // The hidden surface retained damage and the bounded repair probe is
         // outstanding when the key arrives; a #2989 confirmation bound is
         // armed for the hidden incarnation too.
-        fixture.app.runtime.handle_pty_bytes(b"stale frame");
-        let probe_at = std::time::Instant::now();
-        fixture.app.repair_hidden_surface(probe_at);
-        assert!(fixture.app.hidden_repair_probe_pending());
-        assert!(fixture.app.runtime.hidden_repair_deadline().is_some());
         fixture
             .app
             .runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"stale frame");
+        let probe_at = std::time::Instant::now();
+        fixture.app.repair_hidden_surface(probe_at);
+        assert!(fixture.app.hidden_repair_probe_pending());
+        assert!(
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .hidden_repair_deadline()
+                .is_some()
+        );
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
             .arm_present_confirmation_for_test(probe_at);
-        assert!(fixture.app.runtime.present_confirm_deadline().is_some());
+        assert!(
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_confirm_deadline()
+                .is_some()
+        );
 
         let presented_before = fixture.app.presented_frames;
         assert_eq!(
@@ -1481,7 +1633,7 @@ return {}
         );
 
         assert!(
-            fixture.app.runtime.is_surface_visible(),
+            fixture.app.runtime.borrow().is_surface_visible(),
             "a delivered key reopens the gate"
         );
         assert!(
@@ -1489,17 +1641,22 @@ return {}
             "the input reveal ends the hidden-repair probe"
         );
         assert_eq!(
-            fixture.app.runtime.hidden_repair_deadline(),
+            fixture.app.runtime.borrow().hidden_repair_deadline(),
             None,
             "no repair wake survives the reveal"
         );
         assert_eq!(
-            fixture.app.runtime.present_confirm_deadline(),
+            fixture.app.runtime.borrow().present_confirm_deadline(),
             None,
             "the reveal drops the hidden incarnation's confirmation bound"
         );
         assert!(
-            fixture.app.runtime.present_coalescing_deadline().is_some(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_coalescing_deadline()
+                .is_some(),
             "the reveal queues one from-truth frame"
         );
         assert!(
@@ -1523,17 +1680,25 @@ return {}
             fixture.app.drive_tick().is_none(),
             "the baseline mount frame is already committed"
         );
-        assert!(fixture.app.runtime.is_surface_visible(), "gate starts open");
+        assert!(
+            fixture.app.runtime.borrow().is_surface_visible(),
+            "gate starts open"
+        );
         let presented_before = fixture.app.presented_frames;
 
         fixture.event(WindowEventKind::Occluded(false));
 
         assert!(
-            fixture.app.runtime.is_surface_visible(),
+            fixture.app.runtime.borrow().is_surface_visible(),
             "the redundant reveal must not change the gate"
         );
         assert!(
-            fixture.app.runtime.present_coalescing_deadline().is_some(),
+            fixture
+                .app
+                .runtime
+                .borrow()
+                .present_coalescing_deadline()
+                .is_some(),
             "a reveal proof queues one from-truth frame even with the gate open"
         );
         assert!(
@@ -1552,14 +1717,18 @@ return {}
         let mut fixture = Fixture::new("input-reveal-negative");
         // Same runtime transition as the `Occluded(true)` edge (see the
         // positive case: the crash-report sentinel is process-global).
-        fixture.app.runtime.set_surface_visibility(false);
-        assert!(!fixture.app.runtime.is_surface_visible());
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .set_surface_visibility(false);
+        assert!(!fixture.app.runtime.borrow().is_surface_visible());
 
         fixture.platform_event(PlatformEvent::AboutToWait);
         fixture.platform_event(PlatformEvent::PtyReadable);
 
         assert!(
-            !fixture.app.runtime.is_surface_visible(),
+            !fixture.app.runtime.borrow().is_surface_visible(),
             "a wake is not a reveal edge"
         );
         assert!(
@@ -1575,12 +1744,17 @@ return {}
         // runtime's repair deadline must reach the `AboutToWait` wake minimum.
         let mut fixture = Fixture::new("hidden-repair-wake");
         fixture.platform_event(PlatformEvent::Suspended);
-        assert!(!fixture.app.runtime.is_surface_visible());
-        fixture.app.runtime.handle_pty_bytes(b"hidden repair wake");
+        assert!(!fixture.app.runtime.borrow().is_surface_visible());
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"hidden repair wake");
         assert!(fixture.app.drive_tick().is_none(), "no frame while hidden");
         let deadline = fixture
             .app
             .runtime
+            .borrow()
             .hidden_repair_deadline()
             .expect("retained damage must arm the repair wake");
 
@@ -1608,13 +1782,18 @@ return {}
         // opens and the retained frame paints.
         let mut fixture = Fixture::new("hidden-repair-heal");
         fixture.platform_event(PlatformEvent::Suspended);
-        fixture.app.runtime.handle_pty_bytes(b"repair me");
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"repair me");
         let before = fixture.app.presented_frames;
         assert!(fixture.app.drive_tick().is_none(), "no frame while hidden");
         assert_eq!(fixture.app.presented_frames, before);
         let deadline = fixture
             .app
             .runtime
+            .borrow()
             .hidden_repair_deadline()
             .expect("the repair wake is armed");
 
@@ -1622,7 +1801,7 @@ return {}
         // stays closed and the damage stays retained.
         fixture.app.repair_hidden_surface(deadline);
         assert!(
-            !fixture.app.runtime.is_surface_visible(),
+            !fixture.app.runtime.borrow().is_surface_visible(),
             "requesting a probe must not open the gate by itself"
         );
         assert!(fixture.app.drive_tick().is_none());
@@ -1632,13 +1811,13 @@ return {}
         // reconstructed and the retained frame presents.
         let served = deadline + std::time::Duration::from_millis(16);
         assert!(fixture.app.apply_hidden_repair_probe(true, served));
-        assert!(fixture.app.runtime.is_surface_visible());
+        assert!(fixture.app.runtime.borrow().is_surface_visible());
         assert!(
             fixture.app.drive_tick().is_some(),
             "the retained frame paints after the self-heal"
         );
         assert_eq!(fixture.app.presented_frames, before + 1);
-        assert_eq!(fixture.app.runtime.hidden_repair_deadline(), None);
+        assert_eq!(fixture.app.runtime.borrow().hidden_repair_deadline(), None);
     }
 
     #[test]
@@ -1648,12 +1827,17 @@ return {}
         // probe must never re-open the gate on an unrelated redraw.
         let mut fixture = Fixture::new("hidden-repair-closed");
         fixture.platform_event(PlatformEvent::Suspended);
-        fixture.app.runtime.handle_pty_bytes(b"still hidden");
+        fixture
+            .app
+            .runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"still hidden");
         let before = fixture.app.presented_frames;
         assert!(fixture.app.drive_tick().is_none());
         let deadline = fixture
             .app
             .runtime
+            .borrow()
             .hidden_repair_deadline()
             .expect("the repair wake is armed");
 
@@ -1663,7 +1847,7 @@ return {}
             !fixture.app.apply_hidden_repair_probe(false, unserved),
             "an unserved probe is not a reveal"
         );
-        assert!(!fixture.app.runtime.is_surface_visible());
+        assert!(!fixture.app.runtime.borrow().is_surface_visible());
         assert!(fixture.app.drive_tick().is_none());
         assert_eq!(fixture.app.presented_frames, before);
 
@@ -1675,7 +1859,7 @@ return {}
             !fixture.app.apply_hidden_repair_probe(true, late),
             "a stale probe must not open the gate"
         );
-        assert!(!fixture.app.runtime.is_surface_visible());
+        assert!(!fixture.app.runtime.borrow().is_surface_visible());
         assert_eq!(fixture.app.presented_frames, before);
     }
 
@@ -1688,7 +1872,7 @@ return {}
         // `Revealed` nor overwrite an unrelated lifecycle mark.
         let mut fixture = Fixture::new("reveal-lifecycle-dedupe");
         assert!(
-            fixture.app.runtime.is_surface_visible(),
+            fixture.app.runtime.borrow().is_surface_visible(),
             "the fixture starts with an open gate"
         );
 
@@ -2299,14 +2483,14 @@ fn panel_overlay_modal_bit_feeds_modal_capture() {
     let maps =
         bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
-    let mut app = TerminalApp::with_theme(
+    let app = TerminalApp::with_theme(
         rt,
         bitty_config::theme::DEFAULT_THEME_NAME,
         "default",
         maps,
         SpawnSpec::default(),
     );
-    assert!(!app.runtime.overlay_modal_active());
+    assert!(!app.runtime.borrow().overlay_modal_active());
     assert!(!app.modal_capture_active());
     let chord = KeyRef {
         key: KeyName::Char('w'),
@@ -2319,7 +2503,7 @@ fn panel_overlay_modal_bit_feeds_modal_capture() {
     let (priority, action) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
     assert_eq!(priority, DispatchPriority::User);
     assert_eq!(action, Some(ChromeAction::CloseView));
-    app.runtime.set_overlay_modal_active(true);
+    app.runtime.borrow_mut().set_overlay_modal_active(true);
     assert!(app.modal_capture_active());
     let (priority, action) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
     assert_eq!(
@@ -2336,7 +2520,7 @@ fn panel_overlay_modal_bit_feeds_modal_capture() {
     };
     let (priority, _) = app.resolve_dispatch(esc, None);
     assert_eq!(priority, DispatchPriority::Terminal);
-    app.runtime.set_overlay_modal_active(false);
+    app.runtime.borrow_mut().set_overlay_modal_active(false);
     assert!(!app.modal_capture_active());
     let (priority, _) = app.resolve_dispatch(chord, Some(ChromeAction::CloseView));
     assert_eq!(priority, DispatchPriority::User);
@@ -2672,10 +2856,13 @@ fn poll_pty_pump_marks_the_burst_for_the_settle_gate() {
         SpawnSpec::default(),
     );
     app.runtime
+        .borrow_mut()
         .set_present_settle(std::time::Duration::from_millis(2));
     app.runtime
+        .borrow_mut()
         .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
     app.runtime
+        .borrow_mut()
         .handle_resize(bitty_platform::PhysicalSize::new(736, 472))
         .expect("resize applies");
     app._pty_thread
@@ -2689,19 +2876,20 @@ fn poll_pty_pump_marks_the_burst_for_the_settle_gate() {
     let before = std::time::Instant::now();
     assert!(app.poll_pty_pump(), "demo pump must deliver bytes");
     assert!(
-        app.runtime.tick_at(before).is_none(),
+        app.runtime.borrow_mut().tick_at(before).is_none(),
         "poll_pty_pump must mark the consumed burst; without the mark the frame presents immediately"
     );
     let deadline = app
         .runtime
+        .borrow()
         .present_coalescing_deadline()
         .expect("a deferred frame must arm the app wake");
     assert!(deadline > before, "the armed wake must be in the future");
     assert!(
-        app.runtime.tick_at(deadline).is_some(),
+        app.runtime.borrow_mut().tick_at(deadline).is_some(),
         "the quiet deadline must commit the held frame"
     );
-    assert_eq!(app.runtime.present_coalescing_deadline(), None);
+    assert_eq!(app.runtime.borrow().present_coalescing_deadline(), None);
 }
 
 #[test]
@@ -2736,7 +2924,9 @@ fn osc_title_applies_to_window_state_and_is_change_gated() {
         SpawnSpec::default(),
     );
     assert_eq!(app.window.last_applied_title, None);
-    app.runtime.handle_pty_bytes(b"\x1b]2;nvim foo.rs\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]2;nvim foo.rs\x07");
     assert!(
         app.drive_tick().is_some(),
         "first tick presents the startup frame"
@@ -2747,14 +2937,18 @@ fn osc_title_applies_to_window_state_and_is_change_gated() {
     );
     assert_eq!(app.window.title_applies, 1);
     // Same title again: the change gate drops it (no titlebar churn).
-    app.runtime.handle_pty_bytes(b"\x1b]0;nvim foo.rs\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]0;nvim foo.rs\x07");
     let _ = app.drive_tick();
     assert_eq!(
         app.window.title_applies, 1,
         "identical titles must not re-apply"
     );
     // A new title applies exactly once more.
-    app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]2;ssh prod\x07");
     let _ = app.drive_tick();
     assert_eq!(app.window.last_applied_title.as_deref(), Some("ssh prod"));
     assert_eq!(app.window.title_applies, 2);
@@ -2770,11 +2964,13 @@ fn osc_title_sanitizes_and_empty_resets_to_static_title() {
         Vec::new(),
         SpawnSpec::default(),
     );
-    app.runtime.handle_pty_bytes(b"\x1b]2;bad\x01title\x7f\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]2;bad\x01title\x7f\x07");
     app.apply_cold_events();
     assert_eq!(app.window.last_applied_title.as_deref(), Some("badtitle"));
     // Empty OSC 0/2 resets to the static theme title, never a blank bar.
-    app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]2;\x07");
     app.apply_cold_events();
     assert_eq!(
         app.window.last_applied_title.as_deref(),
@@ -2824,6 +3020,7 @@ fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
 
     // A fresh title crosses the seam exactly once, sanitized.
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"\x1b]2;nvim \x01src/\x7fmain.rs\x07");
     app.drive_tick();
     assert_eq!(
@@ -2834,13 +3031,19 @@ fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
 
     // A repeat of the same title is dropped by the change gate: no second
     // call, so the titlebar never churns.
-    app.runtime.handle_pty_bytes(b"\x1b]0;nvim src/main.rs\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]0;nvim src/main.rs\x07");
     app.drive_tick();
     assert_eq!(recorded.lock().expect("poison-free").len(), 1);
 
     // OSC 2 then OSC 0 with a new title applies once more, in order.
-    app.runtime.handle_pty_bytes(b"\x1b]2;ssh prod\x07");
-    app.runtime.handle_pty_bytes(b"\x1b]0;build log\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]2;ssh prod\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]0;build log\x07");
     app.drive_tick();
     assert_eq!(
         recorded.lock().expect("poison-free").as_slice(),
@@ -2850,7 +3053,7 @@ fn osc_title_handoff_call_sequence_reaches_the_os_sink() {
 
     // An empty title resets to the static theme title (never a blank bar),
     // which is a distinct value and so crosses the seam again.
-    app.runtime.handle_pty_bytes(b"\x1b]2;\x07");
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]2;\x07");
     app.drive_tick();
     assert_eq!(
         recorded.lock().expect("poison-free").last().unwrap(),
@@ -2908,7 +3111,9 @@ fn osc22_cursor_handoff_call_sequence_reaches_the_os_sink() {
     );
 
     // A fresh shape crosses the seam exactly once.
-    app.runtime.handle_pty_bytes(b"\x1b]22;pointer\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;pointer\x07");
     app.drive_tick();
     assert_eq!(
         recorded.lock().expect("poison-free").as_slice(),
@@ -2921,16 +3126,20 @@ fn osc22_cursor_handoff_call_sequence_reaches_the_os_sink() {
 
     // A repeat of the same shape is dropped by the change gate: no second
     // call, so the OS pointer never churns.
-    app.runtime.handle_pty_bytes(b"\x1b]22;pointer\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;pointer\x07");
     app.drive_tick();
     assert_eq!(recorded.lock().expect("poison-free").len(), 2);
 
     // Push, pop, and RIS reset each apply once more, in order.
-    app.runtime.handle_pty_bytes(b"\x1b]22;>wait\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;>wait\x07");
     app.drive_tick();
-    app.runtime.handle_pty_bytes(b"\x1b]22;<\x07");
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]22;<\x07");
     app.drive_tick();
-    app.runtime.handle_pty_bytes(b"\x1bc");
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1bc");
     app.drive_tick();
     assert_eq!(
         recorded.lock().expect("poison-free").as_slice(),
@@ -2945,7 +3154,7 @@ fn osc22_cursor_handoff_call_sequence_reaches_the_os_sink() {
     );
 
     // An empty set while already default is dropped by the change gate.
-    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]22;\x07");
     app.drive_tick();
     assert_eq!(
         recorded.lock().expect("poison-free").len(),
@@ -2990,15 +3199,17 @@ fn osc8_link_cell(rt: &Runtime) -> bitty_platform::CursorPosition {
 /// Holds Ctrl for the OSC 8 click gesture (issue #1759, R-005):
 /// activation requires Ctrl (Cmd on macOS) held during the click.
 fn hold_ctrl_for_osc8(app: &mut TerminalApp, window_id: bitty_platform::WindowId) {
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
-            shift: false,
-            control: true,
-            alt: false,
-            super_pressed: false,
-        }),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+                shift: false,
+                control: true,
+                alt: false,
+                super_pressed: false,
+            }),
+        });
 }
 
 #[test]
@@ -3015,41 +3226,50 @@ fn osc8_click_path_reaches_the_live_url_consumer() {
         SpawnSpec::default(),
     );
     let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
-        opened: std::sync::Arc::clone(&opened),
-    }));
+    app.runtime
+        .borrow_mut()
+        .set_url_opener(Box::new(RecordingUrlOpener {
+            opened: std::sync::Arc::clone(&opened),
+        }));
 
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
-    let link_pos = osc8_link_cell(&app.runtime);
+    let link_pos = osc8_link_cell(&app.runtime.borrow());
     hold_ctrl_for_osc8(&mut app, window_id);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(link_pos),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Pressed,
-        )),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Released,
-        )),
-    });
-    assert!(app.runtime.has_pending_hyperlink_activation());
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(link_pos),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Pressed,
+            )),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Released,
+            )),
+        });
+    assert!(app.runtime.borrow().has_pending_hyperlink_activation());
     app.activate_pending_hyperlink_now();
     assert_eq!(
         opened.lock().expect("poison-free").as_slice(),
         ["https://example.test"],
         "the live consumer must open the authorized URI exactly once"
     );
-    assert!(!app.runtime.has_pending_hyperlink_activation());
+    assert!(!app.runtime.borrow().has_pending_hyperlink_activation());
 }
 
 #[test]
@@ -3063,35 +3283,44 @@ fn osc8_click_path_never_opens_a_hostile_scheme() {
         SpawnSpec::default(),
     );
     let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
-        opened: std::sync::Arc::clone(&opened),
-    }));
+    app.runtime
+        .borrow_mut()
+        .set_url_opener(Box::new(RecordingUrlOpener {
+            opened: std::sync::Arc::clone(&opened),
+        }));
 
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"\x1b]8;;javascript:alert(1)\x07x\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
-    let link_pos = osc8_link_cell(&app.runtime);
+    let link_pos = osc8_link_cell(&app.runtime.borrow());
     hold_ctrl_for_osc8(&mut app, window_id);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(link_pos),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Pressed,
-        )),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Released,
-        )),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(link_pos),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Pressed,
+            )),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Released,
+            )),
+        });
     // No gesture was minted, so the app path has nothing to consume.
-    assert!(!app.runtime.has_pending_hyperlink_activation());
+    assert!(!app.runtime.borrow().has_pending_hyperlink_activation());
     app.activate_pending_hyperlink_now();
     assert!(opened.lock().expect("poison-free").is_empty());
 }
@@ -3110,27 +3339,34 @@ fn osc8_padding_click_never_arms_a_live_link() {
         SpawnSpec::default(),
     );
     let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
-        opened: std::sync::Arc::clone(&opened),
-    }));
+    app.runtime
+        .borrow_mut()
+        .set_url_opener(Box::new(RecordingUrlOpener {
+            opened: std::sync::Arc::clone(&opened),
+        }));
 
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     hold_ctrl_for_osc8(&mut app, window_id);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Released,
-        )),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Released,
+            )),
+        });
     assert!(
-        !app.runtime.has_pending_hyperlink_activation(),
+        !app.runtime.borrow().has_pending_hyperlink_activation(),
         "a padding click must not arm the live link"
     );
     app.activate_pending_hyperlink_now();
@@ -3149,15 +3385,17 @@ fn plaintext_cell(rt: &Runtime, col: usize) -> bitty_platform::CursorPosition {
 }
 
 fn hold_ctrl(app: &mut TerminalApp, window_id: bitty_platform::WindowId) {
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
-            shift: false,
-            control: true,
-            alt: false,
-            super_pressed: false,
-        }),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+                shift: false,
+                control: true,
+                alt: false,
+                super_pressed: false,
+            }),
+        });
 }
 
 #[test]
@@ -3173,40 +3411,49 @@ fn plaintext_click_path_reaches_the_live_url_consumer() {
         SpawnSpec::default(),
     );
     let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
-        opened: std::sync::Arc::clone(&opened),
-    }));
+    app.runtime
+        .borrow_mut()
+        .set_url_opener(Box::new(RecordingUrlOpener {
+            opened: std::sync::Arc::clone(&opened),
+        }));
 
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"see https://example.test here");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     hold_ctrl(&mut app, window_id);
-    let pos = plaintext_cell(&app.runtime, 5);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(pos),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Pressed,
-        )),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
-            bitty_platform::MouseButton::Left,
-            bitty_platform::PressState::Released,
-        )),
-    });
-    assert!(app.runtime.has_pending_hyperlink_activation());
+    let pos = plaintext_cell(&app.runtime.borrow(), 5);
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(pos),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Pressed,
+            )),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(
+                bitty_platform::MouseButton::Left,
+                bitty_platform::PressState::Released,
+            )),
+        });
+    assert!(app.runtime.borrow().has_pending_hyperlink_activation());
     app.activate_pending_hyperlink_now();
     assert_eq!(
         opened.lock().expect("poison-free").as_slice(),
         ["https://example.test"],
     );
-    assert!(!app.runtime.has_pending_hyperlink_activation());
+    assert!(!app.runtime.borrow().has_pending_hyperlink_activation());
 }
 
 #[test]
@@ -3229,14 +3476,17 @@ fn plaintext_hover_syncs_the_os_pointer_shape() {
     }));
     assert_eq!(app.window.last_applied_cursor, None);
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"see https://example.test here");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     hold_ctrl(&mut app, window_id);
-    let pos = plaintext_cell(&app.runtime, 5);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(pos),
-    });
+    let pos = plaintext_cell(&app.runtime.borrow(), 5);
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(pos),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3253,10 +3503,12 @@ fn plaintext_hover_syncs_the_os_pointer_shape() {
         Some(bitty_platform::CursorIcon::Pointer)
     );
     assert_eq!(recorded.lock().expect("poison-free").len(), 1);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3363,9 +3615,11 @@ ui.overlay.focus = true
     assert!(app.overlay_capture_active());
 
     let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    app.runtime.set_url_opener(Box::new(RecordingUrlOpener {
-        opened: std::sync::Arc::clone(&opened),
-    }));
+    app.runtime
+        .borrow_mut()
+        .set_url_opener(Box::new(RecordingUrlOpener {
+            opened: std::sync::Arc::clone(&opened),
+        }));
     let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     app.set_os_cursor_sink(Box::new(RecordingCursorSink {
         icons: std::sync::Arc::clone(&recorded),
@@ -3373,24 +3627,27 @@ ui.overlay.focus = true
 
     // URL text under the pointer with Ctrl held.
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"see https://example.test here");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     hold_ctrl(&mut app, window_id);
-    let pos = plaintext_cell(&app.runtime, 5);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(pos),
-    });
+    let pos = plaintext_cell(&app.runtime.borrow(), 5);
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(pos),
+        });
     // Hover arms normally at Runtime level (Ctrl-gated hit test passes).
     assert!(
-        app.runtime.hovered_plaintext_span().is_some(),
+        app.runtime.borrow().hovered_plaintext_span().is_some(),
         "Ctrl+hover must arm the plaintext span pre-tick"
     );
     // The app tick suppresses it while the overlay holds: no underline
     // state survives, and the cursor never shows Pointer for grid URLs.
     let _ = app.drive_tick();
     assert!(
-        app.runtime.hovered_plaintext_span().is_none(),
+        app.runtime.borrow().hovered_plaintext_span().is_none(),
         "overlay capture must clear the plaintext hover on tick"
     );
     app.sync_cursor_icon();
@@ -3402,27 +3659,37 @@ ui.overlay.focus = true
 
     // Ctrl+press+release over the URL mints at Runtime level (which does
     // not know about the overlay), but the app drops it instead of opening.
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Pressed)),
-    });
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::MouseInput(MouseEvent::new(MouseButton::Left, PressState::Released)),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(MouseEvent::new(
+                MouseButton::Left,
+                PressState::Pressed,
+            )),
+        });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::MouseInput(MouseEvent::new(
+                MouseButton::Left,
+                PressState::Released,
+            )),
+        });
     assert!(
-        app.runtime.has_pending_hyperlink_activation(),
+        app.runtime.borrow().has_pending_hyperlink_activation(),
         "Runtime mints unaware of the overlay; the app guards the open"
     );
     // App-level guard: drop, never open, while the capture holds.
     assert!(app.overlay_capture_active());
     if app.overlay_capture_active() {
-        let _ = app.runtime.drop_pending_hyperlink_activation();
+        let _ = app.runtime.borrow_mut().drop_pending_hyperlink_activation();
     } else {
         app.activate_pending_hyperlink_now();
     }
     assert!(
-        !app.runtime.has_pending_hyperlink_activation(),
+        !app.runtime.borrow().has_pending_hyperlink_activation(),
         "pending URL gesture must not survive an overlay session"
     );
     assert!(
@@ -3598,15 +3865,18 @@ ui.overlay.focus = true
     assert_eq!(before_labels.len(), 3);
 
     // Close the second panel mid-session.
-    let leaves = app.runtime.layout().leaf_ids();
+    let leaves = app.runtime.borrow().layout().leaf_ids();
     assert_eq!(leaves.len(), 2);
     let remaining = app
         .runtime
+        .borrow()
         .layout()
         .find_leaf(leaves[0])
         .cloned()
         .expect("remaining leaf");
-    app.runtime.set_layout(LayoutNode::leaf(remaining));
+    app.runtime
+        .borrow_mut()
+        .set_layout(LayoutNode::leaf(remaining));
 
     // First tick publishes the new rows and reconciles the session; the
     // second tick pushes the reconciled layer into the scene.
@@ -3636,6 +3906,7 @@ ui.overlay.focus = true
     );
     assert_eq!(
         app.runtime
+            .borrow()
             .target_annotations()
             .expect("runtime layer")
             .len(),
@@ -3856,13 +4127,16 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
     }));
     assert_eq!(app.window.last_applied_cursor, None);
     app.runtime
+        .borrow_mut()
         .handle_pty_bytes(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
-    let link_pos = osc8_link_cell(&app.runtime);
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(link_pos),
-    });
+    let link_pos = osc8_link_cell(&app.runtime.borrow());
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(link_pos),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3881,7 +4155,9 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
     );
     assert_eq!(recorded.lock().expect("poison-free").len(), 1);
     // `OSC 22` while hovered must not override the hover pointer.
-    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;wait\x07");
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3894,10 +4170,12 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
         "hover-wins must not churn the OS pointer"
     );
     // Leaving the link falls back to the `OSC 22` shape.
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3905,11 +4183,13 @@ fn osc8_hover_syncs_the_os_pointer_shape() {
         "leaving the link must fall back to the OSC 22 shape"
     );
     // Clearing the `OSC 22` stack falls back to `Default`.
-    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
-    });
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]22;\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3935,23 +4215,28 @@ fn pointer_over_terminal_text_uses_the_text_cursor() {
     app.set_os_cursor_sink(Box::new(RecordingCursorSink {
         icons: std::sync::Arc::clone(&recorded),
     }));
-    app.runtime.handle_pty_bytes(b"selectable text");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"selectable text");
     let window_id = bitty_platform::WindowId::from_raw_public(1);
     let frame = *app
         .runtime
+        .borrow()
         .present_frames()
         .first()
         .expect("primary frame must present");
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let text_pos = bitty_platform::CursorPosition {
         x: pad + f64::from(frame.content.x) + 1.5 * f64::from(cw),
         y: pad + f64::from(frame.content.y) + 0.5 * f64::from(ch),
     };
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(text_pos),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(text_pos),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3964,7 +4249,9 @@ fn pointer_over_terminal_text_uses_the_text_cursor() {
     );
 
     // `OSC 22` still owns the pointer when a terminal app sets one.
-    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;wait\x07");
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3973,11 +4260,13 @@ fn pointer_over_terminal_text_uses_the_text_cursor() {
     );
 
     // Window padding is chrome: the arrow returns.
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
-    });
-    app.runtime.handle_pty_bytes(b"\x1b]22;\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(bitty_platform::CursorPosition { x: 1.0, y: 1.0 }),
+        });
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x1b]22;\x07");
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3986,11 +4275,15 @@ fn pointer_over_terminal_text_uses_the_text_cursor() {
     );
 
     // A capturing pane returns the arrow even over its text.
-    app.runtime.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorMoved(text_pos),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorMoved(text_pos),
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -3999,11 +4292,15 @@ fn pointer_over_terminal_text_uses_the_text_cursor() {
     );
 
     // Leaving the window restores the platform arrow even with OSC 22 set.
-    app.runtime.handle_pty_bytes(b"\x1b]22;wait\x07");
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id,
-        kind: WindowEventKind::CursorLeft,
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]22;wait\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id,
+            kind: WindowEventKind::CursorLeft,
+        });
     app.sync_cursor_icon();
     assert_eq!(
         app.window.last_applied_cursor,
@@ -4027,8 +4324,8 @@ fn default_startup_carries_no_demo_line() {
     );
     assert!(app.pty_rx.is_none());
     assert!(!app.poll_pty_pump());
-    app.runtime.select_all();
-    let text = app.runtime.selection_text().unwrap_or_default();
+    app.runtime.borrow_mut().select_all();
+    let text = app.runtime.borrow().selection_text().unwrap_or_default();
     assert!(
         !text.contains("demo pty"),
         "default startup must not contain demo line, got {text:?}"
@@ -4077,8 +4374,8 @@ fn demo_pump_opt_in_delivers_greeting() {
         .join()
         .expect("demo pump thread must join");
     assert!(app.poll_pty_pump(), "opt-in demo pump must deliver bytes");
-    app.runtime.select_all();
-    let text = app.runtime.selection_text().expect("grid text");
+    app.runtime.borrow_mut().select_all();
+    let text = app.runtime.borrow().selection_text().expect("grid text");
     assert!(
         text.contains("demo pty"),
         "opt-in demo pump must deliver greeting, got {text:?}"
@@ -5513,10 +5810,12 @@ fn app_mouse_event(
     button: bitty_platform::MouseButton,
     state: bitty_platform::PressState,
 ) {
-    app.runtime.handle_platform_event(PlatformEvent::Window {
-        window_id: bitty_platform::WindowId::from_raw_public(1),
-        kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(button, state)),
-    });
+    app.runtime
+        .borrow_mut()
+        .handle_platform_event(PlatformEvent::Window {
+            window_id: bitty_platform::WindowId::from_raw_public(1),
+            kind: WindowEventKind::MouseInput(bitty_platform::MouseEvent::new(button, state)),
+        });
     let _ = app.dispatch_pending_mouse_action();
 }
 
@@ -5529,7 +5828,7 @@ fn headless_app_with_runtime_config(config: bitty_runtime::RuntimeConfig) -> Ter
         Vec::new(),
         SpawnSpec::default(),
     );
-    app.runtime.force_headless_clipboard();
+    app.runtime.borrow_mut().force_headless_clipboard();
     app.set_session_persistence(false);
     app
 }
@@ -5547,24 +5846,28 @@ fn default_right_click_is_inert_through_the_app_dispatch() {
     // open the suspicious-paste dialog, and must emit no PTY bytes.
     let mut app = headless_app_with_mouse_right(bitty_config::MouseButtonBinding::None);
     app.runtime
+        .borrow_mut()
         .clipboard_mut()
         .set_text("first line\nsecond line\nthird line".to_string())
         .expect("headless clipboard");
-    app.runtime.drain_pending_input();
+    app.runtime.borrow_mut().drain_pending_input();
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
-    assert!(!app.runtime.has_pending_paste(), "no suspicious-paste trap");
-    assert_eq!(app.runtime.pending_input_len(), 0, "no PTY bytes");
+    assert!(
+        !app.runtime.borrow().has_pending_paste(),
+        "no suspicious-paste trap"
+    );
+    assert_eq!(app.runtime.borrow().pending_input_len(), 0, "no PTY bytes");
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Released,
     );
-    assert!(!app.runtime.has_pending_paste());
-    assert_eq!(app.runtime.pending_input_len(), 0);
+    assert!(!app.runtime.borrow().has_pending_paste());
+    assert_eq!(app.runtime.borrow().pending_input_len(), 0);
 }
 
 #[test]
@@ -5575,22 +5878,23 @@ fn configured_right_click_runs_the_action_exactly_once_through_chrome_dispatch()
         bitty_config::ChromeAction::PasteFromClipboard,
     ));
     app.runtime
+        .borrow_mut()
         .clipboard_mut()
         .set_text("hi".to_string())
         .expect("headless clipboard");
-    app.runtime.drain_pending_input();
+    app.runtime.borrow_mut().drain_pending_input();
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
     assert_eq!(
-        app.runtime.pending_input(),
+        app.runtime.borrow().pending_input(),
         b"hi",
         "the clipboard action dispatches once"
     );
     assert!(
-        !app.runtime.has_pending_paste(),
+        !app.runtime.borrow().has_pending_paste(),
         "clean paste needs no dialog"
     );
     // The paired release must not dispatch a second action.
@@ -5599,7 +5903,7 @@ fn configured_right_click_runs_the_action_exactly_once_through_chrome_dispatch()
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Released,
     );
-    assert_eq!(app.runtime.pending_input(), b"hi");
+    assert_eq!(app.runtime.borrow().pending_input(), b"hi");
 }
 
 #[test]
@@ -5611,28 +5915,36 @@ fn two_configured_right_presses_confirm_a_multiline_paste_through_the_app() {
         bitty_config::ChromeAction::PasteFromClipboard,
     ));
     app.runtime
+        .borrow_mut()
         .clipboard_mut()
         .set_text("one\ntwo".to_string())
         .expect("headless clipboard");
-    app.runtime.drain_pending_input();
+    app.runtime.borrow_mut().drain_pending_input();
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
     assert!(
-        app.runtime.has_pending_paste(),
+        app.runtime.borrow().has_pending_paste(),
         "multi-line paste must gate"
     );
-    assert_eq!(app.runtime.pending_input_len(), 0, "no silent delivery");
+    assert_eq!(
+        app.runtime.borrow().pending_input_len(),
+        0,
+        "no silent delivery"
+    );
     // The second identical press confirms through the same dispatcher.
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
-    assert!(!app.runtime.has_pending_paste(), "repeat press confirms");
-    assert_eq!(app.runtime.pending_input(), b"one\ntwo");
+    assert!(
+        !app.runtime.borrow().has_pending_paste(),
+        "repeat press confirms"
+    );
+    assert_eq!(app.runtime.borrow().pending_input(), b"one\ntwo");
 }
 
 #[test]
@@ -5645,25 +5957,25 @@ fn mouse_action_is_captured_by_a_pending_close_confirmation() {
         close_confirm: bitty_runtime::CloseConfirmMode::Always,
         ..bitty_runtime::RuntimeConfig::default()
     });
-    let view = app.runtime.focused_view().expect("focused view");
+    let view = app.runtime.borrow().focused_view().expect("focused view");
     assert!(matches!(
-        app.runtime.view_close_request(view),
+        app.runtime.borrow_mut().view_close_request(view),
         bitty_runtime::ViewCloseRequest::Pending { .. }
     ));
-    assert!(app.runtime.has_pending_close_confirm());
-    let leaves = app.runtime.leaf_count();
+    assert!(app.runtime.borrow().has_pending_close_confirm());
+    let leaves = app.runtime.borrow().leaf_count();
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
     assert_eq!(
-        app.runtime.leaf_count(),
+        app.runtime.borrow().leaf_count(),
         leaves,
         "the armed close modal captures the non-confirm mouse action"
     );
     assert!(
-        app.runtime.has_pending_close_confirm(),
+        app.runtime.borrow().has_pending_close_confirm(),
         "the modal stays armed for its own confirmation gesture"
     );
 }
@@ -5676,20 +5988,24 @@ fn mouse_capture_wins_over_host_binding_through_the_app_dispatch() {
         bitty_config::ChromeAction::PasteFromClipboard,
     ));
     app.runtime
+        .borrow_mut()
         .clipboard_mut()
         .set_text("clip".to_string())
         .expect("headless clipboard");
-    app.runtime.handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
-    app.runtime.drain_pending_input();
     app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+    app.runtime.borrow_mut().drain_pending_input();
+    app.runtime
+        .borrow_mut()
         .handle_cursor_moved(bitty_platform::CursorPosition { x: 0.0, y: 0.0 });
     app_mouse_event(
         &mut app,
         bitty_platform::MouseButton::Right,
         bitty_platform::PressState::Pressed,
     );
-    assert_eq!(app.runtime.pending_input(), b"\x1b[<2;1;1M");
-    assert!(!app.runtime.has_pending_paste());
+    assert_eq!(app.runtime.borrow().pending_input(), b"\x1b[<2;1;1M");
+    assert!(!app.runtime.borrow().has_pending_paste());
 }
 
 #[test]
@@ -13271,14 +13587,14 @@ fn new_split_without_spawnable_shell_keeps_pane_with_warning() {
         maps,
         spec,
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
-    assert_eq!(app.runtime.leaf_count(), 3);
-    assert_eq!(app.runtime.pane_count(), 0);
+    assert_eq!(app.runtime.borrow().leaf_count(), 3);
+    assert_eq!(app.runtime.borrow().pane_count(), 0);
     // Closing a session-less leaf is quiet and total.
     app.apply_chrome_action(ChromeAction::CloseView);
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert_eq!(app.runtime.pane_count(), 0);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().pane_count(), 0);
 }
 
 // Live-spawn: the fresh leaf owns a real POSIX shell (`/bin/sh` has no
@@ -13309,19 +13625,19 @@ fn new_split_spawns_private_shell_and_close_tears_it_down() {
         maps,
         spec,
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
-    assert_eq!(app.runtime.leaf_count(), 3);
+    assert_eq!(app.runtime.borrow().leaf_count(), 3);
     // Fresh leaf is id 3 (one past the previous max).
-    assert!(app.runtime.has_pane_session(&ViewId::new(3)));
-    assert!(app.runtime.pane_pid(&ViewId::new(3)).is_some());
+    assert!(app.runtime.borrow().has_pane_session(&ViewId::new(3)));
+    assert!(app.runtime.borrow().pane_pid(&ViewId::new(3)).is_some());
     // Focus the new leaf, then close it: the child goes down with it.
     app.apply_chrome_action(ChromeAction::FocusId(3));
-    assert_eq!(app.runtime.focused_view(), Some(ViewId::new(3)));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(ViewId::new(3)));
     app.apply_chrome_action(ChromeAction::CloseView);
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert!(!app.runtime.has_pane_session(&ViewId::new(3)));
-    assert_eq!(app.runtime.pane_count(), 0);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert!(!app.runtime.borrow().has_pane_session(&ViewId::new(3)));
+    assert_eq!(app.runtime.borrow().pane_count(), 0);
 }
 
 /// CTX-1719: only an interactive windowed run defers the startup spawn.
@@ -13344,7 +13660,7 @@ fn primary_text_until(app: &mut TerminalApp, needle: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let _ = app.poll_pty_pump();
-        let snapshot = app.runtime.snapshot();
+        let snapshot = app.runtime.borrow().snapshot();
         let grid = bitty_runtime::inspect::grid_text_from_snapshot_with_images(
             &snapshot,
             snapshot.height,
@@ -13396,11 +13712,14 @@ fn deferred_startup_spawn_hands_the_child_the_committed_window_grid() {
             },
         );
         app.runtime
+            .borrow_mut()
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
         // Window creation adopts the live cell metric and the compositor's
         // `Resized` reflows the grid — both before any spawn.
-        app.runtime.apply_dpi_scale(scale, Some(final_extent));
-        let committed = app.runtime.snapshot();
+        app.runtime
+            .borrow_mut()
+            .apply_dpi_scale(scale, Some(final_extent));
+        let committed = app.runtime.borrow().snapshot();
         assert!(
             committed.width > 80 && committed.height > 24,
             "scale {scale}: fixture must exceed the 80x24 default, got {}x{}",
@@ -13453,6 +13772,7 @@ fn deferred_startup_spawn_falls_back_when_no_resize_arrives() {
         },
     );
     app.runtime
+        .borrow_mut()
         .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
     app.defer_startup_shells(false);
     assert!(
@@ -13632,14 +13952,14 @@ fn editor_test_app() -> TerminalApp {
     let maps =
         bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
     let rt = Runtime::with_defaults().expect("must build");
-    let mut app = TerminalApp::with_theme(
+    let app = TerminalApp::with_theme(
         rt,
         bitty_config::theme::DEFAULT_THEME_NAME,
         "default",
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app
 }
 
@@ -13653,12 +13973,12 @@ fn external_editor_hostile_program_denied_without_side_effects() {
     // A hostile `$VISUAL`/`$EDITOR` is denied before any side effect: no
     // leaf, no session. Headless-safe (resolution fails before any spawn).
     let mut app = editor_test_app();
-    let focused_before = app.runtime.focused_view();
+    let focused_before = app.runtime.borrow().focused_view();
     feed_text(&mut app, "hi");
     app.open_external_editor_with(Some("/tmp/evil-editor"), Some("/tmp/evil-editor"), None);
     assert!(!app.chrome.editor.is_hosting());
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert_eq!(app.runtime.focused_view(), focused_before);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().focused_view(), focused_before);
 }
 
 #[test]
@@ -13669,7 +13989,7 @@ fn external_editor_missing_program_denied_without_side_effects() {
     feed_text(&mut app, "hi");
     app.open_external_editor_with(None, None, None);
     assert!(!app.chrome.editor.is_hosting());
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
 }
 
 #[test]
@@ -13713,7 +14033,7 @@ fn external_editor_poll_cancels_when_leaf_gone() {
     feed_text(&mut app, "hi");
     let temp = bitty_rich::host::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
     let path = temp.path().to_path_buf();
-    let home = app.runtime.focused_view().expect("focused leaf");
+    let home = app.runtime.borrow().focused_view().expect("focused leaf");
     assert!(app.chrome.editor.begin(ExternalEditorSession {
         view: ViewId::new(999),
         temp,
@@ -13722,7 +14042,7 @@ fn external_editor_poll_cancels_when_leaf_gone() {
     app.poll_external_editor();
     assert!(!app.chrome.editor.is_hosting());
     assert!(!path.exists(), "temp deleted on cancel");
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
 }
 
 /// Writes an executable fake editor script under the temp dir: tiny and
@@ -13771,7 +14091,7 @@ fn external_editor_round_trip_applies_and_tears_down() {
     // down and restores focus. The edited buffer is reported via
     // `EditorOutcome`; there is no composer session to assert.
     let mut app = editor_test_app();
-    let home = app.runtime.focused_view().expect("focused leaf");
+    let home = app.runtime.borrow().focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
     // The editor records the winsize its PTY actually has (`stty size` ->
     // "rows cols"), then appends its edit. That is the only way to observe
@@ -13796,9 +14116,9 @@ fn external_editor_round_trip_applies_and_tears_down() {
     app.open_external_editor_with(None, None, Some(script_arg.as_str()));
     assert!(app.chrome.editor.is_hosting());
     let editor_view = app.chrome.editor.pending_view().expect("pending view");
-    assert_eq!(app.runtime.leaf_count(), 3);
-    assert!(app.runtime.has_pane_session(&editor_view));
-    assert_eq!(app.runtime.focused_view(), Some(editor_view));
+    assert_eq!(app.runtime.borrow().leaf_count(), 3);
+    assert!(app.runtime.borrow().has_pane_session(&editor_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(editor_view));
     // CTX-1707: the hosted editor's PTY must be the *painted* content frame,
     // not the raw layout slot. `set_focus` never re-syncs geometry, so an
     // allocation-sized PTY keeps rows the painter windows away for the whole
@@ -13807,10 +14127,12 @@ fn external_editor_round_trip_applies_and_tears_down() {
     // `layout_allocations()` again.
     let frame = app
         .runtime
+        .borrow()
         .presented_frame_cells(editor_view)
         .expect("editor leaf presents a frame");
     let alloc = app
         .runtime
+        .borrow()
         .layout_allocations()
         .into_iter()
         .find(|(id, _)| *id == editor_view)
@@ -13822,15 +14144,15 @@ fn external_editor_round_trip_applies_and_tears_down() {
     );
     // A second open while hosted is refused: no fourth leaf.
     app.open_external_editor_with(None, None, Some(script_arg.as_str()));
-    assert_eq!(app.runtime.leaf_count(), 3);
+    assert_eq!(app.runtime.borrow().leaf_count(), 3);
     wait_for_editor_done(&mut app);
     assert!(
         !app.chrome.editor.is_hosting(),
         "editor exit must finish the round trip"
     );
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert!(!app.runtime.has_pane_session(&editor_view));
-    assert_eq!(app.runtime.focused_view(), Some(home));
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert!(!app.runtime.borrow().has_pane_session(&editor_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(home));
     // The child's own `stty size` ("rows cols") is the PTY winsize the
     // editor actually ran with. It must equal the painted frame, not the
     // larger layout slot: `editor_host` reverting to `layout_allocations()`
@@ -13852,7 +14174,7 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
     // A failing editor reports non-zero (E-CUT: no draft to keep); the leaf
     // still tears down and focus restores.
     let mut app = editor_test_app();
-    let home = app.runtime.focused_view().expect("focused leaf");
+    let home = app.runtime.borrow().focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
     let script = write_fake_editor("fail", "#!/bin/sh\nexit 3\n");
     let script_arg = script.to_string_lossy().into_owned();
@@ -13864,9 +14186,9 @@ fn external_editor_nonzero_exit_discards_and_tears_down() {
         !app.chrome.editor.is_hosting(),
         "failed editor must still finish"
     );
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert!(!app.runtime.has_pane_session(&editor_view));
-    assert_eq!(app.runtime.focused_view(), Some(home));
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert!(!app.runtime.borrow().has_pane_session(&editor_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(home));
     let _ = std::fs::remove_file(&script);
 }
 
@@ -13880,7 +14202,7 @@ fn external_editor_typed_open_reports_busy_and_keeps_existing() {
     feed_text(&mut app, "hi");
     let temp = bitty_rich::host::write_composer_temp("hi", &std::env::temp_dir()).expect("temp");
     let path = temp.path().to_path_buf();
-    let home = app.runtime.focused_view().expect("focused leaf");
+    let home = app.runtime.borrow().focused_view().expect("focused leaf");
     assert!(app.chrome.editor.begin(ExternalEditorSession {
         view: ViewId::new(999),
         temp,
@@ -13899,7 +14221,7 @@ fn external_editor_typed_open_reports_busy_and_keeps_existing() {
     );
     assert_eq!(app.chrome.editor.pending_view(), Some(ViewId::new(999)));
     assert_eq!(
-        app.runtime.leaf_count(),
+        app.runtime.borrow().leaf_count(),
         2,
         "no leaf spawns for a Busy open"
     );
@@ -13918,7 +14240,7 @@ fn external_editor_typed_denied_before_side_effects() {
     // session.
     use crate::editor_host::EditorOpenOutcome;
     let mut app = editor_test_app();
-    let focused_before = app.runtime.focused_view();
+    let focused_before = app.runtime.borrow().focused_view();
     feed_text(&mut app, "hi");
     let outcome = app.open_external_editor_typed(
         Some("/tmp/evil-editor"),
@@ -13931,8 +14253,8 @@ fn external_editor_typed_denied_before_side_effects() {
         EditorOpenOutcome::Denied(bitty_rich::host::EditorDeny::NotAllowed)
     );
     assert!(!app.chrome.editor.is_hosting());
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert_eq!(app.runtime.focused_view(), focused_before);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().focused_view(), focused_before);
 }
 
 #[test]
@@ -13945,7 +14267,7 @@ fn external_editor_hosted_timeout_kills_tree_and_reports() {
     // leaf tears down, focus restores, the draft is kept, and the overlay
     // reopens. The grandchild sleeper proves tree (not direct-child) kill.
     let mut app = editor_test_app();
-    let home = app.runtime.focused_view().expect("focused leaf");
+    let home = app.runtime.borrow().focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13988,9 +14310,9 @@ fn external_editor_hosted_timeout_kills_tree_and_reports() {
         Some(bitty_rich::host::EditorOutcome::Timeout),
         "expiry must report a typed Timeout"
     );
-    assert_eq!(app.runtime.leaf_count(), 2);
-    assert!(!app.runtime.has_pane_session(&editor_view));
-    assert_eq!(app.runtime.focused_view(), Some(home));
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
+    assert!(!app.runtime.borrow().has_pane_session(&editor_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(home));
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // Only an owned-tree kill reaches the grandchild: it must be gone
@@ -14057,16 +14379,17 @@ fn hosted_grandchild_gone(pid: u32) -> bool {
 fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
     require_pty!();
     let mut app = editor_test_app();
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
     let pane_view = ViewId::new(2);
 
     // Spawn an immediately exiting shell script in split pane 2.
     let script = write_fake_editor("exit-pane", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pane_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
-    assert!(app.runtime.has_pane_session(&pane_view));
+    assert!(app.runtime.borrow().has_pane_session(&pane_view));
 
     // Poll until reap_exited_shells detects exit and closes the pane.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -14082,16 +14405,16 @@ fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
     assert_eq!(
-        app.runtime.leaf_count(),
+        app.runtime.borrow().leaf_count(),
         1,
         "closed pane must reduce leaf count to 1"
     );
     assert!(
-        !app.runtime.has_pane_session(&pane_view),
+        !app.runtime.borrow().has_pane_session(&pane_view),
         "pane session must be dropped"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(ViewId::new(1)),
         "sibling must remain focused"
     );
@@ -14103,15 +14426,16 @@ fn reap_exited_split_pane_closes_pane_and_promotes_sibling() {
 fn reap_exited_primary_with_active_pane_closes_primary_pane() {
     require_pty!();
     let mut app = editor_test_app();
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
     let primary_view = ViewId::new(1);
     let pane_view = ViewId::new(2);
-    assert_eq!(app.runtime.primary_view(), Some(primary_view));
+    assert_eq!(app.runtime.borrow().primary_view(), Some(primary_view));
 
     // Spawn a long-running shell in split pane 2.
     let pane_script = write_fake_editor("sleep-pane", "#!/bin/sh\nsleep 10\n");
     let pane_script_arg = pane_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pane_view, pane_script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
 
@@ -14119,6 +14443,7 @@ fn reap_exited_primary_with_active_pane_closes_primary_pane() {
     let primary_script = write_fake_editor("exit-primary", "#!/bin/sh\nexit 0\n");
     let primary_script_arg = primary_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(primary_script_arg.as_str())
         .expect("spawn primary shell");
 
@@ -14135,11 +14460,11 @@ fn reap_exited_primary_with_active_pane_closes_primary_pane() {
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert_eq!(app.runtime.leaf_count(), 1);
-    assert_eq!(app.runtime.focused_view(), Some(pane_view));
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(pane_view));
 
     // Clean up
-    app.runtime.close_pane_session(&pane_view);
+    app.runtime.borrow_mut().close_pane_session(&pane_view);
     let _ = std::fs::remove_file(&pane_script);
     let _ = std::fs::remove_file(&primary_script);
 }
@@ -14158,12 +14483,13 @@ fn reap_exited_last_remaining_shell_signals_app_exit() {
         maps,
         SpawnSpec::default(),
     );
-    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
 
     // Spawn an exiting shell in primary.
     let script = write_fake_editor("exit-last", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(script_arg.as_str())
         .expect("spawn primary shell");
 
@@ -14209,7 +14535,7 @@ fn delayed_exit_after_eof(name: &str) -> (std::path::PathBuf, std::path::PathBuf
 fn wait_for_unreaped_eof_session(app: &mut TerminalApp, deadline: std::time::Instant) {
     while std::time::Instant::now() < deadline {
         let _ = app.poll_pty_pump();
-        if app.runtime.has_unreaped_eof_session() {
+        if app.runtime.borrow().has_unreaped_eof_session() {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -14265,17 +14591,20 @@ fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
         maps,
         SpawnSpec::default(),
     );
-    assert_eq!(app.runtime.leaf_count(), 1);
-    app.runtime.set_session_backend(Some(std::sync::Arc::new(
-        crate::storage_backends::StorageSessionBackend::new(),
-    )));
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
+    app.runtime
+        .borrow_mut()
+        .set_session_backend(Some(std::sync::Arc::new(
+            crate::storage_backends::StorageSessionBackend::new(),
+        )));
     let (script, marker) = delayed_exit_after_eof("late-exit-last-2443");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(script_arg.as_str())
         .expect("spawn primary shell");
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let child = app.runtime.pty_pid().expect("child pid");
+    let child = app.runtime.borrow().pty_pid().expect("child pid");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     wait_for_unreaped_eof_session(&mut app, deadline);
@@ -14311,10 +14640,11 @@ fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     app.runtime
+        .borrow()
         .save_session_to_path(&dir.join("session"))
         .expect("last-panel exit state must stay encodable");
 
-    app.runtime.shutdown();
+    app.runtime.borrow_mut().shutdown();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     assert!(
         hosted_grandchild_gone(child),
@@ -14332,11 +14662,12 @@ fn last_panel_exit_after_pty_eof_terminates_issue_2443() {
 fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
     require_pty!();
     let mut app = editor_test_app();
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
     let pane_view = ViewId::new(2);
     let (script, marker) = delayed_exit_after_eof("late-exit-pane-2443");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pane_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
 
@@ -14354,22 +14685,26 @@ fn late_exiting_split_pane_closes_only_that_pane_issue_2443() {
         terminal_app::ShellExitOutcome::PaneClosed,
         "a non-last exit must close only its pane and never exit the app"
     );
-    assert_eq!(app.runtime.leaf_count(), 1, "sibling pane must survive");
+    assert_eq!(
+        app.runtime.borrow().leaf_count(),
+        1,
+        "sibling pane must survive"
+    );
     assert!(
-        !app.runtime.has_pane_session(&pane_view),
+        !app.runtime.borrow().has_pane_session(&pane_view),
         "the exited pane session must be dropped"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(ViewId::new(1)),
         "focus must return to the surviving pane"
     );
-    assert!(!app.runtime.has_unreaped_eof_session());
+    assert!(!app.runtime.borrow().has_unreaped_eof_session());
     assert!(
         app.shell_exit_poll_deadline().is_none(),
         "no phantom reap schedule after the pane closed"
     );
-    app.runtime.shutdown();
+    app.runtime.borrow_mut().shutdown();
     let _ = std::fs::remove_file(&marker);
     let _ = std::fs::remove_file(&script);
 }
@@ -14393,31 +14728,40 @@ fn reap_exited_last_leaf_of_workspace_prunes_the_workspace() {
         maps,
         SpawnSpec::default(),
     );
-    assert_eq!(app.runtime.leaf_count(), 1);
-    app.runtime.workspace_new().expect("second workspace opens");
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    assert_eq!(app.runtime.leaf_count(), 1);
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
     assert_eq!(app.effective_window_leaf_count(), 2);
 
     // Keep a live shell on the surviving workspace so the prune leaves a
     // usable window with a real input path behind the survivor.
-    assert!(app.runtime.workspace_switch(0));
-    let survivor_view = app.runtime.focused_view().expect("survivor leaf");
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    let survivor_view = app.runtime.borrow().focused_view().expect("survivor leaf");
     let survivor_script = write_fake_editor("sleep-survivor-2525", "#!/bin/sh\nsleep 10\n");
     let survivor_arg = survivor_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor_view, survivor_arg.as_str(), &[], 80, 24, None)
         .expect("spawn survivor shell");
-    assert!(app.runtime.workspace_switch(1));
-    let active_view = app.runtime.focused_view().expect("active leaf focused");
+    assert!(app.runtime.borrow_mut().workspace_switch(1));
+    let active_view = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("active leaf focused");
 
     let script = write_fake_editor("exit-ws-last", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(active_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
-    assert!(app.runtime.has_pane_session(&active_view));
+    assert!(app.runtime.borrow().has_pane_session(&active_view));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -14436,41 +14780,49 @@ fn reap_exited_last_leaf_of_workspace_prunes_the_workspace() {
         "exiting the last leaf must close the pane, never the app"
     );
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         1,
         "emptied workspace is pruned like the close-view gesture"
     );
     assert_eq!(
-        app.runtime.active_workspace_index(),
+        app.runtime.borrow().active_workspace_index(),
         0,
         "focus follows the surviving workspace"
     );
-    assert_eq!(app.runtime.leaf_count(), 1, "survivor keeps its panel");
+    assert_eq!(
+        app.runtime.borrow().leaf_count(),
+        1,
+        "survivor keeps its panel"
+    );
     assert_eq!(
         app.effective_window_leaf_count(),
         1,
         "the surviving workspace owns the remaining panel"
     );
     assert!(
-        !app.runtime.has_pane_session(&active_view),
+        !app.runtime.borrow().has_pane_session(&active_view),
         "exited pane session must be torn down"
     );
-    let survivor = app.runtime.focused_view().expect("survivor leaf focused");
+    let survivor = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("survivor leaf focused");
     assert_eq!(
         survivor, survivor_view,
         "focus must leave the pruned dead tile for the live survivor"
     );
     assert!(
-        app.runtime.has_pane_session(&survivor_view),
+        app.runtime.borrow().has_pane_session(&survivor_view),
         "the live survivor keeps its shell"
     );
 
     // The surviving workspace still presents and stays usable.
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.workspace_count(), 1);
-    assert_eq!(app.runtime.leaf_count(), 1);
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
-    app.runtime.close_pane_session(&survivor_view);
+    assert_eq!(app.runtime.borrow().workspace_count(), 1);
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
+    app.runtime.borrow_mut().close_pane_session(&survivor_view);
     let _ = std::fs::remove_file(&script);
     let _ = std::fs::remove_file(&survivor_script);
 }
@@ -14493,27 +14845,43 @@ fn reap_exited_primary_last_leaf_of_workspace_prunes_workspace() {
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.workspace_new().expect("second workspace opens");
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    let pane_view = app.runtime.focused_view().expect("active leaf focused");
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+    let pane_view = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("active leaf focused");
 
     // Keep a live pane on the surviving workspace.
     let pane_script = write_fake_editor("sleep-pane-2525", "#!/bin/sh\nsleep 10\n");
     let pane_arg = pane_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pane_view, pane_arg.as_str(), &[], 80, 24, None)
         .expect("spawn live pane shell");
-    assert!(app.runtime.has_pane_session(&pane_view));
+    assert!(app.runtime.borrow().has_pane_session(&pane_view));
 
     // Attach the exiting primary to workspace 1's sole leaf (the primary
     // owner is chosen from the focused leaf at attach time).
-    assert!(app.runtime.workspace_switch(0), "switch to workspace 1");
-    let primary_view = app.runtime.focused_view().expect("primary leaf focused");
+    assert!(
+        app.runtime.borrow_mut().workspace_switch(0),
+        "switch to workspace 1"
+    );
+    let primary_view = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("primary leaf focused");
     assert_eq!(primary_view, ViewId::new(1));
     let primary_script = write_fake_editor("exit-primary-2525", "#!/bin/sh\nexit 0\n");
     let primary_arg = primary_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(primary_arg.as_str())
         .expect("spawn primary shell");
 
@@ -14530,28 +14898,28 @@ fn reap_exited_primary_last_leaf_of_workspace_prunes_workspace() {
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         1,
         "the emptied primary workspace is pruned"
     );
     assert_eq!(
-        app.runtime.active_workspace_index(),
+        app.runtime.borrow().active_workspace_index(),
         0,
         "the surviving workspace keeps focus"
     );
     assert!(
-        app.runtime.has_pane_session(&pane_view),
+        app.runtime.borrow().has_pane_session(&pane_view),
         "the live pane survives the prune"
     );
     assert_ne!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(primary_view),
         "the dead primary owner must be replaced"
     );
-    assert_eq!(app.runtime.focused_view(), Some(pane_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(pane_view));
     let _ = app.drive_tick();
 
-    app.runtime.close_pane_session(&pane_view);
+    app.runtime.borrow_mut().close_pane_session(&pane_view);
     let _ = std::fs::remove_file(&pane_script);
     let _ = std::fs::remove_file(&primary_script);
 }
@@ -14575,12 +14943,16 @@ fn reap_exited_shell_in_inactive_workspace_leaves_no_ghost_issue_2167() {
     let script = write_fake_editor("exit-bg-pane", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exited_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
-    assert!(app.runtime.has_pane_session(&exited_view));
+    assert!(app.runtime.borrow().has_pane_session(&exited_view));
 
-    app.runtime.workspace_new().expect("second workspace opens");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -14599,14 +14971,14 @@ fn reap_exited_shell_in_inactive_workspace_leaves_no_ghost_issue_2167() {
     );
 
     // Switching back must show the survivor only: no session-less ghost.
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
     assert!(
-        !app.runtime.has_pane_session(&exited_view),
+        !app.runtime.borrow().has_pane_session(&exited_view),
         "exited background pane must be fully torn down"
     );
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
     let _ = std::fs::remove_file(&script);
 }
 
@@ -14623,12 +14995,14 @@ fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
     let script = write_fake_editor("exit-parked-pane", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(parked_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
     app.runtime
+        .borrow_mut()
         .scratchpad_hide(parked_view)
         .expect("parked panel hides");
-    assert!(app.runtime.scratchpad_occupied());
+    assert!(app.runtime.borrow().scratchpad_occupied());
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -14646,14 +15020,14 @@ fn reap_exited_parked_shell_discards_scratchpad_issue_2167() {
         "parked pane exit must close the pane, never the app"
     );
     assert!(
-        !app.runtime.scratchpad_occupied(),
+        !app.runtime.borrow().scratchpad_occupied(),
         "no dead parked leaf may linger"
     );
     assert!(
-        !app.runtime.has_pane_session(&parked_view),
+        !app.runtime.borrow().has_pane_session(&parked_view),
         "exited parked pane must be fully torn down"
     );
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
     let _ = std::fs::remove_file(&script);
 }
 
@@ -14666,7 +15040,7 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
     // detach path where focus already moved to the survivor.
     require_pty!();
     let mut app = editor_test_app();
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
     let float_view = ViewId::new(2);
     let survivor = ViewId::new(1);
 
@@ -14674,25 +15048,31 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
     // route are observable, rather than treating a session-less tile as a
     // survivor.
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, "/bin/sh", &["-c", "exec sleep 30"], 80, 24, None)
         .expect("spawn survivor shell");
 
     // The float owns an interactive shell. The test sends the exact bytes a
     // user types through Runtime's focused input router below.
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float_view, "/bin/sh", &[], 80, 24, None)
         .expect("spawn float shell");
-    assert!(app.runtime.has_pane_session(&float_view));
+    assert!(app.runtime.borrow().has_pane_session(&float_view));
 
     // Detach pane 2 into a float, then focus it (user clicks the float).
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
         .expect("detach to float");
-    assert!(app.runtime.floated_views().contains(&float_view));
-    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    assert!(app.runtime.borrow().floated_views().contains(&float_view));
+    assert!(
+        app.runtime.borrow_mut().set_focus(float_view),
+        "float must be focusable"
+    );
 
     assert!(
-        app.runtime.push_input_bytes(b"exit\r"),
+        app.runtime.borrow_mut().push_input_bytes(b"exit\r"),
         "typed exit must reach the focused floating shell"
     );
 
@@ -14715,15 +15095,15 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
         "exiting float must dismiss the panel, never the app (and never hang)"
     );
     assert!(
-        !app.runtime.floated_views().contains(&float_view),
+        !app.runtime.borrow().floated_views().contains(&float_view),
         "dead float must be discarded"
     );
     assert!(
-        !app.runtime.has_pane_session(&float_view),
+        !app.runtime.borrow().has_pane_session(&float_view),
         "float session must be dropped"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(survivor),
         "focus must return to the surviving tile"
     );
@@ -14733,17 +15113,19 @@ fn reap_exited_focused_float_dismisses_without_freeze_issue_2169() {
     // the survivor instead of a dead float.
     let _ = app.drive_tick();
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
     assert!(
-        app.runtime.has_pane_session(&survivor),
+        app.runtime.borrow().has_pane_session(&survivor),
         "survivor shell must remain alive after float reap"
     );
     assert!(
-        app.runtime.push_input_bytes(b"echo survivor\r"),
+        app.runtime
+            .borrow_mut()
+            .push_input_bytes(b"echo survivor\r"),
         "survivor shell must remain the live input owner after float reap"
     );
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
 }
 
 #[cfg(unix)]
@@ -14776,17 +15158,21 @@ fn reap_exited_focused_pin_dismisses_without_freeze_issue_2169() {
     let script = write_fake_editor("exit-pin", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pin_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pin shell");
-    assert!(app.runtime.set_focus(pin_view));
+    assert!(app.runtime.borrow_mut().set_focus(pin_view));
     app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned);
-    assert!(app.runtime.pinned_views().contains(&pin_view));
-    assert!(app.runtime.set_focus(pin_view), "pin must be focusable");
+    assert!(app.runtime.borrow().pinned_views().contains(&pin_view));
+    assert!(
+        app.runtime.borrow_mut().set_focus(pin_view),
+        "pin must be focusable"
+    );
     let outcome = reap_until_change_2169(&mut app, 10);
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert!(!app.runtime.pinned_views().contains(&pin_view));
-    assert!(!app.runtime.has_pane_session(&pin_view));
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert!(!app.runtime.borrow().pinned_views().contains(&pin_view));
+    assert!(!app.runtime.borrow().has_pane_session(&pin_view));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
     let _ = app.drive_tick();
     let _ = std::fs::remove_file(&script);
 }
@@ -14803,21 +15189,32 @@ fn reap_exited_focused_float_dismisses_while_zoomed_issue_2169() {
     let script = write_fake_editor("exit-zoomfloat", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
         .expect("detach to float");
-    assert!(app.runtime.set_focus(survivor));
+    assert!(app.runtime.borrow_mut().set_focus(survivor));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
-    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    assert!(
+        app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+        "zoom engaged"
+    );
+    assert!(
+        app.runtime.borrow_mut().set_focus(float_view),
+        "float must be focusable"
+    );
     let outcome = reap_until_change_2169(&mut app, 10);
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert!(!app.runtime.floated_views().contains(&float_view));
+    assert!(!app.runtime.borrow().floated_views().contains(&float_view));
     let _ = app.drive_tick();
     let _ = app.drive_tick();
-    assert!(app.runtime.focused_view().is_some(), "focus must be live");
+    assert!(
+        app.runtime.borrow().focused_view().is_some(),
+        "focus must be live"
+    );
     let _ = std::fs::remove_file(&script);
 }
 
@@ -14839,19 +15236,24 @@ fn reap_exited_inactive_workspace_float_discards_without_freeze_issue_2169() {
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     let float_view = ViewId::new(2);
     let survivor = ViewId::new(1);
     let script = write_fake_editor("exit-inactive", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
         .expect("detach to float");
-    app.runtime.workspace_new().expect("second workspace opens");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
     let outcome = reap_until_change_2169(&mut app, 10);
     assert_eq!(
         outcome,
@@ -14859,14 +15261,14 @@ fn reap_exited_inactive_workspace_float_discards_without_freeze_issue_2169() {
         "inactive-workspace float exit must close the pane (no hang, no app exit)"
     );
     assert!(
-        !app.runtime.has_pane_session(&float_view),
+        !app.runtime.borrow().has_pane_session(&float_view),
         "parked float session must be torn down"
     );
     // Switching back must show the survivor only: no session-less ghost.
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
     assert!(
-        !app.runtime.floated_views().contains(&float_view),
+        !app.runtime.borrow().floated_views().contains(&float_view),
         "parked float must be discarded from its home slot"
     );
     let _ = app.drive_tick();
@@ -14889,39 +15291,51 @@ fn reap_exited_primary_owner_float_dismisses_while_zoomed_issue_2169() {
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     let float_view = ViewId::new(1);
     let survivor = ViewId::new(2);
     let pane_script = write_fake_editor("keep-pane", "#!/bin/sh\nsleep 30\n");
     let pane_arg = pane_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, pane_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
     let prim_script = write_fake_editor("exit-prim", "#!/bin/sh\nexit 0\n");
     let prim_arg = prim_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(prim_arg.as_str())
         .expect("spawn primary shell");
     // Detach the primary FIRST (zoom collapses the tree to a proxy, and a
     // leaf living only in the zoom backup is not detachable).
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
         .expect("detach primary to float");
-    assert!(app.runtime.set_focus(survivor));
+    assert!(app.runtime.borrow_mut().set_focus(survivor));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    assert!(app.chrome.zoom.is_zoomed(&app.runtime), "zoom engaged");
-    assert!(app.runtime.set_focus(float_view), "float must be focusable");
+    assert!(
+        app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+        "zoom engaged"
+    );
+    assert!(
+        app.runtime.borrow_mut().set_focus(float_view),
+        "float must be focusable"
+    );
     let outcome = reap_until_change_2169(&mut app, 10);
     assert_eq!(
         outcome,
         terminal_app::ShellExitOutcome::PaneClosed,
         "primary-owner float exit must dismiss, never hang or exit the app"
     );
-    assert!(!app.runtime.floated_views().contains(&float_view));
+    assert!(!app.runtime.borrow().floated_views().contains(&float_view));
     let _ = app.drive_tick();
     let _ = app.drive_tick();
-    assert!(app.runtime.focused_view().is_some(), "focus must be live");
-    app.runtime.close_pane_session(&survivor);
+    assert!(
+        app.runtime.borrow().focused_view().is_some(),
+        "focus must be live"
+    );
+    app.runtime.borrow_mut().close_pane_session(&survivor);
     let _ = std::fs::remove_file(&pane_script);
     let _ = std::fs::remove_file(&prim_script);
 }
@@ -14936,22 +15350,24 @@ fn reap_exited_float_after_refocus_keeps_survivor_focus_issue_2169() {
     // responsive: ticks present and input still routes to the survivor.
     require_pty!();
     let mut app = editor_test_app();
-    assert_eq!(app.runtime.leaf_count(), 2);
+    assert_eq!(app.runtime.borrow().leaf_count(), 2);
     let float_view = ViewId::new(2);
     let survivor = ViewId::new(1);
 
     let script = write_fake_editor("exit-float-race", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float_view, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn float shell");
-    assert!(app.runtime.has_pane_session(&float_view));
+    assert!(app.runtime.borrow().has_pane_session(&float_view));
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float_view))
         .expect("detach to float");
-    assert!(app.runtime.floated_views().contains(&float_view));
+    assert!(app.runtime.borrow().floated_views().contains(&float_view));
     // Focus leaves the dying float before the reap runs.
-    assert!(app.runtime.set_focus(survivor));
+    assert!(app.runtime.borrow_mut().set_focus(survivor));
     let outcome = reap_until_change_2169(&mut app, 10);
     assert_eq!(
         outcome,
@@ -14959,21 +15375,21 @@ fn reap_exited_float_after_refocus_keeps_survivor_focus_issue_2169() {
         "float exit with focus elsewhere must still dismiss the pane"
     );
     assert!(
-        !app.runtime.floated_views().contains(&float_view),
+        !app.runtime.borrow().floated_views().contains(&float_view),
         "dead float must be discarded"
     );
     assert!(
-        !app.runtime.has_pane_session(&float_view),
+        !app.runtime.borrow().has_pane_session(&float_view),
         "float session must be dropped"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(survivor),
         "survivor keeps focus, never cleared"
     );
     let _ = app.drive_tick();
     let _ = app.drive_tick();
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
     let _ = std::fs::remove_file(&script);
 }
 
@@ -14991,12 +15407,13 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
     let script = write_fake_editor("exit-zoomed-bg", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exiting, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
-    assert!(app.runtime.set_focus(ViewId::new(1)));
+    assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
     assert_eq!(
-        app.runtime.leaf_count(),
+        app.runtime.borrow().leaf_count(),
         1,
         "zoom collapses the live layout to a proxy"
     );
@@ -15019,12 +15436,12 @@ fn reap_exited_shell_while_zoomed_releases_backup_leaf_issue_2167() {
     // The dead leaf must be gone from the real tree (session torn down),
     // never parked in the zoom backup to ghost on unzoom.
     assert!(
-        !app.runtime.has_pane_session(&exiting),
+        !app.runtime.borrow().has_pane_session(&exiting),
         "exited backup leaf must be fully torn down"
     );
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
     assert!(
-        !app.runtime.layout().leaf_ids().contains(&exiting),
+        !app.runtime.borrow().layout().leaf_ids().contains(&exiting),
         "unzoom must not resurrect the dead leaf"
     );
     let _ = std::fs::remove_file(&script);
@@ -15043,6 +15460,7 @@ fn reap_exited_zoomed_alt_screen_pane_in_inactive_workspace_restores_tree_2527()
     let survivor_script = write_fake_editor("sleep-alt-survivor-2527", "#!/bin/sh\nsleep 10\n");
     let survivor_arg = survivor_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
         .expect("spawn survivor");
     let alt_script = write_fake_editor(
@@ -15051,14 +15469,18 @@ fn reap_exited_zoomed_alt_screen_pane_in_inactive_workspace_restores_tree_2527()
     );
     let alt_arg = alt_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exiting, alt_arg.as_str(), &[], 80, 24, None)
         .expect("spawn alt-screen pane");
-    assert!(app.runtime.set_focus(exiting));
+    assert!(app.runtime.borrow_mut().set_focus(exiting));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    app.runtime.workspace_new().expect("second workspace");
-    assert!(app.runtime.workspace_switch(0));
-    assert!(app.runtime.push_input_bytes(b"leave-alt\r"));
-    assert!(app.runtime.workspace_switch(1));
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace");
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert!(app.runtime.borrow_mut().push_input_bytes(b"leave-alt\r"));
+    assert!(app.runtime.borrow_mut().workspace_switch(1));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -15071,13 +15493,17 @@ fn reap_exited_zoomed_alt_screen_pane_in_inactive_workspace_restores_tree_2527()
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
-    assert!(app.runtime.has_pane_session(&survivor));
-    assert!(!app.runtime.has_pane_session(&exiting));
-    assert!(app.runtime.push_input_bytes(b"echo alt-survivor\r"));
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
+    assert!(app.runtime.borrow().has_pane_session(&survivor));
+    assert!(!app.runtime.borrow().has_pane_session(&exiting));
+    assert!(
+        app.runtime
+            .borrow_mut()
+            .push_input_bytes(b"echo alt-survivor\r")
+    );
     let _ = app.drive_tick();
-    app.runtime.close_pane_session(&survivor);
+    app.runtime.borrow_mut().close_pane_session(&survivor);
     let _ = std::fs::remove_file(&survivor_script);
     let _ = std::fs::remove_file(&alt_script);
 }
@@ -15102,17 +15528,27 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
     let hidden_script = write_fake_editor("sleep-hidden-2531", "#!/bin/sh\nsleep 10\n");
     let hidden_arg = hidden_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(hidden, hidden_arg.as_str(), &[], 80, 24, None)
         .expect("spawn hidden live pane");
     let exit_script = write_fake_editor("exit-zoomed-2525", "#!/bin/sh\nexit 0\n");
     let exit_arg = exit_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
         .expect("spawn exiting zoomed pane");
-    assert!(app.runtime.set_focus(exiting));
+    assert!(app.runtime.borrow_mut().set_focus(exiting));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    assert_eq!(app.runtime.leaf_count(), 1, "zoomed proxy is one leaf");
-    let seq = app.runtime.workspace_seq_at(0).expect("workspace seq");
+    assert_eq!(
+        app.runtime.borrow().leaf_count(),
+        1,
+        "zoomed proxy is one leaf"
+    );
+    let seq = app
+        .runtime
+        .borrow()
+        .workspace_seq_at(0)
+        .expect("workspace seq");
     assert_eq!(
         app.chrome.zoom.backup_leaf_ids_for_seq(seq),
         Some(vec![hidden, exiting]),
@@ -15121,8 +15557,11 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
 
     // Switch to a second workspace; the zoom entry (and its backup) survives
     // the stash, so ws1 is now an inactive zoomed workspace.
-    app.runtime.workspace_new().expect("second workspace opens");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
     assert_eq!(
         app.workspace_real_panel_count(0),
         Some(2),
@@ -15145,21 +15584,21 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
         "the zoomed exit is a pane close"
     );
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         2,
         "the workspace still owns a hidden live pane"
     );
     assert_eq!(
-        app.runtime.active_workspace_index(),
+        app.runtime.borrow().active_workspace_index(),
         1,
         "the active workspace is unchanged"
     );
     assert!(
-        app.runtime.has_pane_session(&hidden),
+        app.runtime.borrow().has_pane_session(&hidden),
         "the hidden live pane survives"
     );
     assert!(
-        !app.runtime.has_pane_session(&exiting),
+        !app.runtime.borrow().has_pane_session(&exiting),
         "the exited zoomed pane is torn down"
     );
     assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
@@ -15168,20 +15607,21 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
     // workspace after reap, not only its app-side backup bookkeeping. The
     // dead proxy must not come back as a focused, session-less tile, and the
     // primary owner must remain reachable and typable.
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![hidden]);
-    assert_eq!(app.runtime.workspace_panel_count(0), Some(1));
-    assert_eq!(app.runtime.pane_session_count(), 1);
-    assert_eq!(app.runtime.primary_view(), Some(ViewId::new(1)));
-    assert_eq!(app.runtime.focused_view(), Some(hidden));
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![hidden]);
+    assert_eq!(app.runtime.borrow().workspace_panel_count(0), Some(1));
+    assert_eq!(app.runtime.borrow().pane_session_count(), 1);
+    assert_eq!(app.runtime.borrow().primary_view(), Some(ViewId::new(1)));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(hidden));
     assert!(
         app.runtime
+            .borrow_mut()
             .push_input_bytes(b"echo inactive-zoom-survivor\r")
     );
     let _ = app.drive_tick();
 
-    app.runtime.close_pane_session(&hidden);
+    app.runtime.borrow_mut().close_pane_session(&hidden);
     let _ = std::fs::remove_file(&hidden_script);
     let _ = std::fs::remove_file(&exit_script);
 }
@@ -15201,25 +15641,34 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
     let survivor_script = write_fake_editor("sleep-zoom-survivor-1460", "#!/bin/sh\nsleep 10\n");
     let survivor_arg = survivor_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
         .expect("spawn zoom survivor");
     let exit_script = write_fake_editor("exit-hidden-zoom-1460", "#!/bin/sh\nexit 0\n");
     let exit_arg = exit_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
         .expect("spawn hidden exiting pane");
 
-    assert!(app.runtime.set_focus(survivor));
+    assert!(app.runtime.borrow_mut().set_focus(survivor));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
-    assert_eq!(app.runtime.leaf_count(), 1);
+    let seq = app
+        .runtime
+        .borrow()
+        .workspace_seq_at(0)
+        .expect("workspace sequence");
+    assert_eq!(app.runtime.borrow().leaf_count(), 1);
     assert_eq!(
         app.chrome.zoom.backup_leaf_ids_for_seq(seq),
         Some(vec![survivor, exiting])
     );
 
-    app.runtime.workspace_new().expect("second workspace");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace");
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -15233,21 +15682,25 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
     }
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    assert!(app.runtime.has_pane_session(&survivor));
-    assert!(!app.runtime.has_pane_session(&exiting));
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+    assert!(app.runtime.borrow().has_pane_session(&survivor));
+    assert!(!app.runtime.borrow().has_pane_session(&exiting));
     assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
 
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![survivor]);
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
-    assert_eq!(app.runtime.primary_view(), Some(survivor));
-    assert!(app.runtime.has_pane_session(&survivor));
-    assert!(app.runtime.push_input_bytes(b"echo hidden-zoom-survivor\r"));
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
+    assert_eq!(app.runtime.borrow().primary_view(), Some(survivor));
+    assert!(app.runtime.borrow().has_pane_session(&survivor));
+    assert!(
+        app.runtime
+            .borrow_mut()
+            .push_input_bytes(b"echo hidden-zoom-survivor\r")
+    );
     let _ = app.drive_tick();
 
-    app.runtime.close_pane_session(&survivor);
+    app.runtime.borrow_mut().close_pane_session(&survivor);
     let _ = std::fs::remove_file(&survivor_script);
     let _ = std::fs::remove_file(&exit_script);
 }
@@ -15269,6 +15722,7 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
         write_fake_editor("sleep-primary-zoom-survivor-1460", "#!/bin/sh\nsleep 10\n");
     let survivor_arg = survivor_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
         .expect("spawn survivor");
     let primary_script = write_fake_editor(
@@ -15277,12 +15731,17 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
     );
     let primary_arg = primary_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_with_args("/bin/sh", &["-c", primary_arg.as_str()])
         .expect("spawn primary");
-    assert_eq!(app.runtime.primary_view(), Some(primary));
-    assert!(app.runtime.set_focus(primary));
+    assert_eq!(app.runtime.borrow().primary_view(), Some(primary));
+    assert!(app.runtime.borrow_mut().set_focus(primary));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
-    let seq = app.runtime.workspace_seq_at(0).expect("workspace sequence");
+    let seq = app
+        .runtime
+        .borrow()
+        .workspace_seq_at(0)
+        .expect("workspace sequence");
     assert_eq!(
         app.chrome.zoom.backup_leaf_ids_for_seq(seq),
         Some(vec![primary, survivor])
@@ -15290,9 +15749,12 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
 
     // Deliver exit to the zoom proxy, then leave the workspace inactive
     // before the reap pass runs.
-    assert!(app.runtime.push_input_bytes(b"exit-primary\r"));
-    app.runtime.workspace_new().expect("second workspace");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert!(app.runtime.borrow_mut().push_input_bytes(b"exit-primary\r"));
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace");
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -15307,40 +15769,41 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         2,
         "the inactive workspace keeps its live survivor"
     );
-    assert_eq!(app.runtime.active_workspace_index(), 1);
-    assert!(!app.runtime.has_pane_session(&primary));
-    assert!(app.runtime.has_pane_session(&survivor));
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
+    assert!(!app.runtime.borrow().has_pane_session(&primary));
+    assert!(app.runtime.borrow().has_pane_session(&survivor));
     assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
 
     // The restored stash must no longer carry the dead primary leaf.
-    assert!(app.runtime.workspace_switch(0));
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         vec![survivor],
         "the dead primary leaf must be gone from the restored stashed layout"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(survivor),
         "the survivor keeps focus after the primary owner is reaped"
     );
     assert_ne!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(primary),
         "primary ownership must not stay on the reaped primary"
     );
-    assert!(app.runtime.has_pane_session(&survivor));
+    assert!(app.runtime.borrow().has_pane_session(&survivor));
     assert!(
         app.runtime
+            .borrow_mut()
             .push_input_bytes(b"echo primary-owner-survivor\r")
     );
     let _ = app.drive_tick();
 
-    app.runtime.close_pane_session(&survivor);
+    app.runtime.borrow_mut().close_pane_session(&survivor);
     let _ = std::fs::remove_file(&survivor_script);
     let _ = std::fs::remove_file(&primary_script);
 }
@@ -15362,21 +15825,26 @@ fn reap_exited_pane_in_inactive_workspace_prunes_emptied_workspace() {
         maps,
         SpawnSpec::default(),
     );
-    let exiting = app.runtime.focused_view().expect("ws1 leaf");
+    let exiting = app.runtime.borrow().focused_view().expect("ws1 leaf");
     let exit_script = write_fake_editor("exit-inactive-2525", "#!/bin/sh\nexit 0\n");
     let exit_arg = exit_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(exiting, exit_arg.as_str(), &[], 80, 24, None)
         .expect("spawn exiting background shell");
 
-    app.runtime.workspace_new().expect("second workspace opens");
-    let survivor = app.runtime.focused_view().expect("ws2 leaf");
+    app.runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace opens");
+    let survivor = app.runtime.borrow().focused_view().expect("ws2 leaf");
     let survivor_script = write_fake_editor("sleep-survivor-ws2", "#!/bin/sh\nsleep 10\n");
     let survivor_arg = survivor_script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(survivor, survivor_arg.as_str(), &[], 80, 24, None)
         .expect("spawn active survivor shell");
-    assert_eq!(app.runtime.active_workspace_index(), 1);
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut outcome = terminal_app::ShellExitOutcome::NoExit;
@@ -15391,19 +15859,19 @@ fn reap_exited_pane_in_inactive_workspace_prunes_emptied_workspace() {
 
     assert_eq!(outcome, terminal_app::ShellExitOutcome::PaneClosed);
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         1,
         "the emptied background workspace is pruned"
     );
-    assert_eq!(app.runtime.active_workspace_index(), 0);
-    assert_eq!(app.runtime.focused_view(), Some(survivor));
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(survivor));
     assert!(
-        app.runtime.has_pane_session(&survivor),
+        app.runtime.borrow().has_pane_session(&survivor),
         "the active workspace's live pane survives"
     );
-    assert!(!app.runtime.has_pane_session(&exiting));
+    assert!(!app.runtime.borrow().has_pane_session(&exiting));
 
-    app.runtime.close_pane_session(&survivor);
+    app.runtime.borrow_mut().close_pane_session(&survivor);
     let _ = std::fs::remove_file(&exit_script);
     let _ = std::fs::remove_file(&survivor_script);
 }
@@ -15416,14 +15884,19 @@ fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert_eq!(app.runtime.floated_views(), vec![float]);
-    assert!(app.runtime.set_focus(host), "host must hold focus");
-    assert_eq!(app.runtime.focused_view(), Some(host));
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
+    assert!(
+        app.runtime.borrow_mut().set_focus(host),
+        "host must hold focus"
+    );
+    assert_eq!(app.runtime.borrow().focused_view(), Some(host));
 
     // Present once so the headless surface holds the pre-close frame; the
     // host content origin is the exact cell that used to paint the ghost
@@ -15431,11 +15904,12 @@ fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {
     let _ = app.drive_tick();
     let host_frame = app
         .runtime
+        .borrow()
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == host)
         .expect("host frame before close");
-    let pad = usize::try_from(app.runtime.window_padding_physical()).expect("pad fits");
+    let pad = usize::try_from(app.runtime.borrow().window_padding_physical()).expect("pad fits");
     let origin_x = usize::try_from(host_frame.content.x).expect("x fits") + pad;
     let origin_y = usize::try_from(host_frame.content.y).expect("y fits") + pad;
 
@@ -15445,37 +15919,42 @@ fn close_host_with_detached_float_leaves_no_ghost_or_dead_input_issue_2221() {
     );
 
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "the closed host leaf must be removed, never left session-less"
     );
-    assert_eq!(app.runtime.floated_views(), vec![float]);
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(float),
         "focus must follow the surviving float"
     );
     assert_ne!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(host),
         "primary ownership must not point at the closed leaf"
     );
     assert!(
-        app.runtime.push_input_bytes(b"probe"),
+        app.runtime.borrow_mut().push_input_bytes(b"probe"),
         "input must route to the surviving float shell"
     );
 
     let _ = app.drive_tick();
     assert!(
         app.runtime
+            .borrow()
             .present_frames()
             .iter()
             .all(|frame| frame.view != host),
         "no frame may remain for the closed host view"
     );
-    let rgba = app.runtime.headless_rgba().expect("headless frame");
-    let width =
-        usize::try_from(app.runtime.config().window_extent().width()).expect("width fits usize");
+    let rgba = app
+        .runtime
+        .borrow()
+        .headless_rgba()
+        .expect("headless frame");
+    let width = usize::try_from(app.runtime.borrow().config().window_extent().width())
+        .expect("width fits usize");
     let bg = bitty_render::grid::DEFAULT_BG;
     assert_eq!(
         probe_rgba(&rgba, width, origin_x, origin_y),
@@ -15506,34 +15985,37 @@ fn close_last_tiled_pane_tears_down_the_session_it_painted_issue_2389() {
     let survivor = ViewId::new(3);
 
     app.runtime
+        .borrow_mut()
         .spawn_shell_with_args("/bin/sh", &[])
         .expect("primary shell spawns");
     let pane_frame = app
         .runtime
+        .borrow()
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == pane)
         .expect("pane frame");
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view(pane, "/bin/sh", &[], pane_frame.cols, pane_frame.rows)
         .expect("pane shell spawns");
 
     // Close the primary owner: the only survivor owns a pane session, so the
     // documented re-home lands `primary_view` on a leaf that paints its own
     // grid (WS-INV-8) instead of the primary one.
-    assert!(app.runtime.set_focus(owner));
+    assert!(app.runtime.borrow_mut().set_focus(owner));
     assert!(
         !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "closing the primary owner with a live sibling is a pane close"
     );
     assert_eq!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(pane),
         "an explicit owner close re-homes the primary id to the survivor"
     );
-    assert!(app.runtime.has_pane_session(&pane));
+    assert!(app.runtime.borrow().has_pane_session(&pane));
     assert!(
-        !app.runtime.paints_primary_grid(&pane),
+        !app.runtime.borrow().paints_primary_grid(&pane),
         "the survivor paints its pane session, not the re-homed primary grid"
     );
 
@@ -15545,14 +16027,16 @@ fn close_last_tiled_pane_tears_down_the_session_it_painted_issue_2389() {
         bitty_runtime::LayoutNode::leaf(bitty_runtime::View::new(pane, 80, 24)),
         bitty_runtime::LayoutNode::leaf(bitty_runtime::View::new(survivor, 80, 24)),
     );
-    app.runtime.set_layout(trimmed);
+    app.runtime.borrow_mut().set_layout(trimmed);
     let survivor_frame = app
         .runtime
+        .borrow()
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == survivor)
         .expect("survivor frame");
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view(
             survivor,
             "/bin/sh",
@@ -15562,38 +16046,40 @@ fn close_last_tiled_pane_tears_down_the_session_it_painted_issue_2389() {
         )
         .expect("survivor shell spawns");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(survivor))
         .expect("survivor detaches as a float");
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![pane]);
-    assert_eq!(app.runtime.floated_views(), vec![survivor]);
-    assert_eq!(app.runtime.primary_view(), Some(pane));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![pane]);
+    assert_eq!(app.runtime.borrow().floated_views(), vec![survivor]);
+    assert_eq!(app.runtime.borrow().primary_view(), Some(pane));
 
-    assert!(app.runtime.set_focus(pane));
+    assert!(app.runtime.borrow_mut().set_focus(pane));
     assert!(
         !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "the last tiled panel with a surviving float is a pane close"
     );
 
     assert!(
-        !app.runtime.has_pane_session(&pane),
+        !app.runtime.borrow().has_pane_session(&pane),
         "closing a leaf must tear down the session that leaf painted (WS-INV-9)"
     );
     assert!(
-        app.runtime.has_pane_session(&survivor),
+        app.runtime.borrow().has_pane_session(&survivor),
         "the surviving float keeps its own shell"
     );
     assert!(
-        app.runtime.has_pty(),
+        app.runtime.borrow().has_pty(),
         "a pane close must never tear down the hidden primary shell it did not paint"
     );
     let orphans: Vec<ViewId> = app
         .runtime
+        .borrow()
         .pane_view_ids()
         .into_iter()
         .filter(|view| {
-            !app.runtime.layout().leaf_ids().contains(view)
-                && !app.runtime.floated_views().contains(view)
-                && !app.runtime.pinned_views().contains(view)
+            !app.runtime.borrow().layout().leaf_ids().contains(view)
+                && !app.runtime.borrow().floated_views().contains(view)
+                && !app.runtime.borrow().pinned_views().contains(view)
         })
         .collect();
     assert!(
@@ -15612,17 +16098,18 @@ fn close_last_live_float_requests_window_close_not_dead_view_issue_2221() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert_eq!(app.runtime.floated_views(), vec![float]);
-    assert!(app.runtime.set_focus(host));
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
+    assert!(app.runtime.borrow_mut().set_focus(host));
 
     assert!(
         !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "host teardown with a surviving float is a pane close"
     );
-    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
-    assert_eq!(app.runtime.focused_view(), Some(float));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.borrow().focused_view(), Some(float));
 
     // No PTY and no primary shell: `close_confirm = when_busy` proceeds.
     assert!(
@@ -15630,14 +16117,16 @@ fn close_last_live_float_requests_window_close_not_dead_view_issue_2221() {
         "closing the last live view must request window close, never fall through"
     );
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "no session-less replacement leaf may be created"
     );
     assert!(
-        !app.runtime
-            .primary_view()
-            .is_some_and(|view| !app.runtime.floated_views().contains(&view)),
+        !app.runtime.borrow().primary_view().is_some_and(|view| !app
+            .runtime
+            .borrow()
+            .floated_views()
+            .contains(&view)),
         "primary ownership must never dangle on a non-live view"
     );
 }
@@ -15653,20 +16142,21 @@ fn close_last_float_prunes_emptied_workspace_issue_2221() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert!(app.runtime.set_focus(host));
+    assert!(app.runtime.borrow_mut().set_focus(host));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
-    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
-    assert_eq!(app.runtime.workspace_count(), 1);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.borrow().workspace_count(), 1);
 
     // A second workspace keeps a live panel, so the float-only workspace
     // is prunable rather than the whole window's last view.
     app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert!(app.runtime.workspace_switch(0));
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
     assert!(
-        app.runtime.set_focus(float),
+        app.runtime.borrow_mut().set_focus(float),
         "the float must be focusable after the switch back"
     );
 
@@ -15675,17 +16165,18 @@ fn close_last_float_prunes_emptied_workspace_issue_2221() {
         "closing the emptied workspace's last float is a pane close"
     );
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         1,
         "the view-less workspace must be pruned, never stranded"
     );
-    assert!(app.runtime.floated_views().is_empty());
+    assert!(app.runtime.borrow().floated_views().is_empty());
     let focused = app
         .runtime
+        .borrow()
         .focused_view()
         .expect("focus must land on the surviving workspace's panel");
     assert!(
-        app.runtime.layout().leaf_ids().contains(&focused),
+        app.runtime.borrow().layout().leaf_ids().contains(&focused),
         "focus must be a live member of the surviving layout"
     );
 }
@@ -15703,20 +16194,25 @@ fn new_panel_over_empty_tiled_base_with_float_materializes_tile_issue_2223() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(host),
+        "host must hold focus"
+    );
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "precondition: the tiled base is empty"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(float),
         "precondition: the surviving float holds focus outside the layout"
     );
@@ -15726,7 +16222,7 @@ fn new_panel_over_empty_tiled_base_with_float_materializes_tile_issue_2223() {
         "new_panel over an empty base is a layout change, not a window close"
     );
 
-    let leaves = app.runtime.layout().leaf_ids();
+    let leaves = app.runtime.borrow().layout().leaf_ids();
     assert_eq!(
         leaves.len(),
         1,
@@ -15739,22 +16235,22 @@ fn new_panel_over_empty_tiled_base_with_float_materializes_tile_issue_2223() {
         "the float must stay detached, not become tiled"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(panel),
         "focus must follow the materialized panel"
     );
     assert_eq!(
-        app.runtime.floated_views(),
+        app.runtime.borrow().floated_views(),
         vec![float],
         "the surviving float keeps its detached place"
     );
     assert!(
-        app.runtime.has_pane_session(&panel),
+        app.runtime.borrow().has_pane_session(&panel),
         "the materialized panel must own its fresh shell"
     );
 
     let _ = app.drive_tick();
-    let frames = app.runtime.present_frames();
+    let frames = app.runtime.borrow().present_frames();
     assert!(
         frames.iter().any(|frame| frame.view == panel),
         "the materialized panel must present"
@@ -15778,14 +16274,14 @@ fn cwd_probe_app() -> TerminalApp {
         program_args: vec!["-c".to_string(), "pwd -P; exec sleep 30".to_string()],
         ..SpawnSpec::default()
     };
-    let mut app = TerminalApp::with_theme(
+    let app = TerminalApp::with_theme(
         rt,
         bitty_config::theme::DEFAULT_THEME_NAME,
         "default",
         maps,
         spec,
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app
 }
 
@@ -15799,6 +16295,7 @@ fn wait_for_pane_text_ctx1347(app: &mut TerminalApp, view: ViewId, needle: &str)
         let _ = app.drive_tick();
         let text = app
             .runtime
+            .borrow()
             .pane_snapshot(&view)
             .map(|snap| snap.cells.iter().map(|cell| cell.glyph).collect::<String>())
             .unwrap_or_default();
@@ -15824,6 +16321,7 @@ fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(
             float,
             "/bin/sh",
@@ -15834,28 +16332,33 @@ fn new_panel_over_empty_base_inherits_float_osc7_cwd_issue_2240() {
         )
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .handle_pane_bytes(float, b"\x1b]7;file:///tmp\x07");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(host),
+        "host must hold focus"
+    );
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
     assert!(
-        app.runtime.layout().leaf_ids().is_empty(),
+        app.runtime.borrow().layout().leaf_ids().is_empty(),
         "precondition: the tiled base is empty"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(float),
         "precondition: the surviving float holds focus outside the layout"
     );
 
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let leaves = app.runtime.layout().leaf_ids();
+    let leaves = app.runtime.borrow().layout().leaf_ids();
     assert_eq!(leaves.len(), 1, "new_panel must materialize a tiled base");
     let panel = leaves[0];
     assert!(
-        app.runtime.has_pane_session(&panel),
+        app.runtime.borrow().has_pane_session(&panel),
         "the materialized panel must own its fresh shell"
     );
     let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
@@ -15876,6 +16379,7 @@ fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
     let host = ViewId::new(1);
     let pin = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(
             pin,
             "/bin/sh",
@@ -15886,31 +16390,38 @@ fn new_panel_over_empty_base_inherits_pin_osc7_cwd_issue_2240() {
         )
         .expect("spawn pin shell");
     app.runtime
+        .borrow_mut()
         .handle_pane_bytes(pin, b"\x1b]7;file:///tmp\x07");
-    assert!(app.runtime.set_focus(pin), "pin source must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(pin),
+        "pin source must hold focus"
+    );
     app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned);
     assert!(
-        app.runtime.pinned_views().contains(&pin),
+        app.runtime.borrow().pinned_views().contains(&pin),
         "precondition: the survivor is pinned"
     );
-    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(host),
+        "host must hold focus"
+    );
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
     assert!(
-        app.runtime.layout().leaf_ids().is_empty(),
+        app.runtime.borrow().layout().leaf_ids().is_empty(),
         "precondition: the tiled base is empty"
     );
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(pin),
         "precondition: the surviving pin holds focus outside the layout"
     );
 
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let leaves = app.runtime.layout().leaf_ids();
+    let leaves = app.runtime.borrow().layout().leaf_ids();
     assert_eq!(leaves.len(), 1, "new_panel must materialize a tiled base");
     let panel = leaves[0];
     assert!(
-        app.runtime.has_pane_session(&panel),
+        app.runtime.borrow().has_pane_session(&panel),
         "the materialized panel must own its fresh shell"
     );
     let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
@@ -15966,6 +16477,7 @@ fn osc7_report_3020(dir: &std::path::Path) -> Vec<u8> {
 fn focus_source_pane_in_3020(app: &mut TerminalApp, dir: &std::path::Path) -> ViewId {
     let source = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(
             source,
             "/bin/sh",
@@ -15976,10 +16488,14 @@ fn focus_source_pane_in_3020(app: &mut TerminalApp, dir: &std::path::Path) -> Vi
         )
         .expect("spawn source pane shell");
     app.runtime
+        .borrow_mut()
         .handle_pane_bytes(source, &osc7_report_3020(dir));
-    assert!(app.runtime.set_focus(source), "source pane must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(source),
+        "source pane must hold focus"
+    );
     assert_eq!(
-        app.runtime.inherited_spawn_cwd(ViewId::new(3)),
+        app.runtime.borrow().inherited_spawn_cwd(ViewId::new(3)),
         Some(dir.to_path_buf()),
         "precondition: the focused pane's cwd is inheritable"
     );
@@ -16003,9 +16519,13 @@ fn new_panel_inherits_focused_pane_cwd_issue_3020() {
     focus_source_pane_in_3020(&mut app, &dir);
 
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let panel = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("fresh panel focus");
     assert!(
-        app.runtime.has_pane_session(&panel),
+        app.runtime.borrow().has_pane_session(&panel),
         "the fresh panel must own its shell"
     );
     let text = wait_for_pane_text_ctx1347(&mut app, panel, &marker);
@@ -16036,9 +16556,13 @@ fn new_split_inherits_focused_pane_cwd_issue_3020() {
             bitty_config::SplitDir::Right
         ))
     );
-    let split = app.runtime.focused_view().expect("fresh split focus");
+    let split = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("fresh split focus");
     assert!(
-        app.runtime.has_pane_session(&split),
+        app.runtime.borrow().has_pane_session(&split),
         "the fresh split must own its shell"
     );
     let text = wait_for_pane_text_ctx1347(&mut app, split, &marker);
@@ -16065,6 +16589,7 @@ fn new_panel_inherits_pinned_kernel_cwd_over_osc7_report_issue_3020() {
     let mut app = cwd_probe_app();
     let source = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(
             source,
             "/bin/sh",
@@ -16076,10 +16601,15 @@ fn new_panel_inherits_pinned_kernel_cwd_over_osc7_report_issue_3020() {
         .expect("spawn source pane shell");
     // The pane claims the filesystem root; the kernel says `dir`.
     app.runtime
+        .borrow_mut()
         .handle_pane_bytes(source, b"\x1b]7;file:///\x07");
-    assert!(app.runtime.set_focus(source), "source pane must hold focus");
+    assert!(
+        app.runtime.borrow_mut().set_focus(source),
+        "source pane must hold focus"
+    );
     assert_eq!(
         app.runtime
+            .borrow()
             .focused_pane_child_cwd()
             .map(|cwd| cwd.path().to_path_buf()),
         Some(dir.clone()),
@@ -16087,7 +16617,11 @@ fn new_panel_inherits_pinned_kernel_cwd_over_osc7_report_issue_3020() {
     );
 
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let panel = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("fresh panel focus");
     let text = wait_for_pane_text_ctx1347(&mut app, panel, &marker);
     assert!(
         text.contains(&marker),
@@ -16105,13 +16639,17 @@ fn new_panel_without_a_focused_cwd_falls_back_to_default_issue_3020() {
     require_pty!();
     let mut app = cwd_probe_app();
     assert!(
-        app.runtime.focused_pane_child_cwd().is_none(),
+        app.runtime.borrow().focused_pane_child_cwd().is_none(),
         "precondition: the focused leaf is session-less"
     );
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let panel = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("fresh panel focus");
     assert!(
-        app.runtime.has_pane_session(&panel),
+        app.runtime.borrow().has_pane_session(&panel),
         "a missing inherited cwd must not fail the spawn"
     );
     let default = default_spawn_cwd_3020();
@@ -16131,12 +16669,18 @@ fn new_panel_falls_back_to_focused_osc7_report_issue_3020() {
     require_pty!();
     let mut app = cwd_probe_app();
     assert!(
-        app.runtime.focused_pane_child_cwd().is_none(),
+        app.runtime.borrow().focused_pane_child_cwd().is_none(),
         "precondition: the focused leaf owns no PTY child"
     );
-    app.runtime.handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
+    app.runtime
+        .borrow_mut()
+        .handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::NewPanel));
-    let panel = app.runtime.focused_view().expect("fresh panel focus");
+    let panel = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("fresh panel focus");
     let text = wait_for_pane_text_ctx1347(&mut app, panel, "/tmp");
     assert!(
         text.contains("/tmp"),
@@ -16162,7 +16706,7 @@ fn close_float_on_empty_base_focuses_surviving_float_issue_2221() {
     let host = ViewId::new(1);
     let left = ViewId::new(2);
     let right = ViewId::new(3);
-    app.runtime.set_layout(LayoutNode::split(
+    app.runtime.borrow_mut().set_layout(LayoutNode::split(
         SplitAxis::Horizontal,
         0.5,
         LayoutNode::leaf(View::new(host, 80, 24)),
@@ -16175,18 +16719,20 @@ fn close_float_on_empty_base_focuses_surviving_float_issue_2221() {
     ));
     for view in [left, right] {
         app.runtime
+            .borrow_mut()
             .spawn_shell_for_view_in(view, "/bin/sh", &[], 80, 24, None)
             .expect("spawn float shell");
         app.runtime
+            .borrow_mut()
             .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(view))
             .expect("detach float");
     }
-    assert_eq!(app.runtime.floated_views(), vec![left, right]);
-    assert!(app.runtime.set_focus(host));
+    assert_eq!(app.runtime.borrow().floated_views(), vec![left, right]);
+    assert!(app.runtime.borrow_mut().set_focus(host));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
-    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(right),
         "the topmost surviving float must take focus after the base drains"
     );
@@ -16195,14 +16741,14 @@ fn close_float_on_empty_base_focuses_surviving_float_issue_2221() {
         !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "closing one of two floats is a pane close"
     );
-    assert_eq!(app.runtime.floated_views(), vec![left]);
+    assert_eq!(app.runtime.borrow().floated_views(), vec![left]);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(left),
         "focus must move to the remaining float, never clear"
     );
     assert!(
-        app.runtime.push_input_bytes(b"probe"),
+        app.runtime.borrow_mut().push_input_bytes(b"probe"),
         "input must route to the surviving float shell"
     );
 }
@@ -16217,25 +16763,27 @@ fn reap_exited_last_float_prunes_emptied_workspace_issue_2221() {
     let host = ViewId::new(1);
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(float, "/bin/sh", &[], 80, 24, None)
         .expect("spawn float shell");
     app.runtime
+        .borrow_mut()
         .apply_floating_command(bitty_runtime::FLOATING_CMD_TOGGLE, Some(float))
         .expect("detach float");
-    assert!(app.runtime.set_focus(host));
+    assert!(app.runtime.borrow_mut().set_focus(host));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
-    assert_eq!(app.runtime.layout().leaf_ids(), Vec::new());
-    assert_eq!(app.runtime.focused_view(), Some(float));
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), Vec::new());
+    assert_eq!(app.runtime.borrow().focused_view(), Some(float));
 
     // A second workspace keeps a live leaf, so the float exit is a pane
     // close (PaneClosed) instead of the whole-window close gesture.
     app.apply_chrome_action(bitty_config::ChromeAction::WorkspaceNew);
-    assert_eq!(app.runtime.workspace_count(), 2);
-    assert!(app.runtime.workspace_switch(0));
-    assert!(app.runtime.set_focus(float));
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert!(app.runtime.borrow_mut().set_focus(float));
 
     assert!(
-        app.runtime.push_input_bytes(b"exit\n"),
+        app.runtime.borrow_mut().push_input_bytes(b"exit\n"),
         "typed exit must reach the float shell"
     );
     let outcome = reap_until_change_2169(&mut app, 10);
@@ -16245,22 +16793,24 @@ fn reap_exited_last_float_prunes_emptied_workspace_issue_2221() {
         "float exit with another workspace live is a pane close"
     );
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         1,
         "the emptied float-only workspace must be pruned, never left blank"
     );
-    assert!(app.runtime.floated_views().is_empty());
+    assert!(app.runtime.borrow().floated_views().is_empty());
     let focused = app
         .runtime
+        .borrow()
         .focused_view()
         .expect("focus must land on the surviving workspace's panel");
     assert!(
-        app.runtime.layout().leaf_ids().contains(&focused),
+        app.runtime.borrow().layout().leaf_ids().contains(&focused),
         "focus must be a live member of the surviving layout, never a dead slot"
     );
     assert!(
-        app.runtime.primary_view().is_none_or(|view| app
+        app.runtime.borrow().primary_view().is_none_or(|view| app
             .runtime
+            .borrow()
             .layout()
             .leaf_ids()
             .contains(&view)),
@@ -16281,17 +16831,22 @@ fn close_host_with_pinned_panel_hands_focus_and_primary_to_pin_issue_2222() {
     let host = ViewId::new(1);
     let pinned = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
         .expect("spawn pinned shell");
-    assert!(app.runtime.set_focus(pinned));
+    assert!(app.runtime.borrow_mut().set_focus(pinned));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
-    assert!(app.runtime.set_focus(host), "host must hold focus");
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![host]);
+    assert!(
+        app.runtime.borrow_mut().set_focus(host),
+        "host must hold focus"
+    );
 
     let _ = app.drive_tick();
     let host_frame = app
         .runtime
+        .borrow()
         .present_frames()
         .into_iter()
         .find(|frame| frame.view == host)
@@ -16303,29 +16858,30 @@ fn close_host_with_pinned_panel_hands_focus_and_primary_to_pin_issue_2222() {
     );
 
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "the closed host leaf must be removed, never left session-less"
     );
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(pinned),
         "focus must follow the surviving pinned view"
     );
     assert_eq!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(pinned),
         "primary ownership must hand to the surviving pinned view"
     );
     assert!(
-        app.runtime.push_input_bytes(b"probe"),
+        app.runtime.borrow_mut().push_input_bytes(b"probe"),
         "input must route to the surviving pinned shell"
     );
 
     let _ = app.drive_tick();
     assert!(
         app.runtime
+            .borrow()
             .present_frames()
             .iter()
             .all(|frame| frame.view != host),
@@ -16345,17 +16901,19 @@ fn reap_exited_primary_with_pinned_survivor_hands_focus_and_primary_issue_2222()
     let host = ViewId::new(1);
     let pinned = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
         .expect("spawn pinned shell");
-    assert!(app.runtime.set_focus(pinned));
+    assert!(app.runtime.borrow_mut().set_focus(pinned));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
-    assert!(app.runtime.set_focus(host));
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![host]);
+    assert!(app.runtime.borrow_mut().set_focus(host));
 
     let script = write_fake_editor("exit-pinned-survivor", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell(script_arg.as_str())
         .expect("spawn primary shell");
 
@@ -16366,29 +16924,30 @@ fn reap_exited_primary_with_pinned_survivor_hands_focus_and_primary_issue_2222()
         "primary exit with a pinned survivor is a pane close"
     );
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "the exited host leaf must be removed, never left session-less"
     );
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(pinned),
         "focus must follow the surviving pinned view"
     );
     assert_eq!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(pinned),
         "primary ownership must hand to the surviving pinned view"
     );
     assert!(
-        app.runtime.push_input_bytes(b"probe"),
+        app.runtime.borrow_mut().push_input_bytes(b"probe"),
         "input must route to the surviving pinned shell"
     );
 
     let _ = app.drive_tick();
     assert!(
         app.runtime
+            .borrow()
             .present_frames()
             .iter()
             .all(|frame| frame.view != host),
@@ -16408,16 +16967,18 @@ fn reap_exited_last_tiled_pane_with_pinned_survivor_issue_2222() {
     let host = ViewId::new(1);
     let pinned = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(pinned, "/bin/sh", &[], 80, 24, None)
         .expect("spawn pinned shell");
-    assert!(app.runtime.set_focus(pinned));
+    assert!(app.runtime.borrow_mut().set_focus(pinned));
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::TogglePinned));
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![host]);
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![host]);
 
     let script = write_fake_editor("exit-pinned-pane", "#!/bin/sh\nexit 0\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(host, script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn tiled pane shell");
 
@@ -16428,23 +16989,23 @@ fn reap_exited_last_tiled_pane_with_pinned_survivor_issue_2222() {
         "tiled pane exit with a pinned survivor is a pane close"
     );
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "the exited tiled leaf must be removed, never left session-less"
     );
-    assert_eq!(app.runtime.pinned_views(), vec![pinned]);
+    assert_eq!(app.runtime.borrow().pinned_views(), vec![pinned]);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(pinned),
         "focus must follow the surviving pinned view"
     );
     assert_eq!(
-        app.runtime.primary_view(),
+        app.runtime.borrow().primary_view(),
         Some(pinned),
         "primary ownership must hand to the surviving pinned view"
     );
     assert!(
-        app.runtime.push_input_bytes(b"probe"),
+        app.runtime.borrow_mut().push_input_bytes(b"probe"),
         "input must route to the surviving pinned shell"
     );
 
@@ -16636,7 +17197,7 @@ fn live_reload_keymap_change_alone_cancels_an_armed_leader() {
     assert!(adoption.hints_enabled, "hints unchanged");
     app.adopt_live_config(adoption);
     assert_eq!(app.chrome.leader_state, bitty_config::LeaderState::Idle);
-    assert!(!app.runtime.cw_hint_is_armed());
+    assert!(!app.runtime.borrow().cw_hint_is_armed());
 }
 
 #[test]
@@ -16896,7 +17457,7 @@ claims = []
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app = app.with_plugin_runtime(Some(plugin_runtime));
     assert!(app.overlay_capture_active());
 
@@ -16909,6 +17470,7 @@ claims = []
     let paint = format!(
         "{:?}",
         app.runtime
+            .borrow()
             .plugin_overlay()
             .expect("surface follows the capture owner")
             .root
@@ -16926,7 +17488,7 @@ claims = []
         "unbound typing must be captured while the session holds"
     );
     assert_eq!(queued_len(&app), 1);
-    assert_eq!(app.runtime.pending_input_len(), 0);
+    assert_eq!(app.runtime.borrow().pending_input_len(), 0);
     assert_eq!(
         store_value(&app, &pid, "callback_count"),
         None,
@@ -16955,7 +17517,7 @@ claims = []
         )))
     );
     assert_eq!(queued_len(&app), 3);
-    assert_eq!(app.runtime.pending_input_len(), 0);
+    assert_eq!(app.runtime.borrow().pending_input_len(), 0);
 
     // Pointer releases route to the Runtime (press-to-release ownership
     // never desyncs); only presses enter the capture queue (CodeRabbit PR
@@ -17034,7 +17596,7 @@ claims = []
     assert_eq!(queued_len(&app), 0, "cancel clears the queue");
     let _ = app.drive_tick();
     assert!(
-        app.runtime.plugin_overlay().is_none(),
+        app.runtime.borrow().plugin_overlay().is_none(),
         "cancel removes the surface on the next tick"
     );
 
@@ -17050,14 +17612,14 @@ claims = []
     )
     .expect_value("reacquire");
     assert!(app.overlay_capture_active());
-    let before = app.runtime.focused_view();
+    let before = app.runtime.borrow().focused_view();
     app.apply_chrome_action(bitty_config::ChromeAction::FocusNext);
     assert!(
         !app.overlay_capture_active(),
         "focus-switch must release the capture"
     );
     assert_ne!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         before,
         "focus must actually move on the two-pane layout"
     );
@@ -17145,7 +17707,7 @@ claims = []
         "the tick must revoke a capture past its deadline"
     );
     assert!(
-        app.runtime.plugin_overlay().is_none(),
+        app.runtime.borrow().plugin_overlay().is_none(),
         "timeout removes the surface on the same tick"
     );
 
@@ -17155,11 +17717,11 @@ claims = []
     assert!(!app.intercept_chrome_key(&WindowEventKind::KeyboardInput(key_y.clone())));
     assert!(!app.capture_fallthrough_input(&WindowEventKind::KeyboardInput(key_y.clone())));
     assert!(
-        app.runtime.handle_key_event(key_y).is_some(),
+        app.runtime.borrow_mut().handle_key_event(key_y).is_some(),
         "terminal encoding must still serve released input"
     );
     assert!(
-        app.runtime.pending_input_len() > 0,
+        app.runtime.borrow().pending_input_len() > 0,
         "released input must reach the PTY queue"
     );
 
@@ -17279,7 +17841,7 @@ events = []
         admission_seq: 0,
     });
     assert_eq!(
-        app.runtime.notification_banner().as_deref(),
+        app.runtime.borrow().notification_banner().as_deref(),
         Some("bitty-featured.ctx1033wire:report: result-visible-text"),
         "the dispatch result must surface on the banner"
     );
@@ -17288,17 +17850,17 @@ events = []
     // so the old implicit path would count one undelivered OS notification
     // here even without a display server.
     assert_eq!(
-        app.runtime.notifications_os_undelivered(),
+        app.runtime.borrow().notifications_os_undelivered(),
         0,
         "a dispatch result must never attempt an OS notification"
     );
-    assert_eq!(app.runtime.notifications_os_delivered(), 0);
+    assert_eq!(app.runtime.borrow().notifications_os_delivered(), 0);
 
     // Notify-drain half: the tick drains the queued notice into the bounded
     // queue behind the live banner (never blocking the frame).
     let _ = app.drive_tick();
     assert_eq!(
-        app.runtime.pending_notification_count(),
+        app.runtime.borrow().pending_notification_count(),
         1,
         "the drained notice must wait in the bounded queue"
     );
@@ -17306,7 +17868,7 @@ events = []
     // fail-closed default backend records exactly that one undelivered
     // attempt, proving the explicit path was not disabled with the fix.
     assert_eq!(
-        app.runtime.notifications_os_undelivered(),
+        app.runtime.borrow().notifications_os_undelivered(),
         1,
         "explicit notify.show must still attempt the OS hand-off"
     );
@@ -17317,18 +17879,18 @@ events = []
             .notifications_dropped(),
         0
     );
-    assert_eq!(app.runtime.plugin_notifications_dropped(), 0);
+    assert_eq!(app.runtime.borrow().plugin_notifications_dropped(), 0);
 
     // The queued notice rotates onto the banner once the first expires:
     // the full notify-then-present loop is closed.
     assert!(
-        app.runtime.advance_notification_banner_at(
+        app.runtime.borrow_mut().advance_notification_banner_at(
             std::time::Instant::now() + std::time::Duration::from_secs(5)
         ),
         "the queued notice must advance onto the banner"
     );
     assert_eq!(
-        app.runtime.notification_banner().as_deref(),
+        app.runtime.borrow().notification_banner().as_deref(),
         Some("Wire: notice-visible"),
         "the drained notice must paint"
     );
@@ -17442,12 +18004,12 @@ events = []
         admission_seq: 0,
     });
     assert_eq!(
-        app.runtime.notification_banner(),
+        app.runtime.borrow().notification_banner(),
         None,
         "a boolean acknowledgement must not paint a banner"
     );
     assert_eq!(
-        app.runtime.pending_notification_count(),
+        app.runtime.borrow().pending_notification_count(),
         0,
         "a boolean acknowledgement must not queue a notification"
     );
@@ -17564,7 +18126,7 @@ events = []
         admission_seq: 0,
     });
     assert_eq!(
-        app.runtime.notification_banner().as_deref(),
+        app.runtime.borrow().notification_banner().as_deref(),
         Some("bitty-featured.ctx1190wire:scroll: delta:3 step:2"),
         "the scroll dispatch result must surface declared args plus delta"
     );
@@ -17753,15 +18315,17 @@ fn trace_kinds_live_pty_session_records() {
     let script = write_fake_editor("exit1828", "#!/bin/sh\nexit 3\n");
     let script_arg = script.to_string_lossy().into_owned();
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view_in(ViewId::new(2), script_arg.as_str(), &[], 80, 24, None)
         .expect("spawn pane shell");
     let _ = app.drive_tick();
 
     // Pane-grid signals through the real parser path: OSC 7 cwd and BEL.
     app.runtime
+        .borrow_mut()
         .handle_pane_bytes(ViewId::new(2), b"\x1b]7;file:///tmp/trace1828\x07");
-    app.runtime.handle_pty_bytes(b"\x07");
-    app.runtime.select_all();
+    app.runtime.borrow_mut().handle_pty_bytes(b"\x07");
+    app.runtime.borrow_mut().select_all();
     let _ = app.drive_tick();
 
     // Bounded spin (no sleep) until the reap path observes the exit and
@@ -18193,26 +18757,30 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
         maps,
         SpawnSpec::default(),
     );
-    app.runtime.set_layout(two_pane_layout());
+    app.runtime.borrow_mut().set_layout(two_pane_layout());
     app.runtime
+        .borrow_mut()
         .set_session_backend(Some(std::sync::Arc::new(ScratchPathBackend {
             path: path.clone(),
             inner: crate::storage_backends::StorageSessionBackend::new(),
         })));
     app.runtime
+        .borrow_mut()
         .spawn_shell_with_args("/bin/sh", &[])
         .expect("primary shell spawns");
-    let primary = app.runtime.primary_view().expect("primary owner");
+    let primary = app.runtime.borrow().primary_view().expect("primary owner");
     let float = ViewId::new(2);
     app.runtime
+        .borrow_mut()
         .spawn_shell_for_view(float, "/bin/sh", &[], 40, 12)
         .expect("pane session spawns");
-    assert_eq!(app.runtime.pane_view_ids(), vec![float]);
-    assert!(app.runtime.set_focus(float));
+    assert_eq!(app.runtime.borrow().pane_view_ids(), vec![float]);
+    assert!(app.runtime.borrow_mut().set_focus(float));
 
     // Last good session: both tiled panes with live attachment, saved before
     // the close sequence through the same path the exit hook resolves.
     app.runtime
+        .borrow()
         .save_session_to_path(&path)
         .expect("baseline save works");
     let good = std::fs::read(&path).expect("baseline bytes");
@@ -18225,32 +18793,32 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
     // tiled host plus a detached float; closing the host empties the tiled
     // base and hands focus to the float.
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleFloating);
-    assert_eq!(app.runtime.floated_views(), vec![float]);
-    assert_eq!(app.runtime.layout().leaf_ids(), vec![primary]);
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
+    assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![primary]);
     assert_eq!(
-        app.runtime.pane_view_ids(),
+        app.runtime.borrow().pane_view_ids(),
         vec![float],
         "the detached float keeps its pane session"
     );
-    assert_eq!(app.runtime.focused_view(), Some(primary));
+    assert_eq!(app.runtime.borrow().focused_view(), Some(primary));
     assert!(
         !app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "closing the host with a surviving float is a pane close"
     );
     assert_eq!(
-        app.runtime.layout().leaf_ids(),
+        app.runtime.borrow().layout().leaf_ids(),
         Vec::new(),
         "the tiled base is empty after the close"
     );
-    assert_eq!(app.runtime.floated_views(), vec![float]);
-    assert_eq!(app.runtime.focused_view(), Some(float));
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(float));
     assert!(
-        !app.runtime.has_pty(),
+        !app.runtime.borrow().has_pty(),
         "the tiled host's primary shell is torn down"
     );
 
     // The exit save skips that unencodable state instead of failing.
-    let outcome = app.runtime.save_session_on_exit();
+    let outcome = app.runtime.borrow().save_session_on_exit();
     assert_eq!(
         outcome,
         SessionExitSaveOutcome::SkippedEmptyTiledBase,
@@ -18289,6 +18857,7 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
     // warning rather than a benign no-state-dir path.
     let direct = app
         .runtime
+        .borrow()
         .save_session_to_path(&path)
         .expect_err("the v3 codec cannot encode an empty tiled base");
     assert_eq!(
@@ -18308,13 +18877,13 @@ fn close_to_empty_window_skips_exit_save_and_keeps_last_good_session_issue_2415(
         app.apply_chrome_action(bitty_config::ChromeAction::CloseView),
         "the last live pane requests the window close"
     );
-    assert_eq!(app.runtime.floated_views(), vec![float]);
-    app.runtime.shutdown();
+    assert_eq!(app.runtime.borrow().floated_views(), vec![float]);
+    app.runtime.borrow_mut().shutdown();
     assert!(
-        app.runtime.pane_view_ids().is_empty(),
+        app.runtime.borrow().pane_view_ids().is_empty(),
         "shutdown tears down the surviving pane session"
     );
-    assert!(!app.runtime.has_pty());
+    assert!(!app.runtime.borrow().has_pty());
 
     // The classification is not a blanket silence: a real failure still
     // warns (the pre-existing pin-only refusal keeps its own diagnostic).
@@ -18441,43 +19010,48 @@ events = []
     let _ = app.drive_tick();
     let row = app
         .runtime
+        .borrow()
         .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
         .expect("top band row");
     assert!(
-        app.runtime.plugin_overlay().is_none(),
+        app.runtime.borrow().plugin_overlay().is_none(),
         "no tooltip before hover"
     );
 
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let over_clock = bitty_platform::CursorPosition {
         x: pad + 0.5 * f64::from(cw),
         y: pad + (f64::from(row) + 0.5) * f64::from(ch),
     };
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     assert_eq!(app.pump_cold_commands(), 1, "one hover enter dispatched");
     assert!(
         !app.overlay_capture_active(),
         "hover never takes keyboard capture"
     );
     let _ = app.drive_tick();
-    let surface = app
-        .runtime
-        .plugin_overlay()
-        .expect("hover tooltip surface is presented");
-    assert_eq!(surface.plugin_id, id);
-    match &surface.root {
-        bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
-        other => panic!("expected the tooltip text, got {other:?}"),
+    // CTX-1929: scope the borrow guard to the surface reads only.
+    {
+        let rt = app.runtime.borrow();
+        let surface = rt
+            .plugin_overlay()
+            .expect("hover tooltip surface is presented");
+        assert_eq!(surface.plugin_id, id);
+        match &surface.root {
+            bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
+            other => panic!("expected the tooltip text, got {other:?}"),
+        }
     }
     let anchor = app
         .runtime
+        .borrow()
         .plugin_overlay_anchor()
         .expect("tooltip anchored to the hovered region");
     assert_eq!(anchor.edge, bitty_runtime::BandEdge::Top);
     assert_eq!((anchor.start_col, anchor.end_col), (0, 5));
     assert_eq!(
-        app.runtime.notifications_os_delivered(),
+        app.runtime.borrow().notifications_os_delivered(),
         0,
         "hover never raises an OS notification"
     );
@@ -18487,14 +19061,14 @@ events = []
         x: pad + 0.5 * f64::from(cw),
         y: pad + 12.0 * f64::from(ch),
     };
-    app.runtime.handle_cursor_moved(away);
+    app.runtime.borrow_mut().handle_cursor_moved(away);
     assert_eq!(app.pump_cold_commands(), 1, "one hover leave dispatched");
     let _ = app.drive_tick();
     assert!(
-        app.runtime.plugin_overlay().is_none(),
+        app.runtime.borrow().plugin_overlay().is_none(),
         "leaving the region hides the tooltip"
     );
-    assert!(app.runtime.plugin_overlay_anchor().is_none());
+    assert!(app.runtime.borrow().plugin_overlay_anchor().is_none());
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
@@ -18625,20 +19199,21 @@ events = []
     let _ = app.drive_tick();
     let row = app
         .runtime
+        .borrow()
         .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
         .expect("top band row");
 
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let over_clock = bitty_platform::CursorPosition {
         x: pad + 0.5 * f64::from(cw),
         y: pad + (f64::from(row) + 0.5) * f64::from(ch),
     };
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     assert_eq!(app.pump_cold_commands(), 1, "hover enter dispatched");
     let _ = app.drive_tick();
-    assert!(app.runtime.plugin_overlay().is_some());
-    assert!(app.runtime.plugin_overlay_anchor().is_some());
+    assert!(app.runtime.borrow().plugin_overlay().is_some());
+    assert!(app.runtime.borrow().plugin_overlay_anchor().is_some());
 
     // The plugin acquires a focusable capture (e.g. an unrelated modal).
     app.plugin_runtime
@@ -18649,17 +19224,17 @@ events = []
     let _ = app.drive_tick();
     assert!(app.overlay_capture_active());
     assert!(
-        app.runtime.hovered_band_region().is_none(),
+        app.runtime.borrow().hovered_band_region().is_none(),
         "capture start clears hover ownership"
     );
     assert!(
-        app.runtime.plugin_overlay_anchor().is_none(),
+        app.runtime.borrow().plugin_overlay_anchor().is_none(),
         "no hover tooltip is anchored under the modal"
     );
 
     // Motion under the modal neither queues nor dispatches hover, even though
     // the pointer sits on the same region.
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     assert_eq!(app.pump_cold_commands(), 0, "hover is muted while captured");
 
     // Releasing the capture lets the single queued leave dispatch.
@@ -18671,8 +19246,8 @@ events = []
         1,
         "the capture-start leave dispatches after release"
     );
-    assert!(app.runtime.plugin_overlay().is_none());
-    assert!(app.runtime.plugin_overlay_anchor().is_none());
+    assert!(app.runtime.borrow().plugin_overlay().is_none());
+    assert!(app.runtime.borrow().plugin_overlay_anchor().is_none());
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
@@ -18795,10 +19370,11 @@ events = []
     let _ = app.drive_tick();
     let row = app
         .runtime
+        .borrow()
         .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
         .expect("top band row");
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let over_clock = bitty_platform::CursorPosition {
         x: pad + 0.5 * f64::from(cw),
         y: pad + (f64::from(row) + 0.5) * f64::from(ch),
@@ -18809,7 +19385,7 @@ events = []
     };
 
     // Leave the band, then bump its version without presenting.
-    app.runtime.handle_cursor_moved(away);
+    app.runtime.borrow_mut().handle_cursor_moved(away);
     let _ = app.pump_cold_commands();
     app.plugin_runtime
         .as_mut()
@@ -18820,6 +19396,7 @@ events = []
     // new version, but no frame has published it yet.
     let origin = app
         .runtime
+        .borrow()
         .published_band_origins()
         .first()
         .cloned()
@@ -18828,6 +19405,7 @@ events = []
     let bands = bitty_runtime::ChromeBands {
         top: app
             .runtime
+            .borrow()
             .chrome_bands()
             .top
             .iter()
@@ -18838,7 +19416,7 @@ events = []
             .collect(),
         ..Default::default()
     };
-    app.runtime.set_chrome_bands_with_mounts(
+    app.runtime.borrow_mut().set_chrome_bands_with_mounts(
         bands,
         vec![bitty_runtime::BandMount {
             plugin_id: origin.plugin_id.clone(),
@@ -18850,19 +19428,23 @@ events = []
     );
 
     // Enter while the live band is newer than the presented frame: deferred.
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     assert_eq!(
         app.pump_cold_commands(),
         0,
         "no enter is dispatched before the band is presented"
     );
-    assert!(app.runtime.hovered_band_region().is_none());
+    assert!(app.runtime.borrow().hovered_band_region().is_none());
 
     // The next frame publishes the new band; the cold phase re-derives the
     // enter and the plugin receives it.
-    app.runtime.tick().expect("present the updated band");
+    app.runtime
+        .borrow_mut()
+        .tick()
+        .expect("present the updated band");
     assert_eq!(
         app.runtime
+            .borrow()
             .published_band_origins()
             .first()
             .map(|origin| origin.version),
@@ -18880,21 +19462,24 @@ events = []
         "the delivered enter is not re-fired"
     );
     let _ = app.drive_tick();
-    let surface = app
-        .runtime
-        .plugin_overlay()
-        .expect("tooltip appears after the deferred enter");
-    match &surface.root {
-        bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
-        other => panic!("expected the tooltip text, got {other:?}"),
+    // CTX-1929: scope the borrow guard to the surface reads only.
+    {
+        let rt = app.runtime.borrow();
+        let surface = rt
+            .plugin_overlay()
+            .expect("tooltip appears after the deferred enter");
+        match &surface.root {
+            bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
+            other => panic!("expected the tooltip text, got {other:?}"),
+        }
     }
-    assert!(app.runtime.plugin_overlay_anchor().is_some());
+    assert!(app.runtime.borrow().plugin_overlay_anchor().is_some());
 
     // Leaving still delivers one leave and hides the tooltip.
-    app.runtime.handle_cursor_moved(away);
+    app.runtime.borrow_mut().handle_cursor_moved(away);
     assert_eq!(app.pump_cold_commands(), 1, "one leave");
     let _ = app.drive_tick();
-    assert!(app.runtime.plugin_overlay().is_none());
+    assert!(app.runtime.borrow().plugin_overlay().is_none());
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
@@ -19018,10 +19603,11 @@ events = []
     let _ = app.drive_tick();
     let row = app
         .runtime
+        .borrow()
         .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
         .expect("top band row");
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let over_clock = bitty_platform::CursorPosition {
         x: pad + 0.5 * f64::from(cw),
         y: pad + (f64::from(row) + 0.5) * f64::from(ch),
@@ -19032,7 +19618,7 @@ events = []
     };
 
     // Pointer enters: a v1 enter is queued but not yet dispatched.
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     // Same tick: the plugin bumps the band, the app syncs the new snapshot,
     // and the frame publishes v2 before the cold drain.
     app.plugin_runtime
@@ -19042,6 +19628,7 @@ events = []
         .expect("bump command");
     let origin = app
         .runtime
+        .borrow()
         .published_band_origins()
         .first()
         .cloned()
@@ -19050,6 +19637,7 @@ events = []
     let bands = bitty_runtime::ChromeBands {
         top: app
             .runtime
+            .borrow()
             .chrome_bands()
             .top
             .iter()
@@ -19060,7 +19648,7 @@ events = []
             .collect(),
         ..Default::default()
     };
-    app.runtime.set_chrome_bands_with_mounts(
+    app.runtime.borrow_mut().set_chrome_bands_with_mounts(
         bands,
         vec![bitty_runtime::BandMount {
             plugin_id: origin.plugin_id.clone(),
@@ -19070,7 +19658,10 @@ events = []
             handle: origin.handle,
         }],
     );
-    app.runtime.tick().expect("present the updated band");
+    app.runtime
+        .borrow_mut()
+        .tick()
+        .expect("present the updated band");
 
     // One delivered enter for the current origin, not a stale v1 drop.
     assert_eq!(
@@ -19084,21 +19675,24 @@ events = []
         "the delivered enter is not re-fired"
     );
     let _ = app.drive_tick();
-    let surface = app
-        .runtime
-        .plugin_overlay()
-        .expect("tooltip appears for the same-tick update");
-    match &surface.root {
-        bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
-        other => panic!("expected the tooltip text, got {other:?}"),
+    // CTX-1929: scope the borrow guard to the surface reads only.
+    {
+        let rt = app.runtime.borrow();
+        let surface = rt
+            .plugin_overlay()
+            .expect("tooltip appears for the same-tick update");
+        match &surface.root {
+            bitty_lua::ui::UiNode::Text { text, .. } => assert_eq!(text, "detail:clock"),
+            other => panic!("expected the tooltip text, got {other:?}"),
+        }
     }
-    assert!(app.runtime.plugin_overlay_anchor().is_some());
+    assert!(app.runtime.borrow().plugin_overlay_anchor().is_some());
 
     // Leaving still hides the tooltip with one leave.
-    app.runtime.handle_cursor_moved(away);
+    app.runtime.borrow_mut().handle_cursor_moved(away);
     assert_eq!(app.pump_cold_commands(), 1, "one leave");
     let _ = app.drive_tick();
-    assert!(app.runtime.plugin_overlay().is_none());
+    assert!(app.runtime.borrow().plugin_overlay().is_none());
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
@@ -19212,26 +19806,31 @@ events = []
     let _ = app.drive_tick();
     let row = app
         .runtime
+        .borrow()
         .plugin_band_row(bitty_runtime::BandEdge::Top, 0)
         .expect("top band row");
-    let (cw, ch) = app.runtime.live_cell_size();
-    let pad = f64::from(app.runtime.window_padding_physical());
+    let (cw, ch) = app.runtime.borrow().live_cell_size();
+    let pad = f64::from(app.runtime.borrow().window_padding_physical());
     let over_clock = bitty_platform::CursorPosition {
         x: pad + 0.5 * f64::from(cw),
         y: pad + (f64::from(row) + 0.5) * f64::from(ch),
     };
-    let tooltip_text =
-        |app: &TerminalApp| match &app.runtime.plugin_overlay().expect("overlay").root {
+    let tooltip_text = |app: &TerminalApp| {
+        // CTX-1929: `plugin_overlay` hands back a reference into the runtime,
+        // so the guard binding outlives the match reads.
+        let rt = app.runtime.borrow();
+        match &rt.plugin_overlay().expect("overlay").root {
             bitty_lua::ui::UiNode::Text { text, .. } => text.clone(),
             other => panic!("expected the tooltip text, got {other:?}"),
-        };
+        }
+    };
 
-    app.runtime.handle_cursor_moved(over_clock);
+    app.runtime.borrow_mut().handle_cursor_moved(over_clock);
     assert_eq!(app.pump_cold_commands(), 1, "hover enter dispatched");
     let _ = app.drive_tick();
     assert_eq!(tooltip_text(&app), "detail:1");
     assert!(
-        app.runtime.plugin_overlay_anchor().is_some(),
+        app.runtime.borrow().plugin_overlay_anchor().is_some(),
         "tooltip stays anchored while hovered"
     );
 
@@ -19252,7 +19851,7 @@ events = []
     let _ = app.drive_tick();
     assert_eq!(tooltip_text(&app), "detail:2", "tooltip re-reads the block");
     assert!(
-        app.runtime.plugin_overlay_anchor().is_some(),
+        app.runtime.borrow().plugin_overlay_anchor().is_some(),
         "refresh keeps the same anchor"
     );
 
@@ -19511,11 +20110,11 @@ fn presentation_overlay_esc_dismisses_and_reaches_pty() {
         "init.lua presented the block"
     );
     assert!(
-        app.runtime.presentation_overlay().is_some(),
+        app.runtime.borrow().presentation_overlay().is_some(),
         "the tick mirrors the live session into the paint path"
     );
     assert!(
-        !app.runtime.overlay_modal_active(),
+        !app.runtime.borrow().overlay_modal_active(),
         "presentation never sets the modal authority"
     );
     assert!(
@@ -19541,12 +20140,12 @@ fn presentation_overlay_esc_dismisses_and_reaches_pty() {
         !app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc.clone())),
         "Esc must route onward, not be consumed by the presentation surface"
     );
-    let out = app.runtime.handle_key_event(esc);
+    let out = app.runtime.borrow_mut().handle_key_event(esc);
     assert_eq!(out, Some(vec![27]), "Esc reaches the focused PTY");
-    assert_eq!(app.runtime.pending_input(), b"\x1b");
+    assert_eq!(app.runtime.borrow().pending_input(), b"\x1b");
     assert!(!app.presentation_overlay_active(), "the surface is gone");
     assert!(
-        app.runtime.presentation_overlay().is_none(),
+        app.runtime.borrow().presentation_overlay().is_none(),
         "the paint path clears immediately"
     );
     assert_eq!(
@@ -19592,7 +20191,11 @@ fn presentation_overlay_binds_to_focus_and_drops_when_the_view_closes() {
     let runtime = Runtime::with_defaults().expect("runtime must build");
     let (mut app, presenter, watcher, root, data) = presentation_overlay_app("follow", runtime);
     let _ = app.drive_tick();
-    let bound = app.runtime.focused_view().expect("a view is focused");
+    let bound = app
+        .runtime
+        .borrow()
+        .focused_view()
+        .expect("a view is focused");
     assert!(app.presentation_overlay_active(), "init.lua presented");
     assert_eq!(
         app.plugin_runtime
@@ -19605,16 +20208,16 @@ fn presentation_overlay_binds_to_focus_and_drops_when_the_view_closes() {
         "the tick binds the surface to the focused view"
     );
 
-    let mut after = app.runtime.layout().clone();
+    let mut after = app.runtime.borrow().layout().clone();
     assert!(after.remove_leaf(bound).is_some(), "the bound view closes");
-    app.runtime.set_layout_closing(after, bound);
+    app.runtime.borrow_mut().set_layout_closing(after, bound);
     let _ = app.drive_tick();
     assert!(
         !app.presentation_overlay_active(),
         "no surface survives the view it was drawn over"
     );
     assert!(
-        app.runtime.presentation_overlay().is_none(),
+        app.runtime.borrow().presentation_overlay().is_none(),
         "the paint path clears with the session"
     );
     assert!(
@@ -19654,16 +20257,23 @@ fn presentation_overlay_esc_gate_precedence_keeps_the_consume() {
     let (mut app, _presenter, _watcher, root, data) = presentation_overlay_app("paste", runtime);
     let _ = app.drive_tick();
     assert!(app.presentation_overlay_active());
-    assert!(app.runtime.paste_text_via_gate(String::from("one\ntwo")));
+    assert!(
+        app.runtime
+            .borrow_mut()
+            .paste_text_via_gate(String::from("one\ntwo"))
+    );
     let esc = presentation_escape();
     assert!(
         app.intercept_chrome_key(&WindowEventKind::KeyboardInput(esc)),
         "the paste gate owns the consume"
     );
     assert!(!app.presentation_overlay_active(), "the surface drops too");
-    assert!(!app.runtime.has_pending_paste(), "the gate drops too");
     assert!(
-        app.runtime.pending_input().is_empty(),
+        !app.runtime.borrow().has_pending_paste(),
+        "the gate drops too"
+    );
+    assert!(
+        app.runtime.borrow().pending_input().is_empty(),
         "no Esc leaks to the PTY"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -19678,9 +20288,9 @@ fn presentation_overlay_esc_gate_precedence_keeps_the_consume() {
     let (mut app, _presenter, _watcher, root, data) = presentation_overlay_app("close", runtime);
     let _ = app.drive_tick();
     assert!(app.presentation_overlay_active());
-    app.runtime.view_close_request(ViewId::new(1));
+    app.runtime.borrow_mut().view_close_request(ViewId::new(1));
     assert!(
-        app.runtime.has_pending_close_confirm(),
+        app.runtime.borrow().has_pending_close_confirm(),
         "the close arm is armed"
     );
     let esc = presentation_escape();
@@ -19689,8 +20299,8 @@ fn presentation_overlay_esc_gate_precedence_keeps_the_consume() {
         "the close confirmation owns the consume"
     );
     assert!(!app.presentation_overlay_active());
-    assert!(!app.runtime.has_pending_close_confirm());
-    assert!(app.runtime.pending_input().is_empty());
+    assert!(!app.runtime.borrow().has_pending_close_confirm());
+    assert!(app.runtime.borrow().pending_input().is_empty());
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
@@ -19719,6 +20329,7 @@ fn presentation_overlay_update_and_unload_teardown() {
     let painted = format!(
         "{:?}",
         app.runtime
+            .borrow()
             .presentation_overlay()
             .expect("presentation surface")
             .root
@@ -19737,7 +20348,7 @@ fn presentation_overlay_update_and_unload_teardown() {
     );
     let _ = app.drive_tick();
     assert!(
-        app.runtime.presentation_overlay().is_none(),
+        app.runtime.borrow().presentation_overlay().is_none(),
         "the present path clears on the next tick"
     );
 
@@ -19830,7 +20441,7 @@ fn watchdog_app(threshold_ms: u64) -> (TerminalApp, std::sync::mpsc::Receiver<St
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     app.stall_watchdog = Some(crate::stall_watchdog::StallWatchdog::start_for_test(
         threshold_ms,
-        std::sync::Arc::clone(app.runtime.hang_gauges()),
+        std::sync::Arc::clone(app.runtime.borrow().hang_gauges()),
         Box::new(move |line| {
             let _ = tx.send(line.to_string());
             crate::stall_watchdog::DeliveryOutcome::Delivered
@@ -19858,7 +20469,7 @@ fn runtime_tick_block_reports_in_flight_and_is_measured() {
     // The old app-level seam slept before `tick_at`, so this assertion is the
     // one that proves the injection is inside the measured region.
     assert!(
-        app.runtime.hang_gauges().snapshot().last_tick_ns
+        app.runtime.borrow().hang_gauges().snapshot().last_tick_ns
             >= u64::try_from(block.as_nanos()).unwrap_or(u64::MAX),
         "the injected block must be inside the measured tick region"
     );
@@ -19890,7 +20501,7 @@ fn runtime_tick_block_inside_the_bound_stays_quiet() {
     bitty_runtime::hang_watchdog::set_tick_block_for_test(std::time::Duration::from_millis(5));
     let _ = app.drive_tick();
     assert!(
-        app.runtime.hang_gauges().snapshot().last_tick_ns < 3_000_000_000,
+        app.runtime.borrow().hang_gauges().snapshot().last_tick_ns < 3_000_000_000,
         "the measured tick must stay inside the bound"
     );
     app.stall_watchdog.as_ref().expect("fixture monitor").idle();
@@ -19906,11 +20517,17 @@ fn runtime_tick_block_inside_the_bound_stays_quiet() {
 #[test]
 fn close_last_float_on_empty_base_keeps_workspace_and_focuses_pin_3074() {
     let mut app = editor_test_app();
-    let host = app.runtime.focused_view().expect("seed focus");
+    let host = app.runtime.borrow().focused_view().expect("seed focus");
     let float_view = ViewId::new(2);
     let pin_view = ViewId::new(3);
-    let host_leaf = app.runtime.layout().find_leaf(host).cloned().expect("host");
-    app.runtime.set_layout(LayoutNode::split(
+    let host_leaf = app
+        .runtime
+        .borrow()
+        .layout()
+        .find_leaf(host)
+        .cloned()
+        .expect("host");
+    app.runtime.borrow_mut().set_layout(LayoutNode::split(
         bitty_runtime::SplitAxis::Horizontal,
         0.5,
         LayoutNode::leaf(host_leaf),
@@ -19921,33 +20538,41 @@ fn close_last_float_on_empty_base_keeps_workspace_and_focuses_pin_3074() {
             LayoutNode::leaf(bitty_runtime::View::new(pin_view, 40, 12)),
         ),
     ));
-    app.runtime.float_detach(float_view).expect("detach float");
-    app.runtime.pin_floating(pin_view).expect("pin");
+    app.runtime
+        .borrow_mut()
+        .float_detach(float_view)
+        .expect("detach float");
+    app.runtime
+        .borrow_mut()
+        .pin_floating(pin_view)
+        .expect("pin");
 
     // Open a second workspace and switch back to workspace 0 so workspace_count() > 1.
-    app.runtime.workspace_new().expect("ws2");
-    assert!(app.runtime.workspace_switch(0));
-    assert_eq!(app.runtime.workspace_count(), 2);
+    app.runtime.borrow_mut().workspace_new().expect("ws2");
+    assert!(app.runtime.borrow_mut().workspace_switch(0));
+    assert_eq!(app.runtime.borrow().workspace_count(), 2);
 
     // Retire the sole tiled leaf in workspace 0 so only `float_view` and window-global `pin_view` remain.
     assert_eq!(
-        app.runtime.retire_sole_tiled_leaf_for_floated(host),
+        app.runtime
+            .borrow_mut()
+            .retire_sole_tiled_leaf_for_floated(host),
         Some(float_view)
     );
-    assert_eq!(app.runtime.layout().leaf_count(), 0);
-    assert_eq!(app.runtime.focused_view(), Some(float_view));
+    assert_eq!(app.runtime.borrow().layout().leaf_count(), 0);
+    assert_eq!(app.runtime.borrow().focused_view(), Some(float_view));
 
     // Closing `float_view` via `CloseView` must NOT prune workspace 0 while `pin_view`
     // survives; instead it must keep workspace 0 active and hand focus to `pin_view`.
     assert!(!app.apply_chrome_action(bitty_config::ChromeAction::CloseView));
     assert_eq!(
-        app.runtime.workspace_count(),
+        app.runtime.borrow().workspace_count(),
         2,
         "workspace must not be pruned while a window-global pinned panel survives"
     );
-    assert_eq!(app.runtime.active_workspace_index(), 0);
+    assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
     assert_eq!(
-        app.runtime.focused_view(),
+        app.runtime.borrow().focused_view(),
         Some(pin_view),
         "focus must fall back to the surviving pinned panel"
     );
@@ -20194,21 +20819,23 @@ fn drive_tick_drains_plugin_side_observations() {
         for line in 0..200 {
             payload.push_str(&format!("line-{batch}-{line}\r\n"));
         }
-        app.runtime.handle_pty_bytes(payload.as_bytes());
+        app.runtime
+            .borrow_mut()
+            .handle_pty_bytes(payload.as_bytes());
         let _ = app.drive_tick();
         assert_eq!(
-            app.runtime.plugin_side_len(),
+            app.runtime.borrow().plugin_side_len(),
             0,
             "drive_tick must drain plugin_host.side_queue()"
         );
         assert_eq!(
-            app.runtime.cold_queue_len(),
+            app.runtime.borrow().cold_queue_len(),
             0,
             "drive_tick must drain cold_queue"
         );
     }
-    assert_eq!(app.runtime.plugin_side_dropped(), 0);
-    assert_eq!(app.runtime.cold_queue_dropped(), 0);
+    assert_eq!(app.runtime.borrow().plugin_side_dropped(), 0);
+    assert_eq!(app.runtime.borrow().cold_queue_dropped(), 0);
 }
 
 #[test]
@@ -20297,20 +20924,24 @@ events = ["workspace.focused"]
 
     // First tick presents the initial "ws-init" band and clears present_owed.
     assert!(app.drive_tick().is_some());
-    assert!(!app.runtime.present_owed());
+    assert!(!app.runtime.borrow().present_owed());
 
     // Trigger workspace.focused inside deliver_runtime_events() (after runtime.tick()).
-    let ws = app.runtime.workspace_new().expect("second workspace");
-    assert!(app.runtime.workspace_switch(ws));
+    let ws = app
+        .runtime
+        .borrow_mut()
+        .workspace_new()
+        .expect("second workspace");
+    assert!(app.runtime.borrow_mut().workspace_switch(ws));
     let _ = app.drive_tick();
 
-    let rendered = format!("{:?}", app.runtime.chrome_bands().bottom);
+    let rendered = format!("{:?}", app.runtime.borrow().chrome_bands().bottom);
     assert!(
         rendered.contains("ws-switched"),
         "chrome_bands must sync updates emitted during deliver_runtime_events: {rendered}"
     );
     assert!(
-        app.runtime.present_owed(),
+        app.runtime.borrow().present_owed(),
         "post-event band update must mark a follow-up frame owed"
     );
 

@@ -929,7 +929,16 @@ pub(crate) struct PendingPluginScratchpad {
 /// [`crate::chrome_keys::ChromeState`] so this type keeps only the core
 /// runtime, pump, and gate fields.
 pub(crate) struct TerminalApp {
-    pub(crate) runtime: Runtime,
+    /// Shared handle to the Core runtime (bitty#2388, CTX-1929).
+    ///
+    /// The handle is `Rc<RefCell<Runtime>>` so the composition root can hand a
+    /// `'static`-capable backend — [`bitty_runtime::plugin_runtime::RuntimePanelContentBackend`]
+    /// — the same runtime the app owns, without either half holding a raw
+    /// `&mut`. Every access goes through `borrow()`/`borrow_mut()` guards;
+    /// re-entrancy from a runtime callback fails closed in the backend
+    /// (`E_UI_UNAVAILABLE`) instead of panicking, the same fence
+    /// `runtime/ui_panel.rs` documents.
+    pub(crate) runtime: std::rc::Rc<std::cell::RefCell<Runtime>>,
     /// Window handle, title, opacity, and IME/title counters.
     pub(crate) window: WindowState,
     /// Identity-keyed registry of the OS windows this process owns
@@ -1260,8 +1269,13 @@ impl TerminalApp {
         keymaps: Vec<bitty_config::ResolvedKeymap>,
         spawn_spec: SpawnSpec,
     ) -> Self {
-        let event_tracker = EventTracker::from_runtime(&runtime);
-        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
+        // CTX-1929: the runtime lives behind the shared handle from here on;
+        // the two startup reads below take it through a `borrow()` guard and
+        // the field stores the same handle the app drives for its lifetime.
+        let runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
+        let event_tracker = EventTracker::from_runtime(&runtime.borrow());
+        let stall_watchdog =
+            StallWatchdog::from_env(std::sync::Arc::clone(runtime.borrow().hang_gauges()));
         let memory_report = crate::memory_report::MemoryReportDump::from_env();
         Self {
             runtime,
@@ -1335,8 +1349,11 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
-        let event_tracker = EventTracker::from_runtime(&runtime);
-        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
+        // CTX-1929: same shared-handle shape as [`Self::with_theme`].
+        let runtime = std::rc::Rc::new(std::cell::RefCell::new(runtime));
+        let event_tracker = EventTracker::from_runtime(&runtime.borrow());
+        let stall_watchdog =
+            StallWatchdog::from_env(std::sync::Arc::clone(runtime.borrow().hang_gauges()));
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
@@ -1436,7 +1453,7 @@ impl TerminalApp {
         let Some(pending) = self.pending_startup_spawn.take() else {
             return false;
         };
-        let spawn = crate::spawn_startup_shells(&mut self.runtime, &self.spawn_spec);
+        let spawn = crate::spawn_startup_shells(&mut self.runtime.borrow_mut(), &self.spawn_spec);
         // bitty#2928: an unresolvable default is fatal here too, even when the
         // windowed start was not `--fail-loud`.
         if let Some(err) = spawn.error.as_ref().filter(|err| err.is_fatal()) {
@@ -1447,13 +1464,13 @@ impl TerminalApp {
             eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
             std::process::exit(crate::EXIT_STARTUP);
         }
-        let snapshot = self.runtime.snapshot();
+        let snapshot = self.runtime.borrow().snapshot();
         crate::logging::info(|| {
             format!(
                 "bitty: deferred startup shell spawned at grid {}x{} (has_pty={})",
                 snapshot.width,
                 snapshot.height,
-                self.runtime.has_pty()
+                self.runtime.borrow().has_pty()
             )
         });
         true
@@ -1504,7 +1521,10 @@ impl TerminalApp {
     /// event loop owns the save + shutdown + exit, matching the key path.
     /// No queued action is a no-op (default `mouse.right = "none"`).
     pub(crate) fn dispatch_pending_mouse_action(&mut self) -> bool {
-        match self.runtime.take_pending_mouse_action() {
+        // CTX-1929: hoist the take out of the match scrutinee so the borrow
+        // guard is released before the arms dispatch `&mut self` work.
+        let pending = self.runtime.borrow_mut().take_pending_mouse_action();
+        match pending {
             Some(action) => {
                 if !self.modal_allows_mouse_action(&action) {
                     crate::logging::info(|| {
@@ -1528,7 +1548,7 @@ impl TerminalApp {
         if !self.session_persistence {
             return;
         }
-        let outcome = self.runtime.save_session_on_exit();
+        let outcome = self.runtime.borrow().save_session_on_exit();
         let Some((class, line)) = session_save_report(&outcome, reason) else {
             return;
         };
@@ -1547,19 +1567,19 @@ impl TerminalApp {
     /// The runtime queues one from-truth frame for it without changing the
     /// gate, so a native reveal the #2989 repair pre-empted is never lost.
     fn set_surface_gate(&mut self, visible: bool, reason: &'static str) {
-        if self.runtime.is_surface_visible() == visible {
+        if self.runtime.borrow().is_surface_visible() == visible {
             if visible {
                 // A repair probe belongs to the hidden incarnation; a real
                 // reveal edge ends it even when the gate is already open.
                 self.hidden_repair_probe_at = None;
-                self.runtime.set_surface_visibility(true);
+                self.runtime.borrow_mut().set_surface_visibility(true);
             }
             return;
         }
         // A repair probe belongs to the hidden surface incarnation that armed
         // it: any real edge ends it (bitty#2830 hypothesis 2).
         self.hidden_repair_probe_at = None;
-        self.runtime.set_surface_visibility(visible);
+        self.runtime.borrow_mut().set_surface_visibility(visible);
         log_surface_gate(visible, reason);
     }
 
@@ -1584,7 +1604,9 @@ impl TerminalApp {
             win.note_input_reveal();
         }
         // A settled, visible surface owes nothing: keep frame-on-demand.
-        if self.runtime.is_surface_visible() && !self.runtime.surface_reveal_unproven() {
+        if self.runtime.borrow().is_surface_visible()
+            && !self.runtime.borrow().surface_reveal_unproven()
+        {
             return;
         }
         self.set_surface_gate(true, "input");
@@ -1608,7 +1630,7 @@ impl TerminalApp {
     /// its retained damage and gets one attempt per
     /// `HIDDEN_REPAIR_INTERVAL_MS`, never a busy loop.
     pub(crate) fn repair_hidden_surface(&mut self, now: std::time::Instant) {
-        if self.runtime.is_surface_visible() {
+        if self.runtime.borrow().is_surface_visible() {
             self.hidden_repair_probe_at = None;
             return;
         }
@@ -1616,7 +1638,7 @@ impl TerminalApp {
         if let Some(win) = self.window.handle.as_ref() {
             win.request_redraw();
         }
-        self.runtime.note_hidden_repair_at(now);
+        self.runtime.borrow_mut().note_hidden_repair_at(now);
     }
 
     /// Applies the proof a hidden-surface repair probe received.
@@ -1649,7 +1671,7 @@ impl TerminalApp {
         if !served || now.saturating_duration_since(asked_at) > HIDDEN_REPAIR_PROBE_TTL {
             return false;
         }
-        if self.runtime.is_surface_visible() {
+        if self.runtime.borrow().is_surface_visible() {
             return false;
         }
         self.set_surface_gate(true, "hidden-repair");
@@ -1677,7 +1699,7 @@ impl TerminalApp {
         if let Some(deadline) = self.test_surface_retry_deadline {
             return Some(deadline);
         }
-        self.runtime.surface_retry_deadline()
+        self.runtime.borrow().surface_retry_deadline()
     }
 
     /// Whether the runtime still owes a presented frame (bitty#2830).
@@ -1690,7 +1712,7 @@ impl TerminalApp {
         if let Some(owed) = self.test_present_owed {
             return owed;
         }
-        self.runtime.present_owed()
+        self.runtime.borrow().present_owed()
     }
 
     /// Compositor-confirmation wake, with a test override (bitty#2989).
@@ -1699,7 +1721,7 @@ impl TerminalApp {
         if let Some(deadline) = self.test_present_confirm_deadline {
             return Some(deadline);
         }
-        self.runtime.present_confirm_deadline()
+        self.runtime.borrow().present_confirm_deadline()
     }
 
     fn watchdog_idle(&self) {
@@ -1736,8 +1758,10 @@ impl TerminalApp {
         if !dump.due(now) {
             return;
         }
-        let report =
-            crate::memory_report::current_report(&self.runtime, self.plugin_runtime.as_ref());
+        let report = crate::memory_report::current_report(
+            &self.runtime.borrow(),
+            self.plugin_runtime.as_ref(),
+        );
         let dir = dump.dir().to_path_buf();
         let result = crate::memory_report::write_report(&report, &dir);
         if let Some(dump) = self.memory_report.as_mut() {
@@ -1763,8 +1787,9 @@ impl TerminalApp {
             return;
         }
         // bitty#2830: app-owned queue depths and the plugin-side gauges ride
-        // the same bounded cadence as the identifier sample.
-        let gauges = self.runtime.hang_gauges();
+        // the same bounded cadence as the identifier sample. The gauges arc
+        // is cloned out so the borrow guard ends with this statement.
+        let gauges = std::sync::Arc::clone(self.runtime.borrow().hang_gauges());
         gauges.set_input_commands(
             self.pending_input_commands.len(),
             self.pending_input_commands_dropped,
@@ -1784,7 +1809,11 @@ impl TerminalApp {
             .take(8)
             .map(|id| id.as_str().to_string())
             .collect();
-        let bands = self.runtime.chrome_bands();
+        // CTX-1929: `chrome_bands` hands back a reference into the runtime,
+        // so the guard binding below stays alive for the two derived rows
+        // (both owned before the sample is built).
+        let runtime = self.runtime.borrow();
+        let bands = runtime.chrome_bands();
         let band_count =
             bands.top.len() + bands.bottom.len() + bands.left.len() + bands.right.len();
         let band_plugin_ids = bands
@@ -1803,10 +1832,10 @@ impl TerminalApp {
             .map(WindowHandle::occlusion_snapshot)
             .unwrap_or_default();
         watchdog.update_context(WatchdogContext {
-            focused_view: self.runtime.focused_view().map(|view| view.0),
-            leaf_count: self.runtime.leaf_count(),
-            pane_count: self.runtime.pane_view_ids().len(),
-            scrollback_lines: self.runtime.scrollback_len(),
+            focused_view: self.runtime.borrow().focused_view().map(|view| view.0),
+            leaf_count: self.runtime.borrow().leaf_count(),
+            pane_count: self.runtime.borrow().pane_view_ids().len(),
+            scrollback_lines: self.runtime.borrow().scrollback_len(),
             plugin_count,
             plugin_ids,
             band_count,
@@ -1814,7 +1843,7 @@ impl TerminalApp {
             presented_frames: self.presented_frames,
             surface: bitty_render::telemetry::snapshot(),
             lifecycle: crate::crash_report::last_lifecycle_name(),
-            surface_visible: self.runtime.is_surface_visible(),
+            surface_visible: self.runtime.borrow().is_surface_visible(),
             redraw_pending_ms: occlusion
                 .pending
                 .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
@@ -1922,8 +1951,8 @@ impl TerminalApp {
         // bitty#2830: share the Core gauge handle so a hung plugin callback is
         // visible in the watchdog dump without borrowing plugin state.
         if let Some(plugin) = runtime.as_mut() {
-            plugin.set_hang_gauges(std::sync::Arc::clone(self.runtime.hang_gauges()));
-            plugin.set_window_focused(self.runtime.is_window_focused());
+            plugin.set_hang_gauges(std::sync::Arc::clone(self.runtime.borrow().hang_gauges()));
+            plugin.set_window_focused(self.runtime.borrow().is_window_focused());
         }
         self.plugin_runtime = runtime;
         self
@@ -1937,11 +1966,11 @@ impl TerminalApp {
     /// attach through the same handle. Plugin-less runs and failed host
     /// construction leave it `None`, which keeps every leaf on the grid path.
     pub(crate) fn with_panel_scene_host(
-        mut self,
+        self,
         host: Option<std::rc::Rc<std::cell::RefCell<bitty_runtime::registry::PanelRuntime>>>,
     ) -> Self {
         if let Some(host) = host {
-            self.runtime.install_shared_scene_host(host);
+            self.runtime.borrow_mut().install_shared_scene_host(host);
         }
         self
     }
@@ -2018,7 +2047,7 @@ impl TerminalApp {
     /// left holding a generation the runtime has already torn down.
     fn shutdown_runtime(&mut self) {
         self.a11y.shutdown();
-        self.runtime.shutdown();
+        self.runtime.borrow_mut().shutdown();
     }
 
     /// Whether the accessibility projection is active (bitty#1768).
@@ -2223,7 +2252,7 @@ impl TerminalApp {
         // so cancel it (fail-open: keys route normally again).
         if leader_changed || keymaps_changed || prefixes_changed || hints_disabled {
             self.chrome.leader_state = bitty_config::LeaderState::Idle;
-            self.runtime.cw_hint_disarm();
+            self.runtime.borrow_mut().cw_hint_disarm();
         }
         if (bitty_platform::sanitize_opacity(adoption.window_opacity)
             - bitty_platform::sanitize_opacity(self.window.opacity))
@@ -2339,10 +2368,10 @@ impl TerminalApp {
         Some(Self::format_tick_line(
             present,
             self.presented_frames,
-            self.runtime.focused_view(),
-            self.runtime.leaf_count(),
-            self.runtime.has_gpu(),
-            self.runtime.text_stack(),
+            self.runtime.borrow().focused_view(),
+            self.runtime.borrow().leaf_count(),
+            self.runtime.borrow().has_gpu(),
+            self.runtime.borrow().text_stack(),
             Self::tick_uptime_ms(),
         ))
     }
@@ -2366,13 +2395,13 @@ impl TerminalApp {
         let pump_start = std::time::Instant::now();
         let mut rounds = 0usize;
         loop {
-            let real = self.runtime.poll_pty();
+            let real = self.runtime.borrow_mut().poll_pty();
             if real > 0 {
                 consumed = true;
             }
             rounds += 1;
             // Re-read per round: a single drain may close the `?2026l` batch.
-            let (max_rounds, budget) = if self.runtime.synchronized_update_active() {
+            let (max_rounds, budget) = if self.runtime.borrow().synchronized_update_active() {
                 (8usize, bitty_runtime::POLL_PTY_SYNC_TIME_BUDGET)
             } else {
                 (2usize, bitty_runtime::POLL_PTY_TIME_BUDGET)
@@ -2387,7 +2416,7 @@ impl TerminalApp {
             loop {
                 match rx.try_recv() {
                     Ok(chunk) => {
-                        self.runtime.handle_pty_bytes(&chunk);
+                        self.runtime.borrow_mut().handle_pty_bytes(&chunk);
                         consumed = true;
                     }
                     Err(TryRecvError::Empty) => break,
@@ -2400,11 +2429,11 @@ impl TerminalApp {
             // for the rest of the logical repaint instead of snapshotting a
             // half-applied frame. A no-op for headless/test runtimes, whose
             // settle window stays zero.
-            self.runtime.note_present_input();
+            self.runtime.borrow_mut().note_present_input();
         }
         // Flush any replies generated by PTY bytes (bounded, best-effort).
         // `write_replies` is no-op when no live writer (headless keeps replies for `take_replies`).
-        let _ = self.runtime.write_replies();
+        let _ = self.runtime.borrow_mut().write_replies();
         // CTX-0731 (#982): advance a hosted `$EDITOR` round trip, if any
         // (non-blocking exit poll; no-op when nothing is hosted).
         self.poll_external_editor();
@@ -2433,7 +2462,7 @@ impl TerminalApp {
         let Some(window) = self.window.handle.as_ref() else {
             return;
         };
-        let area = self.runtime.ime_cursor_area();
+        let area = self.runtime.borrow().ime_cursor_area();
         if area == self.window.ime_cursor_area {
             return;
         }
@@ -2461,7 +2490,7 @@ impl TerminalApp {
         // connection authorization snapshot can apply; the drain re-validates
         // each snapshot against the live connection authority.
         let _ = ctl::drain_global_control_queue_with(
-            &mut self.runtime,
+            &mut self.runtime.borrow_mut(),
             &bitty_ipc::ScopeSet::new(),
             |runtime, method| {
                 if ctl::method_mutates_layout(method) {
@@ -2478,7 +2507,8 @@ impl TerminalApp {
         // `config.reloaded` edge for the plugin trace path below (at most
         // one per tick; only `applied` reloads emit).
         self.watchdog_phase(Phase::ConfigPoll);
-        if let Some(info) = crate::config_reload::poll_file(&mut self.runtime) {
+        let scrutinee = crate::config_reload::poll_file(&mut self.runtime.borrow_mut());
+        if let Some(info) = scrutinee {
             if info.applied && info.kind == "applied" {
                 self.pending_config = Some(PendingConfigReload {
                     path: truncate_to_bytes(&info.path, CONFIG_PATH_MAX_BYTES),
@@ -2511,14 +2541,14 @@ impl TerminalApp {
         // `ui.mount("terminal", …)` on this tick lands on the leaf the user
         // is looking at. Core owns this value; plugins never do.
         if let Some(target) = self.scene_target.as_ref() {
-            target.set(self.runtime.focused_view());
+            target.set(self.runtime.borrow().focused_view());
         }
         // OQ-084 B-2: publish the presented workspace's minted id on the same
         // edge, so a `panel.create` dispatched on this tick is attributed to
         // the workspace the user is looking at. Core owns the value; plugin
         // input never reaches it.
         if let Some(workspace) = self.focused_workspace.as_ref() {
-            workspace.set(self.runtime.focused_workspace_id());
+            workspace.set(self.runtime.borrow().focused_workspace_id());
         }
         // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
         // present, so the presented frame reflects the pin state.
@@ -2600,6 +2630,7 @@ impl TerminalApp {
         // input and obscures the grid). The runtime clears hovers on
         // revalidate and skips hover paints while suppressed.
         self.runtime
+            .borrow_mut()
             .set_hover_suppressed_by_overlay(self.overlay_capture_active());
         self.watchdog_phase(Phase::ColdEvents);
         // CTX-0382: drain cold-path events on every tick — including
@@ -2619,7 +2650,7 @@ impl TerminalApp {
         // defer or skip presenting leaves winit in `FrameCallbackState::Requested`
         // without a commit and starves `RedrawRequested`.
         self.watchdog_phase(Phase::RuntimeTick);
-        let stats = self.runtime.tick();
+        let stats = self.runtime.borrow_mut().tick();
         // bitty#2859: opt-in idle-RSS attribution. Off by default; when armed
         // this is one `Instant` compare, and the report itself only runs on a
         // due interval, after the tick committed.
@@ -2631,7 +2662,7 @@ impl TerminalApp {
         // either completes or commits at its timeout. IME/cursor and plugin
         // event delivery below still run, so a deferred tick never strands a
         // queued `process.exited` or config reload.
-        let hold_snapshot = stats.is_none() && self.runtime.synchronized_update_active();
+        let hold_snapshot = stats.is_none() && self.runtime.borrow().synchronized_update_active();
         if !hold_snapshot {
             self.watchdog_phase(Phase::SnapshotPublish);
             // CTX-0481 (#762): after the tick commits, publish the live plugin
@@ -2639,14 +2670,14 @@ impl TerminalApp {
             // frozen generation-1 view. Monotonic: a regression is refused by
             // the source itself.
             if let Some(snapshot) = self.live_snapshot.as_ref() {
-                snapshot.publish(&self.runtime);
+                snapshot.publish(&self.runtime.borrow());
             }
             self.watchdog_phase(Phase::HistoryCapture);
             // CTX-1352: sample newly completed scrollback lines into the bounded,
             // already-redacted transcript ring. Sampling is idempotent per line id
             // and opt-in gated inside the provider.
             if let Some(history) = self.live_history.as_ref() {
-                crate::plugin_runtime::capture_history(&self.runtime, history);
+                crate::plugin_runtime::capture_history(&self.runtime.borrow(), history);
             }
             // bitty#1768: refresh the accessibility projection from the frame
             // this tick just committed. Default off: `is_active()` is one
@@ -2657,7 +2688,7 @@ impl TerminalApp {
             // `!hold_snapshot` gate so a synchronized update never exposes a
             // half-written grid.
             if self.a11y.is_active() {
-                let snapshot = self.runtime.snapshot();
+                let snapshot = self.runtime.borrow().snapshot();
                 if let Err(err) = self.a11y.refresh(&snapshot) {
                     self.report_a11y_refresh_failure(&err);
                 }
@@ -2688,7 +2719,7 @@ impl TerminalApp {
         // emitted during event delivery schedule a frame instead of sitting
         // unseen until an unrelated tick.
         self.deliver_runtime_events();
-        if self.update_chrome_bands() && self.runtime.is_surface_visible() {
+        if self.update_chrome_bands() && self.runtime.borrow().is_surface_visible() {
             if let Some(win) = self.window.handle.as_ref() {
                 win.request_redraw();
             }
@@ -2726,7 +2757,7 @@ impl TerminalApp {
         if let Some(line) = self.maybe_format_tick(present) {
             eprintln!("{line}");
         }
-        if self.runtime.replies_overflowed() {
+        if self.runtime.borrow().replies_overflowed() {
             crate::logging::warn(|| {
                 String::from("warning: terminal reply queue overflowed (bounded cap)")
             });
@@ -2734,16 +2765,19 @@ impl TerminalApp {
         self.watchdog_phase(Phase::ReplyFlush);
         // Bounded reply loop: flush replies generated before this tick (if any) via PtyWriter.
         // When no writer is present (headless), replies stay queued for `take_replies` observation.
-        let written = self.runtime.write_replies();
+        let written = self.runtime.borrow_mut().write_replies();
         if written > 0 && self.tick_logging_enabled() {
             eprintln!("bitty: {written} reply bytes written to PTY master (post-tick)");
         }
         // CTX-0230: same post-tick flush for every pane session, so a
         // split shell's query answers never wait for the next pump.
         // Bounded per pane (reply cap, fail-closed); no-op when quiet.
+        // CTX-1929: materialize the ids first so the borrow guard is
+        // released before each `write_pane_replies` call re-borrows.
         let mut pane_written = 0usize;
-        for id in self.runtime.pane_view_ids() {
-            pane_written += self.runtime.write_pane_replies(id);
+        let pane_ids = self.runtime.borrow().pane_view_ids();
+        for id in pane_ids {
+            pane_written += self.runtime.borrow_mut().write_pane_replies(id);
         }
         if pane_written > 0 && self.tick_logging_enabled() {
             eprintln!("bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)");
@@ -2751,7 +2785,7 @@ impl TerminalApp {
         // bitty#2830 (review): both reply queues just drained. Republish
         // the gauges so an idle park's `pending=replies` names only bytes
         // that are genuinely still held, instead of the pre-flush count.
-        self.runtime.refresh_hang_gauges();
+        self.runtime.borrow().refresh_hang_gauges();
     }
 
     /// Drains cold-path events and applies the ones the app owns (CTX-0382).
@@ -2762,8 +2796,8 @@ impl TerminalApp {
     pub(crate) fn apply_cold_events(&mut self) {
         // Drain host observations unconditionally so `plugin_host.side_queue()`
         // does not stay saturated and count drops on subsequent pushes.
-        let _observations = self.runtime.drain_plugin_observations();
-        let events = self.runtime.drain_cold_events();
+        let _observations = self.runtime.borrow_mut().drain_plugin_observations();
+        let events = self.runtime.borrow_mut().drain_cold_events();
         if events.is_empty() {
             return;
         }
@@ -2802,10 +2836,10 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return;
         };
-        plugin_runtime.set_window_focused(self.runtime.is_window_focused());
+        plugin_runtime.set_window_focused(self.runtime.borrow().is_window_focused());
         // CTX-0889: one bounded summary pass serves both the live workspace
         // source and the event diff.
-        let workspaces = self.runtime.workspace_summaries();
+        let workspaces = self.runtime.borrow().workspace_summaries();
         if let Some(live) = self.live_workspaces.as_ref() {
             live.publish(&workspaces);
         }
@@ -2813,7 +2847,7 @@ impl TerminalApp {
         // cold path, so a targeting session started by a handler on this tick
         // sees the geometry this tick presented.
         if let Some(targets) = self.live_targets.as_ref() {
-            targets.publish(&self.runtime.target_anchor_summaries());
+            targets.publish(&self.runtime.borrow().target_anchor_summaries());
         }
         // Issue #2253 review: reconcile the active targeting session against
         // the rows just published, so a panel closed mid-session loses its
@@ -2823,26 +2857,26 @@ impl TerminalApp {
         // source, so handlers running on this tick validate against the
         // state this tick applied.
         if let Some(pin_state) = self.live_pin_state.as_ref() {
-            let mut live_leaves = self.runtime.layout().leaf_ids();
-            for id in self.runtime.floated_views() {
+            let mut live_leaves = self.runtime.borrow().layout().leaf_ids();
+            for id in self.runtime.borrow().floated_views() {
                 if !live_leaves.contains(&id) {
                     live_leaves.push(id);
                 }
             }
-            pin_state.publish(&live_leaves, &self.runtime.pinned_views());
+            pin_state.publish(&live_leaves, &self.runtime.borrow().pinned_views());
         }
         // One bounded snapshot pass serves the whole state diff (issue
         // #1828): terminals, per-terminal cwds, the observed-`BEL` counter,
         // and the selection owner/presence. All cold-tick reads, never the
         // PTY hot path.
-        let terminals = self.runtime.live_terminal_ids();
-        let cwds = self.runtime.terminal_cwds();
-        let bell_observed = self.runtime.bell_observed();
-        let selection_owner = self.runtime.selection_owner().map(|view| view.0);
-        let has_selection = self.runtime.has_selection();
+        let terminals = self.runtime.borrow().live_terminal_ids();
+        let cwds = self.runtime.borrow().terminal_cwds();
+        let bell_observed = self.runtime.borrow().bell_observed();
+        let selection_owner = self.runtime.borrow().selection_owner().map(|view| view.0);
+        let has_selection = self.runtime.borrow().has_selection();
         let events = self.event_tracker.take_changes(TrackerSnapshot {
-            title: self.runtime.state().title(),
-            window_focused: self.runtime.is_window_focused(),
+            title: self.runtime.borrow().state().title(),
+            window_focused: self.runtime.borrow().is_window_focused(),
             workspaces: &workspaces,
             terminals: &terminals,
             cwds: &cwds,
@@ -2923,6 +2957,7 @@ impl TerminalApp {
             };
             if !self
                 .runtime
+                .borrow_mut()
                 .admit_plugin_notification(title, &notice.body, now)
             {
                 refused = refused.saturating_add(1);
@@ -2937,7 +2972,7 @@ impl TerminalApp {
                     "bitty: plugin notifications dropped (queue overflow +{queue_grew}, \
                      banner refused +{refused}; totals queue={queue_dropped} \
                      banner={})",
-                    self.runtime.plugin_notifications_dropped(),
+                    self.runtime.borrow().plugin_notifications_dropped(),
                 )
             });
         }
@@ -2977,6 +3012,7 @@ impl TerminalApp {
         let now = std::time::Instant::now();
         let _ = self
             .runtime
+            .borrow_mut()
             .admit_plugin_banner_notification(&title, &summary, now);
     }
 
@@ -3035,8 +3071,10 @@ impl TerminalApp {
         // CTX-1332 C-D4/C-D5: set bands and the live origin projection
         // atomically; this also eagerly cancels queued/armed admissions whose
         // origin is no longer live without clearing the release swallow.
-        let changed = self.runtime.chrome_bands() != &bands;
-        self.runtime.set_chrome_bands_with_mounts(bands, mounts);
+        let changed = self.runtime.borrow().chrome_bands() != &bands;
+        self.runtime
+            .borrow_mut()
+            .set_chrome_bands_with_mounts(bands, mounts);
         changed
     }
 
@@ -3153,7 +3191,7 @@ impl TerminalApp {
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return 0;
         };
-        plugin_runtime.set_window_focused(self.runtime.is_window_focused());
+        plugin_runtime.set_window_focused(self.runtime.borrow().is_window_focused());
         #[cfg(test)]
         if let Some(now) = test_now {
             let fired = plugin_runtime.pump_due_timers_at(now);
@@ -3211,7 +3249,7 @@ impl TerminalApp {
         if dismissed {
             // Clear before present so a dismissal outside the tick cadence
             // never paints one extra stale frame.
-            self.runtime.set_presentation_overlay(None);
+            self.runtime.borrow_mut().set_presentation_overlay(None);
         }
         dismissed
     }
@@ -3345,11 +3383,11 @@ impl TerminalApp {
     /// only mark redraw on actual change, so overlay-less ticks stay idle.
     fn update_plugin_overlay(&mut self) {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
-            if self.runtime.plugin_overlay().is_some() {
-                self.runtime.set_plugin_overlay(None);
+            if self.runtime.borrow().plugin_overlay().is_some() {
+                self.runtime.borrow_mut().set_plugin_overlay(None);
             }
-            if self.runtime.presentation_overlay().is_some() {
-                self.runtime.set_presentation_overlay(None);
+            if self.runtime.borrow().presentation_overlay().is_some() {
+                self.runtime.borrow_mut().set_presentation_overlay(None);
             }
             return;
         };
@@ -3358,8 +3396,9 @@ impl TerminalApp {
         // `view-closed` observation when the view it was drawn over closes.
         // Cold tick path only: no plugin runs here, and the observation is
         // queued for `deliver_overlay_dismissed`.
-        let focused = self.runtime.focused_view();
-        plugin_runtime.observe_presentation_focus(focused, |view| self.runtime.is_live_view(view));
+        let focused = self.runtime.borrow().focused_view();
+        plugin_runtime
+            .observe_presentation_focus(focused, |view| self.runtime.borrow().is_live_view(view));
         // CTX-1431 (`bitty` #2406): the presentation-only session is
         // independent of the capture/tooltip surface. Resolve it from the
         // live mount registry so a `ui.update` refreshes the panel contents
@@ -3374,13 +3413,15 @@ impl TerminalApp {
                 version,
             },
         );
-        self.runtime.set_presentation_overlay(presentation);
+        self.runtime
+            .borrow_mut()
+            .set_presentation_overlay(presentation);
         let capture_owner = plugin_runtime
             .overlay_capture()
             .borrow()
             .owner_plugin()
             .map(str::to_string);
-        let hover_region = self.runtime.hovered_band_region();
+        let hover_region = self.runtime.borrow().hovered_band_region();
         // Issue #2411: with no capture owner, the plugin that owns the live
         // hovered band region may present its `overlay`-slot block as a
         // non-modal tooltip. It paints only: no capture, no input routing,
@@ -3392,8 +3433,8 @@ impl TerminalApp {
             (None, None) => (None, false),
         };
         let Some(owner) = owner else {
-            if self.runtime.plugin_overlay().is_some() {
-                self.runtime.set_plugin_overlay(None);
+            if self.runtime.borrow().plugin_overlay().is_some() {
+                self.runtime.borrow_mut().set_plugin_overlay(None);
             }
             return;
         };
@@ -3426,8 +3467,8 @@ impl TerminalApp {
         } else {
             None
         };
-        self.runtime.set_plugin_overlay(surface);
-        self.runtime.set_plugin_overlay_anchor(anchor);
+        self.runtime.borrow_mut().set_plugin_overlay(surface);
+        self.runtime.borrow_mut().set_plugin_overlay_anchor(anchor);
     }
 
     /// Sync the plugin targeting session's present-time annotation batch
@@ -3439,12 +3480,13 @@ impl TerminalApp {
     /// plugin-less run clears any stale layer.
     fn update_target_annotations(&mut self) {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
-            if self.runtime.target_annotations().is_some() {
-                self.runtime.set_target_annotations(None);
+            if self.runtime.borrow().target_annotations().is_some() {
+                self.runtime.borrow_mut().set_target_annotations(None);
             }
             return;
         };
         self.runtime
+            .borrow_mut()
             .set_target_annotations(plugin_runtime.target_annotations());
     }
 
@@ -3651,7 +3693,7 @@ impl TerminalApp {
                     // the tooltip must not anchor. Abandoning the state also
                     // prevents a retry every cold phase; the next motion
                     // starts a fresh hover against the live frame.
-                    self.runtime.abandon_band_hover();
+                    self.runtime.borrow_mut().abandon_band_hover();
                 }
                 false
             }
@@ -3659,7 +3701,7 @@ impl TerminalApp {
         if delivered && hover.phase == bitty_runtime::BandHoverPhase::Enter {
             // Stops revalidation from re-firing on later content updates and
             // lets the overlay host anchor the tooltip for this item.
-            self.runtime.confirm_band_hover(&hover.region);
+            self.runtime.borrow_mut().confirm_band_hover(&hover.region);
         }
         delivered
     }
@@ -3906,7 +3948,7 @@ impl TerminalApp {
     /// as one delivered result. Returns attempts plus completed resumed parks.
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
         if let Some(plugin_runtime) = self.plugin_runtime.as_ref() {
-            plugin_runtime.set_window_focused(self.runtime.is_window_focused());
+            plugin_runtime.set_window_focused(self.runtime.borrow().is_window_focused());
         }
         // Issue #2407 (review B3): surface plugin-suggestion chord
         // collisions once, on the cold path, before other plugin work.
@@ -3927,8 +3969,11 @@ impl TerminalApp {
             // Issue #2411: re-derive a deferred/stale hover first, so an item
             // whose band was newer than the last presented frame enters as
             // soon as that frame is published (no extra pointer motion).
-            self.runtime.revalidate_band_hover();
-            for hover in self.runtime.drain_band_hovers() {
+            self.runtime.borrow_mut().revalidate_band_hover();
+            // CTX-1929: materialize the drained batch before the loop so the
+            // guard is released before the body dispatches `&mut self` work.
+            let band_hovers = self.runtime.borrow_mut().drain_band_hovers();
+            for hover in band_hovers {
                 if hover.phase == bitty_runtime::BandHoverPhase::Enter {
                     let Some(origin) = hover.origin.clone() else {
                         // Unreachable: the queue defers origin-less enters.
@@ -3938,10 +3983,10 @@ impl TerminalApp {
                                 hover.plugin_id, hover.command
                             )
                         });
-                        self.runtime.abandon_band_hover();
+                        self.runtime.borrow_mut().abandon_band_hover();
                         continue;
                     };
-                    if !self.runtime.band_origin_is_current(&origin) {
+                    if !self.runtime.borrow().band_origin_is_current(&origin) {
                         crate::logging::warn(|| {
                             format!(
                                 "bitty: band hover '{}:{}' dropped (origin is stale)",
@@ -3952,7 +3997,7 @@ impl TerminalApp {
                         // hover state silently unannounced (revalidation would
                         // see a current origin and do nothing). Abandon it so
                         // the next motion/revalidation starts a fresh hover.
-                        self.runtime.abandon_band_hover();
+                        self.runtime.borrow_mut().abandon_band_hover();
                         continue;
                     }
                     if self.dispatch_band_hover(hover, Some(&origin)) {
@@ -3968,6 +4013,7 @@ impl TerminalApp {
         }
         let admissions = self
             .runtime
+            .borrow_mut()
             .drain_band_admissions(bitty_runtime::COLD_ADMISSION_SELECTION_MAX);
         // Defense-in-depth: every `drive_tick` calls
         // `set_chrome_bands_with_mounts`, which eagerly retains only live
@@ -3987,7 +4033,7 @@ impl TerminalApp {
                         });
                         continue;
                     };
-                    if !self.runtime.band_origin_is_current(&origin) {
+                    if !self.runtime.borrow().band_origin_is_current(&origin) {
                         crate::logging::warn(|| {
                             format!(
                                 "bitty: cold click '{}:{}' dropped (origin is stale)",
@@ -4010,7 +4056,7 @@ impl TerminalApp {
                         });
                         continue;
                     };
-                    if !self.runtime.band_origin_is_current(&origin) {
+                    if !self.runtime.borrow().band_origin_is_current(&origin) {
                         crate::logging::warn(|| {
                             format!(
                                 "bitty: cold scroll '{}:{}' dropped (origin is stale)",
@@ -4250,9 +4296,9 @@ impl TerminalApp {
     /// Whether a capturing modal blocks workspace mutation (CTX-0889):
     /// the same set that swallows bound chords in `resolve_priority_for`.
     fn workspace_requests_blocked(&self) -> bool {
-        self.runtime.has_pending_ws_close()
-            || self.runtime.has_pending_close_confirm()
-            || self.runtime.overlay_modal_active()
+        self.runtime.borrow().has_pending_ws_close()
+            || self.runtime.borrow().has_pending_close_confirm()
+            || self.runtime.borrow().overlay_modal_active()
     }
 
     /// Applies one validated request; `false` when its target id is gone.
@@ -4261,7 +4307,7 @@ impl TerminalApp {
         let one_based = |index: usize| u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
         match request {
             WorkspaceRequest::FocusId(seq) => {
-                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                let Some(index) = self.runtime.borrow().workspace_index_by_seq(*seq) else {
                     return false;
                 };
                 let _ = self.apply_chrome_action(A::WorkspaceFocus(one_based(index)));
@@ -4277,31 +4323,37 @@ impl TerminalApp {
             }
             WorkspaceRequest::Close(target) => {
                 let index = match target {
-                    None => self.runtime.active_workspace_index(),
-                    Some(seq) => match self.runtime.workspace_index_by_seq(*seq) {
-                        Some(index) => index,
-                        None => return false,
-                    },
+                    None => self.runtime.borrow().active_workspace_index(),
+                    Some(seq) => {
+                        // CTX-1929: hoisted out of the inner match scrutinee
+                        // (guard release before the arm returns).
+                        let scrutinee = self.runtime.borrow().workspace_index_by_seq(*seq);
+                        match scrutinee {
+                            Some(index) => index,
+                            None => return false,
+                        }
+                    }
                 };
-                if index == self.runtime.active_workspace_index() {
+                if index == self.runtime.borrow().active_workspace_index() {
                     let _ = self.apply_chrome_action(A::WorkspaceClose);
                 } else {
-                    let _ = self.runtime.workspace_close_request_at(index);
+                    let _ = self.runtime.borrow_mut().workspace_close_request_at(index);
                 }
             }
             WorkspaceRequest::Rename { id: seq, name } => {
-                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                let Some(index) = self.runtime.borrow().workspace_index_by_seq(*seq) else {
                     return false;
                 };
                 // Same Core handler as `bitty ctl workspace rename`.
-                if let Err(err) = self.runtime.workspace_rename(index, name) {
+                let scrutinee = self.runtime.borrow_mut().workspace_rename(index, name);
+                if let Err(err) = scrutinee {
                     crate::logging::warn(|| {
                         format!("bitty: plugin workspace rename refused ({err})")
                     });
                 }
             }
             WorkspaceRequest::MovePanel(seq) => {
-                let Some(index) = self.runtime.workspace_index_by_seq(*seq) else {
+                let Some(index) = self.runtime.borrow().workspace_index_by_seq(*seq) else {
                     return false;
                 };
                 let _ = self.apply_chrome_action(A::WorkspaceMove(one_based(index)));
@@ -4331,15 +4383,16 @@ impl TerminalApp {
         for queued in requests {
             let id = ViewId::new(queued.panel_id);
             if queued.pinned {
-                if self.runtime.pinned_views().contains(&id) {
+                if self.runtime.borrow().pinned_views().contains(&id) {
                     continue;
                 }
-                if self.runtime.floated_views().contains(&id)
-                    || self.chrome.zoom.backup_leaf_count(&self.runtime) != Some(1)
+                if self.runtime.borrow().floated_views().contains(&id)
+                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
                 {
                     self.restore_zoom();
                 }
-                if let Err(error) = self.runtime.pin_floating(id) {
+                let scrutinee = self.runtime.borrow_mut().pin_floating(id);
+                if let Err(error) = scrutinee {
                     crate::logging::warn(|| {
                         format!(
                             "bitty: plugin pin request for panel {} refused ({error})",
@@ -4347,9 +4400,10 @@ impl TerminalApp {
                         )
                     });
                 }
-            } else if self.runtime.pinned_views().contains(&id) {
+            } else if self.runtime.borrow().pinned_views().contains(&id) {
                 self.restore_zoom();
-                if let Err(error) = self.runtime.unpin_floating(id) {
+                let scrutinee = self.runtime.borrow_mut().unpin_floating(id);
+                if let Err(error) = scrutinee {
                     crate::logging::warn(|| {
                         format!(
                             "bitty: plugin unpin request for panel {} refused ({error})",
@@ -4357,8 +4411,8 @@ impl TerminalApp {
                         )
                     });
                 }
-            } else if !self.runtime.layout().leaf_ids().contains(&id)
-                && !self.runtime.floated_views().contains(&id)
+            } else if !self.runtime.borrow().layout().leaf_ids().contains(&id)
+                && !self.runtime.borrow().floated_views().contains(&id)
             {
                 crate::logging::warn(|| {
                     format!(
@@ -4427,7 +4481,11 @@ impl TerminalApp {
         panel_id: bitty_runtime::registry::PanelId,
         restored: &bitty_runtime::registry::RestoredPanelContent,
     ) {
-        if self.runtime.restore_released_panel_presentation(restored) {
+        if self
+            .runtime
+            .borrow_mut()
+            .restore_released_panel_presentation(restored)
+        {
             return;
         }
         // A no-op is ordinary: the edge closed the leaf (a disposal), the layer
@@ -4459,7 +4517,7 @@ impl TerminalApp {
         panel_id: bitty_runtime::registry::PanelId,
         view_id: ViewId,
     ) {
-        let Some(mode) = self.runtime.view_presentation(view_id) else {
+        let Some(mode) = self.runtime.borrow().view_presentation(view_id) else {
             crate::logging::warn(|| {
                 format!(
                     "bitty: panel {} presentation not observed (leaf {view_id} is gone)",
@@ -4468,7 +4526,7 @@ impl TerminalApp {
             });
             return;
         };
-        let Some(scene_host) = self.runtime.scene_host() else {
+        let Some(scene_host) = self.runtime.borrow().scene_host() else {
             return;
         };
         if let Err(error) = scene_host
@@ -4494,15 +4552,17 @@ impl TerminalApp {
     /// click-to-focus and selection, and a plugin can only observe the press
     /// (the panel input payload carries no hit-test coordinates).
     pub(crate) fn route_focused_plugin_panel_input(&mut self, kind: &WindowEventKind) -> bool {
-        let Some(focused) = self.runtime.focused_view() else {
+        let Some(focused) = self.runtime.borrow().focused_view() else {
             return false;
         };
         // Terminal leaves (pane sessions or primary view) always keep the
         // normal terminal input path.
-        if self.runtime.has_pane_session(&focused) || self.runtime.primary_view() == Some(focused) {
+        if self.runtime.borrow().has_pane_session(&focused)
+            || self.runtime.borrow().primary_view() == Some(focused)
+        {
             return false;
         }
-        let Some(scene_host) = self.runtime.scene_host() else {
+        let Some(scene_host) = self.runtime.borrow().scene_host() else {
             return false;
         };
         let Some((panel_id, owner)) = ({
@@ -4649,9 +4709,9 @@ impl TerminalApp {
         let requests = plugin_runtime.drain_fx_pulses();
         for queued in requests {
             let id = ViewId::new(queued.view);
-            let is_live_view = self.runtime.layout().leaf_ids().contains(&id)
-                || self.runtime.floated_views().contains(&id)
-                || self.runtime.pinned_views().contains(&id);
+            let is_live_view = self.runtime.borrow().layout().leaf_ids().contains(&id)
+                || self.runtime.borrow().floated_views().contains(&id)
+                || self.runtime.borrow().pinned_views().contains(&id);
             if !is_live_view {
                 crate::logging::warn(|| {
                     format!(
@@ -4661,7 +4721,11 @@ impl TerminalApp {
                 });
                 continue;
             }
-            if !self.runtime.trigger_fx_pulse(id, std::time::Instant::now()) {
+            if !self
+                .runtime
+                .borrow_mut()
+                .trigger_fx_pulse(id, std::time::Instant::now())
+            {
                 crate::logging::warn(|| {
                     format!(
                         "bitty: plugin fx request for view {} refused (instant or at capacity)",
@@ -4690,7 +4754,11 @@ impl TerminalApp {
         let backend = plugin_runtime.theme_persist_backend();
         let requests = plugin_runtime.drain_theme_requests();
         for queued in requests {
-            if let Err(error) = self.runtime.apply_theme_request(&queued, &backend) {
+            let scrutinee = self
+                .runtime
+                .borrow_mut()
+                .apply_theme_request(&queued, &backend);
+            if let Err(error) = scrutinee {
                 crate::logging::warn(|| format!("bitty: plugin theme request dropped ({error})"));
             }
         }
@@ -4720,8 +4788,8 @@ impl TerminalApp {
         };
         let requests = plugin_runtime.drain_submit_requests();
         for queued in requests {
-            let dropped_by_content = self.runtime.input_owner_content_frozen();
-            if !self.runtime.push_input_bytes(&queued.frame) {
+            let dropped_by_content = self.runtime.borrow().input_owner_content_frozen();
+            if !self.runtime.borrow_mut().push_input_bytes(&queued.frame) {
                 if dropped_by_content {
                     crate::logging::warn(|| {
                         format!(
@@ -4761,7 +4829,7 @@ impl TerminalApp {
             return;
         };
         let submitted = crate::component_bridge::pump_component_requests(
-            &mut self.runtime,
+            &mut self.runtime.borrow_mut(),
             plugin_runtime,
             std::time::Instant::now(),
         );
@@ -4784,9 +4852,10 @@ impl TerminalApp {
     /// workspace that still owns a live pane. Floats are stored per slot and
     /// are unaffected by zoom, so they are added unchanged.
     pub(crate) fn workspace_real_panel_count(&self, index: usize) -> Option<usize> {
-        let (stashed_tiled, floats) = self.runtime.workspace_panel_counts(index)?;
+        let (stashed_tiled, floats) = self.runtime.borrow().workspace_panel_counts(index)?;
         let tiled = self
             .runtime
+            .borrow()
             .workspace_seq_at(index)
             .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
             .map_or(stashed_tiled, |ids| ids.len());
@@ -4810,7 +4879,7 @@ impl TerminalApp {
     /// gesture. Leaving it running means a window with zero panes that only a
     /// WM `CloseRequested` or `Mod+T` can end (bitty#3201).
     fn window_has_nothing_left(&self) -> bool {
-        self.runtime.pane_session_count() == 0 && self.effective_window_leaf_count() == 0
+        self.runtime.borrow().pane_session_count() == 0 && self.effective_window_leaf_count() == 0
     }
 
     /// Checks for exited shell processes across both split pane sessions and
@@ -4847,11 +4916,14 @@ impl TerminalApp {
     /// leaf. See [`Self::window_has_nothing_left`].
     pub(crate) fn reap_exited_shells(&mut self) -> ShellExitOutcome {
         // 1. Split pane sessions: poll each active session's child.
-        let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.pane_view_ids();
+        let pane_ids: Vec<bitty_runtime::ViewId> = self.runtime.borrow().pane_view_ids();
         let mut closed_any = false;
 
         for view in pane_ids {
-            if let Some(status) = self.runtime.pane_try_wait(&view) {
+            // CTX-1929: hoist the poll out of the `if let` scrutinee so the
+            // guard is released before the close paths run.
+            let status = self.runtime.borrow_mut().pane_try_wait(&view);
+            if let Some(status) = status {
                 // CTX-1039 (#1843): the session ends only when the whole
                 // window is down to its last panel. A shell exiting in one
                 // workspace while others still hold panels closes that
@@ -4889,12 +4961,12 @@ impl TerminalApp {
                 // panel behind (unkillable). Discard the floating view
                 // instead: store entry + offsets + session + focus/primary
                 // fixups, never a stuck empty panel.
-                if self.runtime.floated_views().contains(&view)
-                    || self.runtime.pinned_views().contains(&view)
+                if self.runtime.borrow().floated_views().contains(&view)
+                    || self.runtime.borrow().pinned_views().contains(&view)
                 {
-                    let was_float = self.runtime.floated_views().contains(&view);
+                    let was_float = self.runtime.borrow().floated_views().contains(&view);
                     self.restore_zoom();
-                    self.runtime.discard_floating_view(view);
+                    self.runtime.borrow_mut().discard_floating_view(view);
                     // CTX-1336 (#2221): the exited float may have been the
                     // active workspace's last live view (its tiled base
                     // already closed). Leaving the slot with no layout
@@ -4904,13 +4976,18 @@ impl TerminalApp {
                     // remaining workspace keeps the window-close gesture
                     // handled by the effective-window-count gate above.
                     if was_float
-                        && self.runtime.layout().leaf_count() == 0
-                        && self.runtime.floated_views().is_empty()
-                        && self.runtime.pinned_count() == 0
-                        && self.runtime.workspace_count() > 1
+                        && self.runtime.borrow().layout().leaf_count() == 0
+                        && self.runtime.borrow().floated_views().is_empty()
+                        && self.runtime.borrow().pinned_count() == 0
+                        && self.runtime.borrow().workspace_count() > 1
                     {
-                        let workspace = self.runtime.active_workspace_index();
-                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                        let workspace = self.runtime.borrow().active_workspace_index();
+                        if self
+                            .runtime
+                            .borrow_mut()
+                            .workspace_close_at(workspace)
+                            .is_ok()
+                        {
                             crate::logging::info(|| {
                                 format!(
                                     "bitty: pane shell {view:?} exited — empty workspace pruned"
@@ -4937,15 +5014,23 @@ impl TerminalApp {
                 // (CTX-1336), so both keep the existing leaf handling.
                 self.chrome
                     .zoom
-                    .restore_for_view_mutation(&mut self.runtime, view);
-                if let Some(workspace) = self.runtime.workspace_index_of_view(&view) {
+                    .restore_for_view_mutation(&mut self.runtime.borrow_mut(), view);
+                // CTX-1929: hoist the lookup out of the `if let` scrutinee so
+                // the guard is released before the branch runs.
+                let workspace_of = self.runtime.borrow().workspace_index_of_view(&view);
+                if let Some(workspace) = workspace_of {
                     let sole_panel = self.workspace_real_panel_count(workspace) == Some(1);
                     if sole_panel
-                        && self.runtime.workspace_count() > 1
-                        && self.runtime.floated_count() == 0
-                        && self.runtime.pinned_count() == 0
+                        && self.runtime.borrow().workspace_count() > 1
+                        && self.runtime.borrow().floated_count() == 0
+                        && self.runtime.borrow().pinned_count() == 0
                     {
-                        if self.runtime.workspace_close_at(workspace).is_ok() {
+                        if self
+                            .runtime
+                            .borrow_mut()
+                            .workspace_close_at(workspace)
+                            .is_ok()
+                        {
                             crate::logging::info(|| {
                                 format!(
                                     "bitty: pane shell {view:?} exited — empty workspace pruned"
@@ -4967,26 +5052,28 @@ impl TerminalApp {
                 // with panels elsewhere. Keep the emptied workspace
                 // selected and leave its tile session-less instead of
                 // exiting; the layout surgery below refuses singletons.
-                if self.runtime.layout().leaf_ids().contains(&view)
-                    && self.runtime.leaf_count() <= 1
+                if self.runtime.borrow().layout().leaf_ids().contains(&view)
+                    && self.runtime.borrow().leaf_count() <= 1
                 {
                     // CTX-1337 (#2222) & #3074: a detached float or pinned
                     // panel survives outside the live layout, so the exited
                     // last tiled pane must not keep its session-less leaf
                     // focused. Retire the leaf and hand focus plus primary
                     // ownership to the surviving float/pin, matching close_view.
-                    if self.runtime.floated_count() > 0
+                    if self.runtime.borrow().floated_count() > 0
                         && self
                             .runtime
+                            .borrow_mut()
                             .retire_sole_tiled_leaf_for_floated(view)
                             .is_some()
                     {
                         crate::logging::info(|| {
                             format!("bitty: pane shell {view:?} exited — float base leaf retired")
                         });
-                    } else if self.runtime.pinned_count() > 0
+                    } else if self.runtime.borrow().pinned_count() > 0
                         && self
                             .runtime
+                            .borrow_mut()
                             .retire_sole_tiled_leaf_for_pinned(view)
                             .is_some()
                     {
@@ -4994,7 +5081,7 @@ impl TerminalApp {
                             format!("bitty: pane shell {view:?} exited — pinned base leaf retired")
                         });
                     }
-                    self.runtime.close_pane_session(&view);
+                    self.runtime.borrow_mut().close_pane_session(&view);
                     self.push_pending_exit(view.0, status.code());
                     closed_any = true;
                     continue;
@@ -5014,13 +5101,13 @@ impl TerminalApp {
                 // session: never strand a session-less live tile.
                 self.chrome
                     .zoom
-                    .restore_for_view_mutation(&mut self.runtime, view);
-                let mut layout = self.runtime.layout().clone();
+                    .restore_for_view_mutation(&mut self.runtime.borrow_mut(), view);
+                let mut layout = self.runtime.borrow().layout().clone();
                 if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
-                    self.runtime.set_layout_closing(layout, view);
-                    self.runtime.close_pane_session(&view);
-                } else if self.runtime.remove_stashed_view(view) {
-                    self.runtime.close_pane_session(&view);
+                    self.runtime.borrow_mut().set_layout_closing(layout, view);
+                    self.runtime.borrow_mut().close_pane_session(&view);
+                } else if self.runtime.borrow_mut().remove_stashed_view(view) {
+                    self.runtime.borrow_mut().close_pane_session(&view);
                 } else {
                     eprintln!(
                         "warning: pane shell {view:?} exited but its leaf is in no layout — session kept"
@@ -5049,10 +5136,13 @@ impl TerminalApp {
         // Both halves read the same population: the count substitutes the
         // active workspace's zoom backup, so a live panel behind a zoom proxy
         // is not invisible here (`zoom a pane, type exit`, bitty#3201 review).
-        if let Some(status) = self.runtime.primary_exit_status() {
+        // CTX-1929: hoist the poll out of the `if let` scrutinee so the guard
+        // is released before the close paths run.
+        let status = self.runtime.borrow_mut().primary_exit_status();
+        if let Some(status) = status {
             let live_panel_leaf = self.window_live_non_terminal_leaf_count();
             if live_panel_leaf == 0
-                && (self.runtime.pane_session_count() == 0
+                && (self.runtime.borrow().pane_session_count() == 0
                     || self.effective_window_leaf_count() <= 1)
             {
                 crate::logging::info(|| {
@@ -5063,7 +5153,12 @@ impl TerminalApp {
                         status.signal()
                     )
                 });
-                let terminal_id = self.runtime.primary_view().map(|view| view.0).unwrap_or(0);
+                let terminal_id = self
+                    .runtime
+                    .borrow()
+                    .primary_view()
+                    .map(|view| view.0)
+                    .unwrap_or(0);
                 self.push_pending_exit(terminal_id, status.code());
                 return ShellExitOutcome::AppExiting;
             }
@@ -5072,21 +5167,24 @@ impl TerminalApp {
             // survive: close the primary pane leaf so the rest takes over
             // (CTX-1860: a plugin panel leaf counts here exactly like a split
             // pane — it is a live leaf the window must keep painting).
-            if let Some(primary_view) = self.runtime.primary_view() {
+            // CTX-1929: hoist the lookup out of the `if let` scrutinee so the
+            // guard is released before the branch runs.
+            let primary_of = self.runtime.borrow().primary_view();
+            if let Some(primary_view) = primary_of {
                 crate::logging::info(|| {
                     format!(
                         "bitty: primary shell {primary_view:?} exited (success={} code={} signal={:?}) with {} panes and {} live panel leaves — closing primary pane",
                         status.is_success(),
                         status.code(),
                         status.signal(),
-                        self.runtime.pane_session_count(),
+                        self.runtime.borrow().pane_session_count(),
                         live_panel_leaf
                     )
                 });
                 if !self
                     .chrome
                     .zoom
-                    .restore_for_view_mutation(&mut self.runtime, primary_view)
+                    .restore_for_view_mutation(&mut self.runtime.borrow_mut(), primary_view)
                 {
                     self.restore_zoom();
                 }
@@ -5099,22 +5197,34 @@ impl TerminalApp {
                 // float/pin cases are handled first and keep their behavior.
                 let primary_sole_workspace = self
                     .runtime
+                    .borrow()
                     .workspace_index_of_view(&primary_view)
                     .filter(|workspace| {
                         self.workspace_real_panel_count(*workspace) == Some(1)
-                            && self.runtime.workspace_count() > 1
-                            && self.runtime.floated_count() == 0
-                            && self.runtime.pinned_count() == 0
+                            && self.runtime.borrow().workspace_count() > 1
+                            && self.runtime.borrow().floated_count() == 0
+                            && self.runtime.borrow().pinned_count() == 0
                     });
                 // Issue #2141: the primary owner may sit on a detached
                 // float (it keeps primary while detached). Layout surgery
                 // cannot remove it, so discard the floating view instead.
-                if self.runtime.floated_views().contains(&primary_view)
-                    || self.runtime.pinned_views().contains(&primary_view)
+                if self
+                    .runtime
+                    .borrow()
+                    .floated_views()
+                    .contains(&primary_view)
+                    || self.runtime.borrow().pinned_views().contains(&primary_view)
                 {
-                    self.runtime.discard_floating_view(primary_view);
+                    self.runtime
+                        .borrow_mut()
+                        .discard_floating_view(primary_view);
                 } else if let Some(workspace) = primary_sole_workspace {
-                    if self.runtime.workspace_close_at(workspace).is_ok() {
+                    if self
+                        .runtime
+                        .borrow_mut()
+                        .workspace_close_at(workspace)
+                        .is_ok()
+                    {
                         crate::logging::info(|| {
                             format!(
                                 "bitty: primary shell {primary_view:?} exited — empty workspace pruned"
@@ -5127,9 +5237,10 @@ impl TerminalApp {
                             )
                         });
                     }
-                } else if self.runtime.floated_count() > 0
+                } else if self.runtime.borrow().floated_count() > 0
                     && self
                         .runtime
+                        .borrow_mut()
                         .retire_sole_tiled_leaf_for_floated(primary_view)
                         .is_some()
                 {
@@ -5142,9 +5253,10 @@ impl TerminalApp {
                             "bitty: primary shell {primary_view:?} exited — float base leaf retired"
                         )
                     });
-                } else if self.runtime.pinned_count() > 0
+                } else if self.runtime.borrow().pinned_count() > 0
                     && self
                         .runtime
+                        .borrow_mut()
                         .retire_sole_tiled_leaf_for_pinned(primary_view)
                         .is_some()
                 {
@@ -5158,10 +5270,12 @@ impl TerminalApp {
                         )
                     });
                 } else {
-                    let mut layout = self.runtime.layout().clone();
+                    let mut layout = self.runtime.borrow().layout().clone();
                     if crate::chrome_keys::close_focused_leaf(&mut layout, primary_view) {
-                        self.runtime.set_layout_closing(layout, primary_view);
-                    } else if self.runtime.remove_stashed_view(primary_view) {
+                        self.runtime
+                            .borrow_mut()
+                            .set_layout_closing(layout, primary_view);
+                    } else if self.runtime.borrow_mut().remove_stashed_view(primary_view) {
                         // The primary owner may be in an inactive workspace's
                         // restored zoom backup. The live layout belongs to a
                         // different workspace, so remove the dead owner from
@@ -5228,7 +5342,7 @@ impl TerminalApp {
     /// session is waiting to be reaped, keeping idle windows on the
     /// zero-periodic-wakeup path.
     pub(crate) fn shell_exit_poll_deadline(&mut self) -> Option<std::time::Instant> {
-        if !self.runtime.has_unreaped_eof_session() {
+        if !self.runtime.borrow().has_unreaped_eof_session() {
             self.shell_exit_poll = None;
             return None;
         }
@@ -5330,21 +5444,27 @@ impl TerminalApp {
         // obscures the grid — never show an underlying URL pointer. Issue
         // #2480 extends the same rule to modal panel overlays and to a
         // pointer that left the window.
-        let overlay_active = self.overlay_capture_active() || self.runtime.overlay_modal_active();
-        let inside = self.runtime.cursor_inside_window();
+        let overlay_active =
+            self.overlay_capture_active() || self.runtime.borrow().overlay_modal_active();
+        let inside = self.runtime.borrow().cursor_inside_window();
         let hovered = inside
             && !overlay_active
-            && (self.runtime.hovered_hyperlink_span().is_some()
-                || self.runtime.hovered_plaintext_span().is_some());
+            && (self.runtime.borrow().hovered_hyperlink_span().is_some()
+                || self.runtime.borrow().hovered_plaintext_span().is_some());
+        // CTX-1929: the two probes below are read-only, so evaluating them
+        // before the chain is behaviour-identical and keeps each borrow guard
+        // out of the else-arms.
+        let resize_icon_probe = self.runtime.borrow().resize_cursor_icon();
+        let pointer_shape_probe = self.runtime.borrow().focused_pointer_shape();
         let icon = if !inside || overlay_active {
             bitty_platform::CursorIcon::Default
-        } else if let Some(resize_icon) = self.runtime.resize_cursor_icon() {
+        } else if let Some(resize_icon) = resize_icon_probe {
             resize_icon
         } else if hovered {
             bitty_platform::CursorIcon::Pointer
-        } else if let Some(shape) = self.runtime.focused_pointer_shape() {
+        } else if let Some(shape) = pointer_shape_probe {
             bitty_runtime::runtime::pointer::cursor_icon_for_shape(shape)
-        } else if self.runtime.pointer_over_selectable_text() {
+        } else if self.runtime.borrow().pointer_over_selectable_text() {
             bitty_platform::CursorIcon::Text
         } else {
             bitty_platform::CursorIcon::Default
@@ -5373,7 +5493,11 @@ impl TerminalApp {
     /// reported loudly, never silently swallowed, because a refused click is
     /// user-visible intent.
     pub(crate) fn activate_pending_hyperlink_now(&mut self) {
-        match self.runtime.activate_pending_hyperlink(&[], false) {
+        let scrutinee = self
+            .runtime
+            .borrow_mut()
+            .activate_pending_hyperlink(&[], false);
+        match scrutinee {
             Ok(uri) => {
                 crate::logging::info(|| format!("bitty: opened hyperlink {uri}"));
             }
@@ -5566,11 +5690,14 @@ impl TerminalApp {
         let Some(claim) = crate::ctl::panel_content::claim() else {
             return false;
         };
-        let reply = match crate::ctl::apply_control(
-            &mut self.runtime,
+        // CTX-1929: hoist the apply out of the match scrutinee (guard release
+        // before the reply is built).
+        let scrutinee = crate::ctl::apply_control(
+            &mut self.runtime.borrow_mut(),
             claim.method(),
             Some(claim.params()),
-        ) {
+        );
+        let reply = match scrutinee {
             Ok(result) => PanelContentReply::Applied { result },
             Err((category, code, message)) => PanelContentReply::Refused {
                 category,
@@ -5642,7 +5769,7 @@ impl TerminalApp {
                                 attached,
                                 self.windows.ids(),
                                 self.windows.active(),
-                                self.runtime.window_surface_summary()
+                                self.runtime.borrow().window_surface_summary()
                             )
                         });
                     }
@@ -5765,7 +5892,7 @@ impl TerminalApp {
         }
         // The closed window's own swap chain (a no-op when it was the primary:
         // its surface was replaced by the promoted one).
-        let released = self.runtime.release_window_surface(id);
+        let released = self.runtime.borrow_mut().release_window_surface(id);
         let Some(closed) = self.windows.close(id) else {
             return true;
         };
@@ -5782,7 +5909,7 @@ impl TerminalApp {
                 self.windows.focused(),
                 self.windows.admitted(),
                 self.windows.removed(),
-                self.runtime.window_surface_summary()
+                self.runtime.borrow().window_surface_summary()
             )
         });
         // Dropping the row releases the last handle to that window, so the OS
@@ -5814,7 +5941,8 @@ impl TerminalApp {
         {
             return false;
         }
-        if let Err(error) = self.runtime.promote_window_surface(survivor) {
+        let scrutinee = self.runtime.borrow_mut().promote_window_surface(survivor);
+        if let Err(error) = scrutinee {
             crate::logging::warn(|| {
                 format!(
                     "warning: window {} cannot take the primary surface over ({error})",
@@ -5845,7 +5973,7 @@ impl TerminalApp {
                 "bitty: window {} promoted to primary windows={:?} window_surfaces=[{}]",
                 survivor.get(),
                 self.windows.ids(),
-                self.runtime.window_surface_summary()
+                self.runtime.borrow().window_surface_summary()
             )
         });
         true
@@ -5870,18 +5998,18 @@ impl TerminalApp {
         let mut released = 0usize;
         let mut ids = Vec::with_capacity(rows.len());
         for row in &rows {
-            if self.runtime.release_window_surface(row.id) {
+            if self.runtime.borrow_mut().release_window_surface(row.id) {
                 released += 1;
             }
             ids.push(row.id.get());
         }
-        let primary_released = if self.runtime.has_gpu() {
-            self.runtime.detach_gpu();
+        let primary_released = if self.runtime.borrow().has_gpu() {
+            self.runtime.borrow_mut().detach_gpu();
             true
         } else {
             false
         };
-        let ledger = self.runtime.window_surface_ledger();
+        let ledger = self.runtime.borrow().window_surface_ledger();
         crate::logging::info(|| {
             format!(
                 "bitty: window teardown ids={ids:?} surfaces_released={released} primary_surface_released={primary_released} admitted={} removed={} created={} released={} live={} window_surfaces=[{}]",
@@ -5890,7 +6018,7 @@ impl TerminalApp {
                 ledger.created(),
                 ledger.released(),
                 ledger.live(),
-                self.runtime.window_surface_summary()
+                self.runtime.borrow().window_surface_summary()
             )
         });
         // Dropping the rows destroys the secondary OS windows; clearing the
@@ -6028,10 +6156,11 @@ impl TerminalApp {
         }
         self.deferred_window_surfaces
             .retain(|pending| *pending != id);
-        match self
-            .runtime
-            .attach_window_surface(id, target, inner, self.window.opacity)
-        {
+        let scrutinee =
+            self.runtime
+                .borrow_mut()
+                .attach_window_surface(id, target, inner, self.window.opacity);
+        match scrutinee {
             Ok(()) => {
                 self.windows.mark_attached(id);
                 crate::logging::info(|| {
@@ -6041,7 +6170,7 @@ impl TerminalApp {
                         inner.width(),
                         inner.height(),
                         bitty_platform::sanitize_opacity(self.window.opacity),
-                        self.runtime.window_surface_summary()
+                        self.runtime.borrow().window_surface_summary()
                     )
                 });
                 true
@@ -6076,7 +6205,8 @@ impl TerminalApp {
             }
             return;
         }
-        match self.runtime.resize_window_surface(id, inner) {
+        let scrutinee = self.runtime.borrow_mut().resize_window_surface(id, inner);
+        match scrutinee {
             Ok(()) => {
                 crate::logging::info(|| {
                     format!(
@@ -6084,7 +6214,7 @@ impl TerminalApp {
                         id.get(),
                         inner.width(),
                         inner.height(),
-                        self.runtime.window_surface_summary()
+                        self.runtime.borrow().window_surface_summary()
                     )
                 });
             }
@@ -6105,7 +6235,7 @@ impl TerminalApp {
     /// Called once per tick; the comparison against the last reported count
     /// keeps this silent on the steady path (no drop, no log, no formatting).
     fn report_window_surface_drops(&mut self) {
-        let drops = self.runtime.window_surface_drops();
+        let drops = self.runtime.borrow().window_surface_drops();
         if drops == self.window_surface_drops_logged {
             return;
         }
@@ -6114,7 +6244,7 @@ impl TerminalApp {
         crate::logging::warn(|| {
             format!(
                 "warning: {new_drops} secondary window surface(s) released after refusing a frame; remaining window_surfaces=[{}]",
-                self.runtime.window_surface_summary()
+                self.runtime.borrow().window_surface_summary()
             )
         });
     }
@@ -6122,7 +6252,7 @@ impl TerminalApp {
     /// Attempts to attach a real GPU surface after window creation (single-window slice).
     pub(crate) fn try_attach_gpu(&mut self, handle: &WindowHandle) {
         // Do not re-attach if already has GPU
-        if self.runtime.has_gpu() {
+        if self.runtime.borrow().has_gpu() {
             return;
         }
         let target = handle.surface_target();
@@ -6138,8 +6268,10 @@ impl TerminalApp {
         // derive the grid from the physical inner_size — never the logical
         // size path (the suspected original sin behind #232).
         let scale = target.scale_factor().get();
-        self.runtime.apply_dpi_scale(scale, Some(inner));
-        let snap = self.runtime.snapshot();
+        self.runtime
+            .borrow_mut()
+            .apply_dpi_scale(scale, Some(inner));
+        let snap = self.runtime.borrow().snapshot();
         // Issue #1799: report the Windows WGL backend fallback reason before
         // touching the driver — when the guard excluded GL, `GpuContext`
         // never starts the overflow-prone `wgpu-hal` WGL init thread and
@@ -6174,13 +6306,14 @@ impl TerminalApp {
                             let attached = if off_thread_present {
                                 // Ownership of the surface and GPU context
                                 // moves to the `bitty-present` worker.
-                                match self.runtime.attach_gpu_async(
+                                let scrutinee = self.runtime.borrow_mut().attach_gpu_async(
                                     gpu,
                                     surface,
                                     target.clone(),
                                     extent,
                                     self.window.opacity,
-                                ) {
+                                );
+                                match scrutinee {
                                     Ok(()) => true,
                                     Err(err) => {
                                         crate::logging::warn(|| {
@@ -6192,7 +6325,7 @@ impl TerminalApp {
                                     }
                                 }
                             } else {
-                                self.runtime.attach_gpu(gpu, surface);
+                                self.runtime.borrow_mut().attach_gpu(gpu, surface);
                                 true
                             };
                             if attached {
@@ -6201,10 +6334,10 @@ impl TerminalApp {
                                         "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} text_stack={} presentation={})",
                                         extent.width(),
                                         extent.height(),
-                                        self.runtime.dpi_scale(),
+                                        self.runtime.borrow().dpi_scale(),
                                         snap.width,
                                         snap.height,
-                                        self.runtime.text_stack(),
+                                        self.runtime.borrow().text_stack(),
                                         if off_thread_present {
                                             "off-thread"
                                         } else {
@@ -6259,14 +6392,16 @@ impl AppHandler for TerminalApp {
                 w.wake_pty();
             }
         });
-        self.runtime.set_present_waker(Some(present_wake));
+        self.runtime
+            .borrow_mut()
+            .set_present_waker(Some(present_wake));
         let shared_pty = std::sync::Arc::clone(&shared);
         let pty_waker: bitty_runtime::PtyWaker = std::sync::Arc::new(move || {
             if let Ok(w) = shared_pty.lock() {
                 w.wake_pty();
             }
         });
-        self.runtime.set_pty_waker(pty_waker);
+        self.runtime.borrow_mut().set_pty_waker(pty_waker);
         // CTX-0235: wake the same event loop when an IPC control action is
         // enqueued, so an idle window (`ControlFlow::Wait`, no PTY damage)
         // drains the control queue promptly instead of letting every verb
@@ -6416,7 +6551,7 @@ impl TerminalApp {
                     // winit delivers for the same transition, so the lifecycle
                     // mark follows the gate transition (the same condition
                     // `set_surface_gate` uses) instead of the edge count.
-                    if !self.runtime.is_surface_visible() {
+                    if !self.runtime.borrow().is_surface_visible() {
                         crash_report::lifecycle(crash_report::Lifecycle::Revealed);
                     }
                     // Same contract as `Resumed`: re-queue on full redraw
@@ -6536,8 +6671,8 @@ impl TerminalApp {
                 {
                     Some((
                         "mouse",
-                        self.runtime.has_pending_paste(),
-                        self.runtime.pending_input_len(),
+                        self.runtime.borrow().has_pending_paste(),
+                        self.runtime.borrow().pending_input_len(),
                     ))
                 }
                 WindowEventKind::KeyboardInput(key)
@@ -6554,8 +6689,8 @@ impl TerminalApp {
                     };
                     Some((
                         kind,
-                        self.runtime.has_pending_paste(),
-                        self.runtime.pending_input_len(),
+                        self.runtime.borrow().has_pending_paste(),
+                        self.runtime.borrow().pending_input_len(),
                     ))
                 }
                 _ => None,
@@ -6563,7 +6698,10 @@ impl TerminalApp {
             _ => None,
         };
         self.watchdog_phase(Phase::RouteEvent);
-        let should_exit = self.runtime.handle_platform_event(event.clone());
+        let should_exit = self
+            .runtime
+            .borrow_mut()
+            .handle_platform_event(event.clone());
         if should_exit {
             crate::logging::info(|| format!("bitty: exit requested ({event:?})"));
             self.watchdog_phase(Phase::Shutdown);
@@ -6606,9 +6744,12 @@ impl TerminalApp {
         // CTX-0943: while a focusable overlay capture holds, the modal owns
         // all input — drop (never open) a minted URL gesture so a
         // Ctrl+release over a URL beneath the modal cannot escape it.
-        if self.runtime.has_pending_hyperlink_activation() {
+        if self.runtime.borrow().has_pending_hyperlink_activation() {
             if self.overlay_capture_active() {
-                let _ = self.runtime.drop_pending_hyperlink_activation();
+                let _ = self
+                    .runtime
+                    .borrow_mut()
+                    .drop_pending_hyperlink_activation();
             } else {
                 self.activate_pending_hyperlink_now();
             }
@@ -6638,7 +6779,8 @@ impl TerminalApp {
                 kind: WindowEventKind::CloseRequested,
             }
         ) {
-            if let Some(summary) = self.runtime.close_confirm_banner_text() {
+            let scrutinee = self.runtime.borrow().close_confirm_banner_text();
+            if let Some(summary) = scrutinee {
                 eprintln!("bitty: window close PENDING -> {summary}");
             }
         }
@@ -6647,10 +6789,11 @@ impl TerminalApp {
         // input bytes means the repeat gesture confirmed delivery; an Esc
         // that cleared pending without new bytes means it was cancelled.
         if let Some((probe_kind, had_pending, before_len)) = paste_probe {
-            let has_pending = self.runtime.has_pending_paste();
-            let after_len = self.runtime.pending_input_len();
+            let has_pending = self.runtime.borrow().has_pending_paste();
+            let after_len = self.runtime.borrow().pending_input_len();
             if has_pending {
-                if let Some(summary) = self.runtime.pending_paste_summary() {
+                let scrutinee = self.runtime.borrow().pending_paste_summary();
+                if let Some(summary) = scrutinee {
                     eprintln!("bitty: paste -> {summary}");
                 }
             } else if had_pending && after_len > before_len {
@@ -6704,7 +6847,7 @@ impl TerminalApp {
                             // via winit's SurfaceTarget and present via tick.
                             self.try_attach_gpu(&handle_for_gpu);
                             crash_report::lifecycle(crash_report::Lifecycle::WindowCreated);
-                            if self.runtime.has_gpu() {
+                            if self.runtime.borrow().has_gpu() {
                                 crash_report::lifecycle(crash_report::Lifecycle::GpuAttached);
                             } else {
                                 crash_report::lifecycle(crash_report::Lifecycle::GpuAttachFailed);
@@ -6716,7 +6859,7 @@ impl TerminalApp {
                             // single-window case is unchanged: the row holds a
                             // handle clone of the same window the hot path
                             // keeps in `WindowState`.
-                            let state = if self.runtime.has_gpu() {
+                            let state = if self.runtime.borrow().has_gpu() {
                                 SurfaceState::Attached
                             } else {
                                 SurfaceState::Unattached
@@ -6748,10 +6891,10 @@ impl TerminalApp {
                                 format!(
                                     "bitty: window created id={} gpu={} text_stack={} focused={:?} leafs={} ime=allowed",
                                     id.get(),
-                                    self.runtime.has_gpu(),
-                                    self.runtime.text_stack(),
-                                    self.runtime.focused_view(),
-                                    self.runtime.leaf_count()
+                                    self.runtime.borrow().has_gpu(),
+                                    self.runtime.borrow().text_stack(),
+                                    self.runtime.borrow().focused_view(),
+                                    self.runtime.borrow().leaf_count()
                                 )
                             });
                         }
@@ -6795,13 +6938,15 @@ impl TerminalApp {
                         // the same live scaled cells.
                         if let WindowEventKind::ScaleFactorChanged(factor) = &kind {
                             let physical = self.window.handle.as_ref().map(|win| win.inner_size());
-                            self.runtime.apply_dpi_scale(factor.get(), physical);
-                            let snap = self.runtime.snapshot();
+                            self.runtime
+                                .borrow_mut()
+                                .apply_dpi_scale(factor.get(), physical);
+                            let snap = self.runtime.borrow().snapshot();
                             crate::logging::info(|| {
                                 format!(
                                     "bitty: dpi adopted scale={} dpi={} grid={}x{} physical={} surface={:?}",
                                     factor.get(),
-                                    self.runtime.dpi_scale(),
+                                    self.runtime.borrow().dpi_scale(),
                                     snap.width,
                                     snap.height,
                                     physical.map_or(String::from("none"), |p| format!(
@@ -6809,7 +6954,7 @@ impl TerminalApp {
                                         p.width(),
                                         p.height()
                                     )),
-                                    self.runtime.surface_extent().map(|e| format!(
+                                    self.runtime.borrow().surface_extent().map(|e| format!(
                                         "{}x{}",
                                         e.width(),
                                         e.height()
@@ -6836,7 +6981,7 @@ impl TerminalApp {
                         // being sampled, so the last committed frame reached
                         // the screen; without this the runtime would force a
                         // corrective repaint it does not need.
-                        self.runtime.note_present_confirmed();
+                        self.runtime.borrow_mut().note_present_confirmed();
                         // bitty#2830 hypothesis 2: while the gate is closed a
                         // repair probe asked for this frame. The compositor
                         // serving it proves the surface is mapped again even
@@ -6896,7 +7041,7 @@ impl TerminalApp {
                 // surface-creation budgets and its worker is gone. A fresh
                 // GPU context/surface is the only remaining recovery path;
                 // the runtime rate-limits this to one attempt per cooldown.
-                if self.runtime.needs_gpu_reattach() {
+                if self.runtime.borrow_mut().needs_gpu_reattach() {
                     if let Some(handle) = self.window.handle.clone() {
                         crate::logging::info(|| {
                             String::from("bitty: presenter recovery exhausted; reattaching GPU")
@@ -6922,6 +7067,7 @@ impl TerminalApp {
                 let repair_now = std::time::Instant::now();
                 if self
                     .runtime
+                    .borrow()
                     .hidden_repair_deadline()
                     .is_some_and(|deadline| deadline <= repair_now)
                 {
@@ -6937,7 +7083,7 @@ impl TerminalApp {
                 // after `drive_tick()` would re-enter the owning plugin VM on
                 // the same cold phase for work the next tick's pre-pump
                 // already covers (CTX-1788, PR #3109 round-2 F4).
-                let _ = self.runtime.poll_presenter_acks();
+                let _ = self.runtime.borrow_mut().poll_presenter_acks();
                 self.watchdog_phase(Phase::ColdCommands);
                 let _delivered = self.pump_cold_commands();
                 let presented = self.drive_tick().is_some();
@@ -6957,9 +7103,9 @@ impl TerminalApp {
                 // notification banner also expire on a timer, so arm a wake
                 // at their deadline too; otherwise a quiet window would keep
                 // the surface until unrelated activity forced a frame.
-                let hover = self.runtime.hover_activation_deadline();
-                let animation = self.runtime.animation_deadline();
-                let bell = self.runtime.bell_notification_deadline();
+                let hover = self.runtime.borrow().hover_activation_deadline();
+                let animation = self.runtime.borrow().animation_deadline();
+                let bell = self.runtime.borrow().bell_notification_deadline();
                 // CTX-0943 (CodeRabbit PR #1643): arm a wake at the capture
                 // deadline too, otherwise an idle window holds an expired
                 // capture (and its painted overlay) until unrelated activity.
@@ -6969,13 +7115,13 @@ impl TerminalApp {
                 // completed or expired read sits unapplied under
                 // `ControlFlow::Wait` until unrelated activity wakes the
                 // loop. `None` when no worker is in flight.
-                let kitty_local = self.runtime.kitty_local_deadline();
+                let kitty_local = self.runtime.borrow().kitty_local_deadline();
                 // CTX-1231 (#2093): arm a wake at the coalesced-present
                 // deadline too, otherwise a burst followed by quiet holds
                 // the deferred latest frame until unrelated activity.
                 // `None` while the gate is off or nothing is deferred, so
                 // frame-on-demand idling is unchanged.
-                let coalesced = self.runtime.present_coalescing_deadline();
+                let coalesced = self.runtime.borrow().present_coalescing_deadline();
                 // CTX-1244 (issue #2107): arm a wake at the earliest armed
                 // plugin timer deadline too, otherwise idle never wakes and
                 // armed timers never fire (3-4 mount frames then silence).
@@ -6994,7 +7140,7 @@ impl TerminalApp {
                 // Issue #2470: a pointer held at the selection edge wakes for
                 // the next bounded one-line auto-scroll step; `None` when no
                 // drag is at an edge, so idle unchanged.
-                let selection_auto = self.runtime.selection_autoscroll_deadline();
+                let selection_auto = self.runtime.borrow().selection_autoscroll_deadline();
                 // Issue #2570: a failed real-GPU present retains damage and
                 // arms a bounded retry; without this wake a quiet window would
                 // never retry and could stay stale after a workspace switch.
@@ -7002,12 +7148,12 @@ impl TerminalApp {
                 // bitty#2830 hypothesis 2: a hidden surface with retained
                 // damage arms a bounded repair wake; without it a lost reveal
                 // parks the loop in `ControlFlow::Wait` forever.
-                let hidden_repair = self.runtime.hidden_repair_deadline();
+                let hidden_repair = self.runtime.borrow().hidden_repair_deadline();
                 // bitty#2830: while a frame is with the off-thread presenter,
                 // this is the stuck-present bound. The ack wake normally fires
                 // first; if the worker is wedged in the compositor, this wake
                 // is what notices and recovers instead of parking forever.
-                let present_recovery = self.runtime.present_recovery_deadline();
+                let present_recovery = self.runtime.borrow().present_recovery_deadline();
                 // bitty#2989: a committed frame the compositor has not
                 // confirmed within the bound is the only state that leaves
                 // nothing owed and no retry armed. Without this wake the loop
@@ -7081,7 +7227,11 @@ impl TerminalApp {
                 let Some(effective) = crate::config_reload::current_effective() else {
                     return;
                 };
-                if self.runtime.apply_system_appearance(&effective, appearance) {
+                if self
+                    .runtime
+                    .borrow_mut()
+                    .apply_system_appearance(&effective, appearance)
+                {
                     let prefer_light =
                         matches!(appearance, bitty_platform::SystemAppearance::Light);
                     let active = effective.effective_theme_for(prefer_light);
@@ -7781,9 +7931,11 @@ bitty.commands.register({
         let _ = app.drive_tick();
         assert_eq!(dispatch(&mut app, &id, "drain"), "");
         // State diffs through the real Runtime: OSC title, BEL, selection.
-        app.runtime.handle_pty_bytes(b"\x1b]0;trace-title\x07");
-        app.runtime.handle_pty_bytes(b"\x07");
-        app.runtime.select_all();
+        app.runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"\x1b]0;trace-title\x07");
+        app.runtime.borrow_mut().handle_pty_bytes(b"\x07");
+        app.runtime.borrow_mut().select_all();
         // Edges staged as the reap/config producers would stage them.
         app.push_pending_exit(7, 3);
         app.pending_config = Some(PendingConfigReload {
@@ -7827,14 +7979,17 @@ bitty.commands.register({
                 LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
             ),
         );
-        app.runtime.set_layout(tree);
+        app.runtime.borrow_mut().set_layout(tree);
         app.runtime
+            .borrow_mut()
             .float_detach(ViewId::new(1))
             .expect("detach view 1 must succeed");
         app.runtime
+            .borrow_mut()
             .float_detach(ViewId::new(2))
             .expect("detach view 2 must succeed");
         app.runtime
+            .borrow_mut()
             .pin_floating(ViewId::new(2))
             .expect("pinning detached float view 2 must succeed");
 
@@ -7857,11 +8012,17 @@ bitty.commands.register({
         app.apply_plugin_fx_requests();
         let now = std::time::Instant::now();
         assert!(
-            app.runtime.fx_progress(ViewId::new(1), now).is_some(),
+            app.runtime
+                .borrow()
+                .fx_progress(ViewId::new(1), now)
+                .is_some(),
             "apply_plugin_fx_requests must arm fx pulse on detached floating view"
         );
         assert!(
-            app.runtime.fx_progress(ViewId::new(2), now).is_some(),
+            app.runtime
+                .borrow()
+                .fx_progress(ViewId::new(2), now)
+                .is_some(),
             "apply_plugin_fx_requests must arm fx pulse on pinned view"
         );
 
@@ -7963,7 +8124,9 @@ mod a11y_bridge_1768_tests {
 
     /// Writes PTY bytes through the real runtime and drives one cold tick.
     fn write_and_tick(app: &mut TerminalApp) {
-        app.runtime.handle_pty_bytes(b"hello world\r\nsecond row");
+        app.runtime
+            .borrow_mut()
+            .handle_pty_bytes(b"hello world\r\nsecond row");
         let _ = app.drive_tick();
     }
 

@@ -1,0 +1,70 @@
+name: Nix publish
+
+# #3300: the release.yml `Publish Nix Flake (Cachix)` job only fires on
+# stable tags, so between releases `nix run github:bitty-terminal/bitty`
+# (which resolves to the default branch, not the newest tag) rebuilds from
+# source whenever a main commit changed any build input. Push both flake
+# closures (bitty and bittyd) to bitty.cachix.org on every main commit.
+#
+# Every main push, no path filter: the Nix source fileset (flake.nix)
+# compiles in files beyond the obvious inputs (terminfo/bitty.ti,
+# packaging/icons/*, crates/bitty-render/assets via include_bytes!), so a
+# filter list would silently skip pushes whose closures changed. Cost stays
+# bounded: cancel-in-progress keeps only the newest head, and pushes that
+# changed nothing relevant mostly substitute from the cache.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Publish Nix Flake (Cachix)
+    # Both existing Cachix push jobs (release.yml, repair-release-channels.yml)
+    # read CACHIX_AUTH_TOKEN through the `release` environment; keep that
+    # scope here so an environment-scoped token resolves. Main-branch
+    # publishes then follow that environment's approval policy.
+    environment: release
+    runs-on: ubuntu-24.04
+    # Same budget as the release.yml nix job.
+    timeout-minutes: 25
+    # Disable gate shared with release.yml: NIX_PUBLISH=false stops
+    # main-branch publishes without editing this file.
+    if: vars.NIX_PUBLISH != 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: bitty
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - name: Build and push Nix packages to Cachix
+        run: |
+          nix build .#bitty --print-build-logs
+          # The daemon is a separate flake package (bitty#3000); build it in
+          # its own out-link so both derivations land in Cachix and the
+          # sanity check below has a stable path.
+          nix build .#bittyd --print-build-logs --out-link result-bittyd
+      # A main push carries no tag, so the release job's exact version
+      # assertions do not apply; present executables are the publish bar.
+      - name: Verify build artifacts
+        run: |
+          set -euo pipefail
+          test -x result/bin/bitty
+          test -x result-bittyd/bin/bittyd

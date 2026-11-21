@@ -75,7 +75,7 @@ jobs:
 
       # #2568: v0.0.27 shipped a flake.lock whose nixpkgs narHash (and every
       # github input's lastModified) did not match the pinned revisions. The
-      # Cachix publish job only runs on release tags, so PR CI never resolved
+      # Cachix publish job only ran on release tags, so PR CI never resolved
       # the lock and the release job failed with "NAR hash mismatch in input".
       # Resolve the lock and evaluate the package graph (no build, no cache
       # push) whenever the flake changes; unrelated PRs pay nothing.

@@ -118,6 +118,24 @@ Add Bitty to your flake inputs:
 }
 ```
 
+### Avoid Overriding the Pinned `nixpkgs` Input
+
+The closures published to `bitty.cachix.org` are built against the exact
+`nixpkgs` revision pinned by this repository's `flake.lock`. Overriding
+that pin from a downstream flake (most commonly
+`inputs.bitty.inputs.nixpkgs.follows = "nixpkgs";`, which repoints Bitty at
+your own `nixpkgs` revision) changes the derivation hash of every input in
+the closure: the cached store paths no longer match, and Nix rebuilds Bitty
+and its dependency tree from source even though the substituter is
+configured. (The `v0.0.27` override above is the deliberate exception:
+that tag's lock is broken and no Cachix closure exists for it either way.)
+
+Consume the flake without overriding its inputs for guaranteed cache hits:
+
+```nix
+bitty.url = "github:bitty-terminal/bitty";
+```
+
 ## Build Model
 
 The flake builds one real-source derivation per system. It does not split a
@@ -170,21 +188,32 @@ installs Nix, never builds the package, and never pushes to Cachix.
 
 ## Continuous Delivery Pipeline
 
-During release publishing (`.github/workflows/release.yml`), the `nix` job builds
-the flake and uploads precompiled store closures directly to Cachix using
-`cachix/cachix-action` under `environment: release`:
+Closures are published to Cachix from two paths, both under the `release`
+environment with the same pinned actions:
+
+- Release tags: the `Publish Nix Flake (Cachix)` job in
+  `.github/workflows/release.yml` runs on stable `vX.Y.Z` tags after the
+  release validation jobs pass.
+- Main commits: `.github/workflows/nix-publish.yml` runs on every push to
+  the default branch plus manual `workflow_dispatch` (#3300), so
+  `nix run github:bitty-terminal/bitty` (which resolves to the default
+  branch, not the newest tag) hits the cache between releases. Concurrency
+  cancels any superseded run; only the newest head publishes.
+
+Both paths build and push the same two closures:
 
 ```yaml
-- uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72 # v30
-  with:
-    nix_path: nixpkgs=channel:nixos-unstable
-- uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+- uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+- uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
   with:
     name: bitty
     authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    extraPullNames: nix-community
 - run: nix build .#bitty --print-build-logs
 - run: nix build .#bittyd --print-build-logs --out-link result-bittyd
 ```
 
-This guarantees zero compile time on client machines when fetching supported
-tags, for both the terminal and the daemon.
+Setting the repository variable `NIX_PUBLISH` to `false` disables both
+paths. This guarantees zero compile time on client machines when fetching
+supported tags and default-branch commits, for both the terminal and the
+daemon.

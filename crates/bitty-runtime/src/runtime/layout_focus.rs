@@ -149,8 +149,8 @@ fn boundary_frame_axis(offset_px: f64, cell_px: f64, max: u16) -> u16 {
 /// decoration converted to physical px at the live DPI factor and composed
 /// with the CTX-0177 cell gaps. `frame` is the hit-test rectangle and
 /// `content` is the painted rectangle (inside the border and content inset);
-/// both are relative to the container origin, before the window-padding
-/// inset.
+/// both are relative to the window grid, before adding the physical
+/// [`Runtime::window_grid_origin`].
 ///
 /// CTX-1161 S2: `style` carries the resolved per-`View` chrome style
 /// (populated at present build via `Runtime::view_style_for`).
@@ -532,8 +532,7 @@ impl Runtime {
     /// [`Self::cursor_to_leaf_cell`] for the leaf-aware variant that also
     /// accounts for inner gap bands in multi-pane layouts.
     ///
-    /// CTX-0223: the window padding inset shifts the grid origin the same
-    /// way, so it is subtracted first (physical pixels at the live scale).
+    /// The shared physical window-grid origin is subtracted first.
     ///
     /// CTX-1612: under `terminal.bidi = on` the pointer column is a painted
     /// (visual) column and the returned `CellPos` is logical; the primary
@@ -541,66 +540,54 @@ impl Runtime {
     /// policy is off or the view fails closed (windowed/truncated/alt
     /// stale), matching the renderer's paint decision.
     ///
-    /// bitty#3284: the painted primary grid is centred inside its content
-    /// box, and this mapping subtracts the same sub-cell split (derived from
-    /// the container-origin content box it already assumes), so a pointer
-    /// inside a painted cell resolves to that cell here too — one origin
-    /// with [`Self::cursor_to_present_cell`].
+    /// This legacy mapping assumes one workspace-wide content box, including
+    /// for split and floating layouts whose drag deltas use that coordinate
+    /// space. Its decoration rounding and integer centering match the normal
+    /// single-pane path. Use [`Self::cursor_to_present_cell`] to hit-test a
+    /// particular painted pane.
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
         let live = self.live_cell_metrics();
         let cell_w = live.width as f64;
         let cell_h = live.height as f64;
-        let pad_px = f64::from(self.window_padding_physical());
+        let (origin_x, origin_y) = self.window_grid_origin();
         // CTX-0294/CTX-0333: the Core-owned decoration insets the content
         // inside each frame, so the primary grid origin moves by the outer
         // gap plus the border plus the content inset at the live DPI scale
         // (CTX-0177 cell gaps_out below stays in cells). Positions over the
         // decoration bands still clamp like before (total mapping, no None).
+        let deco = self.decoration();
         let scale = self.dpi_scale();
-        let deco = self.config.decoration;
-        let deco_px =
-            (f64::from(deco.gaps_out) + f64::from(deco.border) + f64::from(deco.content_inset))
-                * scale;
-        // CTX-0873: a top chrome band shifts the container origin.
-        let gap_px_x =
-            (f64::from(self.config.gaps_out) + f64::from(self.container.x)) * cell_w + deco_px;
-        let gap_px_y =
-            (f64::from(self.config.gaps_out) + f64::from(self.container.y)) * cell_h + deco_px;
-        // bitty#3284: the painted primary grid is centred inside its
-        // content box ([`PresentFrame::grid_origin`]), so this legacy
-        // global mapping shifts by the same sub-cell split before
-        // dividing. The split is derived from the container-origin
-        // content box this mapping already assumes, so it is exact for
-        // the default single-pane layout it serves and keeps the same
-        // approximation character as before for splits — one origin with
-        // the paint path, never a second authority.
-        let frame_w_px = f64::from(u32::from(self.container.width)) * cell_w;
-        let frame_h_px = f64::from(u32::from(self.container.height)) * cell_h;
-        let content_w_px = (frame_w_px - deco_px * 2.0).max(0.0);
-        let content_h_px = (frame_h_px - deco_px * 2.0).max(0.0);
-        let cols_assumed = if cell_w <= 0.0 {
-            0.0
-        } else {
-            (content_w_px / cell_w).floor()
+        let physical = |value| u32::from(bitty_ui::decoration::scaled_px(value, scale));
+        let decoration_inset =
+            physical(deco.gaps_out) + physical(deco.border) + physical(deco.content_inset);
+        let outer_gap = u32::from(self.gaps().outer);
+        let grid_offset = |start: u16, span: u16, cell: u32| {
+            let inset = outer_gap
+                .saturating_mul(cell)
+                .saturating_add(decoration_inset);
+            let content = u32::from(span)
+                .saturating_mul(cell)
+                .saturating_sub(inset.saturating_mul(2));
+            // Use the live container and metrics for the virtual grid.
+            // The primary snapshot may instead be sized to a split or float.
+            let cells = (content / cell.max(1)).clamp(1, u32::from(span.max(1))) as u16;
+            f64::from(start) * f64::from(cell)
+                + f64::from(inset)
+                + f64::from(grid_centre_offset(content, cells, cell))
         };
-        let rows_assumed = if cell_h <= 0.0 {
-            0.0
-        } else {
-            (content_h_px / cell_h).floor()
-        };
-        let centre_x = ((content_w_px - cols_assumed * cell_w) / 2.0).max(0.0);
-        let centre_y = ((content_h_px - rows_assumed * cell_h) / 2.0).max(0.0);
+        let grid_x = grid_offset(self.container.x, self.container.width, live.width);
+        let grid_y = grid_offset(self.container.y, self.container.height, live.height);
         let col = if cell_w <= 0.0 {
             0
         } else {
-            ((pos.x - pad_px - gap_px_x - centre_x) / cell_w).floor() as i64
+            ((pos.x - f64::from(origin_x) - grid_x) / cell_w).floor() as i64
         };
         let row = if cell_h <= 0.0 {
             0
         } else {
-            ((pos.y - pad_px - gap_px_y - centre_y) / cell_h).floor() as i64
+            ((pos.y - f64::from(origin_y) - grid_y) / cell_h).floor() as i64
         };
         let max_col = snap.width.saturating_sub(1) as i64;
         let max_row = snap.height.saturating_sub(1) as i64;
@@ -1786,8 +1773,8 @@ impl Runtime {
     /// The accepted CTX-0118 decoration is logical px; this is the render-time
     /// step (spec rule 1) that converts it with the live DPI factor and
     /// composes it with the CTX-0177 cell gaps in one solver pass. Frames are
-    /// relative to the container origin, before the window-padding inset:
-    /// the present path adds [`Self::window_padding_physical`] exactly like
+    /// in window cell space, before the physical window-grid origin:
+    /// the present path adds [`Self::window_grid_origin`] exactly like
     /// the grid content translation it already owns, so decoration sits
     /// inside the Window and padding stays Window chrome.
     ///
@@ -2430,9 +2417,9 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad;
-        let y = pos.y - pad;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -2553,7 +2540,7 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
+        let (origin_x, origin_y) = self.window_grid_origin();
         // bitty#3284: clamp against the centred grid origin the paint path
         // uses, so a drag or selection edge resolves the same cell a fresh
         // render paints there.
@@ -2561,8 +2548,8 @@ impl Runtime {
             let live = self.live_cell_metrics();
             frame.grid_origin(live.width, live.height)
         };
-        let x = pos.x - pad - f64::from(grid_x);
-        let y = pos.y - pad - f64::from(grid_y);
+        let x = pos.x - f64::from(origin_x) - f64::from(grid_x);
+        let y = pos.y - f64::from(origin_y) - f64::from(grid_y);
         let max_col = i64::from(frame.cols.saturating_sub(1));
         let max_row = i64::from(frame.rows.saturating_sub(1));
         Some(CellPos::new(
@@ -2588,14 +2575,14 @@ impl Runtime {
         if cell_w <= 0.0 {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
+        let (origin_x, _) = self.window_grid_origin();
         // bitty#3284: boundaries count cell edges from the centred grid
         // origin, matching the fill placement the selection paint reads.
         let (grid_x, _grid_y) = {
             let live = self.live_cell_metrics();
             frame.grid_origin(live.width, live.height)
         };
-        let x = pos.x - pad - f64::from(grid_x);
+        let x = pos.x - f64::from(origin_x) - f64::from(grid_x);
         Some(SelectionBoundary::new(boundary_frame_axis(
             x, cell_w, frame.cols,
         )))
@@ -2607,7 +2594,7 @@ impl Runtime {
     /// The `(width, height)` pair every pointer mapping and every pixel
     /// origin in the present path divides by. Exposed so tests and embedders
     /// can derive pointer positions from [`Self::present_frames`] plus
-    /// [`Self::window_padding_physical`] instead of hard-coding pixel,
+    /// [`Self::window_grid_origin`] instead of hard-coding pixel,
     /// padding, or decoration constants. Observation only: it mutates
     /// nothing and grants no access to terminal state.
     #[must_use]
@@ -2621,9 +2608,9 @@ impl Runtime {
     ///
     /// This is the cell size the painter actually shows for `view`: the
     /// present solver has already removed the Core-owned decoration and the
-    /// sibling gaps. Frames stay in container coordinates, so the paint path
-    /// adds the window padding when it places the frame and the pointer path
-    /// subtracts the same padding before mapping a pixel; a consumer that
+    /// sibling gaps. Frames stay in window-grid coordinates, so the paint path
+    /// adds the physical window-grid origin and the pointer path subtracts it.
+    /// A consumer that
     /// only needs rows and columns must not apply it again. Any consumer that
     /// sizes a backing grid or a PTY must prefer this over a raw
     /// [`Self::layout_allocations`] slot (issue #2896) and still honor
@@ -3373,7 +3360,7 @@ impl Runtime {
         if cell_w <= 0.0 || cell_h <= 0.0 {
             return None;
         }
-        let pad_px = f64::from(self.window_padding_physical());
+        let (origin_x, origin_y) = self.window_grid_origin();
         let deco_outer_px = {
             let scaled = f64::from(self.config.decoration.gaps_out) * self.dpi_scale();
             if !scaled.is_finite() || scaled <= 0.0 {
@@ -3382,8 +3369,8 @@ impl Runtime {
                 scaled.round()
             }
         };
-        let x = pos.x - pad_px - deco_outer_px;
-        let y = pos.y - pad_px - deco_outer_px;
+        let x = pos.x - f64::from(origin_x) - deco_outer_px;
+        let y = pos.y - f64::from(origin_y) - deco_outer_px;
         if x < 0.0 || y < 0.0 {
             return None;
         }
@@ -4138,7 +4125,7 @@ impl Runtime {
     }
 
     /// Point that directional focus measures intent from, in doubled frame
-    /// space (physical pixels with the window padding removed, times two).
+    /// space (physical pixels with the window-grid origin removed, times two).
     ///
     /// Issue #2939: Hyprland resolves `movefocus` against the cursor, and the
     /// same intent applies here. The live pointer wins while
@@ -4168,10 +4155,10 @@ impl Runtime {
             |point: (i64, i64)| point.0 >= x0 && point.0 < x1 && point.1 >= y0 && point.1 < y1;
         let centre = (x0 + (x1 - x0) / 2, y0 + (y1 - y0) / 2);
         let to_frame = |pos: CursorPosition| {
-            let pad = f64::from(self.window_padding_physical());
+            let (origin_x, origin_y) = self.window_grid_origin();
             (
-                ((pos.x - pad) * 2.0).round() as i64,
-                ((pos.y - pad) * 2.0).round() as i64,
+                ((pos.x - f64::from(origin_x)) * 2.0).round() as i64,
+                ((pos.y - f64::from(origin_y)) * 2.0).round() as i64,
             )
         };
         if self.config.focus_follows_mouse {

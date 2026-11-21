@@ -661,7 +661,7 @@ const BELL_FLASH_BG: bitty_render::grid::Rgba8 = [0x5A, 0x4A, 0x00, 0xB0];
 /// window space and glyph clips are already attached, so the retained list is
 /// presented verbatim.
 pub(super) struct PresentedLeaf {
-    /// Painted content origin (physical px, before window padding) the list
+    /// Painted content origin (window-relative physical px) the list
     /// was translated against. A mismatch forces a fresh leaf render, unless
     /// the difference is a pure translation of the same content grid (issue
     /// #2573 drag ghost / sub-cell move): then the window-relative
@@ -704,9 +704,9 @@ pub(super) struct PresentedLeaf {
 /// leaf's retained list is reused.
 #[derive(Clone)]
 struct CursorPaint {
-    /// Content origin in physical px, window padding already added.
+    /// Content origin in window-relative physical px.
     origin_x: i32,
-    /// Content origin in physical px, window padding already added.
+    /// Content origin in window-relative physical px.
     origin_y: i32,
     /// Cursor with its row translated into viewport coordinates and its
     /// column set to the visual *cell* column (block/underline/IME).
@@ -797,7 +797,7 @@ struct RingFrameContext {
     focused_id: Option<ViewId>,
     workspace_factor: f32,
     now: std::time::Instant,
-    pad_px: i32,
+    window_origin: (i32, i32),
 }
 
 // CTX-0253 F4: pixel-origin math in `i64`/`u64` with saturation.
@@ -1815,12 +1815,9 @@ impl Runtime {
         {
             return None;
         }
-        // bitty#3284: the retained list was translated against the centred
-        // grid origin, so the region-copy shortcut demands the same origin.
-        if retained.origin != {
-            let live = self.live_cell_metrics();
-            frame.grid_origin(live.width, live.height)
-        } {
+        // Region copies can reuse only primitives stored at this physical
+        // origin, including the translation of the whole window stack.
+        if retained.origin != origin_px {
             return None;
         }
         if retained.scroll_offset != view_scroll_offset || retained.fade_factor != fade {
@@ -2964,8 +2961,8 @@ impl Runtime {
         let mut painted = false;
         if frame.frame.width > 0 && frame.frame.height > 0 {
             let ring_frame = bitty_render::geometry::RectPx::new(
-                px_add(ctx.pad_px, frame.frame.x),
-                px_add(ctx.pad_px, frame.frame.y),
+                px_add(ctx.window_origin.0, frame.frame.x),
+                px_add(ctx.window_origin.1, frame.frame.y),
                 frame.frame.width,
                 frame.frame.height,
             );
@@ -3144,11 +3141,11 @@ impl Runtime {
         );
         let shadow_frame = bitty_render::geometry::RectPx::new(
             px_add(
-                px_add(ctx.pad_px, frame.frame.x),
+                px_add(ctx.window_origin.0, frame.frame.x),
                 self.style_offset_physical(frame.style.shadow_offset_x),
             ),
             px_add(
-                px_add(ctx.pad_px, frame.frame.y),
+                px_add(ctx.window_origin.1, frame.frame.y),
                 self.style_offset_physical(frame.style.shadow_offset_y),
             ),
             frame.frame.width,
@@ -3278,8 +3275,8 @@ impl Runtime {
         );
         let pad = u32::from(halo);
         let glow_frame = bitty_render::geometry::RectPx::new(
-            px_add(ctx.pad_px, frame.frame.x).saturating_sub(i32::from(halo)),
-            px_add(ctx.pad_px, frame.frame.y).saturating_sub(i32::from(halo)),
+            px_add(ctx.window_origin.0, frame.frame.x).saturating_sub(i32::from(halo)),
+            px_add(ctx.window_origin.1, frame.frame.y).saturating_sub(i32::from(halo)),
             frame.frame.width.saturating_add(pad.saturating_mul(2)),
             frame.frame.height.saturating_add(pad.saturating_mul(2)),
         );
@@ -3756,8 +3753,8 @@ impl Runtime {
             self.arm_ime_caret(paint);
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
-        self.paint_banded_overlay_stack(&basis.allocations, basis.pad_px, &mut layers);
-        self.paint_target_annotations(basis.pad_px, &mut layers);
+        self.paint_banded_overlay_stack(&basis.allocations, basis.window_origin, &mut layers);
+        self.paint_target_annotations(basis.window_origin, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
         if let Some(paint) = cursor {
             layers.any_needs_draw |= self.paint_cursor_on_top(
@@ -4262,13 +4259,7 @@ impl Runtime {
             m
         };
 
-        // CTX-0223: window padding translates every content origin below
-        // (leaf grids, selection, IME, banner) by the inset; the padding
-        // band itself keeps the surface clear color. Physical pixels at the
-        // live scale so HiDPI placement matches grid derivation.
-        // CTX-0253 F4: saturating conversion — the physical inset is
-        // `u32` and must never wrap into a negative `i32` origin.
-        let pad_px = i32::try_from(self.window_padding_physical()).unwrap_or(i32::MAX);
+        let window_origin = self.window_grid_origin();
 
         // RFC-0002 (CTX-0341): per-surface animation factors for this frame.
         // `open_factor` scales the core-owned ring alpha during a panel open;
@@ -4295,7 +4286,7 @@ impl Runtime {
             focused_id: self.focus.focused(),
             workspace_factor,
             now,
-            pad_px,
+            window_origin,
         };
 
         // CTX-0367: recompute the IME caret for this frame; `paint_cursor`
@@ -4327,7 +4318,7 @@ impl Runtime {
             full_frame,
             current_gen,
             view_map,
-            pad_px,
+            window_origin,
             ring_ctx,
             cells_before,
             glyphs_before,
@@ -4499,7 +4490,7 @@ impl Runtime {
         // keeps the committed logical geometry.
         let allocations = basis.painted_allocations();
         let view_map = &basis.view_map;
-        let pad_px = basis.pad_px;
+        let (window_x, window_y) = basis.window_origin;
         let current_gen = basis.current_gen;
         let ring_ctx = basis.ring_ctx;
         let mut full_frame = basis.full_frame;
@@ -4531,8 +4522,8 @@ impl Runtime {
                 (
                     index,
                     bitty_render::geometry::RectPx::new(
-                        px_add(pad_px, frame.frame.x),
-                        px_add(pad_px, frame.frame.y),
+                        px_add(window_x, frame.frame.x),
+                        px_add(window_y, frame.frame.y),
                         frame.frame.width,
                         frame.frame.height,
                     ),
@@ -4589,8 +4580,8 @@ impl Runtime {
                     let live = self.live_cell_metrics();
                     frame.grid_origin(live.width, live.height)
                 };
-                let origin_px_x = px_add(pad_px, grid_x);
-                let origin_px_y = px_add(pad_px, grid_y);
+                let origin_px_x = px_add(window_x, grid_x);
+                let origin_px_y = px_add(window_y, grid_y);
                 // Each origin's damage comes from its own ring (CTX-0386).
                 // `last_presented_generation` is consumed per present: the
                 // session field for panes, the runtime scalar for the primary
@@ -4666,8 +4657,8 @@ impl Runtime {
                         // grid origin; a pure translation (drag ghost,
                         // sub-cell move) shifts by the grid-origin delta, so
                         // the reuse stays bit-identical to a fresh pass.
-                        let dx = grid_x.saturating_sub(leaf.origin.0);
-                        let dy = grid_y.saturating_sub(leaf.origin.1);
+                        let dx = origin_px_x.saturating_sub(leaf.origin.0);
+                        let dy = origin_px_y.saturating_sub(leaf.origin.1);
                         Some((dx, dy))
                     })
                 };
@@ -4706,8 +4697,8 @@ impl Runtime {
                             .unwrap_or_else(|| self.renderer.theme_palette().background);
                         bg[3] = (f32::from(bg[3]) * effective_float_opacity).round() as u8;
                         let cover = bitty_render::geometry::RectPx::new(
-                            px_add(pad_px, frame.frame.x),
-                            px_add(pad_px, frame.frame.y),
+                            px_add(window_x, frame.frame.x),
+                            px_add(window_y, frame.frame.y),
                             frame.frame.width,
                             frame.frame.height,
                         );
@@ -4764,8 +4755,8 @@ impl Runtime {
                                 // over it and the sub-cell stripes stay
                                 // covered, never window background.
                                 let dest = bitty_rich::RectPx::new(
-                                    px_add(pad_px, frame.content.x),
-                                    px_add(pad_px, frame.content.y),
+                                    px_add(window_x, frame.content.x),
+                                    px_add(window_y, frame.content.y),
                                     frame.content.width,
                                     frame.content.height,
                                 );
@@ -5390,7 +5381,7 @@ impl Runtime {
                         PresentedLeaf {
                             // bitty#3284: the painted origin the list was
                             // translated against — the centred grid origin.
-                            origin: (grid_x, grid_y),
+                            origin: (origin_px_x, origin_px_y),
                             content_size: (frame.content.width, frame.content.height),
                             scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
                             fade_factor: fade,
@@ -5653,20 +5644,20 @@ impl Runtime {
         // owner owns its final slot from the first frame even while its own
         // geometry tween is still sliding into it. The uncovered part of the
         // surface presents the clear color instead of stale accent chrome.
-        self.paint_closing_rings(&basis.allocations, basis.pad_px, now, layers);
+        self.paint_closing_rings(&basis.allocations, basis.window_origin, now, layers);
         // CTX-1335: overlays anchored to a leaf follow its interpolated paint
         // bounds so content, cursor, and selection never tear apart during a
         // geometry transition. Their logical state and hit-testing remain
         // final.
         let paint = basis.painted_allocations();
-        self.paint_selection_highlight(paint, basis.pad_px, layers);
-        self.paint_plaintext_hover(paint, basis.pad_px, layers);
+        self.paint_selection_highlight(paint, basis.window_origin, layers);
+        self.paint_plaintext_hover(paint, basis.window_origin, layers);
         self.paint_ime_preedit(layers);
-        self.paint_pending_banners(paint, &basis.view_map, basis.pad_px, now, layers);
-        self.paint_hyperlink_hover(paint, basis.pad_px, layers);
-        self.paint_bell_and_notification(paint, basis.pad_px, now, layers);
+        self.paint_pending_banners(paint, &basis.view_map, basis.window_origin, now, layers);
+        self.paint_hyperlink_hover(paint, basis.window_origin, layers);
+        self.paint_bell_and_notification(paint, basis.window_origin, now, layers);
         self.paint_scrollbar_overlay(paint, layers);
-        self.paint_hint_overlay(paint, basis.pad_px, layers);
+        self.paint_hint_overlay(paint, basis.window_origin, layers);
     }
 
     /// CTX-0577 (M1-16): the bounded visual bell flash and the single
@@ -5681,7 +5672,7 @@ impl Runtime {
     fn paint_bell_and_notification(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         now: std::time::Instant,
         layers: &mut FrameLayers,
     ) {
@@ -5708,8 +5699,8 @@ impl Runtime {
             let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(
-                    px_add(pad_px, grid_x),
-                    px_add(pad_px, grid_y),
+                    px_add(window_origin.0, grid_x),
+                    px_add(window_origin.1, grid_y),
                     width,
                     live.height,
                 ),
@@ -5720,7 +5711,7 @@ impl Runtime {
         // Notification banner: right-aligned bottom pill, identical in shape
         // to the pending-confirmation banners (one per frame, never stacked).
         if let Some(text) = banner {
-            self.paint_banner_pill(allocations, Some(frame.view), &text, pad_px, layers);
+            self.paint_banner_pill(allocations, Some(frame.view), &text, window_origin, layers);
         }
     }
 
@@ -5750,7 +5741,7 @@ impl Runtime {
     fn paint_closing_rings(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         now: std::time::Instant,
         layers: &mut FrameLayers,
     ) {
@@ -5771,8 +5762,8 @@ impl Runtime {
                 continue;
             }
             let ring_frame = bitty_render::geometry::RectPx::new(
-                px_add(pad_px, closing.frame.x),
-                px_add(pad_px, closing.frame.y),
+                px_add(window_origin.0, closing.frame.x),
+                px_add(window_origin.1, closing.frame.y),
                 closing.frame.width,
                 closing.frame.height,
             );
@@ -5785,8 +5776,8 @@ impl Runtime {
                     return false;
                 }
                 let live_frame = bitty_render::geometry::RectPx::new(
-                    px_add(pad_px, live.frame.x),
-                    px_add(pad_px, live.frame.y),
+                    px_add(window_origin.0, live.frame.x),
+                    px_add(window_origin.1, live.frame.y),
                     live.frame.width,
                     live.frame.height,
                 );
@@ -5812,7 +5803,7 @@ impl Runtime {
     fn paint_selection_highlight(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         // Selection highlight overlay (CTX-0158, ghostty selection rendering):
@@ -5959,8 +5950,8 @@ impl Runtime {
         // bitty#3284: selection fills are cell-anchored — translate from the
         // centred grid origin the press path mapped the pointer through.
         let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
-        let origin_px_x = px_add(pad_px, grid_x);
-        let origin_px_y = px_add(pad_px, grid_y);
+        let origin_px_x = px_add(window_origin.0, grid_x);
+        let origin_px_y = px_add(window_origin.1, grid_y);
         for mut fill in rects {
             fill.rect.x = px_add(fill.rect.x, origin_px_x);
             fill.rect.y = px_add(fill.rect.y, origin_px_y);
@@ -5983,7 +5974,7 @@ impl Runtime {
     fn paint_plaintext_hover(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         if self.hover_suppressed_by_overlay {
@@ -6019,8 +6010,8 @@ impl Runtime {
         // bitty#3284: the underline sits under its painted cell row, so it
         // starts from the centred grid origin.
         let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
-        let origin_x = px_add(pad_px, grid_x);
-        let origin_y = px_add(pad_px, grid_y);
+        let origin_x = px_add(window_origin.0, grid_x);
+        let origin_y = px_add(window_origin.1, grid_y);
         let row_y = px_add(origin_y, px_side(px_span_usize(local_row, live.height)));
         let y = px_add(
             row_y,
@@ -6165,7 +6156,7 @@ impl Runtime {
         allocations: &[layout_focus::PresentFrame],
         focused: Option<ViewId>,
         banner: &str,
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         let Some(fid) = focused else {
@@ -6194,12 +6185,12 @@ impl Runtime {
         // origin.
         let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
         let origin_px_x = px_add(
-            px_add(pad_px, grid_x),
+            px_add(window_origin.0, grid_x),
             px_side(full_w.saturating_sub(pill_w)),
         );
         let banner_y = px_add(
             px_offset_cells(grid_y, frame.rows.saturating_sub(1), live.height),
-            pad_px,
+            window_origin.1,
         );
         layers.combined_overlay.push(bitty_render::grid::FillRect {
             rect: bitty_render::geometry::RectPx::new(origin_px_x, banner_y, pill_w, live.height),
@@ -6222,7 +6213,7 @@ impl Runtime {
         &mut self,
         allocations: &[layout_focus::PresentFrame],
         view_map: &std::collections::HashMap<ViewId, View>,
-        pad_px: i32,
+        window_origin: (i32, i32),
         now: std::time::Instant,
         layers: &mut FrameLayers,
     ) {
@@ -6235,17 +6226,17 @@ impl Runtime {
                 // Paste was auto-cancelled; request redraw to clear banner.
                 self.pending_full_redraw = true;
             } else if let Some(banner) = self.paste_banner_text_at(now) {
-                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
+                self.paint_banner_pill(allocations, focused, &banner, window_origin, layers);
             }
         }
         if self.has_pending_ws_close() {
             if let Some(banner) = self.ws_close_banner_text() {
-                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
+                self.paint_banner_pill(allocations, focused, &banner, window_origin, layers);
             }
         }
         if self.has_pending_close_confirm() {
             if let Some(banner) = self.close_confirm_banner_text() {
-                self.paint_banner_pill(allocations, focused, &banner, pad_px, layers);
+                self.paint_banner_pill(allocations, focused, &banner, window_origin, layers);
             }
         }
     }
@@ -6267,7 +6258,7 @@ impl Runtime {
     fn paint_hyperlink_hover(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         if self.hover_suppressed_by_overlay {
@@ -6303,8 +6294,8 @@ impl Runtime {
         // bitty#3284: the underline sits under its painted cell row, so it
         // starts from the centred grid origin.
         let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
-        let origin_x = px_add(pad_px, grid_x);
-        let origin_y = px_add(pad_px, grid_y);
+        let origin_x = px_add(window_origin.0, grid_x);
+        let origin_y = px_add(window_origin.1, grid_y);
         let row_y = px_add(origin_y, px_side(px_span_usize(local_row, live.height)));
         let y = px_add(
             row_y,
@@ -6339,7 +6330,13 @@ impl Runtime {
         }
         layers.any_needs_draw = true;
         if let Some(preview) = self.hovered_hyperlink_preview() {
-            self.paint_banner_pill(allocations, Some(hover.view), &preview, pad_px, layers);
+            self.paint_banner_pill(
+                allocations,
+                Some(hover.view),
+                &preview,
+                window_origin,
+                layers,
+            );
         }
     }
 
@@ -6389,7 +6386,7 @@ impl Runtime {
     fn paint_hint_overlay(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         // Owned cells first: the resolver borrows `self` immutably and the
@@ -6417,11 +6414,11 @@ impl Runtime {
             // the centred grid origin like every cell-anchored overlay.
             let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
             let origin_x = px_add(
-                px_add(pad_px, grid_x),
+                px_add(window_origin.0, grid_x),
                 px_offset_cells(0, cell.col, live.width),
             );
             let origin_y = px_add(
-                px_add(pad_px, grid_y),
+                px_add(window_origin.1, grid_y),
                 px_offset_cells(0, cell.row, live.height),
             );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
@@ -6459,14 +6456,14 @@ impl Runtime {
     fn paint_banded_overlay_stack(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
-        self.paint_chrome_bands(pad_px, layers);
+        self.paint_chrome_bands(window_origin, layers);
         // CTX-1431 (#2406): the presentation-only panel paints above chrome
         // and below the focusable capture surface.
-        self.paint_presentation_overlay(allocations, pad_px, layers);
-        self.paint_plugin_overlay(allocations, pad_px, layers);
+        self.paint_presentation_overlay(allocations, window_origin, layers);
+        self.paint_plugin_overlay(allocations, window_origin, layers);
     }
 
     /// Renders plugin-mounted chrome bands (CTX-0911, issue #1570; CTX-0946
@@ -6488,12 +6485,8 @@ impl Runtime {
     ///
     /// bitty#3263 (CTX-1906): the granted rectangle is converted to pixels by
     /// the one shared band mapping
-    /// ([`BandPixelGeometry`](super::band_geometry::BandPixelGeometry)), which
-    /// anchors bottom bands to the window's *physical* bottom inset instead of
-    /// the floored cell grid, so the sub-cell row remainder
-    /// `(surface_height - 2 * padding) % cell_height` no longer opens a blank
-    /// strip under the bottom chrome. The granted cell rows, the layout
-    /// container, the grid, and every PTY winsize are unchanged.
+    /// ([`BandPixelGeometry`](super::band_geometry::BandPixelGeometry)). All
+    /// bands share the same physical origin as the workspace cell stack.
     ///
     /// Issue #3165: column bands (`left`/`right`) paint after the row bands
     /// through the same span renderer — one row per root child, clipped to the
@@ -6503,7 +6496,7 @@ impl Runtime {
     /// ([`Self::paint_band_column_rule`]); the `Left`/`Right` arm of
     /// [`Self::paint_band_row`] still returns early on purpose, because the
     /// rule belongs to the band, not to each of its content rows.
-    fn paint_chrome_bands(&mut self, pad_px: i32, layers: &mut FrameLayers) {
+    fn paint_chrome_bands(&mut self, window_origin: (i32, i32), layers: &mut FrameLayers) {
         use super::band_host::band_is_visible;
 
         let live = self.live_cell_metrics();
@@ -6587,7 +6580,15 @@ impl Runtime {
                 continue;
             }
             self.paint_band_row(
-                pad_px, layers, *row, &text, &runs, band_cells, window.x, default_fg, default_bg,
+                window_origin,
+                layers,
+                *row,
+                &text,
+                &runs,
+                band_cells,
+                window.x,
+                default_fg,
+                default_bg,
                 *edge,
             );
         }
@@ -6628,7 +6629,7 @@ impl Runtime {
                     break;
                 };
                 self.paint_band_row(
-                    pad_px,
+                    window_origin,
                     layers,
                     row,
                     text,
@@ -6641,7 +6642,7 @@ impl Runtime {
                 );
                 painted_rows = painted_rows.max(offset.saturating_add(1));
             }
-            self.paint_band_column_rule(pad_px, layers, band, column_area.y, painted_rows);
+            self.paint_band_column_rule(window_origin, layers, band, column_area.y, painted_rows);
         }
     }
 
@@ -6656,7 +6657,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     fn paint_band_row(
         &mut self,
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
         row: u16,
         text: &str,
@@ -6669,13 +6670,7 @@ impl Runtime {
     ) {
         use super::band_host::resolve_band_token;
 
-        // CTX-1906 (bitty#3263): the band's physical rect comes from the one
-        // shared band mapping, not from the cell row alone. The fill, the glyph
-        // origin, and the chrome rule all read it, and the hit-test asks the
-        // same mapping whether the pointer is inside — so a bottom band lands
-        // on the window's physical inset instead of stopping at the floored
-        // cell grid, and paint and routing can never disagree.
-        let geometry = self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0));
+        let geometry = self.band_pixel_geometry(window_origin);
         let chars: Vec<char> = text.chars().collect();
         let mut painted_any = false;
         for run in runs {
@@ -6722,15 +6717,11 @@ impl Runtime {
             // geometry even for a non-zero window origin.
             let col_offset =
                 u32::from(band_x).saturating_add(u32::try_from(start).unwrap_or(u32::MAX));
-            // bitty#3282: paint the band's *cell row*, not the granted rect.
-            // The innermost bottom band is taller than one cell because it
-            // absorbs the sub-cell remainder (bitty#3263); filling the whole
-            // rect left that remainder as dead band fill under the glyphs.
-            let rect = geometry.cell_row(
-                edge,
+            let rect = geometry.rect(
                 row,
                 u16::try_from(col_offset).unwrap_or(u16::MAX),
                 u16::try_from(cells).unwrap_or(u16::MAX),
+                1,
             );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(rect.x, rect.y, rect.width, rect.height),
@@ -6763,22 +6754,17 @@ impl Runtime {
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule_h = chrome.border_px.max(1);
-        // bitty#3282: the rule marks the content-facing edge of the painted
-        // band, so it follows the same cell row the fills use.
-        let rule_rect = geometry.cell_row(
-            edge,
+        let rule_rect = geometry.rect(
             row,
             band_x,
             u16::try_from(band_cells).unwrap_or(u16::MAX),
+            1,
         );
         let rule_y = match edge {
             BandEdge::Top => rule_rect
                 .y
                 .saturating_add(i32::try_from(rule_rect.height).unwrap_or(i32::MAX))
                 .saturating_sub(i32::from(rule_h)),
-            // The rule sits on the band's own (physical) top edge, so it stays
-            // on the content-facing side of a bottom band that is anchored to
-            // the window inset.
             BandEdge::Bottom => rule_rect.y,
             // Issue #3171: a column band draws *one* vertical rule for the
             // whole band, not one horizontal strip per content row. Drawing it
@@ -6815,7 +6801,7 @@ impl Runtime {
     /// of a full-height fence. Drawn once per band, never per content row.
     fn paint_band_column_rule(
         &mut self,
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
         band: &ColumnBandPaint,
         first_row: u16,
@@ -6824,15 +6810,15 @@ impl Runtime {
         if band.width == 0 || rows == 0 {
             return;
         }
-        let live = self.live_cell_metrics();
-        let cell_w = i32::try_from(live.width).unwrap_or(i32::MAX);
-        let cell_h = i32::try_from(live.height).unwrap_or(i32::MAX);
+        let rect =
+            self.band_pixel_geometry(window_origin)
+                .rect(first_row, band.column, band.width, rows);
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let rule = chrome.border_px.max(1);
         let rule_px = i32::from(rule);
-        let band_x = pad_px.saturating_add(i32::from(band.column).saturating_mul(cell_w));
-        let band_w = i32::from(band.width).saturating_mul(cell_w);
+        let band_x = rect.x;
+        let band_w = i32::try_from(rect.width).unwrap_or(i32::MAX);
         if band_w < rule_px {
             return;
         }
@@ -6842,11 +6828,8 @@ impl Runtime {
             // A row band's rule is drawn by `paint_band_row` itself.
             BandEdge::Top | BandEdge::Bottom => return,
         };
-        let rule_y = pad_px.saturating_add(i32::from(first_row).saturating_mul(cell_h));
-        let rule_h = i32::from(rows).saturating_mul(cell_h);
-        let Ok(rule_h) = u32::try_from(rule_h) else {
-            return;
-        };
+        let rule_y = rect.y;
+        let rule_h = rect.height;
         if rule_h == 0 {
             return;
         }
@@ -6890,7 +6873,7 @@ impl Runtime {
     fn paint_plugin_overlay(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         let Some(overlay) = self.plugin_overlay.clone() else {
@@ -6910,7 +6893,7 @@ impl Runtime {
             0,
             state,
             allocations,
-            pad_px,
+            window_origin,
             layers,
             OverlayRowBudget::UNBOUNDED,
         );
@@ -6928,7 +6911,7 @@ impl Runtime {
     fn paint_presentation_overlay(
         &mut self,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
     ) {
         let Some(overlay) = self.presentation_overlay.clone() else {
@@ -6944,7 +6927,7 @@ impl Runtime {
             PRESENTATION_OVERLAY_MIN_COLS,
             bitty_render::chrome::ChromeState::Normal,
             allocations,
-            pad_px,
+            window_origin,
             layers,
             OverlayRowBudget::PRESENTATION,
         );
@@ -6968,7 +6951,7 @@ impl Runtime {
         min_frame_cols: u16,
         state: bitty_render::chrome::ChromeState,
         allocations: &[layout_focus::PresentFrame],
-        pad_px: i32,
+        window_origin: (i32, i32),
         layers: &mut FrameLayers,
         budget: OverlayRowBudget,
     ) -> Option<PresentationPaint> {
@@ -7019,26 +7002,11 @@ impl Runtime {
                 BandEdge::Bottom => (band_row.saturating_sub(count), Some(band_row)),
                 BandEdge::Left | BandEdge::Right => return None,
             };
-            // CTX-1906 (bitty#3263): a bottom band that was displaced to the
-            // window's physical inset takes its anchored rows with it, so the
-            // last tooltip row still ends on the band's painted edge instead of
-            // `remainder` pixels above it. Zero for the exact-multiple case,
-            // for a top band, and for the innermost band (which keeps its cell
-            // top).
-            // bitty#3282: the painted cell row sits `content_drop` px below the
-            // granted rect's top, so anchored rows follow it as well.
-            let y_offset = self
-                .band_vertical_offset(anchor.edge, band_row, pad_px)
-                .saturating_add(
-                    self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
-                        .content_drop(anchor.edge, band_row),
-                );
             let x = centered_tooltip_x(anchor.start_col, anchor.end_col, stack_cells, window.width);
             Some(AnchoredOverlayStack {
                 start_row,
                 x,
                 limit_row,
-                y_offset,
             })
         });
         let mid_row = frame.rows.saturating_sub(1) / 2;
@@ -7056,20 +7024,12 @@ impl Runtime {
         let chrome = bitty_render::chrome::ChromeTokens::resolve(&self.config.theme)
             .scaled(self.dpi_scale());
         let surface_color = chrome.surface_for(bitty_render::chrome::ChromeElevation::Overlay);
-        // CTX-1906 (bitty#3263): a bottom-anchored card clips at the band's
-        // *physical* top edge through the shared band mapping, not at the cell
-        // grid boundary, so the card tracks the band it is anchored to and the
-        // sub-cell remainder above the band is not left blank.
-        let band_limit_px = match (anchored.and_then(|stack| stack.limit_row), anchor) {
-            (Some(limit), Some(anchor)) => Some(
-                // bitty#3282: clip at the painted cell row, not at the granted
-                // rect, so the card ends on the band it is anchored to.
-                self.band_pixel_geometry(u32::try_from(pad_px).unwrap_or(0))
-                    .cell_row(anchor.edge, limit, 0, 0)
-                    .y,
-            ),
-            _ => None,
-        };
+        // Clip a bottom-anchored card at the same cell edge the band paints.
+        let band_limit_px = anchored.and_then(|stack| stack.limit_row).map(|limit| {
+            self.band_pixel_geometry(window_origin)
+                .rect(limit, 0, 0, 1)
+                .y
+        });
         let mut painted_rows: Vec<(usize, OverlayPill)> = Vec::new();
         let mut bottom_limit: Option<i32> = None;
         for (index, overlay_row) in rows.iter().enumerate() {
@@ -7084,7 +7044,6 @@ impl Runtime {
                             cols: window.width.saturating_sub(stack.x),
                             row,
                             window_x: window.x,
-                            y_offset: stack.y_offset,
                         }),
                         stack.limit_row,
                     )
@@ -7106,9 +7065,14 @@ impl Runtime {
             if limit_row.is_some() {
                 bottom_limit = band_limit_px;
             }
-            let Some(pill) =
-                self.overlay_pill_geometry(frame, row, overlay_row, full_w, placement, pad_px)
-            else {
+            let Some(pill) = self.overlay_pill_geometry(
+                frame,
+                row,
+                overlay_row,
+                full_w,
+                placement,
+                window_origin,
+            ) else {
                 continue;
             };
             painted_rows.push((index, pill));
@@ -7118,14 +7082,17 @@ impl Runtime {
         }
         let clip_rect = match anchored {
             Some(_) => bitty_render::geometry::RectPx::new(
-                px_add(pad_px, px_offset_cells(i32::from(window.x), 0, live.width)),
-                px_add(pad_px, px_offset_cells(0, window.y, live.height)),
+                px_add(
+                    window_origin.0,
+                    px_offset_cells(i32::from(window.x), 0, live.width),
+                ),
+                px_add(window_origin.1, px_offset_cells(0, window.y, live.height)),
                 px_span(window.width, live.width),
                 px_span(window.height, live.height),
             ),
             None => bitty_render::geometry::RectPx::new(
-                px_add(pad_px, frame.content.x),
-                px_add(pad_px, frame.content.y),
+                px_add(window_origin.0, frame.content.x),
+                px_add(window_origin.1, frame.content.y),
                 frame.content.width,
                 frame.content.height,
             ),
@@ -7214,7 +7181,7 @@ impl Runtime {
         overlay_row: &OverlayRow,
         full_w: u32,
         anchored: Option<AnchoredOverlayRow>,
-        pad_px: i32,
+        window_origin: (i32, i32),
     ) -> Option<OverlayPill> {
         if anchored.is_some() && overlay_row.text.is_empty() {
             return None;
@@ -7223,7 +7190,7 @@ impl Runtime {
         let cell_w = live.width;
         let cell_h = live.height;
         // bitty#3284: the unanchored arm below composes over painted cell
-        // rows; the anchored arm follows band edges and stays unchanged.
+        // rows; the anchored arm follows the window-grid rows of the band.
         let (grid_x, grid_y) = frame.grid_origin(cell_w, cell_h);
         let clip_cols = anchored.map_or(frame.cols, |anchor| anchor.cols);
         let (_clipped, text_cells) = clip_to_width_cells(&overlay_row.text, clip_cols);
@@ -7231,25 +7198,19 @@ impl Runtime {
         let (origin_px_x, origin_px_y) = match anchored {
             Some(anchor) => (
                 px_add(
-                    pad_px,
+                    window_origin.0,
                     px_offset_cells(i32::from(anchor.window_x), anchor.x, cell_w),
                 ),
-                // CTX-1906: an anchored stack follows the band's own physical
-                // edge, so a bottom band displaced to the window inset keeps
-                // its tooltip attached (offset is `0` otherwise).
-                px_add(
-                    px_add(pad_px, px_offset_cells(0, anchor.row, cell_h)),
-                    anchor.y_offset,
-                ),
+                px_add(window_origin.1, px_offset_cells(0, anchor.row, cell_h)),
             ),
             None => (
                 // bitty#3284: an unanchored pill composes over the pane's
                 // painted cell rows, so it centres on the grid origin.
                 px_add(
-                    px_add(pad_px, grid_x),
+                    px_add(window_origin.0, grid_x),
                     px_side(full_w.saturating_sub(pill_w)) / 2,
                 ),
-                px_add(pad_px, px_offset_cells(grid_y, row, cell_h)),
+                px_add(window_origin.1, px_offset_cells(grid_y, row, cell_h)),
             ),
         };
         Some(OverlayPill {
@@ -7430,9 +7391,9 @@ impl Runtime {
     /// Paints one bounded layer of label pills at the annotation anchors, in
     /// batch (paint) order, above the plugin overlay and below kitty images.
     /// Presentation-only: no grid, cursor, scrollback, or layout mutation.
-    /// Anchors are window cell coordinates; the window-padding inset is added
+    /// Anchors are window cell coordinates; the physical window-grid origin is added
     /// exactly like every other overlay phase. No-op with no batch.
-    fn paint_target_annotations(&mut self, pad_px: i32, layers: &mut FrameLayers) {
+    fn paint_target_annotations(&mut self, window_origin: (i32, i32), layers: &mut FrameLayers) {
         let Some(annotations) = self.target_annotations.clone() else {
             return;
         };
@@ -7459,8 +7420,14 @@ impl Runtime {
             if text_cells == 0 {
                 continue;
             }
-            let origin_x = px_add(pad_px, px_offset_cells(0, annotation.anchor.x, cell_w));
-            let origin_y = px_add(pad_px, px_offset_cells(0, annotation.anchor.y, cell_h));
+            let origin_x = px_add(
+                window_origin.0,
+                px_offset_cells(0, annotation.anchor.x, cell_w),
+            );
+            let origin_y = px_add(
+                window_origin.1,
+                px_offset_cells(0, annotation.anchor.y, cell_h),
+            );
             layers.combined_overlay.push(bitty_render::grid::FillRect {
                 rect: bitty_render::geometry::RectPx::new(
                     origin_x,
@@ -7735,8 +7702,8 @@ impl Runtime {
                 (
                     index,
                     bitty_render::geometry::RectPx::new(
-                        px_add(basis.pad_px, frame.frame.x),
-                        px_add(basis.pad_px, frame.frame.y),
+                        px_add(basis.window_origin.0, frame.frame.x),
+                        px_add(basis.window_origin.1, frame.frame.y),
                         frame.frame.width,
                         frame.frame.height,
                     ),
@@ -7815,7 +7782,7 @@ impl Runtime {
                 pane_origin,
                 frame,
                 rich_metrics,
-                basis.pad_px,
+                basis.window_origin,
                 scroll_offset,
                 &higher_floats,
                 &mut blits_this_frame,
@@ -7914,13 +7881,13 @@ impl Runtime {
                     fresh
                 };
                 // Leaf fills/glyphs translate by the pane's painted grid
-                // origin (window padding already added; bitty#3284); image
+                // origin (window translation already applied; bitty#3284); image
                 // blits use the same window space so they land exactly over
                 // their cells.
                 let (grid_x, grid_y) = frame.grid_origin(live.width, live.height);
                 let dest = bitty_render::geometry::RectPx::new(
-                    px_add(px_add(basis.pad_px, grid_x), rect_px.x),
-                    px_add(px_add(basis.pad_px, grid_y), rect_px.y),
+                    px_add(px_add(basis.window_origin.0, grid_x), rect_px.x),
+                    px_add(px_add(basis.window_origin.1, grid_y), rect_px.y),
                     rect_px.width,
                     rect_px.height,
                 );
@@ -8010,7 +7977,7 @@ impl Runtime {
         origin: Option<u64>,
         frame: &layout_focus::PresentFrame,
         metrics: bitty_rich::CellMetrics,
-        pad_px: i32,
+        window_origin: (i32, i32),
         scroll_offset: usize,
         higher_floats: &[bitty_render::geometry::RectPx],
         blits_this_frame: &mut usize,
@@ -8040,7 +8007,7 @@ impl Runtime {
         let window_start =
             cursor_follow_window_start(cursor_row, grid_rows, usize::from(frame.rows));
         // Pane content viewport in content space (the blit destination
-        // later adds the leaf origin + window padding).
+        // later adds the window-relative leaf origin).
         let viewport = bitty_rich::geometry::RectPx::new(
             0,
             0,
@@ -8196,8 +8163,8 @@ impl Runtime {
             // centred grid origin, exactly like the glyphs beside them.
             let (grid_x, grid_y) = frame.grid_origin(metrics.width, metrics.height);
             let dest = bitty_render::geometry::RectPx::new(
-                px_add(px_add(pad_px, grid_x), union.x),
-                px_add(px_add(pad_px, grid_y), union.y),
+                px_add(px_add(window_origin.0, grid_x), union.x),
+                px_add(px_add(window_origin.1, grid_y), union.y),
                 union.width,
                 union.height,
             );
@@ -9252,8 +9219,8 @@ struct TickBasis {
     current_gen: u64,
     /// id -> View map for scroll/selection/IME lookups.
     view_map: std::collections::HashMap<ViewId, View>,
-    /// Physical window padding inset.
-    pad_px: i32,
+    /// Physical origin of the window cell stack.
+    window_origin: (i32, i32),
     /// Loop-invariant decoration-ring inputs.
     ring_ctx: RingFrameContext,
     /// Renderer cells-examined counter baseline for the stats delta.
@@ -9307,10 +9274,6 @@ struct AnchoredOverlayStack {
     x: u16,
     /// Exclusive window row the stack must not reach.
     limit_row: Option<u16>,
-    /// Extra physical y applied to every anchored row (CTX-1906/bitty#3263):
-    /// the sub-cell distance between the band's cell row and the physical edge
-    /// it was actually painted at, so the last row still ends on the band.
-    y_offset: i32,
 }
 
 /// One overlay row placed against a live band item (issue #2411).
@@ -9327,10 +9290,6 @@ struct AnchoredOverlayRow {
     row: u16,
     /// Window column origin the cells are measured from.
     window_x: u16,
-    /// Physical y shift applied on top of the row's cell origin, so an anchored
-    /// row stack follows a bottom band that was displaced to the window's
-    /// physical inset (CTX-1906/bitty#3263). `0` for every other placement.
-    y_offset: i32,
 }
 
 /// Clipped geometry of one overlay pill row (CTX-1170).
@@ -10294,7 +10253,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_text("")));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -10317,7 +10276,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_text("hello")));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(layers.combined_overlay_content.len(), 1, "one pill fill");
         assert!(
             !layers.combined_glyphs.is_empty(),
@@ -10350,7 +10309,7 @@ mod plugin_overlay_paint_tests {
             end_col: 20,
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let (cell_w, cell_h) = rt.live_cell_size();
         let fill = layers
             .combined_overlay_content
@@ -10367,7 +10326,7 @@ mod plugin_overlay_paint_tests {
         // Clearing the anchor restores the centered modal placement.
         rt.set_plugin_overlay_anchor(None);
         let mut centered = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut centered);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut centered);
         let fill = centered
             .combined_overlay_content
             .first()
@@ -10430,7 +10389,7 @@ mod plugin_overlay_paint_tests {
             end_col: usize::from(width),
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let (cell_w, _) = rt.live_cell_size();
         let fill = layers
             .combined_overlay_content
@@ -10474,7 +10433,7 @@ mod plugin_overlay_paint_tests {
             end_col: 10,
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let (cell_w, cell_h) = rt.live_cell_size();
         assert_eq!(layers.combined_overlay_content.len(), 2, "two tooltip rows");
         for (index, fill) in layers.combined_overlay_content.iter().enumerate() {
@@ -10522,7 +10481,7 @@ mod plugin_overlay_paint_tests {
             end_col: 6,
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             usize::from(band_row),
@@ -10539,11 +10498,7 @@ mod plugin_overlay_paint_tests {
     }
 
     #[test]
-    fn bottom_band_tooltip_rows_follow_a_displaced_band() {
-        // CodeRabbit (PR #3266): a tooltip anchored to a bottom band that was
-        // moved down to the window's physical inset must move with it, so the
-        // last row ends on the band's painted top edge instead of `remainder`
-        // pixels above it (CTX-1906/bitty#3263).
+    fn bottom_band_tooltip_rows_follow_the_centered_stack() {
         let mut rt = runtime();
         let (cell_w, cell_h) = rt.live_cell_size();
         let pad = rt.window_padding_physical();
@@ -10570,17 +10525,10 @@ mod plugin_overlay_paint_tests {
         let outer_row = rt
             .visible_band_row(BandEdge::Bottom, 0)
             .expect("outer band row");
-        let band_top = rt
-            .band_pixel_geometry(pad)
-            .row_band(BandEdge::Bottom, outer_row, 0, 0)
-            .y;
-        assert_eq!(
-            band_top
-                - (i32::try_from(pad).unwrap()
-                    + i32::from(outer_row) * i32::try_from(cell_h).unwrap()),
-            i32::try_from(remainder).unwrap(),
-            "fixture precondition: the outer band is displaced by the remainder"
-        );
+        let origin = rt.window_grid_origin();
+        let expected_y = i32::try_from(pad + remainder / 2).unwrap();
+        assert_eq!(origin.1, expected_y);
+        let band_top = expected_y + i32::from(outer_row) * i32::try_from(cell_h).unwrap();
 
         rt.set_plugin_overlay(Some(surface_with_rows(&["detail", "more"])));
         rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
@@ -10590,11 +10538,7 @@ mod plugin_overlay_paint_tests {
             end_col: 10,
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(
-            &[one_frame()],
-            i32::try_from(pad).expect("padding fits i32"),
-            &mut layers,
-        );
+        rt.paint_plugin_overlay(&[one_frame()], origin, &mut layers);
         assert_eq!(layers.combined_overlay_content.len(), 2, "two tooltip rows");
         let last = layers
             .combined_overlay_content
@@ -10614,19 +10558,14 @@ mod plugin_overlay_paint_tests {
         );
         assert_eq!(
             first.rect.y,
-            i32::try_from(pad).unwrap()
-                + (i32::from(outer_row) - 2) * i32::try_from(cell_h).unwrap()
-                + i32::try_from(remainder).unwrap(),
+            expected_y + (i32::from(outer_row) - 2) * i32::try_from(cell_h).unwrap(),
             "the whole stack moved down with the band"
         );
     }
 
     #[test]
     fn bottom_band_tooltip_ends_on_the_painted_cell_row() {
-        // bitty#3282: a single bottom band absorbs the sub-cell remainder above
-        // its cell row, so an anchored card must end on the cell row the band
-        // actually paints -- ending on the granted rect's top left it
-        // `remainder` pixels away from the component it describes.
+        // The centered band and its tooltip must meet at the exact cell edge.
         let mut rt = runtime();
         let (cell_w, cell_h) = rt.live_cell_size();
         let pad = rt.window_padding_physical();
@@ -10649,25 +10588,8 @@ mod plugin_overlay_paint_tests {
         });
         rt.tick().expect("present the band");
 
-        let pad_i = i32::try_from(pad).expect("padding fits i32");
-        let cell_h_i = i32::try_from(cell_h).expect("cell height fits i32");
-        let inset = i32::try_from(surface_h).expect("surface fits i32") - pad_i;
-        let band_row = rt
-            .visible_band_row(BandEdge::Bottom, 0)
-            .expect("bottom band row");
-        let geometry = rt.band_pixel_geometry(pad);
-        let granted_top = geometry.row_band(BandEdge::Bottom, band_row, 0, 0).y;
-        let cell_top = geometry.cell_row(BandEdge::Bottom, band_row, 0, 0).y;
-        assert_eq!(
-            cell_top - granted_top,
-            i32::try_from(remainder).expect("remainder fits i32"),
-            "fixture precondition: the painted row sits the remainder below the granted rect"
-        );
-        assert_eq!(
-            cell_top,
-            inset - cell_h_i,
-            "the painted row ends on the inset"
-        );
+        let origin = rt.window_grid_origin();
+        let cell_top = i32::try_from(surface_h - pad - remainder.div_ceil(2) - cell_h).unwrap();
 
         rt.set_plugin_overlay(Some(surface_with_rows(&["detail", "more"])));
         rt.set_plugin_overlay_anchor(Some(BandOverlayAnchor {
@@ -10677,7 +10599,7 @@ mod plugin_overlay_paint_tests {
             end_col: 10,
         }));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], pad_i, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], origin, &mut layers);
         let last = layers
             .combined_overlay_content
             .last()
@@ -10695,7 +10617,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(None);
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert!(layers.combined_overlay_content.is_empty());
         assert!(layers.combined_overlay_card_rounded.is_empty());
         assert!(layers.combined_overlay_rounded.is_empty());
@@ -10713,7 +10635,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", "hi"])));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             2,
@@ -10742,10 +10664,10 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", ""])));
         let mut before = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut before);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut before);
         rt.set_plugin_overlay(Some(surface_with_rows(&["Composer", "hi"])));
         let mut after = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut after);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut after);
         assert_eq!(before.combined_overlay_content.len(), 2);
         assert_eq!(after.combined_overlay_content.len(), 2);
         assert_eq!(
@@ -10766,7 +10688,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_rows(&[])));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -10786,7 +10708,7 @@ mod plugin_overlay_paint_tests {
         let borrowed: Vec<&str> = many.iter().map(String::as_str).collect();
         rt.set_plugin_overlay(Some(surface_with_rows(&borrowed)));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             24,
@@ -10836,7 +10758,7 @@ mod plugin_overlay_paint_tests {
             false,
         ))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -10867,13 +10789,13 @@ mod plugin_overlay_paint_tests {
             let mut rt = runtime();
             rt.set_plugin_overlay(Some(surface_with(styled_text("hello", None, None, false))));
             let mut layers = FrameLayers::default();
-            rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+            rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
             layers.combined_glyphs.len()
         };
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with(styled_text("hello", None, None, true))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_glyphs.len(),
             plain_glyphs * 2,
@@ -10894,7 +10816,7 @@ mod plugin_overlay_paint_tests {
             false,
         ))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let chrome_surface =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).surface_elevated;
         assert_eq!(
@@ -10916,7 +10838,7 @@ mod plugin_overlay_paint_tests {
             styled_text("there", None, None, false),
         ]))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -10936,7 +10858,7 @@ mod plugin_overlay_paint_tests {
             styled_text("idle", Some("accent"), Some("selection"), false),
         ]))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             2,
@@ -10966,7 +10888,7 @@ mod plugin_overlay_paint_tests {
             styled_text("", None, None, true),
         ]))));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -11040,7 +10962,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with(root)));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let accent = rt
             .config
             .theme
@@ -11065,7 +10987,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 100, 60, 20);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -11098,10 +11020,10 @@ mod plugin_overlay_paint_tests {
         let second = frame_for(2, 600, 60, 20);
         rt.focus_mut().set(first.view);
         let mut before = FrameLayers::default();
-        rt.paint_presentation_overlay(&[first, second], 8, &mut before);
+        rt.paint_presentation_overlay(&[first, second], (8, 8), &mut before);
         rt.focus_mut().set(second.view);
         let mut after = FrameLayers::default();
-        rt.paint_presentation_overlay(&[first, second], 8, &mut after);
+        rt.paint_presentation_overlay(&[first, second], (8, 8), &mut after);
         assert!(
             after.combined_overlay_content[0].rect.x > before.combined_overlay_content[0].rect.x,
             "the surface follows the focused view's frame"
@@ -11141,7 +11063,7 @@ mod plugin_overlay_paint_tests {
         // Bottom layer: bands paint plain overlay fills plus glyphs and never
         // a card surface, so nothing can sit below them but content.
         let mut bands_only = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut bands_only);
+        rt.paint_chrome_bands((8, 8), &mut bands_only);
         assert!(
             !bands_only.combined_overlay.is_empty(),
             "the band paints an overlay fill"
@@ -11157,7 +11079,7 @@ mod plugin_overlay_paint_tests {
         let band_glyphs = bands_only.combined_glyphs.len();
 
         let mut layers = FrameLayers::default();
-        rt.paint_banded_overlay_stack(&[frame], 8, &mut layers);
+        rt.paint_banded_overlay_stack(&[frame], (8, 8), &mut layers);
 
         // Both overlay surfaces append their text after the band's, so band
         // glyphs composite first (lowest) in the shared glyph list.
@@ -11208,7 +11130,7 @@ mod plugin_overlay_paint_tests {
             combined_glyphs: vec![underlay],
             ..FrameLayers::default()
         };
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_card_rounded.len(),
             1,
@@ -11300,7 +11222,7 @@ mod plugin_overlay_paint_tests {
         let mut rt = runtime();
         rt.set_plugin_overlay(Some(surface_with_text("palette")));
         let mut layers = FrameLayers::default();
-        rt.paint_plugin_overlay(&[one_frame()], 8, &mut layers);
+        rt.paint_plugin_overlay(&[one_frame()], (8, 8), &mut layers);
         let tokens =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).scaled(rt.dpi_scale());
         assert_eq!(layers.combined_overlay_card_rounded.len(), 1);
@@ -11327,7 +11249,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 100, 60, 20);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_card_rounded.len(),
             1,
@@ -11383,7 +11305,7 @@ mod plugin_overlay_paint_tests {
             let frame = frame_for(1, 100, 60, 20);
             rt.focus_mut().set(frame.view);
             let mut layers = FrameLayers::default();
-            rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+            rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
             let surface = layers
                 .combined_overlay_card_rounded
                 .first()
@@ -11422,7 +11344,7 @@ mod plugin_overlay_paint_tests {
         rt.tick().expect("tick presents the band");
         assert_eq!(rt.visible_band_row(BandEdge::Top, 0), Some(0));
         let mut layers = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut layers);
+        rt.paint_chrome_bands((8, 8), &mut layers);
         let tokens =
             bitty_render::chrome::ChromeTokens::resolve(&rt.config.theme).scaled(rt.dpi_scale());
         let cell_h = rt.live_cell_metrics().height;
@@ -11477,7 +11399,7 @@ mod plugin_overlay_paint_tests {
         });
         rt.tick().expect("tick insets the container for the band");
         let mut layers = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut layers);
+        rt.paint_chrome_bands((8, 8), &mut layers);
         let tokens = tokens_for(&rt);
         let rule_px = tokens.border_px.max(1);
         let cell_w = rt.live_cell_metrics().width;
@@ -11534,7 +11456,7 @@ mod plugin_overlay_paint_tests {
         });
         rt.tick().expect("tick insets the container for the band");
         let mut layers = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut layers);
+        rt.paint_chrome_bands((8, 8), &mut layers);
         let tokens = tokens_for(&rt);
         let rule_px = tokens.border_px.max(1);
         let cell_w = rt.live_cell_metrics().width;
@@ -11591,7 +11513,7 @@ mod plugin_overlay_paint_tests {
         );
 
         let mut layers = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut layers);
+        rt.paint_chrome_bands((8, 8), &mut layers);
         assert_eq!(
             rt.band_host_stats().paint_violations,
             0,
@@ -11651,7 +11573,7 @@ mod plugin_overlay_paint_tests {
         assert_eq!(rt.container().width, window.width - 3);
 
         let mut layers = FrameLayers::default();
-        rt.paint_chrome_bands(8, &mut layers);
+        rt.paint_chrome_bands((8, 8), &mut layers);
         assert_eq!(rt.band_host_stats().paint_violations, 0);
         assert!(
             !layers.combined_overlay.is_empty() && !layers.combined_glyphs.is_empty(),
@@ -11677,7 +11599,7 @@ mod plugin_overlay_paint_tests {
         let tiny = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS - 1, 20);
         rt.focus_mut().set(tiny.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[tiny], 8, &mut layers);
+        rt.paint_presentation_overlay(&[tiny], (8, 8), &mut layers);
         assert!(
             layers.combined_overlay_content.is_empty(),
             "a too-narrow frame paints nothing"
@@ -11687,7 +11609,7 @@ mod plugin_overlay_paint_tests {
 
         let wide = frame_for(1, 8, PRESENTATION_OVERLAY_MIN_COLS, 20);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[wide], 8, &mut layers);
+        rt.paint_presentation_overlay(&[wide], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             1,
@@ -11705,7 +11627,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 100, 12, 3);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert_eq!(
             layers.combined_overlay_content.len(),
             3,
@@ -11754,7 +11676,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 8, 80, 60);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         let paint = rt
             .presentation_overlay_paint()
             .expect("a painted surface records its accounting");
@@ -11783,7 +11705,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 8, 40, 20);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         let paint = rt.presentation_overlay_paint().expect("accounted");
         assert_eq!(paint.rows, 1, "the over-budget tail row is dropped");
         assert!(paint.truncated, "the drop is reported");
@@ -11803,7 +11725,7 @@ mod plugin_overlay_paint_tests {
         let frame = frame_for(1, 8, 40, 20);
         rt.focus_mut().set(frame.view);
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert!(rt.presentation_overlay_paint().is_some());
         rt.set_presentation_overlay(None);
         assert!(
@@ -11811,7 +11733,7 @@ mod plugin_overlay_paint_tests {
             "a cleared surface clears its accounting"
         );
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        rt.paint_presentation_overlay(&[frame], (8, 8), &mut layers);
         assert!(rt.presentation_overlay_paint().is_none());
         assert!(!layers.any_needs_draw, "no surface paints nothing");
     }
@@ -11826,7 +11748,7 @@ mod plugin_overlay_paint_tests {
         rt.focus_mut().set(second.view);
         rt.set_presentation_overlay(Some(surface_with_text("panel")));
         let mut layers = FrameLayers::default();
-        rt.paint_presentation_overlay(&[first, second], 8, &mut layers);
+        rt.paint_presentation_overlay(&[first, second], (8, 8), &mut layers);
         assert_eq!(
             rt.focused_view(),
             Some(second.view),

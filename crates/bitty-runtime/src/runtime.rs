@@ -3944,9 +3944,9 @@ impl Runtime {
         if live.width == 0 || live.height == 0 {
             return None;
         }
-        let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad;
-        let y = pos.y - pad;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         if x < 0.0 || y < 0.0 {
             return None;
         }

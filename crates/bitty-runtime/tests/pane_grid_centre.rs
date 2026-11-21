@@ -151,12 +151,12 @@ fn present_selected_grid(rt: &mut Runtime) -> (Vec<u8>, usize, [u8; 4]) {
     let buf = rt.headless_rgba().expect("headless frame after tick");
     let width =
         usize::try_from(rt.surface_extent().expect("surface").width()).expect("width fits usize");
-    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    let (window_x, window_y) = rt.window_grid_origin();
     let centre_x = usize::try_from(frame.content.x).expect("content x fits")
-        + pad
+        + window_x as usize
         + frame.content.width as usize / 2;
     let centre_y = usize::try_from(frame.content.y).expect("content y fits")
-        + pad
+        + window_y as usize
         + frame.content.height as usize / 2;
     let fill = pixel(&buf, width, centre_x, centre_y);
     (buf, width, fill)
@@ -189,7 +189,9 @@ fn row_leftover_is_split_above_and_below_the_grid() {
         );
         let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
         let content_x = usize::try_from(frame.content.x).expect("content x fits") + pad;
-        let content_y = usize::try_from(frame.content.y).expect("content y fits") + pad;
+        let slack = (WINDOW.1 - 2 * PAD) % cell_h;
+        let content_y =
+            usize::try_from(frame.content.y).expect("content y fits") + pad + (slack / 2) as usize;
         let content_h = frame.content.height as usize;
         // Interior column probe: away from the outline ring and both
         // horizontal leftover stripes.
@@ -295,7 +297,9 @@ fn exact_multiple_content_box_keeps_the_grid_flush_with_the_inset() {
     let (buf, width, fill) = present_selected_grid(&mut rt);
     let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
     let content_x = usize::try_from(frame.content.x).expect("content x fits") + pad;
-    let content_y = usize::try_from(frame.content.y).expect("content y fits") + pad;
+    let slack = (WINDOW.1 - 2 * PAD) % cell;
+    let content_y =
+        usize::try_from(frame.content.y).expect("content y fits") + pad + (slack / 2) as usize;
     let content_w = frame.content.width as usize;
     let content_h = frame.content.height as usize;
     let painted_rows = rows_with_color(
@@ -366,6 +370,17 @@ fn pointer_resolves_the_cell_whose_band_contains_it() {
             "the global mapping names the same painted cell"
         );
     }
+    // The odd pane-local horizontal remainder uses the painted integer
+    // origin in the legacy fallback too. A cell starts at its exact edge.
+    let start = CursorPosition {
+        x: grid_x + 9.0,
+        y: grid_y + 19.0,
+    };
+    assert_eq!(
+        rt.cursor_to_present_cell(start),
+        Some((ViewId::new(1), CellPos::new(1, 1)))
+    );
+    assert_eq!(rt.cursor_to_cell(start), CellPos::new(1, 1));
     // Exact band membership: the pixel just above row r's top edge
     // belongs to row r - 1, the row whose band contains it.
     for row in [1u16, 11, 21] {
@@ -399,4 +414,33 @@ fn pointer_resolves_the_cell_whose_band_contains_it() {
         Some((ViewId::new(1), CellPos::new(21, 0))),
         "a pointer in the bottom leftover stripe clamps to the last row"
     );
+}
+
+#[test]
+fn fractional_dpi_pointer_agrees_at_both_painted_cell_edges() {
+    let mut rt = runtime_with_cell(CELL_W, CELL_H);
+    let extent = PhysicalSize::new(1144, 727);
+    rt.apply_dpi_scale(1.5, Some(extent));
+    rt.tick().expect("fractional-DPI frame presents");
+
+    let (cell_w, cell_h) = rt.live_cell_size();
+    assert_eq!((cell_w, cell_h), (14, 29));
+    let frame = rt.present_frames()[0];
+    let (window_x, window_y) = rt.window_grid_origin();
+    let (grid_x, grid_y) = frame.grid_origin(cell_w, cell_h);
+    let edge_x = f64::from(window_x + grid_x) + f64::from(cell_w);
+    let edge_y = f64::from(window_y + grid_y) + f64::from(cell_h);
+    assert_eq!((edge_x, edge_y), (47.0, 73.0));
+
+    let probes = [
+        (edge_x - 0.25, edge_y, CellPos::new(1, 0)),
+        (edge_x, edge_y - 0.25, CellPos::new(0, 1)),
+        (edge_x, edge_y, CellPos::new(1, 1)),
+    ];
+    let global_cells = probes.map(|(x, y, expected)| {
+        let pos = CursorPosition { x, y };
+        assert_eq!(rt.cursor_to_present_cell(pos), Some((frame.view, expected)));
+        rt.cursor_to_cell(pos)
+    });
+    assert_eq!(global_cells, probes.map(|(_, _, expected)| expected));
 }

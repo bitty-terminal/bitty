@@ -107,12 +107,9 @@ fn grid_fits_the_content_rect_at_every_scale() {
             content.width
         );
 
-        // Painted grid origin: the present path translates by the window
-        // padding, then by the content rect (`px_add(pad, content.y + row *
-        // cell_h)`), so the last painted row must still land inside the
-        // window.
-        let pad = rt.window_padding_physical();
-        let painted_bottom = u32::try_from(content.y).unwrap_or(0) + pad + grid_h;
+        let (_, window_y) = rt.window_grid_origin();
+        let (_, grid_y) = frame.grid_origin(cell_w, cell_h);
+        let painted_bottom = u32::try_from(window_y + grid_y).expect("painted top") + grid_h;
         assert!(
             painted_bottom <= physical_for(scale).height(),
             "scale {scale}: painted grid bottom {painted_bottom}px exceeds the \
@@ -197,17 +194,14 @@ fn pointer_in_the_last_cell_maps_to_the_last_cell_at_every_scale() {
         );
         let (cell_w, cell_h) = rt.live_cell_size();
         let frame = primary_frame(&rt);
-        let content = frame.content;
-        let pad = f64::from(rt.window_padding_physical());
-        // Centre of the bottom-right cell, in physical window pixels, through
-        // the same translation the paint path uses (padding + content origin).
+        let (window_x, window_y) = rt.window_grid_origin();
+        let (grid_x, grid_y) = frame.grid_origin(cell_w, cell_h);
+        // Centre of the bottom-right painted cell, in physical window pixels.
         let pos = bitty_platform::CursorPosition {
-            x: pad
-                + f64::from(content.x)
+            x: f64::from(window_x + grid_x)
                 + f64::from(frame.cols.saturating_sub(1)) * f64::from(cell_w)
                 + f64::from(cell_w) / 2.0,
-            y: pad
-                + f64::from(content.y)
+            y: f64::from(window_y + grid_y)
                 + f64::from(frame.rows.saturating_sub(1)) * f64::from(cell_h)
                 + f64::from(cell_h) / 2.0,
         };

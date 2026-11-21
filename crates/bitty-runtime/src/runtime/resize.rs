@@ -178,9 +178,8 @@ impl Runtime {
     /// Window padding in physical pixels at the live DPI scale (CTX-0223).
     ///
     /// The configured logical padding scaled by the sanitized live factor,
-    /// rounded half away from zero. Tick translates grid content by this
-    /// offset and `Self::grid_from_physical` removes twice it before
-    /// dividing, so render placement and grid derivation share one source.
+    /// rounded half away from zero. Grid sizing removes twice this base
+    /// inset. For physical placement use [`Self::window_grid_origin`].
     #[must_use]
     pub fn window_padding_physical(&self) -> u32 {
         let scaled = f64::from(
@@ -198,6 +197,36 @@ impl Runtime {
         } else {
             rounded as u32
         }
+    }
+
+    /// Physical origin `(x, y)` added to window-grid-relative geometry.
+    /// Splits the true sub-cell vertical slack around the entire stack,
+    /// including chrome bands. An odd pixel stays at the bottom. Horizontal
+    /// placement and the padding used for grid sizing are unchanged.
+    #[must_use]
+    pub fn window_grid_origin(&self) -> (i32, i32) {
+        let pad = self.window_padding_physical();
+        let live = self.live_cell_metrics();
+        let window = self.window_cells();
+        let remainder = |extent: u32, cells: u16, cell: u32| {
+            let spare = i64::from(extent) - 2 * i64::from(pad) - i64::from(cells) * i64::from(cell);
+            (cells > 0 && (0..i64::from(cell)).contains(&spare)).then_some(spare)
+        };
+        let top_slack = self.surface_extent().and_then(|extent| {
+            // A nonzero logical origin is only used by synthetic layouts.
+            // The physical resize path always derives a zero-origin grid.
+            if window.x != 0 || window.y != 0 {
+                return None;
+            }
+            // A negative spare means the grid does not fit (including the
+            // minimum clamp). A whole spare cell means the extent is stale
+            // or the grid reached its maximum bound.
+            remainder(extent.width(), window.width, live.width)?;
+            remainder(extent.height(), window.height, live.height)
+        });
+        let x = i32::try_from(pad).unwrap_or(i32::MAX);
+        let y = i32::try_from(i64::from(pad) + top_slack.unwrap_or(0) / 2).unwrap_or(i32::MAX);
+        (x, y)
     }
 
     /// Live-applies a new window padding without restart (CTX-0223).
@@ -248,7 +277,7 @@ impl Runtime {
     /// combined list is synthesized from (a stale 1-cell extent clamps the
     /// factor to 4x and magnifies the whole frame, the dominant blur behind
     /// #232 alongside the unscaled surface/grid/atlas). Tick translates all
-    /// content by the padding origin, so the plan spans the window extent.
+    /// cell content by the window-grid origin in that same pixel space.
     ///
     /// The draw list is authored in *physical* window pixels: cell metrics
     /// and the raster point size already carry the live DPI scale (see
@@ -547,6 +576,8 @@ impl Runtime {
                 .map_err(RuntimeError::from)?;
         }
         self.resize_primary_pty()?;
+        // A physical resize can move the window-grid origin by sub-cell
+        // pixels even when every logical allocation is unchanged.
         self.pending_full_redraw = true;
         Ok(())
     }

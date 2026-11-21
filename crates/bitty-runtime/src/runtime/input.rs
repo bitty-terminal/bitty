@@ -2588,9 +2588,9 @@ impl Runtime {
         };
         // Content-only containment: a pointer on the frame's border ring or
         // on the Core decoration around it is chrome, not text.
-        let pad = f64::from(self.window_padding_physical());
-        let x = pos.x - pad;
-        let y = pos.y - pad;
+        let (origin_x, origin_y) = self.window_grid_origin();
+        let x = pos.x - f64::from(origin_x);
+        let y = pos.y - f64::from(origin_y);
         let content = frame.content;
         let right = f64::from(content.x) + f64::from(content.width);
         let bottom = f64::from(content.y) + f64::from(content.height);

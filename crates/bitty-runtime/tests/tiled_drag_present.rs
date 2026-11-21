@@ -102,10 +102,10 @@ impl Harness {
 
     fn content_point(&self, view: ViewId, fx: f64, fy: f64) -> CursorPosition {
         let frame = self.frame(view);
-        let pad = f64::from(self.rt.window_padding_physical());
+        let (window_x, window_y) = self.rt.window_grid_origin();
         CursorPosition {
-            x: pad + f64::from(frame.content.x) + f64::from(frame.content.width) * fx,
-            y: pad + f64::from(frame.content.y) + f64::from(frame.content.height) * fy,
+            x: f64::from(window_x + frame.content.x) + f64::from(frame.content.width) * fx,
+            y: f64::from(window_y + frame.content.y) + f64::from(frame.content.height) * fy,
         }
     }
 
@@ -174,10 +174,10 @@ fn stale_ink(
 }
 
 fn window_rect(rt: &Runtime, rect: bitty_render::geometry::RectPx) -> (i32, i32, i32, i32) {
-    let pad = rt.window_padding_physical() as i32;
+    let (window_x, window_y) = rt.window_grid_origin();
     (
-        pad + rect.x,
-        pad + rect.y,
+        window_x + rect.x,
+        window_y + rect.y,
         rect.width as i32,
         rect.height as i32,
     )
@@ -515,12 +515,10 @@ fn floating_drag_translates_the_float_without_stale_copies() {
     let old_frame = window_rect(&rt, float_frame.frame);
     let pty_before = rt.pane_pty_pixel_size(&float_id);
 
+    let (window_x, window_y) = rt.window_grid_origin();
     let grab = CursorPosition {
-        x: f64::from(rt.window_padding_physical())
-            + f64::from(float_frame.content.x)
-            + f64::from(float_frame.content.width) / 2.0,
-        y: f64::from(rt.window_padding_physical())
-            + f64::from(float_frame.content.y)
+        x: f64::from(window_x + float_frame.content.x) + f64::from(float_frame.content.width) / 2.0,
+        y: f64::from(window_y + float_frame.content.y)
             + f64::from(float_frame.content.height) / 2.0,
     };
     rt.handle_cursor_moved(grab);

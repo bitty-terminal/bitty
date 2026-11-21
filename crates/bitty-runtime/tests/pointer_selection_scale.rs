@@ -11,8 +11,8 @@
 //! - a plain click still clears (no accidental one-cell highlight).
 //!
 //! Coordinates are derived from `present_frames` (`content` origin),
-//! `window_padding_physical`, and `live_cell_size`, never from hard-coded
-//! pixel constants, so padding, decoration, and DPI rounding stay covered.
+//! `window_grid_origin`, and `live_cell_size`, so window insets, decoration,
+//! and DPI rounding stay covered.
 
 #![forbid(unsafe_code)]
 
@@ -46,7 +46,7 @@ fn primary_frame(rt: &Runtime) -> PresentFrame {
 fn cell_edge_x(rt: &Runtime, frame: &PresentFrame, col: u16) -> f64 {
     let (cell_w, cell_h) = rt.live_cell_size();
     let (grid_x, _) = frame.grid_origin(cell_w, cell_h);
-    f64::from(rt.window_padding_physical()) + f64::from(grid_x) + f64::from(col) * f64::from(cell_w)
+    f64::from(rt.window_grid_origin().0 + grid_x) + f64::from(col) * f64::from(cell_w)
 }
 
 /// Absolute physical y of a cell edge (`row == 0` is the painted grid's top
@@ -54,7 +54,7 @@ fn cell_edge_x(rt: &Runtime, frame: &PresentFrame, col: u16) -> f64 {
 fn cell_edge_y(rt: &Runtime, frame: &PresentFrame, row: u16) -> f64 {
     let (cell_w, cell_h) = rt.live_cell_size();
     let (_, grid_y) = frame.grid_origin(cell_w, cell_h);
-    f64::from(rt.window_padding_physical()) + f64::from(grid_y) + f64::from(row) * f64::from(cell_h)
+    f64::from(rt.window_grid_origin().1 + grid_y) + f64::from(row) * f64::from(cell_h)
 }
 
 fn at(rt: &Runtime, frame: &PresentFrame, col: u16, row: u16) -> CursorPosition {

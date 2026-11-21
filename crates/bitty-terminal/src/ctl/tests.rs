@@ -1357,6 +1357,128 @@ fn panel_content_wire_methods_and_params_round_trip() {
     }
 }
 
+/// bitty#2388 residue 3 (CTX-1931): `panel mode`'s CLI parse, wire identity,
+/// and params shape, mirroring the debug pair's grammar. The mode word is the
+/// closed `PresentationMode` vocabulary: the two answerable modes apply, the
+/// two placement-less modes parse and the runtime refuses them typed, and
+/// anything else is a usage error at the CLI.
+#[test]
+fn panel_mode_verb_parses_and_wires_the_mode_word() {
+    use crate::ctl::request::{
+        METHOD_PANEL_CONTENT_MODE, panel_content_mode_params, parse_panel_content_mode_params,
+    };
+
+    // Token-free form: `p:N` plus one canonical mode word.
+    let (req, _) =
+        parse_ctl_request(&words(&["panel", "mode", "p:3", "floating"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::PanelContentMode {
+            panel_id: String::from("p:3"),
+            mode: String::from("floating"),
+            token: None,
+        }
+    );
+    assert_eq!(req.registry_id(), "core.panel.mode");
+    assert_eq!(req.wire_method(), Some(METHOD_PANEL_CONTENT_MODE));
+    assert_eq!(
+        req.wire_params().expect("the mode travels on the wire"),
+        panel_content_mode_params("p:3", "floating", None),
+        "one stable mode params shape"
+    );
+    assert_eq!(
+        req.wire_params().expect("the mode travels on the wire"),
+        "{\"panel_id\":\"p:3\",\"mode\":\"floating\"}"
+    );
+
+    // Token-fenced form: the present receipt's ordinal rides as a third
+    // field, so a script can prove it still names the layer it presented.
+    let (req, _) =
+        parse_ctl_request(&words(&["panel", "mode", "p:3", "tiled", "7"])).expect("must parse");
+    assert_eq!(
+        req,
+        CtlRequest::PanelContentMode {
+            panel_id: String::from("p:3"),
+            mode: String::from("tiled"),
+            token: Some(7),
+        }
+    );
+    assert_eq!(
+        req.wire_params()
+            .expect("the fenced pair travels on the wire"),
+        panel_content_mode_params("p:3", "tiled", Some(7))
+    );
+    assert_eq!(
+        req.wire_params()
+            .expect("the fenced pair travels on the wire"),
+        "{\"panel_id\":\"p:3\",\"mode\":\"tiled\",\"token\":\"7\"}"
+    );
+
+    // The handler side parses exactly what the CLI built, both shapes.
+    assert_eq!(
+        parse_panel_content_mode_params(Some("{\"panel_id\":\"p:3\",\"mode\":\"floating\"}")),
+        Ok((String::from("p:3"), String::from("floating"), None))
+    );
+    assert_eq!(
+        parse_panel_content_mode_params(Some(
+            "{\"panel_id\":\"p:3\",\"mode\":\"tiled\",\"token\":\"7\"}"
+        )),
+        Ok((String::from("p:3"), String::from("tiled"), Some(7)))
+    );
+
+    // The mode word is the closed canonical vocabulary — no silent aliasing.
+    for word in ["tiled", "floating", "fullscreen", "scratchpad"] {
+        assert!(
+            parse_ctl_request(&words(&["panel", "mode", "p:3", word])).is_ok(),
+            "{word} must parse (the runtime types the placement-less ones)"
+        );
+    }
+
+    // Usage errors stay usage errors: missing mode, extra words, an unknown
+    // or case-broken mode word, a non-numeric or over-long token, a
+    // misplaced flag, and a non-panel id.
+    for raw in [
+        vec!["panel", "mode"],
+        vec!["panel", "mode", "p:3"],
+        vec!["panel", "mode", "p:3", "floating", "7", "extra"],
+        vec!["panel", "mode", "p:3", "zoom"],
+        vec!["panel", "mode", "p:3", "Floating"],
+        vec!["panel", "mode", "p:3", "floating", "x"],
+        vec!["panel", "mode", "p:3", "floating", "99999999999999999999"],
+        vec!["panel", "mode", "p:3", "floating", "--cwd", "/tmp"],
+        vec!["panel", "mode", "v:3", "floating"],
+    ] {
+        assert!(
+            parse_ctl_request(&words(&raw)).is_err(),
+            "{raw:?} must be a usage error"
+        );
+    }
+
+    // Strict params: unknown fields, wrong order, wrong types, an unknown
+    // mode word, and over-long documents are typed refusals, never a
+    // defaulted target.
+    for bad in [
+        None,
+        Some("{}"),
+        Some("{\"mode\":\"floating\"}"),
+        Some("{\"panel_id\":\"p:1\"}"),
+        Some("{\"mode\":\"floating\",\"panel_id\":\"p:1\"}"),
+        Some("{\"panel_id\":\"p:1\",\"zoom\":\"floating\"}"),
+        Some("{\"panel_id\":\"p:1\",\"mode\":floating}"),
+        Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\",\"token\":\"7\",\"extra\":true}"),
+        Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\",\"extra\":\"7\"}"),
+        Some("{\"panel_id\":\"p:1\",\"mode\":\"zoom\"}"),
+        Some("{\"panel_id\":\"v:1\",\"mode\":\"floating\"}"),
+        Some("{\"panel_id\":\"p:1\",\"mode\":\"floating\",\"token\":\"x\"}"),
+        Some("not json"),
+    ] {
+        assert!(
+            parse_panel_content_mode_params(bad).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+}
+
 /// bitty#2388 (CTX-1913): usage, help, and completion all list the
 /// panel-content pair, with the Core identity and the scope it needs.
 #[test]
@@ -1368,7 +1490,7 @@ fn panel_content_verbs_are_documented_in_usage_help_and_completion() {
         .iter()
         .find(|(resource, _)| *resource == "panel")
         .expect("the resource table lists `panel`");
-    assert_eq!(completion.1, &["list", "present", "release"]);
+    assert_eq!(completion.1, &["list", "present", "release", "mode"]);
     assert!(
         parse_ctl_request(&words(&["panel", "present", "p:1"])).is_ok(),
         "completion advertises `panel present` but the parser refuses it"
@@ -1377,13 +1499,23 @@ fn panel_content_verbs_are_documented_in_usage_help_and_completion() {
         parse_ctl_request(&words(&["panel", "release", "p:1", "7"])).is_ok(),
         "completion advertises `panel release` but the parser refuses it"
     );
+    assert!(
+        parse_ctl_request(&words(&["panel", "mode", "p:1", "floating"])).is_ok(),
+        "completion advertises `panel mode` but the parser refuses it"
+    );
     assert!(ctl_usage().contains("panel present p:N | panel release p:N TOKEN"));
+    assert!(ctl_usage().contains("panel mode p:N tiled|floating"));
     let help = ctl_help_text(false);
-    for text in ["panel present p:N", "panel release p:N TOKEN"] {
+    for text in [
+        "panel present p:N",
+        "panel release p:N TOKEN",
+        "panel mode p:N tiled|floating [TOKEN]",
+    ] {
         assert!(help.contains(text), "help must document `{text}`");
     }
     assert!(help.contains("core.panel.present"));
     assert!(help.contains("core.panel.release"));
+    assert!(help.contains("core.panel.mode"));
     assert!(help.contains("view.manage"));
 }
 

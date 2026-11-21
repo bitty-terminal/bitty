@@ -646,3 +646,133 @@ fn release_leaves_a_third_party_mode_alone_after_the_layer_floated() {
         "and the layer is gone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row 9 (bitty#2388 residue 3, CTX-1931): the keybind gesture — the
+// PRESENTATION_CMD_* workspace command names move the FOCUSED presented
+// layer's mode through the string dispatch, the same single gate the ctl
+// verb runs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_presentation_command_names_move_the_focused_presented_layer() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panels_at(&mut rt, &[PRIMARY]);
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("layer"))
+        .expect("primary presents");
+    assert_eq!(presented.presentation, PresentationMode::Tiled);
+
+    // The keybind resolves the opposite mode's command NAME; the string
+    // dispatch applies it through the single transition gate.
+    let moved = rt
+        .apply_panel_content_mode_command(PRIMARY, bitty_ui::PRESENTATION_CMD_FLOATING)
+        .expect("the float command moves the layer");
+    assert_eq!(moved, PresentationMode::Floating);
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Floating),
+        "the leaf itself carries the mode the command stamped"
+    );
+    assert_eq!(
+        rt.panel_content_layer(PRIMARY)
+            .map(|layer| layer.presentation),
+        Some(PresentationMode::Floating),
+        "the record carries it too, so release can tell the layer moved the leaf"
+    );
+
+    // Toggling back through the tiled command name.
+    let back = rt
+        .apply_panel_content_mode_command(PRIMARY, bitty_ui::PRESENTATION_CMD_TILED)
+        .expect("the tiled command moves the layer back");
+    assert_eq!(back, PresentationMode::Tiled);
+    assert_eq!(rt.view_presentation(PRIMARY), Some(PresentationMode::Tiled));
+
+    // A redundant command is the same no-op the direct verb is: nothing
+    // stamps, and the call still reports the requested mode.
+    let same = rt
+        .apply_panel_content_mode_command(PRIMARY, bitty_ui::PRESENTATION_CMD_TILED)
+        .expect("a redundant command is admitted as a no-op");
+    assert_eq!(same, PresentationMode::Tiled);
+    assert_eq!(
+        rt.panel_content_layer(PRIMARY)
+            .map(|layer| layer.presentation),
+        Some(PresentationMode::Tiled),
+        "a redundant command claims no change"
+    );
+    assert_eq!(
+        rt.panel_content_layer(PRIMARY)
+            .map(|layer| layer.prior_presentation),
+        Some(PresentationMode::Tiled),
+        "and never rewrites the mode release will restore"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 10 (bitty#2388 residue 3, CTX-1931): the same dispatch refuses typed —
+// no layer, no panel, an unknown command name, and a placement-less mode all
+// answer PanelError and leave the tree alone, never a fall-through mutation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_presentation_command_dispatch_refuses_typed_and_moves_nothing() {
+    let mut rt = runtime();
+    install(&mut rt, panes_and_a_bare_leaf());
+    install_panels_at(&mut rt, &[PRIMARY]);
+
+    // No layer presented: typed refusal, tree unchanged.
+    match rt.apply_panel_content_mode_command(PRIMARY, bitty_ui::PRESENTATION_CMD_FLOATING) {
+        Err(PanelError::ContentNotPresented { .. }) => {}
+        other => panic!("no layer must refuse typed, got {other:?}"),
+    }
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Tiled),
+        "the refused command moved nothing"
+    );
+
+    // A leaf with no panel mounted at all answers in the same vocabulary.
+    match rt.apply_panel_content_mode_command(BARE, bitty_ui::PRESENTATION_CMD_FLOATING) {
+        Err(PanelError::ContentUnavailable { .. }) => {}
+        other => panic!("a bare leaf must refuse typed, got {other:?}"),
+    }
+    assert_eq!(rt.view_presentation(BARE), Some(PresentationMode::Tiled));
+
+    // An unknown command name is a typed refusal, not a silent drop.
+    match rt.apply_panel_content_mode_command(PRIMARY, "bitty.workspace:not-a-command") {
+        Err(PanelError::ContentUnavailable { .. }) => {}
+        other => panic!("an unknown command must refuse typed, got {other:?}"),
+    }
+
+    // The placement-less mode commands (the other two registry names) are the
+    // same honest typed refusal the direct verb answers, never a stamp that
+    // paints exactly like the mode it replaced.
+    rt.present_panel_content(PRIMARY, text_layer("layer"))
+        .expect("primary presents");
+    for command in [
+        bitty_ui::PRESENTATION_CMD_FULLSCREEN,
+        bitty_ui::PRESENTATION_CMD_SCRATCHPAD,
+    ] {
+        match rt.apply_panel_content_mode_command(PRIMARY, command) {
+            Err(PanelError::ContentPresentationUnsupported { mode, .. }) => {
+                assert!(
+                    command.ends_with(mode),
+                    "the refusal names the mode the command carried: {command} vs {mode}"
+                );
+            }
+            other => panic!("{command} must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            rt.view_presentation(PRIMARY),
+            Some(PresentationMode::Tiled),
+            "the refused command moved nothing"
+        );
+        assert_eq!(
+            rt.panel_content_layer(PRIMARY)
+                .map(|layer| layer.presentation),
+            Some(PresentationMode::Tiled),
+            "and the record did not move either"
+        );
+    }
+}

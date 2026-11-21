@@ -471,11 +471,28 @@ fn handle_panel_content_verb(
         ));
     }
     // Strict params: the present shape is the tab `{"panel_id":"p:N"}`
-    // document, the release shape adds the receipt's `"token"`. A malformed
-    // document is `InvalidParams` here, before any runtime state is read.
+    // document, the release shape adds the receipt's `"token"`, and the mode
+    // shape carries the canonical mode word with the same optional `"token"`
+    // fence. A malformed document is `InvalidParams` here, before any runtime
+    // state is read.
     let params = if method == crate::ctl::request::METHOD_PANEL_CONTENT_PRESENT {
         match crate::ctl::parse_tab_params(request.params_raw.as_deref()) {
             Ok(panel_id) => crate::ctl::tab_params(&panel_id),
+            Err(err) => {
+                return Err(bitty_ipc::devtools::HandlerError::new(
+                    "usage",
+                    "InvalidParams",
+                    format!("{method} refused: {err}"),
+                ));
+            }
+        }
+    } else if method == crate::ctl::request::METHOD_PANEL_CONTENT_MODE {
+        match crate::ctl::parse_panel_content_mode_params(request.params_raw.as_deref()) {
+            // Re-emit from the validated triple so the lane carries exactly
+            // the document the app-side apply will parse again.
+            Ok((panel_id, mode, token)) => {
+                crate::ctl::panel_content_mode_params(&panel_id, &mode, token)
+            }
             Err(err) => {
                 return Err(bitty_ipc::devtools::HandlerError::new(
                     "usage",

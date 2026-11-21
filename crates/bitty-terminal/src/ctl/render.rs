@@ -71,8 +71,8 @@ pub(crate) const TAB_SKEW_MESSAGE: &str = "the running instance does not serve t
 /// the pair registers additively on the dispatcher, so an older instance
 /// answers `UnknownMethod`, which is an upgrade prompt, never a bad argument.
 pub(crate) const PANEL_CONTENT_SKEW_MESSAGE: &str = "the running instance does not serve the \
-     `panel present`/`panel release` verbs (its ctl protocol predates them); restart the \
-     instance with this build and retry";
+     `panel present`/`panel release`/`panel mode` verbs (its ctl protocol predates them); \
+     restart the instance with this build and retry";
 
 /// Map a server error `(category, code)` to the stable CLI exit code.
 ///
@@ -573,7 +573,9 @@ fn render_outcome(
     // together.
     if matches!(
         request,
-        CtlRequest::PanelContentPresent { .. } | CtlRequest::PanelContentRelease { .. }
+        CtlRequest::PanelContentPresent { .. }
+            | CtlRequest::PanelContentRelease { .. }
+            | CtlRequest::PanelContentMode { .. }
     ) && outcome.code == "UnknownMethod"
     {
         let message = PANEL_CONTENT_SKEW_MESSAGE;
@@ -846,6 +848,15 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
         CtlRequest::PanelContentRelease { panel_id, .. } => {
             out.push_str(&format!(
                 "released debug layer on panel {panel_id} on {} — result: {result_json}\n",
+                target.instance
+            ));
+        }
+        // bitty#2388 residue 3 (CTX-1931): the mode receipt is the machine
+        // contract (`changed` plus the mode it moved the layer to); one line
+        // labels the verb and the panel for the human table.
+        CtlRequest::PanelContentMode { panel_id, .. } => {
+            out.push_str(&format!(
+                "moved the presented layer's mode on panel {panel_id} on {} — result: {result_json}\n",
                 target.instance
             ));
         }

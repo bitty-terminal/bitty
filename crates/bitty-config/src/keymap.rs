@@ -73,7 +73,10 @@
 //!   panel tiled/floating toggle, default `alt+a`, `global` only),
 //!   `toggle_pinned` (alias `pinned_toggle`; CTX-1083 follow-up to CTX-1077
 //!   #1757: focused panel pinned/sticky-float toggle, manual bind only,
-//!   never in defaults).
+//!   never in defaults),
+//!   `toggle_panel_mode` (alias `panel_mode_toggle`; bitty#2388 residue 3:
+//!   focused presented panel's content-layer mode toggle, default
+//!   `ctrl+alt+a`, `global` only).
 //!   W-144 (CTX-0937): the search/copy-mode policy actions retired with
 //!   the Core policy; their namespace moves to W-138 with the plugins
 //!   (CTX-0003), so the retired spellings fail closed as unknown here.
@@ -107,8 +110,12 @@
 //! auto-spawning it on first use) and `ctrl+alt+s` `move_to_scratchpad`
 //! (move the focused panel in, or return the shown panel to the tiling);
 //! `alt+s` stays `toggle_split` (issue #3155). Both new chords carry the
-//! `alt` slot so a Super flip rebinds them to `shift+super+s` /
-//! `ctrl+super+s`.
+//! `alt` slot so a Super flip rebinds them to `shift+super+s` / `ctrl+super+s`.
+//! bitty#2388 residue 3 (CTX-1931) adds `ctrl+alt+a` `toggle_panel_mode`
+//! (the FOCUSED presented panel's content-layer tiled/floating toggle
+//! through the `bitty.workspace:presentation-*` command registry; the free
+//! sibling chord of `alt+a`'s floating toggle, rebinding to `ctrl+super+a`
+//! under a Super flip, and a typed no-op with no layer presented).
 //! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
 //! `focus:<n>`); those actions stay parseable and user-bindable but are
 //! no longer bound by default — workspace numbers won the Alt slot per
@@ -1037,6 +1044,26 @@ pub enum ChromeAction {
     /// (same byte-identical discipline as [`Self::TogglePalette`]); the user
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
+    /// Toggle the FOCUSED presented panel's content-layer presentation mode
+    /// between tiled and floating (`toggle_panel_mode`, alias
+    /// `panel_mode_toggle`; bitty#2388 residue 3, CTX-1931).
+    ///
+    /// Present-path verb over the layer a panel presents: the app resolves
+    /// the focused view and, only when that leaf presents a GUI content
+    /// layer, routes the opposite mode's `bitty.workspace:presentation-
+    /// {tiled,floating}` command name through
+    /// `bitty_runtime::Runtime::apply_panel_content_mode_command` — the
+    /// same single transition gate (`apply_presentation_command`) the ctl
+    /// `panel mode` verb runs. Default chord `ctrl+alt+a`: the sibling slot
+    /// of `alt+a`'s [`Self::ToggleFloating`] in the same letter family
+    /// (mirroring how `move_to_scratchpad` owns `ctrl+alt+s` beside
+    /// `toggle_split`'s `alt+s`), free in the shipped map, and clear of the
+    /// `Alt+N` panel namespace. Carries the Mod slot so a Super flip
+    /// rebinds to `ctrl+super+a`. With no layer presented the gesture is a
+    /// typed no-op (the runtime answers `ContentNotPresented` and the tree
+    /// never moves), never a fall-through into the ordinary floating
+    /// toggle. User-overridable via the `context + chord` merge rule.
+    TogglePanelMode,
     /// Toggle a named cross-workspace scratchpad (`toggle_scratchpad[:<name>]`,
     /// issue #3205).
     ///
@@ -1352,6 +1379,10 @@ impl ChromeAction {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::TogglePinned)
             }
+            "toggle_panel_mode" | "panel_mode_toggle" => {
+                reject_arg(arg, trimmed)?;
+                Ok(Self::TogglePanelMode)
+            }
             "new_window" | "new_os_window" => {
                 reject_arg(arg, trimmed)?;
                 Ok(Self::NewWindow)
@@ -1460,6 +1491,7 @@ impl ChromeAction {
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
             Self::TogglePinned => "toggle_pinned".to_string(),
+            Self::TogglePanelMode => "toggle_panel_mode".to_string(),
             Self::ScratchpadToggle(name) => match name {
                 None => "toggle_scratchpad".to_string(),
                 Some(name) => format!("toggle_scratchpad:{name}"),
@@ -1537,6 +1569,9 @@ impl ChromeAction {
             Self::TogglePalette => "Toggle the command palette overlay.",
             Self::ToggleFloating => "Toggle the focused panel between tiled and floating.",
             Self::TogglePinned => "Toggle the focused panel pinned state.",
+            Self::TogglePanelMode => {
+                "Toggle the focused presented panel's content-layer mode (tiled/floating)."
+            }
             Self::ScratchpadToggle(_) => "Toggle a named cross-workspace scratchpad overlay.",
             Self::ScratchpadMove(_) => {
                 "Move the focused panel into a scratchpad, or return it to the tiling."
@@ -2266,6 +2301,18 @@ pub const DEFAULT_KEYMAPS: &[(&str, &str)] = &[
     // is unusable there. Carries the Mod slot so a Super flip rebinds to
     // `super+a`. User-overridable via the `context + chord` merge rule.
     ("alt+a", "toggle_floating"),
+    // bitty#2388 residue 3 (CTX-1931): `ctrl+alt+a` toggles the FOCUSED
+    // presented panel's content-layer mode through the
+    // `bitty.workspace:presentation-{tiled,floating}` command names (the
+    // same single gate `ctl panel mode` runs). The chord is the free sibling
+    // slot of `alt+a`'s floating toggle in the same letter family — the same
+    // relationship `move_to_scratchpad`'s `ctrl+alt+s` has to
+    // `toggle_split`'s `alt+s` — so the mode toggle never shadows the
+    // shipped Alt+N panel namespace or the `alt+p`/`ctrl+alt+p` manual-bind
+    // examples the pinned and devtools actions document. Carries the Mod
+    // slot so a Super flip rebinds to `ctrl+super+a`. With no layer
+    // presented the action is a typed no-op.
+    ("ctrl+alt+a", "toggle_panel_mode"),
     // Issue #3155: Mod+s toggles the enclosing split axis between horizontal
     // and vertical (Hyprland `togglesplit` parity; rebinds to `super+s` under
     // `mod_key = "super"`).
@@ -4300,8 +4347,8 @@ mod tests {
             let maps = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 maps.len(),
-                105,
-                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155) + 3 tab chords (issue #3169) + 2 scratchpad chords (issue #3205)"
+                106,
+                "95 prior shipped defaults + 4 ctrl+alt+h/j/k/l move_split chords + 1 alt+s toggle_split chord (issue #3155) + 3 tab chords (issue #3169) + 2 scratchpad chords (issue #3205) + 1 ctrl+alt+a panel-mode chord (bitty#2388 residue 3)"
             );
             let mut seen = std::collections::HashSet::new();
             for m in &maps {
@@ -4993,6 +5040,84 @@ mod tests {
     }
 
     #[test]
+    fn panel_mode_toggle_parses_canonicalizes_and_stays_user_overridable() {
+        // bitty#2388 residue 3 (CTX-1931): the presented-layer mode toggle
+        // parses (primary plus primitive-order alias), canonicalizes to the
+        // primary spelling, ships on ctrl+Mod+a (the sibling chord of
+        // alt+a's `toggle_floating`, free in the shipped map), and stays
+        // user-overridable through the existing `context + chord` merge
+        // rule. The shipped alt+a binding is NOT overridden.
+        assert_eq!(
+            ChromeAction::parse("toggle_panel_mode")
+                .expect("parses")
+                .canonical(),
+            "toggle_panel_mode"
+        );
+        assert_eq!(
+            ChromeAction::parse("panel_mode_toggle")
+                .expect("alias parses")
+                .canonical(),
+            "toggle_panel_mode"
+        );
+        // Shipped default: ctrl+alt+a under Alt mod, ctrl+super+a under a
+        // Super flip (the chord carries the Mod slot).
+        let alt_maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&alt_maps, key_ref(KeyName::Char('a'), true, true, false))
+                .expect("the panel-mode chord resolves under Alt")
+                .canonical(),
+            "toggle_panel_mode"
+        );
+        let super_maps = default_keymaps_with_mod(ModKey::Super).expect("defaults valid");
+        assert_eq!(
+            match_keymap(&super_maps, key_ref_super(KeyName::Char('a'), true, false))
+                .expect("the panel-mode chord resolves under Super")
+                .canonical(),
+            "toggle_panel_mode"
+        );
+        // The shipped `alt+a` floating toggle is untouched.
+        let maps = default_keymaps().expect("defaults valid");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), false, true, false))
+                .map(|a| a.canonical()),
+            Some("toggle_floating".to_string()),
+            "alt+a still toggles the ordinary panel's floating mode"
+        );
+        // User override replaces the default by chord identity ...
+        let overridden = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "ctrl+alt+a".into(),
+                action: "focus_next".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&overridden).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('a'), true, true, false))
+                .expect("the override resolves")
+                .canonical(),
+            "focus_next"
+        );
+        // ... and the action rebinds elsewhere by explicit chord.
+        let rebound = EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "alt+q".into(),
+                action: "toggle_panel_mode".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = resolve_keymaps(&rebound).expect("resolves");
+        assert_eq!(
+            match_keymap(&maps, key_ref(KeyName::Char('q'), false, true, false))
+                .expect("the rebound chord resolves")
+                .canonical(),
+            "toggle_panel_mode"
+        );
+    }
+
+    #[test]
     fn pinned_toggle_parses_canonicalizes_and_stays_manual_bind_only() {
         // CTX-1083 (follow-up to CTX-1077 #1757): the pinned-toggle action
         // parses (primary plus primitive-order alias), canonicalizes to the
@@ -5163,14 +5288,14 @@ mod tests {
             let defaults = default_keymaps_with_mod(mod_key).expect("defaults valid");
             assert_eq!(
                 defaults.len(),
-                105,
-                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155 + 3 tab chords, issue #3169 + 2 scratchpad chords, issue #3205)",
+                106,
+                "shipped defaults under mod {:?} (95 prior + 4 ctrl+alt+h/j/k/l move_split + 1 alt+s toggle_split, issue #3155 + 3 tab chords, issue #3169 + 2 scratchpad chords, issue #3205 + 1 ctrl+alt+a panel-mode chord, bitty#2388 residue 3)",
                 mod_key
             );
             let maps = resolve_keymaps(&mk_effective(mod_key)).expect("resolves");
             assert_eq!(
                 maps.len(),
-                105 + entries.len(),
+                106 + entries.len(),
                 "explicit binds append, never shadow, under mod {:?}",
                 mod_key
             );

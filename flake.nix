@@ -77,9 +77,9 @@
           buildInputs = with pkgs; [
             fontconfig
             freetype
-          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-            xorg.libxcb
-            xorg.libX11
+          ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            libxcb
+            libx11
             libxkbcommon
             wayland
           ];

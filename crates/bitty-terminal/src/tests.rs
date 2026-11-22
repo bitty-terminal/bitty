@@ -15203,7 +15203,7 @@ fn reap_exited_focused_float_dismisses_while_zoomed_issue_2169() {
     assert!(app.runtime.borrow_mut().set_focus(survivor));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
     assert!(
-        app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+        app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
         "zoom engaged"
     );
     assert!(
@@ -15319,7 +15319,7 @@ fn reap_exited_primary_owner_float_dismisses_while_zoomed_issue_2169() {
     assert!(app.runtime.borrow_mut().set_focus(survivor));
     app.apply_chrome_action(bitty_config::ChromeAction::ToggleZoom);
     assert!(
-        app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+        app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
         "zoom engaged"
     );
     assert!(
@@ -15554,7 +15554,7 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
         .workspace_seq_at(0)
         .expect("workspace seq");
     assert_eq!(
-        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
         Some(vec![hidden, exiting]),
         "the app-side backup owns the real tree"
     );
@@ -15605,7 +15605,7 @@ fn reap_exited_zoomed_pane_in_inactive_workspace_keeps_workspace() {
         !app.runtime.borrow().has_pane_session(&exiting),
         "the exited zoomed pane is torn down"
     );
-    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+    assert_eq!(app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq), None);
 
     // This is the missing half of the old regression: restore the inactive
     // workspace after reap, not only its app-side backup bookkeeping. The
@@ -15664,7 +15664,7 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
         .expect("workspace sequence");
     assert_eq!(app.runtime.borrow().leaf_count(), 1);
     assert_eq!(
-        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
         Some(vec![survivor, exiting])
     );
 
@@ -15690,7 +15690,7 @@ fn reap_exited_hidden_zoom_backup_pane_in_inactive_workspace_restores_tree() {
     assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
     assert!(app.runtime.borrow().has_pane_session(&survivor));
     assert!(!app.runtime.borrow().has_pane_session(&exiting));
-    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+    assert_eq!(app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq), None);
 
     assert!(app.runtime.borrow_mut().workspace_switch(0));
     assert_eq!(app.runtime.borrow().layout().leaf_ids(), vec![survivor]);
@@ -15747,7 +15747,7 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
         .workspace_seq_at(0)
         .expect("workspace sequence");
     assert_eq!(
-        app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+        app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
         Some(vec![primary, survivor])
     );
 
@@ -15780,7 +15780,7 @@ fn reap_exited_primary_in_inactive_zoom_backup_removes_dead_owner() {
     assert_eq!(app.runtime.borrow().active_workspace_index(), 1);
     assert!(!app.runtime.borrow().has_pane_session(&primary));
     assert!(app.runtime.borrow().has_pane_session(&survivor));
-    assert_eq!(app.chrome.zoom.backup_leaf_ids_for_seq(seq), None);
+    assert_eq!(app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq), None);
 
     // The restored stash must no longer carry the dead primary leaf.
     assert!(app.runtime.borrow_mut().workspace_switch(0));

@@ -387,11 +387,19 @@ fn a_foreign_token_cannot_move_another_panels_layer() {
 }
 
 // ---------------------------------------------------------------------------
-// Row 4: a mode this runtime cannot honor is refused, nothing moves
+// Row 4: a mode nobody on this runtime owns is refused, nothing moves
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_mode_with_no_in_tree_placement_is_refused_before_anything_moves() {
+fn scratchpad_is_refused_and_unowned_fullscreen_keeps_the_typed_refusal() {
+    // CTX-1936 premise correction: `Fullscreen` is no longer placement-less —
+    // it is answerable through the installed app-level zoom owner, and this
+    // fixture installs none (the posture of every runtime before the
+    // composition root wires one, and of `--safe`/plugin-less runs). The row
+    // keeps proving the fail-closed half: `Fullscreen` without an owner and
+    // `Scratchpad` with or without one are refused with
+    // `ContentPresentationUnsupported` before any state moves — leaf mode,
+    // frame, focus, winsize, and record all unchanged.
     bitty_test_support::require_pty!();
     let mut rt = runtime();
     install(&mut rt, two_panes());
@@ -441,6 +449,23 @@ fn a_mode_with_no_in_tree_placement_is_refused_before_anything_moves() {
             "{mode:?} must not touch the record"
         );
     }
+
+    // The other half of the corrected premise: with an owner installed,
+    // `Fullscreen` is answerable — but `Scratchpad` keeps its refusal, because
+    // no scratchpad store owns the hide/slot behavior the mode names.
+    let zoom = install_zoom_owner(&mut rt);
+    let refused = rt
+        .set_panel_content_presentation(PANE, presented.token, PresentationMode::Scratchpad)
+        .expect_err("scratchpad stays refused even with a zoom owner installed");
+    assert!(matches!(
+        refused,
+        PanelError::ContentPresentationUnsupported { .. }
+    ));
+    assert_eq!(
+        zoom.state.borrow().engages,
+        0,
+        "the refused scratchpad never reached the zoom owner"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -775,4 +800,362 @@ fn the_presentation_command_dispatch_refuses_typed_and_moves_nothing() {
             "and the record did not move either"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rows 11-13 (bitty#2388 slice, CTX-1936): `Fullscreen` through the installed
+// app-level zoom owner — the support half row 4's corrected premise promises
+// ---------------------------------------------------------------------------
+
+/// Interior state of [`MiniZoom`]: one zoom pair plus the call counts the
+/// rows assert against.
+#[derive(Default)]
+struct MiniZoomState {
+    /// Times the gate asked the owner to engage.
+    engages: u32,
+    /// Times the gate asked the owner to restore.
+    restores: u32,
+    /// The captured live tree, held while the zoom is engaged.
+    backup: Option<LayoutNode>,
+}
+
+/// A recording app-zoom double for the fullscreen rows: mirrors the host
+/// application's zoom pair (capture the live tree, install the single-leaf
+/// proxy, put the tree back on restore) so the runtime rows observe the real
+/// composition shape, and counts every engage/restore the gate asks for —
+/// the observable half of "the owner owns the change".
+struct MiniZoom {
+    state: std::rc::Rc<std::cell::RefCell<MiniZoomState>>,
+}
+
+impl MiniZoom {
+    fn new() -> std::rc::Rc<Self> {
+        std::rc::Rc::new(Self {
+            state: std::rc::Rc::default(),
+        })
+    }
+
+    /// The user's own unzoom, out of band: consumes the zoom without the
+    /// layer's give-back running, the way `toggle_zoom` does.
+    fn unzoom_out_of_band(&self, rt: &mut Runtime) {
+        let backup = self.state.borrow_mut().backup.take();
+        if let Some(backup) = backup {
+            rt.set_layout(backup);
+        }
+    }
+}
+
+impl bitty_runtime::PanelFullscreenOwner for MiniZoom {
+    fn engage(&self, rt: &mut Runtime, view: ViewId) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.backup.is_some() {
+            return false;
+        }
+        let Some(leaf) = rt.layout().find_leaf(view).cloned() else {
+            return false;
+        };
+        let backup = rt.layout().clone();
+        rt.set_layout(LayoutNode::leaf(leaf));
+        state.backup = Some(backup);
+        state.engages = state.engages.saturating_add(1);
+        true
+    }
+
+    fn restore(&self, rt: &mut Runtime, view: ViewId) -> bool {
+        let _ = view;
+        let mut state = self.state.borrow_mut();
+        state.restores = state.restores.saturating_add(1);
+        match state.backup.take() {
+            Some(backup) => {
+                rt.set_layout(backup);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Installs a [`MiniZoom`] owner on `rt` and returns the handle its rows
+/// read the call counts through.
+fn install_zoom_owner(rt: &mut Runtime) -> std::rc::Rc<MiniZoom> {
+    let zoom = MiniZoom::new();
+    rt.set_panel_fullscreen_owner(Some(
+        std::rc::Rc::clone(&zoom) as std::rc::Rc<dyn bitty_runtime::PanelFullscreenOwner>
+    ));
+    zoom
+}
+
+// ---------------------------------------------------------------------------
+// Row 11: entering fullscreen rides the owner, and the gate never re-engages
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_presented_layer_fullscreens_through_the_installed_zoom_owner() {
+    bitty_test_support::require_pty!();
+    let mut rt = runtime();
+    install(&mut rt, two_panes());
+    spawn_pane(&mut rt);
+    install_panels_at(&mut rt, &[PANE]);
+    assert!(rt.set_focus(PANE), "the pane holds focus");
+    let zoom = install_zoom_owner(&mut rt);
+    let presented = rt
+        .present_panel_content(PANE, text_layer("dashboard"))
+        .expect("present is admitted");
+    let winsize = rt.pane_pty_size(&PANE).expect("live pane winsize");
+    let tiled = frame_of(&rt, PANE);
+
+    // The direct verb hands the mode to the owner: the zoom engages before
+    // anything stamps, the leaf carries `Fullscreen`, and the record carries
+    // both the mode and the leaf mode it displaced.
+    let changed = rt
+        .set_panel_content_presentation(PANE, presented.token, PresentationMode::Fullscreen)
+        .expect("a presented panel may fullscreen through the owner");
+    assert_eq!(zoom.state.borrow().engages, 1, "the owner engaged once");
+    assert_eq!(zoom.state.borrow().restores, 0);
+    assert_eq!(changed.view, PANE);
+    assert_eq!(
+        changed.token, presented.token,
+        "the handle survives the move"
+    );
+    assert_eq!(changed.presentation, PresentationMode::Fullscreen);
+    assert_eq!(
+        changed.prior_presentation,
+        PresentationMode::Tiled,
+        "a mode change never rewrites the mode release will restore"
+    );
+    assert_eq!(
+        changed.pre_fullscreen_presentation,
+        Some(PresentationMode::Tiled),
+        "the record carries the leaf mode the fullscreen displaced"
+    );
+    assert_eq!(
+        rt.view_presentation(PANE),
+        Some(PresentationMode::Fullscreen),
+        "the live (proxy) leaf carries the new mode"
+    );
+    // The zoom is real: the live tree collapsed to the single-leaf proxy and
+    // the view paints full-bleed base content, wider than its half-slot.
+    assert_eq!(
+        rt.layout().leaf_ids().len(),
+        1,
+        "the owner installed the single-leaf proxy"
+    );
+    let full = frame_of(&rt, PANE);
+    assert_eq!(full.tier, None, "a fullscreen leaf is base content");
+    assert!(
+        usize::from(full.cols) > usize::from(tiled.cols),
+        "the fullscreen frame is wider than the half-slot: {} vs {}",
+        full.cols,
+        tiled.cols
+    );
+
+    // The hidden terminal is untouched: same winsize now, and still frozen
+    // across the layout pass the change triggers.
+    assert_eq!(
+        rt.pane_pty_size(&PANE),
+        Some(winsize),
+        "fullscreening the layer must not resize the hidden PTY"
+    );
+    assert_eq!(
+        rt.panel_content_kind(PANE),
+        Some(ViewContent::Rich(presented.token.get())),
+        "the panel still presents the layer, not its terminal"
+    );
+    let stats = rt.tick().expect("frame in the new mode");
+    assert!(stats.glyphs > 0, "the layer paints full-bleed");
+    assert_eq!(
+        rt.pane_pty_size(&PANE),
+        Some(winsize),
+        "the layout pass after the change still refuses to touch the frozen PTY"
+    );
+
+    // The string dispatch — the keybind's spelling — rides the same owner.
+    let again = rt
+        .apply_panel_content_mode_command(PANE, bitty_ui::PRESENTATION_CMD_FULLSCREEN)
+        .expect("the fullscreen command is answerable with an owner");
+    assert_eq!(again, PresentationMode::Fullscreen);
+    assert_eq!(
+        zoom.state.borrow().engages,
+        1,
+        "a redundant request never re-engages the zoom"
+    );
+
+    // Leaving fullscreen gives the zoom back before the stamp: the real tree
+    // returns, and the stamp lands on the leaf the disengage restored.
+    let floated = rt
+        .set_panel_content_presentation(PANE, presented.token, PresentationMode::Floating)
+        .expect("a fullscreen layer may return to a float");
+    assert_eq!(zoom.state.borrow().engages, 1);
+    assert_eq!(
+        zoom.state.borrow().restores,
+        1,
+        "leaving fullscreen restores the zoom exactly once"
+    );
+    assert_eq!(rt.layout().leaf_ids().len(), 2, "the real tree is back");
+    assert_eq!(floated.presentation, PresentationMode::Floating);
+    assert_eq!(
+        floated.pre_fullscreen_presentation, None,
+        "the record drops the displaced leaf mode when fullscreen ends"
+    );
+    assert_eq!(rt.view_presentation(PANE), Some(PresentationMode::Floating));
+    assert_eq!(frame_of(&rt, PANE).tier, Some(OverlayTier::Float));
+}
+
+// ---------------------------------------------------------------------------
+// Row 12: release of a fullscreen layer restores the zoom AND the mode, and
+// owes exactly one restore resize
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_of_a_fullscreen_layer_restores_the_zoom_the_mode_and_owes_one_resize() {
+    bitty_test_support::require_pty!();
+    let mut rt = runtime();
+    install(&mut rt, two_panes());
+    spawn_pane(&mut rt);
+    install_panels_at(&mut rt, &[PANE]);
+    let zoom = install_zoom_owner(&mut rt);
+    let presented = rt
+        .present_panel_content(PANE, text_layer("dashboard"))
+        .expect("present is admitted");
+    let winsize = rt.pane_pty_size(&PANE).expect("live pane winsize");
+    let restores_before = rt.content_restore_resizes();
+
+    // Tiled -> Floating -> Fullscreen: the record the release reads says the
+    // layer last requested Fullscreen and displaced a Tiled leaf.
+    rt.set_panel_content_presentation(PANE, presented.token, PresentationMode::Floating)
+        .expect("a presented panel may float");
+    rt.set_panel_content_presentation(PANE, presented.token, PresentationMode::Fullscreen)
+        .expect("a floated layer may fullscreen through the owner");
+    assert_eq!(zoom.state.borrow().engages, 1);
+
+    // The container grows while the layer is fullscreen: the freeze keeps the
+    // hidden PTY at the frozen winsize across the proxy's relayout.
+    rt.set_container(UiRect::new(0, 0, 100, 30));
+    assert_eq!(
+        rt.pane_pty_size(&PANE),
+        Some(winsize),
+        "the freeze keeps the hidden PTY at the frozen winsize across the relayout"
+    );
+
+    let restored = rt
+        .release_panel_content(PANE, presented.token)
+        .expect("release restores the terminal content");
+    assert_eq!(restored.content, ViewContent::Terminal(PANE.0));
+    assert_eq!(restored.presentation, PresentationMode::Fullscreen);
+    assert_eq!(restored.prior_presentation, PresentationMode::Tiled);
+    assert_eq!(
+        restored.pre_fullscreen_presentation,
+        Some(PresentationMode::Floating),
+        "the release carries the leaf mode the fullscreen displaced"
+    );
+
+    // Both halves came back atomically, before the resize was measured:
+    // the zoom (the real tree returns) and the mode (the panel is Tiled
+    // again, not Floating and not Fullscreen).
+    assert_eq!(
+        zoom.state.borrow().restores,
+        1,
+        "the release gave the zoom back exactly once"
+    );
+    assert_eq!(rt.layout().leaf_ids().len(), 2, "the real tree is back");
+    assert_eq!(
+        rt.view_presentation(PANE),
+        Some(PresentationMode::Tiled),
+        "release gives the mode the layer displaced back"
+    );
+    let back = frame_of(&rt, PANE);
+    assert_eq!(back.tier, None, "the panel is back in its own slot");
+    assert_eq!(
+        (back.cols, back.rows),
+        (47, 28),
+        "the returned slot reflects the relayouted container"
+    );
+    assert_eq!(
+        rt.pane_pty_size(&PANE),
+        Some((back.cols, back.rows)),
+        "the restore resized the PTY to the returned slot exactly once"
+    );
+    assert_eq!(
+        rt.content_restore_resizes(),
+        restores_before + 1,
+        "exactly one measured restore resize: the release's own sync delivered \
+         the movement (the zoom give-back's layout install had re-placed the \
+         leaf at the float frame on its way back; the mode give-back then \
+         returned it to the tiled slot, and this is the one measured hop)"
+    );
+    assert!(!rt.content_layer_presented(PANE), "the layer is gone");
+}
+
+// ---------------------------------------------------------------------------
+// Row 13: after the user unzooms out of band and a third party moves the
+// leaf, release restores the content and leaves that intent alone
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_leaves_a_third_party_mode_alone_after_the_user_unzoomed() {
+    let mut rt = runtime();
+    install(&mut rt, single_leaf());
+    install_panels_at(&mut rt, &[PRIMARY]);
+    let zoom = install_zoom_owner(&mut rt);
+    let presented = rt
+        .present_panel_content(PRIMARY, text_layer("layer"))
+        .expect("primary presents");
+    // Float first so the record's displaced leaf mode (`Floating`) differs
+    // from the mode release would give back (`Tiled`): only then can the
+    // third-party guard refuse on its own, exactly like row 8's ordinary twin.
+    rt.set_panel_content_presentation(PRIMARY, presented.token, PresentationMode::Floating)
+        .expect("the layer floats through the verb");
+    rt.set_panel_content_presentation(PRIMARY, presented.token, PresentationMode::Fullscreen)
+        .expect("the floated layer fullscreens through the owner");
+    assert_eq!(zoom.state.borrow().engages, 1);
+
+    // The user unzooms out of band: the zoom gives back the tree the engage
+    // captured, so the leaf returns to the mode it carried before the layer
+    // went fullscreen — Floating, not the proxy's Fullscreen stamp.
+    zoom.unzoom_out_of_band(&mut rt);
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Floating),
+        "the out-of-band unzoom returns the captured tree, leaf at the displaced mode"
+    );
+    assert!(
+        zoom.state.borrow().backup.is_none(),
+        "the zoom left with the user"
+    );
+
+    // Third party, out of band, after the zoom left: the leaf carries
+    // somebody else's intent now, and that outranks the layer's.
+    stamp_out_of_band(&mut rt, PRIMARY, PresentationMode::Scratchpad);
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Scratchpad)
+    );
+
+    let restored = rt
+        .release_panel_content(PRIMARY, presented.token)
+        .expect("release restores the terminal content");
+    assert_eq!(restored.presentation, PresentationMode::Fullscreen);
+    assert_eq!(
+        restored.pre_fullscreen_presentation,
+        Some(PresentationMode::Floating)
+    );
+    assert_eq!(
+        rt.view_presentation(PRIMARY),
+        Some(PresentationMode::Scratchpad),
+        "release restores content, never the mode a third party stamped after the zoom left"
+    );
+    assert_eq!(
+        zoom.state.borrow().restores,
+        1,
+        "the release still asked the owner once — it answered that nothing was held"
+    );
+    assert_eq!(
+        rt.panel_content_kind(PRIMARY),
+        Some(ViewContent::Terminal(PRIMARY.0)),
+        "the content is restored either way"
+    );
+    assert!(
+        !rt.content_layer_presented(PRIMARY),
+        "and the layer is gone"
+    );
 }

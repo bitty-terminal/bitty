@@ -75,8 +75,9 @@
 //!   #1757: focused panel pinned/sticky-float toggle, manual bind only,
 //!   never in defaults),
 //!   `toggle_panel_mode` (alias `panel_mode_toggle`; bitty#2388 residue 3:
-//!   focused presented panel's content-layer mode toggle, default
-//!   `ctrl+alt+a`, `global` only).
+//!   focused presented panel's content-layer mode toggle — tiled/floating,
+//!   plus fullscreen when the app-level zoom owner is installed, CTX-1936 —
+//!   default `ctrl+alt+a`, `global` only).
 //!   W-144 (CTX-0937): the search/copy-mode policy actions retired with
 //!   the Core policy; their namespace moves to W-138 with the plugins
 //!   (CTX-0003), so the retired spellings fail closed as unknown here.
@@ -112,8 +113,10 @@
 //! `alt+s` stays `toggle_split` (issue #3155). Both new chords carry the
 //! `alt` slot so a Super flip rebinds them to `shift+super+s` / `ctrl+super+s`.
 //! bitty#2388 residue 3 (CTX-1931) adds `ctrl+alt+a` `toggle_panel_mode`
-//! (the FOCUSED presented panel's content-layer tiled/floating toggle
-//! through the `bitty.workspace:presentation-*` command registry; the free
+//! (the FOCUSED presented panel's content-layer mode toggle through the
+//! `bitty.workspace:presentation-*` command registry — tiled/floating, and
+//! fullscreen when the app-level zoom owner is installed, CTX-1936, cycling
+//! Tiled -> Floating -> Fullscreen -> Tiled; the free
 //! sibling chord of `alt+a`'s floating toggle, rebinding to `ctrl+super+a`
 //! under a Super flip, and a typed no-op with no layer presented).
 //! `alt+w` and `alt+1..=9` previously drove pane ops (`close_view`,
@@ -1045,13 +1048,18 @@ pub enum ChromeAction {
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
     /// Toggle the FOCUSED presented panel's content-layer presentation mode
-    /// between tiled and floating (`toggle_panel_mode`, alias
-    /// `panel_mode_toggle`; bitty#2388 residue 3, CTX-1931).
+    /// (`toggle_panel_mode`, alias `panel_mode_toggle`; bitty#2388 residue 3,
+    /// CTX-1931; the fullscreen hop is CTX-1936).
+    ///
+    /// Cycles Tiled -> Floating -> Fullscreen -> Tiled when the app-level
+    /// zoom owner is installed, and stays the shipped two-mode cycle without
+    /// it. Default `ctrl+alt+a`, `global` only; with no layer presented the
+    /// action is a typed no-op.
     ///
     /// Present-path verb over the layer a panel presents: the app resolves
     /// the focused view and, only when that leaf presents a GUI content
-    /// layer, routes the opposite mode's `bitty.workspace:presentation-
-    /// {tiled,floating}` command name through
+    /// layer, routes the next mode's `bitty.workspace:presentation-*`
+    /// command name through
     /// `bitty_runtime::Runtime::apply_panel_content_mode_command` — the
     /// same single transition gate (`apply_presentation_command`) the ctl
     /// `panel mode` verb runs. Default chord `ctrl+alt+a`: the sibling slot

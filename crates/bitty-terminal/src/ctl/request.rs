@@ -541,12 +541,14 @@ pub enum CtlRequest {
         /// The present receipt's token ordinal, validated at parse.
         token: u64,
     },
-    /// `panel mode p:N tiled|floating [TOKEN]` (bitty#2388 residue 3,
-    /// CTX-1931): move the presented layer's presentation mode through the
-    /// runtime's single mode gate. Token-free form is fenced on the layer's
-    /// own token; an explicit present-receipt token keeps the release-shaped
-    /// fence. The two placement-less mode words parse and the runtime
-    /// refuses them typed.
+    /// `panel mode p:N tiled|floating|fullscreen [TOKEN]` (bitty#2388 residue 3,
+    /// CTX-1931; the fullscreen half is CTX-1936): move the presented layer's
+    /// presentation mode through the runtime's single mode gate. Token-free
+    /// form is fenced on the layer's own token; an explicit present-receipt
+    /// token keeps the release-shaped fence. `fullscreen` is answerable when
+    /// the app-level zoom owner is installed (the hosted-panel posture) and
+    /// fails closed with the typed refusal otherwise; `scratchpad` parses and
+    /// the runtime refuses it typed, always.
     PanelContentMode {
         /// Target panel id (`p:N`), validated at parse.
         panel_id: String,
@@ -724,7 +726,7 @@ pub fn ctl_usage() -> String {
          \x20 window list | window new\n\
          \x20 view list | view split [--left|--right|--up|--down] | view focus v:N\n\
          \x20 panel list\n\
-         \x20 panel present p:N | panel release p:N TOKEN | panel mode p:N tiled|floating [TOKEN]\n\
+         \x20 panel present p:N | panel release p:N TOKEN | panel mode p:N tiled|floating|fullscreen [TOKEN]\n\
          \x20 terminal list | terminal spawn [--cwd PATH] | terminal close t:N\n\
          \x20 terminal send t:N TEXT | terminal text t:N\n\
          \x20 workspace list (includes bounded memory diagnostics) | workspace new | workspace close ws:N | workspace focus ws:N | workspace move ws:N\n\
@@ -792,8 +794,8 @@ pub fn ctl_help_text(verbose: bool) -> String {
          receipt names the release token)\n  \
          panel release p:N TOKEN       core.panel.release (view.manage; restore the\n                                \
          displaced terminal)\n  \
-         panel mode p:N tiled|floating [TOKEN]  core.panel.mode (view.manage; move the\n                                \
-         presented layer's mode; receipt names the mode)\n  \
+         panel mode p:N tiled|floating|fullscreen [TOKEN]  core.panel.mode (view.manage; move\n                                \
+         the presented layer's mode; receipt names the mode)\n  \
          config reload                 core.config.reload (config.modify, elevation)\n  \
          consent grant --scope S       core.consent.grant ([--terminal T --family F])\n  \
          consent revoke --scope S      core.consent.revoke_scope\n  \

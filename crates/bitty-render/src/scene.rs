@@ -119,6 +119,26 @@
 //! the leaf; the accepted `SCN` node/depth/text budgets are unaffected because
 //! a width changes geometry, not content.
 //!
+//! The four paint primitives resolve before they paint (CTX-1934): both
+//! `SceneNode::Styled` arms hand the declaration to the scene-style resolver
+//! (`bitty_ui::scene_style::resolve`), whose per-field order is framework
+//! default, then theme content style, then node override, then `bitty --safe`.
+//! The theme layer is the documented empty baseline today (no accepted
+//! configuration key supplies a theme content style, candidate open point 5),
+//! and the scene model materialises every wire field at construction, so an
+//! unchanged caller resolves exactly its declaration and paints
+//! byte-identically. [`ScenePaintStyle::safe`] is the `bitty --safe` posture
+//! the candidate specifies: it forces every geometry primitive flat (`0`, no
+//! border) regardless of the declaration, so the wrapper measures and paints
+//! exactly like the unwrapped child and extension content degrades to plain
+//! themed text. The extent, spacing, and placement keys (`min_width`,
+//! `max_width`, `min_height`, `max_height`, `gap`, `align`) are wire-landed
+//! layout vocabulary, not paint geometry, so the safe posture leaves them
+//! in force. The resolver re-checks the caps behind admission (typed refusal,
+//! never a clamp) and fails closed when a border token is absent from the
+//! cascade; [`ContentPalette`] stays the only place a resolved token becomes
+//! pixels, so theme attribution and painted ink cannot diverge per node.
+//!
 //! `gap` is spacing **between adjacent siblings** of the container the style
 //! wraps: it is inserted on that container's composed axis after a sibling whose
 //! span is non-empty and only when a sibling follows it, and it advances the
@@ -403,6 +423,26 @@ pub enum ScenePaintError {
         /// The typed style refusal, shared with the scene model.
         error: bitty_rich::scene::SceneStyleError,
     },
+    /// The scene-style resolver's token cascade failed to build (CTX-1934).
+    ///
+    /// The paint path builds the framework-default cascade (empty preset,
+    /// plugin, and user layers), which cannot fail for those inputs; the
+    /// typed refusal keeps this path panic-free rather than substituting an
+    /// unthemed colour.
+    StyleTokens {
+        /// The typed cascade refusal.
+        error: bitty_ui::theme::TokenError,
+    },
+    /// The scene-style resolver refused a styled node's declaration
+    /// (CTX-1934).
+    ///
+    /// The resolver re-checks the primitive caps behind admission's own
+    /// check and fails closed when a border token is absent from the
+    /// cascade; the paint refuses rather than clamping or substituting.
+    StyleResolve {
+        /// The typed resolver refusal.
+        error: bitty_ui::scene_style::SceneStyleError,
+    },
 }
 
 impl std::fmt::Display for ScenePaintError {
@@ -427,6 +467,12 @@ impl std::fmt::Display for ScenePaintError {
                 write!(f, "scene paint border too wide: {width} > {cap}")
             }
             Self::StyleInvalid { error } => write!(f, "scene paint style invalid: {error}"),
+            Self::StyleTokens { error } => {
+                write!(f, "scene paint style tokens failed: {error}")
+            }
+            Self::StyleResolve { error } => {
+                write!(f, "scene paint style refused: {error}")
+            }
         }
     }
 }
@@ -435,6 +481,8 @@ impl std::error::Error for ScenePaintError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::StyleInvalid { error } => Some(error),
+            Self::StyleTokens { error } => Some(error),
+            Self::StyleResolve { error } => Some(error),
             _ => None,
         }
     }
@@ -843,6 +891,17 @@ pub struct ScenePaintStyle {
     pub rule: Rgba8,
     /// Resolved colours for the v2 content tokens.
     pub content: ContentPalette,
+    /// `bitty --safe` posture for extension-declared scene style (CTX-1934).
+    ///
+    /// The candidate's resolution row: when set, every geometry primitive a
+    /// `SceneNode::Styled` declaration carries is forced flat (`padding = 0`,
+    /// `radius = 0`, no border), regardless of the declaration, so the
+    /// wrapper measures and paints exactly like the unwrapped child. The
+    /// extent, spacing, and placement keys (`min_width`, `max_width`,
+    /// `min_height`, `max_height`, `gap`, `align`) are layout vocabulary, not
+    /// paint geometry, and stay in force. The default (`false`) is today's
+    /// shipped posture.
+    pub safe: bool,
 }
 
 impl Default for ScenePaintStyle {
@@ -851,6 +910,7 @@ impl Default for ScenePaintStyle {
             text: DEFAULT_FG,
             rule: DECORATION_BORDER,
             content: ContentPalette::default(),
+            safe: false,
         }
     }
 }
@@ -941,6 +1001,7 @@ fn paint_scene_prefix_with_style(
         surface,
         budget,
         style,
+        tokens: scene_style_tokens()?,
         ops: Vec::new(),
         text_bytes: 0,
         node_count: 0,
@@ -1141,6 +1202,7 @@ struct Painter {
     surface: SceneSurface,
     budget: ScenePaintBudget,
     style: ScenePaintStyle,
+    tokens: bitty_ui::theme::ResolvedTokens,
     ops: Vec<ScenePaintOp>,
     text_bytes: usize,
     node_count: usize,
@@ -1201,6 +1263,41 @@ impl Painter {
             }
             _ => self.measure(node, depth),
         }
+    }
+
+    /// Resolves one styled node's declaration through the scene-style
+    /// resolver (CTX-1934): per field, framework default, then theme content
+    /// style, then node override, then `bitty --safe`.
+    ///
+    /// The theme layer is the documented empty baseline today (no accepted
+    /// configuration key supplies one, candidate open point 5), and the
+    /// scene model materialises every wire field at construction, so each of
+    /// the four paint primitives reaches the resolver as a declared node
+    /// value and an unchanged caller resolves exactly its declaration. The
+    /// extent, spacing, and placement keys are not resolver vocabulary and
+    /// stay on the declaration. `ScenePaintStyle::safe` is the `bitty --safe`
+    /// posture: it forces every geometry primitive flat (`0`, no border)
+    /// regardless of the declaration. The resolver's typed constructors
+    /// re-check the caps behind admission (never a clamp), and a border
+    /// token absent from the cascade fails closed instead of substituting an
+    /// unthemed colour.
+    fn resolve_style(
+        &self,
+        style: SceneNodeStyle,
+    ) -> Result<bitty_ui::scene_style::ResolvedSceneStyle, ScenePaintError> {
+        let node = bitty_ui::scene_style::SceneStyle::none()
+            .with_padding(style.padding_cells)
+            .and_then(|node| node.with_radius(style.radius_px))
+            .and_then(|node| node.with_border(style.border_px))
+            .map(|node| node.with_border_token(border_token_of(style.border_token)))
+            .map_err(|error| ScenePaintError::StyleResolve { error })?;
+        bitty_ui::scene_style::resolve(
+            &bitty_ui::scene_style::SceneStyle::none(),
+            &node,
+            &self.tokens,
+            self.style.safe,
+        )
+        .map_err(|error| ScenePaintError::StyleResolve { error })
     }
 
     /// Measures a `Row`, with `gap_cells` of spacing between adjacent siblings.
@@ -1317,10 +1414,13 @@ impl Painter {
             SceneNode::Styled { style, child } => {
                 // The border is a stroke inside the frame, so only padding
                 // consumes layout cells; Core derives the box, the producer
-                // never does.
+                // never does. The inset comes from the RESOLVED padding
+                // (CTX-1934), so the `bitty --safe` posture flattens the
+                // measure walk too.
                 let style = paint_style(*style)?;
+                let resolved = self.resolve_style(style)?;
                 let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
-                let inset = style.padding_cells.saturating_mul(2);
+                let inset = resolved.padding_cells().saturating_mul(2);
                 // The declared width and height ranges bound the content box, so
                 // they are applied to the measured child extent and the padding
                 // is added outside them. Both `constrain_*` calls are the
@@ -1584,8 +1684,9 @@ impl Painter {
             }
             SceneNode::Styled { style, child } => {
                 let style = paint_style(*style)?;
+                let resolved = self.resolve_style(style)?;
                 let inner = self.measure_gapped(child, depth + 1, style.gap_cells)?;
-                let double = style.padding_cells.saturating_mul(2);
+                let double = resolved.padding_cells().saturating_mul(2);
                 // The declared width and height ranges feed the ring's own frame
                 // too: a node that asked for at least (or at most) `N` content
                 // cells is framed at that extent plus its padding, so the stroke
@@ -1594,7 +1695,11 @@ impl Painter {
                     cols: style.constrain_width(inner.cols).saturating_add(double),
                     rows: style.constrain_height(inner.rows).saturating_add(double),
                 };
-                if style.border_px > 0 {
+                // The ring comes from the RESOLVED border (CTX-1934): a
+                // non-zero resolved width paints one ring op at the resolved
+                // radius and token colour, and the `bitty --safe` posture
+                // resolves no border, so the op never emits.
+                if let Some(border) = resolved.border() {
                     // One ring op, painted inside the node's own frame. The
                     // frame is the measured (leaf-clamped) extent; clip it to
                     // the allocation this node was handed and to the leaf so
@@ -1611,9 +1716,9 @@ impl Painter {
                         if !rect.is_empty() {
                             self.push_op(ScenePaintOp::Rounded {
                                 rect,
-                                border: style.border_px,
-                                radius: style.radius_px,
-                                color: self.style.content.color(style.border_token),
+                                border: border.width_px,
+                                radius: resolved.radius_px(),
+                                color: self.style.content.color(content_token_of(border.token)),
                             })?;
                         }
                     }
@@ -1654,11 +1759,13 @@ impl Painter {
                     // style must not narrow a root text line. The gap the style
                     // declared is spent by the container walk over this same
                     // allocation, so a sibling is moved, never resized, and the
-                    // alignment offsets it inside the declared box.
+                    // alignment offsets it inside the declared box. The inset
+                    // is the RESOLVED padding, so the safe posture hands the
+                    // child the full allocation (CTX-1934).
                     self.paint_flow(
                         child,
-                        x.saturating_add(style.padding_cells),
-                        y.saturating_add(style.padding_cells),
+                        x.saturating_add(resolved.padding_cells()),
+                        y.saturating_add(resolved.padding_cells()),
                         content_cols,
                         content_rows,
                         depth + 1,
@@ -1939,6 +2046,51 @@ fn paint_style(style: SceneNodeStyle) -> Result<SceneNodeStyle, ScenePaintError>
         .validate()
         .map_err(|error| ScenePaintError::StyleInvalid { error })?;
     Ok(style)
+}
+
+/// Framework-default token cascade for scene-style resolution (CTX-1934).
+///
+/// The scene model carries a token, never a colour literal, and the resolver
+/// fails closed when a named token is absent from this cascade; the closed
+/// six-name content set always resolves through the framework defaults. The
+/// empty preset, plugin, and user layers are the documented today-state (no
+/// accepted configuration key supplies a theme content style, candidate open
+/// point 5), and [`ContentPalette`] stays the only place a token becomes
+/// pixels, so the cascade's colour value is attribution evidence, never the
+/// painted ink.
+fn scene_style_tokens() -> Result<bitty_ui::theme::ResolvedTokens, ScenePaintError> {
+    bitty_ui::theme::resolve(&[], None, &[], false)
+        .map_err(|error| ScenePaintError::StyleTokens { error })
+}
+
+/// Maps the scene model's closed border token onto the resolver vocabulary.
+///
+/// The wire, resolver, and scene-model vocabularies name the same six
+/// spellings (pinned name-for-name by `bitty-runtime`'s
+/// `scene_style_vocabulary` gate), so a renamed variant fails compilation
+/// here rather than drifting silently.
+fn border_token_of(token: ContentToken) -> bitty_ui::scene_style::BorderToken {
+    match token {
+        ContentToken::Foreground => bitty_ui::scene_style::BorderToken::Foreground,
+        ContentToken::Accent => bitty_ui::scene_style::BorderToken::Accent,
+        ContentToken::Muted => bitty_ui::scene_style::BorderToken::Muted,
+        ContentToken::Error => bitty_ui::scene_style::BorderToken::Error,
+        ContentToken::Warning => bitty_ui::scene_style::BorderToken::Warning,
+        ContentToken::Success => bitty_ui::scene_style::BorderToken::Success,
+    }
+}
+
+/// Maps the resolver's winning border token back onto the palette's closed
+/// content token, keeping [`ContentPalette`] the only token-to-pixel seam.
+fn content_token_of(token: bitty_ui::scene_style::BorderToken) -> ContentToken {
+    match token {
+        bitty_ui::scene_style::BorderToken::Foreground => ContentToken::Foreground,
+        bitty_ui::scene_style::BorderToken::Accent => ContentToken::Accent,
+        bitty_ui::scene_style::BorderToken::Muted => ContentToken::Muted,
+        bitty_ui::scene_style::BorderToken::Error => ContentToken::Error,
+        bitty_ui::scene_style::BorderToken::Warning => ContentToken::Warning,
+        bitty_ui::scene_style::BorderToken::Success => ContentToken::Success,
+    }
 }
 
 fn saturating_i32_from_u32(value: u32) -> i32 {

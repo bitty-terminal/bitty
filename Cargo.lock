@@ -400,6 +400,7 @@ dependencies = [
  "bitty-platform",
  "bitty-rich",
  "bitty-term-state",
+ "bitty-ui",
  "bitty-vt",
  "crossfont",
  "fontconfig-parser",

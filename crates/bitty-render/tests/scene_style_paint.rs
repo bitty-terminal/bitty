@@ -6,6 +6,12 @@
 //! to an unwrapped child, that a v1 scene's paint list is unchanged, and that
 //! the text projection (the accessibility parity source) is never changed by
 //! styling.
+//!
+//! Resolution consumption (CTX-1934, bitty#2191): the paint arms resolve the
+//! four style primitives through `bitty_ui::scene_style` before painting, so
+//! the rows at the end pin the `bitty --safe` posture (every geometry
+//! primitive flat, wrapper == unwrapped child) and the unchanged default
+//! posture (resolution == declaration, byte-identical paint).
 
 use bitty_render::error::RenderError;
 use bitty_render::frame::plan_frame;
@@ -21,7 +27,7 @@ use bitty_render::scene::{
 use bitty_render::{RectPx, grid::Rgba8};
 use bitty_rich::scene::{
     BlockAnchor, BlockId, Border, ContentToken, RichBlock, SCENE_STYLE_MAX_BORDER_PX, Scene,
-    SceneNode, SceneNodeStyle, ScrollBehavior, StyledSpan,
+    SceneNode, SceneNodeStyle, SceneStyleAlign, ScrollBehavior, StyledSpan,
 };
 
 // ---------------------------------------------------------------------------
@@ -401,6 +407,7 @@ fn every_content_token_maps_through_the_closed_palette() {
                 text: [0, 0, 0, 0xFF],
                 rule: [0, 0, 0, 0xFF],
                 content: palette,
+                safe: false,
             },
         )
         .expect("paints");
@@ -937,5 +944,118 @@ fn a_width_capped_bordered_block_never_paints_its_border_into_a_row_sibling() {
         text_ops(&paint),
         vec![(0, 1, "Z".to_string())],
         "the sibling starts on column 1 after the width-capped block"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Resolution consumption (CTX-1934): the arms paint resolved style ops
+// ---------------------------------------------------------------------------
+
+/// Paints `content` under one explicit `bitty --safe` posture.
+fn paint_safely(content: SceneNode, safe: bool) -> ScenePaint {
+    paint_scene_with_style(
+        &scene_of(content),
+        surface(),
+        ScenePaintBudget::default(),
+        ScenePaintStyle {
+            safe,
+            ..ScenePaintStyle::default()
+        },
+    )
+    .expect("paints")
+}
+
+#[test]
+fn safe_mode_forces_every_geometry_primitive_flat() {
+    // The candidate's `bitty --safe` resolution row: padding, radius, and
+    // border flatten regardless of the declaration, so the styled wrapper
+    // measures and paints exactly like the unwrapped child — no ring, no
+    // inset, the identical op list.
+    let style = SceneNodeStyle::new(2, 6, 1, ContentToken::Accent);
+    let unwrapped = paint(text("ready"));
+    let flat = paint_safely(styled(style, text("ready")), true);
+    assert!(rings(&flat).is_empty(), "safe mode suppresses the ring");
+    assert_eq!(encode(&flat), encode(&unwrapped));
+    // The same declaration under the default posture keeps its declared
+    // geometry (resolution must not change the unchanged path).
+    let declared = paint(styled(style, text("ready")));
+    assert_eq!(rings(&declared).len(), 1, "default posture keeps the ring");
+    assert_eq!(
+        text_ops(&declared),
+        vec![(2, 2, "ready".to_string())],
+        "default posture keeps the padding inset"
+    );
+}
+
+#[test]
+fn safe_mode_flattens_the_padding_inset_in_the_measure_walk() {
+    // The measure walk consumes the resolved padding too: a safe paint
+    // advances the styled sibling exactly like an unwrapped one, so the
+    // following sibling keeps its pre-style row.
+    let styled_column = || {
+        SceneNode::Column(vec![
+            styled(
+                SceneNodeStyle::new(2, 0, 0, ContentToken::Accent),
+                text("top"),
+            ),
+            text("below"),
+        ])
+    };
+    let plain_column = SceneNode::Column(vec![text("top"), text("below")]);
+    assert_eq!(
+        text_ops(&paint_safely(styled_column(), true)),
+        text_ops(&paint(plain_column)),
+        "a safe paint places the siblings exactly like the unstyled column"
+    );
+    // Without the safe posture the declared padding still shifts the first
+    // line two cells in and pushes the sibling down by the padded frame.
+    assert_eq!(
+        text_ops(&paint(styled_column())),
+        vec![(2, 2, "top".to_string()), (5, 0, "below".to_string())]
+    );
+}
+
+#[test]
+fn safe_mode_leaves_an_unstyled_scene_byte_identical() {
+    // The safe posture only governs extension-declared style: a v1 scene
+    // with no `SceneNode::Styled` node paints the same list either way.
+    let v1 = SceneNode::Column(vec![text("alpha"), text("beta")]);
+    assert_eq!(
+        encode(&paint_safely(v1.clone(), true)),
+        encode(&paint_safely(v1, false))
+    );
+}
+
+#[test]
+fn safe_mode_keeps_the_extent_and_placement_vocabulary_in_force() {
+    // The safe posture flattens the candidate's four paint primitives;
+    // `min_width`, `max_width`, `gap`, and `align` are wire-landed layout
+    // vocabulary, so a safe paint still honours a declared width bound and
+    // placement.
+    let style = SceneNodeStyle::new(2, 6, 1, ContentToken::Accent)
+        .with_width_range(0, 3)
+        .with_align(SceneStyleAlign::End);
+    let scene = scene_of(styled(style, SceneNode::Column(vec![text("ready")])));
+    let safe = paint_scene_with_style(
+        &scene,
+        surface(),
+        ScenePaintBudget::default(),
+        ScenePaintStyle {
+            safe: true,
+            ..ScenePaintStyle::default()
+        },
+    )
+    .expect("paints");
+    // No ring and no inset (flattened), but the max-width still clips the
+    // painted run to 3 cells and the end-placement keeps the column inside
+    // its declared box.
+    assert!(rings(&safe).is_empty());
+    let lines = text_ops(&safe);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(
+        lines[0].2.len(),
+        3,
+        "the width cap still clips: {:?}",
+        lines[0]
     );
 }

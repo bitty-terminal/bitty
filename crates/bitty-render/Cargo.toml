@@ -28,6 +28,16 @@ bitty-term-state = { version = "0.0.47", path = "../bitty-term-state" }
 # model crate with no render/GPU edge, so the one-way render -> rich direction
 # stays acyclic: `bitty-rich` never depends on `bitty-render`.
 bitty-rich = { version = "0.0.47", path = "../bitty-rich" }
+# CTX-1934 (bitty#2191): the scene paint walk consumes the candidate style
+# resolver (`bitty_ui::scene_style`), so a `SceneNode::Styled` node paints its
+# resolved primitives (per-field theme baseline, node declaration, `bitty
+# --safe` flattening) instead of its raw declaration. `bitty-ui` is a pure
+# model crate (depends only on `bitty-term-state` plus the fenced `bitty-a11y`
+# seam; never on render/platform/pty), so this render -> ui direction stays
+# acyclic — `bitty-config` already reaches `bitty-ui` the same way, and the
+# shared vocabulary stays pinned by `bitty-runtime`'s
+# `scene_style_vocabulary` gate.
+bitty-ui = { version = "0.0.47", path = "../bitty-ui" }
 # ADR-0003/ADR-0004 platform seam: GpuContext consumes the owned SurfaceTarget
 # produced by bitty-platform without leaking winit types.
 bitty-platform = { version = "0.0.47", path = "../bitty-platform" }

@@ -14,14 +14,14 @@ use bitty_render::glyph::{
 use bitty_render::grid::{CellMetrics, DrawList, GridRenderer, SnapshotDamage};
 use bitty_render::scene::{
     SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaintBudget, ScenePaintCache,
-    ScenePaintError, ScenePaintOp, SceneSurface, paint_scene, paint_scene_prefix,
+    ScenePaintError, ScenePaintOp, ScenePaintStyle, SceneSurface, paint_scene, paint_scene_prefix,
 };
 use bitty_render::{ExtentPx, RectPx, frame::plan_frame};
 use bitty_rich::image::PlacementId;
 use bitty_rich::scene::{
-    BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
-    SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, Scene, SceneNode, ScrollBehavior, StyledSpan,
-    TableModel,
+    BlockAnchor, BlockId, Border, CodeBlockModel, ContentToken, ListModel, RichBlock,
+    SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, Scene, SceneNode, SceneNodeStyle,
+    ScrollBehavior, StyledSpan, TableModel,
 };
 
 /// Accepted per-terminal block ceiling (`SCN-5`).
@@ -990,6 +990,99 @@ fn cache_distinguishes_a_mutated_clone_at_the_same_generation() {
             .plain_text(),
         "cloned",
         "a cloned scene at the same generation never serves the original's list"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cache key: the --safe posture (CTX-1935, bitty#2191 slice)
+// ---------------------------------------------------------------------------
+
+/// One styled block: 2 cells of padding, a 6 px radius, and a 1 px accent
+/// border around the wrapped text.
+fn styled_block(id: u64) -> RichBlock {
+    block(
+        id,
+        SceneNode::Styled {
+            style: SceneNodeStyle::new(2, 6, 1, ContentToken::Accent),
+            child: Box::new(text("ready")),
+        },
+    )
+}
+
+/// Rounded ring ops in a paint list.
+fn rounded_rings(paint: &bitty_render::scene::ScenePaint) -> usize {
+    paint
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, ScenePaintOp::Rounded { .. }))
+        .count()
+}
+
+/// Text lines of a paint as `(row, col, text)` rows.
+fn text_rows(paint: &bitty_render::scene::ScenePaint) -> Vec<(u16, u16, String)> {
+    paint
+        .text_lines()
+        .map(|line| (line.row, line.col, line.text.to_string()))
+        .collect()
+}
+
+#[test]
+fn cache_key_carries_the_safe_posture_so_safe_and_default_never_collide() {
+    let scene = scene_of(vec![styled_block(1)]);
+    let safe_style = ScenePaintStyle {
+        safe: true,
+        ..ScenePaintStyle::default()
+    };
+    let mut cache = ScenePaintCache::new();
+
+    // Default posture: the declared geometry paints.
+    let declared = cache
+        .get_or_paint(&scene, surface(), ScenePaintBudget::default())
+        .expect("default paints");
+    assert_eq!(rounded_rings(&declared), 1);
+    assert_eq!(text_rows(&declared), vec![(2, 2, "ready".to_string())]);
+
+    // Safe posture for the same node: a flat re-derivation, never the
+    // cached default entry.
+    let flat = cache
+        .get_or_paint_with_style(&scene, surface(), ScenePaintBudget::default(), safe_style)
+        .expect("safe paints");
+    assert!(
+        !std::sync::Arc::ptr_eq(&declared, &flat),
+        "the posture is part of the key: the safe list must be re-derived"
+    );
+    assert_eq!(rounded_rings(&flat), 0, "safe mode suppresses the ring");
+    assert_eq!(text_rows(&flat), vec![(0, 0, "ready".to_string())]);
+
+    // Back to the default posture: the declared list re-derives and stays
+    // byte-identical to the first default paint.
+    let back = cache
+        .get_or_paint(&scene, surface(), ScenePaintBudget::default())
+        .expect("default repaints");
+    assert!(!std::sync::Arc::ptr_eq(&flat, &back));
+    assert_eq!(*back, *declared);
+}
+
+#[test]
+fn cache_default_style_serves_the_styled_declaration_unchanged() {
+    // The pre-latch entry points behave exactly as before (CTX-1935: the
+    // default path is unchanged): the cached default list equals the direct
+    // `paint_scene` derivation, and an unchanged key reuses the same Arc.
+    let scene = scene_of(vec![styled_block(1)]);
+    let mut cache = ScenePaintCache::new();
+    let first = cache
+        .get_or_paint_prefix(&scene, 1, surface(), ScenePaintBudget::default())
+        .expect("prefix paints");
+    let direct = paint_scene(&scene, surface(), ScenePaintBudget::default()).expect("paints");
+    assert_eq!(*first, direct);
+    assert_eq!(rounded_rings(&first), 1, "the declared ring still paints");
+
+    let cached = cache
+        .get_or_paint_prefix(&scene, 1, surface(), ScenePaintBudget::default())
+        .expect("cached paints");
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &cached),
+        "an unchanged default key reuses the cached allocation"
     );
 }
 

@@ -131,7 +131,12 @@
 //! the candidate specifies: it forces every geometry primitive flat (`0`, no
 //! border) regardless of the declaration, so the wrapper measures and paints
 //! exactly like the unwrapped child and extension content degrades to plain
-//! themed text. The extent, spacing, and placement keys (`min_width`,
+//! themed text. The shipped present path carries the process `--safe` latch
+//! into this posture (CTX-1935): the composition root stamps the shared panel
+//! host's latch, `PanelRuntime::scene_paint_for` derives the style from it, and
+//! [`ScenePaintCache`] keys on the style, so a safe paint and a default paint
+//! for the same node never share an entry. The extent, spacing, and placement
+//! keys (`min_width`,
 //! `max_width`, `min_height`, `max_height`, `gap`, `align`) are wire-landed
 //! layout vocabulary, not paint geometry, so the safe posture leaves them
 //! in force. The resolver re-checks the caps behind admission (typed refusal,
@@ -1050,9 +1055,11 @@ fn paint_scene_prefix_with_style(
 ///
 /// Every input that can change the output is part of the key: the scene's
 /// identity and generation, how many blocks the caller admitted, the leaf
-/// rect, the cell metrics, and the budget. A budget-only flip (default to
-/// [`ScenePaintBudget::nothing`] and back) therefore re-derives instead of
-/// serving the previous success or refusal.
+/// rect, the cell metrics, the budget, and the paint style. A budget-only
+/// flip (default to [`ScenePaintBudget::nothing`] and back) therefore
+/// re-derives instead of serving the previous success or refusal, and so
+/// does a `bitty --safe` flip (CTX-1935): a safe paint and a default paint
+/// for the same node never share an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ScenePaintKey {
     identity: u64,
@@ -1061,16 +1068,19 @@ struct ScenePaintKey {
     rect: RectPx,
     cell: CellMetrics,
     budget: ScenePaintBudget,
+    style: ScenePaintStyle,
 }
 
 /// Paint cache: derives one paint list per
-/// `(scene identity, generation, block prefix, surface, budget)` tuple.
+/// `(scene identity, generation, block prefix, surface, budget, style)` tuple.
 ///
 /// The present path caches this per panel slot, so an unchanged scene costs
 /// no layout walk and no text copy: the cached list is shared through an
 /// [`std::sync::Arc`], and [`ScenePaintCache::get_or_paint`] hands out a
 /// cheap clone of the same allocation. A refusal is cached too: re-presenting
 /// the same over-budget scene keeps failing closed without re-walking it.
+/// The style is a key input (CTX-1935), so the `bitty --safe` posture and the
+/// default posture each keep their own entry for the same node.
 #[derive(Debug, Clone, Default)]
 pub struct ScenePaintCache {
     key: Option<ScenePaintKey>,
@@ -1097,7 +1107,26 @@ impl ScenePaintCache {
         surface: SceneSurface,
         budget: ScenePaintBudget,
     ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
-        self.get_or_paint_prefix(scene, scene.len(), surface, budget)
+        self.get_or_paint_with_style(scene, surface, budget, ScenePaintStyle::default())
+    }
+
+    /// [`ScenePaintCache::get_or_paint`] with an explicit paint style.
+    ///
+    /// The style is part of the cache key, so paints under different styles
+    /// (or `bitty --safe` postures) never share an entry.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`paint_scene_with_style`]; a refused build is cached and
+    /// reported until the key (including the style) changes.
+    pub fn get_or_paint_with_style(
+        &mut self,
+        scene: &Scene,
+        surface: SceneSurface,
+        budget: ScenePaintBudget,
+        style: ScenePaintStyle,
+    ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
+        self.get_or_paint_prefix_with_style(scene, scene.len(), surface, budget, style)
     }
 
     /// Returns the paint list for the first `max_blocks` blocks of `scene`,
@@ -1113,6 +1142,33 @@ impl ScenePaintCache {
         surface: SceneSurface,
         budget: ScenePaintBudget,
     ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
+        self.get_or_paint_prefix_with_style(
+            scene,
+            max_blocks,
+            surface,
+            budget,
+            ScenePaintStyle::default(),
+        )
+    }
+
+    /// [`ScenePaintCache::get_or_paint_prefix`] with an explicit paint style
+    /// (CTX-1935): the style is part of the cache key, so the `bitty --safe`
+    /// posture and the default posture each keep their own entry for the
+    /// same node and neither serves the other's list or refusal.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`paint_scene_prefix`] with the style applied; a refused
+    /// build is cached and reported until the key (including the style)
+    /// changes.
+    pub fn get_or_paint_prefix_with_style(
+        &mut self,
+        scene: &Scene,
+        max_blocks: usize,
+        surface: SceneSurface,
+        budget: ScenePaintBudget,
+        style: ScenePaintStyle,
+    ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
         let key = ScenePaintKey {
             identity: scene.identity(),
             generation: scene.generation(),
@@ -1120,11 +1176,13 @@ impl ScenePaintCache {
             rect: surface.rect,
             cell: surface.cell,
             budget,
+            style,
         };
         if self.key != Some(key) || self.entry.is_none() {
             self.key = Some(key);
             self.entry = Some(
-                paint_scene_prefix(scene, max_blocks, surface, budget).map(std::sync::Arc::new),
+                paint_scene_prefix_with_style(scene, max_blocks, surface, budget, style)
+                    .map(std::sync::Arc::new),
             );
         }
         // The build above always leaves a result; cloning it clones the

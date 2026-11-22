@@ -1998,6 +1998,12 @@ impl TerminalApp {
         host: Option<std::rc::Rc<std::cell::RefCell<bitty_runtime::registry::PanelRuntime>>>,
     ) -> Self {
         if let Some(host) = host {
+            // CTX-1935: stamp the app's `--safe` latch onto the host before
+            // the install, so the latch holds whichever order the
+            // composition root wires the two builders in (the shipped
+            // `main.rs` order sets `with_safe_mode` after this call, which
+            // the runtime forward covers; this stamp covers the reverse).
+            host.borrow_mut().set_safe_scene_paint(self.safe_mode);
             self.runtime.borrow_mut().install_shared_scene_host(host);
         }
         self
@@ -2047,9 +2053,17 @@ impl TerminalApp {
 
     /// Sets the safe recovery latch (W-103 S-5, CTX-0929). Production
     /// startup passes the `--safe` flag; the composer cutover reads it to
-    /// select the retained Core path without consulting a VM.
+    /// select the retained Core path without consulting a VM, and the scene
+    /// paint path reads it through the installed panel host (CTX-1935):
+    /// latched, every extension-declared scene style paints flat.
     pub(crate) fn with_safe_mode(mut self, safe_mode: bool) -> Self {
         self.safe_mode = safe_mode;
+        // CTX-1935: forward the latch to the shared scene host the present
+        // loop paints through. The shipped composition installs the host
+        // before this builder runs, so the forward lands on the live host;
+        // a host installed after this call picks the latch up through the
+        // install-time stamp in `with_panel_scene_host`.
+        self.runtime.borrow_mut().set_safe_scene_paint(safe_mode);
         self
     }
 
@@ -8549,5 +8563,181 @@ end)
         let _ = std::fs::remove_dir_all(&data);
         let _ = std::fs::remove_dir_all(&root2);
         let _ = std::fs::remove_dir_all(&data2);
+    }
+}
+
+/// CTX-1935 (bitty#2191 slice): the process `--safe` latch paints the flat
+/// scene posture end-to-end through the shipped present path.
+///
+/// A styled scene mounted on the focused leaf composes into the presented
+/// frame; latched, every geometry primitive flattens so the frame is
+/// pixel-identical to the unwrapped child's, while the default process
+/// keeps the declared ring and inset. The composition is the shipped
+/// `main.rs` builder order (host install, then `with_safe_mode`), and the
+/// reverse order is pinned too: the install edge stamps the latch the
+/// builder already latched.
+#[cfg(test)]
+mod safe_latch_scene_paint_tests {
+    use super::*;
+    use bitty_rich::scene::{
+        BlockAnchor, BlockId, ContentToken, RichBlock, Scene, SceneNode, SceneNodeStyle,
+        ScrollBehavior, StyledSpan,
+    };
+    use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType};
+    use bitty_runtime::{Runtime, RuntimeConfig};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// One block with the wrapped text; `styled` wraps it in a Styled node
+    /// declaring 2 cells of padding, a 6 px radius, and a 1 px accent border.
+    fn latch_scene(styled: bool) -> Scene {
+        let plain = SceneNode::Text(StyledSpan {
+            text: "ready".to_string(),
+            bold: false,
+            italic: false,
+        });
+        let content = if styled {
+            SceneNode::Styled {
+                style: SceneNodeStyle::new(2, 6, 1, ContentToken::Accent),
+                child: Box::new(plain),
+            }
+        } else {
+            plain
+        };
+        let mut scene = Scene::new();
+        let block = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            content,
+            ScrollBehavior::Inline,
+            1,
+            1,
+            1,
+        )
+        .expect("fixture fits SCN-1..5 and style caps");
+        scene.insert(block).expect("fixture fits scene caps");
+        scene
+    }
+
+    /// The shared panel host carrying one Rich panel mounted on the focused
+    /// leaf with the given scene attached.
+    fn host_with_scene(rt: &Runtime, scene: Scene) -> Rc<RefCell<PanelRuntime>> {
+        let view = rt.focused_view().expect("a focused leaf exists");
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("host builds");
+        let handle = host
+            .create_panel(PanelType::Rich, Some(WorkspaceId::new(1)))
+            .expect("rich panel allocates");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("panel mounts on the focused leaf");
+        host.attach_panel_scene(handle, scene)
+            .expect("scene attaches");
+        Rc::new(RefCell::new(host))
+    }
+
+    /// An app composed in the shipped `main.rs` builder order: the scene
+    /// host install first, then the `--safe` latch.
+    fn scene_app(safe: bool, scene: Scene) -> (TerminalApp, Rc<RefCell<PanelRuntime>>) {
+        let rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime builds");
+        let shared = host_with_scene(&rt, scene);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("default keymaps resolve");
+        let app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+        .with_panel_scene_host(Some(Rc::clone(&shared)))
+        .with_safe_mode(safe);
+        (app, shared)
+    }
+
+    /// Presents one frame and returns the scene report.
+    fn present_frame(app: &mut TerminalApp) -> bitty_runtime::runtime::SceneFrameReport {
+        app.drive_tick().expect("the frame presents");
+        app.runtime.borrow().scene_frame().clone()
+    }
+
+    #[test]
+    fn safe_latch_paints_the_flat_posture_on_the_present_path() {
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+
+        // Latched: the styled scene presents flat — one text op, the text at
+        // the unwrapped child's origin, no ring op, and pixels identical to
+        // the unwrapped child's frame.
+        let (mut safe_app, safe_host) = scene_app(true, latch_scene(true));
+        assert!(
+            safe_host.borrow().safe_scene_paint(),
+            "with_safe_mode latches the installed host (the shipped order)"
+        );
+        let report = present_frame(&mut safe_app);
+        assert_eq!(report.views, 1, "the panel leaf paints its scene");
+        assert_eq!(report.refusals, 0, "the styled scene must not refuse");
+        assert_eq!(report.ops, 1, "a flat styled scene paints only its text");
+        assert_eq!(
+            report.a11y[0].lines,
+            vec![(0, "ready".to_string())],
+            "the safe posture paints the text at the unwrapped origin"
+        );
+
+        let (mut plain_app, _) = scene_app(false, latch_scene(false));
+        let plain_report = present_frame(&mut plain_app);
+        assert_eq!(plain_report.ops, 1);
+        assert_eq!(plain_report.a11y[0].lines, vec![(0, "ready".to_string())]);
+        assert_eq!(
+            safe_app.runtime.borrow().headless_rgba(),
+            plain_app.runtime.borrow().headless_rgba(),
+            "a latched styled scene presents exactly the unwrapped child's pixels"
+        );
+
+        // Unlatched: the same styled declaration keeps its ring and inset,
+        // so the latch — not the declaration — is what flattened the frame.
+        let (mut styled_app, styled_host) = scene_app(false, latch_scene(true));
+        assert!(!styled_host.borrow().safe_scene_paint());
+        let styled_report = present_frame(&mut styled_app);
+        assert_eq!(styled_report.views, 1);
+        assert_eq!(styled_report.refusals, 0);
+        assert_eq!(
+            styled_report.ops, 2,
+            "the declared posture paints the ring and the text"
+        );
+        assert_eq!(
+            styled_report.a11y[0].lines,
+            vec![(2, "ready".to_string())],
+            "the declared padding insets the text two cells"
+        );
+        assert_ne!(
+            styled_app.runtime.borrow().headless_rgba(),
+            safe_app.runtime.borrow().headless_rgba(),
+            "the default process must keep today's declared pixels"
+        );
+    }
+
+    #[test]
+    fn safe_latch_stamp_survives_the_reverse_builder_order() {
+        // `with_safe_mode` before the host install: the install edge stamps
+        // the already-latched value onto the incoming host.
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime builds");
+        let shared = host_with_scene(&rt, latch_scene(true));
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("default keymaps resolve");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+        .with_safe_mode(true)
+        .with_panel_scene_host(Some(Rc::clone(&shared)));
+        assert!(shared.borrow().safe_scene_paint());
+        let report = present_frame(&mut app);
+        assert_eq!(report.views, 1);
+        assert_eq!(report.ops, 1, "the reverse order still paints flat");
+        assert_eq!(report.a11y[0].lines, vec![(0, "ready".to_string())]);
     }
 }

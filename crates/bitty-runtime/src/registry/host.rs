@@ -150,11 +150,22 @@ pub struct PanelRuntime {
     scenes: HashMap<super::panel::PanelId, Scene>,
     /// Derived scene paint caches (OQ-051, CTX-1628 / bitty#2760): at most one
     /// [`ScenePaintCache`] per panel slot. The cache key is
-    /// `(scene generation, leaf content rect, cell metrics)`, so an unchanged
-    /// scene and geometry cost no layout walk or text copy on the next frame.
-    /// Entries follow the scene slot lifecycle: replaced on re-attach and
-    /// cleared on detach or dispose.
+    /// `(scene generation, leaf content rect, cell metrics, paint style)`,
+    /// so an unchanged scene and geometry cost no layout walk or text copy
+    /// on the next frame, and the `--safe` posture and the default posture
+    /// (CTX-1935) never share an entry. Entries follow the scene slot
+    /// lifecycle: replaced on re-attach and cleared on detach or dispose.
     scene_paints: HashMap<super::panel::PanelId, ScenePaintCache>,
+    /// Process `--safe` latch for scene paints (CTX-1935, bitty#2191 slice).
+    ///
+    /// Set once by the composition root (`TerminalApp::with_safe_mode`
+    /// forwarding through `Runtime::set_safe_scene_paint`, with the install
+    /// edge stamping the same value), read by
+    /// [`PanelRuntime::scene_paint_for`] to derive the
+    /// `bitty_render::scene::ScenePaintStyle` the panel's paint cache keys
+    /// on. Default `false` is today's shipped posture, so an unchanged
+    /// process paints byte-identically.
+    safe_scene_paint: bool,
     /// Monotonic scene-state revision (CTX-1641 / bitty#2785).
     ///
     /// Bumped by every entry that changes what a leaf would paint (attach,
@@ -405,6 +416,7 @@ impl PanelRuntime {
             leases: HashMap::new(),
             scenes: HashMap::new(),
             scene_paints: HashMap::new(),
+            safe_scene_paint: false,
             scene_revision: 0,
             content_layers: HashMap::new(),
             next_content_token: 1,
@@ -419,6 +431,33 @@ impl PanelRuntime {
     #[must_use]
     pub const fn scene_revision(&self) -> u64 {
         self.scene_revision
+    }
+
+    /// Latches the process `--safe` posture for this host's scene paints
+    /// (CTX-1935, bitty#2191 slice).
+    ///
+    /// The composition root is the only writer: production stamps it once at
+    /// startup (the `--safe` flag), and a latched host paints every
+    /// extension-declared style through
+    /// [`ScenePaintStyle::safe`](bitty_render::scene::ScenePaintStyle::safe)
+    /// — padding, radius, and border forced flat — while the default `false`
+    /// keeps today's declared posture byte-identically. The paint cache keys
+    /// on the derived style, so flipping the latch re-derives every cached
+    /// list instead of serving the stale posture; the revision bump owes one
+    /// frame so a quiet grid repaints under the new posture. Idempotent: a
+    /// call that leaves the latch unchanged bumps nothing.
+    pub fn set_safe_scene_paint(&mut self, safe: bool) {
+        if self.safe_scene_paint == safe {
+            return;
+        }
+        self.safe_scene_paint = safe;
+        self.scene_revision = self.scene_revision.saturating_add(1);
+    }
+
+    /// The latched process `--safe` posture for this host's scene paints.
+    #[must_use]
+    pub const fn safe_scene_paint(&self) -> bool {
+        self.safe_scene_paint
     }
 
     /// Borrows the underlying identity/attachment store.
@@ -1728,6 +1767,12 @@ impl PanelRuntime {
     /// slot. A scene that exceeds a paint budget reports the typed refusal in
     /// [`ScenePresent::refusal`] and paints nothing (fail-closed; nothing is
     /// clamped).
+    ///
+    /// The host's `--safe` latch (CTX-1935,
+    /// [`PanelRuntime::set_safe_scene_paint`]) selects the paint posture for
+    /// the attached scene's declared style: latched, every geometry primitive
+    /// flattens; default, the declaration resolves unchanged. The typed
+    /// refusal vocabulary is the same either way.
     pub fn scene_paint_for(
         &mut self,
         content: super::panel::ViewContent,
@@ -1746,11 +1791,20 @@ impl PanelRuntime {
         };
         let admitted = present.block_ids.len();
         let cache = self.scene_paints.entry(id).or_default();
-        match cache.get_or_paint_prefix(
+        // The host's `--safe` latch selects the posture (CTX-1935); the
+        // default `false` derives exactly the pre-latch default style, so
+        // the unchanged process paints byte-identically. The style is part
+        // of the cache key, so the two postures never share an entry.
+        let style = bitty_render::scene::ScenePaintStyle {
+            safe: self.safe_scene_paint,
+            ..bitty_render::scene::ScenePaintStyle::default()
+        };
+        match cache.get_or_paint_prefix_with_style(
             scene,
             admitted,
             surface,
             bitty_render::scene::ScenePaintBudget::default(),
+            style,
         ) {
             // The cache returns the cached `Arc`: a steady-state frame shares
             // the paint list instead of copying every op and text line.
@@ -2371,7 +2425,8 @@ mod tests {
     // ------------------------------------------------------------------
 
     use bitty_rich::scene::{
-        BlockAnchor, BlockId, RichBlock, SceneNode, ScrollBehavior, StyledSpan,
+        BlockAnchor, BlockId, ContentToken, RichBlock, SceneNode, SceneNodeStyle, ScrollBehavior,
+        StyledSpan,
     };
     use bitty_ui::panel::BrowserSurfaceId;
 
@@ -2665,6 +2720,141 @@ mod tests {
             wider.paint.plain_text(),
             "block 1\nblock 2\nblock 3\nblock 4"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // --safe latch on the scene paint path (CTX-1935, bitty#2191 slice)
+    // ------------------------------------------------------------------
+
+    /// One extension-declared styled block: 2 cells of padding, a 6 px
+    /// radius, and a 1 px accent border around the wrapped text.
+    fn styled_scene() -> Scene {
+        let content = SceneNode::Styled {
+            style: SceneNodeStyle::new(2, 6, 1, ContentToken::Accent),
+            child: Box::new(SceneNode::Text(StyledSpan {
+                text: "ready".to_string(),
+                bold: false,
+                italic: false,
+            })),
+        };
+        let mut scene = Scene::new();
+        let block = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            content,
+            ScrollBehavior::Inline,
+            1,
+            1,
+            1,
+        )
+        .expect("test block fits scene caps");
+        scene.insert(block).expect("test scene fits scene caps");
+        scene
+    }
+
+    /// Text lines of a paint as `(row, col, text)` rows.
+    fn paint_text(paint: &bitty_render::scene::ScenePaint) -> Vec<(u16, u16, String)> {
+        paint
+            .text_lines()
+            .map(|line| (line.row, line.col, line.text.to_string()))
+            .collect()
+    }
+
+    /// Rounded ring ops in a paint list (the styled posture's visible op).
+    fn rounded_ops(paint: &bitty_render::scene::ScenePaint) -> usize {
+        paint
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, bitty_render::scene::ScenePaintOp::Rounded { .. }))
+            .count()
+    }
+
+    #[test]
+    fn safe_latch_flattens_the_painted_posture_and_the_cache_discriminates() {
+        let mut host = runtime();
+        assert!(!host.safe_scene_paint(), "the latch ships unlatched");
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, styled_scene()).unwrap();
+        let content = ViewContent::Panel(handle.id);
+
+        // Default posture: the declared geometry paints — one ring, the
+        // text inset by the declared padding.
+        let declared = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert!(declared.refusal.is_none());
+        assert_eq!(rounded_ops(&declared.paint), 1);
+        assert_eq!(
+            paint_text(&declared.paint),
+            vec![(2, 2, "ready".to_string())]
+        );
+
+        // Latched: every geometry primitive flattens, and the flat list is
+        // a re-derivation, never the cached default entry.
+        host.set_safe_scene_paint(true);
+        assert!(host.safe_scene_paint());
+        let flat = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert!(flat.refusal.is_none());
+        assert_eq!(rounded_ops(&flat.paint), 0, "safe mode suppresses the ring");
+        assert_eq!(paint_text(&flat.paint), vec![(0, 0, "ready".to_string())]);
+        assert!(
+            !std::sync::Arc::ptr_eq(&declared.paint, &flat.paint),
+            "the posture is part of the cache key: the safe paint must not serve the cached default list"
+        );
+
+        // Unlatched again: the declared posture re-derives and is
+        // byte-identical to the first default paint.
+        host.set_safe_scene_paint(false);
+        let back = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert_eq!(back.paint, declared.paint);
+        assert!(
+            !std::sync::Arc::ptr_eq(&flat.paint, &back.paint),
+            "flipping back must not serve the cached safe list"
+        );
+    }
+
+    #[test]
+    fn safe_latch_default_posture_paints_byte_identically_to_the_default_entry() {
+        // The unlatched path is today's shipped derivation: the present
+        // paint equals the direct default-style prefix paint for the same
+        // admitted blocks, surface, and budget.
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, styled_scene()).unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let present = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert!(present.refusal.is_none());
+        let scene = host.panel_scene(handle.id).expect("scene attached");
+        let direct = bitty_render::scene::paint_scene_prefix(
+            scene,
+            present.block_ids.len(),
+            SURFACE,
+            bitty_render::scene::ScenePaintBudget::default(),
+        )
+        .expect("direct default paint");
+        assert_eq!(*present.paint, direct);
+
+        // An idempotent latch call bumps no revision and rekeys nothing:
+        // the same cached list serves again.
+        let revision = host.scene_revision();
+        host.set_safe_scene_paint(false);
+        assert_eq!(host.scene_revision(), revision);
+        let cached = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert!(std::sync::Arc::ptr_eq(&present.paint, &cached.paint));
+    }
+
+    #[test]
+    fn safe_latch_flip_owes_one_scene_revision() {
+        // A mid-session latch flip changes what every leaf paints, so the
+        // host owes a frame exactly like an attach does.
+        let mut host = runtime();
+        let before = host.scene_revision();
+        host.set_safe_scene_paint(true);
+        assert_eq!(host.scene_revision(), before + 1);
+        host.set_safe_scene_paint(true);
+        assert_eq!(host.scene_revision(), before + 1, "the flip is idempotent");
     }
 
     #[test]

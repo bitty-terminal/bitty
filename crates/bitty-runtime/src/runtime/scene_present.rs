@@ -258,6 +258,19 @@ impl Runtime {
         Some(f(&mut host))
     }
 
+    /// Latches the process `--safe` posture for every scene the present loop
+    /// paints (CTX-1935, bitty#2191 slice).
+    ///
+    /// The composition root calls this once with the `--safe` flag; the
+    /// installed shared host derives its [`PanelRuntime::scene_paint_for`]
+    /// style from the latch, so a latched process paints extension-declared
+    /// scene style flat on the shipped present path. A no-op when no host is
+    /// installed (plugin-less runs keep every leaf on the grid path) or when
+    /// the latch value is unchanged.
+    pub fn set_safe_scene_paint(&mut self, safe: bool) {
+        self.with_scene_host_mut(|host| host.set_safe_scene_paint(safe));
+    }
+
     /// Removes the installed panel host and drops every retained scene.
     pub fn take_scene_host(&mut self) -> Option<std::rc::Rc<std::cell::RefCell<PanelRuntime>>> {
         self.presented_scene_frames.clear();

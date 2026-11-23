@@ -1,10 +1,10 @@
 ; bitty.iss — Inno Setup 6 script for the Bitty Windows setup installer.
-;
+
 ; CTX-1064 / GitHub issue #1810 ([P1] Windows: setup-style installer).
 ; Owner decisions are settled: 0.1.0 ships UNSIGNED (paid signing deferred
 ; past 0.2.0); the setup must offer Start Menu + Desktop shortcuts and write
 ; registry uninstall entries; Scoop stays portable on a separate track.
-;
+
 ; Tech choice: Inno Setup 6 over WiX v4/v5 and NSIS. Rationale (also recorded
 ; in the PR body): the stock wizard already provides install/uninstall pages,
 ; Start Menu + opt-in Desktop shortcuts, and per-user/per-machine registry
@@ -12,7 +12,7 @@
 ; sections; the compiler is a single ISCC.exe installed on windows-latest via
 ; Chocolatey with no paid infra and no .NET/WiX toolchain; NSIS would need
 ; hand-written registry/uninstall scripting for the same bar.
-;
+
 ; Build inputs (never hardcoded here):
 ;   MyAppVersion — release version X.Y.Z, passed as
 ;     ISCC.exe /DMyAppVersion="<version>" /DMySourceDir="<stage>" bitty.iss
@@ -25,7 +25,7 @@
 ;     subcommands; the per-user install must carry it next to bitty.exe or
 ;     `bitty init` looks inert from cmd/PowerShell. Absolute
 ;     because relative Source paths resolve against the script directory.
-;
+
 ; Unsigned 0.1.0: no SignTool is configured below (only a commented stub for
 ; the post-0.2.0 Azure Trusted Signing / OV revisit). The installer must NOT
 ; claim trust it does not have: SmartScreen shows the standard unsigned
@@ -33,7 +33,7 @@
 ; verify job asserts Get-AuthenticodeSignature reports NotSigned so a silent
 ; signing without updating this script and the README fails CI instead of
 ; shipping quietly.
-;
+
 ; Registry: Inno writes the uninstall entry automatically under
 ; HKCU (per-user, PrivilegesRequired=lowest) or HKLM (per-machine)
 ; Software\Microsoft\Windows\CurrentVersion\Uninstall\<AppId>_is1 with
@@ -97,6 +97,16 @@ Source: "{#MySourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 
+; #3310: Windows gives a shortcut with no Start-in the target's directory, so
+; every shell would open in {app} (the install bin directory). These entries
+; deliberately set no WorkingDir: `PrivilegesRequiredOverridesAllowed` lets the
+; same installer run all-users, where {group}/{autodesktop} are shared, and a
+; constant expanded at install time ({%USERPROFILE}, `{userprofile}` is not a
+; constant at all) would freeze the installing account's profile into every
+; other user's shortcut. Bitty resolves it at start instead: the runtime
+; redirects a shell whose process directory is the directory holding
+; `bitty.exe` to the launching user's profile. `scripts/install.ps1` (per-user
+; only) still writes the profile as the shortcut's Start-in.
 [Icons]
 Name: "{group}\Bitty"; Filename: "{app}\bitty.exe"
 Name: "{group}\Uninstall Bitty"; Filename: "{uninstallexe}"

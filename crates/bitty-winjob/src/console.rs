@@ -29,6 +29,8 @@ use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
+    ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 
@@ -209,6 +211,138 @@ pub fn adopt_parent_console() -> ConsoleStreams {
     // lock for the same lifetime.
     std::mem::forget(adopted);
     streams
+}
+
+/// Console input bits a single-keypress picker must clear.
+///
+/// Line input and echo are what turn `bitty init` into a line-based wizard;
+/// `ENABLE_PROCESSED_INPUT` turns `Ctrl-C` into a signal instead of the
+/// `0x03` byte the key loops expect; quick-edit would let a mouse selection
+/// freeze the console.
+#[cfg(windows)]
+const PICKER_INPUT_CLEAR: u32 =
+    ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
+
+/// Console input bits a single-keypress picker must set.
+///
+/// `ENABLE_EXTENDED_FLAGS` is required for `SetConsoleMode` to honor the
+/// quick-edit bit above; `ENABLE_VIRTUAL_TERMINAL_INPUT` makes `ReadFile`
+/// deliver arrow/Home/End keys as the ANSI byte sequences the pickers already
+/// parse (`ESC [ A`, ...), so no second key grammar is needed on Windows.
+#[cfg(windows)]
+const PICKER_INPUT_SET: u32 = ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+/// Saved console modes restored when a picker gives stdin back (bitty#3310).
+///
+/// Holds both handles it changed so `Drop` restores exactly the mode that was
+/// there before, including on an early return or a panic in the wizard.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PickerConsoleGuard {
+    input_mode: u32,
+    output_mode: Option<u32>,
+}
+
+#[cfg(windows)]
+impl Drop for PickerConsoleGuard {
+    fn drop(&mut self) {
+        let _ = crate::ffi::set_console_mode(STD_INPUT_HANDLE, self.input_mode);
+        if let Some(mode) = self.output_mode {
+            let _ = crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, mode);
+        }
+    }
+}
+
+/// Enters the console equivalent of cbreak mode for an interactive picker.
+///
+/// Input loses line buffering, echo, processed input, and quick-edit, and
+/// gains virtual-terminal input; output gains virtual-terminal processing so
+/// the pickers' cursor-up/clear-line repaints work in a stock console host.
+///
+/// Returns `Err` when stdin or stdout is not a console (piped or redirected)
+/// or when the host rejects a mode (an older conhost without VT input), so the
+/// caller can keep its line loop. A half-applied setup restores what it
+/// changed before returning.
+#[cfg(windows)]
+pub fn enter_picker_input() -> io::Result<PickerConsoleGuard> {
+    let input_mode = crate::ffi::console_mode(STD_INPUT_HANDLE)?;
+    let output_mode = crate::ffi::console_mode(STD_OUTPUT_HANDLE)?;
+    let picker_input = (input_mode & !PICKER_INPUT_CLEAR) | PICKER_INPUT_SET;
+    crate::ffi::set_console_mode(STD_INPUT_HANDLE, picker_input)?;
+    let picker_output = output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if let Err(error) = crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, picker_output) {
+        let _ = crate::ffi::set_console_mode(STD_INPUT_HANDLE, input_mode);
+        return Err(error);
+    }
+    Ok(PickerConsoleGuard {
+        input_mode,
+        output_mode: Some(output_mode),
+    })
+}
+
+/// Saved stdout mode restored when a wizard hands the console back
+/// (bitty#3310 review).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct VtOutputGuard {
+    output_mode: u32,
+}
+
+#[cfg(windows)]
+impl Drop for VtOutputGuard {
+    fn drop(&mut self) {
+        let _ = crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, self.output_mode);
+    }
+}
+
+/// Enables virtual-terminal processing on stdout for the caller's whole scope.
+///
+/// [`enter_picker_input`] enables it only while a picker holds stdin, but the
+/// `bitty init` in-place step echo repaints with cursor-up/clear-line escapes
+/// after a picker has already handed the console back. This guard keeps the
+/// mode for the wizard instead: `Drop` restores exactly the mode that was
+/// there before, including on an early return or a panic.
+///
+/// Returns `Err` when stdout is not a console or the host rejects the mode, so
+/// the caller can keep writing plain lines.
+#[cfg(windows)]
+pub fn enter_vt_output() -> io::Result<VtOutputGuard> {
+    let output_mode = crate::ffi::console_mode(STD_OUTPUT_HANDLE)?;
+    let enabled = output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, enabled)?;
+    Ok(VtOutputGuard { output_mode })
+}
+
+/// True when stdin is a console this process can put in picker mode.
+#[cfg(windows)]
+#[must_use]
+pub fn is_console_input() -> bool {
+    crate::ffi::console_mode(STD_INPUT_HANDLE).is_ok()
+}
+
+/// Whether a key press is already queued (never blocks).
+///
+/// Only a key-down record produces bytes for the pickers' non-line-mode read;
+/// key-up, focus, and mouse records are skipped so a readiness report always
+/// means the next read returns without waiting.
+#[cfg(windows)]
+#[must_use]
+pub fn input_pending() -> bool {
+    crate::ffi::console_has_key_press()
+}
+
+/// Whether a key is waiting, blocking at most `timeout_ms`.
+#[cfg(windows)]
+#[must_use]
+pub fn wait_for_key(timeout_ms: u32) -> bool {
+    crate::ffi::wait_for_console_input(timeout_ms)
+}
+
+/// Visible size `(rows, columns)` of the console window, when stdout has one.
+#[cfg(windows)]
+#[must_use]
+pub fn viewport_size() -> Option<(u16, u16)> {
+    crate::ffi::console_viewport_size().ok()
 }
 
 #[cfg(test)]

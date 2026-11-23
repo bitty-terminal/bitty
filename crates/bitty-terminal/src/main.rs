@@ -1377,12 +1377,19 @@ fn main() {
     // trusted only as binary paths, never split.
     let shell_env = std::env::var("SHELL").ok();
     let config_shell = app_config.effective.terminal.shell.clone();
+    let config_shell_args = app_config.effective.terminal.shell_args.clone();
+    // bitty#3310: a Windows shortcut whose "Start in" is the install directory
+    // otherwise opens every shell there. `None` on Unix and whenever the user
+    // launched bitty from a directory of their own.
+    let startup_cwd = spawn::resolve_startup_cwd();
     // CTX-0176: frozen once so every split leaf replays this resolution.
     let spawn_spec = SpawnSpec {
         program: args.program.clone(),
         program_args: args.program_args.clone(),
         shell_env: shell_env.clone(),
         config_shell: config_shell.clone(),
+        config_shell_args: config_shell_args.clone(),
+        startup_cwd: startup_cwd.clone(),
     };
     // CTX-1117 (issue #1900): advisory `BITTY_SOCKET` for PTY children so
     // in-terminal `bitty ctl` targets its own instance without the
@@ -1790,6 +1797,7 @@ pub(crate) fn spawn_startup_shells(
     let resolved = match resolve_spawn_program(
         spawn_spec.program.as_deref(),
         spawn_spec.config_shell.as_deref(),
+        &spawn_spec.config_shell_args,
         spawn_spec.shell_env.as_deref(),
     ) {
         Ok(resolved) => resolved,
@@ -1816,20 +1824,19 @@ pub(crate) fn spawn_startup_shells(
     });
     let spawn_result = if let Some(program) = spawn_spec.program.as_deref() {
         let tail: Vec<&str> = spawn_spec.program_args.iter().map(String::as_str).collect();
-        if tail.is_empty() {
-            runtime.spawn_shell(program)
-        } else {
-            runtime.spawn_shell_with_args(program, &tail)
-        }
-        .map_err(|error| StartupShellError::Spawn {
-            program: program.to_string(),
-            error,
-        })
+        runtime
+            .spawn_shell_with_args_in(program, &tail, spawn_spec.startup_cwd.as_deref())
+            .map_err(|error| StartupShellError::Spawn {
+                program: program.to_string(),
+                error,
+            })
     } else {
         spawn_default_shell(
             runtime,
             spawn_spec.config_shell.as_deref(),
+            &spawn_spec.config_shell_args,
             spawn_spec.shell_env.as_deref(),
+            spawn_spec.startup_cwd.as_deref(),
         )
     };
     match spawn_result {

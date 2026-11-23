@@ -24,6 +24,10 @@ pub const MAX_PLUGIN_ID_LEN: usize = 64;
 pub const MAX_KEYMAPS: usize = 1024;
 pub const MAX_PLUGINS: usize = 1024;
 pub const MAX_SHELL_LEN: usize = 1024;
+/// Maximum entries in `terminal.shell_args` (bitty#3310).
+pub const MAX_SHELL_ARGS: usize = 16;
+/// Maximum byte length of one `terminal.shell_args` entry (bitty#3310).
+pub const MAX_SHELL_ARG_LEN: usize = 1024;
 
 /// Maximum chrome band order list entries per edge (CTX-0890).
 pub const MAX_CHROME_ORDER_ENTRIES: usize = 32;
@@ -2841,6 +2845,12 @@ pub struct TerminalConfig {
     pub scrollback: u32,
     /// Preferred shell `argv[0]`, if overridden; trimmed non-empty when present.
     pub shell: Option<String>,
+    /// Direct argv tail for the configured shell, applied only when
+    /// [`Self::shell`] is set (bitty#3310). Empty by default: `$SHELL` and the
+    /// platform default never gain arguments. Enables shells that need argv to
+    /// be usable — a WSL2 distribution (`wsl.exe -d Ubuntu`), `cmd.exe /k`, or
+    /// a login shell — without shell-string splitting.
+    pub shell_args: Vec<String>,
     /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3,
     /// ghostty/alacritty-class throughput).
     pub scroll_lines_per_notch: u32,
@@ -2874,6 +2884,7 @@ impl Default for TerminalConfig {
         Self {
             scrollback: 10_000,
             shell: None,
+            shell_args: Vec::new(),
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
@@ -2927,6 +2938,41 @@ impl TerminalConfig {
         self.bidi
             .validate()
             .map_err(|e| ConfigError::validation("terminal.bidi", e.to_string()))?;
+        if self.shell_args.len() > MAX_SHELL_ARGS {
+            return Err(ConfigError::validation(
+                "terminal.shell_args",
+                format!("must be <= {MAX_SHELL_ARGS} entries"),
+            ));
+        }
+        if self.shell.is_none() && !self.shell_args.is_empty() {
+            return Err(ConfigError::validation(
+                "terminal.shell_args",
+                "requires terminal.shell (arguments never apply to $SHELL or the platform default)",
+            ));
+        }
+        for (index, arg) in self.shell_args.iter().enumerate() {
+            let field = format!("terminal.shell_args[{}]", index + 1);
+            if arg.is_empty() {
+                return Err(ConfigError::validation(field, "must not be empty"));
+            }
+            if arg.len() > MAX_SHELL_ARG_LEN {
+                return Err(ConfigError::validation(
+                    field,
+                    format!("must be <= {MAX_SHELL_ARG_LEN} bytes"),
+                ));
+            }
+            if arg.contains('\0') {
+                return Err(ConfigError::validation(field, "must not contain NUL bytes"));
+            }
+            // Process authority never carries control characters: an argument
+            // is a direct argv entry, never terminal input.
+            if arg.chars().any(char::is_control) {
+                return Err(ConfigError::validation(
+                    field,
+                    "must not contain control characters",
+                ));
+            }
+        }
         if let Some(s) = &self.shell {
             let t = s.trim();
             if t.is_empty() {
@@ -5864,6 +5910,53 @@ mod tests {
         .validate()
         .expect("clean absolute shell is valid");
         TerminalConfig::default().validate().expect("default valid");
+    }
+
+    #[test]
+    fn terminal_shell_args_are_bounded_and_need_a_shell() {
+        // bitty#3310: argv for the configured shell only.
+        TerminalConfig {
+            shell: Some("wsl.exe".into()),
+            shell_args: vec!["-d".into(), "Ubuntu".into()],
+            ..Default::default()
+        }
+        .validate()
+        .expect("a WSL2 distribution is a valid argv tail");
+
+        // Arguments without a program would be silently dropped by the spawn
+        // chain, so they fail closed instead.
+        let err = TerminalConfig {
+            shell: None,
+            shell_args: vec!["-d".into()],
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(err.field(), Some("terminal.shell_args"));
+
+        for bad in [
+            vec![String::new()],
+            vec!["x".repeat(MAX_SHELL_ARG_LEN + 1)],
+            vec!["-d\0Ubuntu".to_string()],
+            vec!["-d\nUbuntu".to_string()],
+            vec!["x".to_string(); MAX_SHELL_ARGS + 1],
+        ] {
+            TerminalConfig {
+                shell: Some("wsl.exe".into()),
+                shell_args: bad.clone(),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err();
+        }
+
+        TerminalConfig {
+            shell: Some("wsl.exe".into()),
+            shell_args: vec!["x".to_string(); MAX_SHELL_ARGS],
+            ..Default::default()
+        }
+        .validate()
+        .expect("the entry bound itself is accepted");
     }
 
     #[test]

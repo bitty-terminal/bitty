@@ -7,7 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`terminal.shell_args` and WSL2 shells (`CTX-1930`; bitty#3310):** the
+  configured shell now takes a bounded Lua list of direct arguments, which
+  applies only to `terminal.shell` — never to `$SHELL` or the platform
+  default. That makes shells that are only meaningful with argv usable
+  without splitting a command string: `shell = "wsl.exe"` with
+  `shell_args = { "-d", "Ubuntu" }` for a WSL2 distribution, `cmd.exe /k`, or
+  `bash -l`. Entries are capped at 16, 1024 bytes each, and reject NUL and
+  control characters; arguments without `terminal.shell` fail closed, and a
+  change is restart-required like the program itself. `bitty config
+  get/set terminal.shell_args` reads and writes the same list.
+
+- **Windows `bitty init` is a real single-keypress wizard (`CTX-1930`;
+  bitty#3310):** the console adapter gained a picker mode (line input, echo,
+  processed input, and quick-edit off; virtual-terminal input and output on),
+  so the option picker and the plugin checkbox multi-select now move with
+  arrows/`j`/`k`, toggle with `Space`, confirm with `Enter`, and repaint in
+  place on Windows instead of falling back to a reprinted line loop. An older
+  console host that rejects the mode still gets the line loop.
+
 ### Fixed
+
+- **Windows shortcuts no longer open shells in the install directory
+  (`CTX-1930`; bitty#3310):** the Inno Setup shortcuts and `install.ps1` both
+  set the start-in directory to `%USERPROFILE%`, so `bitty` no longer opens in
+  `%LOCALAPPDATA%\bitty\bin`. A shortcut created by an older installer is
+  covered by a runtime guard: when the process directory is exactly the
+  directory holding `bitty.exe`, the startup shell starts in the home directory
+  instead; a user-chosen directory is never overridden.
+
+- **Windows shell menu offers `cmd.exe` and WSL, and stops pinning the detected
+  default (`CTX-1930`; bitty#3310):** the menu was built from POSIX paths, so
+  it offered only Windows PowerShell plus a nonexistent `/bin/sh`. It now
+  probes `pwsh.exe`, `powershell.exe`, `cmd.exe`, and `wsl.exe` on `PATH`, and
+  accepting the detected host default records "use the platform chain" rather
+  than freezing that executable path into `terminal.shell` — installing
+  PowerShell 7 later upgrades the default on the next start. `bitty doctor`
+  warns about a Windows PowerShell 5.1 default and prints the `winget install
+  --id Microsoft.PowerShell --source winget` upgrade line.
+
+- **The window title no longer shows a shell's executable path
+  (`CTX-1930`; bitty#3310):** Windows PowerShell titles the console with
+  `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe`. A title that
+  is exactly one known shell path (or bare executable name) now folds to
+  `Windows PowerShell`, `PowerShell`, `Command Prompt`, or `WSL`; prompts and
+  app-set titles pass through unchanged.
 
 - **A Windows install upgraded across the `%LOCALAPPDATA%` precedence change
   keeps its plugin store and its plugin state (`CTX-1876`; bitty#3236,

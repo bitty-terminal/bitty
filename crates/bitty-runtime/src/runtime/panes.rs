@@ -73,6 +73,21 @@ fn spawn_rule_dim(dim: Option<u16>) -> Option<u16> {
     dim.filter(|&v| v != 0 && v <= bitty_ui::view::MAX_FIXED_SIZE_DIM)
 }
 
+/// Directory a leaf spawn starts in: an explicit request first, then the
+/// inherited (live or restored `OSC 7`) directory, then the launcher default
+/// (bitty#3310 review: a Windows launch redirected out of the install
+/// directory must not displace a restored pane's own directory).
+fn spawn_directory(
+    explicit: Option<&std::path::Path>,
+    inherited: Option<std::path::PathBuf>,
+    startup: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = explicit {
+        return Some(dir.to_path_buf());
+    }
+    inherited.or_else(|| startup.map(std::path::Path::to_path_buf))
+}
+
 impl Runtime {
     /// Spawns `program` inside a PTY sized to the current grid, storing the
     /// child handle. The program is taken as a direct `argv[0]` without shell
@@ -107,8 +122,30 @@ impl Runtime {
         program: &str,
         args: &[&str],
     ) -> Result<(), RuntimeError> {
+        self.spawn_shell_with_args_in(program, args, None)
+    }
+
+    /// [`Self::spawn_shell_with_args`] with a default working directory for
+    /// the child.
+    ///
+    /// `Some(dir)` replaces the inherited process directory (the launcher's
+    /// "Start in") unless a captured `OSC 7` restore already names one for the
+    /// focused leaf, which always wins because it is the user's own last
+    /// directory. Used by the startup path so a Windows shortcut never drops
+    /// the user into the install directory (bitty#3310).
+    pub fn spawn_shell_with_args_in(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
+        }
+        if cwd.is_some_and(|dir| !dir.is_dir()) {
+            return Err(RuntimeError::InvalidConfig(
+                "spawn cwd is not an existing directory",
+            ));
         }
         // CTX-0343: binding the primary shell turns the focused leaf into a
         // `terminal`-content `View`; a `ws:`/`view:` entry that first matches
@@ -158,7 +195,12 @@ impl Runtime {
         // CTX-0585 (M1-25): the primary restart attach must seed its cwd from
         // the captured `OSC 7` report, exactly like a split spawn. The leaf
         // focused at attach time becomes the owner below, so resolve against
-        // it; `session_pending_cwd` fails open when there is no capture.
+        // it; `session_pending_cwd` fails open when there is no capture. A
+        // startup default (bitty#3310) applies first, so a restored directory
+        // still wins over the launcher's directory.
+        if let Some(dir) = cwd {
+            builder = builder.cwd(dir);
+        }
         if let Some(owner) = self.focus.focused() {
             if let Some(cwd) = self.session_pending_cwd(&owner) {
                 builder = builder.cwd(cwd);
@@ -489,7 +531,33 @@ impl Runtime {
         rows: u16,
         cwd: Option<&std::path::Path>,
     ) -> Result<(), RuntimeError> {
-        self.spawn_shell_for_view_impl(view, program, args, cols, rows, cwd, &[])
+        self.spawn_shell_for_view_impl(view, program, args, cols, rows, cwd, None, &[])
+    }
+
+    /// [`Self::spawn_shell_for_view_in`] with a launcher default directory.
+    ///
+    /// `startup_cwd` is the last resort: it applies only when this spawn has
+    /// neither an explicit `cwd` nor a captured `OSC 7` directory to inherit,
+    /// so a Windows launch redirected out of the install directory still
+    /// respects a restored pane's own directory (bitty#3310 review).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn_shell_for_view_in`].
+    // Leaf-spawn arity mirrors the shared spawn seam: view + program + argv +
+    // geometry + requested cwd + launcher default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_shell_for_view_with_startup_cwd(
+        &mut self,
+        view: ViewId,
+        program: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+        cwd: Option<&std::path::Path>,
+        startup_cwd: Option<&std::path::Path>,
+    ) -> Result<(), RuntimeError> {
+        self.spawn_shell_for_view_impl(view, program, args, cols, rows, cwd, startup_cwd, &[])
     }
 
     /// [`Self::spawn_shell_for_view`] with inherited-environment removals
@@ -514,7 +582,7 @@ impl Runtime {
         rows: u16,
         scrub_env: &[std::ffi::OsString],
     ) -> Result<(), RuntimeError> {
-        self.spawn_shell_for_view_impl(view, program, args, cols, rows, None, scrub_env)
+        self.spawn_shell_for_view_impl(view, program, args, cols, rows, None, None, scrub_env)
     }
 
     // Leaf-spawn arity is inherent to the spawn seam (view + program + argv
@@ -530,6 +598,7 @@ impl Runtime {
         cols: u16,
         rows: u16,
         cwd: Option<&std::path::Path>,
+        startup_cwd: Option<&std::path::Path>,
         scrub_env: &[std::ffi::OsString],
     ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
@@ -611,10 +680,8 @@ impl Runtime {
         // when it still names an existing directory; otherwise the builder
         // keeps the platform default (fail-open, never an error here). An
         // explicit `cwd` (checked above) takes precedence (#1528).
-        if let Some(dir) = cwd {
+        if let Some(dir) = spawn_directory(cwd, self.inherited_cwd_for(view), startup_cwd) {
             builder = builder.cwd(dir);
-        } else if let Some(inherited) = self.inherited_cwd_for(view) {
-            builder = builder.cwd(inherited);
         }
         for arg in args {
             builder = builder.arg(*arg);
@@ -1389,6 +1456,32 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_directory_prefers_explicit_then_inherited_then_startup() {
+        // bitty#3310 review: a launch redirected out of the install directory
+        // must not displace a restored pane's own captured directory.
+        let explicit = std::path::Path::new("/tmp/bitty-explicit");
+        let inherited = std::path::PathBuf::from("/tmp/bitty-inherited");
+        let startup = std::path::Path::new("/tmp/bitty-startup");
+
+        assert_eq!(
+            spawn_directory(Some(explicit), Some(inherited.clone()), Some(startup)),
+            Some(explicit.to_path_buf()),
+            "the caller's explicit request wins"
+        );
+        assert_eq!(
+            spawn_directory(None, Some(inherited.clone()), Some(startup)),
+            Some(inherited),
+            "an inherited or captured directory outranks the launcher default"
+        );
+        assert_eq!(
+            spawn_directory(None, None, Some(startup)),
+            Some(startup.to_path_buf()),
+            "a fresh pane without a captured directory takes the launcher default"
+        );
+        assert_eq!(spawn_directory(None, None, None), None);
+    }
 
     #[cfg(unix)]
     #[test]

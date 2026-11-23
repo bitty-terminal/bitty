@@ -220,6 +220,7 @@ mod integration_tests {
                 terminal: Some(TerminalConfig {
                     scrollback: 50_000,
                     shell: None,
+                    shell_args: Vec::new(),
                     ..Default::default()
                 }),
                 appearance: Some(AppearanceConfig {

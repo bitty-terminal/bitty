@@ -1130,6 +1130,8 @@ fn spawn_leaf_shell(
         program_args,
         shell_env: std::env::var("SHELL").ok(),
         config_shell: None,
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     crate::spawn::spawn_pane_shell_in(runtime, &spec, view, cols, rows, cwd)
 }

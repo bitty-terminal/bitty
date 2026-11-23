@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bitty_runtime::plugin_runtime::{PluginRecord, load_index};
 
 use crate::cli::Args;
+#[cfg(not(windows))]
 use crate::spawn::FALLBACK_SHELL;
 
 /// Maximum prompt attempts per wizard step before aborting. Bounded so piped
@@ -52,6 +53,10 @@ static INIT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) const INIT_MAX_LINE_BYTES: usize = 4096;
 
 /// Common shells probed in order when building the shell menu on Unix.
+///
+/// Windows builds the menu from [`INIT_WINDOWS_SHELLS`] instead, so this list
+/// is intentionally unused there (`bitty#3310`).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
     "/bin/bash",
     "/usr/bin/bash",
@@ -69,6 +74,7 @@ pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
 /// default; Windows PowerShell 5.1 (`powershell.exe`) and the command
 /// interpreter every host ships follow. `wsl.exe` launches the default WSL2
 /// distribution — a Linux shell with no extra configuration (issue #3310).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const INIT_WINDOWS_SHELLS: &[&str] =
     &["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"];
 
@@ -2400,19 +2406,6 @@ pub(crate) struct InitRawGuard {
     original_flags: nix::fcntl::OFlag,
 }
 
-/// Platform guard that puts the live terminal into single-keypress mode for
-/// the pickers, restored on drop (CTX-1755 Windows follow-up).
-///
-/// Unix clears canonical input/echo/signals through `termios`; Windows clears
-/// the same console bits and enables virtual-terminal input in the reviewed
-/// `bitty-winjob` console adapter.
-#[cfg(unix)]
-pub(crate) type InitInputGuard = InitRawGuard;
-
-/// See the Unix [`InitInputGuard`] alias.
-#[cfg(windows)]
-pub(crate) type InitInputGuard = bitty_winjob::PickerConsoleGuard;
-
 /// Enters cbreak mode on stdin without terminal signals (`ISIG` cleared) so
 /// `Ctrl-C` delivers `0x03` into the picker key loops for frame cleanup and
 /// `Drop`-based restoration instead of raising `SIGINT`. `None` when stdin has
@@ -2454,7 +2447,9 @@ pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
 }
 
 /// Enters single-keypress input for the pickers on a live Windows console
-/// (CTX-1755 Windows follow-up, bitty#3310).
+/// (CTX-1755 Windows follow-up, bitty#3310), clearing the same console bits
+/// Unix clears through `termios` and enabling virtual-terminal input in the
+/// reviewed `bitty-winjob` console adapter.
 ///
 /// Clears line input, echo, processed input, and quick-edit and enables
 /// virtual-terminal input so arrow keys arrive as the ANSI sequences the

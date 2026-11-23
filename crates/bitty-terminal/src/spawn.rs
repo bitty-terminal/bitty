@@ -13,6 +13,7 @@ use bitty_runtime::{Runtime, SplitAxis, ViewId};
 ///
 /// Windows has no `/bin/sh`; the last layer there is the first
 /// [`PLATFORM_SHELL_CANDIDATES`] entry that resolves on `PATH` (bitty#2928).
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) const FALLBACK_SHELL: &str = "/bin/sh";
 
 /// Ordered platform default candidates for the child shell (bitty#2928).
@@ -237,6 +238,7 @@ fn platform_default_shell() -> Result<ResolvedShell, UnresolvedDefaultShell> {
 /// directory (and for the `bitty.com` shim), and it never overrides a
 /// directory the user actually chose: only an exact match with the running
 /// executable's directory is redirected to the home directory.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn startup_cwd_override(
     current: Option<&std::path::Path>,
     exe_dir: Option<&std::path::Path>,
@@ -260,6 +262,7 @@ pub(crate) fn startup_cwd_override(
 /// when canonicalization fails (a path that vanished between the two calls)
 /// the caller's spelling is compared instead, which still catches the exact
 /// install-directory match this guard exists for.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
     let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
     let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());

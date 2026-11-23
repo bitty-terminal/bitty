@@ -365,6 +365,25 @@ pub struct PresentedPanelContent {
     /// is a presentation of the panel, so dismissing it must not leave the
     /// panel where the layer put it.
     pub prior_presentation: PresentationMode,
+    /// The leaf mode the panel's layer displaced when it went **fullscreen**
+    /// (bitty#2388, CTX-1936), or `None` while the layer is not fullscreen.
+    ///
+    /// `Fullscreen` rides the app-level zoom owner rather than a leaf
+    /// placement: entering it makes the owner capture the live tree and
+    /// install the single-leaf proxy, so the tree the zoom holds carries the
+    /// leaf at exactly this mode. Every give-back path (release, close, the
+    /// generation edge) therefore compares the **returned** leaf against
+    /// this value — never against [`Self::presentation`], which reads
+    /// `Fullscreen` while the layer is up — with the same two guards the
+    /// ordinary restore applies: a leaf that reads anything else was moved
+    /// by somebody else, and that intent outranks the layer's.
+    ///
+    /// The value is the mode the layer last requested **before** it went
+    /// fullscreen (the record's own `presentation` at engage time), not the
+    /// live leaf's mode, so a third-party stamp that predates the engage
+    /// keeps refusing the give-back exactly like the ordinary release
+    /// guards do.
+    pub pre_fullscreen_presentation: Option<PresentationMode>,
 }
 
 /// What [`PanelRuntime::release_panel_content`] restored.
@@ -397,6 +416,15 @@ pub struct RestoredPanelContent {
     pub presentation: PresentationMode,
     /// The mode to return the panel to (the mode recorded at present time).
     pub prior_presentation: PresentationMode,
+    /// The leaf mode the released layer's **fullscreen** displaced
+    /// (bitty#2388, CTX-1936), or `None` when the layer never went
+    /// fullscreen.
+    ///
+    /// Carried out of the release because the caller — not the host — owns
+    /// the app-level zoom the mode rode: the give-back restores that zoom
+    /// first, and only a leaf that then still reads exactly this mode is the
+    /// layer's own to return to [`RestoredPanelContent::prior_presentation`].
+    pub pre_fullscreen_presentation: Option<PresentationMode>,
 }
 
 impl PanelRuntime {
@@ -1932,6 +1960,10 @@ impl PanelRuntime {
             token,
             presentation,
             prior_presentation: presentation,
+            // bitty#2388 (CTX-1936): a fresh present is never fullscreen —
+            // the mode only becomes answerable through the gate that hands
+            // it to the installed app-level zoom owner.
+            pre_fullscreen_presentation: None,
         };
         self.content_layers.insert(panel, record.clone());
         Ok(record)
@@ -2001,6 +2033,7 @@ impl PanelRuntime {
             token: record.token,
             presentation: record.presentation,
             prior_presentation: record.prior_presentation,
+            pre_fullscreen_presentation: record.pre_fullscreen_presentation,
         })
     }
 
@@ -2084,6 +2117,7 @@ impl PanelRuntime {
             token: record.token,
             presentation: record.presentation,
             prior_presentation: record.prior_presentation,
+            pre_fullscreen_presentation: record.pre_fullscreen_presentation,
         }))
     }
 
@@ -2133,15 +2167,26 @@ impl PanelRuntime {
         }
     }
 
-    /// Records `mode` as the presentation mode the panel mounted at `view` is
-    /// presenting its content layer in (bitty#2388, CTX-1902).
+    /// Records the pair a presentation-mode change produced — the mode the
+    /// panel mounted at `view` is presenting its content layer in, and the
+    /// leaf mode a **fullscreen** change displaced (bitty#2388, CTX-1902 /
+    /// CTX-1936).
     ///
     /// This is the record half of a mode change: the layout half is
     /// [`bitty_ui::apply_presentation_command`], which stamps the leaf through
-    /// the single transition gate. The caller runs the fallible half first and
-    /// calls this only after it succeeded, so the pair never splits across a
-    /// refusal — see
+    /// the single transition gate, and — for `Fullscreen` — the zoom half is
+    /// the installed app-level owner, which must have engaged before the
+    /// stamp. The caller runs every fallible half first and calls this only
+    /// after they succeeded, so the pair never splits across a refusal — see
     /// [`Runtime::set_panel_content_presentation`](crate::runtime::Runtime::set_panel_content_presentation).
+    ///
+    /// `pre_fullscreen` is `Some(displaced leaf mode)` exactly when `mode` is
+    /// `Fullscreen` and the record did not already describe fullscreen, and
+    /// `None` otherwise: the give-back guards compare the leaf the zoom
+    /// restore returns against that displaced mode, never against the live
+    /// leaf's mode at engage time. A re-entry keeps the value the first entry
+    /// recorded — the record's own `presentation` on a re-entry is the gate's
+    /// previous stamp, not a mode the layer displaced.
     ///
     /// Nothing else is touched: the layer, its scene slot, the displaced
     /// terminal record, the frozen rectangle, and the token keep their values.
@@ -2155,10 +2200,12 @@ impl PanelRuntime {
         &mut self,
         view: ViewId,
         mode: PresentationMode,
+        pre_fullscreen: Option<PresentationMode>,
     ) -> Option<PresentedPanelContent> {
         let panel = self.placement.panel_of(view)?;
         let record = self.content_layers.get_mut(&panel)?;
         record.presentation = mode;
+        record.pre_fullscreen_presentation = pre_fullscreen;
         Some(record.clone())
     }
 

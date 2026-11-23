@@ -2005,6 +2005,20 @@ impl TerminalApp {
             // the runtime forward covers; this stamp covers the reverse).
             host.borrow_mut().set_safe_scene_paint(self.safe_mode);
             self.runtime.borrow_mut().install_shared_scene_host(host);
+            // bitty#2388 (CTX-1936): the hosted panel surface is also where
+            // the app-level zoom owner lands — the same posture that can
+            // present a content layer is the posture whose `Fullscreen`
+            // mode is answerable, and the owner is the one zoom table the
+            // `toggle_zoom` gesture drives. A `--safe` or plugin-less run
+            // never installs the host, so the mode keeps failing closed with
+            // the typed refusal there, like every other unhosted surface.
+            self.runtime
+                .borrow_mut()
+                .set_panel_fullscreen_owner(Some(std::rc::Rc::new(
+                    crate::chrome_keys::AppFullscreenOwner::new(std::rc::Rc::clone(
+                        &self.chrome.zoom,
+                    )),
+                )));
         }
         self
     }
@@ -2536,7 +2550,7 @@ impl TerminalApp {
             &bitty_ipc::ScopeSet::new(),
             |runtime, method| {
                 if ctl::method_mutates_layout(method) {
-                    self.chrome.zoom.restore_for_mutation(runtime);
+                    self.chrome.zoom.borrow_mut().restore_for_mutation(runtime);
                 }
             },
         );
@@ -4456,7 +4470,12 @@ impl TerminalApp {
                     continue;
                 }
                 if self.runtime.borrow().floated_views().contains(&id)
-                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
+                    || self
+                        .chrome
+                        .zoom
+                        .borrow()
+                        .backup_leaf_count(&self.runtime.borrow())
+                        != Some(1)
                 {
                     self.restore_zoom();
                 }
@@ -4926,7 +4945,7 @@ impl TerminalApp {
             .runtime
             .borrow()
             .workspace_seq_at(index)
-            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .and_then(|seq| self.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq))
             .map_or(stashed_tiled, |ids| ids.len());
         Some(tiled + floats)
     }
@@ -5083,6 +5102,7 @@ impl TerminalApp {
                 // (CTX-1336), so both keep the existing leaf handling.
                 self.chrome
                     .zoom
+                    .borrow_mut()
                     .restore_for_view_mutation(&mut self.runtime.borrow_mut(), view);
                 // CTX-1929: hoist the lookup out of the `if let` scrutinee so
                 // the guard is released before the branch runs.
@@ -5170,6 +5190,7 @@ impl TerminalApp {
                 // session: never strand a session-less live tile.
                 self.chrome
                     .zoom
+                    .borrow_mut()
                     .restore_for_view_mutation(&mut self.runtime.borrow_mut(), view);
                 let mut layout = self.runtime.borrow().layout().clone();
                 if crate::chrome_keys::close_focused_leaf(&mut layout, view) {
@@ -5253,6 +5274,7 @@ impl TerminalApp {
                 if !self
                     .chrome
                     .zoom
+                    .borrow_mut()
                     .restore_for_view_mutation(&mut self.runtime.borrow_mut(), primary_view)
                 {
                     self.restore_zoom();

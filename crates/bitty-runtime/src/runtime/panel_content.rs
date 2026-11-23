@@ -42,7 +42,8 @@
 //! | No key reaches the PTY while presented | both keyboard entry points (`Runtime::handle_key_event_at`, `Runtime::handle_key_event_ref`) append the key to the presented layer's Core-owned bounded queue and swallow it (`Runtime::capture_panel_content_key`); a layer with no plugin row has no queue, so the key is only counted |
 //! | No byte reaches the PTY while presented | the two byte paths to a shell drop everything for a presented view: `Runtime::push_input_bytes` (paste, IME commit, programmatic submit) and `Runtime::route_input_bytes_to` (pointer reports, focus reports). Both count what they dropped, and callers that report an outcome read `input_owner_content_frozen()` so a drop is never labelled a headless buffer |
 //! | Layer released when its generation ends | the plugin runtime's generation port calls `PanelRuntime::release_content_layer_at_generation_end` before it presents the placeholder, so a dead generation's layer never outlives it (`runtime::panel_content` "Generation edges") |
-//! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
+//! | Mode chosen and changed on the layer | [`Runtime::set_panel_content_presentation`] validates the token, refuses a mode nobody owns, then stamps the leaf through [`bitty_ui::apply_presentation_command`] (the one transition gate), then records the mode on the layer; a redundant request is a true no-op |
+//! | Fullscreen rides the app-level zoom | [`Runtime::set_panel_content_presentation`] hands the mode to the installed [`PanelFullscreenOwner`]: the owner engages the zoom before anything stamps, gives it back before a stamp leaves fullscreen, and the record carries the displaced leaf mode so the give-back guards read it; without an owner the mode fails closed with the typed refusal (CTX-1936) |
 //! | Mode changed by a user gesture | [`Runtime::apply_panel_content_mode_command`] resolves one `bitty.workspace:presentation-*` command name to a mode, fences the change on the layer's own token (the gesture is Core-owned), and delegates to the same gate; with no layer presented it is a typed no-op, never a fall-through mutation |
 //! | Mode given back on release | [`Runtime::release_panel_content`] restores the mode recorded at present time when the leaf still carries the mode the layer last requested, and leaves the leaf alone when somebody else moved it |
 //! | Mode given back at a generation edge | the edge's release cannot stamp (the plugin runtime owns no layout), so it carries the typed [`RestoredPanelContent`] to [`Runtime::restore_released_panel_presentation`], which applies the same two guards before the next frame |
@@ -106,12 +107,16 @@
 //! set_presentation` stays `E_NOT_IMPLEMENTED` because no plugin-facing
 //! present hands a plugin a [`PanelContentToken`] to fence a change with, and a
 //! verb that can only ever answer "no layer" would be a stub wearing the
-//! feature's name. Two of the four modes are answerable (`Tiled`, `Floating`);
-//! `Fullscreen` (app-level zoom) and `Scratchpad` (the scratchpad store) are
-//! refused with [`PanelError::ContentPresentationUnsupported`] until the
-//! mechanism that can honor them owns the change, and a bottom band has no
-//! placement at all yet. The user-facing halves (CTX-1931, bitty#2388 residue
-//! 3) are the Core-owned `bitty ctl panel mode` verb and the `ctrl+alt+a`
+//! feature's name. Three of the four modes are answerable (`Tiled`,
+//! `Floating`, and — since CTX-1936 — `Fullscreen`): the fullscreen half is
+//! owned by the installed [`PanelFullscreenOwner`] (the app-level zoom), so
+//! it answers through the real backup/proxy capture and fails closed with
+//! the typed refusal on every runtime without one. `Scratchpad` (the
+//! scratchpad store) is still refused with
+//! [`PanelError::ContentPresentationUnsupported`] because no store owns the
+//! hide/slot behavior it names, and a bottom band has no placement at all
+//! yet. The user-facing halves (CTX-1931, bitty#2388 residue 3) are the
+//! Core-owned `bitty ctl panel mode` verb and the `ctrl+alt+a`
 //! `toggle_panel_mode` keybind, both of which route through the same gate; no
 //! plugin surface changed.
 
@@ -122,11 +127,58 @@ use bitty_ui::Point;
 use bitty_ui::PresentationMode;
 use bitty_ui::ViewId;
 use bitty_ui::geometry::Rect;
+use std::rc::Rc;
 
 use super::Runtime;
 use crate::registry::{
     PanelContentToken, PanelError, PresentedPanelContent, RestoredPanelContent, ViewContent,
 };
+
+/// The app-level zoom owner that honors a presented layer's `Fullscreen`
+/// mode (bitty#2388, CTX-1936).
+///
+/// `Fullscreen` is not a placement the tiling solver can give a leaf: the
+/// module contract refused it until the mechanism that can honor it owns the
+/// change, and that mechanism is the **app-level zoom** — the backup/proxy
+/// capture the host application performs around this runtime's live layout.
+/// This trait is the seam that hands the change to that owner:
+/// [`PanelFullscreenOwner::engage`] runs when a layer enters `Fullscreen`
+/// (before anything stamps), and [`PanelFullscreenOwner::restore`] runs when
+/// a layer gives the mode back (release, close, the generation edge) — the
+/// only two moments the mode moves, exactly like the leaf stamp the ordinary
+/// modes take.
+///
+/// Every call receives the `&mut Runtime` the mode gate already owns, so an
+/// implementation holds only its own zoom state — the app's zoom table — and
+/// never a second runtime handle. That is what keeps the owner honest: it
+/// cannot observe or move anything but the zoom it is responsible for.
+///
+/// `None` (no installed owner) keeps `Fullscreen` refused with the typed
+/// [`PanelError::ContentPresentationUnsupported`]: a mode that stamps and
+/// then paints exactly like the mode it replaced would be a lie about
+/// layout, so the gate fails closed instead — the refusal every runtime
+/// before the composition root wired an owner answers.
+pub trait PanelFullscreenOwner {
+    /// Engages the app-level zoom on `view`: captures the live tree and
+    /// installs the single-leaf proxy, so the view paints full-bleed while
+    /// the layer stays presented.
+    ///
+    /// Returns `false` when the owner cannot honor the request (the
+    /// workspace already holds a zoom, the view is no zoomable leaf). A
+    /// `false` must leave the runtime layout untouched, and the gate then
+    /// refuses the mode change typed before anything stamps.
+    fn engage(&self, runtime: &mut Runtime, view: ViewId) -> bool;
+
+    /// Restores the zoom state `view`'s layer engaged, giving the live
+    /// layout back the tree the engage captured — so the leaf returns to
+    /// exactly the mode it carried before the layer went fullscreen.
+    ///
+    /// Returns whether a zoom backup containing `view` was actually
+    /// restored. `false` means the zoom was already given back out of band
+    /// (the user unzoomed), and the caller then guards the leaf exactly like
+    /// any other move it did not make.
+    fn restore(&self, runtime: &mut Runtime, view: ViewId) -> bool;
+}
 
 impl Runtime {
     /// Presents a GUI content layer on the terminal-backed panel of `view`.
@@ -355,8 +407,13 @@ impl Runtime {
             self.note_panel_content_release(&row, super::ui_panel::PANEL_CONTENT_RELEASE_UNLOADED);
         }
         let before = self.view_presentation(restored.view);
-        self.restore_panel_presentation(restored);
-        if self.view_presentation(restored.view) == before {
+        // The zoom give-back counts as a move on its own: a fullscreen layer
+        // whose leaf mode did not change (it never moved the leaf before it
+        // fullscreened) still replaced the live tree — proxy out, real tree
+        // back — so the first frame after the edge must paint the returned
+        // tree in full, exactly like a mode give-back does.
+        let moved = self.restore_panel_presentation(restored);
+        if !moved && self.view_presentation(restored.view) == before {
             return false;
         }
         // The leaf moved, so the retained primitives describe a frame that no
@@ -444,13 +501,20 @@ impl Runtime {
     /// 1. **Validate.** The layer must exist for `view`'s panel
     ///    ([`PanelError::ContentNotPresented`]), `token` must be that layer
     ///    ([`PanelError::ContentTokenMismatch`]), and `mode` must be a mode a
-    ///    presented panel can take ([`PanelError::ContentPresentationUnsupported`]).
+    ///    presented panel can take ([`PanelError::ContentPresentationUnsupported`]
+    ///    — `Fullscreen` needs the installed app-level zoom owner to be
+    ///    answerable; `Scratchpad` still has no owner at all).
     ///    Every one of those refusals happens before anything moves.
-    /// 2. **Stamp.** The leaf is stamped through the workspace command registry
+    /// 2. **Own.** `Fullscreen` is not a leaf placement: the installed
+    ///    [`PanelFullscreenOwner`] engages the app-level zoom (before
+    ///    anything stamps), and leaving `Fullscreen` gives that zoom back
+    ///    first so the stamp lands on the real tree. A refused engage
+    ///    changes nothing.
+    /// 3. **Stamp.** The leaf is stamped through the workspace command registry
     ///    ([`bitty_ui::apply_presentation_command`]) — the same single
     ///    transition gate every other mode change uses, never a direct write to
     ///    the layout node.
-    /// 3. **Record.** Only then does the layer record the new mode
+    /// 4. **Record.** Only then does the layer record the new mode
     ///    ([`crate::registry::PanelRuntime::commit_presented_content_presentation`]),
     ///    so a refused stamp leaves the record untouched and no state is ever
     ///    reported as changed when it did not change.
@@ -479,8 +543,10 @@ impl Runtime {
     /// the detach-restore path, not to the layer); [`PanelError::ContentNotPresented`]
     /// when the panel presents no layer; [`PanelError::ContentTokenMismatch`]
     /// when `token` is not that layer; [`PanelError::ContentPresentationUnsupported`]
-    /// for a mode this runtime cannot give an in-tree panel. A refusal changes
-    /// nothing: no stamp, no record write, no focus, no resize.
+    /// for a mode nobody on this runtime can honor — `Fullscreen` without an
+    /// installed app-level zoom owner, `Scratchpad` with or without one. A
+    /// refusal changes nothing: no zoom, no stamp, no record write, no focus,
+    /// no resize.
     pub fn set_panel_content_presentation(
         &mut self,
         view: ViewId,
@@ -516,7 +582,7 @@ impl Runtime {
                 token: token.get(),
             });
         }
-        if !presented_panel_mode_supported(mode) {
+        if !self.presented_panel_mode_supported(mode) {
             return Err(PanelError::ContentPresentationUnsupported {
                 view_id: view,
                 mode: mode.as_str(),
@@ -533,40 +599,115 @@ impl Runtime {
             // not claim the leaf's mode as the layer's own.
             return Ok(layer);
         }
-        // Step 2 — stamp through the one transition gate.
-        bitty_ui::apply_presentation_command(
+        // Step 2 — own. `Fullscreen` rides the app-level zoom, never a bare
+        // stamp: the installed owner engages before anything moves, and a
+        // refusal (no owner, an engage the owner cannot honor) changes
+        // nothing. The displaced leaf mode the record keeps is the layer's
+        // LAST REQUESTED mode — the record's own `presentation`, not the
+        // live leaf's mode — so a third-party stamp that predates the engage
+        // keeps refusing the give-back below, exactly like the ordinary
+        // release guards.
+        //
+        // Only a *first* entry records the last requested mode: a record
+        // that still describes fullscreen already made that request, so its
+        // `presentation` is this gate's own stamp, not a leaf mode the layer
+        // displaced. The user can give the zoom back out of band —
+        // `Tiled -> Floating -> Fullscreen`, unzoom, fullscreen again — which
+        // leaves the record fullscreen while the leaf returns to `Floating`;
+        // recording `Fullscreen` as the displaced mode would make release's
+        // give-back guard compare against the proxy's stamp and skip the
+        // `Tiled` the first entry displaced. Keeping the existing value is
+        // what preserves it across re-entry.
+        let mut engaged = false;
+        let pre_fullscreen = if mode == PresentationMode::Fullscreen {
+            let Some(owner) = self.fullscreen_owner.clone() else {
+                // The support check above guarantees an owner here; the
+                // clone-then-call shape cannot race an uninstall on this
+                // single-threaded gate, but a missing owner still fails
+                // closed instead of stamping a mode nobody honors.
+                return Err(PanelError::ContentPresentationUnsupported {
+                    view_id: view,
+                    mode: mode.as_str(),
+                });
+            };
+            if !owner.engage(self, view) {
+                return Err(PanelError::ContentPresentationUnsupported {
+                    view_id: view,
+                    mode: mode.as_str(),
+                });
+            }
+            engaged = true;
+            if layer.presentation == PresentationMode::Fullscreen {
+                layer.pre_fullscreen_presentation
+            } else {
+                Some(layer.presentation)
+            }
+        } else {
+            None
+        };
+        // Leaving fullscreen gives the zoom back before the stamp, so the
+        // registry command lands on the real tree the disengage restored —
+        // a stamp on the single-leaf proxy would paint exactly like the
+        // mode it replaced, the lie this gate never tells. The zoom's backup
+        // already put the leaf at the mode it displaced, so this restore and
+        // the give-back guards share one truth.
+        if current == PresentationMode::Fullscreen && mode != PresentationMode::Fullscreen {
+            if let Some(owner) = self.fullscreen_owner.clone() {
+                owner.restore(self, view);
+            }
+        }
+        // Step 3 — stamp through the one transition gate.
+        let stamped = bitty_ui::apply_presentation_command(
             &mut self.layout,
             bitty_ui::presentation_command_for_mode(mode),
             view,
-        )
-        .map_err(|error| match error {
-            bitty_ui::PresentationCommandError::LeafNotFound(_) => PanelError::ContentUnavailable {
-                view_id: view,
-                reason: "view is not a workspace layout leaf",
-            },
-            bitty_ui::PresentationCommandError::Rejected { .. } => {
-                PanelError::ContentPresentationUnsupported {
-                    view_id: view,
-                    mode: mode.as_str(),
+        );
+        if let Err(error) = stamped {
+            // A refused stamp cannot strand the zoom an engage took: give
+            // it back before reporting, so the refusal leaves the leaf,
+            // the record, AND the zoom exactly as they were.
+            if engaged {
+                if let Some(owner) = self.fullscreen_owner.clone() {
+                    owner.restore(self, view);
                 }
             }
-            bitty_ui::PresentationCommandError::UnknownCommand(_) => {
-                PanelError::ContentUnavailable {
-                    view_id: view,
-                    reason: "presentation command is not a workspace command",
+            return Err(match error {
+                bitty_ui::PresentationCommandError::LeafNotFound(_) => {
+                    PanelError::ContentUnavailable {
+                        view_id: view,
+                        reason: "view is not a workspace layout leaf",
+                    }
                 }
-            }
-        })?;
-        // Step 3 — record. The stamp above is the only fallible half, so this
+                bitty_ui::PresentationCommandError::Rejected { .. } => {
+                    PanelError::ContentPresentationUnsupported {
+                        view_id: view,
+                        mode: mode.as_str(),
+                    }
+                }
+                bitty_ui::PresentationCommandError::UnknownCommand(_) => {
+                    PanelError::ContentUnavailable {
+                        view_id: view,
+                        reason: "presentation command is not a workspace command",
+                    }
+                }
+            });
+        }
+        // Step 4 — record. Every fallible half above succeeded, so this
         // cannot refuse on any path that reached it.
         let committed = match host.try_borrow_mut() {
-            Ok(mut host) => host.commit_presented_content_presentation(view, mode),
+            Ok(mut host) => host.commit_presented_content_presentation(view, mode, pre_fullscreen),
             Err(_) => None,
         };
         let Some(record) = committed else {
             // Unreachable: the record was validated a few statements ago and
             // nothing re-entered. Report the refusal honestly and put the leaf
-            // back where the caller found it rather than leave a half state.
+            // — and the zoom an engage took — back where the caller found
+            // them rather than leave a half state.
+            if engaged {
+                if let Some(owner) = self.fullscreen_owner.clone() {
+                    owner.restore(self, view);
+                }
+            }
             let _ = bitty_ui::apply_presentation_command(
                 &mut self.layout,
                 bitty_ui::presentation_command_for_mode(current),
@@ -592,6 +733,37 @@ impl Runtime {
         host.presented_content_for_view(view).cloned()
     }
 
+    /// Whether the app-level zoom owner is installed (bitty#2388, CTX-1936).
+    ///
+    /// A composition fact, not a per-view state: the composition root
+    /// installs the owner when it wires the panel surface, so this is the one
+    /// predicate the user-facing halves (the `ctrl+alt+a` cycle, a UI
+    /// reporting the answerable modes) read to decide whether `Fullscreen`
+    /// belongs in the vocabulary at all. Without the owner the mode fails
+    /// closed at the gate, so a cycle that offered it would only ever
+    /// produce the typed refusal.
+    #[must_use]
+    pub fn panel_fullscreen_owner_installed(&self) -> bool {
+        self.fullscreen_owner.is_some()
+    }
+
+    /// Installs (or removes) the app-level zoom owner that honors a
+    /// presented layer's `Fullscreen` mode (bitty#2388, CTX-1936).
+    ///
+    /// The composition root calls this when it wires the panel surface —
+    /// the same posture that can present a content layer is the posture
+    /// whose `Fullscreen` is answerable. `None` (headless runtimes, `--safe`,
+    /// plugin-less runs) keeps the mode failing closed with the typed
+    /// [`PanelError::ContentPresentationUnsupported`], so nothing this
+    /// runtime already answers changes.
+    ///
+    /// The owner must be the one state the host application's own zoom
+    /// gesture drives: a private second zoom table would desynchronize the
+    /// layer's fullscreen from the user's zoom within a session.
+    pub fn set_panel_fullscreen_owner(&mut self, owner: Option<Rc<dyn PanelFullscreenOwner>>) {
+        self.fullscreen_owner = owner;
+    }
+
     /// Applies one `bitty.workspace:presentation-{tiled,floating,...}` command
     /// name to the content layer the panel at `view` presents (bitty#2388
     /// residue 3, CTX-1931).
@@ -609,9 +781,11 @@ impl Runtime {
     /// [`bitty_ui::presentation_mode_for_command`] names are accepted; anything
     /// else is a typed `ContentUnavailable` that touches no state. The change
     /// itself runs the single mode gate: it validates the layer, refuses a
-    /// placement-less mode (`fullscreen`/`scratchpad` →
+    /// mode nobody owns (`fullscreen` without the installed app-level zoom
+    /// owner, `scratchpad` always →
     /// [`PanelError::ContentPresentationUnsupported`]) exactly like the
-    /// token-fenced verb, stamps the leaf through
+    /// token-fenced verb, hands `fullscreen` to that owner when it is
+    /// installed, stamps the leaf through
     /// [`bitty_ui::apply_presentation_command`] (never a direct layout write),
     /// and records the mode so release can tell the layer's move from
     /// somebody else's. With no layer presented the call is a typed
@@ -624,7 +798,9 @@ impl Runtime {
     /// panel is mounted at `view`, the host is borrowed, or `command` is not a
     /// presentation command name; [`PanelError::ContentNotPresented`] when the
     /// panel presents no layer; [`PanelError::ContentPresentationUnsupported`]
-    /// for a command whose mode has no in-tree placement. Every refusal
+    /// for a command whose mode nobody on this runtime can honor — the
+    /// fullscreen command without an installed app-level zoom owner, the
+    /// scratchpad command always. Every refusal
     /// leaves the leaf, the record, the focus, and the PTY exactly as they
     /// were.
     pub fn apply_panel_content_mode_command(
@@ -926,22 +1102,81 @@ impl Runtime {
     /// [`Runtime::restore_released_panel_presentation`] because the plugin
     /// runtime owns no layout.
     ///
+    /// A layer that went **fullscreen** (bitty#2388, CTX-1936) has no leaf
+    /// stamp to give back — the app-level zoom owns the change — so its arm
+    /// runs first: the installed owner restores the zoom (the disengage puts
+    /// the live tree back, which puts the leaf at exactly the mode the layer
+    /// displaced when it went fullscreen), and only a leaf that then still
+    /// reads that displaced mode is the layer's own to return to
+    /// `prior_presentation`. The comparison value is the record's
+    /// `pre_fullscreen_presentation` — the mode the layer last requested
+    /// **before** its first fullscreen, never the live leaf's mode at engage
+    /// time and never the proxy's `Fullscreen` stamp a re-entry would read
+    /// back — so the two ordinary guards keep their meaning:
+    ///
+    /// - a layer that never moved the leaf before fullscreening restores
+    ///   nothing (`pre_fullscreen == prior`): the disengage already put the
+    ///   leaf at the mode it displaced;
+    /// - a leaf that reads anything else was moved by somebody else (out of
+    ///   band, after the user gave the zoom back), and that intent outranks
+    ///   the layer's.
+    ///
+    /// Returns whether the panel's presentation moved — the mode give-back
+    /// stamped, or the fullscreen zoom it rode came back — so the
+    /// generation-edge drain can arm its full repaint for a zoom give-back
+    /// whose leaf mode did not change (a tiled-leaf fullscreen).
+    ///
     /// The stamp cannot refuse for a supported mode on a live leaf; a layer
     /// whose leaf left the layout (closed, discarded, moved to another store)
     /// has no mode to return to and release must not fail over presentation
     /// after the content is already back.
-    fn restore_panel_presentation(&mut self, restored: &RestoredPanelContent) {
+    fn restore_panel_presentation(&mut self, restored: &RestoredPanelContent) -> bool {
+        if restored.presentation == PresentationMode::Fullscreen {
+            // The zoom give-back first: the mode decides the content rect the
+            // restore resize measures, so the panel must already be back in
+            // its own tree when the rect is read — the same ordering the
+            // ordinary path keeps against the geometry half.
+            let mut moved = false;
+            if let Some(owner) = self.fullscreen_owner.clone() {
+                moved = owner.restore(self, restored.view);
+            }
+            // Fail closed on a record the gate could not have produced: no
+            // displaced mode to compare against, nothing to stamp.
+            let Some(pre_fullscreen) = restored.pre_fullscreen_presentation else {
+                return moved;
+            };
+            if pre_fullscreen == restored.prior_presentation {
+                // Guard 1 — the layer never moved the leaf before it went
+                // fullscreen: the disengage already left the leaf at the
+                // mode it displaced, so not one stamp reaches the transition
+                // gate (the ordinary never-moved guard's fullscreen twin).
+                return moved;
+            }
+            if self.view_presentation(restored.view) != Some(pre_fullscreen) {
+                // Guard 2 — the leaf no longer reads the mode the zoom
+                // give-back returns, so somebody else moved it after the
+                // zoom left. That intent outranks the layer's.
+                return moved;
+            }
+            let _ = bitty_ui::apply_presentation_command(
+                &mut self.layout,
+                bitty_ui::presentation_command_for_mode(restored.prior_presentation),
+                restored.view,
+            );
+            return true;
+        }
         if restored.presentation == restored.prior_presentation {
-            return;
+            return false;
         }
         if self.view_presentation(restored.view) != Some(restored.presentation) {
-            return;
+            return false;
         }
         let _ = bitty_ui::apply_presentation_command(
             &mut self.layout,
             bitty_ui::presentation_command_for_mode(restored.prior_presentation),
             restored.view,
         );
+        true
     }
 
     /// Applies the release-side geometry contract: one resize when the
@@ -999,25 +1234,31 @@ impl Runtime {
         self.presented_leaf_frames.remove(&restored.view);
         self.pending_full_redraw = true;
     }
-}
 
-/// Modes a presented panel can actually take on this tree (bitty#2388,
-/// CTX-1902).
-///
-/// `Tiled` and `Floating` are the two placements the present loop can give an
-/// in-tree leaf today: `Tiled` fills the solver slot, and `Floating` re-places
-/// the leaf at the configured float frame with the elevated `Float` tier
-/// (`PresentationMode::overlay_tier`, `float_frame`). Both are real placements,
-/// so both are answerable.
-///
-/// The other two are refused rather than accepted and ignored, because a mode
-/// that stamps and then paints exactly like the mode it replaced is a lie about
-/// layout. `Fullscreen` is the app-level zoom (`zoom_backup` backup/restore in
-/// the host application), not a leaf stamp: stamping it changes no frame. And
-/// `Scratchpad` is the scratchpad store's hide/slot behavior plus the float
-/// frame, so a bare stamp would produce a float that never hides — also not
-/// what the caller asked for. Both stay refusals until the mechanism that can
-/// honor them owns the mode change.
-fn presented_panel_mode_supported(mode: PresentationMode) -> bool {
-    matches!(mode, PresentationMode::Tiled | PresentationMode::Floating)
+    /// Modes a presented panel can actually take on this tree (bitty#2388,
+    /// CTX-1902; the fullscreen half is CTX-1936).
+    ///
+    /// `Tiled` and `Floating` are the two placements the present loop can give an
+    /// in-tree leaf today: `Tiled` fills the solver slot, and `Floating` re-places
+    /// the leaf at the configured float frame with the elevated `Float` tier
+    /// (`PresentationMode::overlay_tier`, `float_frame`). Both are real placements,
+    /// so both are answerable.
+    ///
+    /// `Fullscreen` is answerable exactly when the app-level zoom owner is
+    /// installed (CTX-1936): the mode rides the owner's backup/proxy capture
+    /// instead of a leaf stamp, so a runtime with no owner answers the same typed
+    /// refusal it always did, and the composition root that wires one makes it
+    /// the real thing.
+    ///
+    /// `Scratchpad` stays refused: it is the scratchpad store's hide/slot
+    /// behavior plus the float frame, so a bare stamp would produce a float that
+    /// never hides — not what the caller asked for. It stays a refusal until the
+    /// mechanism that can honor it owns the mode change.
+    fn presented_panel_mode_supported(&self, mode: PresentationMode) -> bool {
+        match mode {
+            PresentationMode::Tiled | PresentationMode::Floating => true,
+            PresentationMode::Fullscreen => self.fullscreen_owner.is_some(),
+            PresentationMode::Scratchpad => false,
+        }
+    }
 }

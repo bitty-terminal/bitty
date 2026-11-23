@@ -795,6 +795,20 @@ pub struct Runtime {
     /// plugin services (`bitty.ui.mount`/`ui.update` attach through it), so
     /// this is the one scene store, never a second one (CTX-1641).
     scene_host: Option<std::rc::Rc<std::cell::RefCell<crate::registry::PanelRuntime>>>,
+    /// Installed app-level zoom owner for a presented layer's `Fullscreen`
+    /// mode (bitty#2388, CTX-1936).
+    ///
+    /// The composition root installs the host application's zoom owner — the
+    /// one state the `toggle_zoom` gesture drives — when it wires the panel
+    /// surface, so a presented layer's `Fullscreen` rides the real
+    /// backup/proxy capture instead of a bare leaf stamp that paints exactly
+    /// like the mode it replaced. `None` (every headless runtime, `--safe`,
+    /// plugin-less runs) keeps the mode failing closed with the typed
+    /// [`PanelError::ContentPresentationUnsupported`](crate::registry::PanelError::ContentPresentationUnsupported),
+    /// the refusal that predates this seam. The owner holds only its own zoom
+    /// state: every call receives the `&mut Runtime` the mode gate already
+    /// owns, so no second runtime handle exists.
+    fullscreen_owner: Option<std::rc::Rc<dyn self::panel_content::PanelFullscreenOwner>>,
     /// Per-window tab projection host (CTX-1836, bitty#3169).
     ///
     /// Holds the Core tab verbs' only host state: the installed
@@ -2484,6 +2498,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            fullscreen_owner: None,
             tabs: self::tabs::TabHost::default(),
             last_workspace_panel_disposal: None,
             presented_scene_revision: 0,
@@ -2836,6 +2851,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            fullscreen_owner: None,
             tabs: self::tabs::TabHost::default(),
             last_workspace_panel_disposal: None,
             presented_scene_revision: 0,

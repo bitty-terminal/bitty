@@ -80,8 +80,13 @@ pub(crate) struct ChromeState {
     /// Releases and focus transitions clear entries (same staleness bound as
     /// the CTX-0187 mirror clear); bounded by simultaneously held keys.
     pub(crate) held: HashSet<bitty_config::KeyName>,
-    /// Pane zoom state (CTX-0481, #762).
-    pub(crate) zoom: ZoomState,
+    /// Pane zoom state (CTX-0481, #762; per-workspace CTX-0538).
+    ///
+    /// Shared by handle so the app-level zoom owner the runtime's fullscreen
+    /// mode gate calls (bitty#2388, CTX-1936) drives the one table the
+    /// `toggle_zoom` gesture drives: a layer's `Fullscreen` engage/restore and
+    /// the user's zoom stay one state, never two tables that drift.
+    pub(crate) zoom: std::rc::Rc<std::cell::RefCell<ZoomState>>,
     /// Effective Leader binding (CTX-0715 / OQ-088, consumed CTX-0723 #981):
     /// every chord that arms the hint session plus the armed-window budget.
     /// Resolved from the effective config at startup; tests keep the
@@ -126,7 +131,7 @@ impl ChromeState {
             keymaps,
             app_mods: AppModifiers::default(),
             held: HashSet::new(),
-            zoom: ZoomState::new(),
+            zoom: std::rc::Rc::new(std::cell::RefCell::new(ZoomState::new())),
             leader: bitty_config::resolve_leader(None, None, bitty_config::LeaderPlatform::host())
                 .unwrap_or(bitty_config::ResolvedLeader {
                     // Fail-closed: internal defaults are `const` chord
@@ -353,19 +358,54 @@ impl ZoomState {
     /// Restore the zoom backup containing `view`, whether its workspace is
     /// active or stashed. Inactive workspaces cannot use `disengage` directly
     /// because the runtime's live layout belongs to another slot.
+    ///
+    /// Selection is by **backup membership**: the callers are layout
+    /// mutations that are about to move the view itself, so any entry whose
+    /// real tree holds that view is theirs to give back. A presented layer's
+    /// fullscreen give-back must not use this selection — see
+    /// [`Self::restore_for_target`].
     pub(crate) fn restore_for_view_mutation(
         &mut self,
         runtime: &mut Runtime,
         view: ViewId,
     ) -> bool {
+        self.restore_where(runtime, |entry| match entry {
+            ZoomEntry::Tree { backup, .. } => backup.leaf_ids().contains(&view),
+            ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
+        })
+    }
+
+    /// Restore the zoom entry whose **target** is `view` — the leaf that entry
+    /// currently shows full-bleed — whether its workspace is active or
+    /// stashed, and leave every other entry untouched.
+    ///
+    /// This is the presented layer's fullscreen give-back (bitty#2388,
+    /// CTX-1936): a `Fullscreen` layer engaged a zoom of its own leaf, so only
+    /// that entry is its to give back. Selecting by backup membership is wrong
+    /// here — after the user unzooms A and zooms B in the same workspace, B's
+    /// backup still contains A, and releasing A's layer would restore B's
+    /// backup and drop B's zoom. No entry targeting `view` means nothing was
+    /// held for it: the call answers `false` and the sibling zoom stays.
+    pub(crate) fn restore_for_target(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
+        self.restore_where(runtime, |entry| match entry {
+            ZoomEntry::Tree { proxy, .. } => proxy.leaf_ids().first() == Some(&view),
+            ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
+        })
+    }
+
+    /// Shared body of the view-selected restores: picks the entry `matches`
+    /// accepts, refuses a stale proxy instead of dropping the backup, and
+    /// puts the real tree back on the owning workspace (live or stashed).
+    fn restore_where(
+        &mut self,
+        runtime: &mut Runtime,
+        matches: impl Fn(&ZoomEntry) -> bool,
+    ) -> bool {
         self.prune(runtime);
         let Some(seq) = self
             .entries
             .iter()
-            .find(|(_, entry)| match entry {
-                ZoomEntry::Tree { backup, .. } => backup.leaf_ids().contains(&view),
-                ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
-            })
+            .find(|(_, entry)| matches(entry))
             .map(|(seq, _)| *seq)
         else {
             return false;
@@ -413,6 +453,42 @@ impl ZoomState {
     pub(crate) fn prune(&mut self, runtime: &Runtime) {
         self.entries
             .retain(|seq, _| runtime.workspace_index_by_seq(*seq).is_some());
+    }
+}
+
+/// The app-level zoom owner behind a presented layer's `Fullscreen` mode
+/// (bitty#2388, CTX-1936): the same [`ZoomState`] the `toggle_zoom` gesture
+/// drives, shared by handle, so a layer's fullscreen and the user's zoom are
+/// one state.
+///
+/// The runtime's mode gate calls this through
+/// [`bitty_runtime::PanelFullscreenOwner`] and passes the `&mut Runtime` it
+/// already owns, so this struct holds only the zoom table — never a second
+/// runtime handle. Engage is the zoom's own capture-and-proxy step; restore
+/// is [`ZoomState::restore_for_target`] — the entry whose target is the layer's
+/// own leaf — never the active-workspace disengage (a stashed workspace's
+/// fullscreen layer still owes its give-back) and never the membership-based
+/// [`ZoomState::restore_for_view_mutation`] (a sibling zoom's backup contains
+/// the layer's leaf and must survive the release).
+pub(crate) struct AppFullscreenOwner {
+    /// The app's zoom table, shared with [`ChromeState::zoom`].
+    zoom: std::rc::Rc<std::cell::RefCell<ZoomState>>,
+}
+
+impl AppFullscreenOwner {
+    /// Wraps the app's zoom table handle.
+    pub(crate) fn new(zoom: std::rc::Rc<std::cell::RefCell<ZoomState>>) -> Self {
+        Self { zoom }
+    }
+}
+
+impl bitty_runtime::PanelFullscreenOwner for AppFullscreenOwner {
+    fn engage(&self, runtime: &mut Runtime, view: ViewId) -> bool {
+        self.zoom.borrow_mut().engage(runtime, view)
+    }
+
+    fn restore(&self, runtime: &mut Runtime, view: ViewId) -> bool {
+        self.zoom.borrow_mut().restore_for_target(runtime, view)
     }
 }
 
@@ -1102,6 +1178,7 @@ impl TerminalApp {
     pub(crate) fn restore_zoom(&mut self) -> bool {
         self.chrome
             .zoom
+            .borrow_mut()
             .restore_for_mutation(&mut self.runtime.borrow_mut())
     }
 
@@ -1116,6 +1193,7 @@ impl TerminalApp {
         let active = self
             .chrome
             .zoom
+            .borrow()
             .backup_leaf_count(&self.runtime.borrow())
             .unwrap_or_else(|| self.runtime.borrow().window_leaf_count());
         // Zoom backup counts layout leaves only; add live floats/pins (and
@@ -1124,6 +1202,7 @@ impl TerminalApp {
         if self
             .chrome
             .zoom
+            .borrow()
             .backup_leaf_count(&self.runtime.borrow())
             .is_some()
         {
@@ -1153,7 +1232,7 @@ impl TerminalApp {
             .runtime
             .borrow()
             .workspace_seq_at(self.runtime.borrow().active_workspace_index())
-            .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+            .and_then(|seq| self.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq))
             .unwrap_or_else(|| self.runtime.borrow().layout().leaf_ids());
         self.runtime
             .borrow()
@@ -1187,7 +1266,7 @@ impl TerminalApp {
         let Some(seq) = self.runtime.borrow().workspace_seq_at(index) else {
             return false;
         };
-        let Some(ids) = self.chrome.zoom.backup_leaf_ids_for_seq(seq) else {
+        let Some(ids) = self.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq) else {
             return false;
         };
         ids.iter().any(|id| {
@@ -1406,7 +1485,13 @@ impl TerminalApp {
         // Empty slot: the legacy command parks the focused tiled leaf. Do not
         // consume a single-leaf zoom backup behind a refusal (CodeRabbit PR
         // #1903 discipline).
-        if self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1) {
+        if self
+            .chrome
+            .zoom
+            .borrow()
+            .backup_leaf_count(&self.runtime.borrow())
+            != Some(1)
+        {
             self.restore_zoom();
         }
         let focused = self.runtime.borrow().focused_view();
@@ -2359,6 +2444,7 @@ impl TerminalApp {
                 let close_last_tiled_panel = self
                     .chrome
                     .zoom
+                    .borrow()
                     .backup_leaf_count(&self.runtime.borrow())
                     .map_or(self.runtime.borrow().leaf_count() <= 1, |count| count == 1);
                 // CTX-1337 (#2222): a pinned panel is window-global and
@@ -2374,7 +2460,7 @@ impl TerminalApp {
                     self.runtime
                         .borrow()
                         .workspace_seq_at(self.runtime.borrow().active_workspace_index())
-                        .and_then(|seq| self.chrome.zoom.backup_leaf_ids_for_seq(seq))
+                        .and_then(|seq| self.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq))
                         .unwrap_or_default()
                 } else {
                     Vec::new()
@@ -2945,9 +3031,14 @@ impl TerminalApp {
                 // CTX-0538: zoom is scoped to the active workspace, so a
                 // toggle here engages/disengages only this workspace's
                 // entry (closes/restores prune the dead keys).
-                self.chrome.zoom.prune(&self.runtime.borrow());
-                if self.chrome.zoom.is_zoomed(&self.runtime.borrow()) {
-                    if self.chrome.zoom.disengage(&mut self.runtime.borrow_mut()) {
+                self.chrome.zoom.borrow_mut().prune(&self.runtime.borrow());
+                if self.chrome.zoom.borrow().is_zoomed(&self.runtime.borrow()) {
+                    if self
+                        .chrome
+                        .zoom
+                        .borrow_mut()
+                        .disengage(&mut self.runtime.borrow_mut())
+                    {
                         eprintln!(
                             "bitty: keymap toggle_zoom off -> leafs={} focused={:?}",
                             self.runtime.borrow().leaf_count(),
@@ -2966,6 +3057,7 @@ impl TerminalApp {
                     if self
                         .chrome
                         .zoom
+                        .borrow_mut()
                         .engage(&mut self.runtime.borrow_mut(), focused)
                     {
                         eprintln!("bitty: keymap toggle_zoom on -> {focused:?}");
@@ -3033,7 +3125,12 @@ impl TerminalApp {
                     }
                 }
                 if !detaching
-                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
+                    || self
+                        .chrome
+                        .zoom
+                        .borrow()
+                        .backup_leaf_count(&self.runtime.borrow())
+                        != Some(1)
                 {
                     self.restore_zoom();
                 }
@@ -3053,15 +3150,24 @@ impl TerminalApp {
             }
             A::TogglePanelMode => {
                 // bitty#2388 residue 3 (CTX-1931): toggle the FOCUSED panel's
-                // presented content-layer mode between tiled and floating through
-                // the `bitty.workspace:presentation-{tiled,floating}` command
-                // names (`Runtime::apply_panel_content_mode_command` — the same
+                // presented content-layer mode through the
+                // `bitty.workspace:presentation-*` command names
+                // (`Runtime::apply_panel_content_mode_command` — the same
                 // single transition gate the `ctl panel mode` verb runs, so the
                 // keybind can never diverge from the verb). Context-gated on
                 // `content_layer_presented`: a focused leaf with no layer answers a
                 // typed refusal and the tree never moves — this gesture never
                 // falls through into the ordinary `toggle_floating` detach, which
                 // is a different action on a different chord.
+                //
+                // CTX-1936: with the app-level zoom owner installed the cycle
+                // gains the layer's `Fullscreen` — Tiled -> Floating ->
+                // Fullscreen -> Tiled — because the gate can honor it through
+                // the real zoom. Without the owner the shipped two-mode cycle
+                // stands unchanged (a cycle that offered `Fullscreen` would
+                // only ever answer the typed refusal), and a leaf stamped
+                // `Fullscreen` out of band warns like every other mode the
+                // gesture cannot own.
                 let scrutinee = self.runtime.borrow().focused_view();
                 let focused = match scrutinee {
                     Some(id) => id,
@@ -3087,12 +3193,15 @@ impl TerminalApp {
                         return false;
                     }
                 };
-                let target = match current {
-                    PresentationMode::Tiled => PresentationMode::Floating,
-                    PresentationMode::Floating => PresentationMode::Tiled,
-                    other => {
+                let owner_installed = self.runtime.borrow().panel_fullscreen_owner_installed();
+                let target = match (current, owner_installed) {
+                    (PresentationMode::Tiled, _) => PresentationMode::Floating,
+                    (PresentationMode::Floating, true) => PresentationMode::Fullscreen,
+                    (PresentationMode::Floating, false) => PresentationMode::Tiled,
+                    (PresentationMode::Fullscreen, true) => PresentationMode::Tiled,
+                    (other, _) => {
                         eprintln!(
-                            "warning: keymap toggle_panel_mode needs a tiled or floating layer, found {other:?} — ignoring"
+                            "warning: keymap toggle_panel_mode needs a tiled or floating layer (or an owned fullscreen one), found {other:?} — ignoring"
                         );
                         return false;
                     }
@@ -3173,7 +3282,12 @@ impl TerminalApp {
                 }
                 if !pinning
                     || from_float_store
-                    || self.chrome.zoom.backup_leaf_count(&self.runtime.borrow()) != Some(1)
+                    || self
+                        .chrome
+                        .zoom
+                        .borrow()
+                        .backup_leaf_count(&self.runtime.borrow())
+                        != Some(1)
                 {
                     self.restore_zoom();
                 }
@@ -4957,13 +5071,13 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(app.runtime.borrow().leaf_count(), 1, "zoom proxy installed");
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Down));
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "focus movement restores the real tree"
         );
         assert_eq!(app.runtime.borrow().leaf_count(), 3);
@@ -5535,7 +5649,10 @@ mod tests {
             "zoom installs one proxy leaf"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(2)
         );
         assert_eq!(app.runtime.borrow().pane_view_ids(), vec![second, survivor]);
@@ -5544,7 +5661,7 @@ mod tests {
         assert!(!app.apply_chrome_action(ChromeAction::CloseView));
 
         assert_eq!(app.runtime.borrow().workspace_count(), 2);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert!(!app.runtime.borrow().has_pending_close_confirm());
         assert_eq!(app.runtime.borrow().leaf_count(), 1);
         assert!(app.runtime.borrow().has_pane_session(&second));
@@ -5595,7 +5712,7 @@ mod tests {
             .expect("survivor leaf focus");
         assert!(app.runtime.borrow_mut().workspace_switch(0));
         assert_eq!(app.runtime.borrow().focused_view(), Some(primary));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
 
         // The first CloseView must inspect the doomed workspace's primary
         // shell, even though the focused leaf has no private pane session.
@@ -5673,7 +5790,10 @@ mod tests {
             "zoom installs one proxy leaf"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1)
         );
 
@@ -5697,12 +5817,12 @@ mod tests {
         );
         assert_eq!(app.runtime.borrow().workspace_count(), 2);
         assert_eq!(app.runtime.borrow().primary_view(), Some(first));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
 
         // Cancellation leaves the proxy and the backup session alive.
         assert!(drive_chrome(&mut app, esc_press()));
         assert!(!app.runtime.borrow().has_pending_close_confirm());
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(app.runtime.borrow().primary_view(), Some(first));
 
         // Re-arm the same target, then the repeated close confirms the prune.
@@ -5769,7 +5889,7 @@ mod tests {
         // Zoom pane 1: collapses to 1 leaf.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(app.runtime.borrow().leaf_count(), 1);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
 
         // Navigating with GotoSplit restores zoom immediately and moves focus.
         app.apply_chrome_action(ChromeAction::GotoSplit(SplitDir::Right));
@@ -5778,7 +5898,7 @@ mod tests {
             2,
             "must unzoom on navigation"
         );
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime.borrow().focused_view(),
             Some(ViewId::new(2)),
@@ -5938,6 +6058,7 @@ mod tests {
         assert!(
             !app.chrome
                 .zoom
+                .borrow_mut()
                 .restore_for_mutation(&mut app.runtime.borrow_mut())
         );
         assert_eq!(
@@ -5953,6 +6074,7 @@ mod tests {
         assert!(
             app.chrome
                 .zoom
+                .borrow_mut()
                 .restore_for_mutation(&mut app.runtime.borrow_mut())
         );
         assert_eq!(
@@ -5976,7 +6098,7 @@ mod tests {
             .expect("workspace sequence");
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(
-            app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+            app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
             Some(vec![ViewId::new(1), ViewId::new(2)])
         );
         assert!(app.runtime.borrow_mut().workspace_switch(1));
@@ -5991,10 +6113,11 @@ mod tests {
         assert!(
             !app.chrome
                 .zoom
+                .borrow_mut()
                 .restore_for_view_mutation(&mut app.runtime.borrow_mut(), ViewId::new(1))
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_ids_for_seq(seq),
+            app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
             Some(vec![ViewId::new(1), ViewId::new(2)]),
             "stale proxy must not discard the useful backup"
         );
@@ -6031,6 +6154,7 @@ mod tests {
         assert!(
             app.chrome
                 .zoom
+                .borrow_mut()
                 .restore_for_mutation(&mut app.runtime.borrow_mut())
         );
         assert_eq!(
@@ -6612,12 +6736,17 @@ mod tests {
 
     #[test]
     fn chrome_panel_mode_toggle_flips_the_presented_layer_and_is_a_typed_no_op_without_one() {
-        // bitty#2388 residue 3 (CTX-1931): the keybind gesture is
-        // context-gated on the focused leaf presenting a content layer. With
-        // one, the toggle routes the opposite mode's PRESENTATION_CMD_*
-        // command name through the runtime's string dispatch — the same
-        // single transition gate the ctl verb runs; without one, the action
-        // answers a typed refusal and the tree never moves.
+        // bitty#2388 residue 3 (CTX-1931; the fullscreen hop is CTX-1936): the
+        // keybind gesture is context-gated on the focused leaf presenting a
+        // content layer. With one, the toggle routes the next mode's
+        // PRESENTATION_CMD_* command name through the runtime's string
+        // dispatch — the same single transition gate the ctl verb runs.
+        // The composition-root fixture installs the app-level zoom owner
+        // (with_panel_scene_host), so the cycle is the shipped three-mode
+        // one — Tiled -> Floating -> Fullscreen -> Tiled — and the
+        // fullscreen hop engages and releases the app's real zoom. Without
+        // a layer, the action answers a typed refusal and the tree never
+        // moves.
         use bitty_config::ChromeAction;
         let view = ViewId::new(1);
         let (mut app, _panel) = panel_close_app(LayoutNode::leaf(View::new(view, 80, 24)), view);
@@ -6660,11 +6789,47 @@ mod tests {
             "and the layer's record carries the move"
         );
 
-        // Toggling back returns it to its own slot.
+        // CTX-1936: the next press fullscreens the layer through the app's
+        // own zoom — the engage the toggle_zoom gesture uses, so the zoom
+        // state is live and the tree is the single-leaf proxy.
         app.apply_chrome_action(ChromeAction::TogglePanelMode);
         assert_eq!(
             app.runtime.borrow().view_presentation(view),
-            Some(PresentationMode::Tiled)
+            Some(PresentationMode::Fullscreen),
+            "the toggle fullscreens the focused presented layer"
+        );
+        assert_eq!(
+            app.runtime
+                .borrow()
+                .panel_content_layer(view)
+                .map(|layer| layer.presentation),
+            Some(PresentationMode::Fullscreen),
+            "the record carries the fullscreen mode"
+        );
+        assert_eq!(
+            app.runtime
+                .borrow()
+                .panel_content_layer(view)
+                .map(|layer| layer.pre_fullscreen_presentation),
+            Some(Some(PresentationMode::Floating)),
+            "and the leaf mode the fullscreen displaced"
+        );
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the fullscreen hop engaged the app-level zoom"
+        );
+
+        // The cycle closes: fullscreen returns the panel to its own slot and
+        // gives the zoom back.
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the cycle returns the panel to its own slot"
+        );
+        assert!(
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the zoom left with the mode"
         );
 
         // Released: the gesture is a typed no-op again.
@@ -6678,6 +6843,65 @@ mod tests {
             app.runtime.borrow().view_presentation(view),
             before,
             "no layer, no mutation — the released panel keeps the mode release gave back"
+        );
+    }
+
+    /// bitty#2388, CTX-1936: without an installed app-level zoom owner (the
+    /// `--safe`/plugin-less posture) the `ctrl+alt+a` cycle keeps the shipped
+    /// two-mode vocabulary — a cycle that offered `Fullscreen` would only
+    /// ever answer the typed refusal — and the direct request fails closed
+    /// through the same gate.
+    #[test]
+    fn chrome_panel_mode_toggle_keeps_the_two_mode_cycle_without_a_zoom_owner() {
+        use bitty_config::ChromeAction;
+        use bitty_runtime::registry::PanelError;
+        let view = ViewId::new(1);
+        let (mut app, _panel) =
+            panel_close_app_unowned(LayoutNode::leaf(View::new(view, 80, 24)), view);
+        assert!(!app.runtime.borrow().panel_fullscreen_owner_installed());
+
+        let presented = app
+            .runtime
+            .borrow_mut()
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the unowned posture can still present a layer");
+        assert_eq!(presented.presentation, PresentationMode::Tiled);
+
+        // The cycle stays Tiled -> Floating -> Tiled, byte-identical to the
+        // gesture before fullscreen was answerable anywhere.
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Floating)
+        );
+        app.apply_chrome_action(ChromeAction::TogglePanelMode);
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the unowned cycle never offers fullscreen"
+        );
+        assert!(
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "no zoom was ever engaged"
+        );
+
+        // The direct request answers the typed refusal the gate has always
+        // answered, and nothing moves.
+        match app.runtime.borrow_mut().set_panel_content_presentation(
+            view,
+            presented.token,
+            PresentationMode::Fullscreen,
+        ) {
+            Err(PanelError::ContentPresentationUnsupported { view_id, mode }) => {
+                assert_eq!(view_id, view);
+                assert_eq!(mode, "fullscreen");
+            }
+            other => panic!("unowned fullscreen must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the refused request moved nothing"
         );
     }
 
@@ -6835,7 +7059,7 @@ mod tests {
             app.runtime.borrow_mut().set_layout(seeded);
             app.apply_chrome_action(ChromeAction::ToggleZoom);
             assert!(
-                app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+                app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
                 "zoom engaged"
             );
             let before = format!("{:?}", app.runtime.borrow().layout());
@@ -6846,7 +7070,7 @@ mod tests {
                 "rejected toggle on zoomed {mode} must not touch the layout"
             );
             assert!(
-                app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+                app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
                 "rejected toggle on zoomed {mode} must keep the zoom backup"
             );
             assert_eq!(
@@ -6864,12 +7088,12 @@ mod tests {
         let focused = app.runtime.borrow().focused_view().expect("seed focus");
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         app.apply_chrome_action(ChromeAction::ToggleFloating);
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "valid toggle consumes the zoom restore"
         );
         assert_eq!(
@@ -7056,11 +7280,14 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
@@ -7071,11 +7298,14 @@ mod tests {
             "refused pin parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
@@ -7101,11 +7331,14 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
@@ -7116,11 +7349,14 @@ mod tests {
             "refused detach parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
@@ -7143,17 +7379,20 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backed-up tree holds both leaves"
         );
         app.apply_chrome_action(ChromeAction::TogglePinned);
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "valid pin consumes the zoom restore"
         );
         assert_eq!(app.runtime.borrow().pinned_views(), vec![ViewId::new(1)]);
@@ -7312,11 +7551,14 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "backed-up tree holds the sole leaf"
         );
@@ -7329,11 +7571,14 @@ mod tests {
             "refused hide parks nothing"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "refusal keeps the zoom backup"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1),
             "refusal keeps the backed-up leaf count"
         );
@@ -7422,11 +7667,14 @@ mod tests {
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(1)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "zoom engaged"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backed-up tree holds both leaves"
         );
@@ -7434,7 +7682,7 @@ mod tests {
             bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "valid hide consumes the zoom restore"
         );
         assert!(app.runtime.borrow().scratchpad_occupied());
@@ -8307,7 +8555,10 @@ mod tests {
             "proxy alone reads empty at runtime level"
         );
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "backup still holds the real tree"
         );
@@ -8326,7 +8577,10 @@ mod tests {
         app.apply_chrome_action(ChromeAction::WorkspaceNextOccupied);
         assert_eq!(app.runtime.borrow().active_workspace_index(), 0);
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(2),
             "cycle must not consume the zoom backup"
         );
@@ -9339,14 +9593,14 @@ claims = []
         // collapses to the single-leaf proxy, paste still pending, no bytes.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(app.runtime.borrow().leaf_count(), 1);
         assert!(app.runtime.borrow().has_pending_paste());
         assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
         assert!(!drive_chrome(&mut app, char_release("f")));
         // Second Alt+F disengages: real tree restored, paste still pending.
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(app.runtime.borrow().leaf_count(), 2);
         assert!(app.runtime.borrow().has_pending_paste());
         assert!(app.runtime.borrow_mut().drain_pending_input().is_empty());
@@ -12642,7 +12896,7 @@ claims = []
         // `intercept_chrome_key` resolves from a physical key event.
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let full = app
             .runtime
             .borrow()
@@ -12667,7 +12921,7 @@ claims = []
 
         // Second Mod+F restores the pre-fullscreen tiled state exactly.
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             (
                 app.runtime.borrow().state().width(),
@@ -12705,7 +12959,7 @@ claims = []
 
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime
                 .borrow()
@@ -12723,7 +12977,7 @@ claims = []
         assert!(!drive_chrome(&mut app, char_release("f")));
 
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime
                 .borrow()
@@ -12775,7 +13029,7 @@ claims = []
 
         assert!(!drive_chrome(&mut app, alt_mods_event()));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let full = app
             .runtime
             .borrow()
@@ -12806,7 +13060,7 @@ claims = []
         // Second Mod+F restores the tiled pane geometry.
         assert!(!drive_chrome(&mut app, char_release("f")));
         assert!(drive_chrome(&mut app, char_press("f", "f", false)));
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         assert_eq!(
             app.runtime.borrow().pane_pty_size(&pane),
             Some((tiled.cols, tiled.rows)),
@@ -12973,10 +13227,10 @@ claims = []
         // the real tree, not the zoom proxy.
         assert!(app.runtime.borrow_mut().set_focus(ViewId::new(2)));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         app.apply_chrome_action(toggle.clone());
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "hiding the shown scratchpad must restore zoom first"
         );
         assert!(app.runtime.borrow().scratchpad_occupied());
@@ -13371,7 +13625,7 @@ claims = []
 
         // First ToggleZoom expands the PresentationMode::Floating panel to full workspace.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let zoomed = app
             .runtime
             .borrow()
@@ -13387,7 +13641,7 @@ claims = []
 
         // Second ToggleZoom restores PresentationMode::Floating.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let restored = app
             .runtime
             .borrow()
@@ -13404,11 +13658,42 @@ claims = []
     /// App with one `Terminal` panel mounted on `view`, laid out and focused,
     /// and no content layer yet.
     ///
-    /// Mirrors the composition root: the shared host is installed on the runtime
-    /// and the panel is attributed to the workspace the app is on, so
-    /// `present_panel_content` and the close paths see the placement the shipped
-    /// process sees instead of a test-only one.
+    /// Mirrors the composition root: the shared host is installed through the
+    /// app builder (`with_panel_scene_host`), which is also where the
+    /// app-level zoom owner lands (bitty#2388, CTX-1936), so the panel-content
+    /// rows see the posture the shipped process has — including the layer's
+    /// answerable `Fullscreen`.
     fn panel_close_app(layout: LayoutNode, view: ViewId) -> (TerminalApp, PanelId) {
+        use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
+
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut runtime = Runtime::with_defaults().expect("must build");
+        runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+        runtime.set_layout(layout);
+        let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+        let handle = host
+            .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+            .expect("terminal panel");
+        host.mount_panel(handle.id, handle.generation, view)
+            .expect("the panel mounts at the leaf");
+        assert!(runtime.set_focus(view), "the fixture focus must be live");
+        let app = TerminalApp::with_theme(
+            runtime,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        )
+        .with_panel_scene_host(Some(std::rc::Rc::new(std::cell::RefCell::new(host))));
+        (app, handle.id)
+    }
+
+    /// The fail-closed twin of [`panel_close_app`]: the same panel host, but
+    /// installed straight onto the runtime without the app builder, so no
+    /// app-level zoom owner exists — the `--safe`/plugin-less posture whose
+    /// `Fullscreen` answers the typed refusal (bitty#2388, CTX-1936).
+    fn panel_close_app_unowned(layout: LayoutNode, view: ViewId) -> (TerminalApp, PanelId) {
         use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
 
         let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
@@ -13430,6 +13715,10 @@ claims = []
             "default",
             maps,
             SpawnSpec::default(),
+        );
+        assert!(
+            !app.runtime.borrow().panel_fullscreen_owner_installed(),
+            "the unowned fixture must stay unowned"
         );
         (app, handle.id)
     }
@@ -13591,6 +13880,87 @@ claims = []
         assert!(
             app.runtime.borrow().pane_pid(&view).is_none(),
             "closing the panel tears down its shell"
+        );
+    }
+
+    /// bitty#2388, CTX-1936: the first close press on a panel whose layer went
+    /// **fullscreen** pops the layer first and restores BOTH halves the
+    /// fullscreen took — the app-level zoom and the panel's own mode — before
+    /// the close decides anything about the leaf. The close path's own
+    /// `restore_zoom` never runs for the release seam, so the zoom give-back
+    /// has to come from the release itself; this row fails without the
+    /// fullscreen arm of the release.
+    #[test]
+    #[cfg(unix)]
+    fn close_view_pops_a_fullscreen_layer_and_restores_the_zoom_and_mode() {
+        require_pty!();
+        use bitty_config::ChromeAction;
+        use bitty_runtime::registry::ViewContent;
+
+        let view = ViewId::new(2);
+        let (mut app, _panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+                LayoutNode::leaf(View::new(view, 40, 24)),
+            ),
+            view,
+        );
+        app.runtime
+            .borrow_mut()
+            .spawn_shell_for_view(view, "/bin/sh", &[], 40, 24)
+            .expect("the panel leaf owns a shell");
+        app.runtime.borrow_mut().tick().expect("the pane frame");
+
+        let presented = app
+            .runtime
+            .borrow_mut()
+            .present_panel_content(view, content_layer("dashboard"))
+            .expect("the panel presents a layer over its own terminal");
+        app.runtime
+            .borrow_mut()
+            .set_panel_content_presentation(view, presented.token, PresentationMode::Fullscreen)
+            .expect("the layer fullscreens through the app zoom owner");
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the layer's fullscreen engaged the app-level zoom"
+        );
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Fullscreen)
+        );
+
+        // First press: the layer is popped first, and the pop restores the
+        // zoom and the mode in the same step — the panel is back in its own
+        // slot with its displaced terminal, and nothing is closed.
+        assert!(
+            !app.apply_chrome_action(ChromeAction::CloseView),
+            "releasing the layer is not a close"
+        );
+        assert!(
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the close press gave the app-level zoom back"
+        );
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "and the panel is back in the mode the layer displaced"
+        );
+        assert_eq!(
+            app.runtime.borrow().panel_content_kind(view),
+            Some(ViewContent::Terminal(view.0)),
+            "the container is terminal-backed again"
+        );
+        assert_eq!(app.runtime.borrow().leaf_count(), 2, "the leaf stays open");
+
+        // Second press: nothing left to restore, so it is the close it always
+        // was.
+        assert!(!app.apply_chrome_action(ChromeAction::CloseView));
+        assert_eq!(
+            app.runtime.borrow().leaf_count(),
+            1,
+            "the second press closes"
         );
     }
 
@@ -13906,7 +14276,7 @@ claims = []
 
         // First ToggleZoom fills the container.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let zoomed = app
             .runtime
             .borrow()
@@ -13918,7 +14288,7 @@ claims = []
 
         // Second ToggleZoom restores the detached float geometry.
         app.apply_chrome_action(ChromeAction::ToggleZoom);
-        assert!(!app.chrome.zoom.is_zoomed(&app.runtime.borrow()));
+        assert!(!app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()));
         let restored = app
             .runtime
             .borrow()
@@ -13972,7 +14342,10 @@ claims = []
         // guards) and effective_window_leaf_count must be 2 (1 tiled + 1 float).
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(1)
         );
         assert_eq!(app.effective_window_leaf_count(), 2);
@@ -13984,6 +14357,7 @@ claims = []
         assert!(
             app.chrome
                 .zoom
+                .borrow_mut()
                 .restore_for_view_mutation(&mut app.runtime.borrow_mut(), ViewId::new(1)),
             "inactive workspace detached float must unzoom cleanly"
         );
@@ -14033,9 +14407,97 @@ claims = []
         app.runtime.borrow_mut().set_focus(ViewId::new(1));
         app.apply_chrome_action(ChromeAction::ToggleZoom);
         assert_eq!(
-            app.chrome.zoom.backup_leaf_count(&app.runtime.borrow()),
+            app.chrome
+                .zoom
+                .borrow()
+                .backup_leaf_count(&app.runtime.borrow()),
             Some(0)
         );
         assert_eq!(app.effective_window_leaf_count(), 1);
+    }
+
+    /// bitty#3307 review: the fullscreen give-back selects the zoom whose
+    /// **target** is the released layer's leaf, never a sibling zoom whose
+    /// backup merely contains that leaf.
+    ///
+    /// Tiled A -> fullscreen A (zoom A) -> the user unzooms A -> the user zooms
+    /// B in the same workspace. B's backup still contains A, so a
+    /// membership-based selection would hand B's real tree back — and drop
+    /// B's zoom — when A's layer released.
+    #[test]
+    fn fullscreen_give_back_keeps_a_sibling_zoom_whose_backup_contains_the_leaf() {
+        use bitty_runtime::PanelFullscreenOwner;
+
+        let first = ViewId::new(1);
+        let second = ViewId::new(2);
+        let (app, _panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(first, 40, 24)),
+                LayoutNode::leaf(View::new(second, 40, 24)),
+            ),
+            first,
+        );
+        let owner = AppFullscreenOwner::new(std::rc::Rc::clone(&app.chrome.zoom));
+        let seq = app
+            .runtime
+            .borrow()
+            .workspace_seq_at(0)
+            .expect("workspace sequence");
+
+        // A's layer goes fullscreen: the owner engages A's zoom, then the user
+        // gives that zoom back with the plain gesture.
+        assert!(
+            owner.engage(&mut app.runtime.borrow_mut(), first),
+            "the first leaf zooms"
+        );
+        assert!(
+            app.chrome
+                .zoom
+                .borrow_mut()
+                .disengage(&mut app.runtime.borrow_mut()),
+            "the user unzooms A in the same workspace"
+        );
+
+        // The user zooms B instead: its backup is the real two-leaf tree, so
+        // membership cannot tell B's entry from A's.
+        assert!(
+            owner.engage(&mut app.runtime.borrow_mut(), second),
+            "the second leaf zooms"
+        );
+        assert_eq!(
+            app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
+            Some(vec![first, second]),
+            "B's backup contains A's leaf — membership alone cannot select"
+        );
+
+        // Releasing A's fullscreen layer has nothing of its own to give back:
+        // no entry targets A, so the sibling zoom stays engaged.
+        assert!(
+            !owner.restore(&mut app.runtime.borrow_mut(), first),
+            "no zoom targets the released leaf"
+        );
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "B's zoom must survive A's give-back"
+        );
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![second],
+            "the live proxy is still B's"
+        );
+
+        // B's own give-back still restores the real tree: A's release consumed
+        // nothing.
+        assert!(
+            owner.restore(&mut app.runtime.borrow_mut(), second),
+            "the target-selected give-back restores B's zoom"
+        );
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![first, second],
+            "the real two-leaf tree is back"
+        );
     }
 }

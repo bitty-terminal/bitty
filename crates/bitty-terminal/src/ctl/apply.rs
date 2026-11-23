@@ -843,13 +843,16 @@ pub fn apply_control(
         }
     }
     if method == super::request::METHOD_PANEL_CONTENT_MODE {
-        // bitty#2388 residue 3 (CTX-1931): the mode half of the debug pair.
-        // Core owns the gesture, so the token-free form is fenced on the
-        // layer's own token (the app thread is the only host mutator on this
-        // drain); an explicit present-receipt token keeps the release-shaped
-        // fence for a script that captured one. The change runs the runtime's
-        // single mode gate, which stamps through the command registry, records
-        // the mode, and refuses a placement-less mode typed.
+        // bitty#2388 residue 3 (CTX-1931; the fullscreen half is CTX-1936):
+        // the mode half of the debug pair. Core owns the gesture, so the
+        // token-free form is fenced on the layer's own token (the app thread
+        // is the only host mutator on this drain); an explicit present-receipt
+        // token keeps the release-shaped fence for a script that captured
+        // one. The change runs the runtime's single mode gate, which stamps
+        // through the command registry, hands `fullscreen` to the installed
+        // app-level zoom owner (refusing it typed without one), records the
+        // mode so release can tell the layer's move from somebody else's,
+        // and refuses a mode nobody owns typed.
         let (panel_id, mode_word, token) = super::request::parse_panel_content_mode_params(params)
             .map_err(|err| ("usage", "InvalidParams", err))?;
         let num = super::request::parse_panel_id(&panel_id)
@@ -1266,8 +1269,8 @@ fn panel_content_refusal(
         bitty_runtime::registry::PanelError::ContentPresentationUnsupported { mode, .. } => (
             "Conflict",
             format!(
-                "panel {panel_id} cannot take mode {mode}: no in-tree placement for a \
-                 presented layer"
+                "panel {panel_id} cannot take mode {mode}: no installed mechanism \
+                 honors it for a presented layer"
             ),
         ),
         other => ("Conflict", format!("panel {panel_id} refused: {other}")),

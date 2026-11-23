@@ -6693,11 +6693,12 @@ error("activation fails after mounting the terminal slot scene")
         assert!(
             app.chrome
                 .zoom
+                .borrow_mut()
                 .engage(&mut app.runtime.borrow_mut(), primary),
             "the primary leaf must accept the zoom proxy"
         );
         assert!(
-            app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "the fixture must be zoomed for this regression"
         );
         // Production state, exactly as the reviewer measured it: the runtime
@@ -6745,7 +6746,7 @@ error("activation fails after mounting the terminal slot scene")
             "the zoom restore must bring the real tree back and drop only the dead primary"
         );
         assert!(
-            !app.chrome.zoom.is_zoomed(&app.runtime.borrow()),
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
             "closing the zoomed primary must consume the zoom entry"
         );
         assert_eq!(
@@ -8328,6 +8329,235 @@ events = [{events_toml}]
         assert!(
             panel_content_observer_log(&mut app).is_empty(),
             "nothing is observed because nothing happened"
+        );
+    }
+
+    /// bitty#2388, CTX-1936: a presented layer's `Fullscreen` in the shipped
+    /// app composition rides the REAL app-level zoom — the one table the
+    /// `toggle_zoom` gesture drives — because the app builder installed the
+    /// zoom owner beside the panel host. Entering fullscreen engages the
+    /// zoom (the live tree is the single-leaf proxy) while the displaced
+    /// PTY stays frozen, and the owner's release restores the zoom AND the
+    /// mode with exactly one measured restore resize — the fullscreen twin
+    /// of the wire row above.
+    #[test]
+    fn a_fullscreen_layer_rides_the_app_zoom_and_release_restores_it() {
+        bitty_test_support::require_pty!();
+        use bitty_ui::PresentationMode;
+
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, view) = panel_content_app("panel-content-fullscreen", true);
+
+        let pid = app
+            .runtime
+            .borrow()
+            .pane_pid(&view)
+            .expect("live pane child");
+        let winsize = app
+            .runtime
+            .borrow()
+            .pane_pty_size(&view)
+            .expect("live winsize");
+        let resizes_before = app.runtime.borrow().content_restore_resizes();
+
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:present"));
+        let handle = reply
+            .strip_prefix("OK:")
+            .unwrap_or_else(|| panic!("present must answer a handle, not a refusal: {reply}"));
+        let _ = handle;
+        let token = app
+            .runtime
+            .borrow()
+            .panel_content_layer(view)
+            .expect("the layer is live")
+            .token;
+
+        // The Core-owned fullscreen move (the authority the `ctl panel mode`
+        // verb and the `ctrl+alt+a` cycle share) hands the mode to the
+        // installed owner: the app zoom engages and the leaf carries the
+        // mode, while the displaced PTY stays frozen.
+        app.runtime
+            .borrow_mut()
+            .set_panel_content_presentation(view, token, PresentationMode::Fullscreen)
+            .expect("the layer fullscreens through the app zoom owner");
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "fullscreen engaged the app-level zoom the keybind drives"
+        );
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Fullscreen)
+        );
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "the hidden PTY keeps the frozen winsize across the zoom"
+        );
+        assert_eq!(app.runtime.borrow().pane_pid(&view), Some(pid));
+
+        // The window grows while the layer is fullscreen: the freeze keeps
+        // the hidden PTY at the frozen winsize across the proxy's relayout.
+        app.runtime
+            .borrow_mut()
+            .handle_resize(bitty_platform::PhysicalSize::new(1200, 700))
+            .expect("window resize applies");
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some(winsize),
+            "the freeze holds across the fullscreen relayout"
+        );
+
+        // The owner's release gives both halves back: the zoom leaves, the
+        // panel returns to the mode it displaced, and the restore owes
+        // exactly one measured resize to the current rect.
+        let reply = invoke_settled(&mut app, &format!("{PANEL_CONTENT_ID}:release"));
+        assert_eq!(reply, "OK:true", "the release must succeed: {reply}");
+        assert!(
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the release gave the app-level zoom back"
+        );
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the panel is back in the mode the layer displaced"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        let frame = app
+            .runtime
+            .borrow()
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .unwrap_or_else(|| panic!("{view:?} must be presented"));
+        assert_eq!(
+            app.runtime.borrow().pane_pty_size(&view),
+            Some((frame.cols, frame.rows)),
+            "the release brought the displaced PTY to the current rect"
+        );
+        // The counted restore-resize metric reads 0 here, honestly: this row
+        // fullscreens straight from the tiled slot, so the zoom give-back's
+        // own layout install (the ordinary per-leaf sync every zoom restore
+        // runs, with the freeze already lifted) delivered the single winsize
+        // movement, and the release's own measured sync then correctly
+        // skipped a winsize that already matched. The movement count for the
+        // whole release is still exactly one — the runtime-tier row
+        // (float -> fullscreen -> release) proves the release's own sync
+        // delivers and counts it when the mode give-back moves the leaf
+        // after the disengage.
+        assert_eq!(
+            app.runtime.borrow().content_restore_resizes(),
+            resizes_before,
+            "no second resize on top of the zoom give-back's own sync"
+        );
+    }
+
+    /// bitty#2388, CTX-1936: a layer that went fullscreen before its
+    /// generation ends gets BOTH halves back at the edge — the production
+    /// chain (the composition root's port, its queue, the app's drain, and
+    /// `Runtime::restore_released_panel_presentation`) restores the app
+    /// zoom and the displaced mode before the next frame, exactly like the
+    /// floated twin above restores the mode alone.
+    #[test]
+    fn a_generation_edge_returns_a_fullscreen_layer_s_zoom_and_displaced_mode() {
+        bitty_test_support::require_pty!();
+        use bitty_ui::PresentationMode;
+        use bitty_ui::panel::ViewContent;
+
+        let _guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("generation-edge-fullscreen");
+        let lua = r#"
+            bitty.commands.register({
+                id = "open",
+                title = "Open",
+                run = function()
+                    local p = bitty.panel.create({ type = "helper" })
+                    return p.id
+                end,
+            })
+        "#;
+        write_dwindle_plugin(
+            &root,
+            "xuepoo.edgefull",
+            &["panel.create", "panel.focus"],
+            &[],
+            &["open"],
+            lua,
+        );
+        let (mut app, panels) = build_dwindle_app(root);
+        let raw = match dispatch_app_cmd(&mut app, "xuepoo.edgefull", "open", &[]) {
+            Ok(LuaValue::Integer(id)) => id,
+            other => panic!("expected integer panel id, got {other:?}"),
+        };
+        app.drive_tick().expect("tick materializes the leaf");
+        let panel = PanelId(raw as u64);
+        let view = panels
+            .borrow()
+            .placement_view_of(panel)
+            .expect("the created panel is attached to a leaf");
+
+        // A layer displaces live terminal content, so the panel's leaf gets a
+        // shell of its own; present then fullscreens through the owner.
+        let (program, keepalive_args) = generation_edge_keepalive();
+        app.runtime
+            .borrow_mut()
+            .spawn_shell_for_view(view, program, keepalive_args, 40, 12)
+            .expect("the panel leaf owns a shell");
+        app.drive_tick().expect("tick presents the pane");
+        let presented = app
+            .runtime
+            .borrow_mut()
+            .present_panel_content(view, generation_edge_layer())
+            .expect("the panel presents a layer over its own terminal");
+        app.runtime
+            .borrow_mut()
+            .set_panel_content_presentation(
+                view,
+                presented.token,
+                bitty_ui::PresentationMode::Fullscreen,
+            )
+            .expect("the layer fullscreens through the app zoom owner");
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the layer's fullscreen engaged the app-level zoom"
+        );
+
+        // The generation that presented the layer ends, through the production
+        // edge: `reload` disposes the predecessor generation, which releases
+        // its generation-owned layer before the placeholder.
+        let id = bitty_plugin_host::manifest::PluginId::new("xuepoo.edgefull").expect("id");
+        app.plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .reload(&id)
+            .expect("reload");
+        app.drive_tick().expect("tick drains the edge's restore");
+
+        // The record went with the generation, and BOTH halves came back:
+        // the app zoom and the mode the layer displaced.
+        assert_eq!(
+            panels.borrow().presented_content_count(),
+            0,
+            "the ended generation's layer does not outlive its edge"
+        );
+        assert!(
+            !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "the generation edge gave the app-level zoom back"
+        );
+        assert_eq!(
+            app.runtime.borrow().view_presentation(view),
+            Some(PresentationMode::Tiled),
+            "the generation edge returns the panel to the mode its layer displaced"
+        );
+        assert!(!app.runtime.borrow().content_layer_presented(view));
+        assert_eq!(
+            app.runtime.borrow().panel_content_kind(view),
+            Some(ViewContent::Terminal(view.0)),
+            "the container is terminal-backed again"
+        );
+        assert_eq!(
+            panels.borrow().placement_view_of(panel),
+            Some(view),
+            "the reload retained the container on the same leaf"
         );
     }
 }

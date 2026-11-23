@@ -1430,7 +1430,7 @@ fn panel_mode_verb_parses_and_wires_the_mode_word() {
     for word in ["tiled", "floating", "fullscreen", "scratchpad"] {
         assert!(
             parse_ctl_request(&words(&["panel", "mode", "p:3", word])).is_ok(),
-            "{word} must parse (the runtime types the placement-less ones)"
+            "{word} must parse (the runtime types the modes nobody owns)"
         );
     }
 
@@ -1504,12 +1504,12 @@ fn panel_content_verbs_are_documented_in_usage_help_and_completion() {
         "completion advertises `panel mode` but the parser refuses it"
     );
     assert!(ctl_usage().contains("panel present p:N | panel release p:N TOKEN"));
-    assert!(ctl_usage().contains("panel mode p:N tiled|floating"));
+    assert!(ctl_usage().contains("panel mode p:N tiled|floating|fullscreen"));
     let help = ctl_help_text(false);
     for text in [
         "panel present p:N",
         "panel release p:N TOKEN",
-        "panel mode p:N tiled|floating [TOKEN]",
+        "panel mode p:N tiled|floating|fullscreen [TOKEN]",
     ] {
         assert!(help.contains(text), "help must document `{text}`");
     }
@@ -1740,6 +1740,217 @@ fn control_tab_refusals_are_typed_and_leave_state_alone() {
         error.message.contains("single-tab stack"),
         "{}",
         error.message
+    );
+}
+
+/// Headless app with a `Terminal` panel mounted on a two-leaf layout, focus on
+/// the panel's leaf, built the way the composition root builds the shipped
+/// app (bitty#2388, CTX-1936).
+///
+/// `owned` selects the install posture: `true` routes the panel host through
+/// the app builder — which also installs the app-level zoom owner — so the
+/// layer's `Fullscreen` is answerable; `false` installs the host straight
+/// onto the runtime, the `--safe`/plugin-less posture whose `Fullscreen`
+/// fails closed with the typed refusal.
+#[cfg(unix)]
+fn panel_content_ctl_app(owned: bool) -> crate::terminal_app::TerminalApp {
+    use bitty_runtime::registry::{PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId};
+    use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let mut runtime = bitty_runtime::Runtime::with_defaults().expect("headless runtime");
+    runtime.set_container(bitty_ui::Rect::new(0, 0, 80, 24));
+    let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+    let handle = host
+        .create_panel(PanelType::Terminal, Some(WorkspaceId::new(1)))
+        .expect("terminal panel");
+    // The ctl verbs' `p:N` names the leaf `v:N`, so the panel mounts on the
+    // leaf that carries its own number.
+    let view = ViewId::new(handle.id.0);
+    runtime.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(view, 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(view.0 + 1), 80, 24)),
+    ));
+    host.mount_panel(handle.id, handle.generation, view)
+        .expect("the panel mounts at the leaf");
+    assert!(runtime.set_focus(view), "the fixture focus must be live");
+    if owned {
+        crate::terminal_app::TerminalApp::with_theme(
+            runtime,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_panel_scene_host(Some(std::rc::Rc::new(std::cell::RefCell::new(host))))
+    } else {
+        runtime.install_scene_host(host);
+        crate::terminal_app::TerminalApp::with_theme(
+            runtime,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            crate::spawn::SpawnSpec::default(),
+        )
+    }
+}
+
+/// Dispatches one parsed panel-content request through the production serve
+/// table, headlessly — the same lane shape [`dispatch_tab_request`] drives
+/// for the tab verbs (bitty#2388, CTX-1936).
+///
+/// The lane guard is held for the whole dispatch, including the service turn:
+/// `TerminalApp::handle_event` services a parked request too, so every
+/// `handle_event` caller in the crate's tests runs under the same guard
+/// (`crate::tests::handle_event_guarded`), otherwise libtest concurrency could
+/// claim this helper's request first.
+#[cfg(unix)]
+fn dispatch_panel_content_request(
+    app: &mut crate::terminal_app::TerminalApp,
+    request: &CtlRequest,
+    context: &bitty_ipc::devtools::ServeContext,
+) -> Result<String, bitty_ipc::devtools::HandlerError> {
+    use std::time::{Duration, Instant};
+
+    let _lane = crate::ctl::panel_content::test_lane_lock();
+    crate::ctl::panel_content::reset_lane();
+
+    let method = request
+        .wire_method()
+        .expect("panel content verbs are wire verbs");
+    let params_part = request
+        .wire_params()
+        .map_or_else(String::new, |params| format!(",\"params\":{params}"));
+    let raw = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"version\":\"1.0\",\"method\":\"{method}\"{params_part}}}"
+    );
+    let wire = bitty_ipc::devtools::parse_request(raw.as_bytes()).expect("request document");
+    let dispatcher = crate::ipc_serve::build_dispatcher(false);
+
+    std::thread::scope(|scope| {
+        // The handler blocks on the lane, so it runs on its own thread while
+        // this one plays the app.
+        let caller = scope.spawn(|| dispatcher.dispatch(context, &wire));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::ctl::panel_content::is_pending() {
+            assert!(
+                Instant::now() < deadline,
+                "the handler never reached the panel content lane"
+            );
+            std::thread::yield_now();
+        }
+        assert!(app.service_panel_content_requests(), "one request serviced");
+        caller.join().expect("handler thread")
+    })
+}
+
+/// bitty#2388, CTX-1936: the `ctl panel mode` verb's fullscreen word rides
+/// the installed app-level zoom owner through the production serve table —
+/// the verb engages the app's real zoom, answers `mode: "fullscreen"`, and
+/// the release verb gives both halves back (the zoom and the displaced mode).
+#[cfg(unix)]
+#[test]
+fn panel_mode_verb_fullscreen_rides_the_installed_zoom_owner() {
+    use bitty_ui::PresentationMode;
+
+    let mut app = panel_content_ctl_app(true);
+    let (context, _peer) = tab_serve_context();
+    let view = bitty_ui::ViewId::new(1);
+
+    // Present: the debug pair's first half, over the headless primary
+    // owner's own terminal.
+    let (present, _) = parse_ctl_request(&words(&["panel", "present", "p:1"])).expect("parses");
+    let receipt =
+        dispatch_panel_content_request(&mut app, &present, &context).expect("present applied");
+    assert!(
+        receipt.contains("\"presented\":true") && receipt.contains("\"mode\":\"tiled\""),
+        "the receipt names the presented layer: {receipt}"
+    );
+    let token = receipt
+        .split("\"token\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the receipt names the release token");
+
+    // Fullscreen: the verb's word reaches the gate, the gate hands it to the
+    // installed owner, and the app's zoom is live.
+    let (mode, _) =
+        parse_ctl_request(&words(&["panel", "mode", "p:1", "fullscreen"])).expect("parses");
+    let receipt = dispatch_panel_content_request(&mut app, &mode, &context).expect("mode applied");
+    assert!(
+        receipt.contains("\"changed\":true") && receipt.contains("\"mode\":\"fullscreen\""),
+        "the receipt reports the fullscreen move: {receipt}"
+    );
+    assert!(
+        app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+        "the verb engaged the app-level zoom"
+    );
+    assert_eq!(
+        app.runtime.borrow().view_presentation(view),
+        Some(PresentationMode::Fullscreen)
+    );
+
+    // Release: the receipt's token releases the layer, and both halves come
+    // back — the zoom and the mode the layer displaced.
+    let (release, _) =
+        parse_ctl_request(&words(&["panel", "release", "p:1", token])).expect("parses");
+    let receipt =
+        dispatch_panel_content_request(&mut app, &release, &context).expect("release applied");
+    assert!(
+        receipt.contains("\"released\":true") && receipt.contains("\"mode\":\"tiled\""),
+        "the receipt reports the restored mode: {receipt}"
+    );
+    assert!(
+        !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+        "the release gave the app-level zoom back"
+    );
+    assert_eq!(
+        app.runtime.borrow().view_presentation(view),
+        Some(PresentationMode::Tiled),
+        "the panel is back in the mode the layer displaced"
+    );
+}
+
+/// bitty#2388, CTX-1936: without an installed app-level zoom owner (the
+/// `--safe`/plugin-less posture), the same verb answers the typed refusal —
+/// the lane forwards the gate's `Conflict`, and nothing moves.
+#[cfg(unix)]
+#[test]
+fn panel_mode_verb_fullscreen_fails_closed_without_a_zoom_owner() {
+    use bitty_ui::PresentationMode;
+
+    let mut app = panel_content_ctl_app(false);
+    let (context, _peer) = tab_serve_context();
+    let view = bitty_ui::ViewId::new(1);
+
+    let (present, _) = parse_ctl_request(&words(&["panel", "present", "p:1"])).expect("parses");
+    dispatch_panel_content_request(&mut app, &present, &context).expect("present applied");
+
+    let (mode, _) =
+        parse_ctl_request(&words(&["panel", "mode", "p:1", "fullscreen"])).expect("parses");
+    let error = dispatch_panel_content_request(&mut app, &mode, &context)
+        .expect_err("unowned fullscreen must be refused");
+    assert_eq!(
+        (error.category, error.code),
+        ("usage", "Conflict"),
+        "{error:?}"
+    );
+    assert!(
+        error.message.contains("cannot take mode fullscreen"),
+        "the refusal names the mode: {}",
+        error.message
+    );
+    assert!(
+        !app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+        "no zoom was ever engaged"
+    );
+    assert_eq!(
+        app.runtime.borrow().view_presentation(view),
+        Some(PresentationMode::Tiled),
+        "the refused request moved nothing"
     );
 }
 

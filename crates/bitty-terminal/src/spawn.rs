@@ -56,6 +56,13 @@ impl ShellSource {
 pub(crate) struct ResolvedShell {
     /// Direct `argv[0]`; absolute when it came from a `PATH` lookup.
     pub(crate) program: String,
+    /// Additional argv for the configured layer only (`terminal.shell_args`).
+    ///
+    /// Empty for the CLI program name, `$SHELL`, and the platform default:
+    /// those layers name one binary and never invent arguments. The configured
+    /// layer uses it to reach shells that need argv to be meaningful — a WSL2
+    /// distribution (`wsl.exe -d Ubuntu`), `cmd.exe /k`, `bash -l`.
+    pub(crate) args: Vec<String>,
     /// Precedence layer that chose `program`.
     pub(crate) source: ShellSource,
 }
@@ -115,9 +122,12 @@ pub(crate) fn configured_shell_argv0(configured: Option<&str>) -> Option<&str> {
 /// environment, the filesystem, or the network. Every candidate is trimmed
 /// but never split, joined, or interpolated; `$SHELL` is trusted only as a
 /// binary path, and a blank or control-laden configured value fails closed
-/// to `$SHELL` (CTX-0298).
+/// to `$SHELL` (CTX-0298). `config_args` (`terminal.shell_args`) travel with
+/// the configured program only; the other layers always resolve to no
+/// arguments.
 pub(crate) fn select_default_shell(
     config_shell: Option<&str>,
+    config_args: &[String],
     shell_env: Option<&str>,
     candidates: &[&'static str],
     lookup: impl Fn(&str) -> Option<String>,
@@ -125,12 +135,14 @@ pub(crate) fn select_default_shell(
     if let Some(configured) = configured_shell_argv0(config_shell) {
         return Ok(ResolvedShell {
             program: configured.to_string(),
+            args: config_args.to_vec(),
             source: ShellSource::Configured,
         });
     }
     if let Some(env) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(ResolvedShell {
             program: env.to_string(),
+            args: Vec::new(),
             source: ShellSource::Environment,
         });
     }
@@ -138,6 +150,7 @@ pub(crate) fn select_default_shell(
         if let Some(program) = lookup(candidate) {
             return Ok(ResolvedShell {
                 program,
+                args: Vec::new(),
                 source: ShellSource::PlatformDefault,
             });
         }
@@ -156,10 +169,12 @@ pub(crate) fn select_default_shell(
 /// the same bounded lookup `bitty doctor` uses.
 pub(crate) fn resolve_default_shell(
     config_shell: Option<&str>,
+    config_args: &[String],
     shell_env: Option<&str>,
 ) -> Result<ResolvedShell, UnresolvedDefaultShell> {
     select_default_shell(
         config_shell,
+        config_args,
         shell_env,
         PLATFORM_SHELL_CANDIDATES,
         platform_lookup,
@@ -192,21 +207,93 @@ fn platform_lookup(name: &str) -> Option<String> {
 pub(crate) fn resolve_spawn_program(
     program: Option<&str>,
     config_shell: Option<&str>,
+    config_args: &[String],
     shell_env: Option<&str>,
 ) -> Result<ResolvedShell, UnresolvedDefaultShell> {
     match program {
         Some(program) => Ok(ResolvedShell {
             program: program.to_string(),
+            args: Vec::new(),
             source: ShellSource::Explicit,
         }),
-        None => resolve_default_shell(config_shell, shell_env),
+        None => resolve_default_shell(config_shell, config_args, shell_env),
     }
 }
 
 /// The retry target for a configured or `$SHELL` program that cannot spawn:
 /// the platform default on its own (bitty#2928).
 fn platform_default_shell() -> Result<ResolvedShell, UnresolvedDefaultShell> {
-    select_default_shell(None, None, PLATFORM_SHELL_CANDIDATES, platform_lookup)
+    select_default_shell(None, &[], None, PLATFORM_SHELL_CANDIDATES, platform_lookup)
+}
+
+/// Default working directory for a fresh launch (bitty#3310).
+///
+/// A Windows launch from a Start Menu/Desktop shortcut inherits the
+/// shortcut's "Start in" as the process directory. When that installs as the
+/// directory holding `bitty.exe`, every child shell opens in
+/// `%LOCALAPPDATA%\bitty\bin` — the reported `bitty init`/`ls` surprise. The
+/// installers set the shortcut directory to the user profile now; this is the
+/// runtime safety net for a shortcut that still points at the install
+/// directory (and for the `bitty.com` shim), and it never overrides a
+/// directory the user actually chose: only an exact match with the running
+/// executable's directory is redirected to the home directory.
+pub(crate) fn startup_cwd_override(
+    current: Option<&std::path::Path>,
+    exe_dir: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let current = current?;
+    let exe_dir = exe_dir?;
+    let home = home?;
+    if !current.is_dir() || !same_directory(current, exe_dir) {
+        return None;
+    }
+    if same_directory(home, current) || !home.is_dir() {
+        return None;
+    }
+    Some(home.to_path_buf())
+}
+
+/// Whether two paths name the same directory, case-insensitively on Windows.
+///
+/// Canonicalizing first resolves `.`/`..`, trailing separators, and symlinks;
+/// when canonicalization fails (a path that vanished between the two calls)
+/// the caller's spelling is compared instead, which still catches the exact
+/// install-directory match this guard exists for.
+fn same_directory(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+/// [`startup_cwd_override`] resolved from the live process.
+///
+/// Windows only: Unix launches inherit the terminal's directory by design and
+/// have no shortcut "Start in" to correct.
+#[cfg(windows)]
+pub(crate) fn resolve_startup_cwd() -> Option<std::path::PathBuf> {
+    let current = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    startup_cwd_override(current.as_deref(), exe_dir.as_deref(), home.as_deref())
+}
+
+/// [`startup_cwd_override`] resolved from the live process.
+#[cfg(not(windows))]
+pub(crate) fn resolve_startup_cwd() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Why the startup shell did not start (bitty#2928).
@@ -258,17 +345,25 @@ impl From<UnresolvedDefaultShell> for StartupShellError {
 /// before surfacing the error. Callers decide whether to continue without a
 /// child: an unresolvable default is fatal, a failed spawn is fail-soft
 /// unless `--fail-loud` (CTX-0481).
+///
+/// `cwd` is the startup default working directory (bitty#3310): a Windows
+/// shell launched from a shortcut inherits the install directory otherwise.
+/// The retry and pane spawns use the same directory, so no candidate ever
+/// starts somewhere else.
 pub(crate) fn spawn_default_shell(
     runtime: &mut Runtime,
     config_shell: Option<&str>,
+    config_args: &[String],
     shell_env: Option<&str>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<(), StartupShellError> {
-    let resolved = resolve_default_shell(config_shell, shell_env)?;
+    let resolved = resolve_default_shell(config_shell, config_args, shell_env)?;
     let fallback = platform_default_shell()?;
+    let resolved_args: Vec<&str> = resolved.args.iter().map(String::as_str).collect();
     spawn_with_fallback(
-        |candidate| runtime.spawn_shell(candidate),
-        &resolved.program,
-        &fallback.program,
+        |program, args| runtime.spawn_shell_with_args_in(program, args, cwd),
+        (&resolved.program, &resolved_args),
+        (&fallback.program, &[]),
     )
     .map_err(|(program, error)| StartupShellError::Spawn { program, error })
 }
@@ -276,40 +371,47 @@ pub(crate) fn spawn_default_shell(
 /// Spawn core with the startup fallback chain: try `default` first; when it
 /// differs from `fallback` and fails, retry once with `fallback` before
 /// surfacing the error. The `spawn` closure performs the direct-argv exec
-/// into the target session (primary shell or one split pane). Returns the
+/// into the target session (primary shell or one split pane), so the caller
+/// owns the working directory and the argv of both attempts. Returns the
 /// program attempted last alongside its failure so the caller can name it.
 fn spawn_with_fallback(
-    mut spawn: impl FnMut(&str) -> Result<(), bitty_runtime::RuntimeError>,
-    default: &str,
-    fallback: &str,
+    mut spawn: impl FnMut(&str, &[&str]) -> Result<(), bitty_runtime::RuntimeError>,
+    default: (&str, &[&str]),
+    fallback: (&str, &[&str]),
 ) -> Result<(), (String, bitty_runtime::RuntimeError)> {
-    match spawn(default) {
+    match spawn(default.0, default.1) {
         Ok(()) => {
-            crate::logging::info(|| format!("bitty: spawned default shell {default:?}"));
+            crate::logging::info(|| format!("bitty: spawned default shell {:?}", default.0));
             Ok(())
         }
-        Err(err) if default != fallback => {
+        Err(err) if default.0 != fallback.0 => {
             crate::logging::warn(|| {
                 format!(
-                    "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {fallback:?}"
+                    "bitty: spawn_shell({:?}) failed: {err} — trying fallback {:?}",
+                    default.0, fallback.0
                 )
             });
-            match spawn(fallback) {
+            match spawn(fallback.0, fallback.1) {
                 Ok(()) => {
-                    crate::logging::info(|| format!("bitty: spawned fallback shell {fallback:?}"));
+                    crate::logging::info(|| {
+                        format!("bitty: spawned fallback shell {:?}", fallback.0)
+                    });
                     Ok(())
                 }
                 Err(fallback_err) => {
                     crate::logging::warn(|| {
-                        format!("bitty: spawn_shell({fallback:?}) failed: {fallback_err}")
+                        format!(
+                            "bitty: spawn_shell({:?}) failed: {fallback_err}",
+                            fallback.0
+                        )
                     });
-                    Err((fallback.to_string(), fallback_err))
+                    Err((fallback.0.to_string(), fallback_err))
                 }
             }
         }
         Err(err) => {
-            crate::logging::warn(|| format!("bitty: spawn_shell({default:?}) failed: {err}"));
-            Err((default.to_string(), err))
+            crate::logging::warn(|| format!("bitty: spawn_shell({:?}) failed: {err}", default.0));
+            Err((default.0.to_string(), err))
         }
     }
 }
@@ -325,6 +427,13 @@ pub(crate) struct SpawnSpec {
     pub(crate) program_args: Vec<String>,
     pub(crate) shell_env: Option<String>,
     pub(crate) config_shell: Option<String>,
+    /// `terminal.shell_args`: argv for the configured shell only (WSL2
+    /// distribution, `cmd.exe /k`, `bash -l`). Never applied to `$SHELL`, the
+    /// platform default, or an explicit CLI program.
+    pub(crate) config_shell_args: Vec<String>,
+    /// Default working directory for every startup shell (bitty#3310).
+    /// `None` keeps the inherited process directory.
+    pub(crate) startup_cwd: Option<std::path::PathBuf>,
 }
 
 impl SpawnSpec {
@@ -336,8 +445,12 @@ impl SpawnSpec {
     pub(crate) fn resolve(&self) -> Result<(String, Vec<String>), UnresolvedDefaultShell> {
         match self.program.as_deref() {
             Some(program) => Ok((program.to_string(), self.program_args.clone())),
-            None => resolve_default_shell(self.config_shell.as_deref(), self.shell_env.as_deref())
-                .map(|resolved| (resolved.program, Vec::new())),
+            None => resolve_default_shell(
+                self.config_shell.as_deref(),
+                &self.config_shell_args,
+                self.shell_env.as_deref(),
+            )
+            .map(|resolved| (resolved.program, resolved.args)),
         }
     }
 }
@@ -370,6 +483,7 @@ pub(crate) fn spawn_pane_shell_in(
     rows: u16,
     cwd: Option<&std::path::Path>,
 ) -> Result<(), bitty_runtime::RuntimeError> {
+    let cwd = cwd.or(spec.startup_cwd.as_deref());
     let (program, args) = spec.resolve().map_err(|err| {
         // Startup already resolved this chain, so a failure here is a
         // late-environment change (a removed `PATH` entry). The pane stays
@@ -377,19 +491,19 @@ pub(crate) fn spawn_pane_shell_in(
         crate::logging::warn(|| format!("bitty: pane shell not spawned: {err}"));
         bitty_runtime::RuntimeError::Pty(err.to_string())
     })?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     if spec.program.is_some() {
         // Explicit program: verbatim, no fallback (startup parity).
-        let tail: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        return runtime.spawn_shell_for_view_in(view, &program, &tail, cols, rows, cwd);
+        return runtime.spawn_shell_for_view_in(view, &program, &args, cols, rows, cwd);
     }
     let fallback = platform_default_shell().map_err(|err| {
         crate::logging::warn(|| format!("bitty: pane shell not spawned: {err}"));
         bitty_runtime::RuntimeError::Pty(err.to_string())
     })?;
     spawn_with_fallback(
-        |candidate| runtime.spawn_shell_for_view_in(view, candidate, &[], cols, rows, cwd),
-        &program,
-        &fallback.program,
+        |program, args| runtime.spawn_shell_for_view_in(view, program, args, cols, rows, cwd),
+        (&program, &args),
+        (&fallback.program, &[]),
     )
     .map_err(|(_program, error)| error)
 }
@@ -558,6 +672,8 @@ mod tests {
             program_args: vec!["-c".to_string(), "sleep 2".to_string()],
             shell_env: None,
             config_shell: None,
+            config_shell_args: Vec::new(),
+            startup_cwd: None,
         };
         assert_eq!(
             spawn_startup_pane_shells(&mut rt, &spec),
@@ -584,5 +700,74 @@ mod tests {
                 "the pane PTY must match its painted grid"
             );
         }
+    }
+
+    #[test]
+    fn configured_shell_args_travel_only_with_the_configured_layer() {
+        // bitty#3310: `terminal.shell_args` is argv for the configured program
+        // only. `$SHELL` and the platform default name one binary and must
+        // never inherit a WSL/`cmd.exe` tail from the config layer.
+        let args = vec!["-d".to_string(), "Ubuntu".to_string()];
+        let configured = select_default_shell(Some("wsl.exe"), &args, None, &["cmd.exe"], |_| None)
+            .expect("configured shell resolves");
+        assert_eq!(configured.program, "wsl.exe");
+        assert_eq!(configured.args, args);
+        assert_eq!(configured.source, ShellSource::Configured);
+
+        let environment =
+            select_default_shell(None, &args, Some("/bin/fish"), &["cmd.exe"], |_| None)
+                .expect("$SHELL resolves");
+        assert_eq!(environment.program, "/bin/fish");
+        assert!(
+            environment.args.is_empty(),
+            "environment layer gains no argv"
+        );
+
+        let platform = select_default_shell(None, &args, None, &["cmd.exe"], |name| {
+            Some(format!("/resolved/{name}"))
+        })
+        .expect("platform default resolves");
+        assert_eq!(platform.source, ShellSource::PlatformDefault);
+        assert!(platform.args.is_empty(), "platform layer gains no argv");
+    }
+
+    #[test]
+    fn startup_cwd_override_only_redirects_the_executable_directory() {
+        // bitty#3310: a shortcut "Start in" equal to the install directory
+        // became every shell's cwd. Only that exact directory is redirected;
+        // a directory the user chose is preserved.
+        let root = std::env::temp_dir().join(format!(
+            "bitty-startup-cwd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("bin");
+        let home = root.join("home");
+        let project = root.join("project");
+        for dir in [&install, &home, &project] {
+            std::fs::create_dir_all(dir).expect("scratch dir");
+        }
+        assert_eq!(
+            startup_cwd_override(Some(&install), Some(&install), Some(&home)),
+            Some(home.clone())
+        );
+        assert_eq!(
+            startup_cwd_override(Some(&project), Some(&install), Some(&home)),
+            None,
+            "a user-chosen directory is never overridden"
+        );
+        assert_eq!(
+            startup_cwd_override(Some(&home), Some(&install), Some(&home)),
+            None
+        );
+        assert_eq!(
+            startup_cwd_override(None, Some(&install), Some(&home)),
+            None
+        );
+        assert_eq!(
+            startup_cwd_override(Some(&install), Some(&install), None),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2083,7 +2083,7 @@ fn ipc_socket_path_stored_unless_headless_without_test_mode() {
 
 /// Program the default chain selects on this host, for terse assertions.
 fn resolved_program(config_shell: Option<&str>, shell_env: Option<&str>) -> String {
-    resolve_default_shell(config_shell, shell_env)
+    resolve_default_shell(config_shell, &[], shell_env)
         .expect("the platform default layer always resolves in the test environment")
         .program
 }
@@ -2099,7 +2099,7 @@ fn resolved_spawn_program(
     config_shell: Option<&str>,
     shell_env: Option<&str>,
 ) -> String {
-    resolve_spawn_program(args.program.as_deref(), config_shell, shell_env)
+    resolve_spawn_program(args.program.as_deref(), config_shell, &[], shell_env)
         .expect("the platform default layer always resolves in the test environment")
         .program
 }
@@ -2111,23 +2111,29 @@ fn select_default_shell_prefers_configured_then_env_then_platform() {
     let candidates = ["pwsh.exe", "powershell.exe", "cmd.exe"];
     let first_wins = |name: &str| Some(format!("/resolved/{name}"));
 
-    let configured =
-        select_default_shell(Some("/bin/zsh"), Some("/bin/fish"), &candidates, first_wins)
-            .expect("configured shell resolves");
+    let configured = select_default_shell(
+        Some("/bin/zsh"),
+        &[],
+        Some("/bin/fish"),
+        &candidates,
+        first_wins,
+    )
+    .expect("configured shell resolves");
     assert_eq!(
         configured,
         ResolvedShell {
             program: "/bin/zsh".to_string(),
+            args: Vec::new(),
             source: ShellSource::Configured,
         }
     );
 
-    let environment = select_default_shell(None, Some("/bin/fish"), &candidates, first_wins)
+    let environment = select_default_shell(None, &[], Some("/bin/fish"), &candidates, first_wins)
         .expect("$SHELL resolves");
     assert_eq!(environment.source, ShellSource::Environment);
     assert_eq!(environment.program, "/bin/fish");
 
-    let platform = select_default_shell(None, None, &candidates, first_wins)
+    let platform = select_default_shell(None, &[], None, &candidates, first_wins)
         .expect("the first candidate resolves");
     assert_eq!(platform.source, ShellSource::PlatformDefault);
     assert_eq!(platform.program, "/resolved/pwsh.exe");
@@ -2137,7 +2143,7 @@ fn select_default_shell_prefers_configured_then_env_then_platform() {
     let only_cmd =
         |name: &str| (name == "cmd.exe").then(|| String::from("C:\\Windows\\System32\\cmd.exe"));
     let platform =
-        select_default_shell(None, None, &candidates, only_cmd).expect("cmd.exe resolves");
+        select_default_shell(None, &[], None, &candidates, only_cmd).expect("cmd.exe resolves");
     assert_eq!(platform.program, "C:\\Windows\\System32\\cmd.exe");
     assert_eq!(platform.source, ShellSource::PlatformDefault);
 }
@@ -2148,6 +2154,7 @@ fn select_default_shell_fails_with_every_candidate_named() {
     // program it tried, never a silent headless tick.
     let err = select_default_shell(
         None,
+        &[],
         None,
         &["pwsh.exe", "powershell.exe", "cmd.exe"],
         |_| None,
@@ -2172,7 +2179,7 @@ fn default_shell_prefers_shell_env_when_no_configured_shell() {
     assert_eq!(resolved_program(None, Some("/bin/bash")), "/bin/bash");
     assert_eq!(resolved_program(None, Some("/usr/bin/zsh")), "/usr/bin/zsh");
     // The POSIX fallback is the platform default layer, not a spawn guess.
-    let resolved = resolve_default_shell(None, None).expect("posix fallback");
+    let resolved = resolve_default_shell(None, &[], None).expect("posix fallback");
     assert_eq!(resolved.source, ShellSource::PlatformDefault);
 }
 
@@ -2182,7 +2189,7 @@ fn default_shell_resolves_the_first_windows_candidate_on_path() {
     // bitty#2928: Windows sets neither `terminal.shell` nor `$SHELL`, so the
     // chain must resolve a program that exists there. Order is fixed:
     // pwsh.exe, powershell.exe, cmd.exe.
-    let resolved = resolve_default_shell(None, None).expect("Windows ships cmd.exe");
+    let resolved = resolve_default_shell(None, &[], None).expect("Windows ships cmd.exe");
     assert_eq!(resolved.source, ShellSource::PlatformDefault);
     let matched = PLATFORM_SHELL_CANDIDATES
         .iter()
@@ -2302,6 +2309,7 @@ fn explicit_program_arg_stays_identical() {
     let resolved = resolve_spawn_program(
         parsed.program.as_deref(),
         Some("/bin/zsh"),
+        &[],
         Some("/bin/bash"),
     )
     .expect("explicit program resolves");
@@ -2915,6 +2923,51 @@ fn window_title_sanitizer_strips_controls_and_bounds_length() {
     let bounded = sanitize_window_title(&multibyte);
     assert_eq!(bounded.chars().count(), WINDOW_TITLE_MAX_CHARS);
     assert!(bounded.chars().all(|c| c == '\u{e9}'));
+}
+
+#[test]
+fn window_title_normalizer_folds_windows_shell_paths() {
+    use crate::terminal_app::{normalize_window_title, sanitize_window_title};
+    // bitty#3310: Windows PowerShell and cmd.exe title the console with their
+    // own executable path. That exact shape collapses to the product name.
+    for (raw, expected) in [
+        (
+            "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "Windows PowerShell",
+        ),
+        ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "PowerShell"),
+        ("C:\\WINDOWS\\system32\\cmd.exe", "Command Prompt"),
+        ("C:\\Windows\\System32\\wsl.exe", "WSL"),
+        ("powershell.exe", "Windows PowerShell"),
+    ] {
+        assert_eq!(
+            normalize_window_title(&sanitize_window_title(raw)),
+            expected,
+            "raw title {raw:?}"
+        );
+    }
+    // Real content keeps the shell's title: whitespace, prompts, edited
+    // titles, unknown executables, and empty titles pass through.
+    for raw in [
+        "PS C:\\Users\\x\\AppData\\Local\\bitty\\bin>",
+        "nvim src/main.rs",
+        "C:\\tools\\mytool.exe",
+        "",
+    ] {
+        assert_eq!(
+            normalize_window_title(&sanitize_window_title(raw)),
+            sanitize_window_title(raw),
+            "raw title {raw:?}"
+        );
+    }
+    // The theme title seeds the same normalization.
+    assert!(
+        crate::terminal_app::window_title_for_theme(
+            "bitty-dark",
+            "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        )
+        .contains("(Windows PowerShell)"),
+    );
 }
 
 #[test]
@@ -7900,6 +7953,65 @@ fn init_shell_candidates_order_and_fallback() {
 }
 
 #[test]
+#[cfg(windows)]
+fn init_shell_candidates_offer_powershell_cmd_and_wsl_on_windows() {
+    use crate::init::{INIT_WINDOWS_SHELLS, init_shell_candidates};
+    // bitty#3310: the Windows menu must offer the shells a Windows host
+    // actually has — PowerShell 7, Windows PowerShell, the command
+    // interpreter, and the WSL2 entry point — and never a POSIX path.
+    assert_eq!(
+        INIT_WINDOWS_SHELLS,
+        &["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"]
+    );
+    let c = init_shell_candidates(None, &|name| INIT_WINDOWS_SHELLS.contains(&name));
+    assert_eq!(c, INIT_WINDOWS_SHELLS.to_vec());
+    assert!(c.iter().all(|entry| !entry.starts_with('/')));
+
+    // Nothing resolves: the menu still ends with a program every Windows host
+    // ships, never `/bin/sh`.
+    let c = init_shell_candidates(None, &|_| false);
+    assert_eq!(c, vec!["cmd.exe"]);
+}
+
+#[test]
+#[cfg(not(windows))]
+fn init_shell_candidates_keep_the_posix_menu_off_windows() {
+    use crate::init::{INIT_COMMON_SHELLS, init_shell_candidates};
+    let c = init_shell_candidates(None, &|name| INIT_COMMON_SHELLS.contains(&name));
+    assert_eq!(c.last().map(String::as_str), Some("/bin/sh"));
+    assert!(c.iter().all(|entry| entry.starts_with('/')));
+}
+
+#[test]
+fn init_powershell_upgrade_hint_is_windows_only() {
+    // bitty#3310: the summary tells a Windows host how to upgrade, and never
+    // fires for PowerShell 7, cmd.exe, or another platform.
+    let legacy = crate::init::init_powershell_upgrade_hint(
+        None,
+        Some("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+    );
+    if cfg!(windows) {
+        let hint = legacy.expect("5.1 default hints on Windows");
+        assert!(
+            hint.contains("winget install --id Microsoft.PowerShell --source winget"),
+            "{hint}"
+        );
+        assert!(
+            crate::init::init_powershell_upgrade_hint(
+                None,
+                Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+            )
+            .is_none()
+        );
+        assert!(crate::init::init_powershell_upgrade_hint(None, Some("cmd.exe")).is_none());
+        // An explicit 5.1 choice still gets the hint.
+        assert!(crate::init::init_powershell_upgrade_hint(Some("powershell.exe"), None).is_some());
+    } else {
+        assert!(legacy.is_none(), "the advisory is Windows-only");
+    }
+}
+
+#[test]
 fn init_shell_name_positional_gets_shell_init_hint() {
     // `bitty init fish` reads like a shell-init invocation (#2367).
     assert_eq!(
@@ -12119,11 +12231,14 @@ fn init_dispatch_interactive_tty_prompts_and_writes_answers() {
 }
 
 #[test]
-fn init_dispatch_interactive_platform_default_shell_seeds_profile() {
-    // R2 pin (CTX-1755): $SHELL unset, the host probe injected as a Windows
-    // PowerShell path. The dispatch — not just the helper — must seed the
-    // wizard menu and the written profile from it. Reverting the call site to
-    // `env.shell` leaves every other test green and fails here.
+fn init_dispatch_interactive_platform_default_shell_leaves_the_chain_unpinned() {
+    // R2 pin (CTX-1755) updated by bitty#3310: $SHELL unset, the host probe
+    // injected as a Windows PowerShell path. The dispatch — not just the
+    // helper — seeds the wizard menu from it, but accepting that default must
+    // NOT write the executable path: the platform chain re-resolves every
+    // start, so a later PowerShell 7 install upgrades the shell with no
+    // profile edit. Reverting the call site to `env.shell` leaves every other
+    // test green and fails here.
     let xdg = init_test_dir("tty-platform-shell");
     let xdg_s = xdg.display().to_string();
     let mut args = Args::new();
@@ -12152,8 +12267,10 @@ fn init_dispatch_interactive_platform_default_shell_seeds_profile() {
     let profile = xdg.join("bitty").join("profiles").join("default.lua");
     let written = std::fs::read_to_string(&profile).expect("profile written");
     assert!(
-        written.contains("shell = \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\""),
-        "written profile must carry the resolved platform default: {written}"
+        !written
+            .lines()
+            .any(|line| line.trim_start().starts_with("shell =")),
+        "accepting the detected default must not pin an executable path: {written}"
     );
     let _ = std::fs::remove_dir_all(&xdg);
 }
@@ -13513,6 +13630,8 @@ fn spawn_spec_resolve_prefers_explicit_program() {
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
         config_shell: Some("/bin/zsh".to_string()),
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     assert_eq!(
         spec.resolve().expect("explicit program resolves"),
@@ -13532,6 +13651,8 @@ fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
         config_shell: Some("/bin/zsh".to_string()),
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     assert_eq!(
         spec.resolve().expect("configured shell resolves"),
@@ -13542,6 +13663,8 @@ fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
         config_shell: None,
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     assert_eq!(
         spec.resolve().expect("$SHELL resolves"),
@@ -13552,6 +13675,8 @@ fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
         program_args: Vec::new(),
         shell_env: None,
         config_shell: None,
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     assert_eq!(
         spec.resolve().expect("platform default resolves"),
@@ -13562,6 +13687,8 @@ fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
         program_args: Vec::new(),
         shell_env: Some("   ".to_string()),
         config_shell: Some(" \n ".to_string()),
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     assert_eq!(
         spec.resolve().expect("platform default resolves"),
@@ -13583,6 +13710,8 @@ fn new_split_without_spawnable_shell_keeps_pane_with_warning() {
         program_args: Vec::new(),
         shell_env: None,
         config_shell: None,
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     let mut app = TerminalApp::with_theme(
         rt,
@@ -13621,6 +13750,8 @@ fn new_split_spawns_private_shell_and_close_tears_it_down() {
         program_args: Vec::new(),
         shell_env: None,
         config_shell: None,
+        config_shell_args: Vec::new(),
+        startup_cwd: None,
     };
     let mut app = TerminalApp::with_theme(
         rt,
@@ -13713,6 +13844,8 @@ fn deferred_startup_spawn_hands_the_child_the_committed_window_grid() {
                 program_args: vec!["-c".to_string(), "stty size; sleep 30".to_string()],
                 shell_env: None,
                 config_shell: None,
+                config_shell_args: Vec::new(),
+                startup_cwd: None,
             },
         );
         app.runtime
@@ -13773,6 +13906,8 @@ fn deferred_startup_spawn_falls_back_when_no_resize_arrives() {
             program_args: vec!["-c".to_string(), "exit 0".to_string()],
             shell_env: None,
             config_shell: None,
+            config_shell_args: Vec::new(),
+            startup_cwd: None,
         },
     );
     app.runtime
@@ -13842,7 +13977,9 @@ fn spawn_default_shell_uses_configured_terminal_shell() {
     let result = spawn_default_shell(
         &mut rt,
         Some(fake.to_str().expect("utf8 fake path")),
+        &[],
         Some("/bin/sh"),
+        None,
     );
     assert!(result.is_ok(), "configured shell spawns: {result:?}");
     assert!(rt.has_pty(), "configured shell owns the primary PTY");
@@ -13868,7 +14005,9 @@ fn spawn_default_shell_skips_blank_configured_shell_for_env() {
     let result = spawn_default_shell(
         &mut rt,
         Some("   "),
+        &[],
         Some(env_shell.to_str().expect("utf8 fake path")),
+        None,
     );
     assert!(result.is_ok(), "env shell spawns: {result:?}");
     assert!(rt.has_pty(), "env shell owns the primary PTY");
@@ -13889,7 +14028,9 @@ fn spawn_default_shell_falls_back_when_configured_shell_missing() {
     let result = spawn_default_shell(
         &mut rt,
         Some("/nonexistent-bitty-0298-configured-shell"),
+        &[],
         Some("/bin/sh"),
+        None,
     );
     assert!(result.is_ok(), "fallback /bin/sh spawns: {result:?}");
     assert!(rt.has_pty(), "fallback shell owns the primary PTY");
@@ -13903,7 +14044,7 @@ fn spawn_default_shell_starts_a_child_on_windows() {
     // or cmd.exe) must start a real child instead of failing on /bin/sh.
     require_pty!();
     let mut rt = Runtime::with_defaults().expect("must build");
-    let result = spawn_default_shell(&mut rt, None, None);
+    let result = spawn_default_shell(&mut rt, None, &[], None, None);
     assert!(result.is_ok(), "Windows default shell spawns: {result:?}");
     assert!(
         rt.has_pty(),
@@ -13918,7 +14059,13 @@ fn spawn_default_shell_reports_a_typed_error_for_a_missing_program() {
     // and the platform default still rescues the launch.
     require_pty!();
     let mut rt = Runtime::with_defaults().expect("must build");
-    let result = spawn_default_shell(&mut rt, Some("bitty-2928-nonexistent-shell.exe"), None);
+    let result = spawn_default_shell(
+        &mut rt,
+        Some("bitty-2928-nonexistent-shell.exe"),
+        &[],
+        None,
+        None,
+    );
     assert!(
         result.is_ok(),
         "the platform default rescues a missing configured shell: {result:?}"

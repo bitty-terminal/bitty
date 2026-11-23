@@ -1276,6 +1276,44 @@ pub fn check_default_shell(input: &DefaultShellInput) -> DoctorCheck {
     }
 }
 
+/// PowerShell 7 upgrade advisory for the resolved default shell (bitty#3310).
+///
+/// Windows ships Windows PowerShell 5.1 (`powershell.exe`) and it is still the
+/// last-resort candidate, so a host without `pwsh.exe` runs the legacy shell.
+/// This warns — never fails — and names the exact upgrade command; the startup
+/// chain already prefers `pwsh.exe`, so accepting the platform default in
+/// `bitty init` (which is not pinned into `terminal.shell`) switches over on
+/// the next start with no profile edit.
+#[must_use]
+pub fn check_windows_powershell(input: &DefaultShellInput) -> Option<DoctorCheck> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let DefaultShellInput::Resolved { program, .. } = input else {
+        return None;
+    };
+    let name = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program.as_str())
+        .to_ascii_lowercase();
+    if name != "powershell.exe" {
+        return None;
+    }
+    Some(DoctorCheck::warn(
+        "shell-powershell-7",
+        "PowerShell 7",
+        String::from(
+            "winget install --id Microsoft.PowerShell --source winget \
+             (Bitty then prefers pwsh.exe on the next start)",
+        ),
+        format!(
+            "the resolved default shell is Windows PowerShell 5.1 ({program:?}); \
+             remove a pinned terminal.shell if one is set"
+        ),
+    ))
+}
+
 /// Image protocols, reported honestly: kitty graphics and iTerm2 inline
 /// images are supported as bounded subsets (paint-capable images paint;
 /// kitty transmit-only and unknown actions store without painting) and sixel
@@ -1489,29 +1527,34 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
         .iter()
         .map(String::as_str)
         .collect();
+    let mut checks = vec![
+        check_binary(&inputs.version, inputs.exe_ok, &inputs.exe_detail),
+        check_config(&inputs.config),
+        check_keymaps(&inputs.keymaps),
+        check_fonts(inputs.platform, inputs.font_tool_available, &family_refs),
+        check_font_chain(&inputs.font_chain),
+        check_text_stack(&inputs.text_stack),
+        inputs.probe_platform.display(&inputs.display),
+        inputs.probe_platform.gpu(&inputs.gpu),
+        check_clipboard(&clipboard_refs),
+        check_pty(inputs.platform, inputs.pty_available, &inputs.pty_detail),
+        check_terminfo(inputs.term.as_deref(), inputs.terminfo_found),
+        check_shell(
+            inputs.shell.as_deref(),
+            inputs.shell_exists,
+            inputs.shell_executable,
+        ),
+        check_default_shell(&inputs.default_shell),
+    ];
+    // bitty#3310: the PowerShell 7 advisory only exists where Windows
+    // PowerShell 5.1 is the resolved default, so it is appended instead of
+    // displaced by a placeholder row on every other host.
+    checks.extend(check_windows_powershell(&inputs.default_shell));
+    checks.push(check_image_protocols());
+    checks.push(check_plugins_safe_mode());
     DoctorReport {
         version: inputs.version.clone(),
-        checks: vec![
-            check_binary(&inputs.version, inputs.exe_ok, &inputs.exe_detail),
-            check_config(&inputs.config),
-            check_keymaps(&inputs.keymaps),
-            check_fonts(inputs.platform, inputs.font_tool_available, &family_refs),
-            check_font_chain(&inputs.font_chain),
-            check_text_stack(&inputs.text_stack),
-            inputs.probe_platform.display(&inputs.display),
-            inputs.probe_platform.gpu(&inputs.gpu),
-            check_clipboard(&clipboard_refs),
-            check_pty(inputs.platform, inputs.pty_available, &inputs.pty_detail),
-            check_terminfo(inputs.term.as_deref(), inputs.terminfo_found),
-            check_shell(
-                inputs.shell.as_deref(),
-                inputs.shell_exists,
-                inputs.shell_executable,
-            ),
-            check_default_shell(&inputs.default_shell),
-            check_image_protocols(),
-            check_plugins_safe_mode(),
-        ],
+        checks,
         fixes: Vec::new(),
         fix_error: None,
         fix_requested: false,
@@ -3276,8 +3319,10 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
     };
     // bitty#2928: resolve through the spawn layer's own chain so the reported
     // program and the spawned program can never disagree.
+    // `terminal.shell_args` never changes which program wins, so the diagnosis
+    // resolves the chain with no trailing argv.
     let default_shell =
-        match crate::spawn::resolve_default_shell(config_shell.as_deref(), shell.as_deref()) {
+        match crate::spawn::resolve_default_shell(config_shell.as_deref(), &[], shell.as_deref()) {
             Ok(resolved) => DefaultShellInput::Resolved {
                 program: resolved.program,
                 source: resolved.source.label(),
@@ -4427,6 +4472,44 @@ mod tests {
         // Color enabled: PASS rows carry green.
         let colored = format_table(&report, false);
         assert!(colored.contains('\u{1b}'), "color missing: {colored:?}");
+    }
+
+    #[test]
+    fn windows_powershell_advisory_names_the_winget_upgrade() {
+        // bitty#3310: the advisory exists only where Windows PowerShell 5.1 is
+        // the resolved default, so no other host gains a row.
+        let legacy = DefaultShellInput::Resolved {
+            program: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe".to_string(),
+            source: "platform default",
+        };
+        let modern = DefaultShellInput::Resolved {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
+            source: "platform default",
+        };
+        let advisory = check_windows_powershell(&legacy);
+        if cfg!(windows) {
+            let advisory = advisory.expect("5.1 default warns on Windows");
+            assert_eq!(advisory.status, DoctorStatus::Warn);
+            assert_eq!(advisory.code, EXIT_OK);
+            assert!(
+                advisory
+                    .hint
+                    .contains("winget install --id Microsoft.PowerShell"),
+                "{advisory:?}"
+            );
+            assert!(
+                check_windows_powershell(&modern).is_none(),
+                "PowerShell 7 needs no advisory"
+            );
+        } else {
+            assert!(advisory.is_none(), "the advisory is Windows-only");
+        }
+        assert!(
+            check_windows_powershell(&DefaultShellInput::Unresolved {
+                tried: vec!["pwsh.exe"],
+            })
+            .is_none()
+        );
     }
 
     #[test]

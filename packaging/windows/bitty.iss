@@ -97,10 +97,14 @@ Source: "{#MySourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MySourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 
+; #3310: Windows gives a shortcut with no Start-in the target's directory,
+; so these entries must name the user profile explicitly. Without WorkingDir
+; every shell opened in {app} (the install bin directory) instead of the home
+; directory. The runtime keeps a matching safety net for older shortcuts.
 [Icons]
-Name: "{group}\Bitty"; Filename: "{app}\bitty.exe"
+Name: "{group}\Bitty"; Filename: "{app}\bitty.exe"; WorkingDir: "{userprofile}"
 Name: "{group}\Uninstall Bitty"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Bitty"; Filename: "{app}\bitty.exe"; Tasks: desktopicon
+Name: "{autodesktop}\Bitty"; Filename: "{app}\bitty.exe"; Tasks: desktopicon; WorkingDir: "{userprofile}"
 
 [Run]
-Filename: "{app}\bitty.exe"; Description: "{cm:LaunchProgram,Bitty}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\bitty.exe"; Description: "{cm:LaunchProgram,Bitty}"; WorkingDir: "{userprofile}"; Flags: nowait postinstall skipifsilent

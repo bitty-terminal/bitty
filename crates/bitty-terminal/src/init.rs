@@ -51,7 +51,7 @@ static INIT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// `MAX_LINE_BYTES` posture: overlong lines are truncated, never unbounded).
 pub(crate) const INIT_MAX_LINE_BYTES: usize = 4096;
 
-/// Common shells probed in order when building the shell menu.
+/// Common shells probed in order when building the shell menu on Unix.
 pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
     "/bin/bash",
     "/usr/bin/bash",
@@ -61,6 +61,33 @@ pub(crate) const INIT_COMMON_SHELLS: &[&str] = &[
     "/bin/fish",
     "/bin/sh",
 ];
+
+/// Common shells probed in order when building the shell menu on Windows.
+///
+/// PowerShell 7 comes first so a host that installed it with
+/// `winget install --id Microsoft.PowerShell` gets the modern shell by
+/// default; Windows PowerShell 5.1 (`powershell.exe`) and the command
+/// interpreter every host ships follow. `wsl.exe` launches the default WSL2
+/// distribution — a Linux shell with no extra configuration (issue #3310).
+pub(crate) const INIT_WINDOWS_SHELLS: &[&str] =
+    &["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"];
+
+/// Platform candidate list searched for a shell menu entry.
+#[cfg(windows)]
+const INIT_PLATFORM_SHELLS: &[&str] = INIT_WINDOWS_SHELLS;
+/// Platform candidate list searched for a shell menu entry.
+#[cfg(not(windows))]
+const INIT_PLATFORM_SHELLS: &[&str] = INIT_COMMON_SHELLS;
+
+/// Last-resort menu entry so the menu is never empty.
+///
+/// Unix keeps the POSIX fallback; Windows must never offer `/bin/sh` (the
+/// bitty#3048 bug), so it names the command interpreter every host has.
+#[cfg(windows)]
+pub(crate) const INIT_PLATFORM_FALLBACK_SHELL: &str = "cmd.exe";
+/// Last-resort menu entry so the menu is never empty.
+#[cfg(not(windows))]
+pub(crate) const INIT_PLATFORM_FALLBACK_SHELL: &str = FALLBACK_SHELL;
 
 /// Keybinding preset choice (the vim step, CTX-0149 owner note).
 ///
@@ -411,7 +438,7 @@ pub(crate) fn init_apply_overrides(answers: &mut InitAnswers, overrides: &InitOv
 }
 
 /// Builds the shell menu: `$SHELL` first when set, then the common shells
-/// that exist, deduplicated. Always ends with the POSIX fallback so the
+/// that exist, deduplicated. Always ends with the platform fallback so the
 /// menu — and its default — is never empty. `exists` is injected so tests
 /// stay hermetic (no filesystem).
 pub(crate) fn init_shell_candidates(
@@ -428,13 +455,27 @@ pub(crate) fn init_shell_candidates(
     if let Some(env) = shell_env {
         push_unique(env);
     }
-    for candidate in INIT_COMMON_SHELLS {
+    for candidate in INIT_PLATFORM_SHELLS {
         if exists(candidate) {
             push_unique(candidate);
         }
     }
-    push_unique(FALLBACK_SHELL);
+    push_unique(INIT_PLATFORM_FALLBACK_SHELL);
     out
+}
+
+/// Menu predicate for "this shell exists on this host".
+///
+/// Unix menu entries are absolute paths, so a filesystem check is enough.
+/// Windows menu entries are bare names (`pwsh.exe`, `cmd.exe`, `wsl.exe`):
+/// they must resolve on `PATH`, because a relative-path check would report
+/// every one missing and leave only the hardcoded fallback in the menu.
+fn init_shell_exists(candidate: &str) -> bool {
+    #[cfg(windows)]
+    if !candidate.contains(['\\', '/']) {
+        return crate::doctor::find_on_path(candidate).is_some();
+    }
+    std::path::Path::new(candidate).exists()
 }
 
 /// Resolves the effective `$SHELL` seed for interactive `bitty init` on the
@@ -478,7 +519,7 @@ pub(crate) fn init_unresolved_platform_shell_warning(
 #[cfg(windows)]
 pub(crate) fn init_platform_default_shell()
 -> Result<Option<String>, crate::spawn::UnresolvedDefaultShell> {
-    crate::spawn::resolve_default_shell(None, None).map(|resolved| Some(resolved.program))
+    crate::spawn::resolve_default_shell(None, &[], None).map(|resolved| Some(resolved.program))
 }
 
 #[cfg(not(windows))]
@@ -815,6 +856,40 @@ pub(crate) fn init_shell_source_hint(shell: &str) -> &'static str {
 pub(crate) fn init_bundled_plugin_components(id: &str) -> Vec<String> {
     let _ = id;
     Vec::new()
+}
+
+/// One-line PowerShell 7 advisory for the `bitty init` summary (bitty#3310).
+///
+/// Windows PowerShell 5.1 is what a fresh Windows host resolves when
+/// PowerShell 7 is not installed yet. `configured` is the answer the profile
+/// will carry (`None` means "use the platform chain") and `resolved` the host
+/// probe, so the line fires for both an accepted default and an explicitly
+/// chosen `powershell.exe`. Windows-only: other hosts have no `pwsh.exe` to
+/// recommend.
+pub(crate) fn init_powershell_upgrade_hint(
+    configured: Option<&str>,
+    resolved: Option<&str>,
+) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let program = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| resolved.map(str::trim).filter(|value| !value.is_empty()))?;
+    let name = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if name != "powershell.exe" {
+        return None;
+    }
+    Some(String::from(
+        "bitty init: this host resolves Windows PowerShell 5.1; install the current PowerShell with \
+         `winget install --id Microsoft.PowerShell --source winget` and Bitty prefers pwsh.exe on \
+         the next start (no profile edit needed)",
+    ))
 }
 
 /// Render the `bitty init` missing-extension hint.
@@ -2269,9 +2344,8 @@ fn init_option_nav(raw: &[u8], trimmed: &str) -> Option<InitOptionNav> {
 }
 
 /// How long the TTY key loop waits for the rest of an `ESC`-led burst
-/// before treating a lone `ESC` as cancel (Unix TTY only; headless tests
+/// before treating a lone `ESC` as cancel (live TTY only; headless tests
 /// terminate on EOF instead so they never sleep).
-#[cfg(unix)]
 pub(crate) const INIT_KEY_WAIT_MS: u16 = 50;
 
 /// Whether an `ESC`-led byte run is a complete key sequence versus a
@@ -2326,6 +2400,19 @@ pub(crate) struct InitRawGuard {
     original_flags: nix::fcntl::OFlag,
 }
 
+/// Platform guard that puts the live terminal into single-keypress mode for
+/// the pickers, restored on drop (CTX-1755 Windows follow-up).
+///
+/// Unix clears canonical input/echo/signals through `termios`; Windows clears
+/// the same console bits and enables virtual-terminal input in the reviewed
+/// `bitty-winjob` console adapter.
+#[cfg(unix)]
+pub(crate) type InitInputGuard = InitRawGuard;
+
+/// See the Unix [`InitInputGuard`] alias.
+#[cfg(windows)]
+pub(crate) type InitInputGuard = bitty_winjob::PickerConsoleGuard;
+
 /// Enters cbreak mode on stdin without terminal signals (`ISIG` cleared) so
 /// `Ctrl-C` delivers `0x03` into the picker key loops for frame cleanup and
 /// `Drop`-based restoration instead of raising `SIGINT`. `None` when stdin has
@@ -2366,6 +2453,20 @@ pub(crate) fn init_raw_guard() -> Option<InitRawGuard> {
     })
 }
 
+/// Enters single-keypress input for the pickers on a live Windows console
+/// (CTX-1755 Windows follow-up, bitty#3310).
+///
+/// Clears line input, echo, processed input, and quick-edit and enables
+/// virtual-terminal input so arrow keys arrive as the ANSI sequences the
+/// pickers already parse; enables virtual-terminal output so the in-place
+/// repaint's cursor-up/clear-line work in a stock console host. `None` when
+/// stdin or stdout is not a console or the host rejects a mode (an older
+/// conhost without VT input): the caller keeps the line loop.
+#[cfg(windows)]
+pub(crate) fn init_raw_guard() -> Option<bitty_winjob::PickerConsoleGuard> {
+    bitty_winjob::enter_picker_input().ok()
+}
+
 #[cfg(unix)]
 impl Drop for InitRawGuard {
     fn drop(&mut self) {
@@ -2381,16 +2482,13 @@ impl Drop for InitRawGuard {
     }
 }
 
-/// Whether stdin has a key waiting, blocking at most `timeout` (Unix only).
+/// Whether stdin has a key waiting, blocking at most `timeout_ms`.
 ///
-/// Buffered bytes count before the kernel queue: `StdinLock` reads ahead,
-/// so a readiness poll alone misses a swallowed escape burst. With the
+/// Buffered bytes count before the platform queue: `StdinLock` reads ahead,
+/// so a readiness poll alone misses a swallowed escape burst. With the Unix
 /// guard's `O_NONBLOCK` the buffer peek never blocks.
 #[cfg(unix)]
-pub(crate) fn init_stdin_poll_ready(
-    input: &mut dyn std::io::BufRead,
-    timeout: nix::poll::PollTimeout,
-) -> bool {
+pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms: u16) -> bool {
     if matches!(input.fill_buf(), Ok(buf) if !buf.is_empty()) {
         return true;
     }
@@ -2400,7 +2498,67 @@ pub(crate) fn init_stdin_poll_ready(
         stdin.as_fd(),
         nix::poll::PollFlags::POLLIN,
     )];
-    matches!(nix::poll::poll(&mut fds, timeout), Ok(count) if count > 0)
+    matches!(
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(timeout_ms)),
+        Ok(count) if count > 0
+    )
+}
+
+/// [`init_stdin_poll_ready`] on a live Windows console.
+///
+/// The console input handle is waitable and signaled when a key is available;
+/// the same 50 ms bound lets the key loop notice a bare `ESC` without a second
+/// grammar. Buffered bytes still win first, mirroring Unix.
+#[cfg(windows)]
+pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms: u16) -> bool {
+    if matches!(input.fill_buf(), Ok(buf) if !buf.is_empty()) {
+        return true;
+    }
+    bitty_winjob::wait_for_key(u32::from(timeout_ms))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn init_stdin_poll_ready(_input: &mut dyn std::io::BufRead, _timeout_ms: u16) -> bool {
+    false
+}
+
+/// Readiness wait with no timeout (the Unix `WouldBlock` arm).
+#[cfg(unix)]
+fn init_stdin_wait_blocking(input: &mut dyn std::io::BufRead) -> bool {
+    use std::os::unix::io::AsFd as _;
+    let stdin = std::io::stdin();
+    let mut fds = [nix::poll::PollFd::new(
+        stdin.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    if let Ok(buffer) = input.fill_buf() {
+        if !buffer.is_empty() {
+            return true;
+        }
+    }
+    matches!(
+        nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE),
+        Ok(count) if count > 0
+    )
+}
+
+/// [`init_stdin_wait_blocking`] for a Windows console.
+///
+/// Console reads in virtual-terminal input mode do not report `WouldBlock`,
+/// so this arm is a safety net: it keeps the documented "wait for input"
+/// meaning instead of mistaking a slow reader for EOF.
+#[cfg(windows)]
+fn init_stdin_wait_blocking(input: &mut dyn std::io::BufRead) -> bool {
+    loop {
+        if init_stdin_poll_ready(input, INIT_KEY_WAIT_MS) {
+            return true;
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn init_stdin_wait_blocking(_input: &mut dyn std::io::BufRead) -> bool {
+    false
 }
 
 /// Reads one stdin byte for the key loop, waiting as long as needed.
@@ -2410,9 +2568,9 @@ pub(crate) fn init_stdin_poll_ready(
 /// surfaces as `WouldBlock`: park in `poll` instead of spinning or (worse)
 /// mistaking a thinking user for EOF.
 ///
-/// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
-/// through tests, hence the dead-code allowance there.)
-#[cfg_attr(not(unix), allow(dead_code))]
+/// (Dispatched on Unix and a live Windows console; other targets and headless
+/// runs only reach this through tests, hence the dead-code allowance.)
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
     let mut byte = [0u8; 1];
     loop {
@@ -2420,12 +2578,9 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
             Ok(0) => return None,
             Ok(_) => return Some(byte[0]),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                #[cfg(unix)]
-                if !init_stdin_poll_ready(input, nix::poll::PollTimeout::NONE) {
+                if !init_stdin_wait_blocking(input) {
                     return None;
                 }
-                #[cfg(not(unix))]
-                return None;
             }
             Err(_) => return None,
         }
@@ -2441,9 +2596,9 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
 /// preview-free (every non-theme step, and every non-interactive run).
 pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
 
-/// Queries the live Unix terminal window dimensions `(rows, optional cols)`
+/// Queries the live terminal window dimensions `(rows, optional cols)`
 /// when repainting in place and `ws_row > 0`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn init_live_terminal_winsize(inplace: bool) -> Option<(u16, Option<u16>)> {
     #[cfg(unix)]
     if inplace {
@@ -2455,7 +2610,13 @@ fn init_live_terminal_winsize(inplace: bool) -> Option<(u16, Option<u16>)> {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    if inplace {
+        if let Some((rows, cols)) = bitty_winjob::viewport_size() {
+            return Some((rows, Some(cols)));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = inplace;
     None
 }
@@ -3853,9 +4014,10 @@ pub(crate) fn init_ask_option<T>(
     mut preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
-    // Single-keypress navigation when both ends are live TTYs (Unix raw
-    // mode); every other setup keeps the line loop byte-identical.
-    #[cfg(unix)]
+    // Single-keypress navigation when both ends are live TTYs (Unix raw mode
+    // or the Windows console picker mode); every other setup keeps the line
+    // loop byte-identical.
+    #[cfg(any(unix, windows))]
     if tty_interactive {
         if let Some(_raw) = init_raw_guard() {
             return init_picker_key_loop(
@@ -3871,12 +4033,11 @@ pub(crate) fn init_ask_option<T>(
                 // `tty_interactive` implies stdout is a TTY (see the dispatch
                 // in `run_init_subcommand_with_io`), so repaint in place.
                 true,
-                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into()),
+                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS),
                 preview,
             );
         }
     }
-    #[cfg(not(unix))]
     let _ = tty_interactive;
     let mut cursor = default_index.min(options.len() - 1);
     let mut failures: usize = 0;
@@ -4481,6 +4642,12 @@ fn init_terminal_columns() -> Option<usize> {
             }
         }
     }
+    #[cfg(windows)]
+    {
+        if let Some((_, cols)) = bitty_winjob::viewport_size() {
+            return Some(usize::from(cols));
+        }
+    }
     None
 }
 
@@ -4852,7 +5019,12 @@ fn run_init_interactive_impl(
     }
     #[cfg(unix)]
     let inplace_steps = tty_interactive && nix::sys::termios::tcgetattr(std::io::stdin()).is_ok();
-    #[cfg(not(unix))]
+    // A live Windows console is exactly `tty_interactive`: the dispatch sets
+    // it only when stdin and stdout are terminals (`IsTerminal` on Windows is
+    // true for console handles), and the picker guard enables VT output.
+    #[cfg(windows)]
+    let inplace_steps = tty_interactive && bitty_winjob::is_console_input();
+    #[cfg(not(any(unix, windows)))]
     let inplace_steps = false;
     let mut preview_rows: usize = 0;
     if !inplace_steps {
@@ -6620,9 +6792,9 @@ pub(crate) fn init_prompt_plugin_selection(
         return Ok(Vec::new());
     }
     // Single-keypress checkbox selection when both ends are live TTYs
-    // (Unix raw mode); piped runs, failed raw setup, and non-Unix setups
-    // keep the line loop byte-identical.
-    #[cfg(unix)]
+    // (Unix raw mode or the Windows console picker mode); piped runs and a
+    // failed raw setup keep the line loop byte-identical.
+    #[cfg(any(unix, windows))]
     if tty_interactive {
         if let Some(_raw) = init_raw_guard() {
             // Ensure the frame starts at column 0 without adding an orphan
@@ -6635,11 +6807,10 @@ pub(crate) fn init_prompt_plugin_selection(
                 inventory,
                 color,
                 true,
-                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into()),
+                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS),
             );
         }
     }
-    #[cfg(not(unix))]
     let _ = (tty_interactive, color);
     let mut lines = vec![INIT_PLUGIN_PROMPT.to_string()];
     lines.extend(init_plugin_inventory_groups(inventory, &|_, id| {
@@ -6841,12 +7012,20 @@ pub(crate) fn run_init_subcommand_with_io(
     // it from `env.shell` (review nit 4).
     let mut effective_shell: Option<String> = None;
     // The wizard's Enter answer when the platform probe failed and no seed
-    // resolved: its menu still ends with `FALLBACK_SHELL`, which is bitty#3048
-    // itself. Remembered so that answer can be dropped below.
+    // resolved: its menu still ends with the platform fallback, which is
+    // bitty#3048 itself. Remembered so that answer can be dropped below.
     let mut unresolved_menu_default: Option<String> = None;
+    // The probe-resolved host default (Windows PowerShell 7/5.1, `cmd.exe`).
+    // Accepting it must not pin a version-specific path into `terminal.shell`:
+    // leaving the leaf unset keeps the platform chain live, so a later
+    // `winget install --id Microsoft.PowerShell` upgrade is picked up on the
+    // next start instead of a stale 5.1 path being frozen into the profile.
+    let mut platform_menu_default: Option<String> = None;
     // The wizard's own menu predicate, bound once so "the answer was the menu
-    // default" is decided from the same source the menu was built from.
-    let shell_exists: fn(&str) -> bool = |path| std::path::Path::new(path).exists();
+    // default" is decided from the same source the menu was built from. On
+    // Windows a bare candidate name is resolved on `PATH` (the menu offers
+    // `pwsh.exe`/`cmd.exe`/`wsl.exe`), never against the current directory.
+    let shell_exists: fn(&str) -> bool = init_shell_exists;
     let mut answers = if let Some(preset) = init_preset {
         let mut answers = init_preset_answers(preset);
         init_apply_overrides(&mut answers, &overrides);
@@ -6901,8 +7080,8 @@ pub(crate) fn run_init_subcommand_with_io(
             None
         };
         // The host platform default (Windows only) is the last seed before
-        // the menu's POSIX fallback. An unresolved probe is warned about — on
-        // the injected writer, so the dispatch test can pin the line — and
+        // the menu's platform fallback. An unresolved probe is warned about —
+        // on the injected writer, so the dispatch test can pin the line — and
         // leaves the wizard with no seed: its menu default is then a shell
         // this host never resolved, which `unresolved_menu_default` records
         // so the answer is dropped after the wizard (#3048).
@@ -6910,7 +7089,19 @@ pub(crate) fn run_init_subcommand_with_io(
             .platform_shell
             .unwrap_or(&init_platform_default_shell as &dyn Fn() -> _);
         match init_effective_shell_env_for_host(env.shell, platform_default) {
-            Ok(shell) => effective_shell = shell,
+            Ok(shell) => {
+                // Record the probe answer only when `$SHELL` was not the
+                // seed; an explicit environment shell stays the user's choice.
+                if env
+                    .shell
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                {
+                    platform_menu_default = shell.clone();
+                }
+                effective_shell = shell;
+            }
             Err(err) => {
                 let _ = writeln!(output, "{}", init_unresolved_platform_shell_warning(&err));
                 let _ = output.flush();
@@ -6941,7 +7132,18 @@ pub(crate) fn run_init_subcommand_with_io(
         // Unresolved platform probe (Windows only in production): the warning
         // just promised no `terminal.shell` unless the user types one, so an
         // Enter on the menu's synthesized default must not become
-        // `shell = "/bin/sh"` (#3048). A path the user typed is kept verbatim.
+        // `shell = "cmd.exe"`/`"/bin/sh"` (#3048). A path the user typed is
+        // kept verbatim.
+        if answers.shell.as_deref() == Some(menu_default) {
+            answers.shell = None;
+        }
+    }
+    if let Some(menu_default) = platform_menu_default.as_deref() {
+        // Accepting the detected host shell records "use the platform chain",
+        // not that one binary path: the chain re-resolves on every start, so
+        // installing PowerShell 7 after `bitty init` upgrades the default
+        // without the user editing the profile (bitty#3310). Choosing any
+        // other entry (or typing a path) is still written verbatim.
         if answers.shell.as_deref() == Some(menu_default) {
             answers.shell = None;
         }
@@ -7324,6 +7526,12 @@ pub(crate) fn run_init_subcommand_with_io(
                     "bitty init: wire Tab completion + prompt hooks with `{line}`{source_hint} (detected shell: {detected}; `bitty shell-init --help` lists all five)"
                 );
             }
+            let _ = output.flush();
+        }
+        if let Some(hint) =
+            init_powershell_upgrade_hint(answers.shell.as_deref(), effective_shell.as_deref())
+        {
+            let _ = writeln!(output, "{hint}");
             let _ = output.flush();
         }
         0

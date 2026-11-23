@@ -107,8 +107,30 @@ impl Runtime {
         program: &str,
         args: &[&str],
     ) -> Result<(), RuntimeError> {
+        self.spawn_shell_with_args_in(program, args, None)
+    }
+
+    /// [`Self::spawn_shell_with_args`] with a default working directory for
+    /// the child.
+    ///
+    /// `Some(dir)` replaces the inherited process directory (the launcher's
+    /// "Start in") unless a captured `OSC 7` restore already names one for the
+    /// focused leaf, which always wins because it is the user's own last
+    /// directory. Used by the startup path so a Windows shortcut never drops
+    /// the user into the install directory (bitty#3310).
+    pub fn spawn_shell_with_args_in(
+        &mut self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> Result<(), RuntimeError> {
         if program.trim().is_empty() {
             return Err(RuntimeError::InvalidConfig("program must not be empty"));
+        }
+        if cwd.is_some_and(|dir| !dir.is_dir()) {
+            return Err(RuntimeError::InvalidConfig(
+                "spawn cwd is not an existing directory",
+            ));
         }
         // CTX-0343: binding the primary shell turns the focused leaf into a
         // `terminal`-content `View`; a `ws:`/`view:` entry that first matches
@@ -158,7 +180,12 @@ impl Runtime {
         // CTX-0585 (M1-25): the primary restart attach must seed its cwd from
         // the captured `OSC 7` report, exactly like a split spawn. The leaf
         // focused at attach time becomes the owner below, so resolve against
-        // it; `session_pending_cwd` fails open when there is no capture.
+        // it; `session_pending_cwd` fails open when there is no capture. A
+        // startup default (bitty#3310) applies first, so a restored directory
+        // still wins over the launcher's directory.
+        if let Some(dir) = cwd {
+            builder = builder.cwd(dir);
+        }
         if let Some(owner) = self.focus.focused() {
             if let Some(cwd) = self.session_pending_cwd(&owner) {
                 builder = builder.cwd(cwd);

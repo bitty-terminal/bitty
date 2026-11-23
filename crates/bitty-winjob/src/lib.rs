@@ -62,7 +62,10 @@ mod job;
 #[cfg(windows)]
 pub use conpty::{ChildSpec, ConPtyChild, ConPtyMaster};
 #[cfg(windows)]
-pub use console::{ConsoleStreams, adopt_parent_console};
+pub use console::{
+    ConsoleStreams, PickerConsoleGuard, adopt_parent_console, enter_picker_input, is_console_input,
+    viewport_size, wait_for_key,
+};
 #[cfg(windows)]
 pub use job::{
     CREATE_SUSPENDED_FLAG, JobMember, JobObject, process_is_running, resume_suspended_process,

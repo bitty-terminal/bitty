@@ -2159,6 +2159,7 @@ fn build_plan_from_data(
                 Some(TerminalConfig {
                     scrollback: scrollback as u32,
                     shell: t.shell,
+                    shell_args: t.shell_args.unwrap_or_default(),
                     scroll_lines_per_notch,
                     scroll_pixels_per_notch,
                     page_scroll_percent,

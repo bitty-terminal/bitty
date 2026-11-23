@@ -3959,6 +3959,11 @@ const SCHEMA_FIELDS: &[SchemaField] = &[
         get: get_terminal_shell,
     },
     SchemaField {
+        path: "terminal.shell_args",
+        kind: FieldKind::List,
+        get: get_terminal_shell_args,
+    },
+    SchemaField {
         path: "terminal.scroll_lines_per_notch",
         kind: FieldKind::Integer,
         get: get_scroll_lines_per_notch,
@@ -4134,6 +4139,9 @@ fn get_window_radius_px(e: &bitty_config::EffectiveConfig) -> ConfigValue {
 }
 fn get_terminal_scrollback(e: &bitty_config::EffectiveConfig) -> ConfigValue {
     ConfigValue::Number(format!("{}", e.terminal.scrollback))
+}
+fn get_terminal_shell_args(e: &bitty_config::EffectiveConfig) -> ConfigValue {
+    ConfigValue::List(e.terminal.shell_args.clone())
 }
 fn get_terminal_shell(e: &bitty_config::EffectiveConfig) -> ConfigValue {
     e.terminal

@@ -38,9 +38,10 @@ use windows_sys::Win32::Foundation::{
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
-    ATTACH_PARENT_PROCESS, AttachConsole, COORD, ClosePseudoConsole, CreatePseudoConsole,
-    GetStdHandle, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE,
-    SetStdHandle,
+    ATTACH_PARENT_PROCESS, AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole,
+    CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON,
+    PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -692,6 +693,66 @@ pub(crate) fn set_standard_stream(which: STD_HANDLE, handle: RawHandle) -> io::R
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Reads the current mode of console stream `which`.
+///
+/// Fails with `ERROR_INVALID_HANDLE` (or another console error) when the
+/// stream is not a console (a pipe, a file, `NUL`): callers treat that as
+/// "not a terminal" rather than as a failure.
+pub(crate) fn console_mode(which: STD_HANDLE) -> io::Result<u32> {
+    let mut mode = 0u32;
+    // SAFETY: `mode` is a writable `u32` on this stack frame; `which` is one
+    // of the documented `STD_*_HANDLE` constants.
+    check(unsafe { GetConsoleMode(GetStdHandle(which), &raw mut mode) })?;
+    Ok(mode)
+}
+
+/// Replaces the mode of console stream `which`.
+///
+/// The caller passes modes it read with [`console_mode`], so no bit is
+/// invented here; a non-console stream reports the console error unchanged.
+pub(crate) fn set_console_mode(which: STD_HANDLE, mode: u32) -> io::Result<()> {
+    // SAFETY: `which` names a documented standard handle and `mode` is a
+    // plain value; no pointer or caller buffer crosses the boundary.
+    check(unsafe { SetConsoleMode(GetStdHandle(which), mode) })
+}
+
+/// Blocks at most `timeout_ms` until console input is ready.
+///
+/// A console input handle is a waitable object that is signaled when input
+/// is available; the timeout bounds the wait so a picker can repaint.
+pub(crate) fn wait_for_console_input(timeout_ms: u32) -> bool {
+    // SAFETY: `GetStdHandle` only reads the process handle-table entry;
+    // `WaitForSingleObject` on a console input handle has no out-parameter and
+    // never takes ownership of the handle.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    // SAFETY: `handle` came from `GetStdHandle` above and is used only for
+    // this wait; no other thread can close it.
+    matches!(
+        unsafe { WaitForSingleObject(handle, timeout_ms) },
+        WAIT_OBJECT_0
+    )
+}
+
+/// Visible size of the console window attached to stdout, when there is one.
+///
+/// Reads `srWindow` (viewport, not buffer) so a picker sizes itself to what
+/// the user can actually see. Returns `(rows, columns)`.
+pub(crate) fn console_viewport_size() -> io::Result<(u16, u16)> {
+    let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+    // SAFETY: `info` is a writable `CONSOLE_SCREEN_BUFFER_INFO` on this stack
+    // frame and stdout is only queried, never modified.
+    check(unsafe { GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &raw mut info) })?;
+    let rows = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
+    let cols = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+    Ok((
+        u16::try_from(rows).unwrap_or(u16::MAX).max(1),
+        u16::try_from(cols).unwrap_or(u16::MAX).max(1),
+    ))
 }
 
 #[cfg(test)]

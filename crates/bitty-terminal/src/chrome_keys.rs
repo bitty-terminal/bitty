@@ -7896,6 +7896,8 @@ mod tests {
             program_args: Vec::new(),
             shell_env: None,
             config_shell: None,
+            config_shell_args: Vec::new(),
+            startup_cwd: None,
         };
         let mut app = TerminalApp::with_theme(
             rt,

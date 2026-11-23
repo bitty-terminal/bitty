@@ -1413,6 +1413,10 @@ impl ValueSnapshot {
                 }
                 let v = table.get_value(ctx, i);
                 if matches!(v, Value::Nil) {
+                    // A hole inside the border is malformed: Lua's sequence
+                    // view stops there, so accepting the prefix would hand an
+                    // array reader a silently shortened list (bitty#3310).
+                    has_non_string_keys = true;
                     break;
                 }
                 seq.push(match v {
@@ -3089,7 +3093,7 @@ fn expect_array<'a>(path: &str, val: &'a ValueSnapshot) -> Result<&'a [ValueSnap
             ..
         } => {
             if !pairs.is_empty() || *has_non_string_keys {
-                return Err(format!("{path}: expected array (found map keys)"));
+                return Err(format!("{path}: expected array (found map keys or gaps)"));
             }
             Ok(seq)
         }
@@ -3114,7 +3118,7 @@ fn extract_keymaps(val: &ValueSnapshot) -> Result<Vec<KeymapData>, String> {
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("keymaps: expected array (found map keys)".to_string());
+        return Err("keymaps: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!("keymaps: exceeds {MAX_CONFIG_KEYMAPS} entries"));
@@ -3172,7 +3176,7 @@ fn extract_plugins(val: &ValueSnapshot) -> Result<Vec<PluginData>, String> {
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("plugins: expected array (found map keys)".to_string());
+        return Err("plugins: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!("plugins: exceeds {MAX_CONFIG_PLUGINS} entries"));
@@ -3224,7 +3228,7 @@ fn extract_panel_rules(val: &ValueSnapshot) -> Result<Vec<PanelRuleData>, String
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("panel_rules: expected array (found map keys)".to_string());
+        return Err("panel_rules: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!(
@@ -3524,6 +3528,8 @@ mod tests {
             // view, so it must be refused instead of altering the argv list.
             r#"return { terminal = { scrollback = 10000, shell_args = { [0] = "-d", "Ubuntu" } } }"#,
             r#"return { terminal = { scrollback = 10000, shell_args = { [3] = "-d" } } }"#,
+            // An interior hole would shorten the sequence silently.
+            r#"return { terminal = { scrollback = 10000, shell_args = { "-d", nil, "Ubuntu" } } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

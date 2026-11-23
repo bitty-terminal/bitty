@@ -39,9 +39,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole,
-    CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
-    GetStdHandle, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+    CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON,
+    INPUT_RECORD, KEY_EVENT, PSEUDOCONSOLE_INHERIT_CURSOR, PeekConsoleInputW, ResizePseudoConsole,
+    STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -738,17 +738,50 @@ pub(crate) fn wait_for_console_input(timeout_ms: u32) -> bool {
     )
 }
 
-/// Whether the console input queue has at least one event waiting.
+/// Whether a queued console record will hand the next read a character.
 ///
-/// Reads the queue depth instead of reading a byte, so a picker can decide
-/// readiness without blocking past its timeout (bitty#3310 review).
-pub(crate) fn console_input_pending() -> bool {
-    let mut count = 0u32;
-    // SAFETY: `count` is a writable `u32` on this stack frame; the handle is
-    // the documented standard input handle and is only queried.
-    let ok =
-        unsafe { GetNumberOfConsoleInputEvents(GetStdHandle(STD_INPUT_HANDLE), &raw mut count) };
-    ok != 0 && count > 0
+/// Key-up, focus, mouse, and menu records never produce bytes for a
+/// non-line-mode read, so a queue-depth check would report readiness for a
+/// record the read then blocks on (bitty#3310 review). This peeks a bounded
+/// window of the queue and requires a key-down record; anything deeper than
+/// the window keeps the caller's bounded wait.
+pub(crate) fn console_has_key_press() -> bool {
+    /// Queue records inspected per peek. A pending key press is normally the
+    /// first record; the window only needs to skip a few stale releases.
+    const PEEK_RECORDS: usize = 16;
+    let mut records = [console_input_record(); PEEK_RECORDS];
+    let mut read = 0u32;
+    // SAFETY: `records` is a live array of `PEEK_RECORDS` `INPUT_RECORD`s and
+    // the kernel writes at most that many entries into it; the standard input
+    // handle is only queried and never closed here.
+    let ok = unsafe {
+        PeekConsoleInputW(
+            GetStdHandle(STD_INPUT_HANDLE),
+            records.as_mut_ptr(),
+            u32::try_from(PEEK_RECORDS).unwrap_or(u32::MAX),
+            &raw mut read,
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    records
+        .iter()
+        .take(usize::try_from(read).unwrap_or(0))
+        // SAFETY: `EventType == KEY_EVENT` means the union's `KeyEvent` arm is
+        // the one the kernel filled; key-down is the only record a
+        // non-line-mode read turns into bytes.
+        .any(|record| {
+            u32::from(record.EventType) == KEY_EVENT
+                && unsafe { record.Event.KeyEvent.bKeyDown } != 0
+        })
+}
+
+/// A zeroed console `INPUT_RECORD` for the peek buffer.
+fn console_input_record() -> INPUT_RECORD {
+    // SAFETY: `INPUT_RECORD` is a plain C struct of integers and unions whose
+    // all-zero bit pattern is a valid (no-event) record.
+    unsafe { std::mem::zeroed() }
 }
 
 /// Visible size of the console window attached to stdout, when there is one.

@@ -2520,9 +2520,11 @@ pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms
 pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms: u16) -> bool {
     // Ask the console queue instead of the reader: `fill_buf()` would read
     // and block past the timeout, so a lone `ESC` would never reach the
-    // cancellation branch until another key arrived. Bytes a previous read
-    // already buffered are drained by the key loop after this bounded wait,
-    // which is exactly the escape-burst timing the grammar expects.
+    // cancellation branch until another key arrived. Only a queued key-down
+    // counts as ready, so a stale key-up or focus record cannot make the next
+    // read block. Bytes a previous read already buffered are drained by the
+    // key loop after this bounded wait, which is exactly the escape-burst
+    // timing the grammar expects.
     let _ = input;
     if bitty_winjob::input_pending() {
         return true;

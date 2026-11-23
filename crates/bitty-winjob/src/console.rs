@@ -320,11 +320,15 @@ pub fn is_console_input() -> bool {
     crate::ffi::console_mode(STD_INPUT_HANDLE).is_ok()
 }
 
-/// Whether a console event is already queued (never blocks).
+/// Whether a key press is already queued (never blocks).
+///
+/// Only a key-down record produces bytes for the pickers' non-line-mode read;
+/// key-up, focus, and mouse records are skipped so a readiness report always
+/// means the next read returns without waiting.
 #[cfg(windows)]
 #[must_use]
 pub fn input_pending() -> bool {
-    crate::ffi::console_input_pending()
+    crate::ffi::console_has_key_press()
 }
 
 /// Whether a key is waiting, blocking at most `timeout_ms`.

@@ -2124,7 +2124,16 @@ jobs:
               $wsh = New-Object -ComObject WScript.Shell
               $lnk = $wsh.CreateShortcut($shortcut)
               if ($lnk.TargetPath -ne $installedExe) { throw "shortcut target mismatch: $($lnk.TargetPath)" }
-              if ($lnk.WorkingDirectory -ne $installDir) { throw "shortcut working directory mismatch: $($lnk.WorkingDirectory)" }
+              # bitty#3310: the Start menu shortcut must start in the user
+              # profile, never in the install directory the shell used to
+              # inherit.
+              $expectedStartIn = $env:USERPROFILE.TrimEnd('\')
+              if ("$($lnk.WorkingDirectory)".TrimEnd('\') -ne $expectedStartIn) {
+                throw "shortcut start-in mismatch: $($lnk.WorkingDirectory) (expected $expectedStartIn)"
+              }
+              if ("$($lnk.WorkingDirectory)".TrimEnd('\') -ieq $installDir.TrimEnd('\')) {
+                throw 'shortcut start-in is still the install directory (bitty#3310)'
+              }
               if ($lnk.IconLocation -ne "$installedIco,0") { throw "shortcut icon mismatch: $($lnk.IconLocation)" }
               Write-Host "Start Menu shortcut OK (icon $($lnk.IconLocation))"
             }

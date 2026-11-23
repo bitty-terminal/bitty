@@ -114,6 +114,41 @@ fn selection_across_rows_includes_newline() {
 }
 
 #[test]
+fn copy_selection_larger_than_the_paste_bound_copies_in_full() {
+    // bitty#3311: `Ctrl+Shift+C` copies whatever the user selected. A
+    // selection over the 8192-byte paste bound used to be refused by the
+    // untrusted-write guard, so the chord silently did nothing.
+    let mut rt = make_runtime();
+    // Grow the grid so one screen of text is well over the paste bound.
+    rt.handle_resize(bitty_platform::PhysicalSize::new(4000, 800))
+        .expect("headless resize");
+    let (cols, rows) = (rt.state().width(), rt.state().height());
+    assert!(
+        cols * rows > CLIPBOARD_MAX_BYTES,
+        "grid too small for the fixture: {cols}x{rows}"
+    );
+    let line = "x".repeat(cols);
+    for _ in 0..rows {
+        rt.handle_pty_bytes(format!("{line}\r\n").as_bytes());
+    }
+    let last_row = u16::try_from(rows - 1).expect("rows fit a cell coordinate");
+    let last_col = u16::try_from(cols - 1).expect("cols fit a cell coordinate");
+    rt.start_selection(CellPos::new(0, 0));
+    rt.end_selection(CellPos::new(last_row, last_col));
+    let copied = rt
+        .copy_selection_to_clipboard()
+        .expect("large copy must succeed")
+        .expect("text");
+    assert!(
+        copied.len() > CLIPBOARD_MAX_BYTES,
+        "fixture must exceed the paste bound: {}",
+        copied.len()
+    );
+    assert_eq!(rt.clipboard().headless_contents(), copied);
+    assert!(rt.last_clipboard_error().is_none());
+}
+
+#[test]
 fn copy_selection_to_clipboard_headless() {
     let mut rt = make_runtime();
     feed_text(&mut rt, "copy me");

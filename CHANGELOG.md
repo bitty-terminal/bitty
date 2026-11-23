@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a large selection no longer fails silently (`CTX-1932`;
+  bitty#3311):** the app copy path reused the 8192-byte bound that exists to
+  limit *foreign* clipboard data, so `Ctrl+Shift+C` (and copy-on-select)
+  refused every selection over 8 KiB with nothing visible in the window. A
+  selection is Bitty's own data and now has its own 16 MiB write bound, while
+  paste, OSC 52 writes, and every acquisition path keep the audited 8192-byte
+  ceiling.
+
 - **Windows shortcuts no longer open shells in the install directory
   (`CTX-1930`; bitty#3310):** the Inno Setup shortcuts and `install.ps1` both
   set the start-in directory to `%USERPROFILE%`, so `bitty` no longer opens in

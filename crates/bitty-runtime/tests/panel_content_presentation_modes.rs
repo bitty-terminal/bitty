@@ -1159,3 +1159,89 @@ fn release_leaves_a_third_party_mode_alone_after_the_user_unzoomed() {
         "and the layer is gone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row 14: a fullscreen re-entry after the user gave the zoom back preserves
+// the displaced mode the first entry recorded
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fullscreen_re_entry_after_an_out_of_band_unzoom_preserves_the_displaced_mode() {
+    bitty_test_support::require_pty!();
+    let mut rt = runtime();
+    install(&mut rt, two_panes());
+    spawn_pane(&mut rt);
+    install_panels_at(&mut rt, &[PANE]);
+    let zoom = install_zoom_owner(&mut rt);
+    let presented = rt
+        .present_panel_content(PANE, text_layer("dashboard"))
+        .expect("present is admitted");
+
+    // Tiled -> Floating -> Fullscreen: the first entry records the `Floating`
+    // leaf it displaced, while the record's prior mode stays `Tiled`.
+    rt.set_panel_content_presentation(PANE, presented.token, PresentationMode::Floating)
+        .expect("a presented panel may float");
+    rt.set_panel_content_presentation(PANE, presented.token, PresentationMode::Fullscreen)
+        .expect("a floated layer fullscreens through the owner");
+    assert_eq!(zoom.state.borrow().engages, 1);
+
+    // The user unzooms out of band: the leaf returns to the displaced
+    // `Floating` mode, but the record still describes fullscreen.
+    zoom.unzoom_out_of_band(&mut rt);
+    assert_eq!(
+        rt.view_presentation(PANE),
+        Some(PresentationMode::Floating),
+        "the out-of-band unzoom returns the captured tree, leaf at the displaced mode"
+    );
+    assert!(
+        zoom.state.borrow().backup.is_none(),
+        "the zoom left with the user"
+    );
+
+    // Fullscreen again: a re-entry, so the displaced mode the record keeps is
+    // still `Floating` — the proxy's `Fullscreen` stamp is the gate's own
+    // request, never a mode the layer displaced.
+    let re_entered = rt
+        .set_panel_content_presentation(PANE, presented.token, PresentationMode::Fullscreen)
+        .expect("the layer fullscreens again through the owner");
+    assert_eq!(
+        zoom.state.borrow().engages,
+        2,
+        "the re-entry engages the zoom again"
+    );
+    assert_eq!(re_entered.presentation, PresentationMode::Fullscreen);
+    assert_eq!(
+        re_entered.pre_fullscreen_presentation,
+        Some(PresentationMode::Floating),
+        "a re-entry keeps the displaced mode the first entry recorded"
+    );
+    assert_eq!(
+        rt.view_presentation(PANE),
+        Some(PresentationMode::Fullscreen),
+        "the proxy carries the re-entered mode"
+    );
+
+    // Release: the give-back returns the zoom and then the mode the record
+    // displaced — `Tiled` — instead of refusing on the `Fullscreen` stamp a
+    // re-entry would otherwise have written.
+    let restored = rt
+        .release_panel_content(PANE, presented.token)
+        .expect("release restores the terminal content");
+    assert_eq!(restored.prior_presentation, PresentationMode::Tiled);
+    assert_eq!(
+        restored.pre_fullscreen_presentation,
+        Some(PresentationMode::Floating)
+    );
+    assert_eq!(
+        zoom.state.borrow().restores,
+        1,
+        "the release gave the zoom back exactly once"
+    );
+    assert_eq!(rt.layout().leaf_ids().len(), 2, "the real tree is back");
+    assert_eq!(
+        rt.view_presentation(PANE),
+        Some(PresentationMode::Tiled),
+        "release gives back the mode the first fullscreen displaced"
+    );
+    assert!(!rt.content_layer_presented(PANE), "the layer is gone");
+}

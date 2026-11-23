@@ -2181,9 +2181,12 @@ impl PanelRuntime {
     /// [`Runtime::set_panel_content_presentation`](crate::runtime::Runtime::set_panel_content_presentation).
     ///
     /// `pre_fullscreen` is `Some(displaced leaf mode)` exactly when `mode` is
-    /// `Fullscreen` and `None` otherwise: the give-back guards compare the
-    /// leaf the zoom restore returns against that displaced mode, never
-    /// against the live leaf's mode at engage time.
+    /// `Fullscreen` and the record did not already describe fullscreen, and
+    /// `None` otherwise: the give-back guards compare the leaf the zoom
+    /// restore returns against that displaced mode, never against the live
+    /// leaf's mode at engage time. A re-entry keeps the value the first entry
+    /// recorded — the record's own `presentation` on a re-entry is the gate's
+    /// previous stamp, not a mode the layer displaced.
     ///
     /// Nothing else is touched: the layer, its scene slot, the displaced
     /// terminal record, the frozen rectangle, and the token keep their values.

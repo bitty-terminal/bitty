@@ -607,6 +607,18 @@ impl Runtime {
         // live leaf's mode — so a third-party stamp that predates the engage
         // keeps refusing the give-back below, exactly like the ordinary
         // release guards.
+        //
+        // Only a *first* entry records the last requested mode: a record
+        // that still describes fullscreen already made that request, so its
+        // `presentation` is this gate's own stamp, not a leaf mode the layer
+        // displaced. The user can give the zoom back out of band —
+        // `Tiled -> Floating -> Fullscreen`, unzoom, fullscreen again — which
+        // leaves the record fullscreen while the leaf returns to `Floating`;
+        // recording `Fullscreen` as the displaced mode would make release's
+        // give-back guard compare against the proxy's stamp and skip the
+        // `Tiled` the first entry displaced. Keeping the existing value is
+        // what preserves it across re-entry.
+        let mut engaged = false;
         let pre_fullscreen = if mode == PresentationMode::Fullscreen {
             let Some(owner) = self.fullscreen_owner.clone() else {
                 // The support check above guarantees an owner here; the
@@ -624,7 +636,12 @@ impl Runtime {
                     mode: mode.as_str(),
                 });
             }
-            Some(layer.presentation)
+            engaged = true;
+            if layer.presentation == PresentationMode::Fullscreen {
+                layer.pre_fullscreen_presentation
+            } else {
+                Some(layer.presentation)
+            }
         } else {
             None
         };
@@ -649,7 +666,7 @@ impl Runtime {
             // A refused stamp cannot strand the zoom an engage took: give
             // it back before reporting, so the refusal leaves the leaf,
             // the record, AND the zoom exactly as they were.
-            if pre_fullscreen.is_some() {
+            if engaged {
                 if let Some(owner) = self.fullscreen_owner.clone() {
                     owner.restore(self, view);
                 }
@@ -686,7 +703,7 @@ impl Runtime {
             // nothing re-entered. Report the refusal honestly and put the leaf
             // — and the zoom an engage took — back where the caller found
             // them rather than leave a half state.
-            if pre_fullscreen.is_some() {
+            if engaged {
                 if let Some(owner) = self.fullscreen_owner.clone() {
                     owner.restore(self, view);
                 }
@@ -1093,8 +1110,9 @@ impl Runtime {
     /// reads that displaced mode is the layer's own to return to
     /// `prior_presentation`. The comparison value is the record's
     /// `pre_fullscreen_presentation` — the mode the layer last requested
-    /// **before** fullscreen, never the live leaf's mode at engage time — so
-    /// the two ordinary guards keep their meaning:
+    /// **before** its first fullscreen, never the live leaf's mode at engage
+    /// time and never the proxy's `Fullscreen` stamp a re-entry would read
+    /// back — so the two ordinary guards keep their meaning:
     ///
     /// - a layer that never moved the leaf before fullscreening restores
     ///   nothing (`pre_fullscreen == prior`): the disengage already put the

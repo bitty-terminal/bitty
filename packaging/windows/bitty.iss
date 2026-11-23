@@ -100,11 +100,14 @@ Source: "{#MySourceDir}\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
 ; #3310: Windows gives a shortcut with no Start-in the target's directory,
 ; so these entries must name the user profile explicitly. Without WorkingDir
 ; every shell opened in {app} (the install bin directory) instead of the home
-; directory. The runtime keeps a matching safety net for older shortcuts.
+; directory. `{%USERPROFILE}` is Inno Setup's environment-variable constant and
+; the only supported way to name the profile at install time (there is no
+; `{userprofile}` constant). The runtime keeps a matching safety net for older
+; shortcuts.
 [Icons]
-Name: "{group}\Bitty"; Filename: "{app}\bitty.exe"; WorkingDir: "{userprofile}"
+Name: "{group}\Bitty"; Filename: "{app}\bitty.exe"; WorkingDir: "{%USERPROFILE}"
 Name: "{group}\Uninstall Bitty"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Bitty"; Filename: "{app}\bitty.exe"; Tasks: desktopicon; WorkingDir: "{userprofile}"
+Name: "{autodesktop}\Bitty"; Filename: "{app}\bitty.exe"; Tasks: desktopicon; WorkingDir: "{%USERPROFILE}"
 
 [Run]
-Filename: "{app}\bitty.exe"; Description: "{cm:LaunchProgram,Bitty}"; WorkingDir: "{userprofile}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\bitty.exe"; Description: "{cm:LaunchProgram,Bitty}"; WorkingDir: "{%USERPROFILE}"; Flags: nowait postinstall skipifsilent

@@ -879,9 +879,12 @@ pub(crate) fn init_powershell_upgrade_hint(
     if !cfg!(windows) {
         return None;
     }
-    let program = configured
+    let pinned = configured
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let program = pinned
+        .as_deref()
         .or_else(|| resolved.map(str::trim).filter(|value| !value.is_empty()))?;
     let name = program
         .rsplit(['\\', '/'])
@@ -890,6 +893,15 @@ pub(crate) fn init_powershell_upgrade_hint(
         .to_ascii_lowercase();
     if name != "powershell.exe" {
         return None;
+    }
+    // A pinned `terminal.shell` outranks the platform chain, so installing
+    // PowerShell 7 alone would not switch it: that profile needs an edit.
+    if pinned.is_some() {
+        return Some(format!(
+            "bitty init: terminal.shell pins Windows PowerShell 5.1 ({program}); install the \
+             current PowerShell with `winget install --id Microsoft.PowerShell --source winget` \
+             and point terminal.shell at pwsh.exe, or remove it to follow the platform chain"
+        ));
     }
     Some(String::from(
         "bitty init: this host resolves Windows PowerShell 5.1; install the current PowerShell with \
@@ -2506,7 +2518,13 @@ pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms
 /// grammar. Buffered bytes still win first, mirroring Unix.
 #[cfg(windows)]
 pub(crate) fn init_stdin_poll_ready(input: &mut dyn std::io::BufRead, timeout_ms: u16) -> bool {
-    if matches!(input.fill_buf(), Ok(buf) if !buf.is_empty()) {
+    // Ask the console queue instead of the reader: `fill_buf()` would read
+    // and block past the timeout, so a lone `ESC` would never reach the
+    // cancellation branch until another key arrived. Bytes a previous read
+    // already buffered are drained by the key loop after this bounded wait,
+    // which is exactly the escape-burst timing the grammar expects.
+    let _ = input;
+    if bitty_winjob::input_pending() {
         return true;
     }
     bitty_winjob::wait_for_key(u32::from(timeout_ms))
@@ -5016,9 +5034,17 @@ fn run_init_interactive_impl(
     let inplace_steps = tty_interactive && nix::sys::termios::tcgetattr(std::io::stdin()).is_ok();
     // A live Windows console is exactly `tty_interactive`: the dispatch sets
     // it only when stdin and stdout are terminals (`IsTerminal` on Windows is
-    // true for console handles), and the picker guard enables VT output.
+    // true for console handles). The in-place echo repaints outside any picker,
+    // so VT output is held for the whole wizard by its own guard and restored
+    // on every exit path.
     #[cfg(windows)]
     let inplace_steps = tty_interactive && bitty_winjob::is_console_input();
+    #[cfg(windows)]
+    let _vt_output = if inplace_steps {
+        bitty_winjob::enter_vt_output().ok()
+    } else {
+        None
+    };
     #[cfg(not(any(unix, windows)))]
     let inplace_steps = false;
     let mut preview_rows: usize = 0;

@@ -486,7 +486,7 @@ pub(crate) fn spawn_pane_shell_in(
     rows: u16,
     cwd: Option<&std::path::Path>,
 ) -> Result<(), bitty_runtime::RuntimeError> {
-    let cwd = cwd.or(spec.startup_cwd.as_deref());
+    let startup_cwd = spec.startup_cwd.as_deref();
     let (program, args) = spec.resolve().map_err(|err| {
         // Startup already resolved this chain, so a failure here is a
         // late-environment change (a removed `PATH` entry). The pane stays
@@ -497,14 +497,32 @@ pub(crate) fn spawn_pane_shell_in(
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     if spec.program.is_some() {
         // Explicit program: verbatim, no fallback (startup parity).
-        return runtime.spawn_shell_for_view_in(view, &program, &args, cols, rows, cwd);
+        return runtime.spawn_shell_for_view_with_startup_cwd(
+            view,
+            &program,
+            &args,
+            cols,
+            rows,
+            cwd,
+            startup_cwd,
+        );
     }
     let fallback = platform_default_shell().map_err(|err| {
         crate::logging::warn(|| format!("bitty: pane shell not spawned: {err}"));
         bitty_runtime::RuntimeError::Pty(err.to_string())
     })?;
     spawn_with_fallback(
-        |program, args| runtime.spawn_shell_for_view_in(view, program, args, cols, rows, cwd),
+        |program, args| {
+            runtime.spawn_shell_for_view_with_startup_cwd(
+                view,
+                program,
+                args,
+                cols,
+                rows,
+                cwd,
+                startup_cwd,
+            )
+        },
         (&program, &args),
         (&fallback.program, &[]),
     )

@@ -63,8 +63,8 @@ mod job;
 pub use conpty::{ChildSpec, ConPtyChild, ConPtyMaster};
 #[cfg(windows)]
 pub use console::{
-    ConsoleStreams, PickerConsoleGuard, adopt_parent_console, enter_picker_input, is_console_input,
-    viewport_size, wait_for_key,
+    ConsoleStreams, PickerConsoleGuard, VtOutputGuard, adopt_parent_console, enter_picker_input,
+    enter_vt_output, input_pending, is_console_input, viewport_size, wait_for_key,
 };
 #[cfg(windows)]
 pub use job::{

@@ -427,39 +427,61 @@ pub(crate) fn sanitize_window_title(raw: &str) -> String {
 /// owning the title as documented.
 pub(crate) fn normalize_window_title(sanitized: &str) -> String {
     let trimmed = sanitized.trim();
+    // A whitespace-only title is still a title the application set; only an
+    // empty one resets to the theme default (bitty#3310 review).
     if trimmed.is_empty() {
-        return String::new();
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let name = lower.rsplit(['\\', '/']).next().unwrap_or(lower.as_str());
-    let friendly = match name {
-        "powershell.exe" => "Windows PowerShell",
-        "pwsh.exe" => "PowerShell",
-        "cmd.exe" => "Command Prompt",
-        "wsl.exe" => "WSL",
-        _ => return sanitized.to_string(),
-    };
-    // Only a bare program name or a whole Windows path is noise. A prompt
-    // (`PS C:\Users\me>`) or an app-set title carries whitespace and keeps the
-    // shell's own wording.
-    let bare_name = !trimmed.chars().any(char::is_whitespace);
-    if !bare_name && !is_windows_path_title(trimmed) {
         return sanitized.to_string();
     }
+    let Some(friendly) = shell_product_name(trimmed) else {
+        return sanitized.to_string();
+    };
     friendly.to_string()
 }
 
-/// Whether a title is a single Windows path (`C:\...` or `\\server\...`).
+/// Product name for a title that is *entirely* one known shell token.
 ///
-/// A shell prompt (`PS C:\Users\me>`) is not a path: it starts with the prompt
-/// text, so it never matches and stays exactly as the shell set it.
-fn is_windows_path_title(title: &str) -> bool {
-    let mut chars = title.chars();
-    let drive_path = matches!(
-        (chars.next(), chars.next()),
-        (Some(letter), Some(':')) if letter.is_ascii_alphabetic()
-    );
-    drive_path || title.starts_with("\\\\")
+/// The whole title must be either a bare executable name (`powershell.exe`) or
+/// one complete Windows path (`C:\Program Files\PowerShell\7\pwsh.exe`).
+/// A host-prefixed name (`user@host:/tools/pwsh.exe`) and a prompt that merely
+/// contains a shell path (`C:\Users\me> C:\Windows\...\cmd.exe`) are not
+/// shell-set titles and stay exactly as written (bitty#3310 review).
+fn shell_product_name(title: &str) -> Option<&'static str> {
+    let lower = title.to_ascii_lowercase();
+    let bare_name = !lower.contains(['\\', '/']);
+    if !bare_name && !is_single_windows_path(title) {
+        return None;
+    }
+    let name = lower.rsplit(['\\', '/']).next().unwrap_or(lower.as_str());
+    match name {
+        "powershell.exe" => Some("Windows PowerShell"),
+        "pwsh.exe" => Some("PowerShell"),
+        "cmd.exe" => Some("Command Prompt"),
+        "wsl.exe" => Some("WSL"),
+        _ => None,
+    }
+}
+
+/// Whether a title is exactly one Windows path (`C:\...` or `\\server\...`).
+///
+/// A shell prompt (`PS C:\Users\me>`) is not a path: it carries prompt
+/// punctuation or a second colon after the drive, so it never matches and
+/// stays exactly as the shell set it.
+fn is_single_windows_path(title: &str) -> bool {
+    let rest = if let Some(rest) = title.strip_prefix("\\\\") {
+        rest
+    } else {
+        let mut chars = title.chars();
+        match (chars.next(), chars.next()) {
+            (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+                title.get(2..).unwrap_or_default()
+            }
+            _ => return false,
+        }
+    };
+    // One path, not a prompt line: no second drive colon and none of the
+    // characters Windows forbids in a file name (which is what a prompt's
+    // `>` or a quoted command line would add).
+    !rest.contains([':', '>', '<', '|', '"', '*', '?'])
 }
 
 /// Bounded label for a captured key without produced text (CTX-0943).

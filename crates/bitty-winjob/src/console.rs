@@ -280,11 +280,51 @@ pub fn enter_picker_input() -> io::Result<PickerConsoleGuard> {
     })
 }
 
+/// Saved stdout mode restored when a wizard hands the console back
+/// (bitty#3310 review).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct VtOutputGuard {
+    output_mode: u32,
+}
+
+#[cfg(windows)]
+impl Drop for VtOutputGuard {
+    fn drop(&mut self) {
+        let _ = crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, self.output_mode);
+    }
+}
+
+/// Enables virtual-terminal processing on stdout for the caller's whole scope.
+///
+/// [`enter_picker_input`] enables it only while a picker holds stdin, but the
+/// `bitty init` in-place step echo repaints with cursor-up/clear-line escapes
+/// after a picker has already handed the console back. This guard keeps the
+/// mode for the wizard instead: `Drop` restores exactly the mode that was
+/// there before, including on an early return or a panic.
+///
+/// Returns `Err` when stdout is not a console or the host rejects the mode, so
+/// the caller can keep writing plain lines.
+#[cfg(windows)]
+pub fn enter_vt_output() -> io::Result<VtOutputGuard> {
+    let output_mode = crate::ffi::console_mode(STD_OUTPUT_HANDLE)?;
+    let enabled = output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    crate::ffi::set_console_mode(STD_OUTPUT_HANDLE, enabled)?;
+    Ok(VtOutputGuard { output_mode })
+}
+
 /// True when stdin is a console this process can put in picker mode.
 #[cfg(windows)]
 #[must_use]
 pub fn is_console_input() -> bool {
     crate::ffi::console_mode(STD_INPUT_HANDLE).is_ok()
+}
+
+/// Whether a console event is already queued (never blocks).
+#[cfg(windows)]
+#[must_use]
+pub fn input_pending() -> bool {
+    crate::ffi::console_input_pending()
 }
 
 /// Whether a key is waiting, blocking at most `timeout_ms`.

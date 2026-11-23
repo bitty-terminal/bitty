@@ -240,11 +240,15 @@ distribution, or an explicit distribution:
 ```lua
 return {
   terminal = {
+    scrollback = 10000,
     shell = "wsl.exe",
     shell_args = { "-d", "Ubuntu" },
   },
 }
 ```
+
+A `terminal` table always states `scrollback`; without it the loader refuses the
+table rather than guessing a capacity.
 
 `cmd.exe` works the same way (`shell = "cmd.exe"`; `shell_args = { "/k",
 "..." }` to keep a command open). Arguments are direct argv entries: they are

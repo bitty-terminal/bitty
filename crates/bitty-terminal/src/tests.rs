@@ -2954,6 +2954,10 @@ fn window_title_normalizer_folds_windows_shell_paths() {
         "PS C:\\Users\\x\\AppData\\Local\\bitty\\bin>",
         "nvim src/main.rs",
         "C:\\tools\\mytool.exe",
+        // A host prefix that merely ends in a shell name is not a shell title.
+        "user@host:/tools/pwsh.exe",
+        // A prompt line that contains a shell path is not one complete path.
+        "C:\\Users\\me> C:\\Windows\\System32\\cmd.exe",
         "",
     ] {
         assert_eq!(
@@ -2962,6 +2966,11 @@ fn window_title_normalizer_folds_windows_shell_paths() {
             "raw title {raw:?}"
         );
     }
+    // A whitespace-only application title is still a title: only an empty one
+    // resets to the theme default (bitty#3310 review).
+    assert_eq!(normalize_window_title(&sanitize_window_title(" ")), " ");
+    assert_eq!(normalize_window_title(""), "");
+
     // The theme title seeds the same normalization.
     assert!(
         crate::terminal_app::window_title_for_theme(
@@ -8007,8 +8016,12 @@ fn init_powershell_upgrade_hint_is_windows_only() {
             .is_none()
         );
         assert!(crate::init::init_powershell_upgrade_hint(None, Some("cmd.exe")).is_none());
-        // An explicit 5.1 choice still gets the hint.
-        assert!(crate::init::init_powershell_upgrade_hint(Some("powershell.exe"), None).is_some());
+        // An explicit 5.1 choice still gets the hint, and it names the pinned
+        // setting the user has to change (`terminal.shell` outranks the chain).
+        let pinned = crate::init::init_powershell_upgrade_hint(Some("powershell.exe"), None)
+            .expect("a pinned 5.1 still hints");
+        assert!(pinned.contains("terminal.shell"), "{pinned}");
+        assert!(pinned.contains("pwsh.exe"), "{pinned}");
     } else {
         assert!(legacy.is_none(), "the advisory is Windows-only");
     }

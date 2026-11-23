@@ -1342,6 +1342,11 @@ impl ValueSnapshot {
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
+        // Sequence border up front: integer keys outside `1..=len` are what
+        // Lua drops from a sequence, so a table like `{ [0] = "-d" }` would
+        // otherwise hand an array reader a shortened list instead of being
+        // refused (bitty#3310 review).
+        let seq_len = table.length().max(0);
         for (key, val) in table.iter() {
             // Bound the raw scan (all keys, captured or skipped) with the
             // snapshot-wide step budget: trip it and the configuration is
@@ -1350,8 +1355,13 @@ impl ValueSnapshot {
                 break;
             }
             // Integer keys belong to the sequence portion; skip them here
-            // (captured separately below) without spending the pair cap.
-            if matches!(key, Value::Integer(_)) {
+            // (captured separately below) without spending the pair cap. A key
+            // outside `1..=len` is not part of the sequence: record it so an
+            // array reader fails closed instead of silently losing an entry.
+            if let Value::Integer(index) = key {
+                if index < 1 || index > seq_len {
+                    has_non_string_keys = true;
+                }
                 continue;
             }
             count += 1;
@@ -3510,6 +3520,10 @@ mod tests {
             r#"return { terminal = { scrollback = 10000, shell_args = { a = "x" } } }"#,
             r#"return { terminal = { scrollback = 10000, shell_args = { 1 } } }"#,
             r#"return { terminal = { scrollback = 10000, shell_args = "wsl -d Ubuntu" } }"#,
+            // An integer key outside the sequence is dropped by Lua's sequence
+            // view, so it must be refused instead of altering the argv list.
+            r#"return { terminal = { scrollback = 10000, shell_args = { [0] = "-d", "Ubuntu" } } }"#,
+            r#"return { terminal = { scrollback = 10000, shell_args = { [3] = "-d" } } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {

@@ -39,9 +39,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole,
-    CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON,
-    PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
+    CreatePseudoConsole, GetConsoleMode, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents,
+    GetStdHandle, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode, SetStdHandle,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -736,6 +736,19 @@ pub(crate) fn wait_for_console_input(timeout_ms: u32) -> bool {
         unsafe { WaitForSingleObject(handle, timeout_ms) },
         WAIT_OBJECT_0
     )
+}
+
+/// Whether the console input queue has at least one event waiting.
+///
+/// Reads the queue depth instead of reading a byte, so a picker can decide
+/// readiness without blocking past its timeout (bitty#3310 review).
+pub(crate) fn console_input_pending() -> bool {
+    let mut count = 0u32;
+    // SAFETY: `count` is a writable `u32` on this stack frame; the handle is
+    // the documented standard input handle and is only queried.
+    let ok =
+        unsafe { GetNumberOfConsoleInputEvents(GetStdHandle(STD_INPUT_HANDLE), &raw mut count) };
+    ok != 0 && count > 0
 }
 
 /// Visible size of the console window attached to stdout, when there is one.

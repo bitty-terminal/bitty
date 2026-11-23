@@ -20,6 +20,29 @@ fn args_of(words: &[&str]) -> Vec<String> {
     words.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// Drives one platform event through the real
+/// [`bitty_platform::AppHandler::handle_event`] while holding the
+/// process-global panel-content lane.
+///
+/// The application handler services any parked `bitty ctl panel …` request
+/// (`service_panel_content_requests`) before anything else on the turn. That
+/// lane is process-wide, while each test owns its own app, so libtest
+/// concurrency lets an unrelated test claim — and answer — the request a
+/// [`crate::ctl::tests`] fixture parked for itself. Every `handle_event` caller
+/// runs under this guard for the whole call; the mutex is not reentrant, so no
+/// caller may hold it already.
+#[cfg(feature = "input-vm-test-support")]
+fn handle_event_guarded(
+    app: &mut TerminalApp,
+    context: &mut bitty_platform::EventContext<'_>,
+    event: PlatformEvent,
+) {
+    use bitty_platform::AppHandler;
+
+    let _lane = crate::ctl::panel_content::test_lane_lock();
+    <TerminalApp as AppHandler>::handle_event(app, context, event);
+}
+
 // CTX-1327 / CTX-1324 / P0-AC-015: exercise the real application input
 // callback through `AppHandler::handle_event` with a headless `EventContext`
 // and a read-only owning-VM entry counter. The regression proves the accepted
@@ -31,9 +54,8 @@ mod input_vm_boundary {
     use super::*;
     use bitty_platform::app::RecordingOperation;
     use bitty_platform::{
-        AppHandler, CursorPosition, EventContext, KeyEvent, KeyLocation, LogicalKey,
-        ModifiersState, MouseButton, MouseEvent, PhysicalSize, PressState, ScrollDelta,
-        SystemAppearance, WindowId,
+        CursorPosition, EventContext, KeyEvent, KeyLocation, LogicalKey, ModifiersState,
+        MouseButton, MouseEvent, PhysicalSize, PressState, ScrollDelta, SystemAppearance, WindowId,
     };
     use bitty_plugin_host::manifest::PluginId;
     use bitty_runtime::plugin_runtime::{
@@ -348,7 +370,7 @@ return {}
                 kind,
             };
             let mut context = EventContext::recording(&self.operations);
-            <TerminalApp as AppHandler>::handle_event(&mut self.app, &mut context, event);
+            handle_event_guarded(&mut self.app, &mut context, event);
             let after = self.entries();
             self.assert_no_sinks();
             after.checked_sub(before).expect("monotonic VM counter")
@@ -362,7 +384,7 @@ return {}
             self.operations.borrow_mut().clear();
             let before = self.entries();
             let mut context = EventContext::recording(&self.operations);
-            <TerminalApp as AppHandler>::handle_event(&mut self.app, &mut context, event);
+            handle_event_guarded(&mut self.app, &mut context, event);
             let after = self.entries();
             assert!(self.app.window.handle.is_none());
             assert!(self.app.window.os_title_sink.is_none());
@@ -1227,11 +1249,7 @@ return {}
         fixture.app.test_surface_retry_deadline = Some(deadline);
         fixture.operations.borrow_mut().clear();
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
-            &mut fixture.app,
-            &mut context,
-            PlatformEvent::AboutToWait,
-        );
+        handle_event_guarded(&mut fixture.app, &mut context, PlatformEvent::AboutToWait);
         let operations = fixture.operations.borrow();
         assert!(
             operations.iter().any(
@@ -1384,11 +1402,7 @@ return {}
     fn about_to_wait_operations(fixture: &mut Fixture) -> Vec<RecordingOperation> {
         fixture.operations.borrow_mut().clear();
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
-            &mut fixture.app,
-            &mut context,
-            PlatformEvent::AboutToWait,
-        );
+        handle_event_guarded(&mut fixture.app, &mut context, PlatformEvent::AboutToWait);
         fixture.operations.borrow().clone()
     }
 
@@ -1487,11 +1501,7 @@ return {}
         // transition and never present inside either handler.
         let mut fixture = Fixture::new("surface-visibility-gate");
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
-            &mut fixture.app,
-            &mut context,
-            PlatformEvent::Suspended,
-        );
+        handle_event_guarded(&mut fixture.app, &mut context, PlatformEvent::Suspended);
         drop(context);
         assert!(
             !fixture.app.runtime.borrow().is_surface_visible(),
@@ -1511,11 +1521,7 @@ return {}
         // cannot observe a window-capable inline Resumed presentation, so the
         // queue/present-on-a-later-turn contract is covered by runtime tests.
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
-            &mut fixture.app,
-            &mut context,
-            PlatformEvent::Resumed,
-        );
+        handle_event_guarded(&mut fixture.app, &mut context, PlatformEvent::Resumed);
         drop(context);
         assert!(
             fixture.app.runtime.borrow().is_surface_visible(),
@@ -1531,7 +1537,7 @@ return {}
         // the same off-transition contract (no wake left behind).
         let mut fixture = Fixture::new("occlusion-gate");
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
+        handle_event_guarded(
             &mut fixture.app,
             &mut context,
             PlatformEvent::Window {
@@ -1555,7 +1561,7 @@ return {}
         );
 
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
+        handle_event_guarded(
             &mut fixture.app,
             &mut context,
             PlatformEvent::Window {
@@ -1764,11 +1770,7 @@ return {}
 
         fixture.operations.borrow_mut().clear();
         let mut context = EventContext::recording(&fixture.operations);
-        <TerminalApp as AppHandler>::handle_event(
-            &mut fixture.app,
-            &mut context,
-            PlatformEvent::AboutToWait,
-        );
+        handle_event_guarded(&mut fixture.app, &mut context, PlatformEvent::AboutToWait);
         let operations = fixture.operations.borrow();
         assert!(
             operations.iter().any(
@@ -20963,7 +20965,7 @@ events = ["workspace.focused"]
 mod window_registry_command {
     use super::*;
     use bitty_platform::app::RecordingOperation;
-    use bitty_platform::{AppHandler, EventContext, WindowId};
+    use bitty_platform::{EventContext, WindowId};
     use std::cell::RefCell;
 
     /// Drives one platform event through the real `AppHandler` with the
@@ -20975,7 +20977,7 @@ mod window_registry_command {
         kind: WindowEventKind,
     ) {
         let mut context = EventContext::recording(operations);
-        <TerminalApp as AppHandler>::handle_event(
+        handle_event_guarded(
             app,
             &mut context,
             PlatformEvent::Window {

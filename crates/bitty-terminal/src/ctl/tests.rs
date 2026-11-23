@@ -1801,6 +1801,12 @@ fn panel_content_ctl_app(owned: bool) -> crate::terminal_app::TerminalApp {
 /// Dispatches one parsed panel-content request through the production serve
 /// table, headlessly — the same lane shape [`dispatch_tab_request`] drives
 /// for the tab verbs (bitty#2388, CTX-1936).
+///
+/// The lane guard is held for the whole dispatch, including the service turn:
+/// `TerminalApp::handle_event` services a parked request too, so every
+/// `handle_event` caller in the crate's tests runs under the same guard
+/// (`crate::tests::handle_event_guarded`), otherwise libtest concurrency could
+/// claim this helper's request first.
 #[cfg(unix)]
 fn dispatch_panel_content_request(
     app: &mut crate::terminal_app::TerminalApp,

@@ -358,19 +358,54 @@ impl ZoomState {
     /// Restore the zoom backup containing `view`, whether its workspace is
     /// active or stashed. Inactive workspaces cannot use `disengage` directly
     /// because the runtime's live layout belongs to another slot.
+    ///
+    /// Selection is by **backup membership**: the callers are layout
+    /// mutations that are about to move the view itself, so any entry whose
+    /// real tree holds that view is theirs to give back. A presented layer's
+    /// fullscreen give-back must not use this selection — see
+    /// [`Self::restore_for_target`].
     pub(crate) fn restore_for_view_mutation(
         &mut self,
         runtime: &mut Runtime,
         view: ViewId,
     ) -> bool {
+        self.restore_where(runtime, |entry| match entry {
+            ZoomEntry::Tree { backup, .. } => backup.leaf_ids().contains(&view),
+            ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
+        })
+    }
+
+    /// Restore the zoom entry whose **target** is `view` — the leaf that entry
+    /// currently shows full-bleed — whether its workspace is active or
+    /// stashed, and leave every other entry untouched.
+    ///
+    /// This is the presented layer's fullscreen give-back (bitty#2388,
+    /// CTX-1936): a `Fullscreen` layer engaged a zoom of its own leaf, so only
+    /// that entry is its to give back. Selecting by backup membership is wrong
+    /// here — after the user unzooms A and zooms B in the same workspace, B's
+    /// backup still contains A, and releasing A's layer would restore B's
+    /// backup and drop B's zoom. No entry targeting `view` means nothing was
+    /// held for it: the call answers `false` and the sibling zoom stays.
+    pub(crate) fn restore_for_target(&mut self, runtime: &mut Runtime, view: ViewId) -> bool {
+        self.restore_where(runtime, |entry| match entry {
+            ZoomEntry::Tree { proxy, .. } => proxy.leaf_ids().first() == Some(&view),
+            ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
+        })
+    }
+
+    /// Shared body of the view-selected restores: picks the entry `matches`
+    /// accepts, refuses a stale proxy instead of dropping the backup, and
+    /// puts the real tree back on the owning workspace (live or stashed).
+    fn restore_where(
+        &mut self,
+        runtime: &mut Runtime,
+        matches: impl Fn(&ZoomEntry) -> bool,
+    ) -> bool {
         self.prune(runtime);
         let Some(seq) = self
             .entries
             .iter()
-            .find(|(_, entry)| match entry {
-                ZoomEntry::Tree { backup, .. } => backup.leaf_ids().contains(&view),
-                ZoomEntry::DetachedFloat { view: v, .. } => *v == view,
-            })
+            .find(|(_, entry)| matches(entry))
             .map(|(seq, _)| *seq)
         else {
             return false;
@@ -430,9 +465,11 @@ impl ZoomState {
 /// [`bitty_runtime::PanelFullscreenOwner`] and passes the `&mut Runtime` it
 /// already owns, so this struct holds only the zoom table — never a second
 /// runtime handle. Engage is the zoom's own capture-and-proxy step; restore
-/// is [`ZoomState::restore_for_view_mutation`], not the active-workspace
-/// disengage, because a stashed workspace's fullscreen layer still owes its
-/// give-back.
+/// is [`ZoomState::restore_for_target`] — the entry whose target is the layer's
+/// own leaf — never the active-workspace disengage (a stashed workspace's
+/// fullscreen layer still owes its give-back) and never the membership-based
+/// [`ZoomState::restore_for_view_mutation`] (a sibling zoom's backup contains
+/// the layer's leaf and must survive the release).
 pub(crate) struct AppFullscreenOwner {
     /// The app's zoom table, shared with [`ChromeState::zoom`].
     zoom: std::rc::Rc<std::cell::RefCell<ZoomState>>,
@@ -451,9 +488,7 @@ impl bitty_runtime::PanelFullscreenOwner for AppFullscreenOwner {
     }
 
     fn restore(&self, runtime: &mut Runtime, view: ViewId) -> bool {
-        self.zoom
-            .borrow_mut()
-            .restore_for_view_mutation(runtime, view)
+        self.zoom.borrow_mut().restore_for_target(runtime, view)
     }
 }
 
@@ -14377,5 +14412,90 @@ claims = []
             Some(0)
         );
         assert_eq!(app.effective_window_leaf_count(), 1);
+    }
+
+    /// bitty#3307 review: the fullscreen give-back selects the zoom whose
+    /// **target** is the released layer's leaf, never a sibling zoom whose
+    /// backup merely contains that leaf.
+    ///
+    /// Tiled A -> fullscreen A (zoom A) -> the user unzooms A -> the user zooms
+    /// B in the same workspace. B's backup still contains A, so a
+    /// membership-based selection would hand B's real tree back — and drop
+    /// B's zoom — when A's layer released.
+    #[test]
+    fn fullscreen_give_back_keeps_a_sibling_zoom_whose_backup_contains_the_leaf() {
+        use bitty_runtime::PanelFullscreenOwner;
+
+        let first = ViewId::new(1);
+        let second = ViewId::new(2);
+        let (app, _panel) = panel_close_app(
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(first, 40, 24)),
+                LayoutNode::leaf(View::new(second, 40, 24)),
+            ),
+            first,
+        );
+        let owner = AppFullscreenOwner::new(std::rc::Rc::clone(&app.chrome.zoom));
+        let seq = app
+            .runtime
+            .borrow()
+            .workspace_seq_at(0)
+            .expect("workspace sequence");
+
+        // A's layer goes fullscreen: the owner engages A's zoom, then the user
+        // gives that zoom back with the plain gesture.
+        assert!(
+            owner.engage(&mut app.runtime.borrow_mut(), first),
+            "the first leaf zooms"
+        );
+        assert!(
+            app.chrome
+                .zoom
+                .borrow_mut()
+                .disengage(&mut app.runtime.borrow_mut()),
+            "the user unzooms A in the same workspace"
+        );
+
+        // The user zooms B instead: its backup is the real two-leaf tree, so
+        // membership cannot tell B's entry from A's.
+        assert!(
+            owner.engage(&mut app.runtime.borrow_mut(), second),
+            "the second leaf zooms"
+        );
+        assert_eq!(
+            app.chrome.zoom.borrow().backup_leaf_ids_for_seq(seq),
+            Some(vec![first, second]),
+            "B's backup contains A's leaf — membership alone cannot select"
+        );
+
+        // Releasing A's fullscreen layer has nothing of its own to give back:
+        // no entry targets A, so the sibling zoom stays engaged.
+        assert!(
+            !owner.restore(&mut app.runtime.borrow_mut(), first),
+            "no zoom targets the released leaf"
+        );
+        assert!(
+            app.chrome.zoom.borrow().is_zoomed(&app.runtime.borrow()),
+            "B's zoom must survive A's give-back"
+        );
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![second],
+            "the live proxy is still B's"
+        );
+
+        // B's own give-back still restores the real tree: A's release consumed
+        // nothing.
+        assert!(
+            owner.restore(&mut app.runtime.borrow_mut(), second),
+            "the target-selected give-back restores B's zoom"
+        );
+        assert_eq!(
+            app.runtime.borrow().layout().leaf_ids(),
+            vec![first, second],
+            "the real two-leaf tree is back"
+        );
     }
 }

@@ -7938,6 +7938,7 @@ fn init_answer_parsers_cover_new_steps_fail_closed() {
 }
 
 #[test]
+#[cfg(unix)]
 fn init_shell_candidates_order_and_fallback() {
     // $SHELL first, then existing commons, no duplicates, fallback last.
     let c = init_shell_candidates(Some("/bin/zsh"), &|p| p == "/bin/bash" || p == "/bin/zsh");
@@ -8109,6 +8110,19 @@ fn init_step_parsers_accept_and_reject() {
 
 /// Drives the interactive wizard with piped stdin; returns answers plus
 /// everything the wizard printed.
+/// One-based menu entry that answers the shell step with the platform
+/// fallback in the wizard fixture (`/bin/sh` on Unix, `cmd.exe` on Windows),
+/// so the wizard scripts stay platform-neutral.
+fn init_fixture_fallback_shell_pick() -> String {
+    let candidates =
+        init_shell_candidates(Some("/bin/bash"), &|p| p == "/bin/bash" || p == "/bin/sh");
+    let index = candidates
+        .iter()
+        .position(|candidate| candidate == crate::init::INIT_PLATFORM_FALLBACK_SHELL)
+        .expect("the fallback is always listed");
+    (index + 1).to_string()
+}
+
 fn drive_init_wizard(
     stdin_lines: &str,
     shell_env: Option<&str>,
@@ -8202,14 +8216,18 @@ fn init_interactive_all_defaults() {
 
 #[test]
 fn init_interactive_custom_picks() {
-    // Pick /bin/sh (#2), bitty-dark, Fira Code, 14pt, 10/12/3/8 decoration,
-    // 50000 scrollback, always confirm, vim preset (#2).
-    let (result, _) = drive_init_wizard(
-        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
-        Some("/bin/bash"),
+    // Pick the platform fallback shell, bitty-dark, Fira Code, 14pt,
+    // 10/12/3/8 decoration, 50000 scrollback, always confirm, vim preset (#2).
+    let script = format!(
+        "{}\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        init_fixture_fallback_shell_pick()
     );
+    let (result, _) = drive_init_wizard(&script, Some("/bin/bash"));
     let answers = result.expect("custom picks accepted");
-    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+    assert_eq!(
+        answers.shell.as_deref(),
+        Some(crate::init::INIT_PLATFORM_FALLBACK_SHELL)
+    );
     assert_eq!(answers.theme, "dark");
     assert_eq!(answers.font_family, "Fira Code");
     assert_eq!(answers.font_size, 14.0);
@@ -8668,10 +8686,17 @@ fn init_option_list_k_wraps_theme_to_last() {
 
 #[test]
 fn init_option_list_number_fast_path_still_selects_shell() {
-    // Numbered fast path: `2` picks the second shell candidate in one read.
-    let (result, _) = drive_init_wizard("2\n\n\n\n\n\n\n\n\n\n\n", Some("/bin/bash"));
+    // Numbered fast path: one digit picks the fallback shell in one read.
+    let script = format!(
+        "{}\n\n\n\n\n\n\n\n\n\n\n",
+        init_fixture_fallback_shell_pick()
+    );
+    let (result, _) = drive_init_wizard(&script, Some("/bin/bash"));
     let answers = result.expect("numbered shell accepted");
-    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+    assert_eq!(
+        answers.shell.as_deref(),
+        Some(crate::init::INIT_PLATFORM_FALLBACK_SHELL)
+    );
 }
 
 #[test]
@@ -9837,16 +9862,24 @@ fn init_preview_applies_selections_mid_wizard() {
     baseline.layout.resize_step = 0.02;
     let before = baseline.clone();
 
-    // Same custom picks as `init_interactive_custom_picks`: shell #2,
-    // bitty-dark, Fira Code, 14pt, 10/12/3/8, 50000, always, vim (#2).
+    // Same custom picks as `init_interactive_custom_picks`: the platform
+    // fallback shell, bitty-dark, Fira Code, 14pt, 10/12/3/8, 50000, always,
+    // vim (#2).
+    let script = format!(
+        "{}\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        init_fixture_fallback_shell_pick()
+    );
     let (result, _, preview) = drive_init_wizard_with_preview(
-        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        &script,
         Some("/bin/bash"),
         &InitOverrides::default(),
         baseline,
     );
     let answers = result.expect("custom picks accepted");
-    assert_eq!(answers.shell.as_deref(), Some("/bin/sh"));
+    assert_eq!(
+        answers.shell.as_deref(),
+        Some(crate::init::INIT_PLATFORM_FALLBACK_SHELL)
+    );
 
     // One snapshot per prompted step, in prompt order: shell, theme,
     // family, size, gaps_in, gaps_out, border, radius, scrollback,
@@ -9855,7 +9888,7 @@ fn init_preview_applies_selections_mid_wizard() {
     assert_eq!(snapshots.len(), 11, "every prompted step previews");
     assert_eq!(
         snapshots[0].terminal.shell.as_deref(),
-        Some("/bin/sh"),
+        Some(crate::init::INIT_PLATFORM_FALLBACK_SHELL),
         "shell previews first"
     );
     assert_eq!(
@@ -10619,14 +10652,18 @@ fn init_preview_push_live_disabled_is_noop() {
 fn init_live_preview_maps_snapshots_per_step() {
     // Headless hermetic overlay-to-preview mapping (p4 CTX-1119): every
     // prompted snapshot drives the reload path on a deterministic runtime.
-    // Same custom picks as the in-memory preview test: shell 2, bitty-dark,
-    // Fira Code, 14pt, 10/12/3/8, 50000, always, vim 2.
+    // Same custom picks as the in-memory preview test: the platform fallback
+    // shell, bitty-dark, Fira Code, 14pt, 10/12/3/8, 50000, always, vim 2.
     let mut baseline = bitty_config::fallback_builtin();
     baseline.window.opacity = 0.75;
     baseline.layout.resize_step = 0.02;
 
+    let script = format!(
+        "{}\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        init_fixture_fallback_shell_pick()
+    );
     let (_, _, preview) = drive_init_wizard_with_preview(
-        "2\nbitty-dark\nFira Code\n14\n10\n12\n3\n8\n50000\nalways\n2\n",
+        &script,
         Some("/bin/bash"),
         &InitOverrides::default(),
         baseline.clone(),
@@ -10657,7 +10694,7 @@ fn init_live_preview_maps_snapshots_per_step() {
             0 => {
                 assert_eq!(
                     snapshot.terminal.shell.as_deref(),
-                    Some("/bin/sh"),
+                    Some(crate::init::INIT_PLATFORM_FALLBACK_SHELL),
                     "shell previews first"
                 );
                 assert_eq!(

@@ -4490,7 +4490,8 @@ mod tests {
         if cfg!(windows) {
             let advisory = advisory.expect("5.1 default warns on Windows");
             assert_eq!(advisory.status, DoctorStatus::Warn);
-            assert_eq!(advisory.code, EXIT_OK);
+            // Warn rows normalize to the generic exit code, never a hard fail.
+            assert_eq!(advisory.code, EXIT_GENERIC);
             assert!(
                 advisory
                     .hint

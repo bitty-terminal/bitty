@@ -87,6 +87,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "window.background_position"
         | "terminal.scrollback"
         | "terminal.shell"
+        | "terminal.shell_args"
         | "terminal.scroll_lines_per_notch"
         | "terminal.scroll_pixels_per_notch"
         | "terminal.page_scroll_percent"
@@ -1031,6 +1032,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "window",
     "terminal.scrollback",
     "terminal.shell",
+    "terminal.shell_args",
     "terminal.scroll_lines_per_notch",
     "terminal.scroll_pixels_per_notch",
     "terminal.page_scroll_percent",
@@ -1522,6 +1524,7 @@ fn merge_layers_inner(
             for field in [
                 "terminal.scrollback",
                 "terminal.shell",
+                "terminal.shell_args",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
                 "terminal.page_scroll_percent",
@@ -1550,6 +1553,9 @@ fn merge_layers_inner(
                 match field {
                     "terminal.scrollback" => effective.terminal.scrollback = term.scrollback,
                     "terminal.shell" => effective.terminal.shell.clone_from(&term.shell),
+                    "terminal.shell_args" => {
+                        effective.terminal.shell_args.clone_from(&term.shell_args);
+                    }
                     "terminal.scroll_lines_per_notch" => {
                         effective.terminal.scroll_lines_per_notch = term.scroll_lines_per_notch;
                     }
@@ -3169,6 +3175,7 @@ fn merge_layers_allow_policy_violations(
             for field in [
                 "terminal.scrollback",
                 "terminal.shell",
+                "terminal.shell_args",
                 "terminal.scroll_lines_per_notch",
                 "terminal.scroll_pixels_per_notch",
                 "terminal.page_scroll_percent",
@@ -3197,6 +3204,9 @@ fn merge_layers_allow_policy_violations(
                 match field {
                     "terminal.scrollback" => effective.terminal.scrollback = term.scrollback,
                     "terminal.shell" => effective.terminal.shell.clone_from(&term.shell),
+                    "terminal.shell_args" => {
+                        effective.terminal.shell_args.clone_from(&term.shell_args);
+                    }
                     "terminal.scroll_lines_per_notch" => {
                         effective.terminal.scroll_lines_per_notch = term.scroll_lines_per_notch;
                     }

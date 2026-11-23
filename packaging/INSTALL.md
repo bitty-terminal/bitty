@@ -213,6 +213,55 @@ hand:
    `HKCU\Environment` value in `regedit`).
 3. Delete the `%LOCALAPPDATA%\bitty` directory.
 
+## Windows shells, PowerShell 7, and WSL2
+
+A Windows install ships no shell of its own; it starts one from the host in
+this order: the `terminal.shell` you configured, then `$SHELL` when it is set,
+then the first of `pwsh.exe` → `powershell.exe` → `cmd.exe` that resolves on
+`PATH`. Because PowerShell 7 comes first, installing it is enough to upgrade
+the default — no profile edit:
+
+```powershell
+winget install --id Microsoft.PowerShell --source winget
+```
+
+`bitty init` shows the detected host default as the menu's first entry and
+records "use the platform chain" rather than pinning that one executable path,
+so a later PowerShell 7 install is picked up on the next start. `bitty doctor`
+warns when Windows PowerShell 5.1 is the resolved default and prints the
+`winget` line above. To pin one specific program anyway, set
+`terminal.shell` in `profiles/default.lua` (or via `bitty config set
+terminal.shell <path>`).
+
+Shells that need arguments use `terminal.shell_args`, a Lua list applied only
+to the configured program. WSL2 needs nothing beyond `wsl.exe` for the default
+distribution, or an explicit distribution:
+
+```lua
+return {
+  terminal = {
+    scrollback = 10000,
+    shell = "wsl.exe",
+    shell_args = { "-d", "Ubuntu" },
+  },
+}
+```
+
+A `terminal` table always states `scrollback`; without it the loader refuses the
+table rather than guessing a capacity.
+
+`cmd.exe` works the same way (`shell = "cmd.exe"`; `shell_args = { "/k",
+"..." }` to keep a command open). Arguments are direct argv entries: they are
+never split, joined, or passed through a shell, and they apply only to
+`terminal.shell` — never to `$SHELL` or the platform default.
+
+**Starting directory**: the Start Menu and Desktop shortcuts start in your user
+profile (`%USERPROFILE%`), not in `%LOCALAPPDATA%\bitty\bin`. If a shortcut
+created by an older installer still points at the install directory, Bitty
+detects that the process directory is the directory holding `bitty.exe` and
+starts the shell in `%USERPROFILE%` instead; a directory you launched from
+yourself is never overridden.
+
 ## Prebuilt binaries (manual download)
 
 The R2-backed CDN at `https://cdn.bitty.run/releases/<TAG>/` is the preferred

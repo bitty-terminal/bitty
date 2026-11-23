@@ -993,7 +993,15 @@ try {
     Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"
   } else {
     try {
-      New-BittyShortcut -TargetExe $destExe -WorkingDirectory $InstallDir -IconSource $iconSource
+      # Start in the user profile (#3310): inheriting the install directory as
+      # the shortcut's working directory opened every shell in
+      # %LOCALAPPDATA%\bitty\bin instead of the user's home.
+      $shortcutWorkingDir = if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $Home
+      } else {
+        $env:USERPROFILE
+      }
+      New-BittyShortcut -TargetExe $destExe -WorkingDirectory $shortcutWorkingDir -IconSource $iconSource
     } catch {
       Write-BittyLog "warning: could not create the Start Menu shortcut: $($_.Exception.Message)"
       Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"

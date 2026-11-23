@@ -350,6 +350,11 @@ pub struct TerminalData {
     pub scrollback: Option<i64>,
     /// Optional shell `argv[0]` (present only when the key is set).
     pub shell: Option<String>,
+    /// Optional shell argv tail, direct arguments after `argv[0]` (present
+    /// only when the key is set). Enables shells that are only meaningful with
+    /// arguments: a WSL2 distribution (`wsl.exe -d Ubuntu`), `cmd.exe /k`,
+    /// `bash -l`. Bounds are enforced downstream in `bitty-config`.
+    pub shell_args: Option<Vec<String>>,
     /// Lines per wheel notch (present only when the key is set).
     pub scroll_lines_per_notch: Option<i64>,
     /// Smooth-scroll pixels per wheel notch (present only when the key is set).
@@ -1337,6 +1342,11 @@ impl ValueSnapshot {
         let mut has_non_string_keys = false;
         let mut truncated = false;
         let mut count = 0usize;
+        // Sequence border up front: integer keys outside `1..=len` are what
+        // Lua drops from a sequence, so a table like `{ [0] = "-d" }` would
+        // otherwise hand an array reader a shortened list instead of being
+        // refused (bitty#3310 review).
+        let seq_len = table.length().max(0);
         for (key, val) in table.iter() {
             // Bound the raw scan (all keys, captured or skipped) with the
             // snapshot-wide step budget: trip it and the configuration is
@@ -1345,8 +1355,13 @@ impl ValueSnapshot {
                 break;
             }
             // Integer keys belong to the sequence portion; skip them here
-            // (captured separately below) without spending the pair cap.
-            if matches!(key, Value::Integer(_)) {
+            // (captured separately below) without spending the pair cap. A key
+            // outside `1..=len` is not part of the sequence: record it so an
+            // array reader fails closed instead of silently losing an entry.
+            if let Value::Integer(index) = key {
+                if index < 1 || index > seq_len {
+                    has_non_string_keys = true;
+                }
                 continue;
             }
             count += 1;
@@ -1398,6 +1413,10 @@ impl ValueSnapshot {
                 }
                 let v = table.get_value(ctx, i);
                 if matches!(v, Value::Nil) {
+                    // A hole inside the border is malformed: Lua's sequence
+                    // view stops there, so accepting the prefix would hand an
+                    // array reader a silently shortened list (bitty#3310).
+                    has_non_string_keys = true;
                     break;
                 }
                 seq.push(match v {
@@ -2121,6 +2140,7 @@ impl ConfigData {
                             "bell",
                             "ambiguous_width",
                             "bidi",
+                            "shell_args",
                         ],
                     )?;
                     let scrollback = match get_field(nested, "scrollback") {
@@ -2129,6 +2149,23 @@ impl ConfigData {
                     };
                     let shell = match get_field(nested, "shell") {
                         Some(v) => Some(expect_string("terminal.shell", v)?),
+                        None => None,
+                    };
+                    // `terminal.shell_args`: a Lua sequence of plain strings
+                    // (1-based). Shape and count fail closed here; the exact
+                    // per-argument bounds are validated in `bitty-config`.
+                    let shell_args = match get_field(nested, "shell_args") {
+                        Some(v) => {
+                            let arr = expect_array("terminal.shell_args", v)?;
+                            let mut args = Vec::with_capacity(arr.len());
+                            for (idx, item) in arr.iter().enumerate() {
+                                args.push(expect_string(
+                                    &format!("terminal.shell_args[{}]", idx + 1),
+                                    item,
+                                )?);
+                            }
+                            Some(args)
+                        }
                         None => None,
                     };
                     let scroll_lines_per_notch = match get_field(nested, "scroll_lines_per_notch") {
@@ -2163,6 +2200,7 @@ impl ConfigData {
                     out.terminal = Some(TerminalData {
                         scrollback,
                         shell,
+                        shell_args,
                         scroll_lines_per_notch,
                         scroll_pixels_per_notch,
                         page_scroll_percent,
@@ -3055,7 +3093,7 @@ fn expect_array<'a>(path: &str, val: &'a ValueSnapshot) -> Result<&'a [ValueSnap
             ..
         } => {
             if !pairs.is_empty() || *has_non_string_keys {
-                return Err(format!("{path}: expected array (found map keys)"));
+                return Err(format!("{path}: expected array (found map keys or gaps)"));
             }
             Ok(seq)
         }
@@ -3080,7 +3118,7 @@ fn extract_keymaps(val: &ValueSnapshot) -> Result<Vec<KeymapData>, String> {
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("keymaps: expected array (found map keys)".to_string());
+        return Err("keymaps: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!("keymaps: exceeds {MAX_CONFIG_KEYMAPS} entries"));
@@ -3138,7 +3176,7 @@ fn extract_plugins(val: &ValueSnapshot) -> Result<Vec<PluginData>, String> {
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("plugins: expected array (found map keys)".to_string());
+        return Err("plugins: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!("plugins: exceeds {MAX_CONFIG_PLUGINS} entries"));
@@ -3190,7 +3228,7 @@ fn extract_panel_rules(val: &ValueSnapshot) -> Result<Vec<PanelRuleData>, String
         }
     };
     if !pairs.is_empty() || has_non_string_keys {
-        return Err("panel_rules: expected array (found map keys)".to_string());
+        return Err("panel_rules: expected array (found map keys or gaps)".to_string());
     }
     if truncated {
         return Err(format!(
@@ -3451,6 +3489,52 @@ mod tests {
                         message.contains("terminal.cursor_style")
                             || message.contains("terminal.bell")
                             || message.contains("terminal.ambiguous_width"),
+                        "must name the field: {message}"
+                    );
+                }
+                other => panic!("expected shape error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_shell_args_extract_as_a_string_sequence() {
+        // bitty#3310: `terminal.shell_args` is a 1-based Lua sequence of
+        // strings (WSL2 distribution, `cmd.exe /k`, `bash -l`). Absent means
+        // "this layer says nothing"; a map or a non-string fails closed.
+        let data = eval_ok(
+            r#"return { terminal = { scrollback = 10000, shell = "wsl.exe", shell_args = { "-d", "Ubuntu" } } }"#,
+        );
+        let term = data.terminal.expect("terminal table");
+        assert_eq!(term.shell.as_deref(), Some("wsl.exe"));
+        assert_eq!(
+            term.shell_args,
+            Some(vec!["-d".to_string(), "Ubuntu".to_string()])
+        );
+
+        let data = eval_ok(
+            r#"return { terminal = { scrollback = 10000, shell = "bash", shell_args = {} } }"#,
+        );
+        assert_eq!(data.terminal.unwrap().shell_args, Some(Vec::new()));
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.terminal.unwrap().shell_args, None);
+
+        let mut vm = LuaVm::new("test.terminal-shell-args-type");
+        for code in [
+            r#"return { terminal = { scrollback = 10000, shell_args = { a = "x" } } }"#,
+            r#"return { terminal = { scrollback = 10000, shell_args = { 1 } } }"#,
+            r#"return { terminal = { scrollback = 10000, shell_args = "wsl -d Ubuntu" } }"#,
+            // An integer key outside the sequence is dropped by Lua's sequence
+            // view, so it must be refused instead of altering the argv list.
+            r#"return { terminal = { scrollback = 10000, shell_args = { [0] = "-d", "Ubuntu" } } }"#,
+            r#"return { terminal = { scrollback = 10000, shell_args = { [3] = "-d" } } }"#,
+            // An interior hole would shorten the sequence silently.
+            r#"return { terminal = { scrollback = 10000, shell_args = { "-d", nil, "Ubuntu" } } }"#,
+        ] {
+            match vm.eval_config(code).expect("no refuse") {
+                ConfigOutcome::ShapeError { message } => {
+                    assert!(
+                        message.contains("terminal.shell_args"),
                         "must name the field: {message}"
                     );
                 }

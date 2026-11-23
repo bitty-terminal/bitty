@@ -145,6 +145,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `workspace.bar.edge`      | Live               |
 /// | `terminal.scrollback`     | RestartRequired    |
 /// | `terminal.shell`          | RestartRequired    |
+/// | `terminal.shell_args`     | RestartRequired    |
 /// | `terminal.scroll_lines_per_notch` | RestartRequired |
 /// | `terminal.scroll_pixels_per_notch` | RestartRequired |
 /// | `terminal.page_scroll_percent` | RestartRequired |
@@ -313,6 +314,7 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "font.disable_ligatures",
     "terminal.scrollback",
     "terminal.shell",
+    "terminal.shell_args",
     "terminal.scroll_lines_per_notch",
     "terminal.scroll_pixels_per_notch",
     "terminal.page_scroll_percent",
@@ -685,6 +687,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.cursor_style",
         old.terminal.cursor_style.as_str().to_string(),
         new.terminal.cursor_style.as_str().to_string(),
+    );
+    // bitty#3310: the configured argv tail is part of the spawn recipe, which
+    // is frozen at startup, so a change is restart-required like the program.
+    push_if_changed(
+        "terminal.shell_args",
+        old.terminal.shell_args.join("\u{1f}"),
+        new.terminal.shell_args.join("\u{1f}"),
     );
     push_if_changed(
         "terminal.bell",

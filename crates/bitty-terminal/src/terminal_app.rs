@@ -188,8 +188,12 @@ pub(crate) const HIDDEN_REPAIR_PROBE_TTL: std::time::Duration = std::time::Durat
 ///
 /// Visible via `hyprctl clients` and (where decorations show) the title bar,
 /// so screenshots plus class-check prove which config path the window took:
-/// `... — bitty-dark (default)` vs `... — bitty-dark (file)`.
+/// `... — bitty-dark (default)` vs `... — bitty-dark (file)`. The source is
+/// sanitized and normalized exactly like a live `OSC 0/2` title, so a Windows
+/// shell that starts with its own executable path never seeds the titlebar
+/// with that path (bitty#3310).
 pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
+    let source = normalize_window_title(&sanitize_window_title(source));
     format!("bitty \u{2014} Correct Terminal \u{2014} {theme_name} ({source})")
 }
 
@@ -409,6 +413,75 @@ pub(crate) fn sanitize_window_title(raw: &str) -> String {
         .filter(|c| !c.is_control())
         .take(WINDOW_TITLE_MAX_CHARS)
         .collect()
+}
+
+/// Folds the noisy executable path Windows shells put in the console title
+/// into the shell's product name (bitty#3310).
+///
+/// Windows PowerShell and `cmd.exe` set the console title to their own
+/// executable path, so the titlebar read
+/// `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe`. A title that is
+/// exactly one path-shaped token naming a known shell collapses to the product
+/// name; anything else (a program name, a `user@host:` title, a path with
+/// spaces, an app-set title) passes through unchanged, so the shell keeps
+/// owning the title as documented.
+pub(crate) fn normalize_window_title(sanitized: &str) -> String {
+    let trimmed = sanitized.trim();
+    // A whitespace-only title is still a title the application set; only an
+    // empty one resets to the theme default (bitty#3310 review).
+    if trimmed.is_empty() {
+        return sanitized.to_string();
+    }
+    let Some(friendly) = shell_product_name(trimmed) else {
+        return sanitized.to_string();
+    };
+    friendly.to_string()
+}
+
+/// Product name for a title that is *entirely* one known shell token.
+///
+/// The whole title must be either a bare executable name (`powershell.exe`) or
+/// one complete Windows path (`C:\Program Files\PowerShell\7\pwsh.exe`).
+/// A host-prefixed name (`user@host:/tools/pwsh.exe`) and a prompt that merely
+/// contains a shell path (`C:\Users\me> C:\Windows\...\cmd.exe`) are not
+/// shell-set titles and stay exactly as written (bitty#3310 review).
+fn shell_product_name(title: &str) -> Option<&'static str> {
+    let lower = title.to_ascii_lowercase();
+    let bare_name = !lower.contains(['\\', '/']);
+    if !bare_name && !is_single_windows_path(title) {
+        return None;
+    }
+    let name = lower.rsplit(['\\', '/']).next().unwrap_or(lower.as_str());
+    match name {
+        "powershell.exe" => Some("Windows PowerShell"),
+        "pwsh.exe" => Some("PowerShell"),
+        "cmd.exe" => Some("Command Prompt"),
+        "wsl.exe" => Some("WSL"),
+        _ => None,
+    }
+}
+
+/// Whether a title is exactly one Windows path (`C:\...` or `\\server\...`).
+///
+/// A shell prompt (`PS C:\Users\me>`) is not a path: it carries prompt
+/// punctuation or a second colon after the drive, so it never matches and
+/// stays exactly as the shell set it.
+fn is_single_windows_path(title: &str) -> bool {
+    let rest = if let Some(rest) = title.strip_prefix("\\\\") {
+        rest
+    } else {
+        let mut chars = title.chars();
+        match (chars.next(), chars.next()) {
+            (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+                title.get(2..).unwrap_or_default()
+            }
+            _ => return false,
+        }
+    };
+    // One path, not a prompt line: no second drive colon and none of the
+    // characters Windows forbids in a file name (which is what a prompt's
+    // `>` or a quoted command line would add).
+    !rest.contains([':', '>', '<', '|', '"', '*', '?'])
 }
 
 /// Bounded label for a captured key without produced text (CTX-0943).
@@ -5468,7 +5541,7 @@ impl TerminalApp {
     /// production code path that a recording test double observes exactly.
     /// Headlessly (no sink) state is still recorded but no OS call is made.
     pub(crate) fn apply_window_title(&mut self, raw: &str) {
-        let sanitized = sanitize_window_title(raw);
+        let sanitized = normalize_window_title(&sanitize_window_title(raw));
         let title = if sanitized.is_empty() {
             self.window.title.clone()
         } else {

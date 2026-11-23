@@ -158,6 +158,34 @@ use crate::clipboard_x11::{X11Selection, try_read_x11_text};
 /// allocation. See the [`Clipboard`] type docs.
 pub const CLIPBOARD_MAX_BYTES: usize = 8192;
 
+/// Maximum bytes for a write of data Bitty itself produced (a selection the
+/// user asked to copy).
+///
+/// The untrusted-path bound above exists to bound *foreign* data: a paste, an
+/// OSC 52 payload, or a reply to a terminal query. A copy of the user's own
+/// selection is not foreign data, so it keeps a separate, much larger write
+/// bound: reusing [`CLIPBOARD_MAX_BYTES`] here silently refused every selection
+/// over 8 KiB (bitty#3311), and `Ctrl+Shift+C` looked like a no-op.
+///
+/// This is still a bound, not an unbounded write: a selection is materialized
+/// from the grid, so 16 MiB is far above any realistic scrollback grab while
+/// keeping one copy from pinning arbitrary memory in the clipboard backend.
+pub const CLIPBOARD_MAX_OWNED_WRITE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether `len` fits the owned-write bound.
+///
+/// Split from the acquisition guard so the two policies cannot drift: the
+/// untrusted write path keeps [`ensure_within_limit`].
+fn ensure_within_owned_write_limit(len: usize) -> Result<(), PlatformError> {
+    if len > CLIPBOARD_MAX_OWNED_WRITE_BYTES {
+        return Err(PlatformError::ClipboardPayloadTooLarge {
+            len,
+            max: CLIPBOARD_MAX_OWNED_WRITE_BYTES,
+        });
+    }
+    Ok(())
+}
+
 /// Whether a Wayland display is advertised via `WAYLAND_DISPLAY`.
 ///
 /// This is the same signal `arboard` (with `wayland-data-control`) uses to
@@ -456,6 +484,28 @@ impl Clipboard {
     /// [`Self::set_text_lossy`] and keep the buffers.
     pub fn set_text(&mut self, text: String) -> Result<(), PlatformError> {
         ensure_within_limit(text.len())?;
+        self.write_regular(text)
+    }
+
+    /// Writes the user's own selection to the regular clipboard (+ best-effort
+    /// primary sync), bounded by [`CLIPBOARD_MAX_OWNED_WRITE_BYTES`].
+    ///
+    /// Same contract as [`Self::set_text`] otherwise, including the typed
+    /// rejection and the preserved previous value. Used by the app copy path
+    /// (`Ctrl+Shift+C`, copy-on-select) so a large selection is copied instead
+    /// of silently refused by the untrusted-path bound (bitty#3311).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_text`], with [`CLIPBOARD_MAX_OWNED_WRITE_BYTES`] as the
+    /// size bound.
+    pub fn set_text_owned(&mut self, text: String) -> Result<(), PlatformError> {
+        ensure_within_owned_write_limit(text.len())?;
+        self.write_regular(text)
+    }
+
+    /// Shared body of the regular-clipboard writes (already size-checked).
+    fn write_regular(&mut self, text: String) -> Result<(), PlatformError> {
         if self.headless_only {
             self.headless_buf = text.clone();
             self.primary_buf = text;
@@ -505,6 +555,22 @@ impl Clipboard {
     /// updated.
     pub fn set_primary(&mut self, text: String) -> Result<(), PlatformError> {
         ensure_within_limit(text.len())?;
+        self.write_primary(text)
+    }
+
+    /// Writes the user's own selection to the primary selection only, bounded
+    /// by [`CLIPBOARD_MAX_OWNED_WRITE_BYTES`] (bitty#3311).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::set_primary`], with the owned-write bound.
+    pub fn set_primary_owned(&mut self, text: String) -> Result<(), PlatformError> {
+        ensure_within_owned_write_limit(text.len())?;
+        self.write_primary(text)
+    }
+
+    /// Shared body of the primary writes (already size-checked).
+    fn write_primary(&mut self, text: String) -> Result<(), PlatformError> {
         if self.headless_only {
             self.primary_buf = text;
             return Ok(());
@@ -531,6 +597,12 @@ impl Clipboard {
     /// system error.
     pub fn set_text_lossy(&mut self, text: String) {
         let _ = self.set_text(text);
+    }
+
+    /// Best-effort owned write: never returns an error, bounded by
+    /// [`CLIPBOARD_MAX_OWNED_WRITE_BYTES`] (bitty#3311).
+    pub fn set_text_owned_lossy(&mut self, text: String) {
+        let _ = self.set_text_owned(text);
     }
 
     /// Reads text from the regular clipboard, bounded by

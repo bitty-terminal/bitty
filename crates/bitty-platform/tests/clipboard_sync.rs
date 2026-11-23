@@ -61,6 +61,48 @@ fn headless_payloads_stay_bounded_on_both_selections() {
 }
 
 #[test]
+fn owned_writes_accept_the_users_selection_past_the_paste_bound() {
+    // bitty#3311: copying a selection larger than the 8192-byte paste bound
+    // used to be refused, so `Ctrl+Shift+C` looked inert on long selections.
+    // The owned path has its own, larger bound; the untrusted path keeps the
+    // audited 8192 ceiling.
+    use bitty_platform::clipboard::CLIPBOARD_MAX_OWNED_WRITE_BYTES;
+
+    let mut cb = Clipboard::new_headless();
+    let long = "x".repeat(CLIPBOARD_MAX_BYTES * 4);
+    cb.set_text_owned(long.clone())
+        .expect("a selection over the paste bound still copies");
+    assert_eq!(cb.headless_contents(), long);
+    assert_eq!(cb.primary_contents(), long);
+
+    // The untrusted writers (paste replies, OSC 52) are untouched.
+    assert!(matches!(
+        cb.set_text(long.clone()),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge {
+            max, ..
+        }) if max == CLIPBOARD_MAX_BYTES
+    ));
+
+    // The owned bound still exists and is typed.
+    let over = "x".repeat(CLIPBOARD_MAX_OWNED_WRITE_BYTES + 1);
+    assert!(matches!(
+        cb.set_text_owned(over.clone()),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge {
+            max, ..
+        }) if max == CLIPBOARD_MAX_OWNED_WRITE_BYTES
+    ));
+    assert!(matches!(
+        cb.set_primary_owned(over),
+        Err(bitty_platform::PlatformError::ClipboardPayloadTooLarge { .. })
+    ));
+    assert_eq!(
+        cb.headless_contents(),
+        long,
+        "a refused owned write keeps the previous value"
+    );
+}
+
+#[test]
 fn direct_read_rejects_while_bounded_reads_clip() {
     // CTX-0478 review: a simulated over-limit system read rejects through the
     // direct API (typed error) but clips through the bounded reads the paste

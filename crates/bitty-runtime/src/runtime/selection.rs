@@ -2473,14 +2473,17 @@ impl Runtime {
         let Some(text) = self.selection_text() else {
             return Ok(None);
         };
-        self.clipboard.set_text(text.clone())?;
+        // bitty#3311: the selection is our own data, so it is bounded by the
+        // owned-write limit rather than the untrusted paste bound that used to
+        // refuse everything over 8 KiB and make the chord look inert.
+        self.clipboard.set_text_owned(text.clone())?;
         Ok(Some(text))
     }
 
     /// Best-effort copy that never returns an error (drops system errors).
     pub fn copy_selection_lossy(&mut self) -> Option<String> {
         let text = self.selection_text()?;
-        self.clipboard.set_text_lossy(text.clone());
+        self.clipboard.set_text_owned_lossy(text.clone());
         Some(text)
     }
 
@@ -2525,7 +2528,7 @@ impl Runtime {
     /// [`Self::last_clipboard_error`] but the headless buffer is still
     /// updated by the platform layer, so headless tests stay deterministic.
     pub fn set_primary_text(&mut self, text: String) {
-        if let Err(err) = self.clipboard.set_primary(text) {
+        if let Err(err) = self.clipboard.set_primary_owned(text) {
             self.record_clipboard_error(err);
         } else {
             self.clear_clipboard_error();
@@ -2539,7 +2542,7 @@ impl Runtime {
     /// historic call shape.
     pub fn copy_selection_to_primary(&mut self) -> Option<String> {
         let text = self.selection_text()?;
-        if let Err(err) = self.clipboard.set_primary(text.clone()) {
+        if let Err(err) = self.clipboard.set_primary_owned(text.clone()) {
             self.record_clipboard_error(err);
         } else {
             self.clear_clipboard_error();
@@ -2561,7 +2564,7 @@ impl Runtime {
     /// `copy_to_clipboard` chord calls the same path regardless of the toggle.
     pub fn auto_copy_selection(&mut self) -> Option<String> {
         let text = self.selection_text()?;
-        match self.clipboard.set_text(text.clone()) {
+        match self.clipboard.set_text_owned(text.clone()) {
             Ok(()) => self.clear_clipboard_error(),
             Err(err) => self.record_clipboard_error(err),
         }
